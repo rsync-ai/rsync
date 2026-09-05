@@ -45,6 +45,8 @@ import subprocess
 import pytest
 import yaml
 
+import _flip_cut
+
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 QUICKSTART = os.path.join(REPO_ROOT, "docker-compose.quickstart.yml")
 WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "docker-publish.yml")
@@ -525,13 +527,13 @@ def test_every_image_named_in_chart_prose_is_actually_published(image):
 
 # Chart images that the tag named by appVersion did NOT build.
 #
-# EXPECTED TO BE EMPTY. It is not empty today because the generation tier entered
-# the matrix after v0.1.1 was cut, and the next release tag is deliberately being
-# held until the repo goes public. When that tag lands this test will fail by
-# announcing the set is now empty -- delete the two entries, and the release is
-# genuinely complete. Do not add to this set to make a failure go away: a new name
-# here means a new component is undeployable at the version the chart advertises.
-APPVERSION_TAG_GAP = {"llm-service-oss", "connector-lifecycle"}
+# EMPTY, and it stays empty. It held {"llm-service-oss", "connector-lifecycle"}
+# while the generation tier was in HEAD's matrix but not in the newest tag's; the
+# v0.1.2 release run (36/36 jobs) closed that, and emptying this set is what
+# recorded the close. Do not add to it to make a failure go away: a name here means
+# a component is undeployable at the version the chart advertises, which is a
+# release defect, not a test-data problem. Cut a tag that builds it instead.
+APPVERSION_TAG_GAP = set()
 
 
 def _appversion():
@@ -593,15 +595,139 @@ def _tagless_checkout_hint():
     )
 
 
+# --- where the release actually lives -----------------------------------------
+#
+# Every tag check below was written on the assumption that the tree it runs in is
+# the tree that cuts the releases. That is true here and stops being true in any
+# mirror of this file: `v0.1.2` was cut on rsync-ai/rsync, the tree install.sh
+# downloads from and the tree that packaged the published chart, and a checkout
+# without that tag cannot read the build matrix the release was built from. The
+# images exist either way; the local ref does not.
+#
+# Cutting a duplicate tag in the mirror would not repair the read, it would break
+# something else. docker-publish.yml triggers on `push: tags: ["v*.*.*"]`, so the
+# tag would rebuild all 34 images and republish them over the artifacts the real
+# release already produced -- and read that workflow's header before dismissing
+# the cost: a push trigger there once spent the org's whole month of CI minutes.
+RELEASE_REPO = "rsync-ai/rsync"
+
+_OUTSIDE_RELEASE_SKIP = (
+    "%s was cut on " + RELEASE_REPO + ", not in this checkout -- this is a mirror "
+    "of that tree, and the newest tag visible here is %s. The images DO "
+    "exist; what is missing is a local ref to read the build matrix from. This "
+    "check still runs on every mirrored PR against " + RELEASE_REPO + ", where the "
+    "tag is native and no exemption applies -- see "
+    "test_the_outside_release_exemption_cannot_fire_in_the_release_tree."
+)
+
+
+def _version_tuple(tag):
+    """(major, minor, patch) for a `vX.Y.Z` tag, or None if it is not that shape."""
+    try:
+        return tuple(int(p) for p in tag.lstrip("v").split(".")[:3])
+    except (AttributeError, ValueError):
+        return None
+
+
+def _the_newest_release_is_outside_this_checkout():
+    """Whether the newest release genuinely cannot be read here -- the one case a
+    private checkout is entitled to skip a tag check.
+
+    Deliberately narrow, because the tests below exist to make a missing release
+    FAIL rather than skip; a skip is the vacuous pass this whole file is about.
+    Four conditions have to hold together and each closes one way this could
+    become that pass:
+
+      * the tree is pre-cut, i.e. private. The public tree carries the tag
+        natively, so the exemption is unreachable in the tree that owns the
+        released artifact -- pinned by a test, not left to inspection.
+      * a tag IS visible here. Without this a checkout that merely never fetched
+        tags would take the exemption, which is precisely the confusion
+        _tagless_checkout_hint exists to stop.
+      * the shipped version is strictly NEWER than every tag in this checkout.
+        An appVersion naming an older version, or one this repo did cut, is not
+        post-flip drift and still fails.
+      * install.sh and Chart.yaml name the SAME version. They are the two things
+        that point a user at a release, and the exemption is only defensible for
+        a release both of them advertise. Disagreement fails loudly here rather
+        than being waved through: it would mean the compose install and the Helm
+        install pull different image sets, which is a shipping defect on its own.
+    """
+    if not _flip_cut.is_a_pre_cut_tree():
+        return False
+    newest = _newest_release_tag()
+    if newest is None:
+        return False  # the tagless hint owns this case; do not shadow it
+    here, shipped = _version_tuple(newest), _version_tuple(_appversion())
+    if here is None or shipped is None or shipped <= here:
+        return False
+    ref = _default_ref()
+    assert _is_release_ref(ref) and _version_tuple(ref) == shipped, (
+        f"Chart.yaml appVersion is {_appversion()!r} -- newer than {newest}, the "
+        f"newest tag in this checkout -- so the release it names was cut on "
+        f"{RELEASE_REPO} and cannot be read here. That is survivable only while the "
+        f"two published install paths agree on the version, and they do not: "
+        f"install.sh defaults to RSYNC_REF={ref!r}.\n"
+        "`curl | bash` would install one release and `helm install` another, from "
+        "image sets nothing compares. Repin whichever is stale, or move appVersion "
+        "back to a version this repo cut."
+    )
+    return True
+
+
+def test_the_outside_release_exemption_cannot_fire_in_the_release_tree(monkeypatch):
+    """Control for the exemption, run in BOTH trees rather than argued from the code.
+
+    An exemption that silences a vacuity guard is exactly the shape this file was
+    written to distrust, so the tree-kind bit it hangs on gets flipped here rather
+    than inspected. Each half asserts the guarantee its own tree is responsible for:
+
+      * in the public tree -- the one that owns the release -- forcing the bit ON
+        must STILL leave the exemption disarmed, because the tag is native there
+        and no version is newer than itself. That is the load-bearing claim: the
+        checks stay hard where the shipped artifact lives, on every mirrored PR.
+      * in the private tree, forcing the bit OFF must disarm it, proving the bit
+        is what carries the exemption rather than one of the looser conditions.
+    """
+    private = _flip_cut.is_a_pre_cut_tree()
+
+    monkeypatch.setattr(_flip_cut, "is_a_pre_cut_tree", lambda: False)
+    assert _the_newest_release_is_outside_this_checkout() is False, (
+        "the exemption survives the tree-kind bit being false, so something else "
+        "is arming it and it is no longer scoped to the private repo."
+    )
+
+    monkeypatch.setattr(_flip_cut, "is_a_pre_cut_tree", lambda: True)
+    forced = _the_newest_release_is_outside_this_checkout()
+    if private:
+        return  # the bit was already true here; the half above is this tree's control
+    assert forced is False, (
+        f"this is {RELEASE_REPO} -- the tree the release is cut from -- and yet the "
+        "exemption arms once the tree-kind bit is forced. Every tag check in this "
+        "file would then skip HERE, where they are the only thing standing between "
+        "a shipped chart and images that were never built.\n"
+        f"Chart.yaml appVersion is {_appversion()!r} and the newest visible tag is "
+        f"{_newest_release_tag()!r}: if those disagree, the release this tree "
+        "advertises was never cut in it, and that is the real defect to fix."
+    )
+
+
 def test_the_appversion_tag_build_set_was_actually_read():
     """Vacuity guard. A missing tag must FAIL here, never skip.
 
     A skip is what turns this into the bug it exists to catch: the whole point is
     that nothing fails when a release artifact is absent, so "the tag isn't there,
     nothing to check" is precisely the wrong answer.
+
+    One exemption, and it is about WHERE the tag lives rather than WHETHER it
+    exists: see _the_newest_release_is_outside_this_checkout. It cannot fire in
+    the repo that owns the release, so the assertion below still runs against
+    every release, on the tree the release was cut from.
     """
     tag = f"v{_appversion()}"
     built = _build_set_at(tag)
+    if built is None and _the_newest_release_is_outside_this_checkout():
+        pytest.skip(_OUTSIDE_RELEASE_SKIP % (tag, _newest_release_tag()))
     assert built is not None, (
         f"Chart.yaml appVersion is {_appversion()!r}, so a default `helm install` pulls "
         f"`<image>:{_appversion()}` -- but {tag} could not be read here.\n"
@@ -621,6 +747,8 @@ def test_the_appversion_tag_build_set_was_actually_read():
 def test_the_chart_appversion_names_a_release_that_built_its_images():
     tag = f"v{_appversion()}"
     built = _build_set_at(tag)
+    if built is None and _the_newest_release_is_outside_this_checkout():
+        pytest.skip(_OUTSIDE_RELEASE_SKIP % (tag, _newest_release_tag()))
     assert built is not None, f"{tag} does not exist -- see the vacuity guard above"
 
     gap = {
@@ -667,11 +795,11 @@ def test_the_chart_appversion_names_a_release_that_built_its_images():
 # file -- zero, deliberately -- so a missing image is a hard failure of the pull,
 # not a slow local build.
 
-# Ungated quickstart images the newest release tag did NOT build. EXPECTED EMPTY;
-# see APPVERSION_TAG_GAP above for why it is not, and delete entries rather than
-# adding them. `mcp-context7` is absent from this set on purpose: it is gated
-# behind the `generate` profile, so it cannot break a default install.
-RELEASE_TAG_GAP_COMPOSE = {"connector-deployer", "llm-service-oss", "connector-lifecycle"}
+# Ungated quickstart images the newest release tag did NOT build. EMPTY, and it
+# stays empty -- see APPVERSION_TAG_GAP above. Delete entries rather than adding
+# them. `mcp-context7` never belonged here: it is gated behind the `generate`
+# profile, so it cannot break a default install either way.
+RELEASE_TAG_GAP_COMPOSE = set()
 
 
 def _newest_release_tag():
@@ -706,6 +834,11 @@ def test_the_install_script_pulls_images_the_newest_release_actually_built():
         "no release tag could be read, so there is nothing to compare against."
         + _tagless_checkout_hint()
     )
+    # The newest tag HERE is not the newest release once releases moved to the
+    # sibling repo, and comparing against a superseded one would report a gap
+    # that the shipped release has already closed.
+    if _the_newest_release_is_outside_this_checkout():
+        pytest.skip(_OUTSIDE_RELEASE_SKIP % (f"v{_appversion()}", tag))
     gap = {img for img in _ungated(_quickstart_images()) if img not in built}
     assert gap == RELEASE_TAG_GAP_COMPOSE, (
         f"the set of ungated quickstart images missing from {tag} changed.\n"
@@ -1177,6 +1310,11 @@ def test_the_installer_repins_to_a_release_once_one_covers_the_compose_set():
         "no release tag could be read, so there is nothing to compare against."
         + _tagless_checkout_hint()
     )
+    if _the_newest_release_is_outside_this_checkout():
+        # The repin ALREADY HAPPENED -- that is what makes appVersion newer than
+        # anything here. Reporting "no release covers the compose set" off the
+        # superseded local tag would be the stale-skip this test warns about.
+        pytest.skip(_OUTSIDE_RELEASE_SKIP % (f"v{_appversion()}", tag))
     gap = {img for img in _ungated(_quickstart_images()) if img not in built}
     if gap:
         pytest.skip(

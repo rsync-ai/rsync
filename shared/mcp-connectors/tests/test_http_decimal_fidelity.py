@@ -213,9 +213,37 @@ def test_every_http_connector_neutralises_the_decimal_encoder(path):
     )
 
 
+def _require_a_pre_cut_tree():
+    """Delegate to ``llm-service/tests/_flip_cut.py`` -- one definition of "the cut ran".
+
+    Loaded by path rather than imported, so nothing is added to ``sys.path``: that
+    directory holds a ``conftest.py`` of its own, and putting it on the path from
+    here would let it shadow this suite's.
+    """
+    import importlib.util
+
+    src = ROOT.parents[1] / "llm-service" / "tests" / "_flip_cut.py"
+    spec = importlib.util.spec_from_file_location("_flip_cut_for_decimal_fidelity", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    mod.require_a_pre_cut_tree()
+
+
 @pytest.mark.parametrize("name", HTTP_TEMPLATES)
 def test_the_generator_templates_carry_the_fix_forward(name):
     """A fix only in the generated copies is one regeneration away from being gone."""
+    if not TEMPLATES.is_dir():
+        # `src/agents/tool_generator/templates` is oss-strip-list.txt:39, so the public
+        # cut removes it along with the rest of the generator package: there is no
+        # template in that tree for a regeneration to lose, and nothing here to check.
+        #
+        # Skip on the CUT, not on the directory being absent. "Missing => skip" is a
+        # guard that disarms itself -- rename the directory in this repo and the check
+        # stops running with a green tick. _flip_cut reads one witness from each of the
+        # two lists the cut consumes; both gone is the public tree, both present is
+        # this one (so the assertion below runs and a rename fails, which is the point),
+        # and one of each is a state no procedure produces, which it fails on.
+        _require_a_pre_cut_tree()
     path = TEMPLATES / name
     assert path.is_file(), f"{path} is missing -- template renamed?"
     body = path.read_text()
