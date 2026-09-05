@@ -108,7 +108,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/go-playground/universal-translator](https://github.com/go-playground/universal-translator) | v0.18.1 | MIT |
 | [github.com/go-playground/validator/v10](https://github.com/go-playground/validator) | v10.30.3 | MIT |
 | [github.com/go-redis/redis/v8](https://github.com/go-redis/redis) | v8.11.5 | BSD-2-Clause |
-| [github.com/go-sql-driver/mysql](https://github.com/go-sql-driver/mysql) | v1.10.0 | MPL-2.0 |
+| [github.com/go-sql-driver/mysql](https://github.com/go-sql-driver/mysql) | v1.10.1 | MPL-2.0 |
 | [github.com/go-viper/mapstructure/v2](https://github.com/go-viper/mapstructure) | v2.5.0 | MIT |
 | [github.com/goccy/go-yaml](https://github.com/goccy/go-yaml) | v1.19.2 | MIT |
 | [github.com/gogo/protobuf](https://github.com/gogo/protobuf) | v1.3.2 | BSD-3-Clause |
