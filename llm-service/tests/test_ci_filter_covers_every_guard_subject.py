@@ -68,6 +68,32 @@ def _llm_filter_patterns():
     return yaml.safe_load(step["with"]["filters"])["llm"]
 
 
+def _declared_paths(guard):
+    """The repo-relative paths a guard builds with ``os.path.join(REPO_ROOT, ...)``.
+
+    Narrower than `_subjects_of` on purpose, and in two ways: it keeps only the
+    explicit-join shape, not the bare-literal net (any string containing a slash),
+    and it does not filter on existence. So it answers "what does this guard say
+    its subjects are", which is the question the exemption below needs -- a set
+    that survives its subjects being deleted from the tree.
+    """
+    tree = ast.parse(open(os.path.join(TESTS_DIR, guard)).read())
+    out = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "join"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id in ("REPO_ROOT", "ROOT")
+        ):
+            rest = [a.value for a in node.args[1:] if isinstance(a, ast.Constant) and isinstance(a.value, str)]
+            if rest and len(rest) == len(node.args) - 1:
+                out.add("/".join(rest))
+    return out
+
+
 def _subjects_of(guard):
     """Repo-relative files a guard reads, derived from its source.
 
@@ -129,21 +155,36 @@ def test_every_guard_declares_at_least_one_subject(guard):
     assert os.path.isfile(os.path.join(TESTS_DIR, guard)), f"{guard} is gone; drop it from GUARDS"
     subs = _subjects_of(guard)
     if not subs:
-        # Two very different causes look identical here, and the difference is
-        # measurable: if the DERIVER broke, it breaks for everything; if this tree
-        # simply does not contain this guard's subject, every other guard still
-        # derives fine. The public cut is the second case -- it removes
-        # docs/internal/ and scripts/flip/, which is the entire subject of
-        # test_flip_runbook_does_not_invoke_its_own_deleted_tooling.py (that guard
-        # skips there too, by its own skipif). Skipping on a measured denominator
-        # rather than on a name keeps a real deriver regression failing.
-        others = [g for g in GUARDS if g != guard and _subjects_of(g)]
-        if len(others) == len(GUARDS) - 1:
+        # Two very different causes look identical here, and only one is a defect:
+        # the DERIVER stopped recognising this guard's path shape, or this tree
+        # simply does not contain the guard's subject. The public cut is the second
+        # case -- it removes docs/internal/ and scripts/flip/ wholesale, which is
+        # the entire subject of the two flip guards, and both of them skip in that
+        # tree by their own gate.
+        #
+        # The discriminator is the *directory*, not a count. An earlier version of
+        # this exemption asked whether every OTHER guard still derived subjects, on
+        # the theory that a broken deriver breaks for everything -- which made the
+        # exemption fit exactly one barren guard. Enrolling a second flip guard
+        # (2026-09-05) put two of them in the public tree, and both then failed:
+        # each one saw the other as evidence the deriver was broken. A count of
+        # barren guards was never the fact worth measuring.
+        #
+        # A removed directory is. Deleting a tree is what the cut does, and no
+        # deriver regression can fake it: if the join-shape reader broke, `declared`
+        # is empty and this falls through to the assertion below; if a single
+        # subject was renamed, its directory still exists and the guard still fails,
+        # which is the whole point. A guard whose subjects are named only as bare
+        # literals also falls through -- deliberately, because that net is too loose
+        # to earn an exemption.
+        declared = _declared_paths(guard)
+        dirs = {os.path.dirname(p) for p in declared}
+        if dirs and all(d and not os.path.isdir(os.path.join(REPO_ROOT, d)) for d in dirs):
             pytest.skip(
-                f"{guard} names no path that exists in this tree, while all "
-                f"{len(others)} other guards still derive subjects -- so the deriver "
-                f"works and this guard's subject was removed from the tree (the "
-                f"public cut removes docs/internal/ and scripts/flip/)."
+                f"{guard} declares subjects only under {sorted(dirs)}, and no such "
+                f"directory exists in this tree -- the cut removed them wholesale, "
+                f"so there is nothing here for the filter to cover. (A renamed "
+                f"subject inside a directory that still exists is NOT exempt.)"
             )
     assert subs, (
         f"no subject files derived from {guard}. Either it genuinely reads nothing "
