@@ -7,7 +7,7 @@ type: application
 
 # Chart version. Released in lockstep with appVersion: the workflow derives both
 # from the same git tag, so a chart and the images it points at are never skewed.
-version: 0.1.1
+version: 0.1.2
 
 # appVersion is the image tag the chart defaults to (global.image.tag is empty,
 # so every component resolves through here). The release job overwrites BOTH this
@@ -15,13 +15,14 @@ version: 0.1.1
 # the values below only matter for `helm install ./deploy/helm/rsync-ai` from a
 # checkout. Keep them at the latest COMPLETE release.
 #
-# 0.1.1, not 0.1.0, and this is load-bearing rather than cosmetic: the chart pins
-# mcp-minio, whose build job is the one job that FAILED in the v0.1.0 release run
-# (it pointed at a Dockerfile deleted by #184; fixed in #854). ghcr.io/rsync-ai/
-# mcp-minio:0.1.0 therefore does not exist, and a chart pinning 0.1.0 comes up
-# with five healthy pods and one permanent ImagePullBackOff. v0.1.1 published
-# 31/31. Do not "revert" this to 0.1.0 without re-checking that run.
-appVersion: "0.1.1"
+# This is load-bearing rather than cosmetic: the tag named here has to be one whose
+# release run published EVERY image the chart pins, or the install comes up with a
+# permanent ImagePullBackOff on the ones it missed. Two earlier tags failed that
+# test -- v0.1.0's mcp-minio job errored (a Dockerfile deleted by #184; fixed in
+# #854), and v0.1.1 predates llm-service-oss and connector-lifecycle joining the
+# build matrix. v0.1.2's run was 36/36, and all 34 packages answer anonymously at
+# that tag. Do not move this backwards without re-checking the run behind it.
+appVersion: "0.1.2"
 
 keywords:
   - etl

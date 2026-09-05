@@ -54,20 +54,16 @@ secret, and starts the full stack. Open `http://localhost:3000` when it finishes
 stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
-> **Which code you get.** Both halves of the install name the same ref: the compose file
-> is fetched from `RSYNC_REF` (default `main`) and the images are pulled at a tag derived
-> from it. That closes the old mismatch — a compose file tracking a moving `main` against
-> images resolving to `latest`. It does not make the two halves move at the same *rate*.
-> On the default they do not: the compose file comes from the branch tip and changes with
-> every commit, while images are published by the release workflow, which runs on a
-> version tag or on demand — so `main` images track the last publish, not `main`'s newest
-> commit. **For an install you can reproduce, set `RSYNC_REF` to a release tag**, which
-> takes the compose file *and* the images from that tag.
+> **Which code you get.** `v0.1.2`, the current release. Both halves of the install come
+> from that one tag: the compose file is fetched from `RSYNC_REF` and the images are
+> pulled at a tag derived from it, so the file and the containers it starts are the same
+> commit. Every image the default compose starts is published at that tag and pullable
+> anonymously — a test pins that, so a release cannot ship half-built.
 >
-> One caveat if you pin to `v0.1.1` specifically: three services the compose starts
-> (`connector-deployer`, `llm-service-oss`, `connector-lifecycle`) joined the release build
-> matrix after that tag was cut, so it never published them and the pull fails. The next
-> tag closes that; it is pinned by a test so it cannot ship half-done.
+> Pass `RSYNC_REF=main` to track the branch instead. That install is not reproducible:
+> the compose file comes from the branch tip and changes with every commit, while `main`
+> images track the last publish rather than the newest commit, so the two halves move at
+> different rates.
 
 ### Kubernetes
 
@@ -97,15 +93,21 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > and keep it somewhere you will still have it after the cluster is gone — reinstalling
 > with a different key makes every saved connection permanently undecryptable.
 
-> [!NOTE]
-> Two things are still tied to the next release tag, and both are covered in the
-> [Kubernetes guide](docs/deployment/kubernetes.md): a one-command
-> `oci://ghcr.io/rsync-ai/charts/rsync-ai` install ships with the first release cut after
-> the chart-publish job lands, so the checkout above is the live path today; and the chart
-> pulls images at `.Chart.AppVersion` (**0.1.1**), which never published
-> `llm-service-oss` or `connector-lifecycle`. Those two pods sit in `ImagePullBackOff`
-> until the next tag — pass `--set generation.enabled=false` to skip them, at the cost of
-> `/chat`, the only pipeline-creation path in the UI.
+> [!TIP]
+> The chart is also published to the registry, so you can install without cloning:
+>
+> ```bash
+> helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.2 \
+>   --namespace rsync --create-namespace \
+>   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
+>   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
+>   --set secrets.postgresPassword="$(openssl rand -base64 24)" \
+>   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
+>   --set secrets.minioSecretKey="$(openssl rand -base64 32)"
+> ```
+>
+> Both paths pull images at `.Chart.AppVersion` (**0.1.2**), and every image the chart
+> names is published at that tag.
 
 ---
 

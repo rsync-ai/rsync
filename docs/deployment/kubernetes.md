@@ -29,10 +29,26 @@ Both run the same `ghcr.io/rsync-ai/*` images at the same version.
 StorageClass, and — for anything beyond evaluation — managed Postgres, Redis,
 Kafka and object storage.
 
+### From the published chart
+
+The chart is published as an OCI artifact alongside the images by the
+`publish-chart` job in
+[docker-publish.yml](../../.github/workflows/docker-publish.yml), which derives
+the chart version **and** the default image tag from the same git tag, so a
+chart and the images it points at can never skew:
+
+```bash
+helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
+  --version 0.1.2 \
+  --namespace rsync --create-namespace \
+  -f my-values.yaml
+```
+
+No registry login is needed — the chart and every image it pulls are public.
+
 ### From a checkout
 
-The path that works today — with one caveat noted below — and the right one
-when you are modifying the chart:
+The right path when you are modifying the chart:
 
 ```bash
 git clone https://github.com/rsync-ai/rsync.git
@@ -42,16 +58,9 @@ helm install rsync ./deploy/helm/rsync-ai \
 ```
 
 The chart resolves its image tag to `.Chart.AppVersion`, so this pulls the
-**0.1.1** images.
-
-> **Two of them do not exist at 0.1.1.** The generation tier —
-> `llm-service-oss` and `connector-lifecycle`, three pods — entered the release
-> build matrix *after* `v0.1.1` was cut, so that tag never published them.
-> `generation.enabled` defaults to `true`, which means a default install lands
-> those three pods in `ImagePullBackOff` while everything else comes up. Until
-> the next release tag, either pass `--set generation.enabled=false` (you lose
-> `/chat`, which is the only pipeline-creation path in the UI) or build and load
-> the two images yourself. This closes the moment the next tag is cut.
+**0.1.2** images. Every image the chart names is published at that tag: the
+`v0.1.2` release run built 36 of 36 jobs, and all 34 packages answer an
+anonymous pull.
 
 Do not hand-audit this list. `v0.1.0` shipped the same class of defect from the
 other direction — `mcp-minio` pointed at a Dockerfile removed by
@@ -65,27 +74,6 @@ compares every default-enabled chart image against what the tag named by
 `appVersion` actually built, and fails in **both** directions — including when
 the gap closes, so the release is not quietly under-claimed either. Trust that
 over any list written by hand, this one included.
-
-### From the published chart — not yet available
-
-The `publish-chart` job in
-[docker-publish.yml](../../.github/workflows/docker-publish.yml) packages the
-chart as an OCI artifact alongside the images, deriving the chart version **and**
-the default image tag from the same git tag, so a chart and the images it points
-at can never skew.
-
-```bash
-helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
-  --version <release> \
-  --namespace rsync --create-namespace \
-  -f my-values.yaml
-```
-
-> **Nothing is in the chart registry yet — this command will not resolve.**
-> `publish-chart` fires only on a version tag, and both existing tags (`v0.1.0`,
-> `v0.1.1`) predate the job, so they published images only. It becomes usable
-> from the first release cut after that job ships; until then use the checkout
-> path above.
 
 ---
 

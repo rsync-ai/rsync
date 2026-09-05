@@ -207,11 +207,10 @@ connection in a surviving external database.
   given here ("never minted for any image in this repo") expired on 2026-08-19 —
   [docker-publish.yml](../../../.github/workflows/docker-publish.yml) pushes
   `type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}`, and both
-  `v0.1.0` and `v0.1.1` were tag refs, so `latest` does now exist. The chart
+  `v0.1.0`, `v0.1.1` and `v0.1.2` were tag refs, so `latest` does now exist —
+  all 34 packages carry it, confirmed by an anonymous manifest fetch. The chart
   resolves `.tag | default global.image.tag | default .Chart.AppVersion`, which
-  is **0.1.1** today; move it with `global.image.tag`, not with `latest`.
-  (Read from the workflow and the release runs — listing GHCR packages to
-  confirm the tag needs `read:packages`, which this checkout does not have.)
+  is **0.1.2** today; move it with `global.image.tag`, not with `latest`.
 
 ## Troubleshooting
 

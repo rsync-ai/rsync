@@ -525,13 +525,13 @@ def test_every_image_named_in_chart_prose_is_actually_published(image):
 
 # Chart images that the tag named by appVersion did NOT build.
 #
-# EXPECTED TO BE EMPTY. It is not empty today because the generation tier entered
-# the matrix after v0.1.1 was cut, and the next release tag is deliberately being
-# held until the repo goes public. When that tag lands this test will fail by
-# announcing the set is now empty -- delete the two entries, and the release is
-# genuinely complete. Do not add to this set to make a failure go away: a new name
-# here means a new component is undeployable at the version the chart advertises.
-APPVERSION_TAG_GAP = {"llm-service-oss", "connector-lifecycle"}
+# EMPTY, and it stays empty. It held {"llm-service-oss", "connector-lifecycle"}
+# while the generation tier was in HEAD's matrix but not in the newest tag's; the
+# v0.1.2 release run (36/36 jobs) closed that, and emptying this set is what
+# recorded the close. Do not add to it to make a failure go away: a name here means
+# a component is undeployable at the version the chart advertises, which is a
+# release defect, not a test-data problem. Cut a tag that builds it instead.
+APPVERSION_TAG_GAP = set()
 
 
 def _appversion():
@@ -667,11 +667,11 @@ def test_the_chart_appversion_names_a_release_that_built_its_images():
 # file -- zero, deliberately -- so a missing image is a hard failure of the pull,
 # not a slow local build.
 
-# Ungated quickstart images the newest release tag did NOT build. EXPECTED EMPTY;
-# see APPVERSION_TAG_GAP above for why it is not, and delete entries rather than
-# adding them. `mcp-context7` is absent from this set on purpose: it is gated
-# behind the `generate` profile, so it cannot break a default install.
-RELEASE_TAG_GAP_COMPOSE = {"connector-deployer", "llm-service-oss", "connector-lifecycle"}
+# Ungated quickstart images the newest release tag did NOT build. EMPTY, and it
+# stays empty -- see APPVERSION_TAG_GAP above. Delete entries rather than adding
+# them. `mcp-context7` never belonged here: it is gated behind the `generate`
+# profile, so it cannot break a default install either way.
+RELEASE_TAG_GAP_COMPOSE = set()
 
 
 def _newest_release_tag():
