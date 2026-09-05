@@ -44,21 +44,37 @@ def _present(rel):
     return os.path.exists(os.path.join(REPO_ROOT, rel))
 
 
-def require_a_pre_cut_tree():
-    """Skip on a cut tree, fail on a half-cut one, return on the private repo."""
+def is_a_pre_cut_tree():
+    """True in the private repo, False in the public one; fail loudly on a half-cut tree.
+
+    The predicate behind ``require_a_pre_cut_tree`` below, split out because not
+    every caller wants a skip. Some need the plain fact of which tree they are in
+    -- the release tags now live in only one of the two, and a guard that reads
+    them has to know which -- and calling a skipping helper to learn that would
+    end the test at the moment it acquired the information.
+    """
     import pytest
 
     excludes, moat = _present(_FROM_EXCLUDES), _present(_FROM_STRIP_LIST)
     if excludes and moat:
-        return
+        return True
     if not excludes and not moat:
-        pytest.skip(
-            "the public cut has already run on this checkout (%s and %s are both "
-            "gone) -- these guards check that the cut WILL be clean, so there is "
-            "nothing left for them to read" % (_FROM_EXCLUDES, _FROM_STRIP_LIST))
+        return False
     pytest.fail(
         "half-cut tree: %s is %s but %s is %s. No step of the flip produces this -- "
         "the runbook removes both, and the private repo has both. Something was "
         "renamed, half-deleted, or merged wrong, and skipping here would hide it."
         % (_FROM_EXCLUDES, "present" if excludes else "gone",
            _FROM_STRIP_LIST, "present" if moat else "gone"))
+
+
+def require_a_pre_cut_tree():
+    """Skip on a cut tree, fail on a half-cut one, return on the private repo."""
+    import pytest
+
+    if is_a_pre_cut_tree():
+        return
+    pytest.skip(
+        "the public cut has already run on this checkout (%s and %s are both "
+        "gone) -- these guards check that the cut WILL be clean, so there is "
+        "nothing left for them to read" % (_FROM_EXCLUDES, _FROM_STRIP_LIST))

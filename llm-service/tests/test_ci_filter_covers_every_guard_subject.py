@@ -94,6 +94,40 @@ def _declared_paths(guard):
     return out
 
 
+def _repo_relative_files(literal):
+    """Repo-relative files a source literal names, or nothing if it names none.
+
+    Both filters exist because a literal that escapes the repo produced a subject
+    named after a file on the RUNNER, not in the tree -- and did it on exactly one
+    of the two operating systems CI uses, which is the worst way for a guard to be
+    wrong.
+
+    `os.path.join` DISCARDS everything before an absolute component, so a source
+    literal of `"/**"` joins to `"/**"` rather than to a path under the repo, and
+    the glob then enumerates the filesystem root. On ubuntu-latest that root holds
+    a regular file, `/swapfile`, so a parametrised case appeared named
+    `../../../../../swapfile` and no CI filter could ever match it. macOS has no
+    regular file at top level, so the same literal expanded to nothing and the
+    guard was green on the developer machines the private repo runs CI on. Only
+    the public repo, on GitHub-hosted Linux, ever saw it.
+
+    Rejecting absolute literals up front handles that case; re-checking each hit
+    afterwards covers the general one, since a `..` inside a relative literal
+    escapes without ever looking absolute.
+    """
+    if os.path.isabs(literal):
+        return set()
+    found = set()
+    for hit in glob.glob(os.path.join(REPO_ROOT, literal)):
+        if not os.path.isfile(hit):
+            continue
+        rel = os.path.relpath(hit, REPO_ROOT)
+        if rel == ".." or rel.startswith(".." + os.sep):
+            continue
+        found.add(rel)
+    return found
+
+
 def _subjects_of(guard):
     """Repo-relative files a guard reads, derived from its source.
 
@@ -124,9 +158,7 @@ def _subjects_of(guard):
 
     out = set()
     for r in raw:
-        for hit in glob.glob(os.path.join(REPO_ROOT, r)):
-            if os.path.isfile(hit):
-                out.add(os.path.relpath(hit, REPO_ROOT))
+        out |= _repo_relative_files(r)
     # A guard reading its own directory is not a subject; llm-service/** is covered anyway.
     # `.git` is git plumbing -- in a worktree it is a *file*, so isfile() keeps it -- and is
     # read to shell out to git, never as a subject a PR can edit.
@@ -141,6 +173,41 @@ def test_the_llm_job_is_still_the_one_gated_on_that_filter():
         "llm-service-unit is no longer gated on the `llm` paths filter, so the "
         "coverage tests below assert against a filter that decides nothing. "
         "Point them at whatever gates the job now."
+    )
+
+
+def test_a_literal_that_escapes_the_repo_names_no_subject(tmp_path):
+    """Control for _repo_relative_files, written so it fails on either OS.
+
+    The bug it pins fired only where the filesystem root happens to hold a regular
+    file -- true on ubuntu-latest, false on macOS -- so observing the live GUARDS
+    set proves nothing on a developer machine: it would pass there whether the
+    filter existed or not. Building the escaping file makes the case real on both.
+
+    The positive assertion is not decoration. A `_repo_relative_files` that
+    returned the empty set for everything would satisfy the negative half while
+    silently emptying every guard's subject list, which is the same vacuous pass
+    the anti-vacuity floor above exists to catch.
+    """
+    outside = tmp_path / "swapfile"
+    outside.write_text("stand-in for the file ubuntu-latest keeps at /\n")
+    escaping = os.path.relpath(str(outside), REPO_ROOT)
+    assert escaping.startswith(".."), (
+        f"{tmp_path} resolved INSIDE the repo, so this control is not testing an "
+        "escape at all. pytest's tmp_path moved under the tree."
+    )
+
+    for literal in (str(outside), escaping, "/**"):
+        assert _repo_relative_files(literal) == set(), (
+            f"{literal!r} produced a subject outside the repo. No CI paths filter "
+            "can match one, so the coverage test below fails on a file no pull "
+            "request can touch -- and does it only on the runners whose root "
+            "happens to hold a regular file."
+        )
+
+    assert _repo_relative_files("README.md") == {"README.md"}, (
+        "the filter rejects a plain repo-relative literal, so it is not filtering "
+        "escapes, it is filtering everything."
     )
 
 
