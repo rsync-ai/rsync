@@ -1,0 +1,337 @@
+{
+  "id": "oracle",
+  "name": "Oracle",
+  "display_name": "Oracle Database",
+  "aliases": [
+    "oracle",
+    "oracledb",
+    "oracle_db",
+    "oracle_database"
+  ],
+  "version": "1.0.0",
+  "description": "Connector for Oracle Database (batch source + destination + Debezium LogMiner CDC). python-oracledb thin mode — no Instant Client required.",
+  "connector_type": "oracle",
+  "category": "relational_db",
+  "supported_versions": {
+    "batch": "Oracle Database 12c and later (uses OFFSET/FETCH row-limiting). Autonomous Database and RDS for Oracle supported for batch via service_name / wallet.",
+    "cdc": "Oracle 12c+ via Debezium LogMiner (io.debezium.connector.oracle.OracleConnector). Requires ARCHIVELOG mode, database- and table-level supplemental logging, and a LogMiner capture user — provisioned/validated by the orchestrator's Oracle CDC provider (DBA-only prerequisites are escalated). XStream (GoldenGate license) not used."
+  },
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": true,
+  "supports_ddl": true,
+  "auto_create_destination_tables": true,
+  "spec_version": "1.0",
+  "generated_at": "2026-07-09T00:00:00.000000",
+  "status": "active",
+  "production_verified": false,
+  "quality_tier": "bronze",
+  "quality_score": 30.0,
+  "qa_metadata": {
+    "export_attempts": [
+      {
+        "error": null,
+        "passed": true,
+        "response_sample": {
+          "message": "Offline unit suite (test_oracle_connector.py); live E2E pending an Oracle target",
+          "success": true
+        },
+        "status": "",
+        "test": "relational_db_offline_unit",
+        "warning": "Not yet live-verified against a real Oracle instance"
+      }
+    ],
+    "export_validated_with": null,
+    "export_validation_status": "unit_only",
+    "tests_failed": 0,
+    "tests_passed": 0
+  },
+  "auth_type": "basic",
+  "supported_auth_methods": [
+    {
+      "method": "basic",
+      "header_name": "",
+      "header_prefix": "",
+      "config_keys": [
+        "user",
+        "password"
+      ],
+      "description": "Oracle database username and password authentication."
+    }
+  ],
+  "required_config": [
+    "host",
+    "port",
+    "user",
+    "password"
+  ],
+  "optional_config": [
+    "service_name",
+    "sid",
+    "database",
+    "dsn",
+    "wallet_location",
+    "wallet_password"
+  ],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string",
+        "description": "Oracle host address (e.g. db.example.com or an Autonomous DB host)"
+      },
+      "port": {
+        "type": "integer",
+        "description": "Oracle listener port number (default 1521)"
+      },
+      "service_name": {
+        "type": "string",
+        "description": "Oracle service name (modern; Easy-Connect). Prefer over SID. If omitted, 'database' is treated as the service name."
+      },
+      "sid": {
+        "type": "string",
+        "description": "Oracle SID (legacy). Used only when no service_name/dsn is given."
+      },
+      "database": {
+        "type": "string",
+        "description": "Service name alias (accepted as the service_name for compatibility with the generic DB config shape)."
+      },
+      "dsn": {
+        "type": "string",
+        "description": "Full DSN / Easy-Connect string (host:port/service) or a tnsnames alias. Takes precedence over host/port/service_name."
+      },
+      "user": {
+        "type": "string",
+        "description": "Oracle username. For multitenant CDC, a common user (c##dbzuser) is created by the DBA."
+      },
+      "password": {
+        "type": "string",
+        "description": "Oracle password",
+        "secret": true
+      },
+      "wallet_location": {
+        "type": "string",
+        "description": "Path to an Oracle wallet directory (Autonomous DB mTLS). Sets config_dir + wallet_location for python-oracledb thin mode."
+      },
+      "wallet_password": {
+        "type": "string",
+        "description": "Wallet password (if the wallet is password-protected)",
+        "secret": true
+      }
+    },
+    "required": [
+      "host",
+      "port",
+      "user",
+      "password"
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string",
+        "description": "Oracle host address"
+      },
+      "port": {
+        "type": "integer",
+        "description": "Oracle listener port number"
+      },
+      "service_name": {
+        "type": "string",
+        "description": "Oracle service name"
+      },
+      "user": {
+        "type": "string",
+        "description": "Oracle username"
+      },
+      "password": {
+        "type": "string",
+        "description": "Oracle password",
+        "secret": true
+      }
+    },
+    "required": [
+      "host",
+      "port",
+      "user",
+      "password"
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": [
+      "csv",
+      "json"
+    ],
+    "supports_cdc": true,
+    "supports_ddl": true,
+    "auto_create_destination_tables": true
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity to the data source",
+      "method": "oracle_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration without connecting",
+      "method": "oracle_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover available tables and their schemas",
+      "method": "oracle_discover_schema",
+      "parameters": [
+        {
+          "name": "include_columns",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include column metadata (names, types, nullability)"
+        },
+        {
+          "name": "include_row_counts",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include estimated row counts (fast, no full scans)"
+        },
+        {
+          "name": "include_relationships",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Include primary keys and foreign keys (for agents)"
+        },
+        {
+          "name": "include_indexes",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Include index metadata (for agents)"
+        },
+        {
+          "name": "max_tables",
+          "type": "integer",
+          "required": false,
+          "default": 100,
+          "description": "Maximum number of tables to return"
+        }
+      ]
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities for agent interaction",
+      "method": "oracle_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export data from a table",
+      "method": "oracle_export",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 10000
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0
+        },
+        {
+          "name": "where",
+          "type": "string",
+          "required": false,
+          "default": ""
+        },
+        {
+          "name": "columns",
+          "type": "array",
+          "required": false,
+          "default": []
+        }
+      ]
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Import data into a table",
+      "method": "oracle_import_data",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "data",
+          "type": "array",
+          "required": true
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "required": false,
+          "default": "append"
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "name": "health",
+      "endpoint": "/health",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "get"
+      ]
+    },
+    {
+      "name": "collections",
+      "endpoint": "/collections",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "list"
+      ]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in",
+  "config_aliases": {
+    "host": [
+      "dsn",
+      "tns",
+      "connect_string"
+    ],
+    "port": [
+      "dsn",
+      "tns",
+      "connect_string"
+    ]
+  }
+}

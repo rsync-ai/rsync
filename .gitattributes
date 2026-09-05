@@ -1,0 +1,15 @@
+# Files that two concurrent PRs commonly both append to.
+# `merge=union` tells git to keep BOTH sides on conflict instead of marking
+# the file as conflicted. Combined with the append-only convention in
+# CAPABILITIES.md, this means concurrent PRs that each add new rows will
+# merge cleanly into a file containing both new rows — no manual conflict
+# resolution required.
+#
+# Use this driver only for files where line order is not semantically
+# significant beyond chronology (changelogs, capability tables, finding
+# inventories). Do NOT add code files here — union-merging Python or Go
+# silently produces broken syntax.
+CAPABILITIES.md merge=union
+
+# Driver+Reviewer evidence journals are append-only by definition.
+.test-evidence/*.md merge=union

@@ -1,0 +1,65 @@
+#
+# Test source/destination databases for local full-flow testing.
+# Adds a MySQL source + a dedicated PostgreSQL destination so you can run
+# a real batch pipeline end-to-end without touching prod data.
+#
+# Usage (layer on top of the local prod-mirror):
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.prod.yml \
+#     -f docker-compose.staging.yml \
+#     -f docker-compose.test-sources.yml \
+#     --env-file .env.staging \
+#     up -d
+#
+# Then seed test data:
+#   ./scripts/seed-test-data.sh
+
+name: rsync-ai
+
+services:
+  # ── MySQL source ────────────────────────────────────────────────────────────
+  # Simulates a real MySQL production database (orders, users, products tables).
+  mysql-source:
+    image: mysql:8.0
+    container_name: rsync-ai-mysql-source
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: testpassword
+      MYSQL_DATABASE: shop_db
+      MYSQL_USER: rsync
+      MYSQL_PASSWORD: rsyncpass
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_source_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "rsync", "-prsyncpass"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # ── PostgreSQL destination ──────────────────────────────────────────────────
+  # Separate from the control-plane postgres — acts as pipeline destination.
+  postgres-dest:
+    image: postgres:16-alpine
+    container_name: rsync-ai-postgres-dest
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: rsync
+      POSTGRES_PASSWORD: rsyncpass
+      POSTGRES_DB: dest_db
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_dest_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rsync -d dest_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  mysql_source_data:
+  postgres_dest_data:

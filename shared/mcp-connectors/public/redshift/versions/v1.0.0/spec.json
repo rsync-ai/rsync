@@ -1,0 +1,45 @@
+{
+  "name": "redshift",
+  "display_name": "Amazon Redshift",
+  "aliases": ["redshift", "amazon-redshift", "aws-redshift"],
+  "version": "1.0.0",
+  "description": "Amazon Redshift batch source + destination (PostgreSQL-wire data warehouse).",
+  "category": "relational_db",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "base_url": "http://localhost:9999",
+  "default_port": 5439,
+  "connection_timeout": 30,
+  "auth": {
+    "type": "basic",
+    "username_env": "REDSHIFT_USER",
+    "password_env": "REDSHIFT_PASSWORD"
+  },
+  "config_fields": [
+    {"name": "host", "type": "string", "required": true, "secret": false, "description": "Redshift cluster endpoint", "env_var": "REDSHIFT_HOST", "ui_placeholder": "my-cluster.xxxx.us-east-1.redshift.amazonaws.com"},
+    {"name": "port", "type": "integer", "required": true, "secret": false, "default": 5439, "description": "Cluster port", "env_var": "REDSHIFT_PORT"},
+    {"name": "database", "type": "string", "required": true, "secret": false, "description": "Database name", "env_var": "REDSHIFT_DATABASE"},
+    {"name": "user", "type": "string", "required": true, "secret": false, "description": "Database user", "env_var": "REDSHIFT_USER"},
+    {"name": "password", "type": "string", "required": true, "secret": true, "sensitive": true, "description": "Database password", "env_var": "REDSHIFT_PASSWORD"},
+    {"name": "schema", "type": "string", "required": false, "secret": false, "default": "public", "description": "Default schema for unqualified tables", "env_var": "REDSHIFT_SCHEMA"},
+    {"name": "sslmode", "type": "string", "required": false, "secret": false, "default": "require", "description": "psycopg2 sslmode (Redshift requires TLS)", "env_var": "REDSHIFT_SSLMODE"},
+    {"name": "iam_role", "type": "string", "required": false, "secret": false, "description": "IAM role ARN for COPY-from-S3 (dormant in v1.0.0)", "env_var": "REDSHIFT_IAM_ROLE"},
+    {"name": "s3_bucket", "type": "string", "required": false, "secret": false, "description": "S3 staging bucket for COPY-from-S3 (dormant in v1.0.0)", "env_var": "REDSHIFT_S3_BUCKET"},
+    {"name": "region", "type": "string", "required": false, "secret": false, "description": "AWS region for COPY-from-S3 (dormant in v1.0.0)", "env_var": "REDSHIFT_REGION"}
+  ],
+  "resources": [
+    {
+      "name": "health",
+      "endpoint": "/health",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": ["get"]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

@@ -1,0 +1,185 @@
+{
+  "namespace": "com.rsync.pipeline",
+  "type": "record",
+  "name": "PipelineRequest",
+  "doc": "Request to execute a data pipeline between source and destination",
+  "fields": [
+    {
+      "name": "trace_id",
+      "type": "string",
+      "doc": "Unique trace ID for distributed tracing"
+    },
+    {
+      "name": "pipeline_id",
+      "type": "string",
+      "doc": "Unique pipeline identifier"
+    },
+    {
+      "name": "pipeline_name",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Human-readable pipeline name"
+    },
+    {
+      "name": "source",
+      "type": {
+        "type": "record",
+        "name": "ConnectionRef",
+        "doc": "Reference to a connection",
+        "fields": [
+          {
+            "name": "connection_id",
+            "type": "string",
+            "doc": "Connection UUID"
+          },
+          {
+            "name": "connector_type",
+            "type": "string",
+            "doc": "MCP connector type (mysql, postgresql, stripe, etc.)"
+          },
+          {
+            "name": "config",
+            "type": ["null", {
+              "type": "map",
+              "values": "string"
+            }],
+            "default": null,
+            "doc": "Optional connection config overrides"
+          }
+        ]
+      },
+      "doc": "Source connection reference"
+    },
+    {
+      "name": "destination",
+      "type": "ConnectionRef",
+      "doc": "Destination connection reference"
+    },
+    {
+      "name": "sync_mode",
+      "type": {
+        "type": "enum",
+        "name": "SyncMode",
+        "symbols": ["FULL", "INCREMENTAL", "CDC", "APPEND", "UPSERT"]
+      },
+      "default": "FULL",
+      "doc": "Data synchronization mode"
+    },
+    {
+      "name": "entities",
+      "type": ["null", {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "EntitySelection",
+          "fields": [
+            {
+              "name": "name",
+              "type": "string",
+              "doc": "Entity name (table, collection, etc.)"
+            },
+            {
+              "name": "namespace",
+              "type": ["null", "string"],
+              "default": null,
+              "doc": "Namespace (schema, database, bucket prefix)"
+            },
+            {
+              "name": "filter",
+              "type": ["null", "string"],
+              "default": null,
+              "doc": "Optional filter expression"
+            },
+            {
+              "name": "columns",
+              "type": ["null", {
+                "type": "array",
+                "items": "string"
+              }],
+              "default": null,
+              "doc": "Column selection (null = all)"
+            }
+          ]
+        }
+      }],
+      "default": null,
+      "doc": "Specific entities to sync (null = all)"
+    },
+    {
+      "name": "pii_handling",
+      "type": ["null", {
+        "type": "record",
+        "name": "PIIConfig",
+        "fields": [
+          {
+            "name": "mode",
+            "type": {
+              "type": "enum",
+              "name": "PIIMode",
+              "symbols": ["NONE", "DETECT", "MASK", "HASH", "ENCRYPT", "REDACT"]
+            },
+            "default": "NONE"
+          },
+          {
+            "name": "fields",
+            "type": ["null", {
+              "type": "array",
+              "items": "string"
+            }],
+            "default": null,
+            "doc": "Specific fields to apply PII handling"
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "PII handling configuration"
+    },
+    {
+      "name": "schedule",
+      "type": ["null", {
+        "type": "record",
+        "name": "Schedule",
+        "fields": [
+          {
+            "name": "cron",
+            "type": ["null", "string"],
+            "default": null
+          },
+          {
+            "name": "interval_minutes",
+            "type": ["null", "int"],
+            "default": null
+          },
+          {
+            "name": "timezone",
+            "type": "string",
+            "default": "UTC"
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "Scheduling configuration"
+    },
+    {
+      "name": "metadata",
+      "type": ["null", {
+        "type": "map",
+        "values": "string"
+      }],
+      "default": null,
+      "doc": "Additional metadata"
+    },
+    {
+      "name": "created_at",
+      "type": "long",
+      "logicalType": "timestamp-millis",
+      "doc": "Request creation timestamp"
+    },
+    {
+      "name": "user_id",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "User who initiated the request"
+    }
+  ]
+}

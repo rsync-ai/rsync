@@ -1,0 +1,19 @@
+# Requirements for Azure Blob Storage connector (hand-built)
+# base_connector.py is provided from the shared location; rsync_protocol via COPY --from=shared
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Cloud storage SDK
+azure-storage-blob>=12.19.0
+
+# Blob (raw-bytes passthrough) DESTINATION needs the claim-check staging client,
+# which is always S3/MinIO (base_connector._get_staging_client → boto3) regardless
+# of the dest provider — so an azure-blob blob dest must read the staged bytes via
+# boto3. Without it, _read_blob_from_staging fails loud ("missing staging client").
+boto3>=1.26.0
+
+# Source file-format parsing (parquet)
+pyarrow>=14.0.0

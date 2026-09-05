@@ -1,0 +1,28 @@
+# Auto-generated requirements for AWS S3 connector
+# Generated: 2026-01-04T09:11:05.997512
+
+# Base dependencies (always required)
+# Note: base_connector.py is expected from parent directory
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+
+
+
+# Cloud storage SDKs
+boto3>=1.26.0                   # For S3-compatible storage
+
+
+
+# Connector-specific dependencies
+boto3
+fastavro>=1.8.0
+lz4>=4.3.0
+openpyxl>=3.1.0
+pyarrow>=14.0.0
+python-snappy>=0.6.0
+zstandard>=0.21.0
+

@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-01-04T08:50:40.580060",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-01-04T08:50:40.580149",
+      "changes": [
+        "Generated connector"
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

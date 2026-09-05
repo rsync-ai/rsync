@@ -1,0 +1,32 @@
+# Issue-template chooser configuration.
+#
+# blank_issues_enabled: false removes the "Open a blank issue" escape hatch, so
+# every new issue arrives through the bug-report or feature-request template.
+#
+# NOTE FOR MAINTAINERS: GitHub Discussions is DISABLED on this repository. There
+# is deliberately no Discussions contact link below, because a link to a disabled
+# Discussions tab 404s. Enable Discussions in Settings -> General -> Features,
+# then add the entry kept commented out at the bottom of this file.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Documentation
+    url: https://github.com/rsync-ai/rsync/blob/main/docs/README.md
+    about: Install, configuration, deployment, the connector reference and the API reference. Most questions are answered here.
+
+  - name: Getting help
+    url: https://github.com/rsync-ai/rsync/blob/main/SUPPORT.md
+    about: Where to take each kind of question, and what makes a bug report actionable.
+
+  - name: Report a security vulnerability
+    url: https://github.com/rsync-ai/rsync/blob/main/SECURITY.md
+    about: Do NOT open a public issue. Report privately so a fix can ship before the details are public.
+
+  - name: Contributing and development setup
+    url: https://github.com/rsync-ai/rsync/blob/main/CONTRIBUTING.md
+    about: Local dev environment, running the test suites, the DCO sign-off, and the pull request process.
+
+# Add once Discussions is enabled (see the note above):
+#  - name: Questions and ideas
+#    url: https://github.com/rsync-ai/rsync/discussions
+#    about: Ask a question or float an idea before it becomes an issue.

@@ -1,0 +1,213 @@
+{
+  "namespace": "com.rsync.mcp",
+  "type": "record",
+  "name": "MCPMessage",
+  "doc": "Generic MCP connector message for batch and streaming operations",
+  "fields": [
+    {
+      "name": "trace_id",
+      "type": "string",
+      "doc": "Distributed trace identifier"
+    },
+    {
+      "name": "message_id",
+      "type": "string",
+      "doc": "Unique message identifier"
+    },
+    {
+      "name": "pipeline_id",
+      "type": "string",
+      "doc": "Pipeline identifier"
+    },
+    {
+      "name": "connection_id",
+      "type": "string",
+      "doc": "Connection identifier"
+    },
+    {
+      "name": "connector_type",
+      "type": "string",
+      "doc": "MCP connector type"
+    },
+    {
+      "name": "connector_category",
+      "type": {
+        "type": "enum",
+        "name": "ConnectorCategory",
+        "symbols": ["DATABASE", "CLOUD_STORAGE", "DATA_WAREHOUSE", "STREAMING", "API", "FILE", "CDC"]
+      },
+      "doc": "Category of the connector"
+    },
+    {
+      "name": "operation",
+      "type": {
+        "type": "enum",
+        "name": "MCPOperation",
+        "symbols": [
+          "EXTRACT",
+          "LOAD",
+          "QUERY",
+          "WRITE",
+          "UPSERT",
+          "DELETE",
+          "SCHEMA_DISCOVERY",
+          "TEST_CONNECTION",
+          "STREAM_START",
+          "STREAM_STOP"
+        ]
+      },
+      "doc": "MCP operation type"
+    },
+    {
+      "name": "entity",
+      "type": ["null", {
+        "type": "record",
+        "name": "EntityReference",
+        "fields": [
+          {
+            "name": "namespace",
+            "type": ["null", "string"],
+            "default": null
+          },
+          {
+            "name": "name",
+            "type": "string"
+          },
+          {
+            "name": "alias",
+            "type": ["null", "string"],
+            "default": null
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "Target entity reference"
+    },
+    {
+      "name": "partition_key",
+      "type": "string",
+      "doc": "Partition key for Kafka routing"
+    },
+    {
+      "name": "batch_info",
+      "type": ["null", {
+        "type": "record",
+        "name": "BatchInfo",
+        "fields": [
+          {
+            "name": "batch_id",
+            "type": "string"
+          },
+          {
+            "name": "batch_index",
+            "type": "int",
+            "doc": "Index within the batch sequence"
+          },
+          {
+            "name": "batch_total",
+            "type": ["null", "int"],
+            "default": null,
+            "doc": "Total batches (null if unknown/streaming)"
+          },
+          {
+            "name": "record_count",
+            "type": "int",
+            "doc": "Number of records in this batch"
+          },
+          {
+            "name": "is_first",
+            "type": "boolean",
+            "default": false
+          },
+          {
+            "name": "is_last",
+            "type": "boolean",
+            "default": false
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "Batch metadata for chunked operations"
+    },
+    {
+      "name": "records",
+      "type": ["null", "bytes"],
+      "default": null,
+      "doc": "Serialized records (Avro array or JSON bytes)"
+    },
+    {
+      "name": "record_schema",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Schema reference for records payload"
+    },
+    {
+      "name": "record_count",
+      "type": "int",
+      "default": 0,
+      "doc": "Number of records in this message"
+    },
+    {
+      "name": "config",
+      "type": ["null", {
+        "type": "map",
+        "values": "string"
+      }],
+      "default": null,
+      "doc": "Operation-specific configuration"
+    },
+    {
+      "name": "filters",
+      "type": ["null", {
+        "type": "array",
+        "items": {
+          "type": "record",
+          "name": "Filter",
+          "fields": [
+            {
+              "name": "field",
+              "type": "string"
+            },
+            {
+              "name": "operator",
+              "type": {
+                "type": "enum",
+                "name": "FilterOperator",
+                "symbols": ["EQ", "NE", "GT", "GTE", "LT", "LTE", "IN", "NOT_IN", "LIKE", "IS_NULL", "IS_NOT_NULL"]
+              }
+            },
+            {
+              "name": "value",
+              "type": ["null", "string"],
+              "default": null
+            }
+          ]
+        }
+      }],
+      "default": null,
+      "doc": "Filters to apply"
+    },
+    {
+      "name": "timestamp",
+      "type": "long",
+      "logicalType": "timestamp-millis",
+      "doc": "Message timestamp"
+    },
+    {
+      "name": "watermark",
+      "type": ["null", "long"],
+      "default": null,
+      "logicalType": "timestamp-millis",
+      "doc": "Event-time watermark for streaming"
+    },
+    {
+      "name": "metadata",
+      "type": ["null", {
+        "type": "map",
+        "values": "string"
+      }],
+      "default": null,
+      "doc": "Additional metadata"
+    }
+  ]
+}

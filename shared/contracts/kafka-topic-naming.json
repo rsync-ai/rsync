@@ -1,0 +1,152 @@
+{
+  "_comment": [
+    "Cross-language contract for Kafka topic naming. THREE implementations must",
+    "agree on this table:",
+    "  - shared/go/kafkaclient/topics.go            (orchestrator, api-gateway, adapter, sink)",
+    "  - llm-service/src/utils/kafka_topics.py      (planner, PII scanner)",
+    "  - shared/mcp-connectors/internal/debezium/versions/v1.0.0/connector.py",
+    "They are separate copies because they ship in different images with",
+    "different paths. A divergence between them does not raise: the producer",
+    "writes one name, the consumer subscribes to another, and the pipeline",
+    "simply goes quiet. Each language's test suite reads this file, so drifting",
+    "one implementation reddens that language's build.",
+    "Adding a case here is the intended way to pin new behavior.",
+    "",
+    "The rsync.-spelled inputs below are the ones worth reading twice. Five topics",
+    "spell the product name in the literal itself (rsync.notifications,",
+    "rsync.healer.{actions,results,approved-changes,schema-changes}). At the default",
+    "prefix, qualifying one is a no-op -- it already starts with rsync. -- so a call",
+    "site that forgot to qualify is indistinguishable from one that did. Under a",
+    "customer prefix the two diverge: acme.rsync.notifications vs rsync.notifications.",
+    "That is a real production defect (see api-gateway notifier + schema_evolution),",
+    "and it is invisible to every test that runs at the default prefix, so the",
+    "custom-prefix rows are pinned here rather than left to each implementation."
+  ],
+  "cases": [
+    {
+      "prefix": null,
+      "input": "agent.planner.requests",
+      "want": "rsync.agent.planner.requests"
+    },
+    {
+      "prefix": null,
+      "input": "cdc-abc12345",
+      "want": "rsync.cdc-abc12345"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "pipeline.abc12345.data",
+      "want": "rsync.pipeline.abc12345.data"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "pipeline.abc12345.data.dlq",
+      "want": "rsync.pipeline.abc12345.data.dlq"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "cdc.abc12345",
+      "want": "rsync.cdc.abc12345"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "pii.scan.request",
+      "want": "rsync.pii.scan.request"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "schemahistory.cdc-abc12345",
+      "want": "rsync.schemahistory.cdc-abc12345"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "signals.abc12345",
+      "want": "rsync.signals.abc12345"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "rsync.healer.schema-changes",
+      "want": "rsync.healer.schema-changes"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "rsync.cdc.abc12345",
+      "want": "rsync.cdc.abc12345"
+    },
+    {
+      "prefix": "rsync.",
+      "input": "",
+      "want": ""
+    },
+    {
+      "prefix": "rsync.",
+      "input": "   ",
+      "want": ""
+    },
+    {
+      "prefix": "",
+      "input": "cdc.abc12345",
+      "want": "cdc.abc12345"
+    },
+    {
+      "prefix": "",
+      "input": "agent.planner.requests",
+      "want": "agent.planner.requests"
+    },
+    {
+      "prefix": "rsync",
+      "input": "agent.x",
+      "want": "rsync.agent.x"
+    },
+    {
+      "prefix": "acme-",
+      "input": "cdc.abc12345",
+      "want": "acme-cdc.abc12345"
+    },
+    {
+      "prefix": "acme_",
+      "input": "cdc.abc12345",
+      "want": "acme_cdc.abc12345"
+    },
+    {
+      "prefix": "rs ync/co:rp",
+      "input": "cdc.x",
+      "want": "rsynccorp.cdc.x"
+    },
+    {
+      "prefix": "///",
+      "input": "cdc.x",
+      "want": "cdc.x"
+    },
+    {
+      "prefix": "acme.",
+      "input": "rsync.notifications",
+      "want": "acme.rsync.notifications"
+    },
+    {
+      "prefix": "acme.",
+      "input": "rsync.healer.actions",
+      "want": "acme.rsync.healer.actions"
+    },
+    {
+      "prefix": "acme.",
+      "input": "rsync.healer.approved-changes",
+      "want": "acme.rsync.healer.approved-changes"
+    },
+    {
+      "prefix": "acme",
+      "input": "rsync.healer.results",
+      "want": "acme.rsync.healer.results"
+    },
+    {
+      "prefix": "",
+      "input": "rsync.notifications",
+      "want": "rsync.notifications"
+    },
+    {
+      "prefix": "acme.",
+      "input": "acme.rsync.notifications",
+      "want": "acme.rsync.notifications"
+    }
+  ]
+}

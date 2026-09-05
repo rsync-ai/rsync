@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-07-03T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-07-03T00:00:00.000000",
+      "changes": [
+        "Initial Amazon Redshift connector (DB-API via psycopg2, port 5439): batch source + destination. Optimized reads (keyset/offset pagination). Optimized writes (batched multi-row INSERT). Flag-gated COPY-from-S3 dormant. Redshift-correct upsert (stage/DELETE USING/INSERT SELECT, no ON CONFLICT)."
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

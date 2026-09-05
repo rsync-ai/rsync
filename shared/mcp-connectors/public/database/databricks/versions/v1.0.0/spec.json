@@ -1,0 +1,39 @@
+{
+  "name": "databricks",
+  "display_name": "Databricks",
+  "aliases": ["databricks", "databricks-sql", "databricks-lakehouse"],
+  "version": "1.0.0",
+  "description": "Databricks batch source + destination (SQL warehouse / Lakehouse, DB-API).",
+  "category": "data_warehouse",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "base_url": "http://localhost:9999",
+  "default_port": 443,
+  "connection_timeout": 30,
+  "auth": {
+    "type": "api_key",
+    "token_env": "DATABRICKS_ACCESS_TOKEN"
+  },
+  "config_fields": [
+    {"name": "server_hostname", "type": "string", "required": true, "secret": false, "description": "SQL warehouse host", "env_var": "DATABRICKS_SERVER_HOSTNAME", "ui_placeholder": "dbc-xxxx.cloud.databricks.com"},
+    {"name": "http_path", "type": "string", "required": true, "secret": false, "description": "SQL warehouse HTTP path", "env_var": "DATABRICKS_HTTP_PATH", "ui_placeholder": "/sql/1.0/warehouses/abc123"},
+    {"name": "access_token", "type": "string", "required": true, "secret": true, "sensitive": true, "description": "Databricks Personal Access Token (PAT)", "env_var": "DATABRICKS_ACCESS_TOKEN"},
+    {"name": "catalog", "type": "string", "required": false, "secret": false, "description": "Unity Catalog catalog", "env_var": "DATABRICKS_CATALOG"},
+    {"name": "schema", "type": "string", "required": false, "secret": false, "default": "default", "description": "Default schema for unqualified tables", "env_var": "DATABRICKS_SCHEMA"}
+  ],
+  "resources": [
+    {
+      "name": "health",
+      "endpoint": "/health",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": ["get"]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

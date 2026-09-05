@@ -1,0 +1,36 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bring-your-own Kafka — drop the bundled broker.
+#
+#   docker compose -f docker-compose.quickstart.yml -f docker-compose.byo-kafka.yml up -d
+#
+# Requires KAFKA_BROKERS to point at your cluster, e.g. in .env:
+#   KAFKA_BROKERS=b-1.mycluster.kafka.us-east-1.amazonaws.com:9092
+#
+# Without this overlay the app tier already honours KAFKA_BROKERS — but the
+# bundled `kafka` service still started and still held its 1 GB mem_limit, so a
+# BYO deployment paid for a broker nothing talked to.
+#
+# ── How the removal works, and why it is spelled this way ────────────────────
+# Compose overlays merge; they cannot delete a service. Assigning a profile that
+# is never activated is the supported way to exclude one, because a service in a
+# non-active profile is absent from the rendered project entirely.
+#
+# That half alone is a trap. A service excluded by profile is still named by
+# `depends_on` in the base file, and Compose rejects the whole project with
+# "depends on undefined service kafka" — nothing starts, which is strictly worse
+# than the waste this overlay removes. The pairing fix lives in the base file:
+# every `depends_on: kafka` there carries `required: false`. Both halves are
+# needed; either one alone takes the stack down.
+#
+# ── What still runs ──────────────────────────────────────────────────────────
+# `kafka-init` is deliberately NOT excluded. It creates the prefixed topics with
+# the KAFKA_REPLICATION_FACTOR / KAFKA_MIN_INSYNC_REPLICAS you set, which is
+# exactly what a real multi-broker cluster needs (RF=1 topics go unavailable
+# during routine rolling maintenance). If your cluster's ACLs forbid topic
+# creation, create them out of band and add `kafka-init` to this file the same
+# way `kafka` is handled below. See docs/deployment/kafka-acls.md.
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  kafka:
+    # Never activated => the bundled broker is excluded from the project.
+    profiles: ["bundled-broker-disabled"]

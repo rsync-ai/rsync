@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-07-04T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-07-04T00:00:00.000000",
+      "changes": [
+        "SQL Server connector (pyodbc): test_connection, discover_schema (sys catalogs), keyset/offset export with SQL Server pagination (OFFSET/FETCH, TOP), Azure-aware TLS (Encrypt/TrustServerCertificate). Batch source + CDC via Debezium."
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

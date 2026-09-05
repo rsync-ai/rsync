@@ -1,0 +1,246 @@
+{{- if .Values.apiGateway.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-api-gateway
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api-gateway
+spec:
+  type: {{ .Values.apiGateway.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.apiGateway.service.port }}
+      targetPort: http
+  selector:
+    {{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api-gateway
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-api-gateway
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api-gateway
+spec:
+  {{- if not .Values.apiGateway.autoscaling.enabled }}
+  replicas: {{ .Values.apiGateway.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api-gateway
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api-gateway
+        {{- with .Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        # Roll the pods when the Secret changes. Without this a rotated
+        # ENCRYPTION_KEY or JWT_SECRET sits in the Secret while every running
+        # pod keeps serving with the old one, and the rollout looks successful.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      initContainers:
+        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.apiGateway.image) | nindent 8 }}
+        {{- /*
+        The gateway needs the connector catalog on its OWN filesystem, not just
+        the orchestrator's. POST /api/v1/pipelines runs a CapabilityAgent
+        preflight that answers "is this connector installed?" by stat-ing
+        <TOOLS_DIR>/public/<id>/latest.json (api-gateway/internal/handlers/
+        preflight_pipeline.go:46-88) -- a local directory read, not a call to
+        the orchestrator or a database lookup.
+        Without this the directory does not exist, connectorExistsOnDisk()
+        returns false for EVERY connector, and every pipeline create fails 422
+        preflight_hitl_required / generate_connector -- including for connectors
+        whose pod is Running and whose connection just passed its live test.
+        On compose this is invisible: the catalog arrives as a bind mount.
+        */}}
+        {{- include "rsync-ai.catalogInitContainer" . | nindent 8 }}
+      containers:
+        - name: api-gateway
+          image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.apiGateway.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            {{- include "rsync-ai.commonEnv" . | nindent 12 }}
+            {{- include "rsync-ai.postgresEnv" . | nindent 12 }}
+            {{- include "rsync-ai.redisEnv" . | nindent 12 }}
+            {{- include "rsync-ai.cryptoEnv" . | nindent 12 }}
+            {{- include "rsync-ai.kafkaEnv" . | nindent 12 }}
+            # Assembled in the container from the vars above rather than
+            # rendered by Helm, so the Postgres password is never written into
+            # the Deployment manifest — `kubectl get deploy -o yaml` is readable
+            # by anyone with get on Deployments, which is a much wider set than
+            # get on Secrets. $(VAR) expansion only resolves names declared
+            # EARLIER in this same list, which is why the postgres block is
+            # included above.
+            #
+            # A password containing '@', ':' or '/' will break this URL. Those
+            # need percent-encoding in `secrets.postgresPassword`; the chart
+            # cannot encode it here because the value is only known inside the
+            # container.
+            - name: DATABASE_URL
+              value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode={{ include "rsync-ai.postgres.sslmode" . }}"
+            - name: TEMPORAL_ADDRESS
+              value: {{ include "rsync-ai.temporal.address" . | quote }}
+            # Both names are read in different call paths; setting one and not
+            # the other leaves half the gateway pointing at nothing.
+            - name: ORCHESTRATOR_URL
+              value: "http://{{ $fullname }}-orchestrator:{{ .Values.orchestrator.service.port }}"
+            - name: AGENT_ORCHESTRATOR_URL
+              value: "http://{{ $fullname }}-orchestrator:{{ .Values.orchestrator.service.port }}"
+            {{- if .Values.generation.enabled }}
+            - name: TOOL_GENERATOR_URL
+              value: "http://{{ $fullname }}-tool-generator:5010"
+            {{- end }}
+            # CSRF double-submit. Never turn this off: the session cookie is
+            # httpOnly and same-site, so without the header check every
+            # authenticated write is reachable cross-origin.
+            - name: RSYNC_CSRF_ENFORCE
+              value: "true"
+            # Blocks pipelines from targeting the platform's OWN internal
+            # connectors (minio-mcp, the sink, debezium) as user destinations.
+            - name: RSYNC_ALLOW_INTERNAL_CONNECTORS
+              value: "false"
+            # Self-host installs have no Stripe and no cloud plans. Left unset
+            # this defaults to ENFORCED (plan_quota.go billingEnforced()) and
+            # migration 060 seeds a 14-day 1-pipeline trial with no upgrade
+            # path — i.e. a fresh install that bricks itself after two weeks.
+            # This is a billing feature flag, not an edition gate; the default
+            # in the code stays the cloud behaviour and only this deployment
+            # artifact opts out, exactly as docker-compose.quickstart.yml does.
+            - name: RSYNC_BILLING_ENFORCED
+              value: {{ .Values.apiGateway.billingEnforced | default false | quote }}
+            {{- if .Values.demo.enabled }}
+            # Zero-credential try-it path. Unset -- the default, and what cloud
+            # does -- makes the /demo endpoints report unavailable and the
+            # dashboard's "Start with sample data" offer never render. This is a
+            # feature flag defaulting to the cloud behaviour, not an edition
+            # gate; demo.go reads nothing but this variable.
+            #
+            # Assembled in the container from the var below rather than rendered
+            # by Helm, for the same reason as DATABASE_URL above: a plain value:
+            # would write the password into the Deployment manifest, which is
+            # readable by anyone with get on Deployments. $(VAR) only resolves
+            # names declared EARLIER in this list, hence the ordering.
+            #
+            # A password containing '@', ':' or '/' will break this URL and has
+            # to be percent-encoded in secrets.demoWarehousePassword -- the chart
+            # cannot encode it here because the value is only known inside the
+            # container.
+            - name: DEMO_WAREHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: DEMO_WAREHOUSE_PASSWORD
+            - name: RSYNC_DEMO_DESTINATION_DSN
+              value: "postgres://{{ .Values.demo.username }}:$(DEMO_WAREHOUSE_PASSWORD)@{{ $fullname }}-demo-warehouse:5432/{{ .Values.demo.database }}"
+            {{- end }}
+            # Only true behind a Cloudflare tunnel. When true the gateway trusts
+            # CF-Connecting-IP for rate limiting, so turning it on without
+            # Cloudflare in front lets a client spoof its own rate-limit key.
+            - name: RSYNC_TRUST_CLOUDFLARE
+              value: {{ .Values.apiGateway.trustCloudflare | quote }}
+            - name: SIGNOZ_LOGS_ENRICH
+              value: "false"
+            - name: RSYNC_ADMIN_EMAILS
+              value: {{ .Values.apiGateway.adminEmails | quote }}
+            - name: FRONTEND_URL
+              value: {{ .Values.frontend.publicUrl | quote }}
+            # CORS fails closed and has no wildcard branch. Empty here means the
+            # browser gets no Access-Control-Allow-Origin at all, which reads as
+            # "the API is down" from the app.
+            - name: RSYNC_CORS_ORIGINS
+              value: {{ .Values.apiGateway.corsOrigins | default .Values.frontend.publicUrl | quote }}
+            {{- if .Values.apiGateway.oauthCallbackUrl }}
+            - name: OAUTH_CALLBACK_URL
+              value: {{ .Values.apiGateway.oauthCallbackUrl | quote }}
+            {{- end }}
+            {{- range $k, $v := .Values.secrets.oauth }}
+            - name: {{ $k }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" $ }}
+                  key: {{ $k }}
+                  optional: true
+            {{- end }}
+            # Read by connectorsRoot() (preflight_pipeline.go:46). Set
+            # explicitly rather than relying on the /app/shared/mcp-connectors
+            # default so the mountPath below and the code agree in one place.
+            - name: TOOLS_DIR
+              value: /app/shared/mcp-connectors
+          volumeMounts:
+            - name: connector-catalog
+              mountPath: /app/shared/mcp-connectors
+            {{- include "rsync-ai.kafkaTLSVolumeMount" . | nindent 12 }}
+          startupProbe:
+            # The listener binds late on a cold boot: db.Init now retries for up
+            # to DB_CONNECT_TIMEOUT (60s) and the Temporal dial for another 60s
+            # before the HTTP server starts. A startupProbe is what keeps the
+            # liveness probe below from reaching its threshold and restarting a
+            # pod that was only ever waiting on its dependencies. /health is the
+            # right target here -- the question is "has it bound yet", nothing more.
+            httpGet: { path: /health, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 30
+          readinessProbe:
+            # /ready, not /health. /health is a static literal
+            # (api-gateway/cmd/server/main.go:602) and cannot fail for the reason
+            # that matters, so pointing readiness at it marked DB-dead replicas
+            # Ready. /ready pings the pool AND asserts migrations were applied --
+            # both halves are needed: a gateway that loses the boot race against
+            # Postgres ends up with a pool that pings and a schema that is empty.
+            httpGet: { path: /ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            # Deliberately still the static /health. A database outage must drain
+            # traffic from replicas (readiness), not restart all of them: a
+            # restart cannot reach an unreachable Postgres, and the crash-loop
+            # only makes recovery slower.
+            httpGet: { path: /health, port: http }
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.apiGateway.resources | nindent 12 }}
+      volumes:
+        {{- include "rsync-ai.catalogVolume" . | nindent 8 }}
+        {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
+{{- if .Values.apiGateway.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $fullname }}-api-gateway
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api-gateway
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $fullname }}-api-gateway
+  minReplicas: {{ .Values.apiGateway.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.apiGateway.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.apiGateway.autoscaling.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- end }}

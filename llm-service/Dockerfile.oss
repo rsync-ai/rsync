@@ -1,0 +1,63 @@
+# OSS / community connector-lifecycle image.
+#
+# Built from the SAME ./llm-service source tree as the private Dockerfile, but with an
+# ALLOWLIST copy: only the moat-free lifecycle modules are baked in. The connector-
+# generation package (src/agents/tool_generator/agents, .../config, discovery_routes,
+# oauth), the LLM gateway (src/gateway) and the planner are NEVER COPY'd, so the curated
+# moat (vendor_apis.yaml / auth_rules.yaml / capability_rules.yaml / learned_apis.jsonl)
+# cannot end up in any image layer.
+#
+# Proven moat-free by scripts/oss-leak-proof-test.sh (find + layer audit + import-closure).
+FROM python:3.11-slim
+
+# Docker CLI + buildx — REQUIRED: /v1/deploy JIT-builds connector images by shelling out to
+# `docker build` with BuildKit named contexts (--build-context shared=...). Same block as the
+# private Dockerfile; the moat is NOT here, this is generic build tooling.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    ca-certificates \
+    gnupg \
+    && install -m 0755 -d /etc/apt/keyrings \
+    && curl -fsSL https://download.docker.com/linux/debian/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg \
+    && chmod a+r /etc/apt/keyrings/docker.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian bookworm stable" \
+       > /etc/apt/sources.list.d/docker.list \
+    && apt-get update && apt-get install -y --no-install-recommends docker-ce-cli docker-buildx-plugin \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Non-root user; docker group so it can reach a mounted socket (override group id at runtime
+# with `--group-add $(stat -c '%g' /var/run/docker.sock)` if the host GID differs).
+RUN groupadd -g 999 docker 2>/dev/null || true \
+    && useradd -m -u 1000 -G docker appuser
+
+WORKDIR /app
+
+# Slim dependency set — NO spaCy/Presidio/LLM libraries (see requirements-oss.txt).
+COPY requirements-oss.txt .
+RUN pip install --no-cache-dir -r requirements-oss.txt
+
+# ── ALLOWLIST COPY — moat-free modules ONLY ──────────────────────────────────────────
+# Package markers (all empty / import-safe).
+COPY src/__init__.py ./src/__init__.py
+COPY src/agents/__init__.py ./src/agents/__init__.py
+COPY src/agents/tool_generator/__init__.py ./src/agents/tool_generator/__init__.py
+# On-disk connector-path helpers (stdlib only).
+COPY src/utils/__init__.py ./src/utils/__init__.py
+COPY src/utils/connector_paths.py ./src/utils/connector_paths.py
+# The moat-free connector-lifecycle package: /v1/deploy handler + docker build/start service.
+COPY src/agents/tool_generator/deployment/ ./src/agents/tool_generator/deployment/
+# The OSS entrypoint.
+COPY src/lifecycle/ ./src/lifecycle/
+# NOTE: src/agents/tool_generator/{agents,config,schemas,generator,utils,validation,...},
+# src/agents/tool_generator/discovery_routes.py, src/gateway/, src/agents/planner/ and
+# prompts/ are INTENTIONALLY NOT copied. Do not add blanket `COPY src/ ./src/` here.
+
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+ENV PYTHONPATH=/app
+
+# Serves GET /health + POST /v1/deploy on PORT (default 5010).
+CMD ["python", "-m", "src.lifecycle.main"]

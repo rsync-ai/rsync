@@ -1,0 +1,11 @@
+# Google Sheets MCP connector dependencies
+
+# Base dependencies
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# HTTP client for the Sheets v4 REST API. httpx (sync mode) is already
+# used elsewhere in the platform and ships with sensible timeout
+# defaults; requests would also work but we standardise on httpx.
+httpx>=0.25.0

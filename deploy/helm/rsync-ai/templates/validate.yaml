@@ -1,0 +1,301 @@
+{{/*
+Fail-fast guards. These render nothing; they exist to turn a misconfiguration
+that would otherwise surface as a stuck pipeline into an install-time error.
+
+Each one is here because the failure it prevents is SILENT — the platform comes
+up healthy and then does not move rows. That is the failure mode this whole
+chart is written against, so it is worth spending a template on.
+*/}}
+
+{{- if .Values.connectorDeployer.enabled }}
+{{- fail "connectorDeployer.enabled=true is not supported on Kubernetes.\n\nThe connector-deployer builds and starts connector containers through the host\nDocker socket (connector-deployer/internal/dockerx/backend.go:111). There is no\nKubernetes backend for it, and mounting a node's Docker socket into a pod hands\nthat pod the node.\n\nDeclare the connectors your pipelines use under `connectors.fleet` instead. The\njust-in-time deploy path only fires when a connector's Service is MISSING, so a\ndeclared fleet never reaches it." }}
+{{- end }}
+
+{{/*
+The same privilege, reached through a different door. connectorDeployer above is
+the separate Go service; this is tool-generator building the image in-process.
+Both need /var/run/docker.sock, and this chart mounts one nowhere.
+
+It is a separate guard because it fails differently and worse. The deployer is
+absent, so its door is simply shut. Managed mode's door opens onto a drop: the
+build is dispatched detached (deployment/routes.py:146), so /v1/deploy answers
+200 with building:true before docker.from_env() has been tried; the orchestrator
+extends its poll on that flag and waits out the whole pre-flight timeout while
+the build has already failed with a WARNING (docker_builder.py:158). What the
+operator sees is a slow "not reachable -- check `docker compose logs`" on a
+cluster that has no compose in it.
+*/}}
+{{- if .Values.generation.toolGenerator.managedConnectors }}
+{{- fail "generation.toolGenerator.managedConnectors=true is not supported on Kubernetes.\n\nManaged mode lets tool-generator build a connector image and start its container\nitself. With DEPLOYER_URL unset -- which this chart guarantees -- DockerBuilder\ntakes the in-process path and calls docker.from_env()\n(llm-service/src/agents/tool_generator/deployment/docker_builder.py:154), so it\nneeds the host Docker socket in the tool-generator pod. Mounting one hands that\npod the node, which is the privilege connectorDeployer is absent to avoid.\n\nIt does not fail cleanly if you force it: the build runs as a detached task, so\n/v1/deploy returns success and the orchestrator waits out its full pre-flight\ntimeout before reporting the connector unreachable.\n\nLeave it false and declare the connectors your pipelines use under\n`connectors.fleet`. Generated connectors are a Docker-host feature; on\nKubernetes, build the connector image and add it to the fleet." }}
+{{- end }}
+
+{{/*
+min.insync.replicas > replication factor creates a topic that EXISTS and is
+permanently unwritable. Every produce fails with NOT_ENOUGH_REPLICAS, which the
+platform reports as a pipeline that dispatched rows and recorded no acks — it
+reads as an unreachable destination, not as a broker setting. Both values are
+strings here (empty = "let the platform decide"), so only compare when both are
+actually set.
+*/}}
+{{- if and .Values.kafka.minInsyncReplicas .Values.kafka.replicationFactor }}
+{{- $misr := .Values.kafka.minInsyncReplicas | int }}
+{{- $rf := .Values.kafka.replicationFactor | int }}
+{{- if gt $misr $rf }}
+{{- fail (printf "kafka.minInsyncReplicas (%d) exceeds kafka.replicationFactor (%d).\n\nA topic created with min.insync.replicas above its replication factor is created\nsuccessfully and can never be written to. The platform would come up healthy and\nevery pipeline would report 'dispatched N rows ... no acks were recorded'." $misr $rf) }}
+{{- end }}
+{{- end }}
+
+{{/*
+The in-chart broker is a single KRaft node. Anything above RF=1 is unsatisfiable
+there, and the platform's own clamp would quietly reduce it — but the clamp does
+NOT cover Kafka Connect's three internal topics, so a CDC install would fail at
+worker startup instead.
+*/}}
+{{- if and .Values.kafka.enabled .Values.kafka.replicationFactor }}
+{{- if gt (.Values.kafka.replicationFactor | int) 1 }}
+{{- fail (printf "kafka.replicationFactor=%v requires more than one broker.\n\nkafka.enabled=true runs a SINGLE-node KRaft broker. Set replicationFactor to \"\"\n(let the platform decide) or 1, or set kafka.enabled=false and point\nkafka.external.bootstrapServers at a real cluster." .Values.kafka.replicationFactor) }}
+{{- end }}
+{{- end }}
+
+{{/*
+The CDC plane is all-three-or-none: infra_preflight requires kafka-connect,
+debezium-mcp AND kafka-mcp-sink together before it will start a CDC run. The
+chart models them as one unit, so this only guards the BYO-Kafka combination
+that cannot work: Kafka Connect needs a bootstrap server it can reach.
+*/}}
+{{- if and .Values.connectors.cdc.enabled (not .Values.kafka.enabled) }}
+{{- if not .Values.kafka.external.bootstrapServers }}
+{{- fail "connectors.cdc.enabled=true with kafka.enabled=false requires kafka.external.bootstrapServers." }}
+{{- end }}
+{{- end }}
+
+{{/*
+The bundled demo warehouse has two prerequisites the operator cannot see, and
+both fail the way this file exists to prevent: the platform comes up healthy and
+the demo does not work.
+
+The fleet one is the important half. There is no just-in-time connector deploy on
+Kubernetes (see the connectorDeployer guard at the top of this file), so a
+`postgresql` connector with no Service does not error -- StartServer falls through
+to the stdio fallback, which pip-installs the connector inside the calling pod at
+runtime and needs PyPI egress to do it. What the operator sees is a demo that
+takes minutes and then fails on a cluster with no outbound internet, with nothing
+naming the fleet.
+*/}}
+{{- if .Values.demo.enabled }}
+{{- if not .Values.connectors.sampleData.enabled }}
+{{- fail "demo.enabled=true requires connectors.sampleData.enabled=true.\n\nThe demo needs both halves: sample-data is the only source a fresh install can\nconnect to without a credential, and the demo warehouse is where its rows land.\nA pipeline needs two steps, so half a demo produces no rows at all." }}
+{{- end }}
+{{- $hasPostgresqlConnector := false }}
+{{- range $c := .Values.connectors.fleet }}
+{{- if eq ($c.id | toString) "postgresql" }}
+{{- $hasPostgresqlConnector = true }}
+{{- end }}
+{{- end }}
+{{- if not $hasPostgresqlConnector }}
+{{- fail "demo.enabled=true requires a `postgresql` entry in connectors.fleet.\n\nThe demo warehouse is reached through the postgresql connector, and Kubernetes\nhas no just-in-time connector deploy: with no Service for it the platform falls\nback to a stdio subprocess that pip-installs the connector at runtime inside the\ncalling pod. Add:\n\n  connectors:\n    fleet:\n      - id: postgresql\n        version: v1.0.0\n        image: { repository: mcp-postgresql, tag: \"\" }" }}
+{{- end }}
+{{- if and (not .Values.secrets.existingSecret) (not .Values.secrets.demoWarehousePassword) }}
+{{- fail "demo.enabled=true requires secrets.demoWarehousePassword (or set secrets.existingSecret with a DEMO_WAREHOUSE_PASSWORD key). Generate with: openssl rand -base64 32\n\nDeliberately not secrets.postgresPassword. The demo warehouse is a destination\nevery workspace member can run SQL against; sharing the control-plane password\nwith it puts an offline crack of pg_authid between a member and the metadata\ndatabase." }}
+{{- end }}
+{{- end }}
+
+{{/*
+Browser-visible URLs. The frontend calls the API FROM THE BROWSER, so an
+in-cluster Service name will not do. Getting this wrong produces a UI that loads
+and then fails every request with a CORS or connection error.
+*/}}
+{{- if and .Values.ingress.enabled (not .Values.ingress.hosts.app) }}
+{{- fail "ingress.enabled=true requires ingress.hosts.app (the frontend hostname)." }}
+{{- end }}
+{{- if and .Values.ingress.enabled (not .Values.ingress.hosts.api) }}
+{{- fail "ingress.enabled=true requires ingress.hosts.api.\n\nThe frontend calls the API from the browser, so the API needs a routable\nexternal hostname of its own — an in-cluster Service name will not do." }}
+{{- end }}
+
+{{/*
+Secrets. The chart will happily render empty strings, and the services then fail
+in ways that do not name the cause: an empty ENCRYPTION_KEY makes every stored
+connection credential undecryptable, and an empty JWT_SECRET makes every session
+invalid on restart.
+*/}}
+{{- if not .Values.secrets.existingSecret }}
+{{- if not .Values.secrets.jwtSecret }}
+{{- fail "secrets.jwtSecret is required (or set secrets.existingSecret). Generate with: openssl rand -base64 32" }}
+{{- end }}
+{{- if not .Values.secrets.encryptionKey }}
+{{- fail "secrets.encryptionKey is required (or set secrets.existingSecret). Generate with: openssl rand -base64 32\n\nBACK THIS UP. It encrypts every stored connection credential; losing it makes\nevery saved connection permanently undecryptable." }}
+{{- end }}
+{{- if and .Values.postgresql.enabled (not .Values.secrets.postgresPassword) }}
+{{- fail "secrets.postgresPassword is required when postgresql.enabled=true (or set secrets.existingSecret)." }}
+{{- end }}
+{{- if and (eq .Values.objectStorage.mode "minio") (not .Values.secrets.minioAccessKey) }}
+{{- fail "secrets.minioAccessKey is required when objectStorage.mode=minio (or set secrets.existingSecret). Generate with: openssl rand -hex 16" }}
+{{- end }}
+{{- if and (eq .Values.objectStorage.mode "minio") (not .Values.secrets.minioSecretKey) }}
+{{- fail "secrets.minioSecretKey is required when objectStorage.mode=minio (or set secrets.existingSecret). Generate with: openssl rand -base64 32" }}
+{{- end }}
+{{- end }}
+
+{{/*
+SASL credentials the platform will never present.
+
+kafka.external.securityProtocol decides whether this client authenticates at
+all. Set it to PLAINTEXT (the default) with a username and password filled in
+and the credentials are simply discarded: the client connects as an anonymous
+user, and a broker without ACLs accepts that connection. Nothing errors, and the
+operator who supplied the credentials has no way to tell they are unused.
+
+The chart can produce this by itself, which is why it is a guard and not a note:
+_helpers.tpl only emits KAFKA_SASL_USERNAME/PASSWORD when saslMechanism is set,
+so a username and password on their own reach no container at all.
+
+The Go client warns about this at startup too (shared/go/kafkaclient
+Config.ignoredSASLSettings), deliberately without failing — an upgrade must not
+break a running deployment with stray variables set. A fresh install has no such
+constraint, so this one is fatal.
+*/}}
+{{- if not .Values.kafka.enabled }}
+{{- $ext := .Values.kafka.external }}
+{{- $proto := $ext.securityProtocol | default "PLAINTEXT" | upper }}
+{{- $isSASL := or (eq $proto "SASL_PLAINTEXT") (eq $proto "SASL_SSL") }}
+{{- $oauth := $ext.oauth | default dict }}
+{{- $isToken := include "rsync-ai.kafka.isTokenMechanism" . }}
+{{- if and (or $ext.saslMechanism $ext.saslUsername $ext.saslPassword $oauth.tokenEndpoint $oauth.clientId $oauth.clientSecret) (not $isSASL) }}
+{{- fail (printf "kafka.external.securityProtocol=%s does not authenticate, but kafka.external SASL credentials are set.\n\nThey would be silently ignored and every rsync service would connect to your\nbroker as an anonymous user. Set kafka.external.securityProtocol=SASL_SSL (or\nSASL_PLAINTEXT if the broker's SASL listener is unencrypted), or clear\nsaslMechanism/saslUsername/saslPassword and the kafka.external.oauth block." $proto) }}
+{{- end }}
+{{- if and $isSASL (not $ext.saslMechanism) }}
+{{- fail (printf "kafka.external.securityProtocol=%s requires kafka.external.saslMechanism (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512 or OAUTHBEARER).\n\nWithout it the chart emits no credentials at all and the connection would fail\nbroker-side with an authentication error that names neither setting." $proto) }}
+{{- end }}
+{{/*
+The mechanism ALLOWLIST. Every message above names PLAIN/SCRAM-SHA-256/
+SCRAM-SHA-512/OAUTHBEARER, but nothing enforced the set, so a fourth value rendered a
+config the chart cannot honour: kafka-init would build no JAAS entry and dial
+anonymously, and the Connect worker's JAAS string is only defined for these
+four.
+
+The allowlist itself lives in rsync-ai.kafka.saslLoginModule (_helpers.tpl),
+which is where the JAAS module is chosen -- one list, so the two cannot drift.
+Included here purely for the check: this file also runs when the CDC plane is
+disabled, and then nothing else would resolve a login module at all.
+
+FIRST, ahead of the credential-shape checks below, because the mechanism is what
+DECIDES which credentials are required. Run last, it lost every race: an
+operator who set saslMechanism=AWS_MSK_IAM was told "saslUsername is empty" and
+sent off to invent a username for a mechanism that has none, instead of being
+told the mechanism is not supported. The first message an operator sees has to
+be the one naming the actual mistake.
+*/}}
+{{- if and $isSASL $ext.saslMechanism }}
+{{- $_ := include "rsync-ai.kafka.saslLoginModule" . }}
+{{- end }}
+{{/*
+Which credentials are required depends on the mechanism, and getting this wrong
+is not a loud failure. Before OAUTHBEARER existed here the check below demanded
+saslUsername for EVERY mechanism -- correct for PLAIN/SCRAM, and an outright
+lie for OAUTHBEARER, which has no username at all: the operator would have been
+told to invent one, and it would then have gone nowhere (the env block skips
+KAFKA_SASL_USERNAME for token mechanisms).
+*/}}
+{{/*
+GUARDED ON $ext.saslMechanism, not merely on $isSASL. Dropping that condition
+turned the else-branch below into "no mechanism => no username => fail", which
+rejected the plainest BYO config there is: securityProtocol=PLAINTEXT with no
+SASL at all. It rendered on every stage that sets a mechanism, so all four
+S1..S4 overlays passed and only the S0 baseline -- the one nobody re-renders
+once it is green -- broke. Caught by rendering every stage INCLUDING the base.
+*/}}
+{{- if and $isSASL $ext.saslMechanism }}
+{{- if $isToken }}
+{{- if not $oauth.tokenEndpoint }}
+{{- fail "kafka.external.saslMechanism=OAUTHBEARER requires kafka.external.oauth.tokenEndpoint.\n\nEvery client fetches its own token from that URL; there is no username or\npassword to fall back on. Left empty, the JVM containers fail at configure()\nwith \"sasl.oauthbearer.token.endpoint.url value must be non-null\" and the Go\nand Python clients cannot start their token providers." }}
+{{- end }}
+{{- if not $oauth.clientId }}
+{{- fail "kafka.external.saslMechanism=OAUTHBEARER requires kafka.external.oauth.clientId.\n\nIt is a plain value, not a secret — set it here even when the client secret\ncomes from secrets.existingSecret (key KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET).\nsaslUsername is deliberately NOT a fallback: an operator who set it for a\nprevious SCRAM deployment would silently authenticate as the wrong principal." }}
+{{- end }}
+{{- if $ext.saslUsername }}
+{{- fail "kafka.external.saslUsername is set but saslMechanism=OAUTHBEARER does not use it.\n\nOAUTHBEARER authenticates with a fetched token; the username reaches no\ncontainer and no broker. If it is the OAuth client identity you meant, it goes\nin kafka.external.oauth.clientId — leaving it here would authenticate as\nwhatever principal the token names, not the one written in your values file." }}
+{{- end }}
+{{- else if not $ext.saslUsername }}
+{{- fail "kafka.external.saslMechanism is set but kafka.external.saslUsername is empty.\n\nThe username is a plain value, not a secret — set it here even when the password\ncomes from secrets.existingSecret (key KAFKA_SASL_PASSWORD)." }}
+{{- end }}
+{{- end }}
+
+{{/*
+TLS material the platform will never present -- the exact twin of the SASL guard
+above, and it exists for the same reason: securityProtocol is what decides
+whether any of it is read.
+
+Paste a CA bundle in with securityProtocol left at SASL_PLAINTEXT and the
+connection is unencrypted. Nothing errors, nothing warns, and the operator has
+every reason to believe otherwise: they supplied a certificate and the platform
+came up healthy.
+*/}}
+{{- $tls := $ext.tls | default dict }}
+{{- $usesTLS := include "rsync-ai.kafka.usesTLS" . }}
+{{- $declaresTLS := or $tls.caCert $tls.clientCert $tls.clientKey $tls.existingSecret $tls.insecureSkipVerify }}
+{{- if and $declaresTLS (not $usesTLS) }}
+{{- fail (printf "kafka.external.securityProtocol=%s does not use TLS, but kafka.external.tls material is set.\n\nIt would be silently ignored and every rsync service would connect to your\nbroker in cleartext. Set securityProtocol to SASL_SSL (or SSL for certificate\nauthentication with no SASL layer), or clear the kafka.external.tls block." $proto) }}
+{{- end }}
+
+{{/*
+Half a keypair. Both the Go client (shared/go/kafkaclient) and the Python one
+(kafka_security.py:158) fail closed on one half, so this is caught either way --
+but caught at pod startup, one service at a time, with a message about an
+environment variable. Here it names the value.
+*/}}
+{{- if and (or $tls.clientCert $tls.clientKey) (not (and $tls.clientCert $tls.clientKey)) }}
+{{- fail "kafka.external.tls.clientCert and clientKey must be set together (mTLS needs both halves of the keypair)." }}
+{{- end }}
+{{- if and (or $tls.clientCertKey $tls.clientKeyKey) (not (and $tls.clientCertKey $tls.clientKeyKey)) }}
+{{- fail "kafka.external.tls.clientCertKey and clientKeyKey must be set together -- they name the two halves of one keypair inside kafka.external.tls.existingSecret." }}
+{{- end }}
+{{- if and $tls.existingSecret (or $tls.caCert $tls.clientCert $tls.clientKey) }}
+{{- fail "kafka.external.tls.existingSecret is set together with inline caCert/clientCert/clientKey.\n\nThe inline values would be ignored: existingSecret replaces the chart-managed\nSecret entirely. Use one or the other." }}
+{{- end }}
+
+{{/*
+The skip-verify asymmetry, and the one guard here that is not a mirror of an
+existing one.
+
+`insecureSkipVerify` is not a single behaviour. It means three different things
+to the three client runtimes this chart deploys, and only one of them is what
+the name suggests:
+
+  Go       tls.Config.InsecureSkipVerify=true -- the chain is not validated at
+           all (shared/go/kafkaclient/tls.go:23). This one connects to anything.
+  Python   kafka-python maps it to ssl_check_hostname=False only. The context
+           is built with ssl.PROTOCOL_TLS_CLIENT, whose verify_mode is
+           CERT_REQUIRED and is never reassigned; only check_hostname is
+           touched, and with no cafile it loads the DEFAULT trust store
+           (kafka/net/transport.py:397-416, kafka-python 3.0.x). The chain is
+           still validated.
+  JVM      ssl.endpoint.identification.algorithm="" drops the hostname check.
+           The chain is still validated, against the JDK cacerts.
+
+So with no CA bundle this setting does not skip verification for two of the
+three runtimes. Against a private or self-signed CA the result is a platform
+where the Go services connect and nothing else does -- llm-service, planner,
+tool-generator, debezium-mcp, and kafka-init (a JVM CLI that is deployed
+unconditionally) all fail the handshake, each with its own certificate error and
+none of them naming this setting.
+
+The one configuration where it is genuinely useful is a broker whose certificate
+chains to a PUBLIC root but does not match the bootstrap hostname. That case is
+served by supplying that public root as caCert, which is why this fails outright
+rather than warning: there is no situation in which no-CA-plus-skip-verify is
+the right answer for the whole platform.
+*/}}
+{{- if and $usesTLS $tls.insecureSkipVerify (not $tls.caCert) (not $tls.existingSecret) }}
+{{- fail "kafka.external.tls.insecureSkipVerify=true with no CA bundle does not do what its name says.\n\nOnly the Go services actually skip verification. kafka-python maps it to\nssl_check_hostname=False and still validates the chain against the default\ntrust store; the JVM clients (Kafka Connect, and the kafka-init job, which is\ndeployed unconditionally) only drop the HOSTNAME check and validate the chain\nagainst the JDK cacerts.\n\nAgainst a private or self-signed CA you would get a platform where the Go\nservices connect and every Python and JVM client fails its handshake -- each\nwith its own certificate error, none of them naming this setting.\n\nSupply the CA instead: kafka.external.tls.caCert (or .existingSecret). If your\nbroker chains to a public root and only the HOSTNAME is wrong, supply that\npublic root as caCert and keep insecureSkipVerify=true -- that combination is\nsupported and is the one this setting is for." }}
+{{- end }}
+
+{{/*
+mTLS + Kafka Connect. A JVM PEM keystore is ONE file holding the chain and the
+key; there is no way to hand it the two separate paths the Go and Python clients
+read. The chart builds that file itself from clientCert+clientKey -- but it
+cannot build it from a Secret it does not own and cannot read.
+*/}}
+{{- if and $usesTLS $tls.existingSecret $tls.clientCertKey (not $tls.clientPemKey) .Values.connectors.cdc.enabled }}
+{{- fail "kafka.external.tls.existingSecret declares a client keypair but no clientPemKey, and the CDC plane is enabled.\n\nKafka Connect cannot load a certificate and a key as two PEM files -- its\nkeystore is a single file containing both. Add that combined file to your\nSecret and name it in kafka.external.tls.clientPemKey:\n\n  cat client.crt client.key > client.pem\n\nWithout it the Connect worker presents no certificate and every task fails the\nhandshake while the worker itself reports RUNNING." }}
+{{- end }}
+{{- end }}

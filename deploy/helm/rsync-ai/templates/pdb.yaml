@@ -1,0 +1,62 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+{{/*
+Only the two multi-replica tiers get a PDB.
+
+A PDB on a single-replica workload with minAvailable: 1 makes that pod
+undrainable: the node cordon hangs forever and a cluster upgrade stalls with no
+obvious owner. The orchestrator, the temporal-adapter and every connector are
+deliberately one replica, so they are omitted here rather than protected into a
+deadlock.
+*/}}
+{{/*
+The gate reads each tier's GUARANTEED pod count, not its replicaCount. Under an
+HPA the Deployment emits no `replicas:` at all, so replicaCount is a value the
+cluster never sees -- gating on it produced no PDB for a tier really running two
+pods, and a deadlocking PDB for one that could scale down to one.
+(KI-CHART-PDB-GATE-IGNORES-HPA.)
+*/}}
+{{- $apiFloor := int (include "rsync-ai.guaranteedReplicas" $.Values.apiGateway) }}
+{{- $feFloor := int (include "rsync-ai.guaranteedReplicas" $.Values.frontend) }}
+{{/*
+minAvailable at or above the floor means disruptionsAllowed is 0 for as long as
+the tier sits at its floor -- which under an HPA is most of the time. That is the
+undrainable node this file exists to avoid, so it is refused at render time
+rather than shipped as a cluster upgrade that hangs with no obvious owner.
+*/}}
+{{- $minAvail := $.Values.podDisruptionBudget.minAvailable }}
+{{- if kindIs "string" $minAvail }}
+{{- fail (printf "podDisruptionBudget.minAvailable=%q: a percentage is not supported here.\n\nThis chart compares it against each tier's guaranteed pod count to refuse a\nbudget that can never allow a disruption, and it cannot do that arithmetic on a\npercentage. Set an integer." $minAvail) }}
+{{- end }}
+{{- range $c := (list
+  (dict "name" "api-gateway" "enabled" $.Values.apiGateway.enabled "floor" $apiFloor "knob" "apiGateway")
+  (dict "name" "frontend"    "enabled" $.Values.frontend.enabled   "floor" $feFloor  "knob" "frontend"))
+}}
+{{- if and $c.enabled (gt $c.floor 1) }}
+{{- if ge (int $minAvail) $c.floor }}
+{{- fail (printf "podDisruptionBudget.minAvailable=%d is not below the %s tier's guaranteed pod count (%d).\n\nKubernetes would compute disruptionsAllowed=0, so evicting a %s pod always\nblocks: a node drain hangs and a cluster upgrade stalls with no obvious owner.\n\nLower podDisruptionBudget.minAvailable, or raise %s.replicaCount (or\n%s.autoscaling.minReplicas, which is what sets the floor while an HPA is on)." (int $minAvail) $c.name $c.floor $c.name $c.knob $c.knob) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- range $c := (list
+  (dict "name" "api-gateway" "enabled" (and $.Values.apiGateway.enabled (gt $apiFloor 1)))
+  (dict "name" "frontend"    "enabled" (and $.Values.frontend.enabled   (gt $feFloor 1))))
+}}
+{{- if $c.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $fullname }}-{{ $c.name }}
+  labels:
+    {{- include "rsync-ai.labels" $ | nindent 4 }}
+    app.kubernetes.io/component: {{ $c.name }}
+spec:
+  minAvailable: {{ $.Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" $ | nindent 6 }}
+      app.kubernetes.io/component: {{ $c.name }}
+{{- end }}
+{{- end }}
+{{- end }}

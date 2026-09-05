@@ -1,0 +1,322 @@
+#
+# Local prod-mirror — mirrors prod Traefik routing on localhost:8080.
+#
+# ╔══════════════════════════════════════════════════════════════════════════════╗
+# ║  THIS FILE IS NEVER USED ON PROD.                                          ║
+# ║  Prod uses ONLY: docker-compose.yml + docker-compose.prod.yml + .env.prod  ║
+# ║  This file is local-dev infrastructure only.                               ║
+# ╚══════════════════════════════════════════════════════════════════════════════╝
+#
+# Usage (local machine only):
+#
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.prod.yml \
+#     -f docker-compose.staging.yml \
+#     --env-file .env.staging \
+#     up -d
+#
+# ── Database isolation ─────────────────────────────────────────────────────────
+#
+#   EVERY database is on Azure — NO local postgres. This is a topology mirror
+#   of prod, isolated only by `_staging` database names on the same server:
+#
+#   App services (api-gateway, orchestrator, temporal-adapter, …):
+#     → Azure PostgreSQL  staging        (via DATABASE_URL)
+#   Temporal default store:
+#     → Azure PostgreSQL  temporal_staging           (DBNAME)
+#   Temporal visibility store:
+#     → Azure PostgreSQL  temporal_visibility_staging (VISIBILITY_DBNAME)
+#
+#   All three are isolated from prod's pipeline_db / temporal / temporal_visibility
+#   on the same Azure server — prod data is NEVER touched.
+#
+#   First-time setup: run ./scripts/setup-staging-db.sh ONCE.
+#   It creates the three Azure databases and patches .env.staging.
+#   App migrations auto-apply on api-gateway first boot; Temporal schema is set
+#   up by its own auto-setup on first boot — no manual SQL needed.
+#
+# ── What this changes vs prod ─────────────────────────────────────────────────
+#   - Traefik: HTTP only on :8080, no TLS/ACME/Cloudflare
+#   - DOMAIN: localhost
+#   - Databases: Azure `_staging` copies (NOT prod's pipeline_db/temporal/…)
+#   - NO local postgres container (prod's local-db profile stays un-triggered)
+#   - NEXT_PUBLIC_* build args: http://localhost:8080
+#   - Traefik dashboard: http://localhost:8090/dashboard/
+#
+# After changing Go/Python services: just rebuild that one service —
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml \
+#     -f docker-compose.staging.yml --env-file .env.staging \
+#     build <service> && ... up -d --no-deps <service>
+#
+# After changing frontend: must rebuild (NEXT_PUBLIC_* are baked at build time):
+#   docker compose … build frontend && docker compose … up -d --no-deps frontend
+#
+
+services:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # REVERSE PROXY — HTTP only, no TLS
+  # ─────────────────────────────────────────────────────────────────────────
+
+  traefik:
+    ports:
+      - "8080:80"    # access the whole stack at http://localhost:8080
+      - "8090:8080"  # Traefik dashboard/API at http://localhost:8090/dashboard/
+    volumes:
+      - ./deploy/traefik/traefik.local.yml:/etc/traefik/traefik.yml:ro
+      - ./deploy/traefik/dynamic.local.yml:/etc/traefik/dynamic.yml:ro
+    environment:
+      # Unset prod cert resolver vars — not needed locally
+      - TRAEFIK_CERTIFICATESRESOLVERS_letsencrypt_ACME_EMAIL=
+      - CF_DNS_API_TOKEN=
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # NO LOCAL POSTGRES.
+  #
+  # staging is a BYTE-FOR-BYTE topology mirror of prod: every database lives
+  # on Azure PostgreSQL, just on isolated `_staging` databases:
+  #   - App services      → staging        (via DATABASE_URL)
+  #   - Temporal default  → temporal_staging           (DBNAME)
+  #   - Temporal visibility → temporal_visibility_staging (VISIBILITY_DBNAME)
+  #
+  # There is intentionally NO `postgres:` service override here, so the local
+  # postgres container (gated behind profiles: ["local-db"] in prod.yml) NEVER
+  # starts. If you ever see a local postgres container in staging, something
+  # re-introduced the divergence — remove it.
+  #
+  # Create the three Azure databases once: ./scripts/setup-staging-db.sh
+  # ─────────────────────────────────────────────────────────────────────────
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # TEMPORAL — Azure, same as prod, isolated database names.
+  #
+  # Inherits ALL Azure wiring from docker-compose.prod.yml unchanged:
+  #   POSTGRES_SEEDS=${POSTGRES_HOST} (Azure), SKIP_DB_CREATE=true,
+  #   SQL_TLS / SQL_TLS_ENABLED=${POSTGRES_TLS_ENABLED} (true on Azure).
+  # We ONLY override the two database names so staging Temporal state is
+  # isolated from prod's temporal/temporal_visibility on the same Azure server.
+  # The empty databases are pre-created by setup-staging-db.sh; Temporal's
+  # auto-setup populates the schema on first boot (SKIP_DB_CREATE=true, exactly
+  # like prod's first boot).
+  # ─────────────────────────────────────────────────────────────────────────
+
+  temporal:
+    environment:
+      - DBNAME=temporal_staging
+      - VISIBILITY_DBNAME=temporal_visibility_staging
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # TEMPORAL UI — re-enable on a dedicated host port for local ops/testing.
+  # prod.yml gates it behind the "ops" profile and strips its host port.
+  # (UI only — no database, safe to expose locally.)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  temporal-ui:
+    profiles: []                # clear the ops-profile gate — always start locally
+    ports: !override
+      - "8244:8080"             # http://localhost:8244 — Temporal Web UI
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # REDIS — prod.yml requires REDIS_PASSWORD. Keep that behaviour locally.
+  # ─────────────────────────────────────────────────────────────────────────
+
+  redis:
+    command:
+      - sh
+      - -c
+      # The password is written to a 0600 file and never appears on the
+      # redis-server ARGV, so it stays out of `ps` on the host and out of
+      # the rendered compose spec (`docker inspect` / `compose config`).
+      - |
+        umask 077
+        : > /tmp/redis.conf
+        printf 'requirepass %s\n' "$$REDIS_PASSWORD" > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # API GATEWAY — HTTP Traefik labels for localhost
+  # Connects to Azure staging via DATABASE_URL in .env.staging
+  # ─────────────────────────────────────────────────────────────────────────
+
+  api-gateway:
+    labels:
+      traefik.enable: "true"
+      # API routes
+      traefik.http.routers.api.rule: "Host(`localhost`) && PathPrefix(`/api`)"
+      traefik.http.routers.api.entrypoints: "web"
+      traefik.http.routers.api.service: "api"
+      traefik.http.routers.api.middlewares: "security-headers@file,rate-limit@file"
+      traefik.http.routers.api.tls.certresolver: ""   # nullify prod TLS label
+      traefik.http.services.api.loadbalancer.server.port: "8080"
+      # WebSocket
+      traefik.http.routers.ws.rule: "Host(`localhost`) && PathPrefix(`/ws`)"
+      traefik.http.routers.ws.entrypoints: "web"
+      traefik.http.routers.ws.service: "ws"
+      traefik.http.routers.ws.middlewares: "security-headers@file"
+      traefik.http.routers.ws.tls.certresolver: ""    # nullify prod TLS label
+      traefik.http.services.ws.loadbalancer.server.port: "8080"
+      # OAuth callback
+      traefik.http.routers.oauth.rule: "Host(`localhost`) && PathPrefix(`/oauth/callback`)"
+      traefik.http.routers.oauth.entrypoints: "web"
+      traefik.http.routers.oauth.service: "api"
+      traefik.http.routers.oauth.middlewares: "security-headers@file"
+      traefik.http.routers.oauth.tls.certresolver: "" # nullify prod TLS label
+    environment:
+      - OAUTH_CALLBACK_URL=http://localhost:8080/oauth/callback
+      - FRONTEND_URL=http://localhost:8080
+      - APP_BASE_URL=http://localhost:8080
+      # ENVIRONMENT=local: disables CSRF enforcement + allows X-User-ID bypass header
+      - ENVIRONMENT=local
+      - RSYNC_CSRF_ENFORCE=false
+      # Fail closed on the ENCRYPTION_KEY footgun: the base docker-compose.yml
+      # falls back to a DEV key (${ENCRYPTION_KEY:-dev-encryption-key-...}) whenever
+      # ENCRYPTION_KEY resolves EMPTY/unset at `up` time — i.e. no --env-file, OR a
+      # stale/empty ENCRYPTION_KEY exported in the launching shell that overrides
+      # --env-file (shell env wins over --env-file). Either way the stack silently
+      # encrypts connection configs with the dev key: undecryptable once a real key is
+      # set, and inconsistent across services. `:?` makes `docker compose up` hard-fail
+      # instead. The canonical `scripts/staging-up.sh` (--env-file .env.staging with no
+      # conflicting export) satisfies this and keeps working.
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY must be provided for staging - launch via scripts/staging-up.sh or --env-file .env.staging; refusing the base dev-key fallback}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # FRONTEND — bake NEXT_PUBLIC_* for localhost:8080
+  # ─────────────────────────────────────────────────────────────────────────
+
+  frontend:
+    build:
+      args:
+        NEXT_PUBLIC_API_URL: "http://localhost:8080"
+        NEXT_PUBLIC_WS_URL: "ws://localhost:8080/ws"
+        NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL: "http://localhost:8080"
+        NEXT_PUBLIC_WS_ORCHESTRATOR_URL: "ws://localhost:8080/ws/orchestrator"
+        NEXT_PUBLIC_LLM_SERVICE_URL: "http://localhost:8080/llm"
+        NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW: "false"
+        NEXT_PUBLIC_FEATURE_MONITORING_INFRA: "false"
+        NEXT_PUBLIC_FEATURE_MONITORING_TRACES: "false"
+        NEXT_PUBLIC_FEATURE_SIGNOZ_DEEPLINKS: "true"
+        NEXT_PUBLIC_SIGNOZ_UI_URL: "http://localhost:3301"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://localhost:8080
+      - NEXT_PUBLIC_WS_URL=ws://localhost:8080/ws
+      - NEXTAUTH_URL=http://localhost:8080
+      - API_GATEWAY_INTERNAL_URL=http://api-gateway:8080
+      - ORCHESTRATOR_INTERNAL_URL=http://orchestrator:8080
+    labels:
+      traefik.enable: "true"
+      traefik.http.routers.frontend.rule: "Host(`localhost`)"
+      traefik.http.routers.frontend.entrypoints: "web"
+      traefik.http.routers.frontend.service: "frontend"
+      traefik.http.routers.frontend.middlewares: "security-headers@file"
+      traefik.http.routers.frontend.tls.certresolver: "" # nullify prod TLS label
+      traefik.http.services.frontend.loadbalancer.server.port: "3000"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # BACKEND SERVICES — reduce memory limits for dev machine
+  # All connect to Azure staging via DATABASE_URL in .env.staging
+  # ─────────────────────────────────────────────────────────────────────────
+
+  orchestrator:
+    environment:
+      # Orchestrator reads DB_* vars (not POSTGRES_*) — map them to the Azure test DB.
+      - DB_HOST=${POSTGRES_HOST}
+      - DB_PORT=${POSTGRES_PORT:-5432}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=${POSTGRES_DB}
+      - DB_SSLMODE=${DB_SSLMODE:-require}
+      # staging Redis runs WITH --requirepass (see the redis service above), so
+      # the orchestrator's correlation client must authenticate. Inherit the real
+      # password — clearing it caused NOAUTH crash-loops + IntentActivityV2 failures.
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      # Fail closed on the ENCRYPTION_KEY footgun (see api-gateway above): must match
+      # api-gateway/temporal-adapter or connection configs become undecryptable.
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY must be provided for staging - launch via scripts/staging-up.sh or --env-file .env.staging; refusing the base dev-key fallback}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  temporal-adapter:
+    environment:
+      # staging Redis runs WITH --requirepass (see the redis service above), so
+      # the temporal-adapter's correlation writes must authenticate. Inherit the real
+      # password — clearing it caused [INFRA:REDIS_WRITE_FAILED] NOAUTH on IntentActivityV2.
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      # Fail closed on the ENCRYPTION_KEY footgun (see api-gateway above): the adapter
+      # decrypts connection configs in healing activities and MUST share the key.
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY:?ENCRYPTION_KEY must be provided for staging - launch via scripts/staging-up.sh or --env-file .env.staging; refusing the base dev-key fallback}
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  llm-service:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  tool-generator:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  planner:
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # kafka-mcp-sink writes its exactly-once ACK ledger to the control-plane
+  # Postgres. The base docker-compose.yml builds POSTGRES_URL with
+  # ?sslmode=disable (correct for the local `postgres` container in dev), but
+  # staging points POSTGRES_HOST at Azure PostgreSQL, which REQUIRES TLS.
+  # Without this override the sink's ledger ping fails ("no pg_hba.conf entry
+  # ... no encryption"), the worker refuses to start (to preserve
+  # exactly-once), never drains the Kafka topic, and 0 rows reach the
+  # destination while the pipeline still reports "completed". Mirror the
+  # sslmode=require that every app service already uses via DATABASE_URL.
+  kafka-mcp-sink-mcp:
+    environment:
+      - POSTGRES_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:${POSTGRES_PORT}/${POSTGRES_DB}?sslmode=require
+
+  kafka:
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # OBSERVABILITY
+  # ─────────────────────────────────────────────────────────────────────────
+
+  fluent-bit:
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  otel-collector:
+    deploy:
+      resources:
+        limits:
+          memory: 128M

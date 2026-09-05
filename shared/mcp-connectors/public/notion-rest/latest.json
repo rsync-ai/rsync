@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-07-10T12:28:48Z",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-07-10T12:28:48Z",
+      "changes": [
+        "Initial release \u2014 generated via discovery flow (session fast path)"
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

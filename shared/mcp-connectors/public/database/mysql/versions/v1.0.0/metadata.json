@@ -1,0 +1,299 @@
+{
+  "id": "mysql",
+  "name": "MySQL",
+  "display_name": "MySQL",
+  "aliases": [
+    "mysql",
+    "mysql",
+    "MySQL",
+    "mysql"
+  ],
+  "version": "1.0.0",
+  "description": "Connector for MySQL relational database.",
+  "connector_type": "mysql",
+  "category": "relational_db",
+  "supported_versions": {
+    "batch": "MySQL 5.7 and later, including 8.0 (8.0+ recommended); MariaDB 10.x compatible",
+    "cdc": "MySQL 5.7 and later, including 8.0 — via Debezium (requires binlog_format=ROW and binlog_row_image=FULL)"
+  },
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": true,
+  "supports_ddl": true,
+  "auto_create_destination_tables": true,
+  "spec_version": "1.0",
+  "generated_at": "2026-01-12T13:05:23.568523",
+  "status": "active",
+  "quality_tier": "bronze",
+  "quality_score": 34.0,
+  "qa_metadata": {
+    "export_attempts": [
+      {
+        "error": null,
+        "passed": true,
+        "response_sample": {
+          "message": "Skipped (no runtime fixture)",
+          "success": true
+        },
+        "status": "",
+        "test": "relational_db_export_smoke",
+        "warning": null
+      }
+    ],
+    "export_validated_with": null,
+    "export_validation_status": "validated",
+    "tests_failed": 0,
+    "tests_passed": 6
+  },
+  "auth_type": "basic",
+  "supported_auth_methods": [
+    {
+      "method": "basic",
+      "header_name": "",
+      "header_prefix": "",
+      "config_keys": [
+        "user",
+        "password"
+      ],
+      "description": "Username/password authentication to the MySQL server."
+    }
+  ],
+  "required_config": [
+    "host",
+    "port",
+    "database",
+    "user",
+    "password"
+  ],
+  "optional_config": [],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string",
+        "description": "Database host address"
+      },
+      "port": {
+        "type": "integer",
+        "description": "Database port number"
+      },
+      "database": {
+        "type": "string",
+        "description": "Database name"
+      },
+      "user": {
+        "type": "string",
+        "description": "Database user"
+      },
+      "password": {
+        "type": "string",
+        "description": "Database password",
+        "secret": true
+      }
+    },
+    "required": [
+      "host",
+      "port",
+      "database",
+      "user",
+      "password"
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string",
+        "description": "Database host address"
+      },
+      "port": {
+        "type": "integer",
+        "description": "Database port number"
+      },
+      "database": {
+        "type": "string",
+        "description": "Database name"
+      },
+      "user": {
+        "type": "string",
+        "description": "Database user"
+      },
+      "password": {
+        "type": "string",
+        "description": "Database password",
+        "secret": true
+      }
+    },
+    "required": [
+      "host",
+      "port",
+      "database",
+      "user",
+      "password"
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": [
+      "csv",
+      "json"
+    ],
+    "supports_cdc": true,
+    "supports_ddl": true,
+    "auto_create_destination_tables": true
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity to the data source",
+      "method": "mysql_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration without connecting",
+      "method": "mysql_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover available tables/collections and their schemas",
+      "method": "mysql_discover_schema",
+      "parameters": [
+        {
+          "name": "include_columns",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include column metadata (names, types, nullability)"
+        },
+        {
+          "name": "include_row_counts",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include estimated row counts (fast, no full scans)"
+        },
+        {
+          "name": "include_relationships",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Include primary keys and foreign keys (for agents)"
+        },
+        {
+          "name": "include_indexes",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Include index metadata (for agents)"
+        },
+        {
+          "name": "max_tables",
+          "type": "integer",
+          "required": false,
+          "default": 100,
+          "description": "Maximum number of tables to return"
+        }
+      ]
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities for agent interaction",
+      "method": "mysql_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export data from a table",
+      "method": "mysql_export",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 10000
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0
+        },
+        {
+          "name": "where",
+          "type": "string",
+          "required": false,
+          "default": ""
+        },
+        {
+          "name": "columns",
+          "type": "array",
+          "required": false,
+          "default": []
+        }
+      ]
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Import data into a table",
+      "method": "mysql_import_data",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "data",
+          "type": "array",
+          "required": true
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "required": false,
+          "default": "append"
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "name": "health",
+      "endpoint": "/health",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "get"
+      ]
+    },
+    {
+      "name": "collections",
+      "endpoint": "/collections",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "list"
+      ]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

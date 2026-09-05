@@ -1,0 +1,19 @@
+# Local dev override (EXAMPLE). Copy to `docker-compose.override.yml` (gitignored)
+# and fill in YOUR dev-server origins. `docker compose up` auto-loads
+# docker-compose.override.yml on every run, so keep it local — personal
+# worktree ports must never leak into everyone else's stack.
+services:
+  api-gateway:
+    environment:
+      # Frontend dev origin(s) allowed by CORS. Add your own non-3000 worktree
+      # port, e.g.: http://localhost:3000,http://localhost:<your-dev-port>
+      - RSYNC_CORS_ORIGINS=http://localhost:3000
+  # Expose tool-generator to the host for the discovery UI flow (browser hits
+  # localhost:5010 directly via NEXT_PUBLIC_TOOL_GENERATOR_URL).
+  # Production routes via the api-gateway proxy; this is dev-only convenience.
+  tool-generator:
+    ports:
+      - "5010:5010"
+    environment:
+      # Allow CORS from your frontend dev origin(s) for /v1/discover etc.
+      - TG_ALLOWED_ORIGINS=http://localhost:3000

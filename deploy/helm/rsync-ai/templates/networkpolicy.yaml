@@ -1,0 +1,180 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+{{/*
+Default-deny ingress for the release, plus the allows the platform actually
+uses.
+
+Two warnings worth reading before enabling this:
+
+ 1. On a cluster whose CNI does not enforce NetworkPolicy (plain kubenet, some
+    managed defaults), these objects are accepted by the API server and enforce
+    NOTHING. A green `kubectl get networkpolicy` is not evidence of isolation.
+
+ 2. Where it IS enforced, it will break anything reaching into this release
+    that is not listed here — most commonly the ingress controller, whose
+    namespace you must add to networkPolicy.allowFromNamespaces, and any
+    metrics scraper.
+
+Egress is deliberately NOT restricted. The whole product connects to customer
+databases and object stores at addresses only known at run time, so an egress
+allowlist here could only be written as allow-all, and an allow-all egress rule
+reads as a control that exists when it does not.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-default-deny-ingress
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+  policyTypes: [Ingress]
+---
+{{/*
+Everything inside the release may talk to everything else inside it, with ONE
+exclusion: connector pods. The platform is a mesh of internal HTTP calls
+(gateway to orchestrator, orchestrator to connectors, sink to destination
+connectors) and enumerating each of those edges here would be a second,
+silently-drifting copy of the service topology.
+
+Connectors are the exception because they are the one tier running code
+generated for a tenant and holding that tenant's source credentials. Compose
+draws exactly this line, with networks instead of policies: user connectors
+join ONLY the dedicated rsync-ai-mcp network and never the internal
+rsync-ai_default, so they cannot reach postgres, redis, kafka or temporal.
+That is the boundary named SEC-M-06 in scripts/mcp_generate_compose.py:12-16,
+and JIT-deployed connectors land on the same network
+(llm-service/src/agents/tool_generator/deployment/service.py:180-188).
+Admitting connectors under this policy handed them the platform datastores that
+compose withholds - KI-CHART-NO-CONNECTOR-NETWORK-BOUNDARY.
+
+The exclusion keys off rsync.ai/connector-id, which
+templates/connectors/fleet.yaml stamps on every connector Pod and Service and
+nothing else in this chart sets - it is already the connector's identity label,
+the one its own Service selects on. DoesNotExist rather than a NotIn on
+app.kubernetes.io/component is deliberate: NotIn does not match a pod that
+lacks the key at all, so a future pod shipped without a component label would
+drop out of this policy and lose its access to postgres, and it would do so
+silently. Keying off presence of the connector label instead fails the safe
+way - an unlabelled pod stays inside.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-intra-release
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+      - key: rsync.ai/connector-id
+        operator: DoesNotExist
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "rsync-ai.selectorLabels" . | nindent 14 }}
+            matchExpressions:
+              - key: rsync.ai/connector-id
+                operator: DoesNotExist
+---
+{{/*
+The connector tier's own ingress. Only the services that bridge into
+rsync-ai-mcp on compose may reach a connector, and only on its HTTP port.
+
+The caller list is compose's, not a new one:
+scripts/mcp_generate_compose.py:15-16 names orchestrator, api-gateway,
+tool-generator and kafka-mcp-sink as the bridges. compose also puts
+connector-deployer on that network; it has no counterpart here because
+connectorDeployer.enabled hard-fails on Kubernetes
+(templates/validate.yaml:10-11), which is why JIT connectors cannot exist in
+this chart at all and only the declared fleet does.
+
+Note what is absent: temporal-adapter, llm-service and planner. Those sit on
+compose's internal network only and cannot reach a connector there either, so
+this is the same line compose draws, not a tighter one.
+
+Port 8000 is fleet.yaml's hardcoded containerPort, the same port its Service
+targets; it is not configurable per fleet entry, so naming it here cannot drift.
+
+Rendered even when connectors.fleet is empty, which is the default. The
+selector is the contract, not the fleet list: any pod carrying
+rsync.ai/connector-id is confined by this, including one a later template adds.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-connector-ingress
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+    matchExpressions:
+      - key: rsync.ai/connector-id
+        operator: Exists
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "rsync-ai.selectorLabels" . | nindent 14 }}
+            matchExpressions:
+              - key: app.kubernetes.io/component
+                operator: In
+                values: [api-gateway, orchestrator, tool-generator, kafka-mcp-sink]
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+# The two externally-reachable tiers. Nothing else in the release accepts
+# traffic from outside it — notably the orchestrator, whose topology API is
+# authenticated by INTERNAL_SERVICE_SECRET and should never be exposed.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-external-http
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [api-gateway, frontend]
+  policyTypes: [Ingress]
+  ingress:
+    {{- if .Values.networkPolicy.allowFromNamespaces }}
+    - from:
+        {{- range .Values.networkPolicy.allowFromNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . | quote }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.apiGateway.service.port }}
+        - protocol: TCP
+          port: {{ .Values.frontend.service.port }}
+    {{- else }}
+    {{/*
+    No namespaces listed, so this rule omits `from` entirely — which in
+    NetworkPolicy means ANY source may reach these two ports. That is the
+    working default (the ingress controller is usually in a namespace the
+    operator has not told us about) but it is NOT isolation: only the ports are
+    narrowed, not the callers. List the ingress controller's namespace in
+    networkPolicy.allowFromNamespaces to actually restrict this.
+    */}}
+    - ports:
+        - protocol: TCP
+          port: {{ .Values.apiGateway.service.port }}
+        - protocol: TCP
+          port: {{ .Values.frontend.service.port }}
+    {{- end }}
+{{- end }}

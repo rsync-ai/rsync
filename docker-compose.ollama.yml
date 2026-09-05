@@ -1,0 +1,48 @@
+# Optional: bundle a local Ollama so the stack runs FULLY OFFLINE (no OpenAI key,
+# no host Ollama). Layer it on top of the quickstart:
+#
+#     docker compose -f docker-compose.quickstart.yml -f docker-compose.ollama.yml up -d
+#     docker exec rsync-ollama ollama pull qwen2.5:7b      # pull the model once
+#
+# Set LLM_PROVIDER=ollama in .env (install.sh option 2 does this). This overlay just
+# points the LLM services at the bundled ollama container instead of host.docker.internal;
+# the `environment:` maps merge with the base, overriding only OLLAMA_URL.
+#
+# Without this overlay, choosing Ollama in install.sh uses an Ollama running on the HOST
+# (http://host.docker.internal:11434).
+
+services:
+  ollama:
+    # Pinned: `latest` is what the README's no-OpenAI-key path pulls, and a model runtime
+    # that changes under a re-pull changes inference behaviour, not just the binary.
+    image: ollama/ollama:0.33.2
+    container_name: rsync-ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    # For GPU acceleration on a CUDA host, uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  llm-service:
+    environment:
+      OLLAMA_URL: http://ollama:11434
+    depends_on:
+      ollama:
+        condition: service_started
+
+  tool-generator:
+    environment:
+      OLLAMA_URL: http://ollama:11434
+
+  planner:
+    environment:
+      OLLAMA_URL: http://ollama:11434
+
+volumes:
+  ollama_models:

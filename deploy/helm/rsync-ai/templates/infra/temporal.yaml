@@ -1,0 +1,190 @@
+{{- if .Values.temporal.enabled }}
+{{/*
+Temporal, backed by the same Postgres as the control plane.
+
+`auto-setup` is an EVALUATION image: it creates and migrates its own schemas on
+every boot. That is convenient for a self-host install and wrong for anything
+with an uptime commitment — set temporal.enabled=false and point
+temporal.external at Temporal Cloud or a separately-operated cluster there.
+
+A Deployment rather than a StatefulSet: Temporal keeps no local state, all of it
+is in Postgres.
+*/}}
+{{/*
+The dynamic-config file DYNAMIC_CONFIG_FILE_PATH names. The auto-setup image
+does NOT ship it -- Temporal's own docker-compose supplies it as a bind mount,
+and this platform's compose does the same (docker-compose.yml:242 mounts
+deploy/temporal onto /etc/temporal/config/dynamicconfig). Setting the env var
+without also supplying the file is fatal, not a fallback: Temporal exits with
+"unable to validate dynamic config ... no such file or directory" before it
+binds 7233, so the whole workflow engine never starts and every pipeline run
+fails at the adapter. Content is deploy/temporal/development-sql.yaml verbatim.
+*/}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-temporal-dynamicconfig
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: temporal
+data:
+  development-sql.yaml: |
+    system.forceSearchAttributesCacheRefreshOnRead:
+      - value: true
+        constraints: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-temporal
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: temporal
+spec:
+  type: ClusterIP
+  ports:
+    - port: 7233
+      targetPort: grpc
+      name: grpc
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: temporal
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-temporal
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: temporal
+spec:
+  replicas: 1
+  {{/*
+    Recreate, not RollingUpdate. auto-setup runs schema migrations at boot, and
+    two of them against one database is a race with no upside on a single replica.
+  */}}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+{{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: temporal
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: temporal
+      {{- with .Values.global.podAnnotations }}
+      annotations:
+{{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: temporal
+          image: {{ .Values.temporal.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            - name: DB
+              value: "postgresql"
+            - name: DB_PORT
+              value: {{ include "rsync-ai.postgres.port" . | quote }}
+            - name: POSTGRES_SEEDS
+              value: {{ include "rsync-ai.postgres.host" . | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.username | quote }}
+            - name: POSTGRES_PWD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: POSTGRES_PASSWORD
+{{- if not .Values.postgresql.enabled }}
+            # External database: `temporal` and `temporal_visibility` must already
+            # exist, created by you (see the chart README, external PostgreSQL).
+            # auto-setup's create step is guarded only by the name test
+            # `${DBNAME} != ${POSTGRES_USER}`, never on whether the database is
+            # there, so it runs against every external instance and exits 1 with
+            # `permission denied to create database` unless postgresql.username
+            # holds CREATEDB. That exit is fatal — the image runs
+            # `auto-setup.sh && start-temporal.sh` under `set -e` — so the pod
+            # CrashLoopBackOffs and no workflow engine ever starts.
+            # In-chart Postgres keeps the default (unset): it connects as the
+            # superuser, for which the create legitimately succeeds.
+            - name: SKIP_DB_CREATE
+              value: "true"
+{{- end }}
+            # Temporal's TLS names, derived from postgresql.external.sslMode.
+            # It ignores sslMode itself, so against a managed database that
+            # mandates TLS (RDS with rds.force_ssl=1, Azure Database) leaving
+            # these unset stops auto-setup from creating its schemas -- and with
+            # no workflow engine every pipeline hangs rather than failing.
+            - name: SQL_TLS_ENABLED
+              value: {{ include "rsync-ai.postgres.tlsEnabled" . | quote }}
+            - name: SQL_HOST_VERIFICATION
+              value: {{ include "rsync-ai.postgres.tlsHostVerification" . | quote }}
+            - name: SQL_HOST_NAME
+              value: {{ .Values.postgresql.external.tls.serverName | default (include "rsync-ai.postgres.host" .) | quote }}
+            - name: SQL_CA
+              value: {{ .Values.postgresql.external.tls.caFile | quote }}
+            # temporal-sql-tool's family -- same three facts under different
+            # names, because auto-setup's schema step is a separate binary that
+            # runs FIRST. Set only the server's names above and the schema step
+            # still connects in plaintext: on a database that refuses it,
+            # auto-setup exits before the server starts, and the symptom is a
+            # hung pipeline with no TLS error anywhere.
+            - name: SQL_TLS
+              value: {{ include "rsync-ai.postgres.tlsEnabled" . | quote }}
+            - name: SQL_TLS_CA_FILE
+              value: {{ .Values.postgresql.external.tls.caFile | quote }}
+            - name: SQL_TLS_SERVER_NAME
+              value: {{ .Values.postgresql.external.tls.serverName | default (include "rsync-ai.postgres.host" .) | quote }}
+            - name: SQL_TLS_DISABLE_HOST_VERIFICATION
+              value: {{ include "rsync-ai.postgres.tlsDisableHostVerification" . | quote }}
+            - name: DYNAMIC_CONFIG_FILE_PATH
+              value: "config/dynamicconfig/development-sql.yaml"
+          ports:
+            - name: grpc
+              containerPort: 7233
+          {{/*
+            tctl against the real namespace, not a port check. auto-setup binds
+            7233 before its schema migration finishes, and a worker that connects
+            in that window fails its first task rather than waiting.
+
+            The address is the POD's own IP, discovered at runtime, not localhost.
+            auto-setup's entrypoint defaults BIND_ON_IP to the container IP and
+            the config template binds every service to exactly that (frontend at
+            config_template.yaml:306), so nothing is listening on 127.0.0.1 or
+            [::1] — a localhost probe gets "connection refused" forever. That
+            never recovers, and it fails in the most confusing possible way: the
+            Service still routes correctly (it targets podIP:7233, which IS
+            bound), but an unready pod is excluded from the Endpoints, so a
+            healthy, SERVING Temporal has no endpoints and every client sees
+            connection refused. The temporal-adapter then CrashLoopBackOffs
+            against a server that is working.
+          */}}
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "tctl --address \"$(hostname -i)\":7233 cluster health >/dev/null 2>&1"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: grpc
+            initialDelaySeconds: 120
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+{{- toYaml .Values.temporal.resources | nindent 12 }}
+          volumeMounts:
+            - name: dynamicconfig
+              mountPath: /etc/temporal/config/dynamicconfig
+              readOnly: true
+      volumes:
+        - name: dynamicconfig
+          configMap:
+            name: {{ include "rsync-ai.fullname" . }}-temporal-dynamicconfig
+{{- end }}

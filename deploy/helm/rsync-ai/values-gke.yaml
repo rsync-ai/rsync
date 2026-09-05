@@ -1,0 +1,104 @@
+# GKE overlay — layer on top of values.yaml, do not use alone:
+#
+#   helm install rsync ./rsync-ai -f rsync-ai/values-gke.yaml -f my-secrets.yaml
+
+global:
+  # premium-rwo = SSD persistent disk; `standard-rwo` is the balanced/HDD-backed
+  # default. Kafka and Postgres are the two that notice. On Autopilot both exist
+  # already; on Standard verify with `kubectl get sc`.
+  storageClass: premium-rwo
+
+  # GKE Autopilot rejects a pod whose containers declare no CPU/memory requests
+  # and silently rewrites some securityContext fields. Every workload in this
+  # chart sets requests, so Autopilot is supported — but note Autopilot also
+  # blocks hostPath and privileged pods, neither of which this chart uses.
+
+postgresql:
+  enabled: false
+  external:
+    # Cloud SQL. Two shapes work:
+    #   1. Private IP + this host set directly (simplest; needs VPC peering).
+    #   2. The Cloud SQL Auth Proxy as a sidecar — which this chart does NOT
+    #      template. If you need the proxy, run it as a separate Deployment +
+    #      Service in the namespace and point `host` at that Service.
+    host: ""
+    port: 5432
+    sslMode: require
+
+redis:
+  enabled: false
+  external:
+    host: ""            # Memorystore private IP
+    port: 6379
+
+# Managed Kafka on GCP means Confluent Cloud or a self-run cluster; Google's
+# own Managed Service for Apache Kafka speaks plain SASL_SSL/PLAIN, which this
+# chart supports. minInsyncReplicas MUST stay <= replicationFactor — inverted,
+# every topic is created successfully and is permanently unwritable.
+kafka:
+  enabled: false
+  replicationFactor: "3"
+  minInsyncReplicas: "2"
+  external:
+    bootstrapServers: ""
+    securityProtocol: SASL_SSL
+    saslMechanism: PLAIN
+    # REQUIRED whenever saslMechanism is set: the username is a plain value and
+    # the chart refuses to render without it. An empty username with a mechanism
+    # set is how a client ends up connecting anonymously to a cluster that was
+    # supposed to authenticate it.
+    saslUsername: ""   # <-- fill this in
+    saslPassword: ""
+
+# GCS via its S3-compatible (XML) endpoint. The object-storage connectors speak
+# S3 and nothing else, so `mode: gcs` means exactly "an S3-compatible endpoint
+# fronting GCS", not the native GCS API.
+#
+# The XML API does NOT accept a Workload Identity token — it needs an HMAC key.
+# So unlike EKS/AKS, leaving the credentials empty here does not fall back to
+# workload identity; it falls back to no credentials at all. Create an HMAC key
+# for the service account and set both fields (via secrets.existingSecret in
+# anything that is not a laptop).
+objectStorage:
+  mode: gcs
+  external:
+    endpointUrl: https://storage.googleapis.com
+    region: auto
+    accessKeyId: ""      # GOOG1E... HMAC access ID
+    secretAccessKey: ""  # HMAC secret
+
+serviceAccount:
+  create: true
+  annotations: {}
+    # iam.gke.io/gcp-service-account: rsync-ai@PROJECT.iam.gserviceaccount.com
+    #
+    # Useful for Cloud SQL IAM auth and Secret Manager CSI. It does NOT help the
+    # GCS XML endpoint — see the HMAC note above.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingress — GKE native (GCE) ingress
+# ─────────────────────────────────────────────────────────────────────────────
+# The GCE ingress controller health-checks a backend on `/` by default and will
+# mark it UNHEALTHY until it gets a 200, which presents as a 502 from the load
+# balancer rather than as a probe failure. Both backends here answer 200 on `/`
+# (frontend) and the api-gateway answers on `/health`, so attach a
+# BackendConfig if you need a non-`/` check.
+#
+# GCE ingress provisions slowly — 5-10 minutes before the IP serves traffic is
+# normal, and it looks identical to a broken install for the first few minutes.
+ingress:
+  enabled: false
+  className: gce
+  annotations: {}
+    # kubernetes.io/ingress.global-static-ip-name: rsync-ai-ip
+    # networking.gke.io/managed-certificates: rsync-ai-cert
+  hosts:
+    app: ""
+    api: ""
+  tls: []
+
+# GKE Dataplane V2 (Cilium) enforces NetworkPolicy natively. On a Standard
+# cluster WITHOUT Dataplane V2 you must have enabled the network policy add-on
+# (Calico) — otherwise these objects apply and enforce nothing.
+networkPolicy:
+  enabled: false

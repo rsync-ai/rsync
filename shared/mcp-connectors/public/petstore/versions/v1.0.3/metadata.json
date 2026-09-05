@@ -1,0 +1,365 @@
+{
+  "id": "petstore",
+  "name": "Petstore",
+  "display_name": "Petstore",
+  "aliases": [
+    "petstore",
+    "petstore",
+    "Petstore",
+    "petstore"
+  ],
+  "version": "1.0.0",
+  "description": "Swagger Petstore OpenAPI 3.0 sample API",
+  "connector_type": "petstore",
+  "category": "api_saas",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "destination_modes": ["append", "upsert", "delete"],
+  "supports_cdc": false,
+  "supports_ddl": false,
+  "auto_create_destination_tables": false,
+  "spec_version": "1.1",
+  "generated_at": "2026-06-19T16:08:41.982003",
+  "status": "active",  "quality_tier": "silver",  "default_headers": {},
+  "header_config_keys": [],
+  "base_url": "https://petstore3.swagger.io/api/v3",
+  "auth_type": "oauth2",
+  "oauth_provider": "petstore",
+  "supported_auth_methods": [
+    {
+      "method": "oauth2",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer",
+      "config_keys": [
+        "access_token",
+        "oauth_token_id",
+        "token"
+      ],
+      "oauth_provider": "petstore",
+      "description": "OAuth 2.0 via the 'petstore' provider; the access token is sent as a Bearer token in the Authorization header."
+    }
+  ],
+  "required_config": [
+    "access_token"
+  ],
+  "optional_config": [],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "access_token": {
+        "type": "string",
+        "description": "Access token / bearer credential used to authenticate requests.",
+        "secret": true      }
+    },
+    "required": [
+      "access_token"
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "access_token": {
+        "type": "string",
+        "description": "Access token / bearer credential used to authenticate requests.",
+        "secret": true      }
+    },
+    "required": [
+      "access_token"
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": ["json"],    "supports_cdc": false,
+    "supports_ddl": false,
+    "auto_create_destination_tables": false  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity to the API",
+      "method": "petstore_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate connection configuration",
+      "method": "petstore_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover available resources and their schemas",
+      "method": "petstore_discover_schema"
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities",
+      "method": "petstore_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export records from a REST resource with automatic pagination",
+      "method": "petstore_export",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Resource name to export"
+        },
+        {
+          "name": "max_pages",
+          "type": "integer",
+          "required": false,
+          "default": 10,
+          "description": "Maximum pages to fetch"
+        },
+        {
+          "name": "max_records",
+          "type": "integer",
+          "required": false,
+          "default": 10000,
+          "description": "Maximum records to return"
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "required": false,
+          "description": "Incremental sync cursor (ISO-8601 timestamp)"
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination resumption cursor"
+        }
+      ]
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Append records into a REST resource (POST)",
+      "method": "petstore_import_data",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Target resource name"
+        },
+        {
+          "name": "records",
+          "type": "array",
+          "required": true,
+          "description": "Records to import"
+        }
+      ]
+    },
+    {
+      "name": "upsert_data",
+      "type": "destination",
+      "description": "Idempotently upsert records into a REST resource (PUT on id, POST on miss)",
+      "method": "petstore_upsert_data",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Target resource name"
+        },
+        {
+          "name": "records",
+          "type": "array",
+          "required": true,
+          "description": "Records to upsert"
+        },
+        {
+          "name": "key_fields",
+          "type": "array",
+          "required": false,
+          "description": "Columns identifying a row (defaults to the resource id field)"
+        }
+      ]
+    },
+    {
+      "name": "delete_data",
+      "type": "destination",
+      "description": "Delete records from a REST resource by id (DELETE)",
+      "method": "petstore_delete_data",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Target resource name"
+        },
+        {
+          "name": "records",
+          "type": "array",
+          "required": true,
+          "description": "Records (each carrying the key) to delete"
+        },
+        {
+          "name": "key_fields",
+          "type": "array",
+          "required": false,
+          "description": "Columns identifying a row (defaults to the resource id field)"
+        }
+      ]
+    },
+    {
+      "name": "pet",
+      "type": "source",
+      "description": "Export records from pet (/pet/{petId})",
+      "method": "petstore_pet"
+    },
+    {
+      "name": "pet_find_by_status",
+      "type": "source",
+      "description": "Export records from pet_find_by_status (/pet/findByStatus)",
+      "method": "petstore_pet_find_by_status"
+    },
+    {
+      "name": "pet_find_by_tags",
+      "type": "source",
+      "description": "Export records from pet_find_by_tags (/pet/findByTags)",
+      "method": "petstore_pet_find_by_tags"
+    },
+    {
+      "name": "store_inventory",
+      "type": "source",
+      "description": "Export records from store_inventory (/store/inventory)",
+      "method": "petstore_store_inventory"
+    },
+    {
+      "name": "store_order",
+      "type": "source",
+      "description": "Export records from store_order (/store/order/{orderId})",
+      "method": "petstore_store_order"
+    },
+    {
+      "name": "user",
+      "type": "source",
+      "description": "Export records from user (/user/{username})",
+      "method": "petstore_user"
+    }
+  ],
+  "resources": [
+    {
+      "name": "pet",
+      "endpoint": "/pet/{petId}",
+      "path_params": ["petId"],
+      "id_field": "id",
+      "pagination_type": "none",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "limit",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get",
+        "create",
+        "update",
+        "delete"
+      ]
+    },
+    {
+      "name": "pet_find_by_status",
+      "endpoint": "/pet/findByStatus",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "none",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "limit",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    },
+    {
+      "name": "pet_find_by_tags",
+      "endpoint": "/pet/findByTags",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "none",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "limit",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    },
+    {
+      "name": "store_inventory",
+      "endpoint": "/store/inventory",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "none",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "limit",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    },
+    {
+      "name": "store_order",
+      "endpoint": "/store/order/{orderId}",
+      "path_params": ["orderId"],
+      "id_field": "id",
+      "pagination_type": "none",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "limit",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get",
+        "create",
+        "delete"
+      ]
+    },
+    {
+      "name": "user",
+      "endpoint": "/user/{username}",
+      "path_params": ["username"],
+      "id_field": "id",
+      "pagination_type": "none",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "limit",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get",
+        "create",
+        "update",
+        "delete"
+      ]
+    }
+  ],
+  "license": "MIT"
+}
+

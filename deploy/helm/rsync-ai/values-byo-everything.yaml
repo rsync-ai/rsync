@@ -1,0 +1,190 @@
+# Bring-your-own everything — the cloud-neutral reference for a production
+# install. Nothing stateful runs inside the cluster; the chart deploys only the
+# rsync.ai services and the connector plane, and wires them at services you
+# already operate.
+#
+#   helm install rsync ./rsync-ai \
+#     -f rsync-ai/values-byo-everything.yaml \
+#     -f my-secrets.yaml
+#
+# This file is also the honest inventory of what "production" costs: five
+# external dependencies, four of which hold state you cannot lose.
+#
+# Every `""` below is REQUIRED. The chart fails to render for the ones it can
+# check (bootstrap servers, ingress hosts, the three secrets); the rest fail at
+# runtime as a connection error naming the empty host.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets — do not put them in this file
+# ─────────────────────────────────────────────────────────────────────────────
+# Helm stores values in the release Secret in cleartext and `helm get values`
+# reads them back. Point at a Secret you manage instead (External Secrets
+# Operator, SOPS, sealed-secrets, a cloud secret-manager CSI driver).
+#
+# The Secret must carry: JWT_SECRET, ENCRYPTION_KEY, POSTGRES_PASSWORD, and —
+# when the corresponding feature is on — REDIS_PASSWORD, KAFKA_SASL_PASSWORD,
+# MINIO_ACCESS_KEY, MINIO_SECRET_KEY, OPENAI_API_KEY.
+#
+# ENCRYPTION_KEY encrypts every stored connection credential. Back it up before
+# you install, and never rotate it without carrying the old key in
+# ENCRYPTION_KEYS — every saved connection becomes permanently undecryptable.
+secrets:
+  existingSecret: ""
+
+postgresql:
+  enabled: false
+  # This database holds every pipeline definition and every encrypted
+  # connection credential. It is the one thing here whose loss is not
+  # recoverable from a re-install.
+  database: pipeline_db
+  username: rsync
+  external:
+    host: ""
+    port: 5432
+    sslMode: require
+
+redis:
+  enabled: false
+  # Correlation claims and cache only — no durable state. A flush costs
+  # in-flight request correlation, not data.
+  external:
+    host: ""
+    port: 6379
+
+kafka:
+  enabled: false
+  # Applied to the platform's own topics AND handed to Kafka Connect for its
+  # three internal topics. min.insync.replicas MUST be <= replicationFactor: a
+  # topic created the other way round is created successfully and can never be
+  # written to, and the symptom is "dispatched N rows ... no acks were
+  # recorded", not an error at creation. The chart refuses to render if you
+  # invert them.
+  replicationFactor: "3"
+  minInsyncReplicas: "2"
+  # Namespacing every topic under this prefix is what makes rsync.ai's topics
+  # findable on a cluster you share with other workloads. Change it only if it
+  # collides, and change it BEFORE the first run — existing pipelines carry
+  # their planned topic name in a persisted plan.
+  topicPrefix: "rsync."
+  external:
+    # CSV of every broker. All of them, not one: a single entry is a single
+    # point of failure for bootstrap even when the cluster itself is HA.
+    bootstrapServers: ""
+    securityProtocol: SASL_SSL
+    saslMechanism: SCRAM-SHA-512
+    # REQUIRED whenever saslMechanism is set: the username is a plain value and
+    # the chart refuses to render without it. An empty username with a mechanism
+    # set is how a client ends up connecting anonymously to a cluster that was
+    # supposed to authenticate it.
+    saslUsername: ""   # <-- fill this in
+    saslPassword: ""     # prefer secrets.existingSecret / KAFKA_SASL_PASSWORD
+
+objectStorage:
+  mode: s3
+  bucket: ""
+  # Staging objects ARE the in-flight transfer between the export and the sink.
+  # An expiry shorter than your pipeline retention window deletes rows that were
+  # still owed to the destination.
+  prefix: staging
+  stagingExpireDays: 7
+  external:
+    endpointUrl: ""
+    region: ""
+    # Leave BOTH empty to use workload identity (IRSA / AAD workload identity).
+    # GCS is the exception — its S3-compatible endpoint needs an HMAC key.
+    accessKeyId: ""
+    secretAccessKey: ""
+
+temporal:
+  enabled: false
+  external:
+    address: ""          # host:7233, or <ns>.<acct>.tmprl.cloud:7233
+    namespace: default
+
+# ─────────────────────────────────────────────────────────────────────────────
+# What still runs in-cluster
+# ─────────────────────────────────────────────────────────────────────────────
+connectors:
+  # Required for batch pipelines — it is the claim-check staging path, and the
+  # common one. Disabling it does not fail loudly: pre-flight polls the missing
+  # host for the full 120s first, then falls back to a slower path.
+  minio:
+    enabled: true
+
+  # The CDC plane. All three or none. kafka-connect + debezium-mcp share one
+  # pod: debezium writes source-DB credentials into a directory kafka-connect
+  # reads through FileConfigProvider, and an emptyDir in one pod keeps those
+  # credentials off the Kafka config topic without needing an RWX volume.
+  cdc:
+    enabled: true
+
+  # Declare every connector your pipelines use. `id` and `version` are not
+  # labels: they build the Service name the orchestrator resolves by DNS
+  # (<stackPrefix>-<id>-v<X-Y-Z>-mcp:8000). A connector that is not declared
+  # here is not deployed, and just-in-time deployment does not exist on
+  # Kubernetes — see connectorDeployer in values.yaml for why.
+  fleet:
+    - id: postgresql
+      version: v1.0.0
+      image: { repository: mcp-postgresql, tag: "" }
+    - id: mysql
+      version: v1.0.0
+      image: { repository: mcp-mysql, tag: "" }
+    - id: aws-s3
+      version: v1.0.0
+      image: { repository: mcp-aws-s3, tag: "" }
+      # Hands this connector the same object-storage env the platform uses.
+      objectStorage: true
+
+# The LLM tier, off by choice — not by necessity. Both images it runs
+# (llm-service-oss, connector-lifecycle) ARE published by this repo's release
+# workflow; the older note here said the opposite and told you to build one
+# yourself, which was never true of the images this tier actually uses.
+#
+# Off because this overlay is the minimal data plane: the Go create+run path is
+# Python-free and every LLM feature degrades gracefully when absent. Know the
+# cost before copying this file — /chat is the only pipeline-creation path in
+# the UI, so with the tier off you create pipelines via the API, not the app.
+# Set `generation.enabled: true` to get it back; nothing else has to change.
+generation:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Exposure
+# ─────────────────────────────────────────────────────────────────────────────
+# Both hosts must be externally routable. The browser calls the API directly, so
+# an in-cluster Service name will not do for `api`.
+ingress:
+  enabled: true
+  className: ""
+  annotations: {}
+  hosts:
+    app: ""
+    api: ""
+  tls: []
+  #  - secretName: rsync-tls
+  #    hosts: [app.example.com, api.example.com]
+
+frontend:
+  publicUrl: ""    # https://app.example.com — must match ingress.hosts.app
+  apiUrl: ""       # https://api.example.com — must match ingress.hosts.api
+
+# Multi-replica where it is safe. The orchestrator stays at one replica by
+# design: it holds an in-process MCP registry and single-writer Redis
+# correlation claims, so a second replica is not a second worker — it is a
+# second owner of the same claims.
+apiGateway:
+  replicaCount: 2
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Enable only after confirming the CNI enforces policy. Without enforcement
+# these objects apply cleanly, appear in `kubectl get networkpolicy`, and
+# enforce nothing — isolation that is not there reads exactly like isolation
+# that is.
+networkPolicy:
+  enabled: false
+  allowFromNamespaces: []
+  #  - ingress-nginx

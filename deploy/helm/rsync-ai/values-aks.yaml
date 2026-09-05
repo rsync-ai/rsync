@@ -1,0 +1,99 @@
+# AKS overlay — layer on top of values.yaml, do not use alone:
+#
+#   helm install rsync ./rsync-ai -f rsync-ai/values-aks.yaml -f my-secrets.yaml
+
+global:
+  # managed-csi-premium = premium SSD. `managed-csi` is standard SSD and is the
+  # cheaper default. Both are ReadWriteOnce, which is all this chart needs — no
+  # Azure Files / RWX share is required anywhere.
+  storageClass: managed-csi-premium
+
+postgresql:
+  enabled: false
+  external:
+    # Azure Database for PostgreSQL — Flexible Server.
+    host: ""            # <your-server>.postgres.database.azure.com
+    port: 5432
+    # Flexible Server enforces TLS by default. Note the username format differs
+    # between Single Server (user@server) and Flexible Server (plain user) —
+    # set `postgresql.username` accordingly, a wrong one fails as an auth error
+    # that names neither.
+    sslMode: require
+
+redis:
+  enabled: false
+  external:
+    host: ""            # rsync.redis.cache.windows.net
+    # Azure Cache for Redis is TLS-only on 6380 and requires an access key.
+    # This chart wires REDIS_URL as redis:// (not rediss://), so a TLS-only
+    # instance will refuse the connection. Either enable the non-TLS 6379 port
+    # on the cache, or keep redis in-chart — it holds correlation claims and
+    # cache entries, not durable state.
+    port: 6379
+
+# Event Hubs exposes a Kafka-protocol endpoint on :9093 with SASL_SSL/PLAIN,
+# where the username is the literal string `$ConnectionString` and the password
+# is the full connection string. It works, with two caveats worth knowing before
+# you pick it:
+#   - Event Hubs does not honour client-specified replication factor; the values
+#     below are what the platform tells its own admin client, and the service
+#     ignores them.
+#   - Topic auto-creation is namespace-tier dependent. On tiers without it, the
+#     kafka-init Job cannot create the platform topics and CDC will not start.
+kafka:
+  enabled: false
+  replicationFactor: "3"
+  minInsyncReplicas: "2"
+  external:
+    bootstrapServers: ""   # <namespace>.servicebus.windows.net:9093
+    securityProtocol: SASL_SSL
+    saslMechanism: PLAIN
+    saslUsername: "$ConnectionString"
+    saslPassword: ""       # Endpoint=sb://...;SharedAccessKey=...
+
+# Azure Blob via an S3-compatible gateway. There is no first-party S3 endpoint
+# for Blob Storage — `mode: azure` means you are fronting it with something that
+# speaks S3 (MinIO gateway, or a third party). If you have no such gateway,
+# leave objectStorage.mode as `minio` and let the chart run its own; the staging
+# tier is in-flight transfer data, not a system of record.
+objectStorage:
+  mode: azure
+  external:
+    endpointUrl: ""
+    region: ""
+    accessKeyId: ""
+    secretAccessKey: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+    # azure.workload.identity/client-id: <client-id>
+    #
+    # Workload identity also needs the label azure.workload.identity/use: "true"
+    # on the POD, not just the annotation on the ServiceAccount. Set it via
+    # global.podLabels.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingress — AKS Application Routing add-on (nginx)
+# ─────────────────────────────────────────────────────────────────────────────
+# Application Gateway Ingress Controller (className: azure-application-gateway)
+# also works; nginx is the simpler default and its WebSocket handling needs no
+# annotation beyond the read timeout below.
+ingress:
+  enabled: false
+  className: webapprouting.kubernetes.azure.com
+  annotations:
+    # The pipeline progress stream is a long-lived WebSocket. nginx's default
+    # 60s read timeout cuts a quiet connection and the UI stops updating
+    # mid-run with no error anywhere.
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "300"
+  hosts:
+    app: ""
+    api: ""
+  tls: []
+
+# Azure CNI Overlay with Cilium enforces NetworkPolicy. kubenet-based clusters
+# need the Calico add-on; without either, these objects enforce nothing.
+networkPolicy:
+  enabled: false

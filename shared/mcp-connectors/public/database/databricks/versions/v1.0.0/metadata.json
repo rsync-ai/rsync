@@ -1,0 +1,112 @@
+{
+  "id": "databricks",
+  "name": "Databricks",
+  "display_name": "Databricks",
+  "aliases": [
+    "databricks",
+    "databricks-sql",
+    "databricks-lakehouse"
+  ],
+  "version": "1.0.0",
+  "description": "Connector for the Databricks SQL warehouse / Lakehouse as a batch source and destination. DB-API via databricks-sql-connector. Optimized reads (keyset/offset pagination) and optimized writes (batched multi-row INSERT; flag-gated COPY-INTO from cloud storage is dormant in v1.0.0). Native Delta MERGE upsert present but dormant.",
+  "connector_type": "databricks",
+  "category": "data_warehouse",
+  "supported_versions": {
+    "batch": "Databricks SQL warehouses (Unity Catalog); DBSQL / Delta"
+  },
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "spec_version": "2.0",
+  "status": "active",
+  "production_verified": true,
+  "quality_tier": "bronze",
+  "auth_type": "api_key",
+  "supported_auth_methods": [
+    {
+      "method": "api_key",
+      "header_name": "",
+      "header_prefix": "",
+      "config_keys": [
+        "access_token"
+      ],
+      "description": "Personal Access Token (PAT) over a SQL warehouse (server_hostname + http_path)."
+    }
+  ],
+  "required_config": [
+    "server_hostname",
+    "http_path",
+    "access_token"
+  ],
+  "optional_config": [
+    "catalog",
+    "schema",
+    "connect_timeout"
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "server_hostname": {"type": "string", "description": "SQL warehouse host (e.g. dbc-xxxx.cloud.databricks.com)"},
+      "http_path": {"type": "string", "description": "SQL warehouse HTTP path (e.g. /sql/1.0/warehouses/abc123)"},
+      "access_token": {"type": "string", "description": "Databricks Personal Access Token (PAT)", "secret": true},
+      "catalog": {"type": "string", "description": "Unity Catalog catalog (defaults to the warehouse's default catalog)"},
+      "schema": {"type": "string", "description": "Default schema for unqualified tables", "default": "default"},
+      "connect_timeout": {"type": "integer", "description": "Socket timeout and max retry duration (seconds) for opening a connection; bounds the driver's retry policy so an unreachable host fails fast instead of retrying ~15 min", "default": 30}
+    },
+    "required": ["server_hostname", "http_path", "access_token"]
+  },
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "server_hostname": {"type": "string", "description": "SQL warehouse host (e.g. dbc-xxxx.cloud.databricks.com)"},
+      "http_path": {"type": "string", "description": "SQL warehouse HTTP path (e.g. /sql/1.0/warehouses/abc123)"},
+      "access_token": {"type": "string", "description": "Databricks Personal Access Token (PAT)", "secret": true},
+      "catalog": {"type": "string", "description": "Unity Catalog catalog (defaults to the warehouse's default catalog)"},
+      "schema": {"type": "string", "description": "Default schema for unqualified tables", "default": "default"},
+      "connect_timeout": {"type": "integer", "description": "Socket timeout and max retry duration (seconds) for opening a connection; bounds the driver's retry policy so an unreachable host fails fast instead of retrying ~15 min", "default": 30}
+    },
+    "required": ["server_hostname", "http_path", "access_token"]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": ["csv", "json", "jsonl"],
+    "supported_compressions": ["none", "gzip"],
+    "supports_cdc": false,
+    "load_strategy": {
+      "load_method": "multi_insert",
+      "merge_method": "merge",
+      "supports_staging": true,
+      "max_batch_rows": 10000,
+      "notes": "Default bulk write is a batched multi-row INSERT. Flag-gated COPY-INTO from cloud storage (RSYNC_DATABRICKS_COPY_INTO) is dormant in v1.0.0 and falls back to multi-row INSERT. Upsert is a native single Delta MERGE INTO."
+    }
+  },
+  "operations": [
+    {"name": "test_connection", "type": "core", "description": "Test connectivity to the SQL warehouse", "method": "databricks_test_connection"},
+    {"name": "validate_config", "type": "core", "description": "Validate configuration without connecting", "method": "databricks_validate_config"},
+    {"name": "discover_schema", "type": "core", "description": "Discover tables in the configured catalog/schema", "method": "databricks_discover_schema"},
+    {"name": "get_capabilities", "type": "core", "description": "Return connector capabilities", "method": "databricks_get_capabilities"},
+    {"name": "export", "type": "source", "description": "Paginated read from a table (keyset/offset)", "method": "databricks_export", "parameters": [
+      {"name": "table", "type": "string", "required": true},
+      {"name": "cursor_column", "type": "string", "required": false, "description": "Unique column for keyset pagination"},
+      {"name": "cursor_value", "type": "string", "required": false, "description": "Resume boundary echoed back as next_cursor"},
+      {"name": "limit", "type": "integer", "required": false, "default": 10000},
+      {"name": "offset", "type": "integer", "required": false, "default": 0}
+    ]},
+    {"name": "import_data", "type": "destination", "description": "Bulk write into a table (batched multi-row INSERT)", "method": "databricks_import_data", "parameters": [
+      {"name": "table", "type": "string", "required": true},
+      {"name": "data", "type": "array", "required": true},
+      {"name": "page_size", "type": "integer", "required": false, "default": 1000}
+    ]},
+    {"name": "ensure_table", "type": "destination", "description": "Auto-create the destination table (CREATE TABLE IF NOT EXISTS ... USING DELTA)", "method": "databricks_ensure_table"},
+    {"name": "drop_table", "type": "destination", "description": "Drop the destination table for run_mode=reload (DROP TABLE IF EXISTS)", "method": "databricks_drop_table"},
+    {"name": "merge", "type": "destination", "description": "CDC-as-destination apply: soft-delete Delta MERGE (insert/update upsert; delete tombstones _rsync_deleted)", "method": "databricks_merge", "parameters": [
+      {"name": "table", "type": "string", "required": true},
+      {"name": "data", "type": "array", "required": true},
+      {"name": "primary_keys", "type": "array", "required": true}
+    ]}
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

@@ -1,0 +1,117 @@
+{
+  "id": "redshift",
+  "name": "Amazon Redshift",
+  "display_name": "Amazon Redshift",
+  "aliases": [
+    "redshift",
+    "amazon-redshift",
+    "aws-redshift"
+  ],
+  "version": "1.0.0",
+  "description": "Connector for Amazon Redshift (PostgreSQL-wire data warehouse) as a batch source and destination. Optimized reads (keyset/offset pagination) and optimized writes (batched multi-row INSERT; flag-gated COPY-from-S3 is dormant in v1.0.0).",
+  "connector_type": "redshift",
+  "category": "relational_db",
+  "supported_versions": {
+    "batch": "Amazon Redshift (PostgreSQL 8.0.2 wire protocol; RA3/Serverless)"
+  },
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "spec_version": "1.0",
+  "status": "active",
+  "quality_tier": "bronze",
+  "auth_type": "basic",
+  "supported_auth_methods": [
+    {
+      "method": "basic",
+      "header_name": "",
+      "header_prefix": "",
+      "config_keys": [
+        "user",
+        "password"
+      ],
+      "description": "Username/password authentication to the Redshift cluster (port 5439, TLS required)."
+    }
+  ],
+  "required_config": [
+    "host",
+    "port",
+    "database",
+    "user",
+    "password"
+  ],
+  "optional_config": [
+    "schema",
+    "sslmode",
+    "iam_role",
+    "s3_bucket",
+    "region"
+  ],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "host": {"type": "string", "description": "Redshift cluster endpoint (e.g. my-cluster.xxxx.us-east-1.redshift.amazonaws.com)"},
+      "port": {"type": "integer", "description": "Cluster port", "default": 5439},
+      "database": {"type": "string", "description": "Database name"},
+      "user": {"type": "string", "description": "Database user"},
+      "password": {"type": "string", "description": "Database password", "secret": true},
+      "schema": {"type": "string", "description": "Default schema for unqualified tables", "default": "public"},
+      "sslmode": {"type": "string", "description": "psycopg2 sslmode (Redshift requires TLS)", "default": "require"},
+      "iam_role": {"type": "string", "description": "IAM role ARN for COPY-from-S3 (dormant in v1.0.0)"},
+      "s3_bucket": {"type": "string", "description": "S3 staging bucket for COPY-from-S3 (dormant in v1.0.0)"},
+      "region": {"type": "string", "description": "AWS region for COPY-from-S3 (dormant in v1.0.0)"}
+    },
+    "required": ["host", "port", "database", "user", "password"]
+  },
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "host": {"type": "string", "description": "Redshift cluster endpoint (e.g. my-cluster.xxxx.us-east-1.redshift.amazonaws.com)"},
+      "port": {"type": "integer", "description": "Cluster port", "default": 5439},
+      "database": {"type": "string", "description": "Database name"},
+      "user": {"type": "string", "description": "Database user"},
+      "password": {"type": "string", "description": "Database password", "secret": true},
+      "schema": {"type": "string", "description": "Default schema for unqualified tables", "default": "public"},
+      "sslmode": {"type": "string", "description": "psycopg2 sslmode (Redshift requires TLS)", "default": "require"},
+      "iam_role": {"type": "string", "description": "IAM role ARN for COPY-from-S3 (dormant in v1.0.0)"},
+      "s3_bucket": {"type": "string", "description": "S3 staging bucket for COPY-from-S3 (dormant in v1.0.0)"},
+      "region": {"type": "string", "description": "AWS region for COPY-from-S3 (dormant in v1.0.0)"}
+    },
+    "required": ["host", "port", "database", "user", "password"]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": ["csv", "json", "jsonl"],
+    "supported_compressions": ["none", "gzip"],
+    "supports_cdc": false,
+    "load_strategy": {
+      "load_method": "multi_insert",
+      "merge_method": "delete_insert",
+      "supports_staging": true,
+      "max_batch_rows": 10000,
+      "notes": "Default bulk write is a batched multi-row INSERT (Redshift has no COPY FROM STDIN). Flag-gated COPY-from-S3 (RSYNC_REDSHIFT_COPY_S3) is dormant in v1.0.0 and falls back to multi-row INSERT. Upsert is stage/DELETE USING/INSERT SELECT (Redshift has no ON CONFLICT)."
+    }
+  },
+  "operations": [
+    {"name": "test_connection", "type": "core", "description": "Test connectivity to the Redshift cluster", "method": "redshift_test_connection"},
+    {"name": "validate_config", "type": "core", "description": "Validate configuration without connecting", "method": "redshift_validate_config"},
+    {"name": "discover_schema", "type": "core", "description": "Discover tables in the configured schema", "method": "redshift_discover_schema"},
+    {"name": "get_capabilities", "type": "core", "description": "Return connector capabilities", "method": "redshift_get_capabilities"},
+    {"name": "export", "type": "source", "description": "Paginated read from a table (keyset/offset)", "method": "redshift_export", "parameters": [
+      {"name": "table", "type": "string", "required": true},
+      {"name": "cursor_column", "type": "string", "required": false, "description": "Unique column for keyset pagination"},
+      {"name": "cursor_value", "type": "string", "required": false, "description": "Resume boundary echoed back as next_cursor"},
+      {"name": "limit", "type": "integer", "required": false, "default": 10000},
+      {"name": "offset", "type": "integer", "required": false, "default": 0}
+    ]},
+    {"name": "import_data", "type": "destination", "description": "Bulk write into a table (batched multi-row INSERT)", "method": "redshift_import_data", "parameters": [
+      {"name": "table", "type": "string", "required": true},
+      {"name": "data", "type": "array", "required": true},
+      {"name": "page_size", "type": "integer", "required": false, "default": 1000}
+    ]}
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

@@ -1,0 +1,247 @@
+{
+  "id": "shopify-admin-graphql",
+  "name": "Shopify",
+  "display_name": "Shopify",
+  "aliases": [
+    "shopify-admin-graphql",
+    "shopify_admin_graphql",
+    "Shopify",
+    "shopify"
+  ],
+  "version": "1.0.0",
+  "description": "GraphQL connector for Shopify (source + products destination)",
+  "connector_type": "shopify-admin-graphql",
+  "category": "api_saas",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "destination_modes": [
+    "append",
+    "upsert"
+  ],
+  "supports_cdc": false,
+  "supports_ddl": false,
+  "auto_create_destination_tables": false,
+  "spec_version": "1.1",
+  "generated_at": "2026-05-12T13:39:04.694079",
+  "auth_type": "custom_header",
+  "oauth_provider": "shopify",
+  "oauth_authorize_params": { "shop": "shop" },
+  "supported_auth_methods": [
+    {
+      "method": "custom_header",
+      "header_name": "X-Shopify-Access-Token",
+      "header_prefix": "",
+      "config_keys": [
+        "access_token",
+        "token"
+      ],
+      "description": "Shopify Admin API access token (private app or custom app token)"
+    },
+    {
+      "method": "oauth2",
+      "header_name": "X-Shopify-Access-Token",
+      "header_prefix": "",
+      "config_keys": [
+        "oauth_token_id",
+        "access_token"
+      ],
+      "description": "OAuth 2.0 \u2014 for public/custom Shopify Apps installed on a shop"
+    }
+  ],
+  "required_config": [
+    "shop",
+    "access_token"
+  ],
+  "optional_config": [
+    "version"
+  ],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "shop": {
+        "type": "string",
+        "description": "Your Shopify store subdomain (e.g. 'acme' for acme.myshopify.com)"
+      },
+      "access_token": {
+        "type": "string",
+        "description": "Shopify Admin API access token",
+        "secret": true
+      },
+      "version": {
+        "type": "string",
+        "description": "Shopify API version",
+        "default": "2024-10"
+      }
+    },
+    "required": [
+      "shop",
+      "access_token"
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "shop": {
+        "type": "string",
+        "description": "Your Shopify store subdomain (e.g. 'acme' for acme.myshopify.com)"
+      },
+      "access_token": {
+        "type": "string",
+        "description": "Shopify Admin API access token",
+        "secret": true
+      },
+      "version": {
+        "type": "string",
+        "description": "Shopify API version",
+        "default": "2024-10"
+      }
+    },
+    "required": [
+      "shop",
+      "access_token"
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": [
+      "json"
+    ],
+    "supports_cdc": false,
+    "supports_ddl": false,
+    "auto_create_destination_tables": false,
+    "supports_bulk_export": true,
+    "bulk_export_protocol": "shopify_bulk_operations",
+    "bulk_export_threshold_env": "SHOPIFY_BULK_OPS_THRESHOLD",
+    "bulk_export_threshold_default": 10000
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity",
+      "method": "shopify-admin-graphql_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration",
+      "method": "shopify-admin-graphql_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover the upstream schema",
+      "method": "shopify-admin-graphql_discover_schema"
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities",
+      "method": "shopify-admin-graphql_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Generic GraphQL query dispatcher",
+      "method": "shopify-admin-graphql_export",
+      "parameters": [
+        {
+          "name": "operation_name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "variables",
+          "type": "object",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "shop",
+      "type": "source",
+      "description": "Retrieve shop information and settings",
+      "method": "shopify-admin-graphql_shop"
+    },
+    {
+      "name": "products",
+      "type": "source",
+      "description": "List products with Relay connection pagination",
+      "method": "shopify-admin-graphql_products"
+    },
+    {
+      "name": "orders",
+      "type": "source",
+      "description": "List orders with Relay connection pagination",
+      "method": "shopify-admin-graphql_orders"
+    },
+    {
+      "name": "customers",
+      "type": "source",
+      "description": "List customers with Relay connection pagination",
+      "method": "shopify-admin-graphql_customers"
+    },
+    {
+      "name": "collections",
+      "type": "source",
+      "description": "List collections with Relay connection pagination",
+      "method": "shopify-admin-graphql_collections"
+    },
+    {
+      "name": "inventory_items",
+      "type": "source",
+      "description": "List inventory items with Relay connection pagination",
+      "method": "shopify-admin-graphql_inventory_items"
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Append products via productCreate (one mutation per row; userErrors parsed)",
+      "method": "shopify-admin-graphql_import_data",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true,
+          "description": "Destination resource. Supported: products."
+        },
+        {
+          "name": "data",
+          "type": "array",
+          "required": true,
+          "description": "List of product records mapped to Shopify ProductInput."
+        }
+      ]
+    },
+    {
+      "name": "upsert_data",
+      "type": "destination",
+      "description": "Upsert products: productUpdate when a record carries a Shopify product GID, else productCreate. userErrors parsed.",
+      "method": "shopify-admin-graphql_upsert_data",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true,
+          "description": "Destination resource. Supported: products."
+        },
+        {
+          "name": "data",
+          "type": "array",
+          "required": true,
+          "description": "List of product records mapped to Shopify ProductInput."
+        },
+        {
+          "name": "key_fields",
+          "type": "array",
+          "required": false,
+          "description": "Natural key fields (e.g. id). Records carrying a product GID route to productUpdate."
+        }
+      ]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

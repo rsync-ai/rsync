@@ -1,0 +1,30 @@
+# govulncheck allowlist — connector-deployer ONLY.
+#
+# Each ID below is a REACHABLE finding that we consciously accept, with the
+# justification recorded here. The CI govulncheck step (.github/workflows/
+# security.yml) fails on ANY reachable vuln whose ID is NOT in this file, so a
+# new/other/fixable vulnerability still blocks the PR. Blank lines and lines
+# starting with '#' are ignored; only the GO-XXXX-XXXX tokens are the allowlist.
+#
+# Why these 5 are accepted:
+#   The deployer imports the Docker Go client (github.com/docker/docker/client)
+#   to CREATE/START/STOP/REMOVE/INSPECT containers and PING the daemon. The docker
+#   client and the docker DAEMON ship in ONE monolithic Go module, so govulncheck
+#   reports daemon-side CVEs as "reachable" merely because client and daemon share
+#   package init (client.init / versions.LessThan / volume.init). The deployer is
+#   a CLIENT — it never runs the daemon HTTP handlers these CVEs live in. All five
+#   are "Fixed in: N/A" for the github.com/docker/docker +incompatible line; the
+#   fixes exist only in the beta github.com/moby/moby/v2 module, which we will not
+#   depend on for a prod security service. Re-evaluate when moby/moby/v2 is stable.
+#
+# GO-2026-5746 — daemon PUT /containers/{id}/archive executes container binaries on host (docker cp path; deployer never calls archive).
+# GO-2026-5668 — daemon-side; not on the client create/run path the deployer uses.
+# GO-2026-5617 — daemon-side; not on the client create/run path the deployer uses.
+# GO-2026-4887 — daemon-side; not on the client create/run path the deployer uses.
+# GO-2026-4883 — daemon off-by-one in plugin privilege validation; deployer installs no plugins.
+
+GO-2026-5746
+GO-2026-5668
+GO-2026-5617
+GO-2026-4887
+GO-2026-4883

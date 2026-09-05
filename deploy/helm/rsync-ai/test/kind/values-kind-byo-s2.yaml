@@ -1,0 +1,22 @@
+# Stage S2 overlay: SASL_PLAINTEXT + PLAIN.
+#
+# Layered on values-kind-byo.yaml exactly as S1 is, and the ONLY difference from
+# values-kind-byo-s1.yaml is `saslMechanism`. That is deliberate: with one key
+# between the two stages, anything that breaks in S2 is attributable to mechanism
+# handling and to nothing else.
+#
+# This is the stage that would have caught the hardcoded ScramLoginModule in
+# CONNECT_SASL_JAAS_CONFIG -- `PLAIN` rendered perfectly valid YAML and then
+# failed at the broker handshake with a message naming a login module the
+# operator never chose. Fixed pre-emptively in #836, so S2 is a verification
+# stage rather than a discovery one.
+#
+# NO SECRET HERE. `kafka.external.saslPassword` is deliberately omitted; pass it
+# in a third, uncommitted `-f`. broker-up.sh writes the generated password to
+# ./.broker-sasl-password (gitignored, chmod 600).
+
+kafka:
+  external:
+    securityProtocol: SASL_PLAINTEXT
+    saslMechanism: PLAIN
+    saslUsername: rsync

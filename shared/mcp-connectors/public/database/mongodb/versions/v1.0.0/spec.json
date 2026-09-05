@@ -1,0 +1,113 @@
+{
+  "name": "mongodb",
+  "display_name": "MongoDB",
+  "aliases": null,
+  "version": "1.0.0",
+  "description": "Connector for MongoDB / MongoDB Atlas. Batch + CDC source and destination (import/upsert/delete keyed on _id).",
+  "category": "document_db",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": true,
+  "api_category_hint": null,
+  "api_category_hint_source": null,
+  "api_category_hint_confidence": null,
+  "base_url": "http://localhost:9999",
+  "default_port": 27017,
+  "connection_timeout": 30,
+  "auth": {
+    "type": "basic",
+    "header_name": "Authorization",
+    "header_prefix": "Bearer",
+    "env_var": "MONGODB_API_KEY",
+    "username_env": "MONGODB_USER",
+    "password_env": "MONGODB_PASSWORD",
+    "oauth_provider": null,
+    "oauth_scopes": null,
+    "token_url": null,
+    "authorize_url": null,
+    "custom_headers": null
+  },
+  "config_fields": [
+    {
+      "name": "host",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "default": null,
+      "description": "MongoDB host (ignored when connection_string is set)",
+      "env_var": "MONGODB_HOST"
+    },
+    {
+      "name": "port",
+      "type": "integer",
+      "required": false,
+      "secret": false,
+      "default": 27017,
+      "description": "MongoDB port number",
+      "env_var": "MONGODB_PORT"
+    },
+    {
+      "name": "database",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "default": null,
+      "description": "Database name whose collections are discovered/captured",
+      "env_var": "MONGODB_DATABASE"
+    },
+    {
+      "name": "user",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": null,
+      "description": "MongoDB username (SCRAM). Optional for an unauthenticated deployment.",
+      "env_var": "MONGODB_USER"
+    },
+    {
+      "name": "password",
+      "type": "string",
+      "required": false,
+      "secret": true,
+      "default": null,
+      "description": "MongoDB password",
+      "env_var": "MONGODB_PASSWORD"
+    },
+    {
+      "name": "replica_set",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": null,
+      "description": "Replica set name (e.g. rs0). Required for CDC unless connection_string encodes it.",
+      "env_var": null
+    },
+    {
+      "name": "auth_source",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": "admin",
+      "description": "Authentication database (default 'admin')",
+      "env_var": null
+    },
+    {
+      "name": "connection_string",
+      "type": "string",
+      "required": false,
+      "secret": true,
+      "default": null,
+      "description": "Full MongoDB URI (mongodb:// or mongodb+srv://). May embed credentials, so treated as secret.",
+      "env_var": null
+    },
+    {
+      "name": "tls",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": null,
+      "description": "TLS mode: 'true'/'require' to force TLS. Auto-on for *.mongodb.net.",
+      "env_var": null
+    }
+  ]
+}

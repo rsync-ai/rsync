@@ -1,0 +1,21 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-07-03T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-07-03T00:00:00.000000",
+      "changes": [
+        "Initial hand-curated BigQuery data-warehouse connector (source + destination, batch).",
+        "Optimized reads: keyset/offset paginated export (next_cursor/has_more) that resumes large tables to EOF.",
+        "Optimized writes: flag-gated bulk NDJSON load jobs (RSYNC_BQ_LOAD_JOB) with streaming fallback, advertised via DestinationLoadSpec(load_method=bq_load_job).",
+        "Delegates to shared BigQueryWarehouseAdapter; CDC merge/offset code present but dormant (supports_cdc=false)."
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

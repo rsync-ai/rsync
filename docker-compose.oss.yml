@@ -1,0 +1,186 @@
+# OSS / community edition overlay — build the moat-free images from source.
+#
+# ── THIS FILE IS NOT STANDALONE ──────────────────────────────────────────────
+# It is an overlay. Rendering it alone fails, by design:
+#
+#     $ docker compose -f docker-compose.oss.yml config --services
+#     service "connector-seed" refers to undefined volume mcp_connectors: invalid compose project
+#
+# Two objects are missing, not one, and Compose reports whichever it reaches
+# first — the same command also prints
+# `service "connector-deployer" refers to undefined network rsync-ai-mcp`
+# depending on service iteration order, so do not treat either message as the
+# whole diagnosis. Do NOT "fix" either by declaring them here. Both must be the SAME objects the
+# base file creates — declaring a second `mcp_connectors` in this file would give
+# the overlay its own empty volume, and `connector-seed` would seed a volume the
+# orchestrator never reads. They are inherited from the base layered underneath.
+#
+# ── THE REQUIRED BASE IS docker-compose.quickstart.yml ───────────────────────
+# Not `docker-compose.yml`. The cloud base has no `mcp_connectors` volume (its
+# top-level `volumes:` block carries postgres/kafka/redis/minio/connect_secrets/
+# tool_generator_oauth_tokens and nothing else), so
+# `-f docker-compose.yml -f docker-compose.oss.yml` fails with
+# `service "connector-deployer" refers to undefined volume mcp_connectors`.
+# Cloud uses a bind mount for connectors; only the quickstart stack uses the
+# named volume this overlay seeds.
+#
+#     docker compose -f docker-compose.quickstart.yml -f docker-compose.oss.yml up -d
+#
+# Validate the merge before starting anything (rc=0 and 18 services today):
+#
+#     docker compose -f docker-compose.quickstart.yml -f docker-compose.oss.yml \
+#         config --services
+#
+# ── WHAT THIS OVERLAY ACTUALLY CHANGES ───────────────────────────────────────
+# The quickstart ALREADY runs the moat-free lifecycle service: it pulls
+# `ghcr.io/rsync-ai/connector-lifecycle` for `tool-generator` and runs
+# `src.lifecycle.main`. This overlay does NOT introduce that — it switches three
+# services from PULLING the published images to BUILDING them from this working
+# tree. Diff of the rendered project, quickstart alone -> quickstart + this file:
+#
+#     tool-generator      ghcr.io/rsync-ai/connector-lifecycle:latest
+#                      -> rsync-ai/connector-lifecycle:local   (llm-service/Dockerfile.oss)
+#     connector-seed      ghcr.io/rsync-ai/connector-seed:latest
+#                      -> rsync-ai/connector-seed:local        (shared/mcp-connectors/Dockerfile.seed)
+#     connector-deployer  ghcr.io/rsync-ai/connector-deployer:latest  (tag kept)
+#                      +  build: ./connector-deployer
+#     tool-generator container_name  rsync-tool-generator -> rsync-connector-lifecycle
+#
+# Nothing else differs. `depends_on`, networks, volumes and every env var are
+# identical to the quickstart's — so use this file when you want to run YOUR
+# source, and plain `docker compose -f docker-compose.quickstart.yml up -d` when
+# you want the published release.
+#
+# Two consequences of the local tags: `docker compose pull` cannot resolve
+# `rsync-ai/*:local`, so pull with `--ignore-buildable` (or just `up -d`, which
+# builds what is missing); and `up -d` reuses an already-built local image, so
+# pass `--build` after editing source.
+#
+# ── DO NOT scale context7-mcp ────────────────────────────────────────────────
+# An earlier version of this header advised scaling llm-service, planner AND
+# context7-mcp to zero. The third one is wrong and the retired flag is
+# deliberately not spelled out here, because
+# llm-service/tests/test_oss_overlay_documents_its_invocation.py scans this whole
+# header for `--scale <name>=` and would match the cautionary quote as if it
+# were live advice.
+# `context7-mcp` carries `profiles: ["generate"]` (docker-compose.quickstart.yml)
+# and is therefore ABSENT from the default project — `config --services` lists it
+# only under `--profile generate`. Naming it in `--scale` scales a service the
+# rendered project does not contain.
+#
+# `llm-service` and `planner` ARE in the default project and are pullable: both
+# run the stripped `ghcr.io/rsync-ai/llm-service-oss` image, not the moat build,
+# so their presence is deliberate rather than a leak. Scaling them to 0 is a
+# resource choice (the Go data plane's REST create+run path is Python-free and
+# every LLM feature degrades gracefully when absent), not a requirement:
+#
+#     docker compose -f docker-compose.quickstart.yml -f docker-compose.oss.yml \
+#         up -d --scale llm-service=0 --scale planner=0
+#
+# ── OSS/cloud split ──────────────────────────────────────────────────────────
+# No runtime edition gate anywhere in this file. `RSYNC_EDITION: community`
+# below is cosmetic — its only reads are the `edition` field of the
+# lifecycle service's /health and /version bodies (llm-service/src/lifecycle/
+# main.py:52,60), and nothing branches on it. `RSYNC_BILLING_ENFORCED` is
+# deliberately NOT set here: it defaults to enforced (the cloud behavior) and
+# only docker-compose.quickstart.yml, the base underneath, sets it false.
+# See docs/internal/oss-cloud-runtime-split.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # One-shot init: seed the mcp_connectors volume so a COLD self-host boots WITH connectors
+  # (fixes the empty-volume "dead on arrival"). Idempotent — skips if the volume already has
+  # content, so it never clobbers user-generated connectors. Mirrors the kafka-init pattern.
+  # NOTE: orchestrator + temporal-adapter also mount mcp_connectors (:ro); they read connectors
+  # lazily at pipeline-run time, after this init has completed on boot.
+  connector-seed:
+    build:
+      context: ./shared/mcp-connectors
+      dockerfile: Dockerfile.seed
+    image: rsync-ai/connector-seed:local
+    container_name: rsync-connector-seed
+    restart: "no"
+    volumes:
+      - mcp_connectors:/target
+    command:
+      - sh
+      - -c
+      - >-
+        if [ -z "$$(ls -A /target 2>/dev/null)" ]; then
+          cp -a /seed/. /target/ && echo '✅ connectors seeded into mcp_connectors volume';
+        else
+          echo 'ℹ️  mcp_connectors already populated — skipping seed';
+        fi
+
+  # Connector Deployer (SEC-H-02): THE trusted socket-holder for the OSS stack.
+  # tool-generator (the connector-lifecycle image below) drops root + the docker
+  # socket and delegates JIT build/run to this small no-LLM Go service over an
+  # authenticated internal RPC. Same Go image the cloud stack uses — the OSS/cloud
+  # split stays at the compose layer, no runtime edition gate. Identical in shape
+  # to the connector-deployer in docker-compose.quickstart.yml (the layer this file
+  # sits on), so layering merges cleanly. See
+  # docs/internal/jit-connector-sandboxing.md + connector-deployer/CONTRACT.md.
+  connector-deployer:
+    build:
+      context: ./connector-deployer
+    container_name: rsync-connector-deployer
+    restart: unless-stopped
+    environment:
+      # ENVIRONMENT production => app-level S2S fail-closed (503 if secret unset),
+      # same posture the tool-generator carried. Compose-level :? guard is prod.yml only.
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
+      DEPLOYER_DOCKER_NETWORK: rsync-ai-mcp
+      MCP_SHARED_NETWORK: rsync-ai-mcp
+      OAUTH_TOKENS_VOLUME_NAME: rsync-ai-oauth-tokens
+    # Root + RW docker.sock live HERE now, not on tool-generator.
+    user: "0:0"
+    networks:
+      - default
+      - rsync-ai-mcp
+    volumes:
+      - mcp_connectors:/app/shared/mcp-connectors:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  tool-generator:
+    # Build the moat-free lifecycle image instead of pulling the mono generation image.
+    build:
+      context: ./llm-service
+      dockerfile: Dockerfile.oss
+    image: rsync-ai/connector-lifecycle:local
+    container_name: rsync-connector-lifecycle
+    restart: unless-stopped
+    # Replace the base's llm-service dependency entirely: the OSS stack has no llm-service,
+    # and the lifecycle service waits for the connector volume to be seeded so /v1/deploy can
+    # resolve connectors on disk. Also gate on the connector-deployer (SEC-H-02): the
+    # lifecycle service delegates JIT build/run to it and never touches the socket itself.
+    depends_on: !override
+      connector-seed:
+        condition: service_completed_successfully
+      connector-deployer:
+        condition: service_started
+    environment:
+      PORT: 5010
+      TOOLS_DIR: /app/shared/mcp-connectors
+      # Managed mode: the deployer builds user MCP images + starts containers when the
+      # orchestrator's preflight calls /v1/deploy. Set false to manage MCP containers via
+      # a separate stack.
+      RSYNC_MANAGED_CONNECTORS: ${RSYNC_MANAGED_CONNECTORS:-true}
+      DOCKER_NETWORK: rsync-ai-mcp
+      # SEC-H-02: delegate JIT build/run to the connector-deployer over its internal RPC.
+      DEPLOYER_URL: http://connector-deployer:5011
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
+      RSYNC_EDITION: community
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      ENVIRONMENT: production
+    command: ["python", "-m", "src.lifecycle.main"]
+    # SEC-H-02: runs the image's default unprivileged appuser — no root, no
+    # docker.sock. The connector-deployer is the sole trusted socket holder.
+    networks:
+      - default
+      - rsync-ai-mcp
+    volumes:
+      - mcp_connectors:/app/shared/mcp-connectors

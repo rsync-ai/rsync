@@ -1,0 +1,66 @@
+{
+  "id": "debezium",
+  "name": "Debezium",
+  "display_name": "Debezium (CDC Engine)",
+  "aliases": ["debezium", "Debezium", "cdc", "kafka-connect-cdc"],
+  "version": "1.0.0",
+  "description": "Internal CDC engine connector that provisions Debezium source connectors in Kafka Connect (start/stop/status).",
+  "connector_type": "debezium",
+  "category": "streaming",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "internal": true,
+  "supports_source": false,
+  "supports_destination": false,
+  "supports_cdc": true,
+  "required_config": [],
+  "optional_config": ["kafka_connect_url", "kafka_bootstrap_servers"],
+  "supported_databases": {
+    "mysql": {
+      "connector_class": "io.debezium.connector.mysql.MySqlConnector",
+      "cdc_position_method": "gtid"
+    },
+    "postgresql": {
+      "connector_class": "io.debezium.connector.postgresql.PostgresConnector",
+      "cdc_position_method": "lsn"
+    },
+    "mongodb": {
+      "connector_class": "io.debezium.connector.mongodb.MongoDbConnector",
+      "cdc_position_method": "oplog"
+    },
+    "sqlserver": {
+      "connector_class": "io.debezium.connector.sqlserver.SqlServerConnector",
+      "cdc_position_method": "lsn"
+    },
+    "oracle": {
+      "connector_class": "io.debezium.connector.oracle.OracleConnector",
+      "cdc_position_method": "scn"
+    }
+  },
+  "capabilities": {
+    "supports_cdc": true,
+    "cdc_provider": true,
+    "supported_databases": ["mysql", "postgresql", "mongodb", "sqlserver", "oracle"],
+    "kafka_connect_required": true
+  },
+  "tools": [
+    {
+      "name": "debezium_start_sync",
+      "description": "Create or update a Debezium connector in Kafka Connect for CDC streaming."
+    },
+    {
+      "name": "debezium_stop_sync",
+      "description": "Delete a Debezium connector from Kafka Connect."
+    },
+    {
+      "name": "debezium_get_status",
+      "description": "Get Debezium connector and task status from Kafka Connect."
+    },
+    {
+      "name": "debezium_list_connectors",
+      "description": "List all Kafka Connect connector names."
+    }
+  ]
+}
+
+

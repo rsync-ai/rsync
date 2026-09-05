@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-06-01T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-06-01T00:00:00.000000",
+      "changes": [
+        "Hand-curated connector: PII strip, Admin API 2024-10 fixes, OAuth access_token config_keys fix (PR #92)"
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

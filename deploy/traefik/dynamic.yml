@@ -1,0 +1,70 @@
+# Traefik Dynamic Configuration for rsync-ai
+# This file is watched for changes — edits apply without restart.
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+      cipherSuites:
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
+      sniStrict: true
+
+http:
+  middlewares:
+    security-headers:
+      headers:
+        stsSeconds: 63072000
+        stsIncludeSubdomains: true
+        stsPreload: true
+        contentTypeNosniff: true
+        frameDeny: true
+        browserXssFilter: true
+        referrerPolicy: strict-origin-when-cross-origin
+
+    rate-limit:
+      rateLimit:
+        average: 100
+        burst: 50
+        period: 1s
+
+    # An opt-in CORS allow-list. NOTHING ATTACHES THIS TODAY — no router in
+    # docker-compose.prod.yml lists cors-locked@file in its `middlewares=`, so
+    # defining it here has no effect on any request. It is kept as a ready-made
+    # starting point, not as an active control.
+    #
+    # You do not normally need it: the frontend is same-origin behind Traefik,
+    # and OAuth callbacks are top-level redirects, not cross-origin XHR. Reach
+    # for it only if you put a separate front end on its own origin.
+    #
+    # To use it: add your origin(s) to accessControlAllowOriginList below, then
+    # attach it to the routers that need it, e.g.
+    #   - "traefik.http.routers.api.middlewares=security-headers@file,rate-limit@file,cors-locked@file"
+    # An empty list means "no cross-origin allowed", which is why it is the
+    # default here — an allow-list naming somebody else's domain would be worse
+    # than none. (There is no CORS_ALLOWED_ORIGINS variable; nothing reads one.)
+    cors-locked:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        accessControlAllowHeaders:
+          - Authorization
+          - Content-Type
+          - X-Trace-Id
+        accessControlAllowOriginList: []
+        accessControlMaxAge: 600
+        addVaryHeader: true
+
+  # No routers or services are defined here. Every route in the stack comes from
+  # docker labels (see docker-compose.prod.yml); this file carries only TLS
+  # options and the reusable middlewares above.
+  #
+  # If you run SigNoz off-box and want Traefik to proxy its UI, add a router and
+  # service here for YOUR hostname and YOUR SigNoz address — do not expect a
+  # default. If you run SigNoz as a container instead, deploy/signoz/docker/
+  # already carries the labels; set SIGNOZ_DOMAIN and SIGNOZ_TRAEFIK_ENABLE=true.

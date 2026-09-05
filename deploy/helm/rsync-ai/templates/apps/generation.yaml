@@ -1,0 +1,190 @@
+{{- if .Values.generation.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+{{- $root := . }}
+{{/*
+llm-service and planner are ONE image (ghcr.io/rsync-ai/llm-service-oss) started
+with two entrypoints; tool-generator runs the smaller connector-lifecycle image.
+All three are rendered from one list so the shared env — LLM provider, model,
+Ollama URL — cannot drift between the two that use it, which is the failure this
+file is arranged to prevent: a planner on a different model from the explorer
+produces plans the rest of the stack cannot execute, and nothing errors.
+
+tool-generator's entrypoint is src.lifecycle.main, NOT
+src.agents.tool_generator.service: the latter is the connector-GENERATION
+service, which is not in any published image (llm-service/oss-strip-list.txt).
+Its module would be missing and the pod would CrashLoopBackOff on import.
+
+The tier is still optional (generation.enabled), but it now defaults on — see
+the note in values.yaml: /chat is the only pipeline-creation path in the UI.
+*/}}
+{{- $svcs := list
+  (dict "name" "llm-service"    "port" 5000 "cfg" .Values.generation.llmService    "image" .Values.generation.image                "command" (list))
+  (dict "name" "tool-generator" "port" 5010 "cfg" .Values.generation.toolGenerator "image" .Values.generation.toolGenerator.image  "command" (list "python" "-m" "src.lifecycle.main"))
+  (dict "name" "planner"        "port" 5011 "cfg" .Values.generation.planner       "image" .Values.generation.image                "command" (list "python" "-m" "src.agents.planner.service"))
+}}
+{{- range $svc := $svcs }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-{{ $svc.name }}
+  labels:
+    {{- include "rsync-ai.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $svc.name }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ $svc.port }}
+      targetPort: http
+  selector:
+    {{- include "rsync-ai.selectorLabels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $svc.name }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-{{ $svc.name }}
+  labels:
+    {{- include "rsync-ai.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: {{ $svc.name }}
+spec:
+  replicas: {{ $svc.cfg.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: {{ $svc.name }}
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" $root | nindent 8 }}
+        app.kubernetes.io/component: {{ $svc.name }}
+        {{- with $root.Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secret: {{ include (print $root.Template.BasePath "/secret.yaml") $root | sha256sum }}
+        {{- with $root.Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" $root | nindent 6 }}
+      initContainers:
+        {{- include "rsync-ai.catalogInitContainer" $root | nindent 8 }}
+      containers:
+        - name: {{ $svc.name }}
+          image: {{ include "rsync-ai.image" (dict "root" $root "image" $svc.image) }}
+          imagePullPolicy: {{ $root.Values.global.image.pullPolicy }}
+          {{- with $svc.command }}
+          command: {{ toJson . }}
+          {{- end }}
+          securityContext:
+            {{- toYaml $root.Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ $svc.port }}
+          env:
+            {{- include "rsync-ai.commonEnv" $root | nindent 12 }}
+            - name: PORT
+              value: {{ $svc.port | quote }}
+            {{- if ne $svc.name "tool-generator" }}
+            - name: LLM_PROVIDER
+              value: {{ $root.Values.generation.llm.provider | quote }}
+            - name: LLM_MODEL
+              value: {{ $root.Values.generation.llm.model | quote }}
+            {{- with $root.Values.generation.llm.ollamaUrl }}
+            # OLLAMA_BASE_URL wins over OLLAMA_URL in the client
+            # (openai_client.py _ollama_base_url), so both are set to the same
+            # value — setting only the losing one is a silent no-op.
+            - name: OLLAMA_URL
+              value: {{ . | quote }}
+            - name: OLLAMA_BASE_URL
+              value: {{ . | quote }}
+            {{- end }}
+            # Soft, not required: a fully-offline Ollama install has no OpenAI
+            # key and must still boot. Provider selection is by LLM_PROVIDER.
+            - name: OPENAI_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" $root }}
+                  key: OPENAI_API_KEY
+                  optional: true
+            {{- end }}
+            - name: INTERNAL_SERVICE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" $root }}
+                  key: INTERNAL_SERVICE_SECRET
+                  optional: true
+            {{- if ne $svc.name "tool-generator" }}
+            - name: LLM_GATEWAY_URL
+              value: "http://{{ $fullname }}-llm-service:5000"
+            {{- end }}
+            {{- if eq $svc.name "llm-service" }}
+            # Pins ONLY the Data Explorer to Ollama so schema metadata never
+            # leaves the deployment. It is listed explicitly because there is no
+            # envFrom here — an unlisted var set by the operator silently never
+            # reaches the container and the privacy guarantee quietly does not
+            # hold.
+            - name: EXPLORER_OFFLINE_ONLY
+              value: {{ $root.Values.generation.llm.explorerOfflineOnly | default false | quote }}
+            - name: USE_MOCK_LLM
+              value: "false"
+            {{- include "rsync-ai.kafkaEnv" $root | nindent 12 }}
+            {{- end }}
+            {{- if eq $svc.name "tool-generator" }}
+            - name: RSYNC_EDITION
+              value: community
+            - name: TOOLS_DIR
+              value: /app/shared/mcp-connectors
+            - name: RSYNC_MANAGED_CONNECTORS
+              value: {{ $root.Values.generation.toolGenerator.managedConnectors | quote }}
+            # DEPLOYER_URL is deliberately NOT set. The connector-deployer is
+            # absent from this chart (it needs /var/run/docker.sock — see the
+            # connectorDeployer note in values.yaml), so pointing this at a
+            # Service that does not exist would turn a clean "JIT unavailable"
+            # into a per-request timeout. Declare the connectors you need under
+            # connectors.fleet instead.
+            {{- end }}
+            {{- if eq $svc.name "planner" }}
+            - name: API_GATEWAY_URL
+              value: "http://{{ $fullname }}-api-gateway:{{ $root.Values.apiGateway.service.port }}"
+            - name: TOOL_GENERATOR_URL
+              value: "http://{{ $fullname }}-tool-generator:5010"
+            # The planner NAMES the Kafka topic it writes into the persisted
+            # plan, and the orchestrator later hands that name to the sink as a
+            # subscription. If this prefix disagrees with the orchestrator's
+            # KAFKA_TOPIC_PREFIX the two halves resolve different topics: rows
+            # are produced to one and the sink waits on the other, and the run
+            # fails as "no destination acks recorded", which reads as an
+            # unreachable destination rather than a name mismatch. Both come
+            # from kafka.topicPrefix for that reason. (The executor now
+            # re-qualifies defensively — resolvePipelineTopic in
+            # internal/agents/executor/executor.go — but do not rely on the
+            # backstop to paper over a misconfigured prefix here.)
+            {{- include "rsync-ai.kafkaEnv" $root | nindent 12 }}
+            # The planner is a request/response service in this topology; its
+            # Kafka consumer is off and the broker vars above exist only so the
+            # producer names topics consistently.
+            - name: ENABLE_KAFKA_CONSUMER
+              value: "false"
+            - name: CONNECTORS_DIR
+              value: /app/shared/mcp-connectors
+            {{- end }}
+            {{- range $k, $v := $root.Values.generation.extraEnv }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+          volumeMounts:
+            - name: connector-catalog
+              mountPath: /app/shared/mcp-connectors
+            {{- include "rsync-ai.kafkaTLSVolumeMount" $root | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 12
+          resources:
+            {{- toYaml $svc.cfg.resources | nindent 12 }}
+      volumes:
+        {{- include "rsync-ai.catalogVolume" $root | nindent 8 }}
+        {{- include "rsync-ai.kafkaTLSVolume" $root | nindent 8 }}
+{{- end }}
+{{- end }}

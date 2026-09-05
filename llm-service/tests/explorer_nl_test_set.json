@@ -1,0 +1,177 @@
+{
+  "description": "NL test set for Explorer table/column linking and SQL generation",
+  "test_cases": [
+    {
+      "id": "single_table_simple",
+      "category": "single_table",
+      "question": "Show me all users",
+      "expected": {
+        "tables": ["users"],
+        "sql_pattern": "SELECT.*FROM.*users",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "single_table_filter",
+      "category": "single_table",
+      "question": "Find users who signed up in 2024",
+      "expected": {
+        "tables": ["users"],
+        "sql_pattern": "SELECT.*FROM.*users.*WHERE.*(created|signup|registered).*2024",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "single_table_aggregation",
+      "category": "aggregation",
+      "question": "How many orders do we have?",
+      "expected": {
+        "tables": ["orders"],
+        "sql_pattern": "SELECT.*COUNT.*FROM.*orders",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "single_table_group_by",
+      "category": "aggregation",
+      "question": "Total revenue by month",
+      "expected": {
+        "tables": ["orders"],
+        "sql_pattern": "SELECT.*SUM.*(amount|total|revenue).*GROUP BY",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "join_simple",
+      "category": "join",
+      "question": "Show me all orders with customer names",
+      "expected": {
+        "tables": ["orders", "customers"],
+        "sql_pattern": "SELECT.*JOIN.*ON",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "join_multiple",
+      "category": "join",
+      "question": "List all products ordered by each customer",
+      "expected": {
+        "tables": ["products", "orders", "customers"],
+        "sql_pattern": "SELECT.*JOIN.*JOIN",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "ambiguous_table",
+      "category": "ambiguous",
+      "question": "Show me sales data",
+      "expected": {
+        "possible_tables": ["sales", "orders", "transactions", "revenue"],
+        "needs_hitl": true,
+        "hitl_reason": "ambiguous_table"
+      }
+    },
+    {
+      "id": "ambiguous_column",
+      "category": "ambiguous",
+      "question": "Show me the IDs",
+      "expected": {
+        "needs_hitl": true,
+        "hitl_reason": "ambiguous_column"
+      }
+    },
+    {
+      "id": "time_range",
+      "category": "filter",
+      "question": "Revenue for last 30 days",
+      "expected": {
+        "tables": ["orders"],
+        "sql_pattern": "SELECT.*SUM.*WHERE.*>.*NOW|CURRENT_DATE",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "top_n",
+      "category": "filter",
+      "question": "Top 10 customers by total spend",
+      "expected": {
+        "tables": ["customers", "orders"],
+        "sql_pattern": "SELECT.*SUM.*GROUP BY.*ORDER BY.*DESC.*LIMIT 10",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "complex_aggregation",
+      "category": "aggregation",
+      "question": "Average order value by customer segment",
+      "expected": {
+        "tables": ["orders", "customers"],
+        "sql_pattern": "SELECT.*AVG.*GROUP BY.*segment",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "subquery",
+      "category": "advanced",
+      "question": "Customers who never placed an order",
+      "expected": {
+        "tables": ["customers", "orders"],
+        "sql_pattern": "(NOT IN|NOT EXISTS|LEFT JOIN.*WHERE.*IS NULL)",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "date_comparison",
+      "category": "filter",
+      "question": "Orders from January 2024",
+      "expected": {
+        "tables": ["orders"],
+        "sql_pattern": "SELECT.*FROM.*orders.*WHERE.*(created|date).*2024-01",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "percentage_calc",
+      "category": "advanced",
+      "question": "What percentage of users are active?",
+      "expected": {
+        "tables": ["users"],
+        "sql_pattern": "SELECT.*(COUNT|SUM).*(/|100.0).*FROM.*users",
+        "needs_hitl": false
+      }
+    },
+    {
+      "id": "vague_question",
+      "category": "ambiguous",
+      "question": "Show me some data",
+      "expected": {
+        "needs_hitl": true,
+        "hitl_reason": "vague_question"
+      }
+    }
+  ],
+  "schema_context": {
+    "tables": [
+      {
+        "name": "users",
+        "columns": ["id", "name", "email", "created_at", "active", "segment"]
+      },
+      {
+        "name": "orders",
+        "columns": ["id", "user_id", "total", "created_at", "status"]
+      },
+      {
+        "name": "customers",
+        "columns": ["id", "name", "email", "segment", "created_at"]
+      },
+      {
+        "name": "products",
+        "columns": ["id", "name", "price", "category", "created_at"]
+      },
+      {
+        "name": "order_items",
+        "columns": ["id", "order_id", "product_id", "quantity", "price"]
+      }
+    ]
+  }
+}

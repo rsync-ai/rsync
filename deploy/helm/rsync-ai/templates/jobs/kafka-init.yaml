@@ -1,0 +1,362 @@
+{{/*
+Control-plane topic bootstrapper. Runs on every install and upgrade, against the
+in-chart broker or a BYO cluster alike — which is the point: on a customer's
+managed Kafka, `auto.create.topics.enable` is usually FALSE, and every topic
+this platform does not explicitly create then simply never exists. That failure
+is silent (see KI-KAFKA-DATAPLANE-AUTOCREATE-ONLY): the producer's send fails
+into a path that does not name the topic, and the consumer blocks on a topic
+that is not there. A pipeline reports `completed` having moved zero rows.
+
+The shell below is copied from docker-compose.quickstart.yml's `kafka-init`
+rather than reimplemented in Go templating. The prefix normalisation has to
+agree EXACTLY with kafkaclient.TopicPrefix(); a second implementation that
+disagrees by one character produces precisely the split this chart's other
+guards exist to prevent — topics created under one name, subscribed under
+another, nothing erroring.
+
+Two topics here are NOT in the compose list, deliberately: `pii.scan.request`
+and `pipeline.failed.dlq`. Both are auto-create-only on the compose path, which
+is survivable on the bundled broker (auto-create is on) and is not survivable on
+a BYO cluster — the shape this chart exists for.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-kafka-init
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-init
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kafka-init
+    spec:
+      restartPolicy: OnFailure
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: kafka-init
+          image: {{ .Values.kafka.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            - name: BOOTSTRAP
+              value: {{ include "rsync-ai.kafka.bootstrap" . | quote }}
+            {{/*
+              Rendered even when empty. An explicitly empty prefix is the
+              documented migration lever for a deployment with live unprefixed
+              topics, so it must reach the script as "set and empty", never as
+              "unset" — the script's `${VAR-default}` would otherwise substitute
+              the default and overwrite the operator's choice.
+            */}}
+            - name: KAFKA_TOPIC_PREFIX
+              value: {{ .Values.kafka.topicPrefix | quote }}
+            {{/*
+              Same helper Kafka Connect's internal topics use. It is shared
+              because these two used to derive the value independently and
+              disagreed -- 1 here, 3 there, for one cluster in one install.
+            */}}
+            - name: KAFKA_REPLICATION_FACTOR
+              value: {{ include "rsync-ai.kafka.replicationFactor" . | quote }}
+            - name: KAFKA_MIN_INSYNC_REPLICAS
+              value: {{ .Values.kafka.minInsyncReplicas | quote }}
+            {{- include "rsync-ai.kafkaSecurityEnv" . | nindent 12 }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              set -o pipefail
+              export PATH="/opt/kafka/bin:$PATH"
+
+              # ── AdminClient config ────────────────────────────────────────
+              # Written even for PLAINTEXT, because the timeouts are not
+              # optional. A client whose security config does not match the
+              # listener does NOT get an error -- it BLOCKS: a PLAINTEXT client
+              # against a SASL_PLAINTEXT listener sits in the handshake until
+              # the CLI's 5-minute default gives up, and the broker meanwhile
+              # logs "Unexpected Kafka request of type METADATA during SASL
+              # handshake". Unbounded, one retry took ~75s here, so the loop
+              # below would need over an hour to reach its own error message
+              # and the helm post-upgrade hook fails first with nothing but
+              # "Job in progress".
+              CFG=/tmp/kafka-client.properties
+              umask 077
+              {
+                echo "request.timeout.ms=10000"
+                echo "default.api.timeout.ms=15000"
+                echo "security.protocol=${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}"
+              } > "$CFG"
+
+              # ── TLS ───────────────────────────────────────────────────────
+              # `type=PEM` is the whole point (KIP-651, Kafka 2.7+). Without it
+              # the JVM defaults to JKS, fails to parse the PEM the chart
+              # mounted, and reports a keystore format error that names neither
+              # the file nor the setting. The Go and Python clients read the
+              # very same files with no conversion, which is why the chart can
+              # ship one CA bundle for every client it configures.
+              if [ -n "${KAFKA_SSL_CA_LOCATION:-}" ]; then
+                {
+                  echo "ssl.truststore.type=PEM"
+                  echo "ssl.truststore.location=$KAFKA_SSL_CA_LOCATION"
+                } >> "$CFG"
+              fi
+              if [ -n "${KAFKA_SSL_KEYSTORE_LOCATION:-}" ]; then
+                # mTLS. One file holding chain + key: a JVM PEM keystore cannot
+                # take the cert and the key as two paths the way the Go and
+                # Python clients do.
+                {
+                  echo "ssl.keystore.type=PEM"
+                  echo "ssl.keystore.location=$KAFKA_SSL_KEYSTORE_LOCATION"
+                } >> "$CFG"
+              fi
+              if [ "${KAFKA_SSL_SKIP_VERIFY:-}" = "true" ]; then
+                # As close as a JVM gets: this drops the HOSTNAME check only,
+                # the chain is still validated. The Go and Python clients skip
+                # both, so this job can fail on a certificate they accepted --
+                # deliberately not papered over, and validate.yaml refuses the
+                # combination that makes it likely (skip-verify with no CA).
+                echo "ssl.endpoint.identification.algorithm=" >> "$CFG"
+              fi
+
+              if [ -n "${KAFKA_SASL_MECHANISM:-}" ]; then
+                # The login module is a FUNCTION of the mechanism. Hardcoding
+                # one (as the Connect worker config did) turns a mechanism swap
+                # into a handshake failure whose message names the module, not
+                # the mechanism.
+                case "$KAFKA_SASL_MECHANISM" in
+                  SCRAM-SHA-256|SCRAM-SHA-512)
+                    MOD=org.apache.kafka.common.security.scram.ScramLoginModule ;;
+                  PLAIN)
+                    MOD=org.apache.kafka.common.security.plain.PlainLoginModule ;;
+                  OAUTHBEARER)
+                    MOD=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule ;;
+                  *)
+                    echo "FATAL: kafka-init cannot build a JAAS config for sasl.mechanism=$KAFKA_SASL_MECHANISM" >&2
+                    echo "       Supported here: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER." >&2
+                    exit 1 ;;
+                esac
+                # The password crosses TWO grammars on the way to the broker,
+                # and each one eats a level of backslash:
+                #
+                #   1. this file is a Java .properties file (--command-config is
+                #      read with Utils.loadProps);
+                #   2. the value of sasl.jaas.config is then parsed with a
+                #      StreamTokenizer-backed quoted-string grammar.
+                #
+                # So it needs escaping twice. Escaping it once -- which is what
+                # this did originally -- corrupts identically to not escaping at
+                # all: C:\Users\svc arrives as C:Userssvc and the broker reports
+                # an ordinary authentication failure, so the password looks wrong
+                # rather than mangled. A trailing backslash is worse: it swallows
+                # the closing quote and Kafka reports "JAAS config entry not
+                # terminated by semi-colon", which points at the syntax instead.
+                #
+                # Measured against Kafka's own parser, not inferred -- reproduce
+                # with test/kind/jaas-probe/run.sh.
+                esc() {
+                  printf '%s' "$1" |
+                    sed 's/\\/\\\\/g; s/"/\\"/g' |
+                    sed 's/\\/\\\\/g'
+                }
+                if [ "$KAFKA_SASL_MECHANISM" = "OAUTHBEARER" ]; then
+                  # OAUTHBEARER splits its settings across two places, and the
+                  # split is not guessable from the other mechanisms:
+                  #
+                  #   * clientId / clientSecret / scope / extension_* are JAAS
+                  #     OPTIONS on the login module line;
+                  #   * the token endpoint is a separate client property.
+                  #
+                  # A credential-less "LoginModule required;" line -- the shape
+                  # PLAIN and SCRAM suggest -- is rejected outright with
+                  # "The OAuth configuration option clientId value must be
+                  # non-null". Measured against kafka-clients 3.7.0, not
+                  # inferred: reproduce with test/kind/jaas-probe/OAuthProbe.java.
+                  for v in KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT \
+                           KAFKA_SASL_OAUTHBEARER_CLIENT_ID \
+                           KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET; do
+                    eval "set_to=\${$v:-}"
+                    if [ -z "$set_to" ]; then
+                      echo "FATAL: sasl.mechanism=OAUTHBEARER but $v is empty." >&2
+                      echo "       Set kafka.external.oauth.{tokenEndpoint,clientId,clientSecret}." >&2
+                      echo "       The client secret is read from the release Secret; an" >&2
+                      echo "       existingSecret must carry key KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET." >&2
+                      exit 1
+                    fi
+                  done
+                  # Order matches what the Python builder emits (sorted), so a
+                  # config dumped from here and one from llm-service diff cleanly
+                  # while debugging a handshake. The JVM itself does not care.
+                  OPTS=$(printf ' clientId="%s" clientSecret="%s"' \
+                    "$(esc "$KAFKA_SASL_OAUTHBEARER_CLIENT_ID")" \
+                    "$(esc "$KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET")")
+                  if [ -n "${KAFKA_SASL_OAUTHBEARER_EXTENSIONS:-}" ]; then
+                    OLDIFS=$IFS; IFS=,
+                    for kv in $KAFKA_SASL_OAUTHBEARER_EXTENSIONS; do
+                      IFS=$OLDIFS
+                      case "$kv" in
+                        *=*) ;;
+                        *) echo "FATAL: kafka.external.oauth.extensions entry '$kv' has no '=' separator." >&2; exit 1 ;;
+                      esac
+                      EK=${kv%%=*}; EV=${kv#*=}
+                      # 'auth' is the SASL/OAUTHBEARER frame's own key -- sending
+                      # it as an extension produces a malformed frame the broker
+                      # rejects without naming the extension.
+                      if [ -z "$EK" ] || [ "$EK" = "auth" ]; then
+                        echo "FATAL: kafka.external.oauth.extensions has an empty or reserved name in '$kv'." >&2
+                        exit 1
+                      fi
+                      OPTS=$OPTS$(printf ' extension_%s="%s"' "$EK" "$(esc "$EV")")
+                      IFS=,
+                    done
+                    IFS=$OLDIFS
+                  fi
+                  if [ -n "${KAFKA_SASL_OAUTHBEARER_SCOPE:-}" ]; then
+                    OPTS=$OPTS$(printf ' scope="%s"' "$(esc "$KAFKA_SASL_OAUTHBEARER_SCOPE")")
+                  fi
+                  {
+                    echo "sasl.mechanism=$KAFKA_SASL_MECHANISM"
+                    printf 'sasl.jaas.config=%s required%s;\n' "$MOD" "$OPTS"
+                    # Without the handler class OAuthBearerLoginModule falls back
+                    # to its UNSECURED default and mints a self-signed JWS; the
+                    # broker then rejects a token it cannot validate, and the
+                    # error describes the token rather than the missing handler.
+                    echo "sasl.login.callback.handler.class=${KAFKA_SASL_OAUTHBEARER_LOGIN_CALLBACK_HANDLER}"
+                    echo "sasl.oauthbearer.token.endpoint.url=${KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT}"
+                  } >> "$CFG"
+                else
+                  {
+                    echo "sasl.mechanism=$KAFKA_SASL_MECHANISM"
+                    printf 'sasl.jaas.config=%s required username="%s" password="%s";\n' \
+                      "$MOD" "$(esc "${KAFKA_SASL_USERNAME:-}")" "$(esc "${KAFKA_SASL_PASSWORD:-}")"
+                  } >> "$CFG"
+                fi
+              fi
+              CC="--command-config $CFG"
+
+              # Wait for the broker. On a BYO cluster this is the DNS/auth check too.
+              READY=""
+              for i in $(seq 1 30); do
+                if ERR="$(kafka-topics.sh --bootstrap-server "$BOOTSTRAP" $CC --list 2>&1)"; then
+                  READY=1; break
+                fi
+                echo "waiting for kafka at $BOOTSTRAP ($i/30)..."; sleep 5
+              done
+
+              if [ -z "$READY" ]; then
+                # "never became reachable" was a guess, and on a secured cluster
+                # it was the wrong one -- the broker was reachable and rejecting
+                # us. /dev/tcp separates the two without adding a dependency.
+                echo "FATAL: could not list topics on $BOOTSTRAP" >&2
+                echo "  security.protocol=${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT} sasl.mechanism=${KAFKA_SASL_MECHANISM:-<none>} sasl username=${KAFKA_SASL_USERNAME:-<none>}" >&2
+                FIRST="${BOOTSTRAP%%,*}"; H="${FIRST%:*}"; PORT="${FIRST##*:}"
+                if (exec 3<>"/dev/tcp/$H/$PORT") 2>/dev/null; then
+                  exec 3<&- 3>&-
+                  echo "  TCP connect to $H:$PORT SUCCEEDED -> the broker is reachable." >&2
+                  echo "  This is an AUTHENTICATION or PROTOCOL mismatch, not DNS and not the network." >&2
+                else
+                  echo "  TCP connect to $H:$PORT FAILED -> DNS or network, not authentication." >&2
+                fi
+                echo "  last error from kafka-topics.sh:" >&2
+                printf '%s\n' "$ERR" | tail -20 >&2
+                exit 1
+              fi
+
+              P="${KAFKA_TOPIC_PREFIX-rsync.}"
+              P="$(printf '%s' "$P" | tr -cd 'a-zA-Z0-9._-')"
+              case "$P" in ""|*[._-]) ;; *) P="$P." ;; esac
+              echo "Topic prefix: ${P:-<none>}"
+
+              RF="${KAFKA_REPLICATION_FACTOR:-1}"
+              case "$RF" in ''|*[!0-9]*) RF=1 ;; esac
+              if [ "$RF" -lt 1 ]; then RF=1; fi
+
+              # Clamp the REQUEST down to the cluster that actually exists, exactly
+              # as the orchestrator does for the topics it mints itself
+              # (backend-orchestrator/internal/kafka/topology.go clampToCluster).
+              # The chart states durability INTENT; this Job is the only part of the
+              # chart holding a live, authenticated broker view, so it is the only
+              # place that intent can be reconciled with reality. Unclamped, an RF
+              # above the broker count fails every create with
+              # InvalidReplicationFactor and the install dies on topic 1 of 25.
+              #
+              # A count of 0 means the probe itself failed, and that is deliberately
+              # NOT read as "zero brokers": guessing at a cluster we cannot see would
+              # be worse than letting Kafka reject the request with its own accurate
+              # error. Same reasoning as brokerCount() returning 0 to disable the
+              # clamp on the Go side.
+              BROKERS="$(kafka-broker-api-versions.sh --bootstrap-server "$BOOTSTRAP" $CC 2>/dev/null | grep -c '(id: ' || true)"
+              case "$BROKERS" in ''|*[!0-9]*) BROKERS=0 ;; esac
+              if [ "$BROKERS" -gt 0 ] && [ "$RF" -gt "$BROKERS" ]; then
+                echo "WARN: replication factor $RF exceeds the live broker count $BROKERS - clamping to $BROKERS"
+                RF="$BROKERS"
+              fi
+
+              MISR="${KAFKA_MIN_INSYNC_REPLICAS:-}"
+              case "$MISR" in *[!0-9]*) MISR='' ;; esac
+              if [ -n "$MISR" ] && [ "$MISR" -lt 1 ]; then MISR=''; fi
+              PINNED=""
+              if [ -z "$MISR" ]; then
+                # Unset does NOT mean "no floor" -- it means the BROKER's default
+                # applies, and that default is invisible from here. On MSK and most
+                # managed clusters it is 2, so a topic created RF=1 against one is
+                # born permanently unwritable: creation succeeds, --list shows it,
+                # the sink subscribes to it, and every acks=all produce returns
+                # NOT_ENOUGH_REPLICAS with nothing in any log naming the replication
+                # factor as the cause. The pipeline reports running and streams zero
+                # rows. These 14 topics carry the whole agent control plane, so that
+                # is not a corner: it is the platform failing to start work at all.
+                #
+                # min(2, RF) is the value the orchestrator already pins for its own
+                # topics (kafka/replication.go pinMinInsyncReplicas) and the one the
+                # planner pairs with its RF, so these topics stop being the odd ones
+                # out. It is never a durability downgrade -- it only removes the
+                # impossible case.
+                MISR=2
+                if [ "$MISR" -gt "$RF" ]; then MISR="$RF"; fi
+                PINNED=" pinned"
+              elif [ "$MISR" -gt "$RF" ]; then
+                # min.insync.replicas above RF creates a topic that EXISTS and can
+                # never be written to: every acks=all produce is rejected with
+                # NOT_ENOUGH_REPLICAS, which the platform surfaces as a pipeline
+                # that dispatched rows and recorded no acks.
+                echo "WARN: KAFKA_MIN_INSYNC_REPLICAS=$MISR exceeds replication factor $RF - clamping to $RF"
+                MISR="$RF"
+              fi
+              MISR_ARG="--config min.insync.replicas=$MISR"
+              echo "Replication factor: $RF (min ISR: $MISR$PINNED; live brokers: $BROKERS)"
+
+              mk() {
+                kafka-topics.sh --create --if-not-exists \
+                  --bootstrap-server "$BOOTSTRAP" $CC \
+                  --topic "$1" --partitions "${2:-3}" \
+                  --replication-factor "$RF" $MISR_ARG || exit 1
+              }
+
+              for agent in intent planner validator executor discovery resolver \
+                           capability_resolver connection_validator cost_estimator; do
+                mk "${P}agent.control.commands.$agent"
+              done
+              mk "${P}agent.planner.responses"
+              mk "${P}pipeline.domain.events"
+              mk "${P}pii.scan.request"
+              mk "${P}pii.scan.response"
+              mk "${P}pipeline.failed.dlq"
+              echo "Kafka topics ready"
+          resources:
+            requests: { cpu: 100m, memory: 256Mi }
+            limits: { memory: 512Mi }
+          {{- if include "rsync-ai.kafka.hasTLSFiles" . }}
+          volumeMounts:
+            {{- include "rsync-ai.kafkaTLSVolumeMount" . | nindent 12 }}
+          {{- end }}
+      {{- if include "rsync-ai.kafka.hasTLSFiles" . }}
+      volumes:
+        {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
+      {{- end }}

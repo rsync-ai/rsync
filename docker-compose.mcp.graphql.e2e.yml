@@ -1,0 +1,40 @@
+#
+# Generated-GraphQL e2e overlay (OPT-IN, MCP-connector tier) — layered on top of
+# docker-compose.mcp.yml by run_gate.sh's dc_mcp() ONLY when E2E_INCLUDE_GRAPHQL=1.
+# Normal gate runs (flag unset) never load this file, so the generated connector
+# compose renders exactly as committed.
+#
+# Purpose: let the widgets-graphql MCP reach the PRIVATE mock GraphQL host
+# (http://mock-graphql:8080/graphql) during the generated-GraphQL e2e:
+#
+#   1. MCP_ALLOW_PRIVATE_NETWORKS=true bypasses the connector's outbound SSRF
+#      guard (base_connector.py) for the private mock host. This is a DEV/CI-ONLY
+#      escape hatch — base_connector documents it as "never in production", which
+#      is exactly why it lives in this opt-in overlay and NOT in the generated
+#      docker-compose.mcp.yml.
+#   2. Attaching the connector to rsync-ai_default (the app network, where the
+#      mock-graphql service publishes its alias) so `mock-graphql` resolves by DNS.
+#      The base compose keeps user connectors on the isolated rsync-ai-mcp
+#      network only; the mock is a trusted CI fixture, so bridging widgets-graphql
+#      onto the app net for this one opt-in run is intentional and contained.
+#
+# Mirrors docker-compose.mcp.e2e.yml (the OAuth/github-rest lane) — same topology
+# that proved the generated-GraphQL connector live (widgets-graphql MCP on
+# {rsync-ai-mcp, rsync-ai_default} + MCP_ALLOW_PRIVATE_NETWORKS). Consumed by
+# e2e/test_graphql_connector_to_postgres_batch.py.
+#
+services:
+  widgets-graphql-v1-0-0-mcp:
+    environment:
+      - MCP_ALLOW_PRIVATE_NETWORKS=true
+    networks:
+      - rsync-network
+      - rsync-ai_default
+
+networks:
+  rsync-network:
+    external: true
+    name: rsync-ai-mcp
+  rsync-ai_default:
+    external: true
+    name: rsync-ai_default

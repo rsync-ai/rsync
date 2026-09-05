@@ -1,0 +1,1517 @@
+#
+# rsync.ai — Quickstart (single-command install)
+#
+# Usage:
+#   docker compose -f docker-compose.quickstart.yml --env-file .env up -d
+#
+# All images are pre-built and pulled from GHCR — no source code required.
+# Requires: Docker 24+, docker compose v2, and an .env file (see install.sh).
+#
+# ── Sizing ───────────────────────────────────────────────────────────────────
+# Targets a 4 vCPU / 16 GiB host. Every service carries an explicit `mem_limit`,
+# which is doing two jobs: it stops one runaway container from taking the host
+# down via the OOM killer (which picks the largest RSS on the box — Kafka or
+# Postgres — not the container at fault), and it is what makes the orchestrator's
+# own memory-aware sizing engage at all. resolveTableConcurrency() reads the
+# CGROUP limit (backend-orchestrator/internal/agents/executor/table_concurrency.go
+# detectMemoryLimitBytes); with no limit set, that read returns "unlimited" and
+# the memory guard is dead code, so a 4-core box fans out to 8 concurrent table
+# loads budgeted at ~384 MiB each.
+#
+# These are CEILINGS, not reservations: nothing is pre-allocated, and the sum
+# deliberately exceeds host RAM (~13.8 GiB default, ~16.8 GiB with the cdc
+# profile) because no two services peak together. Steady state for the default
+# profile is far lower. The number that is NOT slack is the orchestrator's 2 GiB
+# — that one is a real buffer budget, since concurrent table loads are sized
+# against it. Shrink it and throughput drops; the stack will not fall over.
+#
+# ── Optional profiles ────────────────────────────────────────────────────────
+# The default `up` starts the batch data plane only. Two opt-in profiles:
+#
+#   --profile cdc       change-data-capture: kafka-connect + debezium-mcp +
+#                       kafka-mcp-sink. ~2 GiB, and REQUIRED for any CDC
+#                       pipeline — the orchestrator's preflight hard-requires
+#                       all three (internal/workers/infra_preflight.go
+#                       requiredServices), so without this profile a CDC
+#                       pipeline fails preflight rather than degrading.
+#   --profile generate  context7-mcp, API-doc research used only while GENERATING
+#                       a new connector. Existing connectors run without it.
+#
+#   docker compose -f docker-compose.quickstart.yml --profile cdc up -d
+#
+
+name: rsync-ai
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Kafka client security — BYO / managed broker (MSK, Confluent Cloud, Aiven, …)
+# ─────────────────────────────────────────────────────────────────────────────
+# Merged into every service that opens a Kafka client. It exists because Compose
+# injects ONLY what a service declares: a KAFKA_SASL_PASSWORD sitting in the
+# root .env reaches interpolation but NOT the container, so the operator sets
+# credentials, the app connects anonymously, and an ACL-enforcing broker rejects
+# it with an error naming the broker rather than the missing setting.
+#
+# Every value defaults to empty, and empty is read as unset
+# (shared/go/kafkaclient/config.go:240 protocolWasSet) — so with none of these in
+# your .env the rendered config is byte-identical to the bundled-broker default.
+#
+# Minimum for SASL/SCRAM against a managed cluster:
+#   KAFKA_BROKERS=b-1.example.amazonaws.com:9096,b-2.example.amazonaws.com:9096
+#   KAFKA_SECURITY_PROTOCOL=SASL_SSL
+#   KAFKA_SASL_MECHANISM=SCRAM-SHA-512
+#   KAFKA_SASL_USERNAME=... / KAFKA_SASL_PASSWORD=...
+#
+# Setting the credentials WITHOUT KAFKA_SECURITY_PROTOCOL is the common slip; the
+# client logs "SASL settings are configured … they are IGNORED" once and connects
+# anonymously (config.go:281-297). Read that warning as a hard failure.
+x-kafka-security: &kafka-security
+  KAFKA_SECURITY_PROTOCOL: ${KAFKA_SECURITY_PROTOCOL:-}
+  KAFKA_SASL_MECHANISM: ${KAFKA_SASL_MECHANISM:-}
+  KAFKA_SASL_USERNAME: ${KAFKA_SASL_USERNAME:-}
+  KAFKA_SASL_PASSWORD: ${KAFKA_SASL_PASSWORD:-}
+  # OIDC client-credentials, for KAFKA_SASL_MECHANISM=OAUTHBEARER.
+  KAFKA_SASL_OAUTHBEARER_CLIENT_ID: ${KAFKA_SASL_OAUTHBEARER_CLIENT_ID:-}
+  KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET: ${KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET:-}
+  KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT: ${KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT:-}
+  KAFKA_SASL_OAUTHBEARER_SCOPE: ${KAFKA_SASL_OAUTHBEARER_SCOPE:-}
+  KAFKA_SASL_OAUTHBEARER_EXTENSIONS: ${KAFKA_SASL_OAUTHBEARER_EXTENSIONS:-}
+  # JVM-only, and only the CDC profile has a JVM in it (kafka-connect). Carried
+  # here anyway because Debezium's schema-history client is configured from the
+  # connector container's environment, so the name has to survive the trip.
+  KAFKA_SASL_OAUTHBEARER_LOGIN_CALLBACK_HANDLER: ${KAFKA_SASL_OAUTHBEARER_LOGIN_CALLBACK_HANDLER:-}
+  # AWS_MSK_IAM. The Go services implement it (kafkaclient/tokenauth/msk.go); the
+  # Python tier and the JVM Connect image do not, so an IAM-only cluster runs the
+  # Go data plane and leaves the CDC profile unable to authenticate.
+  KAFKA_AWS_REGION: ${KAFKA_AWS_REGION:-}
+  # Paths INSIDE the container. Mount the files yourself — this file cannot guess
+  # a host path.
+  KAFKA_SSL_CA_LOCATION: ${KAFKA_SSL_CA_LOCATION:-}
+  # mTLS, the two-path shape the Go and Python clients read.
+  KAFKA_SSL_CERT_LOCATION: ${KAFKA_SSL_CERT_LOCATION:-}
+  KAFKA_SSL_KEY_LOCATION: ${KAFKA_SSL_KEY_LOCATION:-}
+  # The SAME keypair in the shape a JVM can load: ONE file holding chain + key.
+  # A JVM PEM keystore cannot take the cert and the key as two paths, so this is
+  # not derivable from the pair above -- `cat tls.crt tls.key > client.pem`.
+  # Inert in the Go and Python services; kafka-init and kafka-connect need it,
+  # and kafka-init refuses to start a half-configured mTLS handshake without it.
+  KAFKA_SSL_KEYSTORE_LOCATION: ${KAFKA_SSL_KEYSTORE_LOCATION:-}
+  # Disables certificate verification, and is logged unconditionally when set: a
+  # self-signed lab, not prod.
+  #
+  # TWO SPELLINGS FOR ONE SETTING, and that is not tidy-uppable here. Python
+  # reads only KAFKA_SSL_SKIP_VERIFY (kafka_security.py:54); Go reads both
+  # (config.go:80 and the alias at :115). Shipping the Go spelling alone leaves
+  # verification silently ON for the Python half -- the exact split the Go alias
+  # was added to end. So both names are emitted, each defaulting to the other,
+  # and an operator who sets either one gets both.
+  KAFKA_SSL_SKIP_VERIFY: ${KAFKA_SSL_SKIP_VERIFY:-${KAFKA_SSL_INSECURE_SKIP_VERIFY:-}}
+  KAFKA_SSL_INSECURE_SKIP_VERIFY: ${KAFKA_SSL_INSECURE_SKIP_VERIFY:-${KAFKA_SSL_SKIP_VERIFY:-}}
+
+services:
+
+  # ─── INFRASTRUCTURE ──────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: rsync-postgres
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    # Metadata DB only — pipeline rows never land here. Default shared_buffers
+    # is 128 MiB; 1 GiB leaves room for work_mem across the connection pool.
+    mem_limit: 1g
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-rsync}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-pipeline_db}
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=1
+      - -c
+      - max_replication_slots=1
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-rsync} -d ${POSTGRES_DB:-pipeline_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── DEMO WAREHOUSE ──────────────────────────────────────────────────────────
+  #
+  # The destination half of the zero-credential try-it path. `sample-data` gives a
+  # fresh install a source it can connect to with no credentials, but a pipeline
+  # needs TWO steps: intent.go:417 returns "plan has insufficient steps" for
+  # len(steps) < 2. Every other destination in the catalog requires a credential
+  # the new user does not have yet, so without this container the demo ends at a
+  # successful connection test and never produces a row.
+  #
+  # This is deliberately NOT the `postgres` service above. That one is sized and
+  # tuned as a metadata DB ("pipeline rows never land here") and runs with
+  # max_wal_senders=1 / max_replication_slots=1 -- exactly one CDC slot. Landing
+  # demo rows there would put pipeline data in the control-plane DB and contend
+  # for that single slot.
+  #
+  # It gets its OWN credential rather than reusing POSTGRES_PASSWORD. Sharing the
+  # control-plane password with a user-facing destination is a real, if
+  # second-order, escalation path: any workspace member can run SQL against this
+  # database through the pipeline/explorer, a superuser there can read
+  # pg_authid.rolpassword, and a SCRAM verifier is offline-crackable. The two
+  # credentials have no reason to be the same string, so they are not.
+  #
+  # The default below is a literal, on purpose, and is not a secret. A new
+  # REQUIRED var -- one written with the `:?` interpolation guard -- would break a
+  # fresh host and ONLY a fresh host, because a single unsatisfied `:?` aborts
+  # interpolation for the whole merged config while prod, staging and CI stay
+  # green. So the choice was a default or nothing. This database is never
+  # published off the internal network and holds nothing but the sample rows the
+  # demo writes into it. Override RSYNC_DEMO_WAREHOUSE_PASSWORD if you disagree.
+  demo-warehouse:
+    image: postgres:16-alpine
+    container_name: rsync-demo-warehouse
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      POSTGRES_USER: rsync_demo
+      POSTGRES_PASSWORD: ${RSYNC_DEMO_WAREHOUSE_PASSWORD:-rsync-demo-not-a-secret}
+      POSTGRES_DB: demo_warehouse
+    volumes:
+      - demo_warehouse_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rsync_demo -d demo_warehouse"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: rsync-redis
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      # Consumed by the command + healthcheck below; keeps the secret off ARGV.
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+    command:
+      - sh
+      - -c
+      # The password is written to a 0600 file and never appears on the
+      # redis-server ARGV, so it stays out of `ps` on the host and out of
+      # the rendered compose spec (`docker inspect` / `compose config`).
+      - |
+        umask 077
+        : > /tmp/redis.conf
+        printf 'requirepass %s\n' "$$REDIS_PASSWORD" > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli --no-auth-warning ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.7.0
+    hostname: kafka
+    container_name: rsync-kafka
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    # KAFKA_HEAP_OPTS below pins Xmx at 512m; the rest is direct buffers plus
+    # log-segment page cache, which is reclaimable and so shrinks under
+    # pressure rather than triggering the OOM killer.
+    mem_limit: 1g
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 3000
+      KAFKA_GROUP_MAX_SESSION_TIMEOUT_MS: 180000
+      KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS: 6000
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:29093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:29092,CONTROLLER://0.0.0.0:29093,PLAINTEXT_HOST://0.0.0.0:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Broker cap on a single record. The 1 MiB default rejects CDC change events for
+      # rows with large JSON/text/blob columns (RecordTooLargeException -> Debezium task
+      # FAILED -> restart loop). LOCKSTEP with CONNECT_PRODUCER_MAX_REQUEST_SIZE on
+      # kafka-connect below and with the sink worker's ReaderConfig.MaxBytes, which must
+      # exceed it. docker-compose.yml has carried this since the bug was first hit; the
+      # quickstart shipped the producer half alone.
+      KAFKA_MESSAGE_MAX_BYTES: 15728640
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+      # Kafka's two internal topics default to 50 partitions EACH. On a single
+      # broker that is 100 partition directories, 100 index/timeindex file pairs
+      # and 100 sets of in-memory metadata, bought for a stack whose real traffic
+      # is a handful of 3-partition topics. 8 keeps consumer-group parallelism far
+      # above anything this deployment uses.
+      #
+      # Both are read ONLY when the topic is first created. On an existing cluster
+      # this is a harmless no-op — the topic keeps whatever partition count it was
+      # born with — so it cannot be applied retroactively by editing this file.
+      KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS: 8
+      KAFKA_TRANSACTION_STATE_LOG_NUM_PARTITIONS: 8
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  kafka-init:
+    image: apache/kafka:3.7.0
+    container_name: rsync-kafka-init
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    # Run-once job, but it starts a JVM AdminClient. Capped so the topic
+    # creation pass cannot compete with the broker it just waited for.
+    mem_limit: 512m
+    depends_on:
+      kafka:
+        condition: service_healthy
+        # Other half of docker-compose.byo-kafka.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        required: false
+    entrypoint: ["/bin/bash", "-c"]
+    environment:
+      # Bare `-`, matching kafkaclient.TopicPrefix(): an explicitly empty prefix
+      # is the migration lever for a deployment with live unprefixed topics, and
+      # `:-` would silently overwrite that choice with the default.
+      # The bundled broker by default; a BYO cluster when KAFKA_BROKERS is set.
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:29092}
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX-rsync.}
+      # Same two names the Go side reads (backend-orchestrator/internal/kafka/
+      # replication.go EnvReplicationFactor / EnvMinInsyncReplicas), so ONE operator
+      # setting covers the bootstrapper below and the runtime topic-creation path.
+      # The bundled single-broker Kafka can only serve RF=1, but this file is also
+      # the starting point for a self-host pointed at a real cluster via
+      # KAFKA_BROKERS, and there RF=1 topics go unavailable during routine rolling
+      # maintenance. Empty means "operator stated nothing" -> the default below.
+      KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-}
+      KAFKA_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-}
+      # The topic bootstrapper is a Kafka CLIENT too. Without these it speaks
+      # PLAINTEXT to a SASL listener, which does not error -- it BLOCKS in the
+      # handshake until the CLI's 5-minute default gives up, so the install
+      # appears to hang rather than to be misconfigured.
+      <<: *kafka-security
+    # Single-element list, not a bare block scalar: Compose splits a string
+    # command into argv, which left `bash -c` running only "export" and exiting 0
+    # without creating a single topic. `docker compose config` must show ONE item.
+    command:
+      - |
+        export PATH="/opt/kafka/bin:$$PATH";
+        # Was hardcoded to kafka:29092 in all four calls below, so the RF /
+        # min-insync knobs above could never reach the real cluster they were
+        # written for. Honour KAFKA_BROKERS like every other service does.
+        B="$${KAFKA_BROKERS:-kafka:29092}";
+        P="$${KAFKA_TOPIC_PREFIX-rsync.}";
+        P="$$(printf '%s' "$$P" | tr -cd 'a-zA-Z0-9._-')";
+        case "$$P" in ""|*[._-]) ;; *) P="$$P." ;; esac;
+        echo "Topic prefix: $${P:-<none>}";
+        RF="$${KAFKA_REPLICATION_FACTOR:-1}";
+        case "$$RF" in ''|*[!0-9]*) RF=1 ;; esac;
+        if [ "$$RF" -lt 1 ]; then RF=1; fi;
+        MISR="$${KAFKA_MIN_INSYNC_REPLICAS:-}";
+        case "$$MISR" in *[!0-9]*) MISR='' ;; esac;
+        if [ -n "$$MISR" ] && [ "$$MISR" -lt 1 ]; then MISR='' ; fi;
+        MISR_ARG="";
+        if [ -n "$$MISR" ]; then
+          if [ "$$MISR" -gt "$$RF" ]; then
+            echo "WARN: KAFKA_MIN_INSYNC_REPLICAS=$$MISR exceeds replication factor $$RF - clamping to $$RF (min.insync.replicas > RF creates a topic that every acks=all produce rejects with NOT_ENOUGH_REPLICAS on brokers older than 3.7)";
+            MISR="$$RF";
+          fi;
+          MISR_ARG="--config min.insync.replicas=$$MISR";
+        fi;
+        echo "Replication factor: $$RF (min ISR: $${MISR:-<broker default>})";
+        # ── AdminClient config ────────────────────────────────────────────────
+        # Written even for PLAINTEXT, because the timeouts are not optional. A
+        # client whose security config does not match the listener does NOT get
+        # an error -- it BLOCKS. Mirrors deploy/helm/rsync-ai/templates/jobs/
+        # kafka-init.yaml; the two are hand-kept in lockstep because compose can
+        # ship no file but this one (install.sh downloads only this compose file),
+        # so the script cannot be factored out.
+        CFG=/tmp/kafka-client.properties;
+        umask 077;
+        { echo "request.timeout.ms=10000";
+          echo "default.api.timeout.ms=15000";
+          echo "security.protocol=$${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}"; } > "$$CFG";
+        # type=PEM is the whole point (KIP-651, Kafka 2.7+): without it the JVM
+        # defaults to JKS, fails to parse the PEM, and names neither the file nor
+        # the setting. The Go and Python clients read the same file unconverted.
+        if [ -n "$${KAFKA_SSL_CA_LOCATION:-}" ]; then
+          { echo "ssl.truststore.type=PEM";
+            echo "ssl.truststore.location=$$KAFKA_SSL_CA_LOCATION"; } >> "$$CFG";
+        fi;
+        # mTLS. KAFKA_SSL_KEYSTORE_LOCATION, NOT KAFKA_SSL_CERT_LOCATION: a JVM
+        # PEM keystore is ONE file holding chain + key, and it cannot take the
+        # two paths the Go and Python clients read. Pointing it at the cert half
+        # alone yields "Failed to load PEM keystore" -- a message that names the
+        # file, so it reads like a bad certificate rather than a missing key.
+        if [ -n "$${KAFKA_SSL_KEYSTORE_LOCATION:-}" ]; then
+          { echo "ssl.keystore.type=PEM";
+            echo "ssl.keystore.location=$$KAFKA_SSL_KEYSTORE_LOCATION"; } >> "$$CFG";
+        elif [ -n "$${KAFKA_SSL_CERT_LOCATION:-}" ]; then
+          # Fail here rather than connect without the client certificate: the
+          # broker would reject the handshake anyway, and this says why.
+          echo "FATAL: KAFKA_SSL_CERT_LOCATION is set but KAFKA_SSL_KEYSTORE_LOCATION is not." >&2;
+          echo "       The Kafka CLI is a JVM and needs the keypair as ONE PEM file:" >&2;
+          echo "         cat \$$KAFKA_SSL_CERT_LOCATION \$$KAFKA_SSL_KEY_LOCATION > /certs/client.pem" >&2;
+          echo "       then set KAFKA_SSL_KEYSTORE_LOCATION=/certs/client.pem." >&2;
+          exit 1;
+        fi;
+        # KAFKA_SSL_SKIP_VERIFY is the spelling every service reads; the anchor
+        # at the top of this file fills it in from either name.
+        if [ "$${KAFKA_SSL_SKIP_VERIFY:-}" = "true" ]; then
+          # As close as a JVM gets: drops the HOSTNAME check only, the chain is
+          # still validated. The Go client skips both, so this job can fail on a
+          # certificate the data plane accepted. Deliberately not papered over.
+          echo "ssl.endpoint.identification.algorithm=" >> "$$CFG";
+        fi;
+        if [ -n "$${KAFKA_SASL_MECHANISM:-}" ]; then
+          # The login module is a FUNCTION of the mechanism; hardcoding one turns
+          # a mechanism swap into a handshake failure naming the module.
+          case "$$KAFKA_SASL_MECHANISM" in
+            SCRAM-SHA-256|SCRAM-SHA-512) MOD=org.apache.kafka.common.security.scram.ScramLoginModule ;;
+            PLAIN) MOD=org.apache.kafka.common.security.plain.PlainLoginModule ;;
+            OAUTHBEARER) MOD=org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule ;;
+            *) echo "FATAL: kafka-init cannot build a JAAS config for sasl.mechanism=$$KAFKA_SASL_MECHANISM" >&2;
+               echo "       Supported here: PLAIN, SCRAM-SHA-256, SCRAM-SHA-512, OAUTHBEARER." >&2;
+               echo "       AWS_MSK_IAM is NOT one of them: the Go data plane implements it" >&2;
+               echo "       (shared/go/kafkaclient/tokenauth/msk.go) but this JVM CLI image does" >&2;
+               echo "       not. Create the topics out of band and drop kafka-init -- see" >&2;
+               echo "       docs/deployment/kafka-acls.md." >&2;
+               exit 1 ;;
+          esac;
+          # The password crosses TWO grammars (a Java .properties file, then the
+          # StreamTokenizer-backed sasl.jaas.config value) and each eats a level
+          # of backslash. Escaping once corrupts identically to not escaping:
+          # C:\Users\svc arrives as C:Userssvc and the broker reports an ordinary
+          # auth failure, so the password looks wrong rather than mangled.
+          esc() { printf '%s' "$$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed 's/\\/\\\\/g'; };
+          if [ "$$KAFKA_SASL_MECHANISM" = "OAUTHBEARER" ]; then
+            for v in KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT KAFKA_SASL_OAUTHBEARER_CLIENT_ID KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET; do
+              eval "set_to=\$${$$v:-}";
+              if [ -z "$$set_to" ]; then
+                echo "FATAL: sasl.mechanism=OAUTHBEARER but $$v is empty." >&2; exit 1;
+              fi;
+            done;
+            OPTS=$$(printf ' clientId="%s" clientSecret="%s"' "$$(esc "$$KAFKA_SASL_OAUTHBEARER_CLIENT_ID")" "$$(esc "$$KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET")");
+            if [ -n "$${KAFKA_SASL_OAUTHBEARER_EXTENSIONS:-}" ]; then
+              OLDIFS=$$IFS; IFS=,;
+              for kv in $$KAFKA_SASL_OAUTHBEARER_EXTENSIONS; do
+                IFS=$$OLDIFS;
+                case "$$kv" in *=*) ;; *) echo "FATAL: extensions entry '$$kv' has no '=' separator." >&2; exit 1 ;; esac;
+                EK=$${kv%%=*}; EV=$${kv#*=};
+                # 'auth' is the OAUTHBEARER frame's own key; sending it as an
+                # extension makes a malformed frame the broker rejects without
+                # naming the extension.
+                if [ -z "$$EK" ] || [ "$$EK" = "auth" ]; then
+                  echo "FATAL: extensions has an empty or reserved name in '$$kv'." >&2; exit 1;
+                fi;
+                OPTS=$$OPTS$$(printf ' extension_%s="%s"' "$$EK" "$$(esc "$$EV")");
+                IFS=,;
+              done;
+              IFS=$$OLDIFS;
+            fi;
+            if [ -n "$${KAFKA_SASL_OAUTHBEARER_SCOPE:-}" ]; then
+              OPTS=$$OPTS$$(printf ' scope="%s"' "$$(esc "$$KAFKA_SASL_OAUTHBEARER_SCOPE")");
+            fi;
+            { echo "sasl.mechanism=$$KAFKA_SASL_MECHANISM";
+              printf 'sasl.jaas.config=%s required%s;\n' "$$MOD" "$$OPTS";
+              # Without the handler class OAuthBearerLoginModule falls back to
+              # its UNSECURED default and mints a self-signed JWS; the broker
+              # then rejects a token it cannot validate, and the error describes
+              # the token rather than the missing handler.
+              echo "sasl.login.callback.handler.class=org.apache.kafka.common.security.oauthbearer.secured.OAuthBearerLoginCallbackHandler";
+              echo "sasl.oauthbearer.token.endpoint.url=$$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT"; } >> "$$CFG";
+          else
+            if [ -z "$${KAFKA_SASL_USERNAME:-}" ] || [ -z "$${KAFKA_SASL_PASSWORD:-}" ]; then
+              echo "FATAL: sasl.mechanism=$$KAFKA_SASL_MECHANISM but KAFKA_SASL_USERNAME or KAFKA_SASL_PASSWORD is empty." >&2;
+              exit 1;
+            fi;
+            { echo "sasl.mechanism=$$KAFKA_SASL_MECHANISM";
+              printf 'sasl.jaas.config=%s required username="%s" password="%s";\n' "$$MOD" "$$(esc "$$KAFKA_SASL_USERNAME")" "$$(esc "$$KAFKA_SASL_PASSWORD")"; } >> "$$CFG";
+          fi;
+        fi;
+        CC="--command-config $$CFG";
+        # Wait for the broker. On a BYO cluster this is the DNS/auth check too --
+        # and it must run BEFORE --if-not-exists, whose "already exists" success
+        # would otherwise mask an auth failure as a no-op.
+        READY="";
+        i=1;
+        while [ "$$i" -le 30 ]; do
+          if kafka-topics.sh --bootstrap-server "$$B" $$CC --list >/dev/null 2>&1; then READY=1; break; fi;
+          echo "waiting for kafka at $$B ($$i/30)...";
+          sleep 5;
+          i=$$((i + 1));
+        done;
+        if [ -z "$$READY" ]; then
+          echo "FATAL: could not list topics on $$B" >&2;
+          echo "  security.protocol=$${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT} sasl.mechanism=$${KAFKA_SASL_MECHANISM:-<none>} sasl username=$${KAFKA_SASL_USERNAME:-<none>}" >&2;
+          echo "  If the credentials are set but security.protocol is not, the client" >&2;
+          echo "  connected ANONYMOUSLY and the broker rejected it: set KAFKA_SECURITY_PROTOCOL." >&2;
+          exit 1;
+        fi;
+        for agent in intent planner validator executor discovery resolver capability_resolver connection_validator cost_estimator; do
+          kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}agent.control.commands.$$agent" --partitions 3 --replication-factor "$$RF" $$MISR_ARG || exit 1
+        done &&
+        kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}agent.planner.responses" --partitions 3 --replication-factor "$$RF" $$MISR_ARG &&
+        kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}pipeline.domain.events" --partitions 3 --replication-factor "$$RF" $$MISR_ARG &&
+        kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}pii.scan.response" --partitions 3 --replication-factor "$$RF" $$MISR_ARG &&
+        echo "✅ Kafka topics ready"
+    restart: "no"
+
+  minio:
+    # Pinned: this is the one-command install. An unpinned tag means two operators running
+    # the same install command on different days get different object stores.
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    container_name: rsync-minio
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── TEMPORAL ────────────────────────────────────────────────────────────────
+
+  temporal:
+    image: temporalio/auto-setup:1.22.4
+    container_name: rsync-temporal
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 1g
+    depends_on:
+      postgres:
+        condition: service_healthy
+        # Other half of docker-compose.byo-postgres.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        required: false
+    environment:
+      DB: postgresql
+      DB_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-rsync}
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: ${POSTGRES_HOST:-postgres}
+      # TLS to the database. Temporal does NOT read POSTGRES_SSLMODE -- it has
+      # its own names, verified against the pinned image's
+      # /etc/temporal/config/config_template.yaml (1.22.4). SQL_TLS_ENABLED
+      # gates all four sql blocks (default store + visibility) at once.
+      # Managed Postgres that mandates TLS (Azure Database, RDS with
+      # rds.force_ssl=1) needs this true or auto-setup cannot create its
+      # schemas -- and then no workflow engine starts and every pipeline fails.
+      SQL_TLS_ENABLED: ${POSTGRES_TLS_ENABLED:-false}
+      SQL_HOST_VERIFICATION: ${POSTGRES_TLS_VERIFY_HOST:-false}
+      SQL_HOST_NAME: ${POSTGRES_TLS_SERVER_NAME:-}
+      SQL_CA: ${POSTGRES_TLS_CA_FILE:-}
+      # The SECOND TLS family. auto-setup runs temporal-sql-tool to create the
+      # schemas BEFORE starting the server, and that is a different binary with
+      # its own flags -- verified from `temporal-sql-tool --help` on this pinned
+      # image, not from the server's config template. Set only the four names
+      # above and the schema step still connects in plaintext, so a database
+      # that refuses plaintext kills auto-setup before the server ever binds:
+      # no workflow engine, every pipeline hangs, and no TLS error in any log.
+      SQL_TLS: ${POSTGRES_TLS_ENABLED:-false}
+      SQL_TLS_CA_FILE: ${POSTGRES_TLS_CA_FILE:-}
+      SQL_TLS_SERVER_NAME: ${POSTGRES_TLS_SERVER_NAME:-}
+      # Stated as "disable" -- the INVERSE of SQL_HOST_VERIFICATION above.
+      # Compose interpolation cannot negate, so this is its own key rather than
+      # a derivation. Turning on host verification means setting BOTH:
+      # POSTGRES_TLS_VERIFY_HOST=true and POSTGRES_TLS_SKIP_HOST_VERIFY=false.
+      SQL_TLS_DISABLE_HOST_VERIFICATION: ${POSTGRES_TLS_SKIP_HOST_VERIFY:-true}
+      # config/dynamicconfig/docker.yaml -- NOT development-sql.yaml. Both
+      # docker-compose.yml and the Helm chart name development-sql.yaml, but both
+      # also mount it (deploy/temporal, and a ConfigMap). This file cannot:
+      # install.sh downloads this compose file ALONE, with no repo checkout, so
+      # there is nothing on the host to bind-mount. Naming a file the image does
+      # not ship makes the server exit at boot -- "unable to validate dynamic
+      # config: no such file or directory" -- and `restart: unless-stopped` turns
+      # that into a permanent crash loop with no workflow engine, i.e. every
+      # pipeline hangs. docker.yaml ships in the image (empty) and is the image's
+      # own default. The only setting the mounted file carried is
+      # forceSearchAttributesCacheRefreshOnRead, which is inert here: this
+      # product registers no custom search attributes. Add one and this needs a
+      # real file again -- via `configs:` content, not a bind mount.
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/docker.yaml
+    healthcheck:
+      test: ["CMD", "tctl", "--address", "temporal:7233", "workflow", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # ─── APPLICATION SERVICES ────────────────────────────────────────────────────
+
+  # The COMMUNITY image, not the private ./llm-service/Dockerfile one. Built from
+  # Dockerfile.community: an allowlist COPY cut against llm-service/oss-strip-list.txt,
+  # so the connector-generation moat (tool_generator/config + the agents that read it)
+  # is absent from every layer. It carries the /chat gateway — the only
+  # pipeline-creation path in the product — plus the Data Explorer, suggestions and
+  # the PII scanner. See .github/workflows/docker-publish.yml.
+  llm-service:
+    image: ghcr.io/rsync-ai/llm-service-oss:${RSYNC_VERSION:-latest}
+    container_name: rsync-llm-service
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 1536m
+    # OLLAMA_URL below defaults to host.docker.internal, which Docker Desktop
+    # (macOS/Windows) resolves for free and Linux Docker does NOT -- so without
+    # this line the offline provider fails to resolve its own default on exactly
+    # the platform every server install runs. install.sh picks Ollama
+    # automatically for an unattended install with no OPENAI_API_KEY, so the
+    # default path and the broken platform are the same path.
+    #
+    # Note this only makes the NAME resolve; Ollama must also be listening off
+    # loopback (OLLAMA_HOST=0.0.0.0), since host-gateway is the bridge address,
+    # not 127.0.0.1.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Kafka client security (BYO/managed broker). See x-kafka-security at the
+      # top of this file; every key defaults to empty and empty means unset.
+      <<: *kafka-security
+      PORT: 5000
+      # Sent as X-Internal-Secret on service-to-service calls to the orchestrator
+      # topology API (requirePrincipal). Empty = topology calls 401 in production.
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
+      # Soft (not :?) so a fully-offline Ollama install (no OpenAI key) can boot.
+      # Provider selection is by LLM_PROVIDER; the client falls back to Ollama when
+      # no cloud key is present (see llm-service openai_client.py).
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      # OLLAMA_BASE_URL wins over OLLAMA_URL (openai_client.py _ollama_base_url).
+      # docs/deployment/env-vars.md tells operators to set this one, so it needs a
+      # delivery path here or the value they set is silently ignored.
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      # Air-gapped / on-prem: pins ONLY the Data Explorer to Ollama so schema
+      # metadata never leaves the deployment. There is no env_file on this service,
+      # so every var the operator is allowed to set must be listed explicitly —
+      # without this line EXPLORER_OFFLINE_ONLY=true in .env never reaches the
+      # container and the privacy guarantee silently does not hold.
+      EXPLORER_OFFLINE_ONLY: ${EXPLORER_OFFLINE_ONLY:-false}
+      EXPLORER_LLM_PROVIDER: ${EXPLORER_LLM_PROVIDER:-}
+      EXPLORER_TABLE_LINK_MODEL: ${EXPLORER_TABLE_LINK_MODEL:-}
+      EXPLORER_COLUMN_LINK_MODEL: ${EXPLORER_COLUMN_LINK_MODEL:-}
+      EXPLORER_NEXT_STEPS_MODEL: ${EXPLORER_NEXT_STEPS_MODEL:-}
+      EXPLORER_QUERY_SPEC_MODEL: ${EXPLORER_QUERY_SPEC_MODEL:-}
+      EXPLORER_SQL_MODEL: ${EXPLORER_SQL_MODEL:-}
+      EXPLORER_SQL_MODEL_MYSQL: ${EXPLORER_SQL_MODEL_MYSQL:-}
+      # /agents/rank-tables (table recommendation during pipeline setup). Unset
+      # inherits EXPLORER_LLM_PROVIDER then LLM_PROVIDER; EXPLORER_OFFLINE_ONLY
+      # overrides both.
+      RANK_TABLES_LLM_PROVIDER: ${RANK_TABLES_LLM_PROVIDER:-}
+      RANK_TABLES_MODEL: ${RANK_TABLES_MODEL:-}
+      EXPLORER_SQL_PROVIDER: ${EXPLORER_SQL_PROVIDER:-}
+      EXPLORER_SQL_ALLOW_ONLINE: ${EXPLORER_SQL_ALLOW_ONLINE:-}
+      EXPLORER_SQL_OPENAI_MODEL: ${EXPLORER_SQL_OPENAI_MODEL:-}
+      EXPLORER_SQL_FALLBACK_MODELS: ${EXPLORER_SQL_FALLBACK_MODELS:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
+      # The async PII-scan consumer reads these; without them it falls back to
+      # localhost:9092 and its startup failure is swallowed into a log warning.
+      KAFKA_BROKERS: "${KAFKA_BROKERS:-kafka:29092}"
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX-rsync.}
+      # Avro requires a Schema Registry; this compose ships none. The code default is
+      # true, so leaving it unset points the producer at a host that does not exist here.
+      KAFKA_USE_AVRO: "false"
+      USE_MOCK_LLM: "false"
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      ENVIRONMENT: production
+    command: ["python", "-m", "src.gateway.main"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import httpx; httpx.get('http://localhost:5000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # One-shot init: seed the mcp_connectors volume so a COLD self-host boots WITH
+  # connectors. Without it the volume is created empty and every pipeline run
+  # resolves zero connectors — a stack that comes up green and cannot move a row.
+  # Idempotent: skips when the volume already has content, so it never clobbers
+  # user-generated connectors on a restart. Same definition as
+  # docker-compose.oss.yml so layering the two merges cleanly.
+  connector-seed:
+    image: ghcr.io/rsync-ai/connector-seed:${RSYNC_VERSION:-latest}
+    container_name: rsync-connector-seed
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    volumes:
+      - mcp_connectors:/target
+    command:
+      - sh
+      - -c
+      - >-
+        if [ -z "$$(ls -A /target 2>/dev/null)" ]; then
+          cp -a /seed/. /target/ && echo 'connectors seeded into mcp_connectors volume';
+        else
+          echo 'mcp_connectors already populated - skipping seed';
+        fi
+
+  # Connector Deployer (SEC-H-02): THE trusted socket-holder. tool-generator now
+  # drops root + the docker socket and delegates all JIT connector build/run to
+  # this small no-LLM service over an authenticated internal RPC. The security
+  # property is allow-by-construction (the deployer builds the Docker create
+  # payload itself with a hardcoded-safe HostConfig); because the HOST daemon
+  # creates the container it still joins rsync-ai-mcp by name/alias so the sink
+  # resolves JIT destinations. Same topology on Docker Desktop as in cloud — the
+  # deployer holds the socket in every stack. See
+  # docs/internal/jit-connector-sandboxing.md + connector-deployer/CONTRACT.md.
+  connector-deployer:
+    # An IMAGE, not a `build:`. This file is downloaded on its own by install.sh
+    # into an otherwise empty directory, so a build context is a path that does
+    # not exist on the customer's box -- `docker compose up` aborts the whole
+    # stack with `unable to prepare context: path "./connector-deployer" not
+    # found`. Published by docker-publish.yml alongside the other core services.
+    image: ghcr.io/rsync-ai/connector-deployer:${RSYNC_VERSION:-latest}
+    container_name: rsync-connector-deployer
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      # Same app-level fail-closed posture the tool-generator carried: ENVIRONMENT
+      # production => the deployer's S2S gate 503s when the secret is unset. The
+      # compose-level :? guard lives in prod.yml ONLY (OSS/cloud split rule), so
+      # here the secret defaults to empty for local Docker Desktop runs.
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
+      DEPLOYER_DOCKER_NETWORK: rsync-ai-mcp
+      MCP_SHARED_NETWORK: rsync-ai-mcp
+      OAUTH_TOKENS_VOLUME_NAME: rsync-ai-oauth-tokens
+    # Root + RW docker.sock live HERE now, not on tool-generator.
+    user: "0:0"
+    networks:
+      - default
+      - rsync-ai-mcp
+    volumes:
+      # Connector artifacts, READ-ONLY (build contexts only).
+      - mcp_connectors:/app/shared/mcp-connectors:ro
+      # RW docker socket for build/run of JIT connector containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # Connector LIFECYCLE, not connector generation. This image (Dockerfile.oss)
+  # serves GET /health + POST /v1/deploy and nothing else — it carries none of the
+  # LLM/NLP dependency tree and no generation code, which is why it is publishable.
+  # /v1/deploy is the one endpoint the Go data plane calls
+  # (backend-orchestrator server_manager.go -> TOOL_GENERATOR_URL) for connector
+  # self-heal and pinned-version JIT builds, so the service name stays
+  # `tool-generator` — every peer resolves it by that hostname.
+  tool-generator:
+    image: ghcr.io/rsync-ai/connector-lifecycle:${RSYNC_VERSION:-latest}
+    container_name: rsync-tool-generator
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 1g
+    # No llm-service edge: the lifecycle image never calls the gateway. It waits for
+    # the connector volume to be seeded so /v1/deploy can resolve connectors on disk,
+    # and for the deployer it delegates every build/run to.
+    depends_on:
+      connector-seed:
+        condition: service_completed_successfully
+      connector-deployer:
+        condition: service_started
+    environment:
+      PORT: 5010
+      TOOLS_DIR: /app/shared/mcp-connectors
+      # Universal default: managed mode on. Tool-generator dynamically
+      # builds images and starts user MCP containers when the
+      # orchestrator's Preflight calls /v1/deploy. Override to "false"
+      # if you'd rather manage user MCPs via a separate compose stack.
+      RSYNC_MANAGED_CONNECTORS: ${RSYNC_MANAGED_CONNECTORS:-true}
+      DOCKER_NETWORK: rsync-ai-mcp
+      RSYNC_EDITION: community
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      ENVIRONMENT: production
+      # SEC-H-03: S2S secret for /v1/deploy (X-Internal-Secret). Unset => no-op.
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
+      # SEC-H-02: managed-mode JIT build/run is delegated to the connector-deployer
+      # over this internal RPC; tool-generator no longer touches the docker socket.
+      DEPLOYER_URL: http://connector-deployer:5011
+    command: ["python", "-m", "src.lifecycle.main"]
+    # SEC-H-02: runs the image's default unprivileged appuser — no root, no
+    # docker.sock. The connector-deployer is the sole trusted socket holder.
+    networks:
+      - default
+      - rsync-ai-mcp
+    volumes:
+      - mcp_connectors:/app/shared/mcp-connectors
+
+  planner:
+    image: ghcr.io/rsync-ai/llm-service-oss:${RSYNC_VERSION:-latest}
+    container_name: rsync-planner
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 768m
+    depends_on:
+      llm-service:
+        condition: service_healthy
+    # Same reason as llm-service: OLLAMA_URL below defaults to a name Linux
+    # Docker does not resolve on its own.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # Kafka client security (BYO/managed broker). See x-kafka-security at the
+      # top of this file; every key defaults to empty and empty means unset.
+      <<: *kafka-security
+      PORT: 5011
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      LLM_PROVIDER: ${LLM_PROVIDER:-openai}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      TOOL_GENERATOR_URL: http://tool-generator:5010
+      API_GATEWAY_URL: http://api-gateway:8080
+      LLM_GATEWAY_URL: http://llm-service:5000
+      KAFKA_BOOTSTRAP_SERVERS: "${KAFKA_BROKERS:-kafka:29092}"
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX-rsync.}
+      # Avro requires a Schema Registry; this compose ships none. The code default is
+      # true, so leaving it unset points the producer at a host that does not exist here.
+      KAFKA_USE_AVRO: "false"
+      ENABLE_KAFKA_CONSUMER: "false"
+      CONNECTORS_DIR: /app/shared/mcp-connectors
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      ENVIRONMENT: production
+    command: ["python", "-m", "src.agents.planner.service"]
+    volumes:
+      - mcp_connectors:/app/shared/mcp-connectors:ro
+
+  orchestrator:
+    image: ghcr.io/rsync-ai/orchestrator:${RSYNC_VERSION:-latest}
+    container_name: rsync-orchestrator
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 2g
+    depends_on:
+      postgres:
+        condition: service_healthy
+        # Other half of docker-compose.byo-postgres.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        required: false
+      kafka:
+        condition: service_healthy
+        # Other half of docker-compose.byo-kafka.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        required: false
+      redis:
+        condition: service_healthy
+    environment:
+      # Kafka client security (BYO/managed broker). See x-kafka-security at the
+      # top of this file; every key defaults to empty and empty means unset.
+      <<: *kafka-security
+      DB_HOST: ${POSTGRES_HOST:-postgres}
+      DB_PORT: ${POSTGRES_PORT:-5432}
+      DB_USER: ${POSTGRES_USER:-rsync}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB:-pipeline_db}
+      # internal/config/config.go:168 reads DB_SSLMODE (default "disable").
+      # Naming it explicitly matters: a DSN that omits sslmode negotiates
+      # plaintext without complaining, so a BYO database would look connected
+      # while shipping credentials in the clear.
+      DB_SSLMODE: ${POSTGRES_SSLMODE:-disable}
+      KAFKA_BROKERS: "${KAFKA_BROKERS:-kafka:29092}"
+      # Durability for every topic the orchestrator creates at runtime. Read by
+      # internal/kafka/replication.go (EnvReplicationFactor / EnvMinInsyncReplicas).
+      # Empty means "operator stated nothing" -- not zero -- so the built-in
+      # derivation applies (1 on a single broker, min(3, brokers) beyond).
+      #
+      # The pair travels together: min.insync.replicas > replication factor yields a
+      # topic that is created, listed and subscribable, and then rejects every
+      # acks=all produce with NOT_ENOUGH_REPLICAS -- a pipeline that reports running
+      # and moves zero rows. The Go side clamps misr down to the topic's final RF,
+      # so setting only one of these cannot wedge a cluster. Brokers from 3.7 on cap
+      # the effective value at the replica count and are immune; the older managed
+      # clusters a self-host points at are not. See docker-compose.yml for the
+      # measurement.
+      KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-}
+      KAFKA_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-}
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX-rsync.}
+      # Avro requires a Schema Registry; this compose ships none. The code default is
+      # true, so leaving it unset points the producer at a host that does not exist here.
+      KAFKA_USE_AVRO: "false"
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET is required}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?ENCRYPTION_KEY is required}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      TOOL_GENERATOR_URL: http://tool-generator:5010
+      CORRELATION_CLAIM_TTL: 1h
+      ENABLE_SCHEDULER: "false"
+      ENABLE_CDC_TABLE_STATS: "true"
+      # Batch data-plane sizing. Both empty by default = the code's own values,
+      # which are now correct rather than merely default: with this container's
+      # mem_limit set above, resolveTableConcurrency() can finally read a real
+      # cgroup limit and cap the pool at what the box can buffer (~384 MiB per
+      # concurrent table load). Pin EXECUTOR_TABLE_CONCURRENCY only to override
+      # that derivation; lower EXECUTOR_TABLE_BATCH_ROWS (default 10000) if a
+      # source has unusually wide rows, since one page is held in memory.
+      EXECUTOR_TABLE_CONCURRENCY: ${EXECUTOR_TABLE_CONCURRENCY:-}
+      EXECUTOR_TABLE_BATCH_ROWS: ${EXECUTOR_TABLE_BATCH_ROWS:-}
+      DOCKER_NETWORK: rsync-ai-mcp
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      ENVIRONMENT: production
+    networks:
+      - default
+      - rsync-ai-mcp
+    volumes:
+      - mcp_connectors:/app/shared/mcp-connectors
+
+  temporal-adapter:
+    image: ghcr.io/rsync-ai/temporal-adapter:${RSYNC_VERSION:-latest}
+    container_name: rsync-temporal-adapter
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 768m
+    depends_on:
+      temporal:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+        # Other half of docker-compose.byo-kafka.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        required: false
+      redis:
+        condition: service_healthy
+    environment:
+      # Kafka client security (BYO/managed broker). See x-kafka-security at the
+      # top of this file; every key defaults to empty and empty means unset.
+      <<: *kafka-security
+      TEMPORAL_ADDRESS: temporal:7233
+      KAFKA_BOOTSTRAP_SERVERS: "${KAFKA_BROKERS:-kafka:29092}"
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX-rsync.}
+      # Avro requires a Schema Registry; this compose ships none. The code default is
+      # true, so leaving it unset points the producer at a host that does not exist here.
+      KAFKA_USE_AVRO: "false"
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      POSTGRES_HOST: ${POSTGRES_HOST:-postgres}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+      POSTGRES_USER: ${POSTGRES_USER:-rsync}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:-pipeline_db}
+      # internal/db/db.go:23 reads POSTGRES_SSLMODE (default "disable").
+      POSTGRES_SSLMODE: ${POSTGRES_SSLMODE:-disable}
+      REDIS_ADDRESS: redis:6379
+      # The `redis` service above always starts with `requirepass` (REDIS_PASSWORD
+      # is `:?`-required at line 209), so this client must authenticate or it does
+      # not start at all: cmd/adapter/main.go:222 reads exactly this name and
+      # main.go:223-226 `log.Fatalf`s when the correlation store cannot init. Its
+      # own comment at main.go:217-220 names this failure "Redis auth split-brain".
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      LOG_LEVEL: info
+      ENVIRONMENT: production
+
+  api-gateway:
+    image: ghcr.io/rsync-ai/api-gateway:${RSYNC_VERSION:-latest}
+    container_name: rsync-api-gateway
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 1g
+    ports:
+      # Loopback by default -- a laptop install must not publish an unauthenticated
+      # port to the LAN. A server install has the opposite problem: bound here, the
+      # only two published ports in this file are unreachable from anywhere but the
+      # server itself, so install.sh could ask for a domain, print a URL for it, and
+      # be believed, because its health check polls localhost and always passes.
+      # install.sh sets RSYNC_BIND_ADDR=0.0.0.0 when the operator names a real host
+      # and is not putting a TLS proxy in front. Leave it at the default when a
+      # reverse proxy on the host terminates TLS -- it reaches loopback fine, and
+      # 0.0.0.0 would additionally expose the plaintext port beside it.
+      - "${RSYNC_BIND_ADDR:-127.0.0.1}:5001:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+        # Other half of docker-compose.byo-postgres.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        required: false
+      kafka:
+        condition: service_healthy
+        # Other half of docker-compose.byo-kafka.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        required: false
+      redis:
+        condition: service_healthy
+      # Wait for Temporal so the startup client.Dial wins the cold-boot race.
+      temporal:
+        condition: service_healthy
+      orchestrator:
+        condition: service_started
+    environment:
+      # Kafka client security (BYO/managed broker). See x-kafka-security at the
+      # top of this file; every key defaults to empty and empty means unset.
+      <<: *kafka-security
+      DATABASE_URL: postgres://${POSTGRES_USER:-rsync}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-pipeline_db}?sslmode=${POSTGRES_SSLMODE:-disable}
+      KAFKA_BROKERS: "${KAFKA_BROKERS:-kafka:29092}"
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX-rsync.}
+      # Avro requires a Schema Registry; this compose ships none. The code default is
+      # true, so leaving it unset points the producer at a host that does not exist here.
+      KAFKA_USE_AVRO: "false"
+      TEMPORAL_ADDRESS: temporal:7233
+      ORCHESTRATOR_URL: http://orchestrator:8080
+      AGENT_ORCHESTRATOR_URL: http://orchestrator:8080
+      TOOL_GENERATOR_URL: http://tool-generator:5010
+      JWT_SECRET: ${JWT_SECRET}
+      REDIS_ADDRESS: redis:6379
+      # Same requirepass as the adapter above. api-gateway fails SOFTER -- it
+      # retries 5x then logs "proceeding without caching" (cmd/server/main.go:412-427)
+      # -- so the omission does not crash the stack, it silently disables the schema
+      # cache and the Data Explorer cache built on the same client. Read at
+      # cmd/server/main.go:408 and internal/handlers/admin_health.go:80, which is why
+      # /admin/health would otherwise report redis "down" on a healthy Redis.
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
+      RSYNC_CSRF_ENFORCE: "true"
+      RSYNC_ALLOW_INTERNAL_CONNECTORS: "false"
+      # Self-host has no Stripe / cloud plans: disable plan-quota enforcement so a
+      # fresh install is never trial-gated (migration 060 would otherwise seed a
+      # 14-day, 1-pipeline trial with no upgrade path). Cloud leaves this unset ⇒
+      # enforced. See resolvePlanQuota / billingEnforced() in plan_quota.go.
+      RSYNC_BILLING_ENFORCED: "false"
+      # Zero-credential try-it path. Unset ⇒ the demo endpoints report unavailable
+      # and refuse to seed, which is the CLOUD behavior (app.rsync.ai must never
+      # offer a bundled warehouse). Only this compose file sets it, so the split
+      # stays "which compose runs", not a runtime edition gate.
+      # Parsed by demoDestinationConfig() in api-gateway/internal/handlers/demo.go;
+      # host/port/database/user/password are handed to the `postgresql` connector,
+      # whose required_config is exactly those five keys. The value never reaches
+      # the browser — the seed endpoint builds the connection server-side.
+      RSYNC_DEMO_DESTINATION_DSN: postgres://rsync_demo:${RSYNC_DEMO_WAREHOUSE_PASSWORD:-rsync-demo-not-a-secret}@demo-warehouse:5432/demo_warehouse
+      # SEC-M-07: self-host is NOT behind Cloudflare, so CF-Connecting-IP is
+      # attacker-controllable. Disable Cloudflare client-IP trust here; cloud
+      # leaves this unset => enabled. See trustCloudflareClientIP() in api-gateway.
+      RSYNC_TRUST_CLOUDFLARE: "false"
+      # Diagnose enriches its evidence with log lines from self-hosted SigNoz.
+      # This stack ships no SigNoz, and signozLogsHTTPURL()
+      # (api-gateway/internal/handlers/signoz_logs.go) defaults to
+      # http://host.docker.internal:8123 when nothing is set — a name that does
+      # not even resolve under Linux Docker. The path is fail-soft, so the only
+      # symptom is every diagnose call paying a pointless connect timeout first.
+      SIGNOZ_LOGS_ENRICH: "false"
+      RSYNC_ADMIN_EMAILS: ${RSYNC_ADMIN_EMAILS:-}
+      OAUTH_CALLBACK_URL: ${OAUTH_CALLBACK_URL:-}
+      GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
+      GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      SLACK_CLIENT_ID: ${SLACK_CLIENT_ID:-}
+      SLACK_CLIENT_SECRET: ${SLACK_CLIENT_SECRET:-}
+      HUBSPOT_CLIENT_ID: ${HUBSPOT_CLIENT_ID:-}
+      HUBSPOT_CLIENT_SECRET: ${HUBSPOT_CLIENT_SECRET:-}
+      SALESFORCE_CLIENT_ID: ${SALESFORCE_CLIENT_ID:-}
+      SALESFORCE_CLIENT_SECRET: ${SALESFORCE_CLIENT_SECRET:-}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+      # CORS allowlist: must match the frontend origin so browser requests succeed
+      RSYNC_CORS_ORIGINS: ${NEXTAUTH_URL:-http://localhost:3000}
+      # Secure flag on the session and CSRF cookies. install.sh derives it from
+      # the scheme it published; left empty the gateway falls back to
+      # ENVIRONMENT, i.e. Secure. Fail-closed on purpose -- the failure this
+      # guards against (a Secure cookie dropped by the browser on plain http) is
+      # invisible, while the opposite mistake is at least visible as a warning.
+      RSYNC_COOKIE_SECURE: ${RSYNC_COOKIE_SECURE:-}
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      ENVIRONMENT: production
+    networks:
+      - default
+      - rsync-ai-mcp
+    volumes:
+      - mcp_connectors:/app/shared/mcp-connectors:ro
+
+  frontend:
+    image: ghcr.io/rsync-ai/frontend:${RSYNC_VERSION:-latest}
+    container_name: rsync-frontend
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 768m
+    ports:
+      # Same knob as the api-gateway port above; see the comment there.
+      - "${RSYNC_BIND_ADDR:-127.0.0.1}:3000:3000"
+    depends_on:
+      - api-gateway
+    environment:
+      API_GATEWAY_INTERNAL_URL: http://api-gateway:8080
+      # The NEXT_PUBLIC_* pair below is inert on a published image -- the Next.js
+      # compiler substituted those names at `docker build` time, so nothing set
+      # here can reach the browser through them. They stay for a locally built
+      # image, where build and run share an environment.
+      #
+      # These two are what actually reach the browser, served per request by
+      # /runtime-config.js. Without them the UI published on :3000 resolves the
+      # api-gateway to its own origin and every request 404s against Next.js,
+      # while the installer's health probe on :5001 still reports success.
+      PUBLIC_URL: ${PUBLIC_URL:-}
+      PUBLIC_WS_URL: ${PUBLIC_WS_URL:-}
+      NEXT_PUBLIC_API_URL: ${PUBLIC_URL:-http://localhost:5001}
+      NEXT_PUBLIC_WS_URL: ${PUBLIC_WS_URL:-ws://localhost:5001/ws}
+      NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3000}
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
+
+  # ─── INTERNAL MCP CONNECTORS ─────────────────────────────────────────────────
+
+  # ── Container names are load-bearing ────────────────────────────────────────
+  # The orchestrator does not look these services up by compose service name. It
+  # builds the hostname itself, as `<STACK_PREFIX>-<connector>-v1-0-0-mcp`
+  # (backend-orchestrator/internal/workers/infra_preflight.go requiredServices,
+  # via mcp.StackPrefix() which defaults to "rsync-ai"). The short names used here
+  # before — rsync-minio-mcp, rsync-debezium-mcp, rsync-kafka-mcp-sink — matched
+  # neither that pattern nor anything else the orchestrator asks DNS for.
+  #
+  # Nothing errored. The preflight health poll simply NXDOMAIN'd for its full
+  # 24 x 5s budget (preflightKafkaConnectRetries) and then fell through to its
+  # "start it via tool-generator" last resort, which deployed a SECOND, correctly
+  # named container beside the compose one. So every batch pipeline on a
+  # quickstart box paid 120 seconds at preflight and then ran with a duplicate
+  # minio-mcp resident, while the compose-started container sat unused forever.
+  # Renaming is the whole fix; do not shorten these again.
+
+  minio-mcp:
+    image: ghcr.io/rsync-ai/mcp-minio:${RSYNC_VERSION:-latest}
+    container_name: rsync-ai-minio-v1-0-0-mcp
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      PORT: 8000
+      MCP_HTTP_MODE: "true"
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+      MINIO_BUCKET: pipeline-data
+      ENVIRONMENT: production
+
+  # The zero-credential demo source, and the reason it is worth a service block
+  # of its own: it is the ONLY connector in the tree whose auth_type is "none"
+  # (every other one of the 21 public connectors needs a credential before it
+  # will do anything). It carries its customers/orders/products rows inside its
+  # own image and imports nothing outside the Python standard library, so it is
+  # the one source a fresh install can connect to before the operator has
+  # produced a single secret.
+  #
+  # It was absent from THIS file while being present in the catalog the
+  # connector-seed image bakes -- Dockerfile.seed allowlist-COPYs public/
+  # wholesale, so sample-data has always been listed as installable. That is the
+  # worst of the two possible states: the connector was offered in the UI and
+  # selecting it failed at connection test with a DNS miss for a container no
+  # compose file here ever started. Absent-and-unlisted would at least have been
+  # honest.
+  #
+  # container_name is load-bearing and must keep EXACTLY this shape --
+  # <StackPrefix()>-<id>-vX-Y-Z-mcp, built by MCPContainerName()
+  # (backend-orchestrator/internal/mcp/server_manager.go:310). Docker's embedded
+  # DNS resolves it, so it doubles as the hostname the orchestrator health-checks
+  # at http://<name>:8000/health. The minio-mcp note above is the record of what
+  # shortening one of these costs: 120s of preflight per pipeline plus a
+  # duplicate container. Do not shorten it.
+  sample-data-mcp:
+    image: ghcr.io/rsync-ai/mcp-sample-data:${RSYNC_VERSION:-latest}
+    container_name: rsync-ai-sample-data-v1-0-0-mcp
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    # Stdlib-only, and it serves three in-memory lists. It does not need the
+    # 512m the credentialed connectors take.
+    mem_limit: 128m
+    environment:
+      PORT: 8000
+      MCP_PORT: 8000
+      MCP_HTTP_MODE: "true"
+      ENVIRONMENT: production
+
+  # ── CDC data plane (profile: cdc) ───────────────────────────────────────────
+  # These three are a set. The orchestrator's preflight requires kafka-connect
+  # AND debezium-mcp AND kafka-mcp-sink for any CDC pipeline, so shipping a
+  # subset is strictly worse than shipping none: the two MCPs used to start
+  # unconditionally here while kafka-connect — the engine debezium-mcp is a bridge
+  # to — had no service at all, so a CDC pipeline failed preflight on a box that
+  # was already paying to run half of it.
+  kafka-connect:
+    image: ghcr.io/rsync-ai/kafka-connect:${RSYNC_VERSION:-latest}
+    container_name: kafka-connect
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    profiles: ["cdc"]
+    restart: unless-stopped
+    mem_limit: 1536m
+    depends_on:
+      kafka:
+        condition: service_healthy
+        # Other half of docker-compose.byo-kafka.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        required: false
+    environment:
+      # Unprefixed names on purpose: the debezium/connect entrypoint hand-exports
+      # this fixed list. See docker-compose.yml for the full annotation — anything
+      # else unprefixed is discarded in silence.
+      BOOTSTRAP_SERVERS: "${KAFKA_BROKERS:-kafka:29092}"
+      GROUP_ID: "rsync-connect-cluster"
+      CONFIG_STORAGE_TOPIC: "_rsync-connect-configs"
+      OFFSET_STORAGE_TOPIC: "_rsync-connect-offsets"
+      STATUS_STORAGE_TOPIC: "_rsync-connect-status"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "${KAFKA_REPLICATION_FACTOR:-1}"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "${KAFKA_REPLICATION_FACTOR:-1}"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "${KAFKA_REPLICATION_FACTOR:-1}"
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      OFFSET_FLUSH_INTERVAL_MS: 10000
+      ADVERTISED_HOST_NAME: "kafka-connect"
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_PRODUCER_ACKS: "all"
+      CONNECT_PRODUCER_RETRIES: 10
+      # Lockstep with the broker's message.max.bytes and the sink worker's
+      # ReaderConfig.MaxBytes — a row with a large JSON/text/blob column fails the
+      # task with RecordTooLargeException if these three disagree.
+      CONNECT_PRODUCER_MAX_REQUEST_SIZE: 15728640
+      CONNECT_CONSUMER_AUTO_OFFSET_RESET: "earliest"
+      # FileConfigProvider: source DB passwords resolve at task start from the
+      # shared connect_secrets volume, so they never enter the Kafka config topic
+      # nor the GET /connectors/<name>/config response.
+      CONNECT_CONFIG_PROVIDERS: "file"
+      CONNECT_CONFIG_PROVIDERS_FILE_CLASS: "org.apache.kafka.common.config.provider.FileConfigProvider"
+      CONNECT_CONFIG_PROVIDERS_FILE_PARAM_ALLOWED_PATHS: "/connect-secrets"
+      KAFKA_HEAP_OPTS: "-Xms256M -Xmx768M"
+
+      # ── BYO-Kafka security ───────────────────────────────────────────────
+      # The x-kafka-security anchor is NOT usable here. This image's entrypoint
+      # turns every ^CONNECT_ variable into one connect-distributed.properties
+      # line (strip CONNECT_, lowercase, '_' -> '.') and DISCARDS everything
+      # else in silence, so the KAFKA_* names the Go and Python services read
+      # reach this container and then evaporate.
+      #
+      # Connect needs the profile in THREE places. The worker's own admin client
+      # is a different client from the producer each source task writes with and
+      # the consumer each sink task reads with, and the task-level ones do not
+      # inherit reliably. Configure only the worker and the failure is
+      # silent-partial: the worker authenticates, joins the group, answers the
+      # REST API and reports connectors RUNNING while every task fails its own
+      # handshake and not one row moves.
+      #
+      # Unset, these render exactly the bundled-broker behaviour: PLAINTEXT,
+      # with sasl.mechanism inert because no handshake is attempted.
+      CONNECT_SECURITY_PROTOCOL: "${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}"
+      CONNECT_SASL_MECHANISM: "${KAFKA_SASL_MECHANISM:-PLAIN}"
+      CONNECT_PRODUCER_SECURITY_PROTOCOL: "${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}"
+      CONNECT_PRODUCER_SASL_MECHANISM: "${KAFKA_SASL_MECHANISM:-PLAIN}"
+      CONNECT_CONSUMER_SECURITY_PROTOCOL: "${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}"
+      CONNECT_CONSUMER_SASL_MECHANISM: "${KAFKA_SASL_MECHANISM:-PLAIN}"
+      #
+      # ONE string, not the username/password pair the other clients take: a
+      # Java client wants the login module class inline, and which class depends
+      # on the mechanism. Compose interpolation cannot choose between them.
+      #
+      #   PLAIN        org.apache.kafka.common.security.plain.PlainLoginModule
+      #   SCRAM-SHA-*  org.apache.kafka.common.security.scram.ScramLoginModule
+      #
+      # e.g. in your .env, on ONE line:
+      #   KAFKA_SASL_JAAS_CONFIG=org.apache.kafka.common.security.scram.ScramLoginModule required username="alice" password="s3cret";
+      #
+      # A password containing " or \\ needs BOTH escapes -- the value crosses a
+      # properties grammar and then a JAAS StreamTokenizer -- so `p"w` is
+      # written `p\\"w`. Escaping it once corrupts it identically to not
+      # escaping it at all. If that is your password, kafka-init prints the
+      # correctly escaped line for you (it builds its own).
+      CONNECT_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"
+      CONNECT_PRODUCER_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"
+      CONNECT_CONSUMER_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"
+      #
+      # Truststore PATH and PASSWORD are BARE pass-through keys -- no `${...:-}`
+      # default, deliberately. A key with no value is OMITTED from the container
+      # environment when the host variable is unset; `${VAR:-}` renders it
+      # present-but-EMPTY, and this entrypoint writes every CONNECT_ var it sees,
+      # empty included. Kafka then reads an empty ssl.truststore.location as a
+      # real path and the worker exits 2 with "Failed to load PEM SSL keystore".
+      # Worse for the password: Kafka REJECTS a truststore password outright for
+      # PEM stores, and an empty string counts as specified. Both would break the
+      # commonest BYO case -- MSK and Confluent Cloud chain to a public root and
+      # need no truststore setting at all.
+      #
+      # Set all THREE of each; the worker-only half is the classic partial.
+      #   export CONNECT_SSL_TRUSTSTORE_LOCATION=/connect-certs/ca.pem
+      #   export CONNECT_PRODUCER_SSL_TRUSTSTORE_LOCATION="$CONNECT_SSL_TRUSTSTORE_LOCATION"
+      #   export CONNECT_CONSUMER_SSL_TRUSTSTORE_LOCATION="$CONNECT_SSL_TRUSTSTORE_LOCATION"
+      CONNECT_SSL_TRUSTSTORE_LOCATION:
+      CONNECT_PRODUCER_SSL_TRUSTSTORE_LOCATION:
+      CONNECT_CONSUMER_SSL_TRUSTSTORE_LOCATION:
+      CONNECT_SSL_TRUSTSTORE_PASSWORD:
+      CONNECT_PRODUCER_SSL_TRUSTSTORE_PASSWORD:
+      CONNECT_CONSUMER_SSL_TRUSTSTORE_PASSWORD:
+      # TYPE is safe to default: it is consulted only when a location is set, and
+      # JKS is Kafka's own default. Set KAFKA_SSL_TRUSTSTORE_TYPE=PEM for a PEM
+      # CA bundle -- one variable, all three clients.
+      CONNECT_SSL_TRUSTSTORE_TYPE: "${KAFKA_SSL_TRUSTSTORE_TYPE:-JKS}"
+      CONNECT_PRODUCER_SSL_TRUSTSTORE_TYPE: "${KAFKA_SSL_TRUSTSTORE_TYPE:-JKS}"
+      CONNECT_CONSUMER_SSL_TRUSTSTORE_TYPE: "${KAFKA_SSL_TRUSTSTORE_TYPE:-JKS}"
+      # Bare `-`, not `:-`: unset means Kafka's default ("https", verify), while
+      # an explicitly EMPTY value is Kafka's documented off switch and has to
+      # survive as empty -- `:-` would substitute the default back over it.
+      CONNECT_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: "${KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM-https}"
+      CONNECT_PRODUCER_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: "${KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM-https}"
+      CONNECT_CONSUMER_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM: "${KAFKA_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM-https}"
+    volumes:
+      # Read-only: this worker only RESOLVES the secrets debezium-mcp writes.
+      - connect_secrets:/connect-secrets:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  debezium-mcp:
+    image: ghcr.io/rsync-ai/mcp-debezium:${RSYNC_VERSION:-latest}
+    container_name: rsync-ai-debezium-v1-0-0-mcp
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    profiles: ["cdc"]
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      PORT: 8000
+      MCP_HTTP_MODE: "true"
+      # Where debezium-mcp WRITES the per-connector secret file that
+      # kafka-connect's FileConfigProvider reads back. Unset, it had nowhere to
+      # put them and the ${file:...} references in a CDC connector config would
+      # resolve to nothing — so the volume and this variable travel together.
+      DEBEZIUM_SECRETS_DIR: /connect-secrets
+      ENVIRONMENT: production
+      # BYO-Kafka. This service authors the Debezium connector config, and the
+      # connector's own producer plus its schema-history client are configured
+      # FROM here -- so an unsecured debezium-mcp writes a connector that dials
+      # a secured broker anonymously, which surfaces as a task that never leaves
+      # RUNNING and a snapshot that never starts.
+      #
+      # The ADDRESS travels with the credentials, and must: no caller passes
+      # kafka_bootstrap_servers, so _bootstrap_from_args() falls through to
+      # connector.py:533's `_env("KAFKA_BROKERS") or ... "kafka:29092"`. Without
+      # this line a BYO operator gets a connector whose schema history is
+      # SASL-credentialed for their cluster and ADDRESSED to the bundled broker
+      # -- so it authenticates against the wrong Kafka, or (under SASL_SSL) hangs
+      # handshaking with a PLAINTEXT one. The schema-history client is separate
+      # from the task producer, so the connector starts fine and only breaks on
+      # the restart that replays it.
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:29092}
+      <<: *kafka-security
+    volumes:
+      - connect_secrets:/connect-secrets
+
+  kafka-mcp-sink-mcp:
+    image: ghcr.io/rsync-ai/mcp-kafka-sink:${RSYNC_VERSION:-latest}
+    container_name: rsync-ai-kafka-mcp-sink-v1-0-0-mcp
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    profiles: ["cdc"]
+    restart: unless-stopped
+    mem_limit: 768m
+    environment:
+      PORT: 8000
+      MCP_HTTP_MODE: "true"
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+      MINIO_BUCKET: pipeline-data
+      ENVIRONMENT: production
+      # The sink owns the durable ACK ledger (pipeline_batch_acks) and fails
+      # CLOSED without it: main.go:3153-3156 reads POSTGRES_URL then DATABASE_URL,
+      # and main.go:3186-3196 logs "FATAL: ACK ledger (POSTGRES_URL / DATABASE_URL)
+      # is unavailable" and os.Exit(1)s unless RSYNC_SINK_ALLOW_NO_LEDGER=true.
+      # With neither name set the worker exits on every spawn and the Python
+      # supervisor respawns it forever, so nothing drains the data topic and the
+      # pipeline reports `completed` into an empty destination.
+      #
+      # sslmode is ${POSTGRES_SSLMODE:-disable}, NOT a hardcoded `disable`: the
+      # literal is what broke staging and prod against a TLS-requiring managed
+      # Postgres (see the two archived write-ups), and it is the one URL part no
+      # other env var could override. Same form as api-gateway's DATABASE_URL above.
+      POSTGRES_URL: postgres://${POSTGRES_USER:-rsync}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-pipeline_db}?sslmode=${POSTGRES_SSLMODE:-disable}
+      # BYO-Kafka. The Go sink worker reads exactly these names
+      # (kafka-mcp-sink/worker-src/.../kafka_security.go initKafkaSecurity) and
+      # is fatal on an INVALID profile -- but silent on an ABSENT one, where it
+      # defaults to PLAINTEXT and consumes anonymously. That is the failure this
+      # block exists to prevent: it is the last hop of the CDC path, so the
+      # symptom is a pipeline that reports `completed` with an empty destination.
+      #
+      # The address travels with the credentials. Today every caller passes it
+      # explicitly (kafka.SinkBootstrapServers()), so this changes no behaviour --
+      # it is here so the rule "anything merging x-kafka-security also declares a
+      # broker" holds without an exception, because the exception is what makes
+      # the next service's omission look deliberate.
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:29092}
+      <<: *kafka-security
+    # The sink worker writes to destination MCPs (e.g. rsync-ai-postgresql-v1-0-0-mcp)
+    # by container name. JIT-deployed connector MCPs live on the rsync-ai-mcp network
+    # (tool-generator sets DOCKER_NETWORK=rsync-ai-mcp), so without bridging the sink
+    # into it the sink resolves NOTHING and every destination write fails with
+    # "no such host" — the silent DLQ mode that lets a pipeline report `completed`
+    # while the destination stays empty. Mirrors docker-compose.yml (the regular stack).
+    networks:
+      - default
+      - rsync-ai-mcp
+
+  # Generation-time only (profile: generate). Every reference to context7 in the
+  # product is under llm-service/src/agents/tool_generator/, and the one call site
+  # is wrapped in try/except with a 3s timeout, so its absence is tolerated by
+  # design — a stack that only RUNS existing connectors never needs it.
+  context7-mcp:
+    image: ghcr.io/rsync-ai/mcp-context7:${RSYNC_VERSION:-latest}
+    container_name: rsync-context7-mcp
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    profiles: ["generate"]
+    restart: unless-stopped
+    mem_limit: 256m
+    environment:
+      PORT: 8080
+      CONTEXT7_API_URL: https://context7.com/api
+      CONTEXT7_API_KEY: ${CONTEXT7_API_KEY:-}
+      ENVIRONMENT: production
+
+volumes:
+  postgres_data:
+  demo_warehouse_data:
+  redis_data:
+  kafka_data:
+  minio_data:
+  # Shared between debezium-mcp (writes) and kafka-connect (reads, ro) so source
+  # DB credentials never transit the Kafka config topic.
+  connect_secrets:
+  mcp_connectors:
+    name: rsync-ai-mcp-connectors
+
+networks:
+  rsync-ai-mcp:
+    name: rsync-ai-mcp

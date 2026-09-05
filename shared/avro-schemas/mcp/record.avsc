@@ -1,0 +1,79 @@
+{
+  "namespace": "com.rsync.mcp",
+  "type": "record",
+  "name": "GenericRecord",
+  "doc": "Generic record format that works across all MCP connectors",
+  "fields": [
+    {
+      "name": "record_id",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Unique record identifier"
+    },
+    {
+      "name": "key",
+      "type": ["null", {
+        "type": "map",
+        "values": ["null", "string", "long", "int", "double", "boolean"]
+      }],
+      "default": null,
+      "doc": "Primary key fields"
+    },
+    {
+      "name": "data",
+      "type": {
+        "type": "map",
+        "values": ["null", "string", "long", "int", "double", "boolean", "bytes", {
+          "type": "array",
+          "items": ["null", "string", "long", "int", "double", "boolean"]
+        }, {
+          "type": "map",
+          "values": ["null", "string", "long", "int", "double", "boolean"]
+        }]
+      },
+      "doc": "Record data fields"
+    },
+    {
+      "name": "metadata",
+      "type": ["null", {
+        "type": "record",
+        "name": "RecordMetadata",
+        "fields": [
+          {
+            "name": "source_ts",
+            "type": ["null", "long"],
+            "default": null,
+            "logicalType": "timestamp-millis"
+          },
+          {
+            "name": "ingest_ts",
+            "type": "long",
+            "logicalType": "timestamp-millis"
+          },
+          {
+            "name": "sequence",
+            "type": ["null", "long"],
+            "default": null
+          },
+          {
+            "name": "partition",
+            "type": ["null", "int"],
+            "default": null
+          },
+          {
+            "name": "offset",
+            "type": ["null", "long"],
+            "default": null
+          },
+          {
+            "name": "checksum",
+            "type": ["null", "string"],
+            "default": null
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "Record metadata"
+    }
+  ]
+}

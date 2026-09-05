@@ -1,0 +1,650 @@
+{{- if .Values.connectors.cdc.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+{{- $debeziumName := include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "debezium" "version" "v1.0.0") }}
+{{- $sinkName := include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "kafka-mcp-sink" "version" "v1.0.0") }}
+{{/*
+The CDC plane. Three components, and pre-flight requires all three together
+(internal/workers/infra_preflight.go, CDC branch) — kafka-connect at
+KAFKA_CONNECT_URL, plus these two literal hosts:
+
+    http://<STACK_PREFIX>-debezium-v1-0-0-mcp:8000/health
+    http://<STACK_PREFIX>-kafka-mcp-sink-v1-0-0-mcp:8000/health
+
+debezium-mcp is a SIDECAR of the kafka-connect pod, not its own Deployment.
+That is not a packaging preference. debezium-mcp writes each source database's
+credentials into DEBEZIUM_SECRETS_DIR and kafka-connect reads them back through
+FileConfigProvider, which is what keeps those credentials out of the Kafka
+config topic (and if that handoff ever fails, provisioning fails with it rather
+than quietly falling back to an inline password — see DEBEZIUM_SECRETS_ENFORCED
+below). Two pods would need a shared writable volume for that handoff —
+ReadWriteMany, which EBS/PD/Azure Disk cannot do. One pod with an emptyDir does
+it with no storage requirement at all, and the credentials never leave the node.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-kafka-connect
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-connect
+spec:
+  type: ClusterIP
+  ports:
+    - name: rest
+      port: 8083
+      targetPort: rest
+  selector:
+    {{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-connect
+---
+# Second Service, same pod, matching the name pre-flight and the MCP registry
+# resolve. It has to be a separate object because the two components answer on
+# different ports and are discovered under different names.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $debeziumName }}
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-connect
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: mcp
+  selector:
+    {{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-connect
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-kafka-connect
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-connect
+spec:
+  replicas: 1
+  # Recreate: Connect workers with the same GROUP_ID rebalance when a second
+  # one joins, and a rebalance mid-rollout pauses every running connector. One
+  # worker in, one worker out is the cheaper trade at this scale.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kafka-connect
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: kafka-connect
+        {{- with .Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: kafka-connect
+          image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.connectors.cdc.kafkaConnect.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          {{- if .Values.kafka.external.saslMechanism }}
+          {{- /*
+          Build the JAAS config in the container, because the SASL password has
+          to be escaped and a Helm template cannot do it: the value arrives by
+          kubelet $(VAR) substitution, after rendering.
+
+          It then crosses TWO grammars, each of which eats a level of backslash:
+
+            1. docker-entrypoint.sh writes every CONNECT_* env var into
+               connect-distributed.properties, a Java .properties file;
+            2. connect-distributed.sh loads that file and Kafka parses
+               sasl.jaas.config with a StreamTokenizer-backed quoted-string
+               grammar.
+
+          So the value is escaped twice. Escaping once corrupts identically to
+          not escaping at all, which is the trap: the site looks guarded and is
+          not. Measured against Kafka's own parser -- reproduce the table with
+          test/kind/jaas-probe/run.sh.
+
+          Overriding the entrypoint is deliberately scoped to the SASL branch:
+          without SASL there is nothing to escape, and the image runs exactly as
+          it did before. The password is never echoed; the entrypoint's own
+          SENSITIVE_PROPERTIES list already covers these three variable names.
+          */}}
+          command: ["/bin/bash", "-c"]
+          args:
+            - |
+              set -euo pipefail
+              esc() {
+                printf '%s' "$1" |
+                  sed 's/\\/\\\\/g; s/"/\\"/g' |
+                  sed 's/\\/\\\\/g'
+              }
+{{- if include "rsync-ai.kafka.isTokenMechanism" . }}
+              # OAUTHBEARER carries its credentials as JAAS OPTIONS -- there is
+              # no username= or password= on the line at all -- and takes the
+              # token endpoint as a separate property. A credential-less
+              # "LoginModule required;" line, which is what the username/password
+              # shape below degrades to, is refused outright by the JVM with
+              # "The OAuth configuration option clientId value must be non-null".
+              # Measured against kafka-clients 3.7.0: test/kind/jaas-probe/OAuthProbe.java.
+              for v in KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT \
+                       KAFKA_SASL_OAUTHBEARER_CLIENT_ID \
+                       KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET; do
+                if [ -z "${!v:-}" ]; then
+                  echo "FATAL: kafka.external.saslMechanism=OAUTHBEARER but $v is empty." >&2
+                  echo "       Set kafka.external.oauth.{tokenEndpoint,clientId,clientSecret}." >&2
+                  echo "       With secrets.existingSecret, it must carry key" >&2
+                  echo "       KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET." >&2
+                  exit 1
+                fi
+              done
+              OPTS="$(printf ' clientId="%s" clientSecret="%s"' \
+                "$(esc "$KAFKA_SASL_OAUTHBEARER_CLIENT_ID")" \
+                "$(esc "$KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET")")"
+              if [ -n "${KAFKA_SASL_OAUTHBEARER_EXTENSIONS:-}" ]; then
+                OLDIFS=$IFS; IFS=,
+                for kv in $KAFKA_SASL_OAUTHBEARER_EXTENSIONS; do
+                  IFS=$OLDIFS
+                  case "$kv" in
+                    *=*) ;;
+                    *) echo "FATAL: kafka.external.oauth.extensions entry '$kv' has no '=' separator." >&2; exit 1 ;;
+                  esac
+                  EK=${kv%%=*}; EV=${kv#*=}
+                  # 'auth' is the OAUTHBEARER frame's own key; sending it as an
+                  # extension makes a malformed frame the broker rejects without
+                  # naming the extension.
+                  if [ -z "$EK" ] || [ "$EK" = "auth" ]; then
+                    echo "FATAL: kafka.external.oauth.extensions has an empty or reserved name in '$kv'." >&2
+                    exit 1
+                  fi
+                  OPTS="$OPTS$(printf ' extension_%s="%s"' "$EK" "$(esc "$EV")")"
+                  IFS=,
+                done
+                IFS=$OLDIFS
+              fi
+              if [ -n "${KAFKA_SASL_OAUTHBEARER_SCOPE:-}" ]; then
+                OPTS="$OPTS$(printf ' scope="%s"' "$(esc "$KAFKA_SASL_OAUTHBEARER_SCOPE")")"
+              fi
+              JAAS="$(printf '%s required%s;' \
+                '{{ include "rsync-ai.kafka.saslLoginModule" . }}' "$OPTS")"
+              # Without the handler class OAuthBearerLoginModule falls back to
+              # its UNSECURED default and mints a self-signed JWS; the broker
+              # then rejects a token it cannot validate and the error describes
+              # the token, not the missing handler. Set at all three client
+              # levels because Connect's worker, producer and consumer each
+              # build their own login context.
+              for L in "" "PRODUCER_" "CONSUMER_"; do
+                eval "export CONNECT_${L}SASL_JAAS_CONFIG=\"\$JAAS\""
+                eval "export CONNECT_${L}SASL_LOGIN_CALLBACK_HANDLER_CLASS=\"\$KAFKA_SASL_OAUTHBEARER_LOGIN_CALLBACK_HANDLER\""
+                eval "export CONNECT_${L}SASL_OAUTHBEARER_TOKEN_ENDPOINT_URL=\"\$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT\""
+              done
+{{- else }}
+              if [ -z "${KAFKA_SASL_PASSWORD:-}" ]; then
+                echo "FATAL: kafka.external.saslMechanism={{ .Values.kafka.external.saslMechanism }} but KAFKA_SASL_PASSWORD is empty." >&2
+                echo "       Set kafka.external.saslPassword, or provide key KAFKA_SASL_PASSWORD in secrets.existingSecret." >&2
+                exit 1
+              fi
+              JAAS="$(printf '%s required username="%s" password="%s";' \
+                '{{ include "rsync-ai.kafka.saslLoginModule" . }}' \
+                "$(esc "${KAFKA_SASL_USERNAME:-}")" \
+                "$(esc "$KAFKA_SASL_PASSWORD")")"
+              export CONNECT_SASL_JAAS_CONFIG="$JAAS"
+              export CONNECT_PRODUCER_SASL_JAAS_CONFIG="$JAAS"
+              export CONNECT_CONSUMER_SASL_JAAS_CONFIG="$JAAS"
+{{- end }}
+              exec {{ .Values.connectors.cdc.kafkaConnect.entrypoint | default "/docker-entrypoint.sh start" }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: rest
+              containerPort: 8083
+          env:
+            - name: BOOTSTRAP_SERVERS
+              value: {{ include "rsync-ai.kafka.bootstrap" . | quote }}
+            - name: GROUP_ID
+              value: {{ .Values.connectors.cdc.kafkaConnect.groupId | quote }}
+            - name: CONFIG_STORAGE_TOPIC
+              value: "_rsync-connect-configs"
+            - name: OFFSET_STORAGE_TOPIC
+              value: "_rsync-connect-offsets"
+            - name: STATUS_STORAGE_TOPIC
+              value: "_rsync-connect-status"
+            {{/*
+            Connect creates these three internal topics ITSELF, before any of the
+            platform's code runs, so the platform's replication-factor clamp never
+            sees them -- and neither does kafka-init's, because that Job is a
+            post-install hook and `--wait` will not run it while Connect is
+            crash-looping. This value therefore has to be right when it is
+            RENDERED; there is no component downstream that can correct it.
+
+            That is why it comes from the shared helper rather than being derived
+            here. This line used to read
+
+                .Values.kafka.replicationFactor | default (ternary "1" "3" .Values.kafka.enabled)
+
+            which guessed 3 for any BYO cluster, while kafka-init's shell
+            independently guessed 1 for the same cluster -- and on a BYO cluster
+            with fewer than three brokers the 3 crash-looped Connect with a
+            TimeoutException naming neither the factor nor the broker count.
+            */}}
+            {{- $rf := include "rsync-ai.kafka.replicationFactor" . }}
+            - name: CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: CONNECT_STATUS_STORAGE_REPLICATION_FACTOR
+              value: {{ $rf | quote }}
+            - name: KEY_CONVERTER
+              value: "org.apache.kafka.connect.json.JsonConverter"
+            - name: VALUE_CONVERTER
+              value: "org.apache.kafka.connect.json.JsonConverter"
+            - name: CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE
+              value: "false"
+            - name: CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE
+              value: "false"
+            - name: OFFSET_FLUSH_INTERVAL_MS
+              value: "10000"
+            - name: ADVERTISED_HOST_NAME
+              value: "{{ $fullname }}-kafka-connect"
+            # acks=all is the whole point of CDC durability: a Debezium record
+            # acknowledged by one replica and then lost to a leader election is
+            # a row that silently never reaches the destination.
+            - name: CONNECT_PRODUCER_ACKS
+              value: "all"
+            - name: CONNECT_PRODUCER_RETRIES
+              value: "10"
+            # The default 1 MiB rejects any row wider than it, and the rejection
+            # surfaces as a stuck connector rather than a bad row. Same value as the
+            # broker's KAFKA_MESSAGE_MAX_BYTES in templates/infra/kafka.yaml by
+            # construction - both read kafka.maxMessageBytes - so the pair that has to
+            # agree cannot drift. With kafka.enabled=false this still applies, and the
+            # external broker must be configured to accept at least this much.
+            - name: CONNECT_PRODUCER_MAX_REQUEST_SIZE
+              value: {{ .Values.kafka.maxMessageBytes | int64 | quote }}
+            - name: CONNECT_CONSUMER_AUTO_OFFSET_RESET
+              value: "earliest"
+            # FileConfigProvider is how the source-DB password reaches a
+            # connector config without being written to the Kafka config topic
+            # in cleartext. ALLOWED_PATHS must match debezium-mcp's
+            # DEBEZIUM_SECRETS_DIR exactly — they share the emptyDir below.
+            - name: CONNECT_CONFIG_PROVIDERS
+              value: "file"
+            - name: CONNECT_CONFIG_PROVIDERS_FILE_CLASS
+              value: "org.apache.kafka.common.config.provider.FileConfigProvider"
+            - name: CONNECT_CONFIG_PROVIDERS_FILE_PARAM_ALLOWED_PATHS
+              value: "/connect-secrets"
+            - name: KAFKA_HEAP_OPTS
+              value: {{ .Values.connectors.cdc.kafkaConnect.heapOpts | quote }}
+            {{- if not .Values.kafka.enabled }}
+            {{- $proto := .Values.kafka.external.securityProtocol | default "PLAINTEXT" }}
+            {{- /*
+            Connect runs THREE Kafka client families: the worker's own clients
+            (config/offset/status topics), and one producer + one consumer per
+            connector task. The `CONNECT_`-prefixed worker settings do not reach
+            the task clients -- those read `producer.` / `consumer.` prefixed
+            keys -- so configuring only the worker gives a secured cluster a
+            worker that starts, joins its group and reports RUNNING while every
+            task producer dials anonymously and moves zero rows.
+
+            The protocol is set for all three UNCONDITIONALLY, outside the SASL
+            branch below. It used to live inside it, which was correct for
+            SASL_SSL and SASL_PLAINTEXT and silently wrong for `SSL`: certificate
+            authentication has no mechanism, so `saslMechanism` is empty, the
+            branch did not render, and both task clients fell back to PLAINTEXT
+            against a TLS listener. Same symptom as the original defect -- RUNNING
+            connectors, zero rows -- reachable through the one protocol the SASL
+            guard cannot see.
+            */}}
+            - name: CONNECT_SECURITY_PROTOCOL
+              value: {{ $proto | quote }}
+            - name: CONNECT_PRODUCER_SECURITY_PROTOCOL
+              value: {{ $proto | quote }}
+            - name: CONNECT_CONSUMER_SECURITY_PROTOCOL
+              value: {{ $proto | quote }}
+            {{- if .Values.kafka.external.saslMechanism }}
+            {{- if include "rsync-ai.kafka.isTokenMechanism" . }}
+            {{- /*
+            The prelude above assembles the JAAS line from these, exactly as the
+            username/password branch does with KAFKA_SASL_USERNAME/PASSWORD.
+            They are deliberately NOT the CONNECT_-prefixed names: the entrypoint
+            copies CONNECT_* straight into the worker properties, and the JAAS
+            line has to be built from the parts first (the client secret needs
+            the same double-escaping as a password).
+            */}}
+            - name: KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT
+              value: {{ (.Values.kafka.external.oauth | default dict).tokenEndpoint | quote }}
+            - name: KAFKA_SASL_OAUTHBEARER_CLIENT_ID
+              value: {{ (.Values.kafka.external.oauth | default dict).clientId | quote }}
+            - name: KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET
+                  optional: true
+            - name: KAFKA_SASL_OAUTHBEARER_SCOPE
+              value: {{ (.Values.kafka.external.oauth | default dict).scope | default "" | quote }}
+            - name: KAFKA_SASL_OAUTHBEARER_EXTENSIONS
+              value: {{ (.Values.kafka.external.oauth | default dict).extensions | default "" | quote }}
+            - name: KAFKA_SASL_OAUTHBEARER_LOGIN_CALLBACK_HANDLER
+              value: {{ include "rsync-ai.kafka.oauthLoginCallbackHandler" . | quote }}
+            {{- else }}
+            - name: KAFKA_SASL_USERNAME
+              value: {{ .Values.kafka.external.saslUsername | quote }}
+            - name: KAFKA_SASL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: KAFKA_SASL_PASSWORD
+                  optional: true
+            {{- end }}
+            {{- /*
+            The login module is a FUNCTION of the mechanism, not a constant.
+            Hardcoding ScramLoginModule meant `saslMechanism: PLAIN` -- the
+            default on Confluent Cloud and on plenty of managed clusters --
+            rendered a worker config that cannot authenticate, and Connect
+            reports that as a login-module error rather than as "you asked for
+            PLAIN". Mirrors llm-service/src/utils/kafka_security.py:220-224.
+            An unsupported mechanism is rejected at render time by
+            templates/validate.yaml rather than shipped as a broken JAAS string.
+            */}}
+            - name: CONNECT_SASL_MECHANISM
+              value: {{ .Values.kafka.external.saslMechanism | quote }}
+            - name: CONNECT_PRODUCER_SASL_MECHANISM
+              value: {{ .Values.kafka.external.saslMechanism | quote }}
+            - name: CONNECT_CONSUMER_SASL_MECHANISM
+              value: {{ .Values.kafka.external.saslMechanism | quote }}
+            {{- /*
+            The three CONNECT_*_SASL_JAAS_CONFIG values are NOT set here. They
+            used to be, as "... password=\"$(KAFKA_SASL_PASSWORD)\";" -- and
+            that is unfixable in a template, because kubelet substitutes $(VAR)
+            verbatim long after Helm has rendered. Any password containing a
+            backslash or a quote was therefore inserted raw into two nested
+            grammars, and corrupted:
+
+              C:\Users\svc  ->  C:Userssvc        (silent; broker just says
+                                                    authentication failed)
+              pa"ss          ->  parse error naming a key called 'ss'
+
+            They are built in the container instead, by the prelude in `args`,
+            which can escape. See the comment there for the two grammars.
+            */}}
+            {{- end }}
+            {{- if include "rsync-ai.kafka.usesTLS" . }}
+            {{- $dir := include "rsync-ai.kafka.tlsDir" . }}
+            {{- /*
+            Trust material, at the same three levels and for the same reason.
+
+            `type=PEM` (KIP-651, Kafka 2.7+) is what lets one CA bundle serve
+            every client in the chart. Without it the JVM assumes JKS, fails to
+            parse the file, and reports a keystore FORMAT error -- which reads
+            like a corrupt file rather than a missing setting, and sends the
+            operator off to convert a PEM that never needed converting.
+            */}}
+            {{- if include "rsync-ai.kafka.hasCA" . }}
+            {{- $ca := printf "%s/ca.crt" $dir }}
+            - name: CONNECT_SSL_TRUSTSTORE_TYPE
+              value: "PEM"
+            - name: CONNECT_SSL_TRUSTSTORE_LOCATION
+              value: {{ $ca | quote }}
+            - name: CONNECT_PRODUCER_SSL_TRUSTSTORE_TYPE
+              value: "PEM"
+            - name: CONNECT_PRODUCER_SSL_TRUSTSTORE_LOCATION
+              value: {{ $ca | quote }}
+            - name: CONNECT_CONSUMER_SSL_TRUSTSTORE_TYPE
+              value: "PEM"
+            - name: CONNECT_CONSUMER_SSL_TRUSTSTORE_LOCATION
+              value: {{ $ca | quote }}
+            {{- end }}
+            {{- if include "rsync-ai.kafka.tlsKey.pem" . }}
+            {{- $ks := printf "%s/client.pem" $dir }}
+            {{- /*
+            mTLS. A JVM PEM keystore is ONE file holding the chain and the key;
+            it cannot take the two paths the Go and Python clients read. The
+            chart builds that file from the same two values rather than asking
+            for the material twice.
+            */}}
+            - name: CONNECT_SSL_KEYSTORE_TYPE
+              value: "PEM"
+            - name: CONNECT_SSL_KEYSTORE_LOCATION
+              value: {{ $ks | quote }}
+            - name: CONNECT_PRODUCER_SSL_KEYSTORE_TYPE
+              value: "PEM"
+            - name: CONNECT_PRODUCER_SSL_KEYSTORE_LOCATION
+              value: {{ $ks | quote }}
+            - name: CONNECT_CONSUMER_SSL_KEYSTORE_TYPE
+              value: "PEM"
+            - name: CONNECT_CONSUMER_SSL_KEYSTORE_LOCATION
+              value: {{ $ks | quote }}
+            {{- end }}
+            {{- if (.Values.kafka.external.tls | default dict).insecureSkipVerify }}
+            {{- /*
+            The closest a JVM gets to the Go client's InsecureSkipVerify, and it
+            is NOT the same thing: this disables the HOSTNAME check only, the
+            certificate chain is still validated. That asymmetry is why
+            validate.yaml refuses skip-verify with no CA when the CDC plane is
+            on -- the Go services would connect and every Connect task would not.
+            */}}
+            - name: CONNECT_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM
+              value: ""
+            - name: CONNECT_PRODUCER_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM
+              value: ""
+            - name: CONNECT_CONSUMER_SSL_ENDPOINT_IDENTIFICATION_ALGORITHM
+              value: ""
+            {{- end }}
+            {{- end }}
+            {{- end }}
+          volumeMounts:
+            - name: connect-secrets
+              mountPath: /connect-secrets
+            {{- include "rsync-ai.kafkaTLSVolumeMount" . | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /, port: rest }
+            # Connect's REST port opens well before the worker has joined its
+            # group and read the three internal topics; 60s of grace is the
+            # compose start_period carried over rather than guessed.
+            initialDelaySeconds: 60
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 10
+          resources:
+            {{- toYaml .Values.connectors.cdc.kafkaConnect.resources | nindent 12 }}
+        - name: debezium-mcp
+          image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.connectors.cdc.debezium.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: mcp
+              containerPort: 8000
+          env:
+            {{- include "rsync-ai.commonEnv" . | nindent 12 }}
+            {{- /*
+            Debezium's schema history is a SEPARATE Kafka client that lives
+            inside the connector task and does NOT inherit the Connect worker's
+            credentials. This container builds its properties -- connector.py
+            _schema_history_security():340 emits the
+            schema.history.internal.{producer,consumer}.* keys -- by reading
+            KAFKA_SECURITY_PROTOCOL and KAFKA_SASL_* from its own environment,
+            and connector.py:398-399 reads KAFKA_BROKERS for the bootstrap list
+            with a compose-only `kafka:29092` fallback. The chart passed
+            neither, so on a secured BYO cluster the function returned {} and
+            the history client dialled an address that does not resolve, with
+            no credentials. The failure is delayed and asymmetric: the producer
+            half is written at snapshot time, the consumer half only on task
+            restart, so a connector can look healthy for days.
+            */}}
+            {{- include "rsync-ai.kafkaEnv" . | nindent 12 }}
+            - name: PORT
+              value: "8000"
+            - name: MCP_HTTP_MODE
+              value: "true"
+            # Same path as CONNECT_CONFIG_PROVIDERS_FILE_PARAM_ALLOWED_PATHS
+            # above. A mismatch is silent on both sides: debezium writes the
+            # file, Connect refuses to read outside its allowed path, and the
+            # connector fails to start with a config error naming the property
+            # rather than the path.
+            - name: DEBEZIUM_SECRETS_DIR
+              value: "/connect-secrets"
+            # Setting the path above is a promise that the database password
+            # stays out of the Kafka config topic; enforcement makes it one.
+            # Without it, a broken mount or a permissions change downgrades the
+            # promise silently -- provisioning still succeeds, the password is
+            # just inline again, and the only trace is a warning log nobody
+            # reads. Defaults to true in the connector, so this is a restatement
+            # rather than a switch; set it to "false" only to trade the
+            # guarantee back for provisioning availability.
+            - name: DEBEZIUM_SECRETS_ENFORCED
+              value: "true"
+            # Same-pod, so localhost. Deliberately not the Service name: a
+            # sidecar talking to its own pod through a Service round-trips
+            # through kube-proxy and can land on a different pod entirely if
+            # this is ever scaled.
+            - name: KAFKA_CONNECT_URL
+              value: "http://localhost:8083"
+          volumeMounts:
+            - name: connect-secrets
+              mountPath: /connect-secrets
+            {{- include "rsync-ai.kafkaTLSVolumeMount" . | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /health, port: mcp }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.connectors.cdc.debezium.resources | nindent 12 }}
+      volumes:
+        # emptyDir, not a PVC: these files are per-connector-config credentials
+        # that debezium-mcp rewrites on every deploy. Persisting them would keep
+        # a stale password readable after the connection was rotated.
+        - name: connect-secrets
+          emptyDir: {}
+        {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $sinkName }}
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-mcp-sink
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+  selector:
+    {{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-mcp-sink
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-kafka-mcp-sink
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-mcp-sink
+spec:
+  replicas: {{ .Values.connectors.cdc.sink.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kafka-mcp-sink
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: kafka-mcp-sink
+        {{- with .Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: kafka-mcp-sink
+          image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.connectors.cdc.sink.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            {{- include "rsync-ai.commonEnv" . | nindent 12 }}
+            {{- /*
+            This container had NO Kafka configuration at all -- not the brokers,
+            not the security profile -- while being the process that consumes
+            every pipeline's data topic. It survived on compose because the Go
+            worker's last-resort literal is `kafka:29092`, which resolves there
+            and nowhere else; connector.py:318-322 reads KAFKA_BROKERS /
+            KAFKA_BOOTSTRAP_SERVERS first, and the worker it spawns inherits
+            os.environ (connector.py:703-714) and reads KAFKA_SECURITY_PROTOCOL
+            and KAFKA_SASL_* itself. Starved of both, a secured cluster gives a
+            sink that starts cleanly, dials anonymously and acks nothing.
+            */}}
+            {{- include "rsync-ai.kafkaEnv" . | nindent 12 }}
+            {{- include "rsync-ai.objectStorageEnv" . | nindent 12 }}
+            {{- include "rsync-ai.postgresEnv" . | nindent 12 }}
+            - name: PORT
+              value: "8000"
+            - name: MCP_HTTP_MODE
+              value: "true"
+            # The sink owns the durable ACK ledger (pipeline_batch_acks). With
+            # no POSTGRES_URL the DB handle is nil, the ledger stays empty, and
+            # the post-flight silent-drop invariant falls back to sink-emitted
+            # stats events — a strictly weaker signal for "did this offset reach
+            # the destination?". It reads POSTGRES_* names, not DB_*, so the
+            # aliases below are required even though postgresEnv is included.
+            - name: POSTGRES_HOST
+              value: {{ include "rsync-ai.postgres.host" . | quote }}
+            - name: POSTGRES_PORT
+              value: {{ include "rsync-ai.postgres.port" . | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_URL
+              value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode={{ include "rsync-ai.postgres.sslmode" . }}"
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: REDIS_PASSWORD
+                  optional: true
+            # Must carry the password when Redis runs with --requirepass, or
+            # the sink worker crash-loops on every start with "NOAUTH
+            # Authentication required" — which reads as a Redis outage.
+            - name: REDIS_URL
+              value: "redis://:$(REDIS_PASSWORD)@{{ include "rsync-ai.redis.address" . }}/0"
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.connectors.cdc.sink.resources | nindent 12 }}
+          {{- if include "rsync-ai.kafka.hasTLSFiles" . }}
+          volumeMounts:
+            {{- include "rsync-ai.kafkaTLSVolumeMount" . | nindent 12 }}
+          {{- end }}
+      {{- if include "rsync-ai.kafka.hasTLSFiles" . }}
+      volumes:
+        {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
+      {{- end }}
+{{- end }}

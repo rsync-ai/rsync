@@ -1,0 +1,120 @@
+{
+  "id": "widgets-graphql",
+  "name": "Widgets-Graphql",
+  "display_name": "Widgets-Graphql",
+  "aliases": [
+    "widgets-graphql",
+    "widgets_graphql",
+    "Widgets-Graphql",
+    "widgets-graphql"
+  ],
+  "version": "1.0.0",
+  "description": "Widgets GraphQL test API (deterministic E2E fixture) \u2014 Relay widgets list.",
+  "connector_type": "widgets-graphql",
+  "category": "api_saas",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": false,
+  "destination_modes": [],
+  "supports_cdc": false,
+  "supports_ddl": false,
+  "auto_create_destination_tables": false,
+  "spec_version": "1.1",
+  "generated_at": "2026-07-05T15:47:52.925352",
+  "status": "active",  "quality_tier": "silver",  "default_headers": {},
+  "header_config_keys": [],
+  "base_url": "https://api.widgets.test/graphql",
+  "auth_type": "bearer",  "supported_auth_methods": [    {
+      "method": "bearer",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer",
+      "config_keys": ["access_token", "token"],      "description": ""    }  ],  "required_config": [
+  ],
+  "optional_config": [
+  ],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+    },
+    "required": [
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+    },
+    "required": [
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": ["json"],
+    "supported_modalities": ["structured"],    "supports_cdc": false,
+    "supports_ddl": false,
+    "auto_create_destination_tables": false  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity",
+      "method": "widgets-graphql_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration",
+      "method": "widgets-graphql_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover the upstream schema",
+      "method": "widgets-graphql_discover_schema"
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities",
+      "method": "widgets-graphql_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Generic GraphQL query dispatcher",
+      "method": "widgets-graphql_export",
+      "parameters": [
+        {
+          "name": "operation_name",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "variables",
+          "type": "object",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "widgets",
+      "type": "source",
+      "description": "List widgets (Relay connection).",
+      "method": "widgets-graphql_widgets",
+      "parameters": [
+        {
+          "name": "first",
+          "type": "integer",
+          "required": false
+        },
+        {
+          "name": "after",
+          "type": "string",
+          "required": false
+        }
+      ]
+    }
+  ],
+  "license": "MIT"
+}
+

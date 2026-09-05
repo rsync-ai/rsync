@@ -1,0 +1,286 @@
+name: rsync-ai-e2e
+
+services:
+  # ============================================================================
+  # E2E: MySQL (seeded) + Postgres (logical replication) + MinIO + Mock GitHub
+  # Runs as a separate Docker Desktop group: rsync-ai-e2e
+  # ============================================================================
+
+  mysql-e2e:
+    image: mysql:8.4
+    container_name: rsync-ai-mysql-e2e
+    # Enable MySQL binlog (required for Debezium CDC)
+    command:
+      - "--server-id=184054"
+      - "--log-bin=mysql-bin"
+      - "--binlog-format=ROW"
+      - "--binlog-row-image=FULL"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+      # Re-enable mysql_native_password (DISABLED by default on 8.4, NOT removed
+      # until 9.x). Without this, e2e_user defaults to caching_sha2_password,
+      # whose cold-cache first-auth requires TLS/RSA — the Go batch executor
+      # (go-sql-driver) can't complete it over the plaintext socket and fails
+      # with "2061 Authentication requires secure connection" until some other
+      # client warms the cache. That made the golden batch gate test flaky
+      # (green only when the container happened to be warm). init/001 switches
+      # e2e_user to this plugin so auth is deterministic for every client.
+      - "--mysql-native-password=ON"
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpassword
+      - MYSQL_DATABASE=e2e_db
+      - MYSQL_USER=e2e_user
+      - MYSQL_PASSWORD=e2e_password
+    ports:
+      - "${RSYNC_HP_MYSQL_E2E:-3307}:3306"
+    volumes:
+      - ./e2e/mysql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -prootpassword --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      rsync-ai_default:
+        aliases:
+          - mysql-e2e
+          - e2e-mysql   # connection configs may use either name
+
+  postgres-e2e:
+    image: postgres:16-alpine
+    container_name: rsync-ai-postgres-e2e
+    # Enable logical replication so Postgres can be used as a Debezium CDC source in E2E.
+    command:
+      - postgres
+      - -c
+      - wal_level=logical
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+    environment:
+      - POSTGRES_USER=e2e_user
+      - POSTGRES_PASSWORD=e2e_password
+      - POSTGRES_DB=e2e_db
+    ports:
+      - "${RSYNC_HP_POSTGRES_E2E:-5433}:5432"
+    volumes:
+      - ./e2e/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2e_user -d e2e_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      rsync-ai_default:
+        aliases:
+          - postgres-e2e
+
+  # STANDALONE-ONLY minio. The e2e GATE (e2e/run_gate.sh) does NOT start this —
+  # it brings up the MAIN stack's minio (docker-compose.yml, container
+  # rsync-ai-minio) and runs `minio-init` below with `--no-deps`. This service
+  # exists only for `make e2e-start` (e2e DBs without the main stack), where it
+  # provides minio + host ports 9000/9001.
+  # NO hard container_name pin: the main stack already owns `rsync-ai-minio`, and
+  # a pinned name here crash-collides ("container name already in use") if both
+  # run. Without the pin Docker auto-names this one. Do NOT run this standalone
+  # minio while the main stack is up — both alias `minio` on the shared network,
+  # which makes that hostname ambiguous.
+  minio:
+    # Gated behind the `standalone-minio` profile so a plain `up` (the old
+    # `make e2e-start`) does NOT start it. It shares the `minio` network alias
+    # with the main stack's `rsync-ai-minio`; running both makes `minio:9000`
+    # DNS-round-robin across two stores, so claim-check writes and reads can hit
+    # different MinIO instances → NoSuchKey → DLQ → silent data drop. Only start
+    # it when the main stack is absent — `make e2e-start` guards on exactly that.
+    profiles: ["standalone-minio"]
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    ports:
+      - "${RSYNC_HP_MINIO:-9000}:9000"
+      - "${RSYNC_HP_MINIO_CONSOLE:-9001}:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      rsync-ai_default:
+        aliases:
+          - minio
+
+  minio-init:
+    # Same profile as `minio`. The e2e GATE starts it explicitly with
+    # `up -d --no-deps minio-init` (an explicitly-named service starts even when
+    # its profile is inactive) and points it at the MAIN stack's minio; a plain
+    # profile-less `up` must NOT pull it in.
+    profiles: ["standalone-minio"]
+    image: minio/mc:latest
+    container_name: rsync-ai-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - |
+        mc alias set rsync http://minio:9000 minioadmin minioadmin;
+        mc mb -p rsync/pipeline-data || true;
+        mc mb -p rsync/intermediate-storage || true;
+        mc mb -p rsync/agent-artifacts || true;
+        mc mb -p rsync/audit-logs || true;
+        mc mb -p rsync/backups || true;
+        echo "minio-init done";
+    restart: "no"
+    networks:
+      rsync-ai_default: {}
+
+  # E2E: Mock GitHub OAuth + API server (offline auth-expiry tests)
+  mock-github:
+    image: python:3.11-alpine
+    container_name: rsync-ai-mock-github
+    environment:
+      - PORT=8080
+    command: ["python", "/app/mock_github_server.py"]
+    volumes:
+      - ./e2e/mock_github_server.py:/app/mock_github_server.py:ro
+    ports:
+      - "${RSYNC_HP_MOCK_GITHUB:-8099}:8080"
+    healthcheck:
+      # Use IPv4 explicitly: Alpine wget may prefer IPv6 ::1 for localhost
+      # while the server binds only on 0.0.0.0, causing false "Connection refused".
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      rsync-ai_default:
+        aliases:
+          - mock-github
+
+  # E2E: Mock GraphQL server (deterministic Relay `widgets` API — offline,
+  # mock-backed generated-GraphQL-connector pipeline test). Only relevant when
+  # E2E_INCLUDE_GRAPHQL=1; harmless otherwise (unused idle container).
+  mock-graphql:
+    image: python:3.11-alpine
+    container_name: rsync-ai-mock-graphql
+    environment:
+      - PORT=8080
+    command: ["python", "/app/mock_graphql_server.py"]
+    volumes:
+      - ./e2e/mock_graphql_server.py:/app/mock_graphql_server.py:ro
+    ports:
+      - "${RSYNC_HP_MOCK_GRAPHQL:-8098}:8080"
+    healthcheck:
+      # IPv4 explicit: Alpine wget may prefer IPv6 ::1 while the server binds 0.0.0.0.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    networks:
+      rsync-ai_default:
+        aliases:
+          - mock-graphql
+
+  # Extra MySQL instance for CDC testing (separate from existing mysql-e2e)
+  mysql-e2e2:
+    image: mysql:8.4
+    # Enable MySQL binlog (required for Debezium CDC)
+    command:
+      - "--server-id=284054"
+      - "--log-bin=mysql-bin"
+      - "--binlog-format=ROW"
+      - "--binlog-row-image=FULL"
+      - "--gtid-mode=ON"
+      - "--enforce-gtid-consistency=ON"
+    environment:
+      - MYSQL_ROOT_PASSWORD=rootpassword
+      - MYSQL_DATABASE=e2e_db
+      - MYSQL_USER=e2e_user
+      - MYSQL_PASSWORD=e2e_password
+    volumes:
+      - ./e2e/mysql/init:/docker-entrypoint-initdb.d:ro
+      # Seed richer demo datasets (fintech_db, logistics_db) so table selection has real tables.
+      - ./e2e/mysql/fixtures/fintech_logistics.sql:/docker-entrypoint-initdb.d/004_fintech_logistics.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -prootpassword --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      rsync-ai_default:
+        aliases:
+          - mysql-e2e2
+
+  # Extra Postgres instance for CDC testing (separate from existing postgres-e2e)
+  postgres-e2e2:
+    image: postgres:16-alpine
+    # Required for Debezium Postgres CDC:
+    # - wal_level=logical
+    # - enough slots/senders for replication
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10", "-c", "max_wal_senders=10"]
+    environment:
+      - POSTGRES_USER=e2e_user
+      - POSTGRES_PASSWORD=e2e_password
+      - POSTGRES_DB=e2e_db
+    volumes:
+      - ./e2e/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U e2e_user -d e2e_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    networks:
+      rsync-ai_default:
+        aliases:
+          - postgres-e2e2
+
+  # MongoDB (replica set) for Debezium CDC testing
+  mongo-e2e:
+    image: mongo:6
+    container_name: rsync-ai-mongo-e2e
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      test: ["CMD-SHELL", "mongosh --quiet --eval 'db.runCommand({ ping: 1 }).ok' | grep 1 >/dev/null"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    networks:
+      rsync-ai_default:
+        aliases:
+          - mongo-e2e
+
+  mongo-e2e-init:
+    image: mongo:6
+    depends_on:
+      mongo-e2e:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - |
+        mongosh --host mongo-e2e --quiet --eval '
+          try {
+            rs.status();
+            print("replica set already initialized");
+          } catch (e) {
+            rs.initiate({_id:"rs0", members:[{_id:0, host:"mongo-e2e:27017"}]});
+            print("replica set initiated");
+          }'
+    restart: "no"
+    networks:
+      rsync-ai_default: {}
+
+networks:
+  # Attach e2e DBs to the main app network so Kafka Connect and MCP connectors can resolve them by hostname.
+  rsync-ai_default:
+    external: true
+    name: rsync-ai_default
+
+volumes:
+  minio_data:
+
+

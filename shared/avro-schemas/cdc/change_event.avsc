@@ -1,0 +1,138 @@
+{
+  "namespace": "com.rsync.cdc",
+  "type": "record",
+  "name": "ChangeEvent",
+  "doc": "Generic change event that works across all CDC sources",
+  "fields": [
+    {
+      "name": "trace_id",
+      "type": "string",
+      "doc": "Pipeline trace ID"
+    },
+    {
+      "name": "pipeline_id",
+      "type": "string",
+      "doc": "Pipeline identifier"
+    },
+    {
+      "name": "connection_id",
+      "type": "string",
+      "doc": "Source connection identifier"
+    },
+    {
+      "name": "connector_type",
+      "type": "string",
+      "doc": "MCP connector type (mysql, postgresql, mongodb, etc.)"
+    },
+    {
+      "name": "entity",
+      "type": {
+        "type": "record",
+        "name": "EntityRef",
+        "fields": [
+          {
+            "name": "namespace",
+            "type": ["null", "string"],
+            "default": null,
+            "doc": "Schema/database/bucket prefix"
+          },
+          {
+            "name": "name",
+            "type": "string",
+            "doc": "Table/collection/object name"
+          },
+          {
+            "name": "sub_entity",
+            "type": ["null", "string"],
+            "default": null,
+            "doc": "Sub-entity (partition, nested document, etc.)"
+          }
+        ]
+      },
+      "doc": "Entity reference"
+    },
+    {
+      "name": "operation",
+      "type": {
+        "type": "enum",
+        "name": "ChangeOperation",
+        "symbols": ["INSERT", "UPDATE", "DELETE", "UPSERT", "SNAPSHOT", "TRUNCATE", "DDL"]
+      },
+      "doc": "Type of change operation"
+    },
+    {
+      "name": "key",
+      "type": ["null", {
+        "type": "map",
+        "values": ["null", "string", "long", "int", "double", "boolean", "bytes"]
+      }],
+      "default": null,
+      "doc": "Primary key fields and values"
+    },
+    {
+      "name": "partition_key",
+      "type": "string",
+      "doc": "Computed partition key ({connection}.{namespace}.{entity}[.{sub}][.{pk}])"
+    },
+    {
+      "name": "before",
+      "type": ["null", {
+        "type": "map",
+        "values": ["null", "string", "long", "int", "double", "boolean", "bytes"]
+      }],
+      "default": null,
+      "doc": "Record state before change"
+    },
+    {
+      "name": "after",
+      "type": ["null", {
+        "type": "map",
+        "values": ["null", "string", "long", "int", "double", "boolean", "bytes"]
+      }],
+      "default": null,
+      "doc": "Record state after change"
+    },
+    {
+      "name": "diff",
+      "type": ["null", {
+        "type": "array",
+        "items": "string"
+      }],
+      "default": null,
+      "doc": "List of changed field names"
+    },
+    {
+      "name": "source_ts",
+      "type": "long",
+      "logicalType": "timestamp-millis",
+      "doc": "Timestamp from source system"
+    },
+    {
+      "name": "processed_ts",
+      "type": "long",
+      "logicalType": "timestamp-millis",
+      "doc": "Timestamp when processed by RSync"
+    },
+    {
+      "name": "sequence",
+      "type": ["null", "long"],
+      "default": null,
+      "doc": "Sequence number for ordering within transaction"
+    },
+    {
+      "name": "is_snapshot",
+      "type": "boolean",
+      "default": false,
+      "doc": "Whether this is from initial snapshot"
+    },
+    {
+      "name": "metadata",
+      "type": ["null", {
+        "type": "map",
+        "values": "string"
+      }],
+      "default": null,
+      "doc": "Additional metadata (transaction_id, lsn, etc.)"
+    }
+  ]
+}

@@ -1,0 +1,198 @@
+#!/bin/bash
+# RSYNC AI - Master Control Script
+# Fully automated pipeline orchestration with auto-recovery
+# Usage: ./scripts/rsync <command> [options]
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+GREEN='\033[0;32m'
+BLUE='\033[0;34m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+# Help text
+show_help() {
+    echo "RSYNC AI - Agentic Data Pipeline Platform"
+    echo "=========================================="
+    echo ""
+    echo "Usage: ./scripts/rsync <command> [options]"
+    echo ""
+    echo "Commands:"
+    echo "  setup              - One-time environment setup (deps, db, docker)"
+    echo "  start              - Start all services with health checks"
+    echo "  stop               - Stop all services gracefully"
+    echo "  restart            - Restart all services"
+    echo "  status             - Show service status"
+    echo "  execute <pipeline> - Execute a pipeline by name"
+    echo "  logs [service]     - Tail logs (orchestrator|api|frontend|all)"
+    echo "  test               - Run test suite (Phases A,B,C,D)"
+    echo "  venv <connector>   - Check isolated venv for connector"
+    echo "  help               - Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  ./scripts/rsync setup          # First time setup"
+    echo "  ./scripts/rsync start          # Start all services"
+    echo "  ./scripts/rsync execute mysql2s3  # Run pipeline"
+    echo "  ./scripts/rsync logs orchestrator  # View orchestrator logs"
+    echo "  ./scripts/rsync venv mysql     # Check MySQL venv"
+    echo "  ./scripts/rsync status         # Check what's running"
+    echo ""
+    echo "🚀 Phases A, B, C, D are active!"
+    echo "   Phase A: Data streaming (JSONL/Parquet)"
+    echo "   Phase B: Isolated venv per connector"
+    echo "   Phase C: Schema discovery & auto-mapping"
+    echo "   Phase D: OAuth token management"
+    echo ""
+}
+
+# Command handlers
+cmd_setup() {
+    echo -e "${BLUE}Running automated environment setup...${NC}"
+    cd "$PROJECT_ROOT"
+    "$SCRIPT_DIR/setup_environment.sh"
+}
+
+cmd_start() {
+    echo -e "${BLUE}Starting all services...${NC}"
+    cd "$PROJECT_ROOT"
+    "$SCRIPT_DIR/run_services.sh"
+}
+
+cmd_stop() {
+    echo -e "${BLUE}Stopping all services...${NC}"
+    cd "$PROJECT_ROOT"
+    "$SCRIPT_DIR/stop-all.sh"
+}
+
+cmd_restart() {
+    echo -e "${BLUE}Restarting all services...${NC}"
+    cmd_stop
+    sleep 3
+    cmd_start
+}
+
+cmd_status() {
+    echo -e "${BLUE}Service Status:${NC}"
+    echo ""
+    curl -s http://localhost:5001/health > /dev/null 2>&1 && echo "✅ Agent Orchestrator: http://localhost:5001" || echo "❌ Agent Orchestrator: Not running"
+    curl -s http://localhost:8080/health > /dev/null 2>&1 && echo "✅ API Gateway      : http://localhost:8080" || echo "❌ API Gateway: Not running"
+    curl -s http://localhost:3000 > /dev/null 2>&1 && echo "✅ Frontend         : http://localhost:3000" || echo "❌ Frontend: Not running"
+    docker ps | grep -q postgres && echo "✅ PostgreSQL       : localhost:5432" || echo "❌ PostgreSQL: Not running"
+    docker ps | grep -q kafka && echo "✅ Kafka            : localhost:9092" || echo "❌ Kafka: Not running"
+    docker ps | grep -q minio && echo "✅ MinIO            : localhost:9000" || echo "❌ MinIO: Not running"
+    echo ""
+}
+
+cmd_execute() {
+    local pipeline_name=$1
+    if [ -z "$pipeline_name" ]; then
+        echo -e "${RED}❌ Pipeline name required${NC}"
+        echo "Usage: ./scripts/rsync execute <pipeline_name>"
+        exit 1
+    fi
+    
+    echo -e "${BLUE}Executing pipeline: $pipeline_name${NC}"
+    cd "$PROJECT_ROOT"
+    "$SCRIPT_DIR/execute_pipeline.sh" "$pipeline_name"
+}
+
+cmd_logs() {
+    local service=$1
+    cd "$PROJECT_ROOT"
+    
+    case $service in
+        orchestrator|agent|agents)
+            tail -f logs/orchestrator.log
+            ;;
+        api|gateway)
+            tail -f logs/api-gateway.log
+            ;;
+        frontend|fe)
+            tail -f logs/frontend.log
+            ;;
+        all|"")
+            tail -f logs/*.log
+            ;;
+        *)
+            echo -e "${RED}Unknown service: $service${NC}"
+            echo "Available: orchestrator, api, frontend, all"
+            exit 1
+            ;;
+    esac
+}
+
+cmd_test() {
+    echo -e "${BLUE}Running test suite (Phases A, B, C, D)...${NC}"
+    cd "$PROJECT_ROOT"
+    python3 e2e/test_phases_abcd.py
+}
+
+cmd_venv() {
+    local connector=$1
+    if [ -z "$connector" ]; then
+        echo -e "${YELLOW}Available connectors:${NC}"
+        ls "$PROJECT_ROOT/agents/generated_tools/"
+        exit 0
+    fi
+    
+    venv_path="$PROJECT_ROOT/agents/generated_tools/$connector/venv"
+    if [ -d "$venv_path" ]; then
+        echo -e "${GREEN}✅ Isolated venv exists for $connector${NC}"
+        echo ""
+        echo "Path: $venv_path"
+        echo "Python: $venv_path/bin/python"
+        echo ""
+        echo "Installed packages:"
+        "$venv_path/bin/pip" list
+    else
+        echo -e "${YELLOW}⚠️  No venv found for $connector${NC}"
+        echo "It will be created automatically on first use (Phase B)"
+    fi
+}
+
+# Main
+COMMAND=${1:-help}
+
+case $COMMAND in
+    setup)
+        cmd_setup
+        ;;
+    start)
+        cmd_start
+        ;;
+    stop)
+        cmd_stop
+        ;;
+    restart)
+        cmd_restart
+        ;;
+    status)
+        cmd_status
+        ;;
+    execute|run)
+        cmd_execute "$2"
+        ;;
+    logs|log)
+        cmd_logs "$2"
+        ;;
+    test)
+        cmd_test
+        ;;
+    venv)
+        cmd_venv "$2"
+        ;;
+    help|--help|-h|"")
+        show_help
+        ;;
+    *)
+        echo -e "${RED}Unknown command: $COMMAND${NC}"
+        echo ""
+        show_help
+        exit 1
+        ;;
+esac
+

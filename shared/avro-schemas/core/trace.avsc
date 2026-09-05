@@ -1,0 +1,45 @@
+{
+  "namespace": "com.rsync.trace",
+  "type": "record",
+  "name": "TraceContext",
+  "doc": "OpenTelemetry-compatible trace context for distributed tracing",
+  "fields": [
+    {
+      "name": "trace_id",
+      "type": "string",
+      "doc": "W3C Trace ID (32 hex chars)"
+    },
+    {
+      "name": "span_id",
+      "type": "string",
+      "doc": "W3C Span ID (16 hex chars)"
+    },
+    {
+      "name": "parent_span_id",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Parent span ID for hierarchical traces"
+    },
+    {
+      "name": "trace_flags",
+      "type": "int",
+      "default": 1,
+      "doc": "W3C trace flags (1 = sampled)"
+    },
+    {
+      "name": "trace_state",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "W3C tracestate header value"
+    },
+    {
+      "name": "baggage",
+      "type": ["null", {
+        "type": "map",
+        "values": "string"
+      }],
+      "default": null,
+      "doc": "Context baggage items"
+    }
+  ]
+}

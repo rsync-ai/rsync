@@ -1,0 +1,149 @@
+{{- if .Values.orchestrator.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-orchestrator
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  type: {{ .Values.orchestrator.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.orchestrator.service.port }}
+      targetPort: http
+  selector:
+    {{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-orchestrator
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: orchestrator
+spec:
+  replicas: {{ .Values.orchestrator.replicaCount }}
+  # Recreate, not RollingUpdate. The orchestrator holds an in-process MCP server
+  # registry and takes correlation claims in Redis; overlapping old and new pods
+  # during a rollout means two processes probing and claiming for the same run.
+  # This costs a few seconds of downtime per upgrade and buys single-writer
+  # semantics on a tier that is deliberately one replica.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: orchestrator
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: orchestrator
+        {{- with .Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      initContainers:
+        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.orchestrator.image) | nindent 8 }}
+        {{- include "rsync-ai.catalogInitContainer" . | nindent 8 }}
+      containers:
+        - name: orchestrator
+          image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.orchestrator.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            {{- include "rsync-ai.commonEnv" . | nindent 12 }}
+            {{- include "rsync-ai.postgresEnv" . | nindent 12 }}
+            {{- include "rsync-ai.redisEnv" . | nindent 12 }}
+            {{- include "rsync-ai.cryptoEnv" . | nindent 12 }}
+            {{- include "rsync-ai.kafkaEnv" . | nindent 12 }}
+            # THE load-bearing one. Connector discovery builds
+            # "<STACK_PREFIX>-<id>-v<X-Y-Z>-mcp" and GETs :8000/health on it
+            # (internal/mcp/server_manager.go StackPrefix + containerNameCandidates,
+            # :290-347). The connector Services this chart renders are named from
+            # the same value, so these two must never be set independently —
+            # both come from global.stackPrefix.
+            - name: STACK_PREFIX
+              value: {{ .Values.global.stackPrefix | quote }}
+            {{- if .Values.generation.enabled }}
+            - name: TOOL_GENERATOR_URL
+              value: "http://{{ $fullname }}-tool-generator:5010"
+            {{- end }}
+            {{- if .Values.connectors.cdc.enabled }}
+            # Every Kafka Connect caller in the orchestrator resolves this env
+            # var (executor, cdc_incremental, cdcstats, cdc_reconciler,
+            # cdc_sentinel, the health monitor, and four sites in main.go) and
+            # falls back to the compose service name "kafka-connect" when it is
+            # empty. On Kubernetes the Service carries the release prefix, so an
+            # unset value here means every one of those call paths dials a host
+            # that does not resolve.
+            - name: KAFKA_CONNECT_URL
+              value: "http://{{ $fullname }}-kafka-connect:8083"
+            {{- end }}
+            - name: CORRELATION_CLAIM_TTL
+              value: {{ .Values.orchestrator.correlationClaimTtl | quote }}
+            - name: ENABLE_SCHEDULER
+              value: {{ .Values.orchestrator.enableScheduler | quote }}
+            - name: ENABLE_CDC_TABLE_STATS
+              value: {{ .Values.orchestrator.enableCdcTableStats | quote }}
+            # Empty means "use the binary's cgroup-aware sizing". That sizing
+            # reads /sys/fs/cgroup/memory.max, which is a real number only
+            # because resources.limits.memory is set below — with no limit it
+            # reads "max" and the guard silently never engages.
+            - name: EXECUTOR_TABLE_CONCURRENCY
+              value: {{ .Values.orchestrator.tableConcurrency | quote }}
+            - name: EXECUTOR_TABLE_BATCH_ROWS
+              value: {{ .Values.orchestrator.tableBatchRows | quote }}
+            - name: TOOLS_DIR
+              value: /app/shared/mcp-connectors
+            - name: CONNECTORS_DIR
+              value: /app/shared/mcp-connectors
+            {{/*
+              Included in EVERY mode, deliberately. This used to be wrapped in
+              `if eq .Values.objectStorage.mode "minio"`, which made it the
+              outlier -- minio-mcp.yaml and cdc.yaml include the same helper
+              unconditionally, and fleet.yaml gates per connector. The helper is
+              already mode-aware: it emits static keys only when there are static
+              keys to emit, and nothing on the workload-identity path.
+
+              With the gate, `objectStorage.mode=s3` (every cloud overlay) gave
+              the orchestrator no MINIO_ or OBJECT_STORAGE_ variables at all, so
+              buildStagingConfig fell back to the bundled MinIO's address and
+              handed those to the connectors -- pointing them at a Service that
+              does not exist in non-minio mode.
+              (KI-CHART-ORCHESTRATOR-LOSES-OBJECTSTORAGE-ENV.)
+            */}}
+            {{- include "rsync-ai.objectStorageEnv" . | nindent 12 }}
+          volumeMounts:
+            - name: connector-catalog
+              mountPath: /app/shared/mcp-connectors
+            {{- include "rsync-ai.kafkaTLSVolumeMount" . | nindent 12 }}
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            # A restart here aborts every in-flight pipeline run this process
+            # owns, so the threshold is deliberately far from twitchy.
+            initialDelaySeconds: 90
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.orchestrator.resources | nindent 12 }}
+      volumes:
+        {{- include "rsync-ai.catalogVolume" . | nindent 8 }}
+        {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
+{{- end }}

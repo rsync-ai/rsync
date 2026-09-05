@@ -1,0 +1,115 @@
+{{/*
+`helm test` for this release.
+
+WHY THIS EXISTS. docs/deployment/kubernetes.md has offered `helm -n rsync test
+rsync` as its verification step since the chart was written, and until this file
+existed the chart defined ZERO test hooks -- its only two are
+`post-install,post-upgrade` (infra/minio.yaml, jobs/kafka-init.yaml). So the
+command printed `TEST SUITE: None` and exited 0. A reader ran the documented
+verify step, got a pass, and had verified nothing. A verify step that always
+passes is worse than no verify step, because it converts "I have not checked"
+into "I checked and it is fine".
+
+WHY IT DOES NOT JUST CURL /health. Two of the three services here answer a
+static 200 that cannot fail for the reason that matters:
+
+  - api-gateway /health is a literal (api-gateway/cmd/server/main.go:614). A
+    gateway that lost the cold-boot race against Postgres logs one warning,
+    falls back to mock data, never retries, and answers /health 200 forever --
+    the exact failure the #859 kind run hit, with a Ready pod serving fiction.
+    /ready is the one that pings the pool AND asserts migrations applied
+    (api-gateway/cmd/server/ready.go readinessVerdict). This test asserts the
+    BODY too: a 200 whose body is not `"status":"ready"` cannot happen today,
+    but pinning it means a future handler cannot quietly widen what counts.
+
+WHAT IT ADDS OVER POD READINESS, which is the only other post-install signal:
+readiness is evaluated by the kubelet against the pod's own IP, so it proves
+nothing about the Services. A Service with a typo'd selector has zero endpoints
+while every pod behind it is Ready -- valid YAML, green `kubectl get pods`, and
+a cluster where nothing can reach anything. Every request below deliberately
+goes through the Service DNS name, not a pod IP.
+
+IMAGE. The api-gateway image, because it is `alpine:3.19` plus curl
+(api-gateway/Dockerfile:42-45) and is guaranteed present in any install that has
+an api-gateway to test. Naming a utility image here (curlimages/curl, busybox)
+would add a registry dependency that an air-gapped or mirrored cluster then has
+to mirror, for a pod that exists for thirty seconds.
+*/}}
+{{- if .Values.apiGateway.enabled }}
+apiVersion: v1
+kind: Pod
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-test-connection
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: test
+  annotations:
+    helm.sh/hook: test
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  restartPolicy: Never
+{{- include "rsync-ai.podBoilerplate" . | nindent 2 }}
+  containers:
+    - name: probe
+      image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.apiGateway.image) }}
+      imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+      securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 8 }}
+      resources:
+        requests: { cpu: 50m, memory: 64Mi }
+        limits: { memory: 128Mi }
+      {{/*
+        The script writes one response body to /tmp. global.containerSecurityContext
+        defaults to readOnlyRootFilesystem: false, but an operator who hardens it to
+        true would otherwise turn every probe into a write error that reads exactly
+        like a service failure. Its own emptyDir makes the test independent of that.
+      */}}
+      volumeMounts:
+        - name: tmp
+          mountPath: /tmp
+      command:
+        - "sh"
+        - "-c"
+        - |
+          set -eu
+
+          fail() { echo "FAIL: $*" >&2; exit 1; }
+
+          # $1 label, $2 url, $3 expected substring ("" = body not asserted)
+          probe() {
+              _label="$1"; _url="$2"; _want="${3:-}"
+              _code=$(curl -sS --max-time 10 -o /tmp/body -w '%{http_code}' "$_url") \
+                  || fail "$_label: could not reach $_url (Service DNS or endpoints)"
+              [ "$_code" = "200" ] \
+                  || fail "$_label: $_url returned HTTP $_code -- $(head -c 200 /tmp/body)"
+              if [ -n "$_want" ]; then
+                  grep -q "$_want" /tmp/body \
+                      || fail "$_label: $_url was 200 but body lacks $_want -- $(head -c 200 /tmp/body)"
+              fi
+              echo "ok: $_label $_url"
+          }
+
+          probe "api-gateway" \
+              "http://{{ include "rsync-ai.fullname" . }}-api-gateway:{{ .Values.apiGateway.service.port }}/ready" \
+              '"status":"ready"'
+          {{- if .Values.generation.enabled }}
+          {{/* Port 5000 is a literal in apps/generation.yaml's $svcs list, not a value. */}}
+          probe "llm-service" \
+              "http://{{ include "rsync-ai.fullname" . }}-llm-service:5000/health" ""
+          {{- end }}
+          {{- if .Values.frontend.enabled }}
+          {{/*
+            /api/health is a Next.js route handler in the frontend image, so a
+            200 here means the app actually booted -- not merely that a port is
+            open. Same path the chart's own frontend probes use.
+          */}}
+          probe "frontend" \
+              "http://{{ include "rsync-ai.fullname" . }}-frontend:{{ .Values.frontend.service.port }}/api/health" ""
+          {{- end }}
+
+          echo "PASS: every rsync-ai Service answered through cluster DNS"
+  volumes:
+    - name: tmp
+      emptyDir: {}
+{{- end }}

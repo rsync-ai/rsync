@@ -1,0 +1,30 @@
+# Connector-seed image (OSS / community).
+#
+# Populates the `mcp_connectors` named volume so a COLD self-host boots WITH connectors
+# instead of an empty volume (the "zero connectors = dead-on-arrival" P0). A one-shot init
+# container copies the baked artifacts into the volume on first boot (idempotent — it skips
+# if the volume is already populated, so it never clobbers user-generated connectors).
+#
+# ALLOWLIST COPY — bakes ONLY runtime connector artifacts (all verified YAML-free):
+#   public/         pre-built public connectors + their versions/<v>/ snapshots
+#   internal/       debezium, kafka-mcp-sink, minio (+ context7) internal connectors
+#   schemas/        connector spec schemas used at build time
+#   base_connector.py   shared base class (also the BuildKit `shared` context for JIT builds)
+#
+# INTENTIONALLY NOT baked (moat / generation-only):
+#   generators/     connector-generation tooling (method_injector.py)
+#   oauth/          curated OAuth registry (providers.json + oauth_registry.py) — cloud-only.
+#                   base_connector.py's `from oauth.token_manager import TokenManager` is a
+#                   lazy, optional import (only OAuth connectors hit it), so module load is fine.
+#   tests/, *.md    not needed at runtime
+FROM busybox:1.38
+
+WORKDIR /seed
+COPY public/ ./public/
+COPY internal/ ./internal/
+COPY schemas/ ./schemas/
+COPY base_connector.py ./base_connector.py
+
+# Default: copy the seed into a volume mounted at /target. The OSS compose overrides this
+# with an idempotency guard (only seed when /target is empty).
+CMD ["sh", "-c", "cp -a /seed/. /target/ && echo 'connectors seeded'"]

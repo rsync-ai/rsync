@@ -1,0 +1,251 @@
+{
+  "name": "aws-s3-mock",
+  "description": "Mock server for AWS S3 API",
+  "base_url": "http://localhost:43039",
+  "endpoints": [
+    {
+      "path": "/object/tagging",
+      "methods": [
+        "POST",
+        "GET",
+        "DELETE"
+      ],
+      "description": "Manage object tags for S3 objects.",
+      "matcher": null,
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "Tags": [
+            {
+              "Key": "string",
+              "Value": "string"
+            }
+          ]
+        },
+        "response_type": "template",
+        "template_vars": {},
+        "generator_expr": null,
+        "delay_ms": 0
+      },
+      "error_responses": {},
+      "request_validation": false,
+      "expected_request_schema": null
+    },
+    {
+      "path": "/bucket/tagging",
+      "methods": [
+        "POST",
+        "GET",
+        "DELETE"
+      ],
+      "description": "Apply tags to buckets for cost allocation, organization, and access control policies.",
+      "matcher": null,
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "Tags": [
+            {
+              "Key": "string",
+              "Value": "string"
+            }
+          ]
+        },
+        "response_type": "template",
+        "template_vars": {},
+        "generator_expr": null,
+        "delay_ms": 0
+      },
+      "error_responses": {},
+      "request_validation": false,
+      "expected_request_schema": null
+    },
+    {
+      "path": "/multipart-uploads",
+      "methods": [
+        "GET"
+      ],
+      "description": "List and manage in-progress multipart uploads.",
+      "matcher": null,
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "Uploads": [
+            {
+              "UploadId": "string",
+              "Key": "string"
+            }
+          ]
+        },
+        "response_type": "template",
+        "template_vars": {},
+        "generator_expr": null,
+        "delay_ms": 0
+      },
+      "error_responses": {},
+      "request_validation": false,
+      "expected_request_schema": null
+    },
+    {
+      "path": "/object/existence",
+      "methods": [
+        "HEAD"
+      ],
+      "description": "Check if an object exists without downloading its content.",
+      "matcher": null,
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "ContentType": "string",
+          "ContentLength": "number",
+          "LastModified": "string"
+        },
+        "response_type": "template",
+        "template_vars": {},
+        "generator_expr": null,
+        "delay_ms": 0
+      },
+      "error_responses": {},
+      "request_validation": false,
+      "expected_request_schema": null
+    },
+    {
+      "path": "/cors/configuration",
+      "methods": [
+        "POST",
+        "GET",
+        "DELETE"
+      ],
+      "description": "Configure CORS for S3 resources.",
+      "matcher": null,
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "CORSRules": [
+            {
+              "AllowedMethods": [
+                "GET",
+                "POST"
+              ],
+              "AllowedOrigins": [
+                "string"
+              ]
+            }
+          ]
+        },
+        "response_type": "template",
+        "template_vars": {},
+        "generator_expr": null,
+        "delay_ms": 0
+      },
+      "error_responses": {},
+      "request_validation": false,
+      "expected_request_schema": null
+    },
+    {
+      "path": "/object/upload",
+      "methods": [
+        "PUT"
+      ],
+      "description": "Upload files or string content to S3 buckets.",
+      "matcher": null,
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "ETag": "string",
+          "VersionId": "string"
+        },
+        "response_type": "template",
+        "template_vars": {},
+        "generator_expr": null,
+        "delay_ms": 0
+      },
+      "error_responses": {},
+      "request_validation": false,
+      "expected_request_schema": null
+    },
+    {
+      "path": "/object/download",
+      "methods": [
+        "GET"
+      ],
+      "description": "Download objects from S3 with conditional requests and range support.",
+      "matcher": null,
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "Content": "binary",
+          "Metadata": {
+            "Author": "string",
+            "Version": "string"
+          }
+        },
+        "response_type": "template",
+        "template_vars": {},
+        "generator_expr": null,
+        "delay_ms": 0
+      },
+      "error_responses": {},
+      "request_validation": false,
+      "expected_request_schema": null
+    }
+  ],
+  "default_response": {
+    "status_code": 404,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "error": "Not Found",
+      "message": "Endpoint not found"
+    },
+    "response_type": "static",
+    "template_vars": {},
+    "generator_expr": null,
+    "delay_ms": 0
+  },
+  "auth": null,
+  "chaos_config": {
+    "enabled": true,
+    "latency_enabled": true,
+    "latency_range_ms": [
+      50,
+      200
+    ],
+    "error_rate": 0.05,
+    "error_types": [
+      "timeout",
+      "server_error"
+    ],
+    "rate_limit_enabled": false,
+    "rate_limit_requests": 100,
+    "rate_limit_window_seconds": 60,
+    "malformed_response_rate": 0.0
+  },
+  "global_response_headers": {
+    "X-Mock-Server": "true",
+    "Content-Type": "application/json"
+  },
+  "log_requests": true,
+  "spec_version": "1.0"
+}

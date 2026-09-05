@@ -1,0 +1,99 @@
+{
+  "name": "bigquery",
+  "display_name": "Google BigQuery",
+  "aliases": ["bq", "google-bigquery"],
+  "version": "1.0.0",
+  "description": "Google BigQuery data warehouse — optimized batch source (keyset-paginated reads) and destination (flag-gated bulk NDJSON load jobs).",
+  "category": "data_warehouse",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "base_url": null,
+  "default_port": null,
+  "connection_timeout": 30,
+  "auth": {
+    "type": "service_account",
+    "header_name": "",
+    "header_prefix": "",
+    "env_var": "BIGQUERY_SERVICE_ACCOUNT_JSON",
+    "oauth_provider": null,
+    "oauth_scopes": null,
+    "token_url": null,
+    "authorize_url": null,
+    "custom_headers": null
+  },
+  "config_fields": [
+    {
+      "name": "project_id",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "default": null,
+      "description": "GCP project that owns the dataset (billing + default query project).",
+      "env_var": "BIGQUERY_PROJECT_ID",
+      "ui_widget": "text",
+      "ui_order": 1,
+      "ui_placeholder": "my-gcp-project"
+    },
+    {
+      "name": "dataset_id",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "default": null,
+      "description": "Default BigQuery dataset for unqualified table names.",
+      "env_var": "BIGQUERY_DATASET_ID",
+      "ui_widget": "text",
+      "ui_order": 2,
+      "ui_placeholder": "analytics"
+    },
+    {
+      "name": "service_account_json",
+      "type": "string",
+      "required": false,
+      "secret": true,
+      "default": "",
+      "description": "Service-account JSON key. Leave empty to use Application Default Credentials (ADC).",
+      "env_var": "BIGQUERY_SERVICE_ACCOUNT_JSON",
+      "ui_widget": "textarea",
+      "ui_order": 3
+    },
+    {
+      "name": "credentials_path",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": null,
+      "description": "Path to a service-account JSON file (alternative to service_account_json).",
+      "env_var": "GOOGLE_APPLICATION_CREDENTIALS",
+      "ui_widget": "text",
+      "ui_order": 4
+    },
+    {
+      "name": "location",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": "US",
+      "description": "Dataset location, e.g. 'US' or 'EU'.",
+      "env_var": "BIGQUERY_LOCATION",
+      "ui_widget": "text",
+      "ui_order": 5
+    }
+  ],
+  "operations": [
+    {"name": "test_connection", "type": "core", "method": "test_connection"},
+    {"name": "discover_schema", "type": "core", "method": "discover_schema"},
+    {"name": "export", "type": "source", "method": "export"},
+    {"name": "import_data", "type": "destination", "method": "import_data"},
+    {"name": "load", "type": "destination", "method": "load"},
+    {"name": "merge", "type": "destination", "method": "merge"}
+  ],
+  "resources": [],
+  "max_batch_size": 10000,
+  "supported_formats": ["json", "jsonl", "csv"],
+  "python_dependencies": ["google-cloud-bigquery>=3.0.0"],
+  "spec_version": "2.0",
+  "license": "ELv2",
+  "status": "active"
+}

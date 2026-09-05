@@ -1,0 +1,11 @@
+# Requirements for the ClickHouse MCP connector.
+# ClickHouse is accessed over its HTTP interface via the official
+# clickhouse-connect driver (pure-Python, ships wheels, no system libs).
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# ClickHouse driver (official; HTTP interface, port 8123)
+clickhouse-connect>=0.7.0

@@ -1,0 +1,806 @@
+# rsync.ai — cloud-agnostic defaults.
+#
+# Nothing in this file is AWS-, GCP- or Azure-specific. The cloud files
+# (values-eks.yaml / values-gke.yaml / values-aks.yaml) only set storage classes,
+# ingress class/annotations, and which of the BYO toggles are flipped off.
+#
+# Two things are worth reading before you change anything:
+#
+#  1. Connector Service names are load-bearing DNS, not cosmetics. The
+#     orchestrator finds a connector by GETting
+#     http://<stackPrefix>-<id>-v<X-Y-Z>-mcp:8000/health and nothing else
+#     (backend-orchestrator/internal/mcp/server_manager.go:1007-1037), and
+#     pre-flight builds the same names from STACK_PREFIX
+#     (internal/workers/infra_preflight.go:177-210). Rename a connector Service
+#     and the platform does not error — it polls the dead name for 120s and then
+#     falls back to a slower path. Keep `stackPrefix` and the connector `id`/
+#     `version` fields aligned with what the pipeline config asks for.
+#
+#  2. The whole connector plane is HTTP+DNS. That is why this chart needs no
+#     Docker socket and no ReadWriteMany volume — see `connectorDeployer` and
+#     `connectorCatalog` below for the two places that would otherwise force one.
+
+# debug | info | warn | error. Applied to every service via LOG_LEVEL.
+logLevel: info
+
+global:
+  # Prefix for the connector Service names AND the value of STACK_PREFIX handed
+  # to the orchestrator. These two MUST agree; the chart wires both from here.
+  stackPrefix: rsync-ai
+
+  image:
+    registry: ghcr.io/rsync-ai
+    # Empty = use the chart's appVersion, which .github/workflows/docker-publish.yml
+    # sets from the git tag at package time. A chart pulled at 0.1.1 therefore pins
+    # 0.1.1 images with no literal here to fall out of date — the drift this
+    # replaced had the chart pinning 0.1.0 while 0.1.1 was the current release.
+    # Set a value only to pin images independently of the chart. `latest` IS
+    # published on tags now, but pinning stays the supported path: an unpinned tag
+    # silently changes what a re-pulled pod runs.
+    tag: ""
+    pullPolicy: IfNotPresent
+    pullSecrets: []
+
+  # Applied to every PersistentVolumeClaim the chart creates. Empty = the
+  # cluster default StorageClass. Every volume here is ReadWriteOnce; the chart
+  # deliberately has no RWX requirement, so gp3/pd-balanced/managed-csi all work
+  # without EFS/Filestore/Azure Files.
+  #
+  # This is the FALLBACK. Each of the four stateful components has its own
+  # `persistence.storageClass` that overrides it, for the case where one volume
+  # wants different media than the rest (Kafka or Postgres on provisioned IOPS,
+  # MinIO on something cheap). Those four keys existed from the start and were
+  # read by nothing until they were wired up: setting one was silently ignored
+  # and the PVC fell through to the cluster default.
+  storageClass: ""
+
+  # Kubernetes >=1.29 lets you keep this empty and rely on the namespace's
+  # Pod Security Admission label. Set explicitly for older clusters.
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 1000
+    runAsGroup: 1000
+    fsGroup: 1000
+    seccompProfile:
+      type: RuntimeDefault
+
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: false
+    capabilities:
+      drop: ["ALL"]
+
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+  # Added to every pod. Useful for cost allocation / mesh opt-out.
+  podAnnotations: {}
+  podLabels: {}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets
+# ─────────────────────────────────────────────────────────────────────────────
+# By default the chart creates a Secret from the values below. For anything that
+# leaves a laptop, point `existingSecret` at a Secret you manage (External
+# Secrets Operator, SOPS, sealed-secrets, cloud secret manager CSI) and leave
+# these empty — Helm values end up in the release's own Secret in cleartext, and
+# `helm get values` will read them back.
+secrets:
+  existingSecret: ""
+
+  # REQUIRED unless existingSecret is set. The chart fails to render without
+  # them rather than defaulting, because a defaulted encryption key is worse
+  # than a failed install: every stored connection is encrypted with it, and
+  # rotating it later without keeping the old key in ENCRYPTION_KEYS makes every
+  # saved connection permanently undecryptable.
+  jwtSecret: ""
+  encryptionKey: ""
+
+  # Service-to-service shared secret. Empty is allowed and the services fail
+  # closed (503) rather than open, but you want this set.
+  internalServiceSecret: ""
+
+  postgresPassword: ""
+  redisPassword: ""
+
+  # Only read when demo.enabled=true. A separate credential from
+  # postgresPassword on purpose: the demo warehouse is a DESTINATION any
+  # workspace member can run SQL against, so sharing the control-plane password
+  # with it would hand that member an offline crack of pg_authid away from the
+  # metadata database. validate.yaml refuses to render without it.
+  demoWarehousePassword: ""
+
+  # Only read when objectStorage.mode == "minio". Deliberately empty: the
+  # vendor defaults (minioadmin/minioadmin) are the first credentials any
+  # scanner tries, and a chart that ships them installs a known-credential
+  # object store holding pipeline data. validate.yaml refuses to render
+  # without these when mode is "minio".
+  minioAccessKey: ""
+  minioSecretKey: ""
+
+  # Optional; every LLM feature degrades gracefully when absent.
+  openaiApiKey: ""
+
+  # Optional OAuth app credentials for connector auth.
+  oauth: {}
+  #  GITHUB_CLIENT_ID: ""
+  #  GITHUB_CLIENT_SECRET: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BYO infrastructure toggles
+# ─────────────────────────────────────────────────────────────────────────────
+# Each block is `enabled: true` (chart runs a single-replica dev-grade instance)
+# or `enabled: false` (chart wires the app tier at `external.*` instead and runs
+# nothing). The env-var surface handed to the apps is identical either way, so
+# swapping to a managed service is a values change and nothing else.
+
+postgresql:
+  # In-chart Postgres is a StatefulSet with one replica and no backups. It is
+  # fine for an evaluation and wrong for production — this database holds every
+  # pipeline definition and every encrypted connection credential. On a real
+  # cluster set enabled=false and point at RDS / Cloud SQL / Azure Database.
+  enabled: true
+  image: postgres:16-alpine
+  database: pipeline_db
+  username: rsync
+  persistence:
+    size: 20Gi
+    # Overrides global.storageClass for this volume only. Empty = inherit it.
+    storageClass: ""
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+    # 1Gi matches the compose ceiling: this is a metadata DB and Postgres'
+    # default shared_buffers is 128 MiB.
+    limits: { memory: 1Gi }
+  external:
+    host: ""
+    port: 5432
+    # sslmode for every component that talks to this database -- api-gateway's
+    # DATABASE_URL, orchestrator's DB_SSLMODE, temporal-adapter's
+    # POSTGRES_SSLMODE, and (translated, see below) Temporal's own TLS switches.
+    # `require` is the right default for every managed Postgres; the in-chart one
+    # uses `disable`.
+    sslMode: require
+    # Temporal has no sslmode concept, so the chart derives its TLS settings
+    # from sslMode above. These two have no sslmode equivalent and are the only
+    # things left to set by hand.
+    tls:
+      # CA bundle for verifying the server, read from a path INSIDE the
+      # container -- mount it yourself via global.extraVolumes; the chart cannot
+      # guess a host path. Empty means "use the image's system trust store",
+      # which is what AWS RDS and Azure Database public CAs need.
+      caFile: ""
+      # Hostname to verify against, when it differs from the connection host
+      # (a load balancer, a pooler like PgBouncer or RDS Proxy in front). Empty
+      # defaults to postgresql.external.host.
+      serverName: ""
+
+redis:
+  enabled: true
+  image: redis:7-alpine
+  persistence:
+    size: 8Gi
+    # Overrides global.storageClass for this volume only. Empty = inherit it.
+    storageClass: ""
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 768Mi }
+  external:
+    host: ""
+    port: 6379
+
+kafka:
+  # In-chart Kafka is single-node KRaft. Replication factor is forced to 1
+  # because a one-broker cluster cannot satisfy anything higher — and a topic
+  # created with min.insync.replicas above the replication factor EXISTS but is
+  # permanently unwritable, which surfaces as a pipeline that silently produces
+  # nothing rather than as an error.
+  enabled: true
+  image: apache/kafka:3.7.0
+  clusterId: MkU3OEVBNTcwNTJENDM2Qk
+  heapOpts: "-Xms256m -Xmx512m"
+  # Broker cap on a single record, in bytes. Kafka's 1 MiB default REJECTS a CDC
+  # change event for any row carrying a large JSON/text/blob column: the producer
+  # gets RecordTooLargeException, the Debezium task goes FAILED, and what the
+  # operator actually sees is a connector restart loop, not a bad row.
+  #
+  # This one value feeds BOTH halves of the pair that has to agree - the broker
+  # (KAFKA_MESSAGE_MAX_BYTES, templates/infra/kafka.yaml) and Kafka Connect's
+  # producer (CONNECT_PRODUCER_MAX_REQUEST_SIZE, templates/connectors/cdc.yaml).
+  # The chart used to ship the producer half alone with the broker left at its
+  # 1 MiB default, and there was no lever at all: templates/infra/kafka.yaml
+  # includes rsync-ai.commonEnv zero times, so even the global extraEnv escape
+  # hatch could not reach the broker.
+  #
+  # The third leg is the sink worker's consumer fetch cap, compiled in at 16 MiB
+  # (kafka-sink-worker main.go, ReaderConfig.MaxBytes). It must stay ABOVE this
+  # number - raising this past 16 MiB strands max-size events unread.
+  #
+  # With kafka.enabled=false this still configures the Connect producer, so a BYO
+  # broker must itself accept at least this much.
+  #
+  # Both templates pipe this through `int64` before `quote`, and that is not
+  # decoration: Helm decodes every number in a values file as a float64, so a bare
+  # `| quote` renders this as "1.572864e+07". That is valid YAML, the pod starts,
+  # and Kafka rejects the config value - a failure that names neither this setting
+  # nor the template. Keep the `| int64` if you add another reader.
+  maxMessageBytes: 15728640
+  persistence:
+    size: 50Gi
+    # Overrides global.storageClass for this volume only. Empty = inherit it.
+    storageClass: ""
+  resources:
+    requests: { cpu: 250m, memory: 640Mi }
+    limits: { memory: 1Gi }
+
+  # Applied to BOTH the in-chart broker and any BYO cluster.
+  topicPrefix: "rsync."
+  # REQUIRED when kafka.enabled=false. Empty is valid ONLY for the in-chart broker,
+  # which is a single KRaft node, so the answer there is knowable (1). The chart
+  # cannot see a BYO cluster and will not guess: it used to assume 3, which
+  # crash-loops Kafka Connect on any cluster with fewer than three brokers with a
+  # TimeoutException naming neither the factor nor the broker count.
+  #   1 broker -> "1"   2 brokers -> "2"   3 or more -> "3"
+  # kafka-init clamps this down to the LIVE broker count at run time, so too large
+  # degrades with a warning rather than failing every topic create.
+  replicationFactor: ""
+  # The topic-level `min.insync.replicas`. Empty = kafka-init pins
+  # min(2, replicationFactor) -- deliberately NOT the broker default, which is
+  # invisible from here and is 2 on MSK and most managed clusters. An RF=1 topic
+  # inheriting min.insync.replicas=2 is created successfully and is then permanently
+  # unwritable. MUST be <= replicationFactor.
+  minInsyncReplicas: ""
+
+  external:
+    # Comma-separated CSV is supported and preserved end to end.
+    bootstrapServers: ""
+    # PLAINTEXT | SASL_PLAINTEXT | SASL_SSL | SSL
+    securityProtocol: PLAINTEXT
+    # PLAIN | SCRAM-SHA-256 | SCRAM-SHA-512 | OAUTHBEARER
+    saslMechanism: ""
+    # Not used by OAUTHBEARER -- see oauth.clientId below.
+    saslUsername: ""
+    # Read from `secrets.existingSecret` key KAFKA_SASL_PASSWORD when set;
+    # otherwise from the value below.
+    saslPassword: ""
+
+    # OAUTHBEARER only; ignored by every other mechanism.
+    #
+    # OIDC client-credentials. The clients do not share a configuration style
+    # here, and the difference is not cosmetic:
+    #
+    #   Go / Python   fetch the token themselves from tokenEndpoint
+    #   JVM           is handed clientId/clientSecret/scope as JAAS options and
+    #                 the endpoint as a separate property, and fetches its own
+    #
+    # so all of it has to be supplied once, here, and fanned out by the chart.
+    oauth:
+      # REQUIRED for OAUTHBEARER. The IdP's client-credentials token endpoint.
+      tokenEndpoint: ""
+      # REQUIRED for OAUTHBEARER. Not a secret; saslUsername is NOT a fallback
+      # at the chart level, because a value that means "username" on three
+      # mechanisms and "client id" on a fourth is the kind of overload that
+      # gets mis-set silently.
+      clientId: ""
+      # Read from `secrets.existingSecret` key
+      # KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET when set; otherwise from here.
+      clientSecret: ""
+      # Optional. Sent as the `scope` form parameter and as a JAAS option.
+      scope: ""
+      # Optional SASL extensions, "name=value,name2=value2". Confluent Cloud
+      # uses this for logicalCluster/identityPoolId. `auth` is reserved by the
+      # mechanism and is rejected.
+      extensions: ""
+      # The JVM's login callback handler class. Leave empty for the default.
+      #
+      # Override only to match your broker's Kafka version: the class was
+      # promoted out of the `...oauthbearer.secured` package in Kafka 3.6 and
+      # the old spelling was removed in 4.0, so neither name is correct across
+      # the whole supported range. Default is the promoted (3.6+) name.
+      loginCallbackHandler: ""
+
+    # TLS trust material. Read ONLY when securityProtocol is SASL_SSL or SSL —
+    # on a PLAINTEXT or SASL_PLAINTEXT listener there is no certificate to
+    # verify and everything below is ignored.
+    #
+    # Leaving the whole block empty is the RIGHT answer for managed Kafka whose
+    # certificate chains to a public root (MSK, Confluent Cloud, Aiven): the
+    # images already trust those. It is the wrong answer for a private or
+    # self-signed CA, where the handshake fails with a certificate error that
+    # names the issuer and not this setting.
+    tls:
+      # The CA bundle, inline PEM. Chart-managed: rendered into a Secret of its
+      # own and mounted read-only at /etc/rsync-ai/kafka-tls/ca.crt.
+      caCert: ""
+      # Client keypair for mutual TLS. Both or neither — half a pair fails
+      # closed in every client rather than downgrading to server-only TLS.
+      clientCert: ""
+      clientKey: ""
+
+      # Use a Secret you already manage instead of the three values above.
+      # The key NAMES are yours; the chart projects them onto fixed filenames,
+      # so nothing downstream depends on how you named them.
+      existingSecret: ""
+      caKey: ca.crt
+      # Leave BOTH empty for server-only TLS. Setting them is how mTLS is
+      # declared when the material comes from your own Secret — the chart
+      # cannot look inside it to find out.
+      clientCertKey: ""
+      clientKeyKey: ""
+      # Kafka Connect (Java) cannot load a cert and a key as two separate PEM
+      # files: its PEM keystore is ONE file holding both. The chart builds that
+      # file itself from clientCert+clientKey; with existingSecret you must
+      # supply it and name it here. Only needed when the CDC plane is enabled.
+      clientPemKey: ""
+
+      # Last resort, and a real downgrade: it stops the client checking that the
+      # certificate belongs to the broker it dialled, so anything holding a
+      # valid-looking certificate can terminate the connection.
+      #
+      # It is also NOT one behaviour — it means something different in each of
+      # the three runtimes this chart deploys, and only Go does what the name
+      # says:
+      #
+      #   Go      InsecureSkipVerify=true — the chain is not validated at all.
+      #   Python  kafka-python maps it to ssl_check_hostname=False only. Its
+      #           context is ssl.PROTOCOL_TLS_CLIENT, whose verify_mode is
+      #           CERT_REQUIRED and is never reassigned, so the chain IS
+      #           still validated.
+      #   JVM     ssl.endpoint.identification.algorithm="" — hostname check off,
+      #           chain still validated against the JDK cacerts.
+      #
+      # So this is a HOSTNAME override, not a verification override, for two of
+      # the three. Use it for a broker whose certificate chains to a public root
+      # but does not match the bootstrap hostname — and still set caCert to that
+      # public root. Setting it with no caCert at all is rejected by
+      # validate.yaml: against a private CA it would put the Go services on the
+      # broker and leave every Python and JVM client failing its handshake.
+      insecureSkipVerify: false
+
+objectStorage:
+  # minio | s3 | gcs | azure
+  #
+  # This picks BOTH what runs and what the object-storage connectors are told.
+  # "minio" runs an in-chart MinIO; the other three run nothing and point the
+  # connectors at the managed service. Note the connectors speak S3 regardless —
+  # `gcs` and `azure` mean "an S3-compatible endpoint fronting them".
+  mode: minio
+  bucket: pipeline-data
+
+  # Prefix the batch export stages objects under, and how long they survive.
+  #
+  # The expiry is a real retention setting, not housekeeping: staging objects ARE
+  # the in-flight transfer between the export and the sink. An expiry shorter than
+  # the pipeline retention window deletes rows that were still owed to the
+  # destination, which is why the compose stack raised this default to 7 days
+  # after a shorter one opened a loss window. Sink-side delete is the primary
+  # cleanup; this rule only reaps what a failed run abandoned.
+  prefix: staging
+  stagingExpireDays: 7
+
+  minio:
+    # Pinned, per this file's own rule at the `tag:` key above: an unpinned tag
+    # silently changes what a re-pulled pod runs. Digest-identical to `latest`
+    # at the time of pinning, so this froze the image rather than changing it.
+    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # The `mc` client, used once per install/upgrade to create the bucket and
+    # apply the lifecycle rule above.
+    # Pinned for the same reason as the server image above.
+    mcImage: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    persistence:
+      size: 50Gi
+      # Overrides global.storageClass for this volume only. Empty = inherit it.
+      storageClass: ""
+    resources:
+      requests: { cpu: 100m, memory: 256Mi }
+      limits: { memory: 768Mi }
+  external:
+    # e.g. https://s3.eu-west-1.amazonaws.com
+    endpointUrl: ""
+    region: ""
+    # Leave BOTH empty on EKS/GKE/AKS to use workload identity (IRSA /
+    # Workload Identity / AAD Pod Identity) — the chart then sets no static
+    # credentials at all and the SDK picks them up from the projected token.
+    accessKeyId: ""
+    secretAccessKey: ""
+
+temporal:
+  # Temporal's own persistence lives in the same Postgres. `auto-setup` creates
+  # its schemas on first boot; it is an evaluation image, not a production one.
+  # Set enabled=false to use Temporal Cloud or a separately-operated cluster.
+  enabled: true
+  image: temporalio/auto-setup:1.22.4
+  resources:
+    requests: { cpu: 200m, memory: 512Mi }
+    limits: { memory: 1Gi }
+  external:
+    address: ""
+    namespace: default
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Application tier
+# ─────────────────────────────────────────────────────────────────────────────
+# Limits mirror the compose ceilings. They are CEILINGS, not reservations —
+# requests are set well below because no two services peak together. The one
+# number that is not slack is the orchestrator's 2Gi: concurrent table loads are
+# sized against it, so shrinking it costs throughput.
+
+apiGateway:
+  enabled: true
+  replicaCount: 2
+  image: { repository: api-gateway, tag: "" }
+  resources:
+    requests: { cpu: 200m, memory: 384Mi }
+    limits: { memory: 1Gi }
+  service: { type: ClusterIP, port: 8080 }
+  # Comma-separated browser origins allowed to call the API. Defaults to
+  # frontend.publicUrl when empty. The CORS middleware fails closed and there is
+  # no wildcard path, so getting this wrong shows up as a blocked browser call.
+  corsOrigins: ""
+  adminEmails: ""
+  # Self-host has no Stripe and no cloud plans, so plan/quota enforcement is off
+  # here. Leaving the code's own default in place (enforced) makes a fresh
+  # install seed a 14-day 1-pipeline trial with no upgrade path — see
+  # api-gateway/internal/handlers/plan_quota.go billingEnforced(). This is a
+  # billing feature flag, not a product-edition gate: the DEFAULT in the code
+  # stays the cloud behaviour and only this deployment artifact opts out, the
+  # same way docker-compose.quickstart.yml does.
+  billingEnforced: false
+  # Absolute URL connector OAuth flows redirect back to, e.g.
+  # https://api.example.com/api/v1/oauth/callback. Empty disables OAuth
+  # connectors; a WRONG value fails at the provider, not here.
+  oauthCallbackUrl: ""
+  # Only set true when a Cloudflare tunnel terminates in front of the ingress —
+  # it makes the gateway trust CF-Connecting-IP for rate limiting.
+  trustCloudflare: false
+  autoscaling: { enabled: false, minReplicas: 2, maxReplicas: 6, targetCPUUtilizationPercentage: 70 }
+
+orchestrator:
+  enabled: true
+  # Single replica by design: the orchestrator holds correlation claims in Redis
+  # with a TTL and the scheduler is off (ENABLE_SCHEDULER=false), but the
+  # in-memory MCP server registry is per-process, so a second replica re-probes
+  # every connector independently. Scale only after measuring.
+  replicaCount: 1
+  image: { repository: orchestrator, tag: "" }
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits: { memory: 2Gi }
+  service: { type: ClusterIP, port: 8080 }
+  # Empty = the binary's own cgroup-aware sizing. That sizing reads
+  # /sys/fs/cgroup/memory.max, which is only a real number because the limit
+  # above is set — with no limit it reads "max" and the guard never engages.
+  tableConcurrency: ""
+  tableBatchRows: ""
+  correlationClaimTtl: 1h
+  enableScheduler: false
+  enableCdcTableStats: true
+
+temporalAdapter:
+  enabled: true
+  replicaCount: 1
+  image: { repository: temporal-adapter, tag: "" }
+  resources:
+    requests: { cpu: 200m, memory: 384Mi }
+    limits: { memory: 768Mi }
+
+frontend:
+  enabled: true
+  replicaCount: 2
+  image: { repository: frontend, tag: "" }
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits: { memory: 768Mi }
+  service: { type: ClusterIP, port: 3000 }
+  # Browser-visible URLs. These are baked into what the browser calls, so they
+  # must be the EXTERNAL addresses, not in-cluster Service names.
+  publicUrl: ""       # https://app.example.com  → NEXTAUTH_URL
+  apiUrl: ""          # https://api.example.com  → NEXT_PUBLIC_API_URL
+  wsUrl: ""           # wss://api.example.com/ws → NEXT_PUBLIC_WS_URL
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Generation tier
+# ─────────────────────────────────────────────────────────────────────────────
+# llm-service / tool-generator / planner are the Python tier. In the community
+# build they run TWO published images, not one:
+#
+#   llm-service, planner  → ghcr.io/rsync-ai/llm-service-oss     (Dockerfile.community)
+#   tool-generator        → ghcr.io/rsync-ai/connector-lifecycle (Dockerfile.oss)
+#
+# Both are built by the publish matrix (.github/workflows/docker-publish.yml) and
+# both are allowlist builds that omit the connector-generation moat. The omitted
+# set is llm-service/oss-strip-list.txt, and llm-service/tests/test_oss_image_boundary.py
+# fails if any tracked source file is neither shipped nor stripped — so a new
+# module cannot drift into either image unnoticed.
+#
+# On by default because /chat is the product's ONLY pipeline-creation path
+# (frontend/src/app/(dashboard)/page.tsx:272 and :482 both link to /chat). With
+# this tier off the stack comes up green and the operator still cannot create a
+# pipeline. Turn it off only if you drive the REST API directly: the Go
+# create+run path is Python-free and every LLM feature degrades gracefully, so
+# disabling this never breaks an already-created pipeline.
+generation:
+  enabled: true
+  # llm-service + planner. tool-generator runs a different image — see below.
+  image: { repository: llm-service-oss, tag: "" }
+  llm:
+    provider: openai
+    model: gpt-4o
+    ollamaUrl: ""
+    # Air-gapped / on-prem: pins ONLY the Data Explorer to Ollama so schema
+    # metadata never leaves the deployment.
+    explorerOfflineOnly: false
+  llmService:
+    replicaCount: 1
+    resources:
+      requests: { cpu: 250m, memory: 768Mi }
+      limits: { memory: 1536Mi }
+  toolGenerator:
+    # Deliberately not the same image as the other two. This pod only needs the
+    # connector-lifecycle surface (/health, /v1/deploy — src/lifecycle/main.py),
+    # and connector-lifecycle is the minimal image built for exactly that.
+    # llm-service-oss could serve it too, but docker-compose.quickstart.yml puts
+    # tool-generator on the small image, and keeping both installs on the same
+    # binaries is what makes a compose reproduction of a Kubernetes bug valid.
+    image: { repository: connector-lifecycle, tag: "" }
+    replicaCount: 1
+    # false on Kubernetes, and it cannot usefully be anything else.
+    #
+    # Managed mode lets tool-generator build a connector image and start its
+    # container itself. With DEPLOYER_URL unset — which this chart guarantees,
+    # see the note beside it in templates/apps/generation.yaml — DockerBuilder
+    # takes the legacy in-process path and calls docker.from_env()
+    # (deployment/docker_builder.py:154), so it needs /var/run/docker.sock in
+    # THIS pod. No template in this chart mounts one, for the same reason
+    # connectorDeployer is absent: a pod holding the node's Docker socket holds
+    # the node.
+    #
+    # Leaving it true does not fail cleanly, which is why the default is stated
+    # here rather than left to the compose value. The build is dispatched as a
+    # detached task (deployment/routes.py:146), so /v1/deploy answers 200 with
+    # building:true before anything has been attempted; the orchestrator extends
+    # its poll on that flag (mcp/server_manager.go:827-836) and waits out the
+    # full pre-flight timeout while docker.from_env() has already failed with a
+    # WARNING and returned False (docker_builder.py:158). The operator gets a
+    # slow "not reachable — check `docker compose logs`" on a cluster with no
+    # compose in it, and the real cause sits in a tool-generator log line.
+    #
+    # False instead returns 501 immediately (routes.py:212-219) with a body
+    # naming the remedy, and the orchestrator surfaces the status
+    # (server_manager.go:821). Declare the connectors your pipelines use under
+    # `connectors.fleet` and the JIT path is never reached at all.
+    managedConnectors: false
+    resources:
+      requests: { cpu: 200m, memory: 512Mi }
+      limits: { memory: 1Gi }
+  planner:
+    replicaCount: 1
+    resources:
+      requests: { cpu: 100m, memory: 384Mi }
+      limits: { memory: 768Mi }
+
+  # Applied to all three generation pods. The tier has a large env surface
+  # (EXPLORER_*, RANK_TABLES_*, per-feature model overrides) that this chart
+  # does not model field by field; set them here.
+  extraEnv: {}
+
+# The connector-deployer builds and starts connector containers through
+# /var/run/docker.sock (connector-deployer/internal/dockerx/backend.go:111).
+# There is no Kubernetes backend for it, and mounting a node's Docker socket
+# into a pod hands that pod the node — which is precisely the privilege the
+# SEC-H-02 work removed from tool-generator. So it is absent from this chart,
+# and just-in-time connector deployment is therefore unavailable on Kubernetes.
+#
+# The consequence is bounded: JIT only fires when a connector's Service is
+# MISSING. Declare the connectors you need under `connectors.fleet` below and
+# the path is never reached. This toggle exists to be read, not to be flipped;
+# setting it true renders a hard failure with an explanation.
+connectorDeployer:
+  enabled: false
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Connectors
+# ─────────────────────────────────────────────────────────────────────────────
+connectors:
+  # The six pods that READ the connector catalog -- api-gateway, orchestrator,
+  # temporal-adapter, and the three generation pods (llm-service, planner,
+  # tool-generator) -- each get their own copy from an initContainer running the
+  # seed image (shared/mcp-connectors/Dockerfile.seed, already used by
+  # docker-compose.oss.yml) into an emptyDir. That is what replaces the shared
+  # `mcp_connectors` volume: the only writer to that tree in the Go services is
+  # the stdio-venv fallback (internal/mcp/server_manager.go:942), which is
+  # unreachable when every connector answers on HTTP — so nothing needs
+  # ReadWriteMany.
+  #
+  # Connector pods are NOT among them and never were: each runs its own
+  # mcp-<connector> image, which already contains that connector's code. No
+  # template under templates/connectors/ references the catalog volume or this
+  # initContainer. The inverted claim ("every connector pod runs a seed
+  # initContainer") lived here first and was copied from here into
+  # docs/deployment/kubernetes.md, which is why it is stated explicitly now.
+  #
+  # Unlike compose, Kubernetes has no `build:` fallback — this image must exist in
+  # the registry or all six of those pods sit in Init:ImagePullBackOff. It is built
+  # by the publish matrix (.github/workflows/docker-publish.yml, service
+  # `connector-seed`); it was missing there until the chart was cross-checked
+  # against that matrix, which is the only reason to state it here explicitly.
+  # Safe to publish: Dockerfile.seed allowlist-COPYs public/ + internal/ +
+  # schemas/ + base_connector.py and excludes the generators/ + oauth/ moat, so it
+  # carries none of what keeps llm-service unpublished (see `generation` above).
+  catalog:
+    image: { repository: connector-seed, tag: "" }
+
+  # minio-mcp is NOT optional for batch pipelines. The batch branch of
+  # requiredServices() (infra_preflight.go:202-210) requires it for claim-check
+  # staging, and batch is the common path. Disabling it does not fail loudly:
+  # pre-flight polls the missing host for the full 120s first.
+  minio:
+    enabled: true
+    image: { repository: mcp-minio, tag: "" }
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { memory: 512Mi }
+
+  # The zero-credential demo source: the only connector whose auth_type is
+  # "none", so it is the one thing a fresh cluster can run a pipeline against
+  # before the operator has produced a secret. Stdlib-only Python serving three
+  # in-memory tables, which is why the requests are a tenth of the other
+  # connectors'.
+  #
+  # Default true on purpose. The catalog the connector-seed image bakes is the
+  # same on Kubernetes as on compose, so the UI offers sample-data either way;
+  # disabling this leaves that offer standing and the connection test resolving
+  # nothing. Turn it off for a cluster that will only ever run real sources.
+  sampleData:
+    enabled: true
+    image: { repository: mcp-sample-data, tag: "" }
+    resources:
+      requests: { cpu: 10m, memory: 32Mi }
+      limits: { memory: 128Mi }
+
+  # The CDC plane. All three or none — pre-flight requires kafka-connect,
+  # debezium-mcp and kafka-mcp-sink together (infra_preflight.go:177-201).
+  # debezium-mcp runs as a sidecar of kafka-connect, not a separate Deployment,
+  # because debezium writes source-DB credentials to a directory kafka-connect
+  # reads through FileConfigProvider. Sharing an emptyDir in one pod keeps those
+  # credentials off the Kafka config topic without needing a RWX volume.
+  cdc:
+    enabled: false
+    kafkaConnect:
+      image: { repository: kafka-connect, tag: "" }
+      groupId: rsync-connect-cluster
+      # Only consulted when kafka.external.saslMechanism is set. In that case the
+      # container runs a short prelude that builds sasl.jaas.config with the
+      # escaping the value needs (see templates/connectors/cdc.yaml) and then
+      # execs this. Override it if you point `image` at a Connect distribution
+      # whose entrypoint is not Debezium's.
+      entrypoint: "/docker-entrypoint.sh start"
+      heapOpts: "-Xms256M -Xmx768M"
+      resources:
+        requests: { cpu: 300m, memory: 1Gi }
+        limits: { memory: 1536Mi }
+    debezium:
+      image: { repository: mcp-debezium, tag: "" }
+      resources:
+        requests: { cpu: 50m, memory: 128Mi }
+        limits: { memory: 512Mi }
+    sink:
+      image: { repository: mcp-kafka-sink, tag: "" }
+      replicaCount: 1
+      resources:
+        requests: { cpu: 100m, memory: 256Mi }
+        limits: { memory: 768Mi }
+
+  # The source/destination connectors your pipelines actually use.
+  #
+  # `id` and `version` are not labels — they build the Service name the
+  # orchestrator resolves. A pipeline whose source type is `postgresql` at
+  # version `v1.0.0` looks for `<stackPrefix>-postgresql-v1-0-0-mcp:8000`.
+  # `version` is written the human way here (v1.0.0) and the chart converts the
+  # dots to dashes for the Service name, matching the platform's own naming.
+  #
+  # Ceilings default to 256Mi: the measured floor is ~43 MB per connector, of
+  # which ~32 MB is FastAPI+pydantic rather than the driver, and the headroom is
+  # for one wide page of rows. An UNCAPPED connector that leaks does not get
+  # OOM-killed itself — the kernel kills the largest process on the node, which
+  # is Kafka or Postgres.
+  # Empty by default, and that is a resource decision rather than a missing
+  # prerequisite: all 21 connector images publish to ghcr.io/rsync-ai, but
+  # running all 21 would cost ~1 GB of the target 16 GB node before a single row
+  # moves. Declare only the connectors your pipelines actually name.
+  fleet: []
+  #  - id: postgresql
+  #    version: v1.0.0
+  #    image: { repository: mcp-postgresql, tag: "" }
+  #    resources:
+  #      requests: { cpu: 50m, memory: 96Mi }
+  #      limits:   { memory: 256Mi }
+  #    env: {}
+  #  - id: aws-s3
+  #    version: v1.0.0
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bundled demo warehouse
+# ─────────────────────────────────────────────────────────────────────────────
+# The destination half of the zero-credential try-it path. `connectors.sampleData`
+# above gives a fresh install a source it can connect to with no credentials;
+# this gives it somewhere to land the rows. A pipeline needs both — intent.go:417
+# returns "plan has insufficient steps" for len(steps) < 2 — so with only the
+# source the demo stops at a green connection test and never moves a row.
+#
+# When enabled, the api-gateway learns the DSN and the dashboard offers a
+# one-click "Start with sample data". When disabled — the default — the /demo
+# endpoints report unavailable and the offer never appears, which is also exactly
+# what cloud does.
+#
+# Off by default because a cluster install is normally a real deployment and this
+# costs a pod plus a PVC. The compose quickstart ships it always-on, where both
+# are free.
+#
+# Enabling it requires TWO other things, and the chart fails the install if
+# either is missing rather than letting them fail silently later:
+#   1. `secrets.demoWarehousePassword` (or the key DEMO_WAREHOUSE_PASSWORD in
+#      your existingSecret). Deliberately NOT secrets.postgresPassword: this is a
+#      destination every workspace member can run SQL against, and reusing the
+#      control-plane password there is an escalation path.
+#   2. A `postgresql` entry in `connectors.fleet` above. There is no
+#      just-in-time connector deploy on Kubernetes, so without it the destination
+#      connection falls back to a stdio subprocess that pip-installs at runtime.
+demo:
+  enabled: false
+  image: postgres:16-alpine
+  database: demo_warehouse
+  # A role of its own, not the control-plane `rsync` user.
+  username: rsync_demo
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits: { memory: 256Mi }
+  persistence:
+    size: 2Gi
+    # Per-component first, global as the fallback — the same shape as
+    # postgresql.persistence, and read the same way (see the note there).
+    storageClass: ""
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Cluster plumbing
+# ─────────────────────────────────────────────────────────────────────────────
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  # The frontend and the API are two backends behind one or two hosts. The
+  # frontend calls the API from the BROWSER, so the API needs a routable
+  # external address of its own — an in-cluster Service name will not do.
+  hosts:
+    app: ""   # → frontend  (/)
+    api: ""   # → api-gateway (/)
+  tls: []
+  #  - secretName: rsync-tls
+  #    hosts: [app.example.com, api.example.com]
+
+serviceAccount:
+  create: true
+  name: ""
+  # For IRSA / GKE Workload Identity / AKS workload identity. Set here and the
+  # object-storage connectors need no static credentials.
+  annotations: {}
+
+networkPolicy:
+  # Default-deny ingress for every pod in the release, plus explicit allows for
+  # the paths the platform actually uses. Off by default because it is
+  # inert-to-harmful on clusters without a policy-enforcing CNI: with no
+  # enforcement it does nothing, and with enforcement it will break anything
+  # reaching in from outside the release that is not listed here.
+  enabled: false
+  # Extra namespace selectors allowed to reach api-gateway/frontend, e.g. the
+  # ingress controller's namespace.
+  allowFromNamespaces: []
+
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+
+# Extra env applied to every application pod. Escape hatch for a var this chart
+# does not model; prefer a real value if one exists.
+extraEnv: {}

@@ -1,0 +1,101 @@
+{
+  "id": "bigquery",
+  "name": "bigquery",
+  "display_name": "Google BigQuery",
+  "aliases": ["bq", "google-bigquery"],
+  "version": "1.0.0",
+  "description": "Google BigQuery data warehouse. Optimized batch SOURCE (keyset-paginated reads that resume large tables to EOF) and DESTINATION (flag-gated bulk NDJSON load jobs with streaming fallback). Hand-curated; delegates to the shared BigQueryWarehouseAdapter.",
+  "connector_type": "bigquery",
+  "category": "data_warehouse",
+  "supported_versions": {
+    "batch": "BigQuery Standard SQL (GA)"
+  },
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "spec_version": "2.0",
+  "status": "active",
+  "production_verified": true,
+  "quality_tier": "hand_curated",
+  "auth_type": "api_key",
+  "supported_auth_methods": [
+    {
+      "method": "api_key",
+      "header_name": "",
+      "header_prefix": "",
+      "config_keys": ["service_account_json"],
+      "description": "GCP service-account JSON key. If omitted, Application Default Credentials (ADC) / GOOGLE_APPLICATION_CREDENTIALS are used."
+    }
+  ],
+  "required_config": ["project_id", "dataset_id"],
+  "optional_config": ["service_account_json", "credentials_path", "location"],
+  "configuration_schema": {
+    "type": "object",
+    "required": ["project_id", "dataset_id"],
+    "properties": {
+      "project_id": {
+        "type": "string",
+        "description": "GCP project that owns the dataset (billing + default query project)."
+      },
+      "dataset_id": {
+        "type": "string",
+        "description": "Default BigQuery dataset for unqualified table names."
+      },
+      "service_account_json": {
+        "type": "string",
+        "secret": true,
+        "description": "Full service-account JSON key. Leave empty to use ADC."
+      },
+      "credentials_path": {
+        "type": "string",
+        "description": "Path to a service-account JSON file (alternative to service_account_json)."
+      },
+      "location": {
+        "type": "string",
+        "description": "Dataset location, e.g. 'US' or 'EU'."
+      }
+    }
+  },
+  "config_schema": {
+    "type": "object",
+    "required": ["project_id", "dataset_id"],
+    "properties": {
+      "project_id": {"type": "string"},
+      "dataset_id": {"type": "string"},
+      "service_account_json": {"type": "string", "secret": true},
+      "credentials_path": {"type": "string"},
+      "location": {"type": "string"}
+    }
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": ["json", "jsonl", "csv"],
+    "supported_compressions": ["none", "gzip"],
+    "supported_modalities": ["structured"],
+    "supports_cdc": false,
+    "load_strategy": {
+      "load_method": "bq_load_job",
+      "merge_method": "merge",
+      "supports_staging": true,
+      "max_batch_rows": 10000,
+      "staged_load_available": true
+    },
+    "optimized_read": {
+      "pagination": "keyset",
+      "fallback": "offset"
+    }
+  },
+  "operations": [
+    {"name": "test_connection", "type": "core", "method": "test_connection", "description": "Run SELECT 1 to validate credentials + reachability."},
+    {"name": "discover_schema", "type": "core", "method": "discover_schema", "description": "List tables in project_id.dataset_id."},
+    {"name": "export", "type": "source", "method": "export", "description": "Keyset/offset-paginated read; returns next_cursor + has_more."},
+    {"name": "import_data", "type": "destination", "method": "import_data", "description": "Bulk-first append (load job when RSYNC_BQ_LOAD_JOB set) with streaming fallback."},
+    {"name": "load", "type": "destination", "method": "load", "description": "Explicit bulk NDJSON load job (flag-gated) with streaming fallback."},
+    {"name": "merge", "type": "destination", "method": "merge", "description": "CDC-style MERGE upsert/delete (present but dormant in v1.0.0)."}
+  ],
+  "resources": [],
+  "license": "ELv2",
+  "source": "hand-curated"
+}

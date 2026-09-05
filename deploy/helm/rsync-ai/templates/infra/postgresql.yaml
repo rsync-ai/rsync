@@ -1,0 +1,123 @@
+{{- if .Values.postgresql.enabled }}
+{{/*
+The control-plane database. A StatefulSet rather than a Deployment because the
+PVC must follow the pod identity, and because a rolling Deployment would briefly
+run two postgres processes against one ReadWriteOnce volume.
+
+This is the bundled convenience database. Anything with a recovery objective
+should set postgresql.enabled=false and point postgresql.external at RDS /
+Cloud SQL / Azure Database — see values-eks.yaml.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-postgres
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  {{/* Headless: the StatefulSet needs stable per-pod DNS, and nothing load-balances a single writer. */}}
+  clusterIP: None
+  ports:
+    - port: 5432
+      targetPort: postgres
+      name: postgres
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-postgres
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  serviceName: {{ include "rsync-ai.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+{{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+      {{- with .Values.global.podAnnotations }}
+      annotations:
+{{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: postgres
+          image: {{ .Values.postgresql.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            {{/*
+              The image initialises into $PGDATA. A PVC mounted at /var/lib/postgresql/data
+              can arrive non-empty (lost+found on some CSI drivers), which makes initdb
+              refuse to run. A subdirectory sidesteps that.
+            */}}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          {{/*
+            pg_isready against the real user AND database: the default check passes
+            while the bootstrap database is still being created, which lets dependent
+            pods connect early and CrashLoop on "database does not exist".
+          */}}
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgresql.username | quote }}, "-d", {{ .Values.postgresql.database | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.postgresql.username | quote }}]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+{{- toYaml .Values.postgresql.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{/*
+          Per-component first, global as the fallback. Both keys have shipped in
+          values.yaml since the chart landed, but ONLY the global one was ever
+          read: setting postgresql.persistence.storageClass was
+          silently ignored and the PVC fell through to the cluster default. An
+          inert key in values.yaml is worse than an absent one, because
+          values.yaml is the file an operator copies to build an overlay.
+          (KI-CHART-DEAD-PER-COMPONENT-STORAGECLASS.)
+        */}}
+        {{- with (default .Values.global.storageClass .Values.postgresql.persistence.storageClass) }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size | quote }}
+{{- end }}

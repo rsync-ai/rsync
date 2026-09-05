@@ -1,0 +1,114 @@
+{{- $fullname := include "rsync-ai.fullname" . }}
+{{- $root := . }}
+{{/*
+The source/destination connectors. This list is what makes just-in-time
+connector deployment unnecessary on Kubernetes: JIT only fires when a
+connector's Service is MISSING, and the connector-deployer that would do it
+needs a Docker socket this chart deliberately does not mount (see the
+connectorDeployer note in values.yaml).
+
+`id` and `version` build the Service name the orchestrator resolves —
+<stackPrefix>-<id>-v<X-Y-Z>-mcp — and that resolution is DNS + GET /health and
+nothing else (internal/mcp/server_manager.go containerNameCandidates + the
+health probe). A connector declared here at a version no pipeline asks for is
+therefore invisible to the platform, and the symptom is a 120s pre-flight stall
+rather than an error.
+*/}}
+{{- range $c := .Values.connectors.fleet }}
+{{- $svcName := include "rsync-ai.connectorServiceName" (dict "prefix" $root.Values.global.stackPrefix "id" $c.id "version" $c.version) }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $svcName }}
+  labels:
+    {{- include "rsync-ai.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: connector
+    rsync.ai/connector-id: {{ $c.id | quote }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+  selector:
+    {{- include "rsync-ai.selectorLabels" $root | nindent 4 }}
+    app.kubernetes.io/component: connector
+    rsync.ai/connector-id: {{ $c.id | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-connector-{{ $c.id }}
+  labels:
+    {{- include "rsync-ai.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: connector
+    rsync.ai/connector-id: {{ $c.id | quote }}
+spec:
+  replicas: {{ $c.replicaCount | default 1 }}
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" $root | nindent 6 }}
+      app.kubernetes.io/component: connector
+      rsync.ai/connector-id: {{ $c.id | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" $root | nindent 8 }}
+        app.kubernetes.io/component: connector
+        rsync.ai/connector-id: {{ $c.id | quote }}
+        {{- with $root.Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secret: {{ include (print $root.Template.BasePath "/secret.yaml") $root | sha256sum }}
+        {{- with $root.Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" $root | nindent 6 }}
+      containers:
+        - name: connector
+          image: {{ include "rsync-ai.image" (dict "root" $root "image" (required (printf "connectors.fleet entry %q needs an image" $c.id) $c.image)) }}
+          imagePullPolicy: {{ $root.Values.global.image.pullPolicy }}
+          securityContext:
+            {{- toYaml $root.Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            {{- include "rsync-ai.commonEnv" $root | nindent 12 }}
+            - name: PORT
+              value: "8000"
+            - name: MCP_HTTP_MODE
+              value: "true"
+            {{- if $c.objectStorage }}
+            {{- include "rsync-ai.objectStorageEnv" $root | nindent 12 }}
+            {{- end }}
+            {{- range $k, $v := $c.env }}
+            - name: {{ $k }}
+              value: {{ $v | quote }}
+            {{- end }}
+            {{- range $k, $sk := ($c.secretEnv | default dict) }}
+            - name: {{ $k }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $root.Values.secrets.existingSecret | default (include "rsync-ai.secretName" $root) }}
+                  key: {{ $sk | quote }}
+            {{- end }}
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 6
+          {{/*
+          Uncapped is the dangerous default here, not a generous one. A leaking
+          connector without a limit is not the process the kernel kills — the
+          OOM killer takes the largest process on the node, which is Kafka or
+          Postgres. The measured floor is ~43 MB per connector (~32 MB of it
+          FastAPI + pydantic), so 256Mi is roughly six times the floor.
+          */}}
+          resources:
+            {{- toYaml ($c.resources | default (dict "requests" (dict "cpu" "50m" "memory" "96Mi") "limits" (dict "memory" "256Mi"))) | nindent 12 }}
+{{- end }}

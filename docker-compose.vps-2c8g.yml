@@ -1,0 +1,57 @@
+#
+# VPS overlay tuned for small machines (2 CPU / 8 GB RAM).
+#
+# Usage:
+#   docker compose \
+#     -f docker-compose.yml \
+#     -f docker-compose.prod.yml \
+#     -f docker-compose.vps-2c8g.yml \
+#     --env-file .env.prod up -d --compatibility
+#
+# Scope note: this overlay gates exactly ONE service. That is not an oversight —
+# see the kafka-mcp-sink and kafka-connect notes below. Everything else the CDC
+# plane costs is either load-bearing for batch or cannot be removed without
+# manufacturing a worse failure than the RAM it saves.
+#
+
+services:
+  # debezium-mcp is genuinely CDC-only: nothing in a batch pipeline touches it,
+  # and requiredServices() lists it solely under the isCDC branch
+  # (backend-orchestrator/internal/workers/infra_preflight.go:176-200).
+  # Enable with `--profile cdc`.
+  debezium-mcp:
+    profiles: ["cdc"]
+
+  # kafka-mcp-sink-mcp is deliberately NOT profiled out.
+  #
+  # It used to carry `profiles: ["cdc"]`, which broke EVERY batch pipeline on
+  # this overlay. The sink is not a CDC component: a batch run dispatches its
+  # rows through it on BOTH lanes — direct-kafka and the MinIO claim-check lane
+  # (executor/silent_drop_check.go:30-60, "both go through kafka-mcp-sink").
+  #
+  # Pre-flight cannot catch its absence, which is what made this expensive:
+  # requiredServices() only lists kafka-mcp-sink under the isCDC branch
+  # (infra_preflight.go:190-200), so a batch run sails through pre-flight, ships
+  # its rows into Kafka with nothing consuming them, and fails at the reconcile
+  # deadline with "dispatched N rows via sink but no acks were recorded …
+  # failing closed as a total drop" (silent_drop_check.go:93). That message
+  # reads as an unreachable DESTINATION, so it sends you to the wrong end of
+  # the pipeline entirely.
+
+  # kafka-connect is deliberately NOT profiled out either, and this one is a
+  # trade rather than a requirement.
+  #
+  # It is the single largest CDC cost (~900 MB) and batch never uses it, so
+  # gating it is tempting. Don't, at least not from compose alone: the
+  # sentinel's health monitor probes Connect unconditionally every 30s
+  # (sentinel/health_monitor.go:482 → :536) with no "is CDC in use?" gate, so an
+  # intentionally-absent Connect pins infrastructure:kafka-connect to unhealthy
+  # forever. The CDC health surface is what the sentinel and the healer read, so
+  # a permanently-red component there is indistinguishable from a real Connect
+  # outage — the healer then reasons off a signal that can never clear. Trading
+  # 900 MB for a health surface that lies is a bad trade on a box this small,
+  # because a small box is exactly where you need the alerts to mean something.
+  #
+  # Gating it safely needs a CDC_ENABLED-style flag (defaulting to today's
+  # behaviour) that the health monitor honours. Until that exists, Connect stays
+  # up.

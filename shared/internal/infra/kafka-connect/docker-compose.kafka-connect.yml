@@ -1,0 +1,114 @@
+# Kafka Connect with RSync SMT
+#
+# This extends the main docker-compose.yml with Kafka Connect
+# configured with our custom SMTs for CDC routing.
+#
+# Usage:
+#   docker-compose -f docker-compose.yml -f shared/internal/infra/kafka-connect/docker-compose.kafka-connect.yml up -d
+
+version: '3.8'
+
+services:
+  kafka-connect:
+    profiles:
+      - demo
+    build:
+      # NOTE: This file is invoked from the project root.
+      # Use an explicit build context to avoid resolving relative to the root docker-compose.yml.
+      context: ./shared/internal/infra/kafka-connect
+      dockerfile: Dockerfile
+    container_name: kafka-connect
+    depends_on:
+      - kafka
+    ports:
+      - "8083:8083"
+    environment:
+      # Keep memory bounded in local Docker Desktop environments.
+      # Without this, Kafka Connect can be OOM-killed (exit 137) during plugin scan/startup.
+      KAFKA_HEAP_OPTS: "-Xms128M -Xmx256M"
+      # Bootstrap servers
+      CONNECT_BOOTSTRAP_SERVERS: "${KAFKA_BROKERS:-kafka:29092}"
+      
+      # Connect cluster configuration
+      CONNECT_GROUP_ID: "rsync-connect-cluster"
+      CONNECT_CONFIG_STORAGE_TOPIC: "_rsync-connect-configs"
+      CONNECT_OFFSET_STORAGE_TOPIC: "_rsync-connect-offsets"
+      CONNECT_STATUS_STORAGE_TOPIC: "_rsync-connect-status"
+      
+      # Replication factor for Connect's three internal topics.
+      #
+      # Parameterized, not hardcoded 1. This file is always layered ON TOP of the
+      # root docker-compose.yml (see the usage line at the top), and compose merges
+      # the two `environment` maps per key with THIS file winning. A literal 1 here
+      # therefore silently overrode the root file's ${KAFKA_REPLICATION_FACTOR}: an
+      # operator who set KAFKA_REPLICATION_FACTOR=3 got RF=3 normally and RF=1 the
+      # moment they added `--profile demo`, with nothing anywhere reporting the
+      # downgrade. Same variable name the Go side reads
+      # (backend-orchestrator/internal/kafka/replication.go EnvReplicationFactor).
+      #
+      # These MUST keep the CONNECT_ prefix: the debezium/connect entrypoint turns
+      # every ^CONNECT_ variable into a connect-distributed.properties line (strip
+      # the prefix, lowercase, '_' -> '.') and discards non-matching names in
+      # silence. Connect exposes no min.insync.replicas worker property, so RF is
+      # the only durability lever here.
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "${KAFKA_REPLICATION_FACTOR:-1}"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "${KAFKA_REPLICATION_FACTOR:-1}"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "${KAFKA_REPLICATION_FACTOR:-1}"
+      
+      # REST interface
+      CONNECT_REST_ADVERTISED_HOST_NAME: "kafka-connect"
+      CONNECT_REST_PORT: 8083
+      
+      # Key and value converters (JSON-only for demo)
+      CONNECT_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      
+      # Internal converters (for Connect internal topics - must be JSON)
+      CONNECT_INTERNAL_KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_INTERNAL_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_INTERNAL_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      
+      # Plugins
+      CONNECT_PLUGIN_PATH: "/usr/share/java,/usr/share/confluent-hub-components,/opt/kafka-connect/plugins"
+      
+      # Logging -- debezium/connect names, NOT Confluent cp-kafka-connect ones.
+      #
+      # The entrypoint treats CONNECT_LOG4J_LOGGERS as a straight REPLACEMENT for the
+      # whole `log4j.rootLogger=` value (docker-entrypoint.sh does
+      # `sed -e "s|^(log4j.rootLogger)=.*|\1=${CONNECT_LOG4J_LOGGERS}|"`), not as
+      # Confluent's comma-separated "logger=LEVEL,logger=LEVEL" list. The value used
+      # here before therefore produced, verbatim, in /kafka/config/log4j.properties:
+      #
+      #   log4j.rootLogger=org.apache.kafka.connect=INFO,com.rsync.kafka.smt=DEBUG
+      #
+      # which log4j reads as level "org.apache.kafka.connect=INFO" plus an appender
+      # named "com.rsync.kafka.smt=DEBUG" -> "Could not instantiate appender named
+      # ..." followed by "No appenders could be found". The worker came up logging
+      # NOTHING. That is the worst possible state to be in while pointing Connect at a
+      # customer-managed cluster: a rejected SASL handshake would be entirely
+      # invisible, which is exactly the failure the security block above exists to
+      # make debuggable. CONNECT_LOG4J_ROOT_LOGLEVEL is Confluent's spelling too --
+      # it landed as the dead property `log4j.root.loglevel` and set nothing.
+      #
+      # LOG_LEVEL is the entrypoint's own root-level knob. Per-logger levels go
+      # through its CONNECT_LOG4J_* loop, which derives the property name by
+      # stripping CONNECT_, lowercasing, and translating '_' to '.'.
+      LOG_LEVEL: "INFO"
+      CONNECT_LOG4J_LOGGER_ORG_APACHE_KAFKA_CONNECT: "INFO"
+      CONNECT_LOG4J_LOGGER_COM_RSYNC_KAFKA_SMT: "DEBUG"
+      
+      # Producer/Consumer settings for reliability
+      CONNECT_PRODUCER_ACKS: "all"
+      CONNECT_PRODUCER_RETRIES: 10
+      CONNECT_PRODUCER_RETRY_BACKOFF_MS: 100
+      CONNECT_CONSUMER_AUTO_OFFSET_RESET: "earliest"
+      
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8083/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

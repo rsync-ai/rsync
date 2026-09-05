@@ -1,0 +1,49 @@
+# Paths (relative to llm-service/) that carry the connector-generation moat.
+#
+# SINGLE SOURCE OF TRUTH. Three consumers must agree with this file, and a guard
+# test (tests/test_oss_image_boundary.py) fails the build if any of them drifts:
+#
+#   1. Dockerfile.community  — the published community image (llm-service-oss).
+#                              Its COPY allowlist must cover EXACTLY the tracked
+#                              files under src/ and prompts/ that are NOT listed here.
+#   2. Dockerfile.oss        — the published connector-lifecycle image. A strict
+#                              subset of (1); it may ship less, never more.
+#   3. docs/internal/public-flip-runbook.md §2a — the paths deleted from the public
+#                              source tree. Same list, so "moat-free image" and
+#                              "moat-free repo" cannot diverge.
+#
+# Why a list and not "delete the whole tool_generator package": the connector
+# DEPLOY runtime (deployment/) lives inside that package and is what the Go data
+# plane calls on every self-heal / JIT build. It is moat-free by construction --
+# deployment/routes.py's module docstring records that it must never import
+# .orchestrator, ..config or any generation agent. Stripping it too would leave the
+# community stack unable to start a connector at all.
+#
+# Every path here MUST exist on disk. The guard test asserts that, so a rename
+# cannot silently turn a strip entry into a no-op that ships the moat.
+
+# ── Generation package (curated API intelligence + the agents that use it) ──
+src/agents/tool_generator/AGENTIC_PIPELINE.md
+src/agents/tool_generator/agents
+src/agents/tool_generator/config
+src/agents/tool_generator/contracts
+src/agents/tool_generator/discovery_routes.py
+src/agents/tool_generator/field_templates.py
+src/agents/tool_generator/generator
+src/agents/tool_generator/harness
+src/agents/tool_generator/mock_server
+src/agents/tool_generator/prompts
+src/agents/tool_generator/requirements.txt
+src/agents/tool_generator/schemas
+src/agents/tool_generator/service.py
+src/agents/tool_generator/templates
+src/agents/tool_generator/tests
+src/agents/tool_generator/utils
+src/agents/tool_generator/validation
+
+# ── Generation prompts ──────────────────────────────────────────────────────
+prompts/standards
+prompts/tool_generator
+
+# ── Generation entrypoint script ────────────────────────────────────────────
+generate_connectors.py

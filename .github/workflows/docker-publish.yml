@@ -1,0 +1,489 @@
+name: Build & Publish Docker Images
+
+on:
+  # Publish on version tags + manual dispatch ONLY — NOT on every push to main.
+  # Building the 9 images the matrix held at the time on every main-push
+  # exhausted the org's 2,000 free Actions minutes (private repo on GitHub
+  # Free), so every push then failed with no hosted runner. Images are needed
+  # at release time, not per commit: cut a v*.*.* tag or run the workflow
+  # manually to publish.
+  #
+  # That budget got tighter, not looser: a release now builds 34 images (the 13
+  # hand-listed below plus the 21 discovered connectors), so restoring a push
+  # trigger would exhaust the month faster than the incident this comment
+  # records. Both numbers are transcribed, so they are pinned to what they
+  # describe by llm-service/tests/test_shipped_images_are_publishable.py
+  # (test_the_header_*): the first must equal len(include:) below, the second
+  # that plus the discover-connectors count. Reword this prose freely -- a
+  # vacuity test fails if the phrases those regexes match disappear. They read
+  # "9 here / 30 total" from 2026-08-19 to 2026-08-29, four service images
+  # behind (llm-service-oss, connector-lifecycle, connector-deployer,
+  # mcp-context7 all joined after the count was written), and nothing caught
+  # it because a wrong number in a comment fails no build.
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  ORG: rsync-ai
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ── Application services ────────────────────────────────────────────
+          - service: api-gateway
+            context: .
+            dockerfile: api-gateway/Dockerfile
+            cache_scope: api-gateway
+
+          - service: orchestrator
+            context: .
+            dockerfile: backend-orchestrator/Dockerfile
+            cache_scope: orchestrator
+
+          - service: temporal-adapter
+            context: .
+            dockerfile: backend-temporal-adapter/Dockerfile
+            cache_scope: temporal-adapter-v2
+
+          # llm-service (./Dockerfile) is intentionally NOT published. Its build
+          # context contains the proprietary connector-generation moat under
+          # src/agents/tool_generator/config (vendor_apis.yaml, auth_rules.yaml,
+          # capability_rules.yaml, learned_apis.jsonl); publishing it bakes that
+          # into a pullable artifact — irreversible once the registry is public.
+          # The generation service ships only via the private release workflow.
+          #
+          # The two entries below are the stripped replacements that comment used
+          # to only promise. Both are allowlist COPY builds cut against
+          # llm-service/oss-strip-list.txt, so a moat path cannot reach a layer;
+          # llm-service/tests/test_oss_image_boundary.py fails CI if either
+          # Dockerfile drifts from that list in either direction.
+          #
+          # Without these, `docker compose -f docker-compose.quickstart.yml up -d`
+          # dies at pull with manifest-unknown on ghcr.io/rsync-ai/llm-service and
+          # NOTHING starts — the compose file's llm-service, tool-generator and
+          # planner all referenced it, and unlike mcp-context7 they are on the
+          # default path and cannot be profile-gated away.
+
+          # Serves quickstart `llm-service` (the /chat gateway — the only
+          # pipeline-creation path in the product) and `planner`.
+          - service: llm-service-oss
+            context: ./llm-service
+            dockerfile: llm-service/Dockerfile.community
+            cache_scope: llm-service-oss
+
+          # Serves quickstart `tool-generator`. Much smaller: POST /v1/deploy +
+          # GET /health only, none of the LLM/NLP dependency tree. This is what
+          # the Go data plane calls on every connector self-heal / JIT build
+          # (backend-orchestrator server_manager.go -> TOOL_GENERATOR_URL).
+          - service: connector-lifecycle
+            context: ./llm-service
+            dockerfile: llm-service/Dockerfile.oss
+            cache_scope: connector-lifecycle
+
+          - service: frontend
+            context: ./frontend
+            dockerfile: frontend/Dockerfile
+            cache_scope: frontend
+
+          # ── Internal MCP connectors (used by docker-compose.quickstart.yml) ─
+          - service: mcp-debezium
+            context: ./shared/mcp-connectors/internal/debezium/versions/v1.0.0
+            dockerfile: shared/mcp-connectors/internal/debezium/versions/v1.0.0/Dockerfile
+            cache_scope: mcp-debezium
+
+          # Versioned path, like debezium above. The root copies were removed
+          # repo-wide by 6e1aa12d (#184, 2026-06-10); debezium's entry was updated
+          # then and minio's was not, so this pointed at a Dockerfile that does not
+          # exist and the job failed on the first release, v0.1.0.
+          #
+          # Nothing surfaced it in the ten weeks between. The trigger only went
+          # tags-only on 2026-06-22 (5f36c761, #304), so for twelve days a push to
+          # main could in principle have caught it -- but every run in that window
+          # died at runner allocation in ~2s with zero steps executed (the exhausted
+          # Actions minutes this file's trigger comment records). v0.1.0 was the
+          # first run that ever reached a build step. Three independent reasons for
+          # the same silence; finding one says nothing about how many remain.
+          - service: mcp-minio
+            context: ./shared/mcp-connectors/internal/minio/versions/v1.0.0
+            dockerfile: shared/mcp-connectors/internal/minio/versions/v1.0.0/Dockerfile
+            cache_scope: mcp-minio
+
+          - service: mcp-kafka-sink
+            context: .
+            dockerfile: shared/mcp-connectors/internal/kafka-mcp-sink/Dockerfile
+            cache_scope: mcp-kafka-sink
+
+          # ── Connector seed ──────────────────────────────────────────────────
+          # Populates the connector tree a fresh self-host boots with. In compose
+          # this is a one-shot init that fills the `mcp_connectors` volume; in the
+          # Helm chart it is an initContainer on the six pods that READ the
+          # catalog — api-gateway, orchestrator, temporal-adapter, llm-service,
+          # planner, tool-generator (deploy/helm/rsync-ai/values.yaml
+          # connectors.catalog.image). Connector pods are NOT among them; each
+          # carries its own code in its own mcp-<connector> image. There is no
+          # `build:` fallback on Kubernetes — an unpublished seed image means all
+          # six of those pods sit in Init:ImagePullBackOff. Safe to publish:
+          # Dockerfile.seed is an allowlist COPY of public/ + internal/ + schemas/
+          # + base_connector.py and explicitly excludes the generators/ and oauth/
+          # moat, so unlike llm-service there is nothing proprietary to leak.
+          - service: connector-seed
+            context: ./shared/mcp-connectors
+            dockerfile: shared/mcp-connectors/Dockerfile.seed
+            cache_scope: connector-seed
+
+          # ── CDC engine ──────────────────────────────────────────────────────
+          # Not an MCP connector: this is the Kafka Connect worker debezium-mcp
+          # drives, built from quay.io/debezium/connect plus the repo's SMTs and
+          # pinned kafka-clients/lz4 swaps. It is the third leg of the CDC set the
+          # orchestrator's preflight hard-requires (kafka-connect + debezium-mcp +
+          # kafka-mcp-sink), so publishing the other two without it ships a CDC
+          # plane that cannot pass preflight.
+          - service: kafka-connect
+            context: ./shared/internal/infra/kafka-connect
+            dockerfile: shared/internal/infra/kafka-connect/Dockerfile
+            cache_scope: kafka-connect
+
+          # ── Trusted socket-holder ───────────────────────────────────────────
+          # The quickstart's connector-deployer carried a `build:` and no
+          # `image:` for its whole life, and that is not a smaller version of the
+          # unpublished-image bug -- it is a worse one. An unpublished image at
+          # least fails at pull with manifest-unknown, which names the artifact.
+          # A build stanza makes compose try to build from ./connector-deployer,
+          # and install.sh downloads exactly one file into an otherwise empty
+          # directory, so the customer gets
+          #   unable to prepare context: path ".../connector-deployer" not found
+          # -- a message about a path on THEIR box, pointing at nothing they did.
+          #
+          # It is not optional either: it is the one process holding
+          # /var/run/docker.sock (SEC-H-02), and tool-generator delegates every
+          # connector build/run to it.
+          #
+          # Safe to publish: its own go.mod, no LLM/NLP tree, no generation code,
+          # nothing from the connector-generation moat. The context is the
+          # service directory itself, exactly as every other compose file builds
+          # it. BUILDKIT_VERSION defaults inside the Dockerfile (ARG at :13), so
+          # no build-arg is needed here; keep it in step with the buildkitd
+          # sidecar in docker-compose.prod.yml when bumping.
+          - service: connector-deployer
+            context: ./connector-deployer
+            dockerfile: connector-deployer/Dockerfile
+            cache_scope: connector-deployer
+
+          # mcp-context7 (API-doc research for the connector generator) used to be
+          # excluded here "alongside llm-service". Both halves of that reasoning
+          # are now gone. llm-service is published — as `llm-service-oss`, the
+          # moat-stripped build above — so the analogy points the other way, and
+          # excluding an image from a *registry* protects nothing once the repo
+          # itself is public: server.py ships either way. It is 322 lines of thin
+          # proxy over the public context7.com API plus a Levenshtein matcher, no
+          # prompts and no generator code.
+          #
+          # What the exclusion did cost: `--profile generate` is documented in the
+          # quickstart's own header (docker-compose.quickstart.yml:37), and on that
+          # path an unbuilt image is `pull access denied`, not a degraded feature.
+          # The publishable-images guard tolerated it because it is profile-gated;
+          # test_no_quickstart_image_is_absent_from_the_publish_matrix now closes
+          # that hole for every image, gated or not.
+          #
+          # Self-contained context: the Dockerfile COPYs one file from beside it.
+          - service: mcp-context7
+            context: ./shared/mcp-connectors/internal/context7
+            dockerfile: shared/mcp-connectors/internal/context7/Dockerfile
+            cache_scope: mcp-context7
+
+          # The 21 public mcp-<connector> images are NOT listed here. They are
+          # discovered from the connector tree by the two jobs below, because a
+          # hand-written list would pin `versions/<v>` and silently publish a
+          # stale version the moment a connector's current_version moved — the
+          # drift class CLAUDE.md's connector-paths rule exists to prevent.
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+          # NEXT_PUBLIC_* vars must be baked into the Next.js client bundle at
+          # build time — runtime env vars are too late for client-side code.
+          # Set PUBLIC_URL and PUBLIC_WS_URL as repository variables in GitHub.
+          build-args: |
+            ${{ matrix.service == 'frontend' && format('NEXT_PUBLIC_API_URL={0}', vars.PUBLIC_URL || 'http://localhost:5001') || '' }}
+            ${{ matrix.service == 'frontend' && format('NEXT_PUBLIC_WS_URL={0}', vars.PUBLIC_WS_URL || 'ws://localhost:5001/ws') || '' }}
+
+  # ───────────────────────────────────────────────────────────────────────────
+  # Public MCP connectors — discovered, not listed
+  # ───────────────────────────────────────────────────────────────────────────
+  # Until this existed, `connectors.fleet` in the Helm chart shipped commented
+  # out and a real cluster install had no connector images to pull: the seed
+  # image populates the connector *catalog*, but every connector pod still needs
+  # a runtime image of its own. On Kubernetes there is no `build:` fallback, so
+  # an unpublished connector is an ImagePullBackOff, not a slow start.
+  #
+  # The matrix is derived from each connector's own `latest.json.current_version`
+  # — the same pointer the Docker build context uses everywhere else in this repo
+  # — so it cannot drift from what actually runs. Listing `versions/v1.0.0` by
+  # hand would keep publishing v1.0.0 after the pointer moved, and the image name
+  # would not change, so nothing downstream would notice.
+  discover-connectors:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.scan.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Scan the connector tree
+        id: scan
+        run: |
+          set -euo pipefail
+
+          # git ls-files, not find: locally generated connectors are untracked by
+          # design and must never reach a public registry just because they exist
+          # on someone's disk. In CI the two are identical; the difference only
+          # shows when this script is run by hand, which is when it matters.
+          # while-read over process substitution rather than `mapfile`, which is
+          # bash 4+ and absent from macOS's stock bash 3.2 -- this script is meant
+          # to be runnable by hand on a dev box, not only on ubuntu-latest.
+          matrix='[]'
+          while IFS= read -r f; do
+            dir="$(dirname "$f")"
+            id="$(basename "$dir")"
+            cv="$(jq -er '.current_version' "$f")"
+            ctx="$dir/versions/$cv"
+
+            # A pointer naming a version that was never committed would otherwise
+            # fail deep inside buildx with a confusing context error.
+            if [ ! -f "$ctx/Dockerfile" ]; then
+              echo "FATAL: $id pins current_version=$cv but $ctx/Dockerfile does not exist" >&2
+              exit 1
+            fi
+
+            matrix="$(jq -c --arg s "mcp-$id" --arg c "./$ctx" --arg d "$ctx/Dockerfile" --arg v "$cv" \
+              '. += [{service: $s, context: $c, dockerfile: $d, cache_scope: $s, version: $v}]' <<<"$matrix")"
+          done < <(git ls-files 'shared/mcp-connectors/public/**/latest.json' | sort)
+
+          n="$(jq 'length' <<<"$matrix")"
+
+          # Vacuity floor. A moved directory or a changed pathspec would otherwise
+          # produce an empty matrix, and an empty matrix is a job that reports
+          # success having published nothing.
+          if [ "$n" -eq 0 ]; then
+            echo "FATAL: discovered 0 connectors — refusing to report a successful publish" >&2
+            exit 1
+          fi
+
+          # Cross-check against docker-compose.mcp.yml. It is generated by a
+          # filesystem walk (scripts/mcp_generate_compose.py:87, Path.rglob), not
+          # by the git pathspec above — so it is a genuinely independent census of
+          # the same tree, and a walk and a pathspec do not fail the same way.
+          # That independence is the entire point: the failure being watched for
+          # is the pathspec above quietly matching FEWER connectors than exist.
+          # public/ is two levels deep in places (public/database/mysql), a
+          # shortfall raises nothing, and a smaller number reads as a pass.
+          #
+          # The two directions are NOT symmetric, so they are not treated alike:
+          #
+          #   compose > n   discovery SHORTFALL. Some images the compose file
+          #                 promises would simply never be built, and this job
+          #                 would report a successful publish having shipped a
+          #                 partial set. FATAL — a release that is quietly 10/21
+          #                 is worse than no release.
+          #   n > compose   stale compose. Every discovered image is still built
+          #                 and pushed; only the checked-in compose file lags.
+          #                 Warned, never enforced, so an unrelated stale compose
+          #                 file cannot block a release.
+          compose="$(grep -c '^    image: mcp-' docker-compose.mcp.yml || true)"
+          compose="${compose:-0}"
+          echo "discovered $n connector images; docker-compose.mcp.yml lists $compose"
+
+          # A cross-check that silently stops working is the same bug class it
+          # exists to catch, so a zero on this side is fatal too.
+          if [ "$compose" -eq 0 ]; then
+            echo "FATAL: the compose cross-check matched 0 services in docker-compose.mcp.yml." >&2
+            echo "       Either the file moved or the 'image: mcp-' shape changed. Until it is" >&2
+            echo "       fixed this job has no independent check on what it is about to publish." >&2
+            exit 1
+          fi
+
+          if [ "$compose" -gt "$n" ]; then
+            echo "FATAL: docker-compose.mcp.yml lists $compose connectors but discovery found $n." >&2
+            echo "       Discovery is short by $((compose - n)). Publishing now would ship a" >&2
+            echo "       partial image set and report success. Check the ls-files pathspec above:" >&2
+            echo "       public/ is two levels deep in places, and a pathspec that cannot cross a" >&2
+            echo "       directory separator (e.g. one carrying :(glob) magic) finds only the" >&2
+            echo "       connectors sitting directly under public/." >&2
+            exit 1
+          fi
+
+          [ "$n" = "$compose" ] || echo "::warning::connector count $n != compose count $compose — regenerate docker-compose.mcp.yml"
+
+          jq -r '.[].service' <<<"$matrix" | sed 's/^/  /'
+          echo "matrix=$(jq -c '{include: .}' <<<"$matrix")" >> "$GITHUB_OUTPUT"
+
+  build-and-push-connectors:
+    needs: discover-connectors
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.discover-connectors.outputs.matrix) }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.ORG }}/${{ matrix.service }}
+          # `type=raw,value=${{ matrix.version }}` publishes each connector under
+          # its OWN current_version as well as the platform release version.
+          # Without it a connector is addressable only as `:0.1.0` -- "whatever
+          # shipped in that release" -- so two connectors sitting at different
+          # current_versions become indistinguishable once published, and an
+          # operator cannot pin one connector independently of the platform.
+          # latest.json tracks all_versions precisely so that is possible.
+          # Adding this after the fact is not free: images already pushed under a
+          # release tag would have to be rebuilt to gain it.
+          #
+          # The comment lives HERE rather than inside the block scalar below: `#`
+          # inside a `|` is literal text, not a YAML comment, so it would be
+          # handed to metadata-action as eight tag directives. That action does
+          # strip `#` lines, but staking 21 release builds on that is a bet with
+          # no upside -- and it only fails at release time, where it is expensive.
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=${{ matrix.version }}
+            type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
+
+      - name: Build and push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.cache_scope }}
+          # Not optional decoration: every connector Dockerfile that needs
+          # warehouse_adapters.py / canonical_types.py reaches them through a
+          # BuildKit NAMED context called `shared`, mirroring
+          # docker-compose.mcp.yml's build.additional_contexts. Without it those
+          # builds fail at `COPY --from=shared`. Connectors that do not use it
+          # are unaffected by its presence, so it is passed uniformly.
+          build-contexts: |
+            shared=shared/mcp-connectors/public
+
+  # ── Helm chart ──────────────────────────────────────────────────────────────
+  # The chart is the Kubernetes delivery vehicle, and until this job existed it
+  # was never published anywhere: an EKS/GKE/AKS user had to clone the repo and
+  # `helm install ./deploy/helm/rsync-ai`, while the images it references were a
+  # one-line pull. Publishing it as an OCI artifact to the same GHCR org makes
+  # the Kubernetes path a single command, the way the compose path already is.
+  publish-chart:
+    name: Publish Helm chart (OCI)
+    # Tag-only. `helm package` below derives BOTH the chart version and — via
+    # --app-version, which every component's image tag now resolves through —
+    # the image tag, so a workflow_dispatch run has no version to publish under.
+    # Dispatch republishes images; a chart is cut by tagging.
+    if: github.ref_type == 'tag'
+    # A chart is a promise that the images it names exist. Kubernetes has no
+    # `build:` fallback the way compose does, so a chart published ahead of its
+    # images puts every pod in ImagePullBackOff — the exact failure #796 fixed
+    # for connector-seed. Wait for both image jobs.
+    needs: [build-and-push, build-and-push-connectors]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+
+      - name: Package and push chart
+        env:
+          # Passed via env + --password-stdin: a token spelled as a flag value
+          # is visible in the process table on the runner.
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Publishing chart version ${VERSION} (appVersion ${VERSION})"
+
+          helm lint deploy/helm/rsync-ai
+
+          # --app-version is load-bearing, not cosmetic: values.yaml ships
+          # `global.image.tag: ""`, so every component falls back to
+          # .Chart.AppVersion. Packaging without it would publish a chart whose
+          # images resolve to whatever appVersion is committed in Chart.yaml —
+          # exactly the drift this replaced, where the chart pinned 0.1.0 while
+          # 0.1.1 was the current release.
+          helm package deploy/helm/rsync-ai \
+            --version "${VERSION}" \
+            --app-version "${VERSION}" \
+            --destination dist
+
+          printf '%s' "${GHCR_TOKEN}" \
+            | helm registry login "${REGISTRY}" --username "${ACTOR}" --password-stdin
+
+          helm push "dist/rsync-ai-${VERSION}.tgz" "oci://${REGISTRY}/${ORG}/charts"
+
+          echo "Installable with:"
+          echo "  helm install rsync oci://${REGISTRY}/${ORG}/charts/rsync-ai --version ${VERSION}"

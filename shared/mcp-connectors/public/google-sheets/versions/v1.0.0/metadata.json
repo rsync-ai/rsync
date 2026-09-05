@@ -1,0 +1,237 @@
+{
+  "id": "google-sheets",
+  "name": "Google Sheets",
+  "display_name": "Google Sheets",
+  "aliases": [
+    "google-sheets",
+    "google_sheets",
+    "googlesheets",
+    "gsheets",
+    "Google Sheets"
+  ],
+  "version": "1.0.0",
+  "description": "Source + destination connector for Google Sheets via the Sheets v4 REST API. Each sheet tab is treated as a table; the first row is the header. As a source it reads rows offset-paged (export); as a destination it appends rows (import_data) and auto-creates tabs. OAuth2 with the 'google' provider.",
+  "connector_type": "google-sheets",
+  "category": "api_saas",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "supports_ddl": true,
+  "auto_create_destination_tables": true,
+  "spec_version": "1.0",
+  "generated_at": "2026-05-22T00:00:00.000000",
+  "status": "active",
+  "auth_type": "oauth2",
+  "oauth_provider": "google",
+  "oauth_scopes": [
+    "https://www.googleapis.com/auth/spreadsheets"
+  ],
+  "supported_auth_methods": [
+    {
+      "method": "oauth2",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer",
+      "config_keys": [
+        "access_token",
+        "oauth_token_id",
+        "token"
+      ],
+      "description": "OAuth 2.0 via the 'google' provider with the spreadsheets scope."
+    }
+  ],
+  "required_config": [
+    "spreadsheet_id",
+    "access_token"
+  ],
+  "optional_config": [],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "spreadsheet_id": {
+        "type": "string",
+        "description": "Google Sheets workbook ID — the long string between /d/ and /edit in the URL (docs.google.com/spreadsheets/d/{ID}/edit)."
+      },
+      "access_token": {
+        "type": "string",
+        "description": "OAuth2 access token with the https://www.googleapis.com/auth/spreadsheets scope. Populated by the Google OAuth callback.",
+        "secret": true
+      }
+    },
+    "required": [
+      "spreadsheet_id",
+      "access_token"
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "spreadsheet_id": {
+        "type": "string",
+        "description": "Google Sheets workbook ID — the long string between /d/ and /edit in the URL."
+      },
+      "access_token": {
+        "type": "string",
+        "description": "OAuth2 access token with the spreadsheets scope.",
+        "secret": true
+      }
+    },
+    "required": [
+      "spreadsheet_id",
+      "access_token"
+    ]
+  },
+  "config_fields": [
+    {
+      "name": "spreadsheet_id",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "description": "Google Sheets workbook ID — the long string between /d/ and /edit in the URL.",
+      "ui_placeholder": "1AbCdEfGhIjKlMnOpQrStUvWxYz_abcDEFghi",
+      "ui_help_text": "Open your workbook, copy the ID between /d/ and /edit in the URL."
+    },
+    {
+      "name": "access_token",
+      "type": "string",
+      "required": true,
+      "secret": true,
+      "description": "OAuth2 access token with the https://www.googleapis.com/auth/spreadsheets scope.",
+      "ui_help_text": "Populated automatically after you connect a Google account."
+    }
+  ],
+  "capabilities": {
+    "max_batch_size": 1000,
+    "supported_formats": [
+      "json"
+    ],
+    "supports_cdc": false,
+    "supports_ddl": true,
+    "auto_create_destination_tables": true
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Verify access to the configured workbook (returns the workbook title).",
+      "method": "google-sheets_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Static validation — confirm required fields present without an API call.",
+      "method": "google-sheets_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "List sheet tabs (treated as tables) and their header columns.",
+      "method": "google-sheets_discover_schema",
+      "parameters": [
+        {
+          "name": "max_tables",
+          "type": "integer",
+          "required": false,
+          "default": 100,
+          "description": "Maximum number of tabs to return."
+        }
+      ]
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities for agent interaction.",
+      "method": "google-sheets_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Read rows from a tab (offset-paged). Each tab is a table; row 1 is the header; data starts at row 2.",
+      "method": "google-sheets_export",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true,
+          "description": "Tab name to read (aliases: tab, sheet, resource, endpoint, object)."
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 1000,
+          "description": "Max rows to return per call. The executor passes its own batch size."
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0,
+          "description": "Number of data rows to skip (0 = first data row below the header)."
+        }
+      ]
+    },
+    {
+      "name": "ensure_table",
+      "type": "destination",
+      "description": "Create missing tab + write the header row. Idempotent.",
+      "method": "google-sheets_ensure_table",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true,
+          "description": "Tab name to ensure."
+        },
+        {
+          "name": "columns",
+          "type": "array",
+          "required": true,
+          "description": "List of column names to use as the header row."
+        },
+        {
+          "name": "column_types",
+          "type": "object",
+          "required": false,
+          "description": "Ignored — Sheets cells are stringly-typed."
+        },
+        {
+          "name": "pipeline_id",
+          "type": "string",
+          "required": false,
+          "description": "Optional pipeline ID recorded in the _rsync_pipelines metadata tab."
+        }
+      ]
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Append rows to a tab via values:append.",
+      "method": "google-sheets_import_data",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true,
+          "description": "Tab name."
+        },
+        {
+          "name": "data",
+          "type": "array",
+          "required": true,
+          "description": "List of row dicts. Keys not in the header row are ignored; missing keys become empty strings."
+        },
+        {
+          "name": "columns",
+          "type": "array",
+          "required": false,
+          "description": "Optional explicit column order; defaults to the tab's header row."
+        }
+      ]
+    }
+  ],
+  "resources": [],
+  "license": "MIT",
+  "source": "built_in"
+}

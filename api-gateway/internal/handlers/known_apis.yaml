@@ -1,0 +1,92 @@
+# Known APIs Configuration
+#
+# Maps API names to category hints for auto-detection.
+# Embedded into api-gateway so runtime does not depend on external volumes.
+#
+# VERSION: 1.0.0
+
+crm:
+  - pipedrive
+  - salesforce
+  - hubspot
+  - zoho-crm
+  - zohocrm
+  - freshsales
+  - copper
+  - insightly
+
+ecommerce:
+  - shopify
+  - woocommerce
+  - magento
+  - bigcommerce
+  - prestashop
+
+payments:
+  - stripe
+  - paypal
+  - square
+  - braintree
+  - adyen
+
+marketing:
+  - mailchimp
+  - hubspot
+  - marketo
+  - activecampaign
+  - sendgrid
+  - constant-contact
+
+support:
+  - zendesk
+  - freshdesk
+  - intercom
+  - helpscout
+  - drift
+
+devtools:
+  - github
+  - gitlab
+  - bitbucket
+  - jira
+  - confluence
+
+analytics:
+  - google-analytics
+  - mixpanel
+  - amplitude
+  - segment
+  - heap
+
+storage:
+  - aws-s3
+  - dropbox
+  - box
+  - google-drive
+
+project_management:
+  - asana
+  - trello
+  - monday
+  - basecamp
+  - clickup
+
+communication:
+  - slack
+  - teams
+  - discord
+  - twilio
+
+accounting:
+  - quickbooks
+  - xero
+  - freshbooks
+  - wave
+
+hr:
+  - bamboohr
+  - workday
+  - greenhouse
+  - lever
+
+

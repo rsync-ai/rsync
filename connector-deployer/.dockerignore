@@ -1,0 +1,7 @@
+# Keep the build context tiny — only the Go module is needed.
+.git
+.gitignore
+*.md
+Dockerfile
+.dockerignore
+**/*_test.go

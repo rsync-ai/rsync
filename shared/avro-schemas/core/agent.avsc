@@ -1,0 +1,141 @@
+{
+  "namespace": "com.rsync.agent",
+  "type": "record",
+  "name": "AgentMessage",
+  "doc": "Message format for inter-agent communication",
+  "fields": [
+    {
+      "name": "trace_id",
+      "type": "string",
+      "doc": "Distributed trace identifier"
+    },
+    {
+      "name": "message_id",
+      "type": "string",
+      "doc": "Unique message identifier"
+    },
+    {
+      "name": "correlation_id",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "ID to correlate request/response pairs"
+    },
+    {
+      "name": "source_agent",
+      "type": "string",
+      "doc": "Agent that sent this message"
+    },
+    {
+      "name": "target_agent",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Target agent (null for broadcast)"
+    },
+    {
+      "name": "message_type",
+      "type": {
+        "type": "enum",
+        "name": "MessageType",
+        "symbols": [
+          "REQUEST",
+          "RESPONSE",
+          "EVENT",
+          "ERROR",
+          "HEARTBEAT",
+          "COMMAND"
+        ]
+      },
+      "doc": "Type of message"
+    },
+    {
+      "name": "action",
+      "type": "string",
+      "doc": "Action to perform or event name"
+    },
+    {
+      "name": "payload",
+      "type": ["null", "bytes"],
+      "default": null,
+      "doc": "Serialized payload (can be nested Avro or JSON)"
+    },
+    {
+      "name": "payload_schema",
+      "type": ["null", "string"],
+      "default": null,
+      "doc": "Schema name for the payload if nested Avro"
+    },
+    {
+      "name": "status",
+      "type": ["null", {
+        "type": "enum",
+        "name": "Status",
+        "symbols": ["PENDING", "PROCESSING", "SUCCESS", "FAILED", "TIMEOUT", "CANCELLED"]
+      }],
+      "default": null,
+      "doc": "Status for response messages"
+    },
+    {
+      "name": "error",
+      "type": ["null", {
+        "type": "record",
+        "name": "ErrorInfo",
+        "fields": [
+          {
+            "name": "code",
+            "type": "string"
+          },
+          {
+            "name": "message",
+            "type": "string"
+          },
+          {
+            "name": "details",
+            "type": ["null", "string"],
+            "default": null
+          },
+          {
+            "name": "retryable",
+            "type": "boolean",
+            "default": false
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "Error details for failed messages"
+    },
+    {
+      "name": "context",
+      "type": ["null", {
+        "type": "map",
+        "values": "string"
+      }],
+      "default": null,
+      "doc": "Additional context (pipeline_id, connection_id, etc.)"
+    },
+    {
+      "name": "timestamp",
+      "type": "long",
+      "logicalType": "timestamp-millis",
+      "doc": "Message timestamp"
+    },
+    {
+      "name": "expires_at",
+      "type": ["null", "long"],
+      "default": null,
+      "logicalType": "timestamp-millis",
+      "doc": "Message expiration time"
+    },
+    {
+      "name": "priority",
+      "type": "int",
+      "default": 0,
+      "doc": "Message priority (higher = more urgent)"
+    },
+    {
+      "name": "retry_count",
+      "type": "int",
+      "default": 0,
+      "doc": "Number of retry attempts"
+    }
+  ]
+}

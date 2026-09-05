@@ -1,0 +1,744 @@
+{
+  "id": "gcs",
+  "name": "Google Cloud Storage",
+  "display_name": "Google Cloud Storage",
+  "aliases": [
+    "gcs",
+    "google-cloud-storage",
+    "google_cloud_storage",
+    "Google Cloud Storage",
+    "gcs_storage"
+  ],
+  "version": "1.0.0",
+  "description": "Connector for Google Cloud Storage (GCS) \u2014 first-class source (batch + last-modified incremental, no CDC) and destination. Reads CSV/TSV/JSON/JSONL/Parquet objects into logical tables.",
+  "connector_type": "gcs",
+  "category": "cloud_storage",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "spec_version": "1.0",
+  "generated_at": "2026-01-04T09:11:38.191670",
+  "status": "active",
+  "quality_tier": "bronze",
+  "quality_score": 44.0,
+  "api_category_hint": "storage",
+  "qa_metadata": {
+    "export_attempts": [],
+    "export_validated_with": null,
+    "export_validation_status": "unknown",
+    "tests_failed": 0,
+    "tests_passed": 0
+  },
+  "auth_type": "api_key",
+  "supported_auth_methods": [
+    {
+      "method": "api_key",
+      "header_name": "",
+      "header_prefix": "",
+      "config_keys": [
+        "service_account_json"
+      ],
+      "description": "GCS service account JSON key. Leave empty to use Application Default Credentials or a custom endpoint (emulator)."
+    }
+  ],
+  "required_config": [
+    "bucket"
+  ],
+  "optional_config": [
+    "service_account_json",
+    "project_id",
+    "endpoint_url",
+    "path_prefix",
+    "file_format",
+    "compression",
+    "sync_mode",
+    "file_mapping",
+    "source_table_name",
+    "table_patterns",
+    "dynamic_table_regex",
+    "globs",
+    "start_date",
+    "sample_files",
+    "max_sample_rows",
+    "primary_key"
+  ],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "bucket": {
+        "type": "string",
+        "description": "GCS bucket name",
+        "ui_order": 3,
+        "applies": "both",
+        "ui_tier": "basic"
+      },
+      "path_prefix": {
+        "type": "string",
+        "description": "Path prefix for files",
+        "default": "",
+        "applies": "both",
+        "ui_tier": "basic",
+        "ui_order": 7
+      },
+      "file_format": {
+        "type": "string",
+        "description": "Output file format",
+        "default": "infer",
+        "enum": [
+          "infer",
+          "csv",
+          "tsv",
+          "json",
+          "jsonl",
+          "parquet"
+        ],
+        "ui_widget": "select",
+        "ui_order": 10,
+        "applies": "both",
+        "ui_tier": "basic"
+      },
+      "compression": {
+        "type": "string",
+        "description": "Compression type",
+        "default": "none",
+        "enum": [
+          "none",
+          "gzip",
+          "bzip2"
+        ],
+        "ui_widget": "select",
+        "ui_order": 11,
+        "applies": "both",
+        "ui_tier": "advanced"
+      },
+      "partition_by": {
+        "type": "string",
+        "description": "Destination only: comma-separated columns to partition bronze CDC output by (Hive col=val/ keys). Empty = no column partitioning.",
+        "default": "",
+        "ui_order": 12,
+        "applies": "destination",
+        "ui_tier": "basic"
+      },
+      "partition_time_granularity": {
+        "type": "string",
+        "description": "Destination only: time bucket for bronze output keys (dt=YYYY-MM-DD[/hour=HH]). CDC honors all granularities; batch is day-level.",
+        "default": "none",
+        "enum": [
+          "none",
+          "hour",
+          "day",
+          "month"
+        ],
+        "ui_widget": "select",
+        "ui_order": 13,
+        "applies": "destination",
+        "ui_tier": "basic"
+      },
+      "max_file_rows": {
+        "type": "integer",
+        "description": "Destination only: roll a new part-file every N rows (0 = off). Caps bronze object size for downstream warehouses; applies to CDC and batch output.",
+        "default": 0,
+        "ui_order": 14,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "max_file_mb": {
+        "type": "integer",
+        "description": "Destination only: roll a new part-file at ~N MB, estimated pre-compression (0 = off). 128-256 is a good warehouse target; applies to CDC and batch output.",
+        "default": 0,
+        "ui_order": 15,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "cdc_include_op": {
+        "type": "boolean",
+        "description": "Destination only (CDC): include the op (I/U/D) field in each bronze envelope. Disable for an append-only after-image log.",
+        "default": true,
+        "ui_widget": "checkbox",
+        "ui_order": 16,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "cdc_partition_by_op": {
+        "type": "boolean",
+        "description": "Destination only (CDC): partition bronze output by change type (op=I/op=U/op=D path prefix). If cdc_include_op is also on, the in-file op duplicates this partition column.",
+        "default": false,
+        "ui_widget": "checkbox",
+        "ui_order": 17,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "endpoint_url": {
+        "type": "string",
+        "description": "Custom GCS API endpoint (e.g. a private endpoint or a fake-gcs-server emulator http://host:4443). Leave empty for Google Cloud. Cannot point at rsync-ai's internal MinIO.",
+        "default": "",
+        "ui_order": 6,
+        "applies": "both",
+        "ui_tier": "basic"
+      },
+      "sync_mode": {
+        "type": "string",
+        "description": "Read mode: full re-reads all matching files; incremental reads only objects modified since the last run (by last_modified).",
+        "default": "full",
+        "enum": [
+          "full",
+          "incremental"
+        ],
+        "ui_widget": "select",
+        "ui_order": 20,
+        "applies": "source",
+        "ui_tier": "basic"
+      },
+      "file_mapping": {
+        "type": "string",
+        "description": "How source files map to tables: single (all files = one table), per_table (table_patterns), or dynamic (extract the table name from the object key via a regex).",
+        "default": "single",
+        "enum": [
+          "single",
+          "per_table",
+          "dynamic"
+        ],
+        "ui_widget": "select",
+        "ui_order": 21,
+        "applies": "source",
+        "ui_tier": "basic"
+      },
+      "source_table_name": {
+        "type": "string",
+        "description": "Table name used when file_mapping=single (defaults to the bucket name).",
+        "default": "",
+        "ui_order": 22,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "table_patterns": {
+        "type": "string",
+        "description": "JSON object mapping table name -> glob(s) for file_mapping=per_table, e.g. {\"users\": \"users/*.json\", \"orders\": \"orders/*.parquet\"}.",
+        "default": "",
+        "ui_order": 23,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "dynamic_table_regex": {
+        "type": "string",
+        "description": "Regex with a named group capturing the table name for file_mapping=dynamic, e.g. raw/(?<table>[^/]+)/. Both (?<table>...) and (?P<table>...) are accepted.",
+        "default": "",
+        "ui_order": 24,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "globs": {
+        "type": "string",
+        "description": "Comma-separated filename globs to include (matched against the full key and the file leaf), e.g. *.json,*.csv.gz. Default * = all files under the prefix.",
+        "default": "*",
+        "ui_order": 25,
+        "applies": "source",
+        "ui_tier": "basic"
+      },
+      "start_date": {
+        "type": "string",
+        "description": "Only read objects with last_modified >= this ISO-8601 timestamp (e.g. 2026-01-01T00:00:00+00:00).",
+        "default": "",
+        "ui_order": 26,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "sample_files": {
+        "type": "integer",
+        "description": "How many files per table to sample when inferring schema in discover_schema.",
+        "default": 5,
+        "ui_order": 27,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "max_sample_rows": {
+        "type": "integer",
+        "description": "Maximum rows to sample per table when inferring schema.",
+        "default": 100,
+        "ui_order": 28,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "primary_key": {
+        "type": "string",
+        "description": "Optional comma-separated primary key column(s) for destination upsert. Leave empty for append-only.",
+        "default": "",
+        "ui_order": 29,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "service_account_json": {
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "ui_widget": "textarea",
+        "ui_order": 1,
+        "description": "GCS service account JSON key (paste the JSON). Leave empty to use Application Default Credentials or a custom endpoint (emulator).",
+        "applies": "both",
+        "ui_tier": "basic"
+      },
+      "project_id": {
+        "type": "string",
+        "default": "",
+        "ui_order": 2,
+        "description": "GCP project ID (optional; inferred from the service account when omitted).",
+        "applies": "both",
+        "ui_tier": "basic"
+      }
+    },
+    "required": [
+      "bucket"
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "bucket": {
+        "type": "string",
+        "description": "GCS bucket name",
+        "ui_order": 3,
+        "applies": "both",
+        "ui_tier": "basic"
+      },
+      "path_prefix": {
+        "type": "string",
+        "description": "Path prefix for files",
+        "default": "",
+        "applies": "both",
+        "ui_tier": "basic",
+        "ui_order": 7
+      },
+      "file_format": {
+        "type": "string",
+        "description": "Output file format",
+        "default": "infer",
+        "enum": [
+          "infer",
+          "csv",
+          "tsv",
+          "json",
+          "jsonl",
+          "parquet"
+        ],
+        "ui_widget": "select",
+        "ui_order": 10,
+        "applies": "both",
+        "ui_tier": "basic"
+      },
+      "compression": {
+        "type": "string",
+        "description": "Compression type",
+        "default": "none",
+        "enum": [
+          "none",
+          "gzip",
+          "bzip2"
+        ],
+        "ui_widget": "select",
+        "ui_order": 11,
+        "applies": "both",
+        "ui_tier": "advanced"
+      },
+      "partition_by": {
+        "type": "string",
+        "description": "Destination only: comma-separated columns to partition bronze CDC output by (Hive col=val/ keys). Empty = no column partitioning.",
+        "default": "",
+        "ui_order": 12,
+        "applies": "destination",
+        "ui_tier": "basic"
+      },
+      "partition_time_granularity": {
+        "type": "string",
+        "description": "Destination only: time bucket for bronze output keys (dt=YYYY-MM-DD[/hour=HH]). CDC honors all granularities; batch is day-level.",
+        "default": "none",
+        "enum": [
+          "none",
+          "hour",
+          "day",
+          "month"
+        ],
+        "ui_widget": "select",
+        "ui_order": 13,
+        "applies": "destination",
+        "ui_tier": "basic"
+      },
+      "max_file_rows": {
+        "type": "integer",
+        "description": "Destination only: roll a new part-file every N rows (0 = off). Caps bronze object size for downstream warehouses; applies to CDC and batch output.",
+        "default": 0,
+        "ui_order": 14,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "max_file_mb": {
+        "type": "integer",
+        "description": "Destination only: roll a new part-file at ~N MB, estimated pre-compression (0 = off). 128-256 is a good warehouse target; applies to CDC and batch output.",
+        "default": 0,
+        "ui_order": 15,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "cdc_include_op": {
+        "type": "boolean",
+        "description": "Destination only (CDC): include the op (I/U/D) field in each bronze envelope. Disable for an append-only after-image log.",
+        "default": true,
+        "ui_widget": "checkbox",
+        "ui_order": 16,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "cdc_partition_by_op": {
+        "type": "boolean",
+        "description": "Destination only (CDC): partition bronze output by change type (op=I/op=U/op=D path prefix). If cdc_include_op is also on, the in-file op duplicates this partition column.",
+        "default": false,
+        "ui_widget": "checkbox",
+        "ui_order": 17,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "endpoint_url": {
+        "type": "string",
+        "description": "Custom GCS API endpoint (e.g. a private endpoint or a fake-gcs-server emulator http://host:4443). Leave empty for Google Cloud. Cannot point at rsync-ai's internal MinIO.",
+        "default": "",
+        "ui_order": 6,
+        "applies": "both",
+        "ui_tier": "basic"
+      },
+      "sync_mode": {
+        "type": "string",
+        "description": "Read mode: full re-reads all matching files; incremental reads only objects modified since the last run (by last_modified).",
+        "default": "full",
+        "enum": [
+          "full",
+          "incremental"
+        ],
+        "ui_widget": "select",
+        "ui_order": 20,
+        "applies": "source",
+        "ui_tier": "basic"
+      },
+      "file_mapping": {
+        "type": "string",
+        "description": "How source files map to tables: single (all files = one table), per_table (table_patterns), or dynamic (extract the table name from the object key via a regex).",
+        "default": "single",
+        "enum": [
+          "single",
+          "per_table",
+          "dynamic"
+        ],
+        "ui_widget": "select",
+        "ui_order": 21,
+        "applies": "source",
+        "ui_tier": "basic"
+      },
+      "source_table_name": {
+        "type": "string",
+        "description": "Table name used when file_mapping=single (defaults to the bucket name).",
+        "default": "",
+        "ui_order": 22,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "table_patterns": {
+        "type": "string",
+        "description": "JSON object mapping table name -> glob(s) for file_mapping=per_table, e.g. {\"users\": \"users/*.json\", \"orders\": \"orders/*.parquet\"}.",
+        "default": "",
+        "ui_order": 23,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "dynamic_table_regex": {
+        "type": "string",
+        "description": "Regex with a named group capturing the table name for file_mapping=dynamic, e.g. raw/(?<table>[^/]+)/. Both (?<table>...) and (?P<table>...) are accepted.",
+        "default": "",
+        "ui_order": 24,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "globs": {
+        "type": "string",
+        "description": "Comma-separated filename globs to include (matched against the full key and the file leaf), e.g. *.json,*.csv.gz. Default * = all files under the prefix.",
+        "default": "*",
+        "ui_order": 25,
+        "applies": "source",
+        "ui_tier": "basic"
+      },
+      "start_date": {
+        "type": "string",
+        "description": "Only read objects with last_modified >= this ISO-8601 timestamp (e.g. 2026-01-01T00:00:00+00:00).",
+        "default": "",
+        "ui_order": 26,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "sample_files": {
+        "type": "integer",
+        "description": "How many files per table to sample when inferring schema in discover_schema.",
+        "default": 5,
+        "ui_order": 27,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "max_sample_rows": {
+        "type": "integer",
+        "description": "Maximum rows to sample per table when inferring schema.",
+        "default": 100,
+        "ui_order": 28,
+        "applies": "source",
+        "ui_tier": "advanced"
+      },
+      "primary_key": {
+        "type": "string",
+        "description": "Optional comma-separated primary key column(s) for destination upsert. Leave empty for append-only.",
+        "default": "",
+        "ui_order": 29,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "service_account_json": {
+        "type": "string",
+        "secret": true,
+        "default": "",
+        "ui_widget": "textarea",
+        "ui_order": 1,
+        "description": "GCS service account JSON key (paste the JSON). Leave empty to use Application Default Credentials or a custom endpoint (emulator).",
+        "applies": "both",
+        "ui_tier": "basic"
+      },
+      "project_id": {
+        "type": "string",
+        "default": "",
+        "ui_order": 2,
+        "description": "GCP project ID (optional; inferred from the service account when omitted).",
+        "applies": "both",
+        "ui_tier": "basic"
+      }
+    },
+    "required": [
+      "bucket"
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": [
+      "csv",
+      "tsv",
+      "json",
+      "jsonl",
+      "parquet"
+    ],
+    "supported_modalities": [
+      "structured",
+      "blob"
+    ],
+    "supported_compressions": [
+      "none",
+      "gzip",
+      "bzip2"
+    ],
+    "supports_cdc": false
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity to the data source",
+      "method": "gcs_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration without connecting",
+      "method": "gcs_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover available tables/collections and their schemas",
+      "method": "gcs_discover_schema",
+      "parameters": [
+        {
+          "name": "include_columns",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include column metadata (names, types, nullability)"
+        },
+        {
+          "name": "include_row_counts",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include estimated row counts (fast, no full scans)"
+        },
+        {
+          "name": "include_relationships",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Include primary keys and foreign keys (for agents)"
+        },
+        {
+          "name": "include_indexes",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Include index metadata (for agents)"
+        },
+        {
+          "name": "max_tables",
+          "type": "integer",
+          "required": false,
+          "default": 100,
+          "description": "Maximum number of tables to return"
+        }
+      ]
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities for agent interaction",
+      "method": "gcs_get_capabilities"
+    },
+    {
+      "name": "read",
+      "type": "source",
+      "description": "Read file from storage",
+      "method": "gcs_read",
+      "parameters": [
+        {
+          "name": "bucket",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "key",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Write data to storage",
+      "method": "gcs_import_data",
+      "parameters": [
+        {
+          "name": "bucket",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "key",
+          "type": "string",
+          "required": false
+        },
+        {
+          "name": "data",
+          "type": "any",
+          "required": true
+        },
+        {
+          "name": "format",
+          "type": "string",
+          "required": false,
+          "default": "json"
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "name": "object_tagging",
+      "endpoint": "/object/tagging",
+      "id_field": "key",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "get",
+        "create"
+      ]
+    },
+    {
+      "name": "bucket_tagging",
+      "endpoint": "/bucket/tagging",
+      "id_field": "key",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "get",
+        "create"
+      ]
+    },
+    {
+      "name": "object_existence",
+      "endpoint": "/object/existence",
+      "id_field": "key",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "get"
+      ]
+    },
+    {
+      "name": "cors_configuration",
+      "endpoint": "/cors/configuration",
+      "id_field": "key",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "get",
+        "create"
+      ]
+    },
+    {
+      "name": "object_upload",
+      "endpoint": "/object/upload",
+      "id_field": "key",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "create"
+      ]
+    },
+    {
+      "name": "download",
+      "endpoint": "/download",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "list"
+      ]
+    },
+    {
+      "name": "multipart_uploads",
+      "endpoint": "/multipart-uploads",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "list"
+      ]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

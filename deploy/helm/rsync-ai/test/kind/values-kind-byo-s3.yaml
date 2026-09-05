@@ -1,0 +1,34 @@
+# Stage S3 overlay: SASL_SSL + SCRAM-SHA-512 against a PRIVATE CA.
+#
+# Overlays values-kind-byo.yaml. The delta from S1 is ONE axis -- transport --
+# so anything that breaks under S3 and not under S1 is attributable to TLS.
+#
+# NO SECRET HERE, and no CA either. `kafka.external.saslPassword` and
+# `kafka.external.tls.caCert` are both deliberately omitted; both go in a third,
+# uncommitted `-f`, exactly as the password does for S1/S2:
+#
+#   { echo 'kafka:'; echo '  external:';
+#     echo "    saslPassword: $(cat .broker-sasl-password)";
+#     echo '    tls:'; echo '      caCert: |';
+#     sed 's/^/        /' .tls/broker/ca.crt; } > /tmp/s3-secret.yaml
+#
+# The CA certificate is not itself confidential, but it is regenerated per
+# environment, so committing one would only guarantee a stale bundle and a
+# handshake failure that reads like a chart bug.
+
+kafka:
+  external:
+    securityProtocol: SASL_SSL
+    saslMechanism: SCRAM-SHA-512
+    saslUsername: rsync
+    # tls.caCert: supplied by the uncommitted third -f.
+    #
+    # tls.insecureSkipVerify is deliberately NOT set. It would be the wrong
+    # escape hatch here twice over: the broker certificate carries a SAN for the
+    # exact name the clients dial, so there is nothing to skip; and it does not
+    # mean the same thing in the three runtimes this chart deploys -- only Go
+    # stops validating the chain, while the Python and JVM clients keep
+    # validating it against a trust store that would not contain this CA. Setting
+    # it here would put the Go services on the broker and leave llm-service,
+    # planner, tool-generator, debezium-mcp, kafka-connect and kafka-init failing
+    # their handshakes -- a half-green run that looks like a partial success.

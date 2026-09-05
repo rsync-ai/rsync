@@ -1,0 +1,41 @@
+{
+  "name": "clickhouse",
+  "display_name": "ClickHouse",
+  "aliases": ["clickhouse", "clickhouse-server", "yandex-clickhouse"],
+  "version": "1.0.0",
+  "description": "ClickHouse batch source + destination (OLAP columnar warehouse, HTTP interface).",
+  "category": "relational_db",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "base_url": "http://localhost:9999",
+  "default_port": 8123,
+  "connection_timeout": 30,
+  "auth": {
+    "type": "basic",
+    "username_env": "CLICKHOUSE_USER",
+    "password_env": "CLICKHOUSE_PASSWORD"
+  },
+  "config_fields": [
+    {"name": "host", "type": "string", "required": true, "secret": false, "description": "ClickHouse host", "env_var": "CLICKHOUSE_HOST", "ui_placeholder": "my-clickhouse.example.com"},
+    {"name": "port", "type": "integer", "required": false, "secret": false, "default": 8123, "description": "HTTP interface port (8123 plain / 8443 secure)", "env_var": "CLICKHOUSE_PORT"},
+    {"name": "database", "type": "string", "required": true, "secret": false, "default": "default", "description": "Database name", "env_var": "CLICKHOUSE_DATABASE"},
+    {"name": "user", "type": "string", "required": true, "secret": false, "default": "default", "description": "ClickHouse user", "env_var": "CLICKHOUSE_USER"},
+    {"name": "password", "type": "string", "required": false, "secret": true, "sensitive": true, "description": "ClickHouse password", "env_var": "CLICKHOUSE_PASSWORD"},
+    {"name": "secure", "type": "boolean", "required": false, "secret": false, "default": false, "description": "Use HTTPS (TLS) for the HTTP interface", "env_var": "CLICKHOUSE_SECURE"}
+  ],
+  "resources": [
+    {
+      "name": "health",
+      "endpoint": "/health",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": ["get"]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

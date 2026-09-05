@@ -1,0 +1,1388 @@
+name: CI
+
+on:
+  pull_request:
+    # Docs-only / housekeeping changes never affect CI — skip the whole run.
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
+      - '.gitignore'
+      - '.editorconfig'
+  push:
+    branches: [main]
+  workflow_dispatch:
+  # Nightly trigger for the non-blocking a11y suite. It used to run on
+  # every PR purely to upload a report (continue-on-error, known-unfixed
+  # violations), adding a full Playwright build+browser run to the PR
+  # critical path for zero gating value. Moved off PRs onto a nightly
+  # cron so violations are still tracked without slowing every push.
+  schedule:
+    - cron: '0 9 * * *'  # 09:00 UTC daily (off-peak for the mac runners)
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# dorny/paths-filter needs `pull-requests: read` to call the PR
+# listFiles API; without it the action fails with
+# `Resource not accessible by integration`.
+permissions:
+  contents: read
+  pull-requests: read
+
+# Self-hosted-runner tool cache. The setup-go / setup-python /
+# setup-node actions default their cache to /Users/runner/hostedtoolcache
+# (the GitHub-hosted-runner user). That path doesn't exist on a
+# self-hosted Mac. AGENT_TOOLSDIRECTORY is exported by each runner's
+# own ~/.env so every parallel runner uses its own _work/_tool dir
+# (avoids concurrent-write races on a shared cache). Don't set it at
+# workflow level — that would override the per-runner value.
+
+jobs:
+  # Detect which directories changed in this PR, so downstream jobs can
+  # skip themselves when their code wasn't touched. A frontend-only PR
+  # no longer waits on every Go matrix entry, and a Go-only PR doesn't
+  # rebuild Next.js + Playwright. Huge perceived-speed win.
+  #
+  # `changes` itself is fast (<30s), so the overhead is negligible
+  # against the wall-clock savings on the jobs that get skipped.
+  changes:
+    name: Detect changes
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    outputs:
+      go: ${{ steps.filter.outputs.go }}
+      go-shared: ${{ steps.filter.outputs.go-shared }}
+      sink: ${{ steps.filter.outputs.sink }}
+      llm: ${{ steps.filter.outputs.llm }}
+      e2e: ${{ steps.filter.outputs.e2e }}
+      datapath: ${{ steps.filter.outputs.datapath }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: |
+            go:
+              - 'api-gateway/**'
+              - 'backend-orchestrator/**'
+              - 'backend-temporal-adapter/**'
+              - 'connector-deployer/**'
+              - 'shared/go/**'
+              - '.github/workflows/ci.yml'
+            go-shared:
+              - 'shared/go/**'
+              - '.github/workflows/ci.yml'
+            # kafka-mcp-sink worker is its own Go module (NOT under shared/go,
+            # so neither the `go` nor `go-shared` matrix covers it). Trigger its
+            # dedicated job on the worker module itself AND on shared/go/transforms
+            # — the worker `replace`s that path, so a transforms API change can
+            # break the sink build/tests and must be caught on the PR.
+            sink:
+              - 'shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/**'
+              - 'shared/go/transforms/**'
+              - '.github/workflows/ci.yml'
+            llm:
+              - 'llm-service/**'
+              - 'shared/mcp-connectors/**'
+              # The Helm chart is here because llm-service/tests holds the chart
+              # guards (test_chart_service_hostnames_resolve.py,
+              # test_chart_kafka_security_env.py) -- they parse deploy/helm as
+              # text and need no cluster. Without this path the guards were dead
+              # on exactly the change they exist to catch: PR #836 rewrote six
+              # chart templates and this job reported `skipping`, so the test
+              # written to catch a chart hostname bug never ran against a chart
+              # PR. A guard gated on a filter that excludes its own subject is
+              # not a guard.
+              - 'deploy/helm/**'
+              # Same reasoning one step further out: this filter gates the
+              # oss-leak-proof job, whose subject IS this script. Without the
+              # path, editing the moat-leak proof itself would not run it.
+              - 'scripts/oss-leak-proof-test.sh'
+              # And once more, one directory over. test_validate_connector_script_
+              # finds_connectors.py guards scripts/mcp-connectors/validate_connector.py
+              # -- the contributor gate the developer guide points at, which spent its
+              # whole life resolving connectors under its OWN directory and therefore
+              # examined zero of them. The guard lives here because its fixture is the
+              # connector tree; its subject does not, so without this path a PR fixing
+              # (or re-breaking) the script alone would skip the job.
+              - 'scripts/mcp-connectors/**'
+              # And once more, for the same reason. test_kafka_init_builders_
+              # stay_in_lockstep.py compares SEVEN copies of the SASL
+              # mechanism -> JAAS login module mapping. Five live under paths
+              # already listed above; these two do not, and the compose one is
+              # the likeliest drift vector of the lot -- it is the file
+              # install.sh downloads. Without these paths, a PR editing only
+              # the Docker install path would not run the guard written to
+              # catch exactly that.
+              # A sixth time, same shape, and the widest yet.
+              # test_shipped_images_are_pinned.py reads EVERY root compose file --
+              # a floating image tag anywhere on the delivery surface is the bug
+              # it exists to catch. Scoped to the two compose files this filter
+              # used to name, it was dead on the other 18, including
+              # docker-compose.yml itself: the base stack the prod overlay merges
+              # onto, and where the docker-socket-proxy pin lives. A PR floating a
+              # tag there would have skipped this job entirely, and a skipped
+              # check is not a passing one. The glob is what makes the guard's
+              # reach equal its subject; test_the_ci_filter_covers_every_file_this
+              # _guard_reads asserts they stay equal. It subsumes
+              # docker-compose.quickstart.yml (needed by test_kafka_init_builders_
+              # stay_in_lockstep.py, the file install.sh downloads) and
+              # docker-compose.mcp.yml (the independently generated census
+              # test_mcp_compose_generation.py cross-checks against), so neither
+              # is listed separately.
+              - 'docker-compose*.yml'
+              - 'scripts/kafka-init-new-topics.sh'
+              # A fourth time, same shape. test_mcp_compose_generation.py now reads
+              # the release workflow's OWN connector pathspec and re-runs it
+              # against the tree, so that narrowing that pathspec fails a PR
+              # instead of silently publishing a partial image set. That guard is
+              # only worth having if editing docker-publish.yml is what runs it --
+              # and the one edit it exists to catch is an edit to that file alone.
+              # (docker-compose.mcp.yml -- the independently generated census
+              # those guards cross-check against -- is covered by the
+              # docker-compose*.yml glob above.)
+              # Every workflow file, not just ci.yml and docker-publish.yml, because
+              # llm-service/tests also holds the fork-guard census
+              # (test_self_hosted_jobs_are_fork_guarded.py) and its subject is all
+              # four workflows. Scoped to one file, an unguarded job added to
+              # security.yml or licenses.yml would never run the test written to
+              # catch it -- the same dead-guard shape PR #836 hit with the chart
+              # tests, one file over. This glob subsumes the two specific workflow
+              # paths the guards above need, so neither is listed separately.
+              - '.github/workflows/**'
+              # A fifth time, same shape. test_connector_metadata_matches_cdc_policy.py
+              # asserts that no connector's metadata claims CDC the policy denies,
+              # and that the Go allowlist in tools.go still equals the YAML one --
+              # a promise tools.go:586 makes in a comment and nothing enforced.
+              # Grading metadata against a policy the product does not run is worse
+              # than not checking, so the Go file and the generator that mirrors it
+              # both have to be able to trigger this job.
+              - 'api-gateway/internal/handlers/tools.go'
+              # test_connector_reference_matches_disk.py (#888) imports this script
+              # and re-runs it; without the path, editing the generator itself was
+              # the one change that could not run its own guard.
+              - 'scripts/generate_connector_reference.py'
+              # A sixth time, and this one was already dead rather than
+              # hypothetical. test_sarif_findings_have_a_destination.py exists to
+              # stop the SARIF destinations being silently removed, and these two
+              # scripts ARE two of the three -- but neither path was listed, so a
+              # PR that deleted or broke scripts/summarize-sarif.sh and touched
+              # nothing else ran no guard at all. The glob above covers
+              # security.yml, which CALLS them; it does not cover them.
+              - 'scripts/summarize-sarif.sh'
+              - 'scripts/report-sarif-sinks.sh'
+              # Same guard, third subject. test_retired_claims_are_not_quoted_verbatim
+              # sweeps this report for two sentences retired from security.yml's
+              # header, so the report is an INPUT to the guard and has to be able to
+              # trigger it. Caveat recorded honestly: `pull_request` above carries
+              # `paths-ignore: '**.md'`, so a REPORT.md-ONLY PR still runs nothing --
+              # this only helps a mixed PR, and `push: [main]` (unfiltered) after it.
+              # Second caveat, for the public repo: security-audit-results/ is on
+              # scripts/flip/excludes.txt, so there this glob matches nothing and is a
+              # silent no-op. Kept anyway rather than deleted -- it is load-bearing
+              # HERE, and the guard it triggers (test_retired_claims_are_not_quoted_
+              # verbatim) loses its subject in the same cut, so filter and guard die
+              # together rather than leaving a live check with a dead trigger.
+              - 'security-audit-results/**'
+              # A seventh time, same shape -- and this one arrived with the very
+              # guards it would have killed. The self-host fixes added five guards
+              # whose subjects are the root compose files (already covered by the
+              # docker-compose*.yml glob above), the prod env template, the
+              # preflight script, the flip runbook and the flip tooling. The last
+              # four matched no pattern here: a PR that re-broke
+              # scripts/preflight-prod-config.sh -- the file whose SIGPIPE defect
+              # the guard exists to catch -- would have skipped llm-service-unit
+              # and reported green.
+              # Same honest caveat as security-audit-results above: `pull_request`
+              # carries `paths-ignore: '**.md'`, so a runbook-ONLY PR still runs
+              # nothing; the markdown path helps a mixed PR and the unfiltered
+              # `push: [main]` after it. The three non-markdown paths are not
+              # subject to that.
+              # test_ci_filter_covers_every_guard_subject.py derives each guard's
+              # subjects from the guard's own source and asserts this list still
+              # matches them, so the next subject added to one of those guards
+              # cannot quietly land dead.
+              - '.env.prod.example'
+              - 'scripts/preflight-prod-config.sh'
+              - 'docs/internal/public-flip-runbook.md'
+              - 'scripts/flip/**'
+              # A seventh time, and this one's subject cannot be read out of the guard's
+              # source at all. test_doc_links_into_the_moat_are_delinked.py sweeps EVERY
+              # tracked *.md for links into the paths llm-service/oss-strip-list.txt
+              # strips -- the three that survived un-de-linked aborted the cut at
+              # check-doc-links.sh -- and test_doc_links_resolve.py reads ARCHITECTURE.md,
+              # the one pinned doc the cut keeps. Both subjects are computed from
+              # `git ls-files '*.md'`, so the census in
+              # test_ci_filter_covers_every_guard_subject.py sees no literal to match and
+              # stays green while the guards sit dead on exactly the PR shape that breaks
+              # them: a docs-only edit adding a fourth link into the moat.
+              - 'docs/**'
+              - '*.md'
+              # `install.sh` is the whole Docker-install acceptance path and is read by four
+              # guards (test_install_reachability, test_byo_overlays_are_complete,
+              # test_repo_slug_is_publishable, test_shipped_images_are_publishable -- 18
+              # references in the last alone). It matched no pattern here, so an
+              # install.sh-only PR ran none of them.
+              - 'install.sh'
+              - 'scripts/mcp_generate_compose.py'
+            e2e:
+              - 'e2e/_support/**'
+              - '.github/workflows/ci.yml'
+            # Data-fidelity surface: any hop that schema metadata (column_types,
+            # primary_keys) must survive on its way from source to destination.
+            # When any of these change, run the data-pipeline correctness gate
+            # (batch + CDC). Covers every hop that source->destination data
+            # fidelity, CDC ordering, and reload/resume correctness flow through.
+            datapath:
+              - 'backend-orchestrator/internal/agents/executor/**'
+              - 'backend-orchestrator/internal/agents/sentinel/**'
+              - 'backend-orchestrator/internal/cdc/**'
+              - 'api-gateway/internal/projector/**'
+              # Pipeline WORKFLOW module. Scoped whole-module on purpose, unlike the
+              # orchestrator above: the orchestrator is a large repo with genuinely
+              # unrelated surfaces (billing, auth, registry) so it is subpath-scoped,
+              # whereas every package here exists to run pipeline workflows —
+              # workflows/ (nl_pipeline_v2_workflow.go: park/resume/chunk-continuation,
+              # i.e. reload+resume correctness), adapter/ + correlation/ (the Kafka ->
+              # workflow-signal return path; break it and every run hangs waiting for a
+              # signal that never arrives), cmd/ (worker registration — an unregistered
+              # activity is invisible to unit tests and fatal at runtime). A subpath
+              # allowlist inside this module would just re-create THIS bug one level
+              # down, which is how the module got omitted in the first place.
+              # Cost measured over the 90 days to 2026-08-08: 45 commits touched it, 15
+              # already tripped datapath via another dir, and only 10 touched none of
+              # workflows/adapter/correlation/cmd — so whole-module scoping costs ~1
+              # extra smoke run per 9 days over a narrower filter. Added 2026-08-08
+              # after #758 changed control flow at all 6 HITL park sites and the smoke
+              # gate reported SKIPPING (KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW).
+              # A skipped check is not a passing one.
+              # NB: this needs the matching `temporal_adapter` entry in the `svc`
+              # filter in data-pipeline-smoke — triggering the gate without rebuilding
+              # the image runs it against a STALE adapter (the #682 -> #687 trap below).
+              - 'backend-temporal-adapter/**'
+              # DELIBERATELY NOT LISTED: backend-orchestrator/internal/agents/heal/**.
+              # The healer is out-of-band failure recovery, not a source->destination
+              # hop: sweepCandidatesQuery (heal/worker.go:343-347) only selects
+              # executions whose status is already failed/error/silent_drop_detected/
+              # silent_partial_drop_detected/credential_check_failed, so a GREEN smoke
+              # run exercises none of it and the gate would burn 25 min of the shared
+              # serialized stack for zero signal. Its coverage is the real-Postgres
+              # suite (heal/issue_sweep_pg_test.go) plus the nightly full gate.
+              - 'shared/mcp-connectors/internal/kafka-mcp-sink/**'
+              # Debezium/Kafka-Connect SOURCE image: a change here must trigger the
+              # smoke gate so the fast PR path both tests it and refreshes the warm
+              # rsync-ci kafka-connect image (see the `kafka_connect` svc filter in
+              # data-pipeline-smoke). Omitting it let a kafka-connect-only fix merge
+              # without ever refreshing the CI warm stack (#682 -> stale image -> #687).
+              - 'shared/internal/infra/kafka-connect/**'
+              - 'shared/mcp-connectors/public/postgresql/**'
+              - 'shared/mcp-connectors/public/database/mysql/**'
+              # Also absent from the public repo (llm-service/oss-strip-list.txt), so
+              # this glob is a no-op there for the same reason as
+              # security-audit-results/** above: the code it gates is gone too.
+              - 'llm-service/src/agents/tool_generator/templates/**'
+              # The PLANNER names the batch data topic, and the orchestrator hands
+              # that name to the sink as its SUBSCRIPTION -- so this directory is on
+              # the data path even though nothing in it moves a row. It is also the
+              # Python half of the two-language naming contract with
+              # shared/go/kafkaclient (src/utils/kafka_topics.py); a divergence there
+              # does not raise, it just subscribes the sink to a topic nobody writes.
+              # NB: needs the matching `planner` entry in the `svc` filter below --
+              # triggering the gate without rebuilding the image runs it against a
+              # STALE planner, which is the same trap as temporal_adapter / kafka_connect.
+              - 'llm-service/src/agents/planner/**'
+              - 'llm-service/src/utils/kafka_topics.py'
+              - 'e2e/run_gate.sh'
+              - 'e2e/test_*'
+              - '.github/workflows/ci.yml'
+            frontend:
+              - 'frontend/**'
+
+  # Deliberately NOT behind `needs: changes`. It is a sub-second pure-grep check, and
+  # a paths-filter that excluded the very file it protects is exactly how
+  # KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW happened (see the datapath comments
+  # above). Running it unconditionally costs nothing and cannot be filtered wrong.
+  #
+  # Guards a failure mode that no other job can see: a `${VAR:?}` in a shipped compose
+  # file whose value no shipped template supplies. One `:?` aborts interpolation for
+  # the WHOLE merged config, so the symptom is not a degraded service — nothing starts.
+  # It only bites a FRESH stand-up (an existing host's .env already has the variable),
+  # i.e. precisely a cloud migration, which is when it is most expensive.
+  env-templates:
+    name: Env templates satisfy compose
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: ./scripts/check-env-templates.sh
+
+  go:
+    name: Go (${{ matrix.module }})
+    needs: changes
+    if: ${{ (needs.changes.outputs.go == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - api-gateway
+          - backend-orchestrator
+          - backend-temporal-adapter
+          # SEC-H-02: the trusted socket-holder that replaces tool-generator's raw
+          # docker.sock access. Own Go module (github.com/rsync-ai/connector-deployer)
+          # — build + vet it here so a change can't ship unbuilt/unscanned.
+          - connector-deployer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+          # CRITICAL: disable setup-go's built-in auto-cache. It saves the
+          # entire global ~/go/pkg/mod (~2.95 GB) at job end via a "Post Run"
+          # step. At 0.1-0.2 MB/s on our self-hosted runners that upload runs
+          # for hours, hits a GitHub cache-API auth error, and fails the job
+          # even though all tests passed. Our explicit "Cache go build + modules"
+          # step below handles caching with per-module keys and a much smaller
+          # scope, so setup-go's auto-cache is redundant.
+          cache: false
+      # NO GitHub actions/cache for Go caches on self-hosted runners.
+      #
+      # actions/cache exists to ferry state between EPHEMERAL runners. Our
+      # runners are persistent Macs (m1-m4): both ~/go/pkg/mod AND
+      # ~/Library/Caches/go-build already survive on local disk between runs,
+      # so `go test` reuses a warm build cache with zero round-trip.
+      #
+      # The build cache had grown to ~1.4 GB; uploading it via actions/cache@v6
+      # at ~1 MB/s added a ~9-min "Post Cache" step to every Go job for no
+      # benefit (and slow cold-key restores on top). Removed — same reasoning
+      # already applied to the excluded ~/go/pkg/mod module cache. First build
+      # of a module on a runner that's never seen it is a one-time cold compile,
+      # strictly cheaper than a 1.4 GB upload every run.
+      - name: go test (includes build + vet via compiler)
+        working-directory: ${{ matrix.module }}
+        # `go test ./...` compiles every package, so the explicit
+        # `go build` + `go vet` steps that used to run before were
+        # redundant — `go test` already runs the same compile checks
+        # and `go vet -all` style analyses (subsumed since Go 1.10).
+        # Removing them saves a clean rebuild per job.
+        #
+        # `-race` is off, and after the flip-day split that is a deliberate
+        # hold, not a platform limit. It was dropped because `-race` emits
+        # binaries missing LC_UUID on macOS arm64 and dyld aborts before any
+        # test runs; this job now runs on ubuntu-latest, where that bug does
+        # not apply. Turning it on changes what the suite can fail on, so it
+        # belongs in its own PR that can be judged on the races it finds --
+        # bundled into a runner move, a red job would be indistinguishable
+        # from a broken split.
+        run: go test -timeout 5m ./...
+
+  go-shared:
+    name: Go shared modules
+    needs: changes
+    if: ${{ (needs.changes.outputs.go-shared == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - shared/go/correlation
+          - shared/go/crypto
+          - shared/go/transforms
+          # Own Go module (github.com/rsync-ai/shared/naming), consumed by
+          # api-gateway + orchestrator via `replace` — but `replace` only builds
+          # it, it never runs the module's *_test.go. Its tests (ValidateNamespace /
+          # IsSuspiciousIdentifier) gatekeep destination namespace/identifier
+          # safety, a data path, so they must run in CI. No go.sum (no external
+          # deps); the go-shared paths-filter already covers shared/go/**.
+          - shared/go/naming
+          # The pgx shim every Go service reaches PostgreSQL through (#830).
+          # Same reason as naming: the services consume it via `replace`, which
+          # builds the package but never runs its *_test.go. Leaving it out would
+          # mean preprotocol_dos_test.go — the regression test for GO-2026-6173,
+          # the advisory the whole module exists to close — never ran in CI, and
+          # a silent driver regression is exactly what it is there to catch.
+          - shared/go/pgdriver
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache-dependency-path: ${{ matrix.module }}/go.sum
+          cache: false  # see go job above for why auto-cache is disabled
+      # No actions/cache — see go job above: build cache persists on local disk
+      # on these self-hosted runners; uploading it added ~9 min/job for nothing.
+      - name: go test (includes build via compiler)
+        working-directory: ${{ matrix.module }}
+        # `go test ./...` runs the compiler so the prior explicit
+        # `go build` step was redundant. Dropped to save a clean
+        # rebuild per job. Same -race / LC_UUID note as the main
+        # go matrix above.
+        run: go test -timeout 5m ./...
+
+  # The kafka-mcp-sink worker is a SEPARATE Go module
+  # (shared/mcp-connectors/internal/kafka-mcp-sink/worker-src) that lives outside
+  # both Go matrices above, so its data-critical unit tests — table normalization,
+  # namespace routing, CDC/batch message parsing, DLQ handling — never ran in CI
+  # and only executed when a dev ran `go test` locally. Dedicated job (not folded
+  # into the `go` matrix) so a sink-only PR doesn't drag in a rebuild of the three
+  # big service modules, honoring this workflow's per-area change-detection design.
+  sink-worker:
+    name: Go (kafka-mcp-sink worker)
+    needs: changes
+    if: ${{ (needs.changes.outputs.sink == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/go.mod
+          cache-dependency-path: shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/go.sum
+          cache: false  # see go job above for why auto-cache is disabled
+      # No actions/cache — see go job above: build cache persists on local disk
+      # on these self-hosted runners; uploading it added ~9 min/job for nothing.
+      - name: go test (includes build via compiler)
+        # The worker `replace`s ../../../../go/transforms (shared/go/transforms);
+        # actions/checkout pulls the whole repo so that relative path resolves.
+        working-directory: shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
+        run: go test -timeout 5m ./...
+
+  llm-service-unit:
+    name: llm-service unit tests
+    needs: changes
+    if: ${{ (needs.changes.outputs.llm == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # Tags, not just the tip. test_shipped_images_are_publishable.py asks
+          # what the RELEASE TAG built -- `latest` is minted only on a tag, so the
+          # tag's build matrix is what decides whether a shipped image exists,
+          # and HEAD's does not. The default shallow checkout fetches no tags at
+          # all, which made that suite report "the tag v0.1.1 does not exist in
+          # this repository" -- a false statement about a tag that does exist and
+          # was simply never fetched. A check that cannot tell absence from
+          # not-having-looked is the exact failure it was written to catch.
+          fetch-depth: 0
+      # This job used to skip `actions/setup-python` and hard-code the brew
+      # interpreter: the action writes `/Users/runner/hostedtoolcache/...`,
+      # which a self-hosted Mac cannot create regardless of RUNNER_TOOL_CACHE
+      # or AGENT_TOOLSDIRECTORY. The flip-day fork-safety split moved this job
+      # to ubuntu-latest, where that tool cache is exactly what the action is
+      # built to write — so the action is now the right way to pin 3.11, and
+      # the bare `python3` below resolves to it.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.11'
+      - name: Set up Python venv
+        run: |
+          PY=python3
+          $PY --version
+          # Venv lives in a stable path outside the workspace so it survives
+          # runner cleanup between jobs. Activating is just adding bin/ to PATH.
+          #
+          # The path carries the requirements.txt hash -- the SAME hash the cache
+          # key below uses -- so a venv directory means exactly one dependency
+          # set. It used to be one shared `llm-ci` for every job on this host,
+          # and that is a data race, not a hygiene question: four runner installs
+          # share one $HOME, so two jobs whose requirements.txt differ ran
+          # `pip install` into the same site-packages at the same time. On
+          # 2026-08-31 that produced a venv holding TWO pydantic dist-infos --
+          # 2.13.5 (wants pydantic-core==2.46.5) and 2.13.4 (wants ==2.46.4) --
+          # with 2.13.4's code live and 2.46.5 installed:
+          #   SystemError: The installed pydantic-core version (2.46.5) is
+          #   incompatible with the current pydantic version, which requires 2.46.4
+          # Collection died, so the whole suite failed, on a PR that touched no
+          # Python at all. Worse, pip could not repair it: it reads dist-info to
+          # decide what is installed, saw 2.13.5's leftover metadata, printed
+          # "Requirement already satisfied: pydantic>=2.13.5 ... (2.13.5)" and
+          # skipped the one package that needed rewriting. Torn state that the
+          # installer reports as satisfied does not heal on a re-run.
+          #
+          # This is the same shape as the cache-overlay bug documented below --
+          # two dependency sets unioned into one site-packages, diagnosed there
+          # via two pip-*.dist-info dirs. That fix removed `restore-keys`, which
+          # closed the cache route into this state and left the concurrency route
+          # open. Keying the path closes it structurally: differing dependency
+          # sets can no longer name the same directory. Jobs sharing a hash still
+          # write concurrently, but they install identical versions, so there is
+          # no version to tear.
+          echo "$HOME/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}/bin" >> "$GITHUB_PATH"
+          # One venv per requirements revision would otherwise grow without bound
+          # (~450MB each, and Dependabot moves this file most weeks). Drop the
+          # stale ones, never the current one -- an untouched dir may still be
+          # the live venv of an open PR whose deps have not changed in a while.
+          find "$HOME/.venvs" -maxdepth 1 -type d -name 'llm-ci-*' \
+            ! -name 'llm-ci-${{ hashFiles('llm-service/requirements.txt') }}' -mtime +14 -print -exec rm -rf {} + 2>/dev/null || true
+      # CI SPEEDUP: cache the entire installed venv, not just pip wheels.
+      # The old pip-wheel cache still required dep resolution + extraction
+      # on every run (~5-7 min). Caching the venv directly reduces to a
+      # ~5s restore on cache hit. Key is requirements.txt hash so a dep
+      # change correctly busts the cache.
+      #
+      # DELIBERATELY NO `restore-keys`. `path` is a PERSISTENT directory (it
+      # lives outside the workspace so it survives runner cleanup, see the
+      # step below), and actions/cache extracts its tarball OVER whatever is
+      # already on disk without deleting files absent from the tarball. So a
+      # PREFIX match unions two different dependency sets into one
+      # site-packages. That is not theoretical: it bricked this lane for every
+      # llm-touching PR. #702 changed requirements.txt, so the exact key
+      # stopped matching; main's stale entry still prefix-matched; the overlay
+      # produced a half-26.1.2 / half-26.2 pip (both pip-*.dist-info dirs, and
+      # both `pip/_internal/build_env/` (26.2, a package) and `build_env.py`
+      # (26.1.2, a module) — Python resolves the package, whose installer.py
+      # imports `get_runnable_pip` from a utils/misc.py that predates it):
+      #   ImportError: cannot import name 'get_runnable_pip'
+      # The crash happened BEFORE "Post Cache", so the poisoned entry could
+      # never be replaced — the failure was self-perpetuating and had to be
+      # broken by deleting the cache entry by hand.
+      #
+      # An exact-key-only cache cannot do this: either the tarball is
+      # byte-identical to what the key describes (idempotent overlay) or
+      # nothing is restored at all. And prefix-restoring a venv bought nothing
+      # anyway — the install step below reinstalls on any miss. An EXACT hit
+      # still skips that step and keeps the ~5s restore.
+      - name: Cache Python venv
+        id: venv-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}
+          key: ${{ runner.os }}-venv-llm-${{ hashFiles('llm-service/requirements.txt') }}
+      - name: Install dependencies
+        if: steps.venv-cache.outputs.cache-hit != 'true'
+        working-directory: llm-service
+        run: |
+          PY=python3
+          # Venv lives in a stable path outside the workspace so it survives
+          # runner cleanup between jobs. Activating is just adding bin/ to PATH.
+          #
+          # Still NOT `venv --clear`: a job sharing this hash may be installing
+          # into this same directory right now, and --clear would delete
+          # site-packages out from under it (a real scenario here — Dependabot
+          # lands PRs in large batches). The reason it is now merely unnecessary
+          # rather than a compromise is the hash in the path: a cache miss can
+          # only reuse a directory built from THIS requirements.txt, so the
+          # "package dropped from requirements.txt lingers" wart is gone too --
+          # dropping a package changes the hash, which names a new directory.
+          $PY -m venv "$HOME/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}"
+          # Always `python -m pip`, never the bin/pip console script. `venv`
+          # over an existing dir rewrites bin/ but leaves site-packages, so the
+          # shim and the installed pip library can skew — and a skewed shim
+          # cannot even run to repair itself (that is the failure above). The
+          # module form resolves whichever pip is actually installed.
+          VPY="$HOME/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}/bin/python"
+          "$VPY" -m pip install --upgrade pip
+          "$VPY" -m pip install -r requirements.txt
+          "$VPY" -m pip install pytest pytest-asyncio
+      - name: Install connector test drivers
+        # Test-only DB drivers NOT in llm-service/requirements.txt — each connector ships
+        # its own driver in its own image and llm-service never imports them, so they don't
+        # belong in requirements.txt. Only the per-connector offline suites (added below)
+        # need them at COLLECTION time, e.g. mongodb's test does `from bson import ObjectId`
+        # (bson ships with pymongo). NOT cache-gated (unlike "Install dependencies" above),
+        # because a venv cache HIT would otherwise skip the install; pip no-ops when already
+        # satisfied. Extend this list when a newly-gated connector needs a collection-time driver.
+        #
+        # setuptools<81 is not a driver: opentelemetry-instrumentation==0.46b0 (pinned in
+        # requirements.txt) imports pkg_resources at module scope, and setuptools>=81 no
+        # longer ships it. The runtime image (python:3.11-slim) still bundles an older
+        # setuptools, so this is a CI-only divergence — without the pin, tests/ fails at
+        # COLLECTION with ModuleNotFoundError: pkg_resources, not at runtime in prod.
+        run: pip install pymongo 'setuptools<81'
+      - name: Run unit tests
+        working-directory: llm-service
+        env:
+          PYTHONPATH: ${{ github.workspace }}/llm-service:${{ github.workspace }}/llm-service/src:${{ github.workspace }}/shared/mcp-connectors
+          # Importing the gateway calls telemetry.init_tracer(), which has no env
+          # kill-switch of its own, so the OTLP exporter starts and then retries a
+          # gRPC connect to localhost:4317 on every span+shutdown. Nothing listens in
+          # CI, so that is ~250 lines of "Connection refused" per run, burying real
+          # failures in the log. This is the SDK's own standard opt-out (read by
+          # opentelemetry-sdk, not by our code) — no product code changes for it.
+          OTEL_SDK_DISABLED: "true"
+        run: |
+          # TODO(qa): re-enable test_deserialize_wire_format once it's reconciled
+          # with the current AvroSerializer (JSON fallback now requires AVRO_ALLOW_JSON_PAYLOAD).
+          #
+          # test_generated_connectors.py and test_connector_resolver.py live at
+          # llm-service/ root (not under tests/) but are pure unit tests against
+          # every generated MCP connector — explicitly included here.
+          #
+          # src/agents/tool_generator/tests/ and src/agents/planner/test_*.py live
+          # inside source dirs (next to the modules they test) — also pure unit
+          # tests with no infra deps. Several files are excluded below: some have
+          # collection errors against the current code, others have known-bad
+          # test bodies. Tracked in tests/DORMANT_TESTS_TO_FIX.md so they get
+          # picked up later instead of staying invisibly broken.
+          # test_suggestions_schema_detect.py is a pure in-process unit suite that
+          # lived in tests/ but was never collected (the lane enumerates paths by
+          # name rather than globbing tests/) — added here so it actually runs.
+          # test_connector_auth_contract.py is the canonical auth-contract gate
+          # (auth_type enum + auth_type!=none ⟹ supported_auth_methods non-empty +
+          # oauth2 methods resolve a registered provider). It was written to be
+          # enforced but, like the suite above, was never in the enumerated lane —
+          # added here so connector auth-metadata drift becomes un-mergeable.
+          # test_staged_upsert_write_count.py guards base_connector.staged_upsert's
+          # write-count contract (return the driver's rowcount, clamped to the input
+          # batch size — MySQL's ON DUPLICATE KEY UPDATE reports 2 per updated row).
+          # Same story as the two above: it lives in tests/ but the lane enumerates
+          # by name, so it had to be listed to run at all.
+          #
+          # ../shared/mcp-connectors/tests/ is passed as a DIRECTORY, not as the
+          # single test_discovery_contract.py it used to name. That file was the
+          # only one of the eleven in there that any CI lane ran: the per-connector
+          # lane below globs `public/**/versions/*/test_*.py`, which this shared
+          # dir is not under, so the other ten — 72 tests including the SSRF
+          # redirect guard and the LLM log-scrubbing contract — were dead weight in
+          # the repo. Same enumerate-by-name bug as the three files above, one
+          # directory over; globbing the dir also auto-gates new files instead of
+          # requiring this list to be edited (which is how they got missed).
+          #
+          # The tests/ list above is now a DIRECTORY glob, for the same reason the
+          # shared dir is: new files under llm-service/tests/ gate themselves instead
+          # of waiting for someone to remember to edit a list. Doing that picked up 19
+          # files / 110 tests that had never run in CI once — among them the LLM
+          # error-scrubber parity contract (test_scrubber_parity.py,
+          # test_masking_scrub.py, test_suggestions_pii_type_guard.py) and twelve
+          # connector-generation regression suites (test_gen_*.py).
+          #
+          # It has to be TWO pytest invocations, and the split is load-bearing.
+          # tests/unit and the rest of tests/ cannot share one process: two different
+          # packages claim the top-level name `schemas` (shared/mcp-connectors/schemas
+          # and src/agents/tool_generator/schemas) and two claim `agents`
+          # (src/agents and src/agents/tool_generator/agents). Whichever test imports
+          # first binds the name for the whole process, because
+          # src/agents/tool_generator/agents/researcher.py:32 does a bare
+          # sys.path.insert(0, <tool_generator dir>) at import time. Listing
+          # `tests/unit` ahead of `tests/` does NOT fix the order — pytest collapses
+          # the child arg into the parent and walks it alphabetically, so
+          # test_staged_upsert_write_count.py binds `schemas` to the shared package
+          # long before tests/unit is reached. Separate processes = separate
+          # sys.modules, which is the only thing that actually separates them.
+          # If you add a file under tests/ that needs the other convention and CI goes
+          # red on a `schemas`/`agents` import, move it under tests/unit — do not go
+          # back to enumerating by name.
+
+          # (1) src/agents world: tests/unit plus the tool_generator suites.
+          #
+          # The tool_generator half is assembled into $TG_ARGS instead of being written
+          # inline, and the conditional is not defensive habit -- it is the difference
+          # between a green first public CI run and a red one.
+          # src/agents/tool_generator/tests is on llm-service/oss-strip-list.txt, so the
+          # PUBLIC repo does not have that directory. pytest treats a missing PATH
+          # ARGUMENT as a usage error, not as "nothing to collect": exit code 4,
+          # `ERROR: file or directory not found`, and NOTHING in the invocation runs --
+          # tests/unit and src/agents/planner/ go down with it. A `--ignore=` naming a
+          # path that does not exist is harmless by contrast (exit 0), which is why the
+          # ignores can sit inside the same variable without their own guard.
+          #
+          # Deliberately NOT conditional: tests/unit, the two root test files, and
+          # src/agents/planner/. Dockerfile.community COPYs planner, so it survives the
+          # cut; if any of them ever goes missing that is a real defect and this job
+          # should stay loud about it.
+          TG_DIR=src/agents/tool_generator/tests
+
+          # The dormant suites, described in the header comment above. Full paths on
+          # purpose -- a grep for one of these files has to find it here.
+          TG_IGNORES="
+            --ignore=src/agents/tool_generator/tests/test_builder.py
+            --ignore=src/agents/tool_generator/tests/test_context7_capability_validation.py
+            --ignore=src/agents/tool_generator/tests/test_mock_server.py
+            --ignore=src/agents/tool_generator/tests/test_qa_auth_e2e.py
+            --ignore=src/agents/tool_generator/tests/test_qa_feedback_enricher.py
+            --ignore=src/agents/tool_generator/tests/test_qa_mcp_protocol.py
+            --ignore=src/agents/tool_generator/tests/test_validate_context7_threshold.py
+            --ignore=src/agents/tool_generator/tests/test_architect_graphql_phase_5.py
+            --ignore=src/agents/tool_generator/tests/test_e2e_pipeline_phase_13e.py
+            --ignore=src/agents/tool_generator/tests/test_end_to_end_review.py
+            --ignore=src/agents/tool_generator/tests/test_harness_matrix.py
+            --ignore=src/agents/tool_generator/tests/test_oauth_flow_capture_integration.py
+            --ignore=src/agents/tool_generator/tests/test_eval_phase_9.py
+            --ignore=src/agents/tool_generator/tests/test_graphql_mock_and_validator_phase_7.py
+            --ignore=src/agents/tool_generator/tests/test_graphql_template_phase_6.py
+            --ignore=src/agents/tool_generator/tests/test_multi_auth_phase_12.py
+            --ignore=src/agents/tool_generator/tests/test_auth_preset_nonbearer.py
+            --ignore=src/agents/tool_generator/tests/test_parity_phase_13f.py
+            --ignore=src/agents/tool_generator/tests/test_preflight_phase_13d.py
+            --ignore=src/agents/tool_generator/tests/test_session_handoff_phase_13a.py
+            --ignore=src/agents/tool_generator/tests/test_discovery_phase_0a.py
+            --ignore=src/agents/tool_generator/tests/test_probe_pipeline_phase_4.py
+            --ignore=src/agents/tool_generator/tests/test_vendor_registry_phase_0b.py
+            --ignore=src/agents/tool_generator/tests/test_oauth_provider_linkage.py
+          "
+
+          TG_ARGS=""
+          if [ -d "$TG_DIR" ]; then
+            TG_ARGS="$TG_DIR/ $TG_IGNORES"
+          else
+            # Printed, not silent. "The suites were stripped" and "the suites vanished"
+            # look identical from the summary line, and this repo has been bitten by
+            # exactly that difference before.
+            echo "NOTE: $TG_DIR is absent -- stripped by llm-service/oss-strip-list.txt."
+            echo "      The tool_generator suites are not part of this tree; everything"
+            echo "      else in this invocation still runs."
+          fi
+
+          # $TG_ARGS is intentionally unquoted: it is a word list, and no path in it
+          # contains a space. Empty expands to nothing, which is the public-repo case.
+          pytest tests/unit \
+            test_generated_connectors.py test_connector_resolver.py \
+            src/agents/planner/ \
+            $TG_ARGS \
+            -k "not test_deserialize_wire_format" \
+            -v
+
+          # (2) app + shared-connector world: everything else under tests/, globbed.
+          # Nothing under tests/ is ignored any more. test_explorer_endpoints.py used
+          # to be the one file that genuinely could not run here — it issued real
+          # openai /chat/completions calls, so 13 of its 15 tests failed on connection
+          # error without a live LLM backend. It now stubs both module-level clients
+          # (explorer_api.explorer_client, gateway_main.sql_client) in an autouse
+          # fixture, so it is offline-clean and gated like everything else.
+          pytest tests/ \
+            --ignore=tests/unit \
+            ../shared/mcp-connectors/tests/ \
+            -v
+      - name: Per-connector regression tests (offline suites)
+        # The offline unit suites that ship next to each connector under
+        # public/**/versions/<v>/test_*.py — fail-loud-on-truncation, decimal scale
+        # fidelity, multi-schema discovery, type canonicalization, INV-1 storage
+        # isolation, GraphQL pagination — were in NO CI lane, so regressions went
+        # SILENTLY red: the GPLv2->MIT pymysql swap (#499) narrowed a fail-loud sql_mode
+        # guard and broke mysql's test_upsert_strict_failloud for months unnoticed; two
+        # sqlserver assertions drifted stale behind the #527/#530 type-fidelity fixes; and
+        # aws-s3's INV-1 export test made a live network call (endpoint_url in the wrong
+        # place). This gate runs them all so that class of drift becomes un-mergeable.
+        #
+        # Each connector dir runs in its OWN pytest process: every connector ships a module
+        # literally named `connector.py` (imported via sys.path.insert at the top of each
+        # test), and several test files share a basename across connectors
+        # (test_multi_schema_discovery.py, test_decimal_scale_preservation.py). A single
+        # process would collide on sys.modules['connector'] (first import wins) and on
+        # duplicate basenames — per-dir subprocesses give each a clean module table.
+        #
+        # Scope = every connector offline suite under BOTH connector trees:
+        # public/**/versions/<v>/ (DB family, storage, GraphQL, redshift, sample-data) and
+        # internal/**/versions/<v>/ (debezium). New connectors are auto-gated: keep the
+        # suite offline (no network) and add any collection-time driver to the step above.
+        #
+        # `internal` was missing from this find for as long as the step has existed, so the
+        # five debezium suites — publication.autocreate.mode, secret externalization, log
+        # redaction, topic naming, schema-history TLS — ran in NO lane at all. They are
+        # 38 offline tests that finish in under a tenth of a second; the only reason they
+        # were unguarded is that the glob named one directory instead of two. The floors
+        # below are per-tree for exactly that reason: a single total would have stayed
+        # comfortably above any threshold while one whole tree contributed zero.
+        shell: bash
+        env:
+          PYTHONPATH: ${{ github.workspace }}/llm-service:${{ github.workspace }}/llm-service/src:${{ github.workspace }}/shared/mcp-connectors
+        run: |
+          set -uo pipefail
+          cd "$GITHUB_WORKSPACE"
+          fail=0
+          # Two plain counters rather than one associative array: `shell: bash` resolves to
+          # whatever bash is first on PATH, and on the macOS runners that can still be the
+          # system 3.2, which has no `declare -A`. A gate that dies on its own syntax is a
+          # worse outcome than a slightly longer script.
+          count_public=0
+          count_internal=0
+          run_tree() {
+            tree="$1"
+            n=0
+            while IFS= read -r d; do
+              n=$((n + 1))
+              echo "::group::pytest $d"
+              ( cd "$d" && pytest -q --no-header -p no:cacheprovider ) || fail=1
+              echo "::endgroup::"
+            done < <(find "shared/mcp-connectors/$tree" \
+                          \( -name venv -o -name .venv -o -name node_modules \
+                             -o -name site-packages -o -name __pycache__ \) -prune -o \
+                          -path '*/versions/*/test_*.py' -exec dirname {} \; | sort -u)
+            # `fail` is set inside the while body, which runs in THIS shell (process
+            # substitution, not a pipe) -- so the assignment survives. Do not turn the
+            # `done < <(...)` back into `find ... | while`, which would run the body in a
+            # subshell and throw away every failure.
+            #
+            # The -prune matters even though the pruned dirs are all gitignored: a dev who
+            # has ever run a connector locally has a venv/ under versions/<v>/, and without
+            # it this find descends into site-packages and cheerfully runs setuptools' OWN
+            # test suite (7 extra "connector dirs", ~55 errors). CI never saw it because
+            # the venv is untracked -- which is exactly what makes the count untrustworthy
+            # as a floor: it differs between the runner and every laptop.
+            eval "count_$tree=$n"
+          }
+          run_tree public
+          run_tree internal
+          echo "ran per-connector regression suites: public=$count_public internal=$count_internal; aggregate_fail=$fail"
+          # A gate that runs ZERO tests must NOT report success (see data-pipeline-gate).
+          # Checked per tree, not on the sum: `internal` currently contributes 1 dir out of
+          # 23, so a total-only floor would still pass with the entire internal tree silently
+          # dropped -- which is precisely the failure this step shipped with.
+          for tree in public internal; do
+            eval "n=\$count_$tree"
+            if [ "$n" -eq 0 ]; then
+              echo "ERROR: no per-connector test dirs matched under shared/mcp-connectors/$tree" >&2
+              echo "       Either the connector layout drifted, or that tree lost its suites." >&2
+              fail=1
+            fi
+          done
+          exit "$fail"
+
+  e2e-support-unit:
+    name: e2e/_support unit tests
+    needs: changes
+    if: ${{ (needs.changes.outputs.e2e == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.11'
+      - name: Set up Python 3.11 venv
+        run: |
+          PY=python3
+          $PY --version
+          $PY -m venv "$GITHUB_WORKSPACE/.venv-e2e"
+          "$GITHUB_WORKSPACE/.venv-e2e/bin/python" -m pip install --upgrade pip
+          echo "$GITHUB_WORKSPACE/.venv-e2e/bin" >> "$GITHUB_PATH"
+      - name: Install dependencies
+        run: pip install pytest requests
+      - name: Run unit tests for e2e helpers
+        run: pytest e2e/_support -v
+
+  # Data-pipeline correctness GATE (RELIABILITY_PLAN.md Phase 0).
+  # Brings up the full stack ONCE (batch + CDC, incl. Debezium/Kafka-Connect) and
+  # runs the curated data-correctness + chaos e2e suite against it via
+  # `e2e/run_gate.sh` (which aggregates results and exits non-zero if ANY test
+  # fails). This replaces the single golden batch test with the whole gateable
+  # suite, so a regression at ANY hop -- batch type fidelity, CDC ordering/type,
+  # delete correctness, schema evolution, reload/resume, or chaos recovery --
+  # blocks the merge.
+  #   * Only runs when a data-pipeline path changed (changes.datapath).
+  #   * Needs an LLM key (GROQ/OPENAI) for the planner-driven batch tests. A gate
+  #     that cannot run MUST NOT report success -- a silent skip is the
+  #     false-green that let regressions through (it reported `success` having
+  #     run ZERO tests). So a missing key now HARD-FAILS same-repo PRs (the
+  #     secret is a config fix), and only fork PRs -- which cannot access secrets
+  #     by design -- skip. Remaining for a TRUE required gate (task 0.3): mark
+  #     this a required status check on `main` once the secret is configured.
+  # Runs on the self-hosted runner because it brings up the full docker compose
+  # stack. We do NOT `down -v` afterwards: these runners double as dev machines
+  # and a volume wipe would destroy local state -- the tests seed uniquely-named
+  # (timestamped) tables and reconcile the stack idempotently on each run.
+  data-pipeline-gate:
+    name: Data pipeline gate (batch + CDC correctness)
+    needs: changes
+    # Serialize gate runs: they all drive the ONE shared `rsync-ai` stack on the
+    # single self-hosted runner, so two at once would clobber each other. Queue
+    # (don't cancel) so an in-flight gate finishes rather than dying mid-bring-up.
+    # Belt-and-suspenders with the host-level lock in run_gate.sh.
+    concurrency:
+      group: rsync-ai-shared-stack
+      cancel-in-progress: false
+    # Gate runs NIGHTLY + ON-DEMAND only -- never on a PR, never on push-to-main.
+    # The full batch+CDC bring-up is ~40-45 min and drives the ONE shared CI stack
+    # (see concurrency group above), so a post-merge run HOGS that stack and queues
+    # the next PR's fast smoke gate behind it -- a datapath change would land, kick
+    # off the ~40-min full gate on `main`, and every subsequent PR smoke would wait.
+    # Pulling it off push-to-main keeps the single CI stack free for PR smokes all
+    # day; the full suite (incl. chaos) still runs every night and can be triggered
+    # by hand before a deploy via `workflow_dispatch` (Actions -> CI -> Run workflow).
+    # Trade-off: a datapath regression is now caught at the next NIGHTLY run (<=24h)
+    # or on a manual dispatch, NOT within minutes of merge -- so before deploying off
+    # `main`, either trust the last green nightly or dispatch this gate manually and
+    # wait for green. Per-PR smoke gate still gives pre-merge batch+CDC signal.
+    #   - nightly schedule: always run the FULL suite incl. chaos (see env below).
+    #   - workflow_dispatch: on-demand full gate (pre-deploy safety valve).
+    #   - push to main / pull_request: SKIP.
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 150
+    # NO LLM API KEY required. This gate exercises the DETERMINISTIC data plane
+    # only: already-generated connectors moving rows MySQL -> MinIO/Debezium ->
+    # Kafka -> sink -> Postgres. The LLM (Azure OpenAI) is control-plane only --
+    # connector generation + interactive schema mapping/assessment -- and is
+    # deliberately NOT brought up here (the tests `ack_warnings` to bypass the
+    # assessment gate; the proven golden bring-up omits llm-service entirely).
+    # A required, merge-blocking check must stay hermetic: no paid third-party
+    # API in the blocking path, so a provider outage/rate-limit can never red a
+    # PR for non-code reasons. If we ever want to test the LLM-driven
+    # generation/mapping path, that belongs in a SEPARATE, non-blocking nightly
+    # job with a live key -- never in this gate.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Run data-pipeline gate (batch + CDC; chaos nightly)
+        env:
+          # Isolated CI stack: the gate runs under its OWN compose project +
+          # container names + host ports (rsync-ci-*), threaded everywhere by
+          # run_gate.sh's STACK_PREFIX. It therefore COEXISTS with a developer's
+          # local rsync-ai dev/staging stack on the same runner and can never
+          # clobber it — replacing the old staging-hold mutex.
+          STACK_PREFIX: rsync-ci
+          # Chaos tests kill services and wait for recovery — the slowest part of
+          # the suite and not needed to gate every PR. Run them ONLY on the
+          # nightly schedule; the PR gate stays on the deterministic batch + CDC
+          # correctness surface (a chaos regression is still caught within 24h).
+          E2E_INCLUDE_CHAOS: ${{ github.event_name == 'schedule' && '1' || '' }}
+        run: |
+          chmod +x e2e/run_gate.sh
+          E2E_BUILD=1 bash e2e/run_gate.sh
+
+  # Data-pipeline SMOKE gate (FAST per-PR signal). Complements the full
+  # post-merge/nightly `data-pipeline-gate` above. Runs the minimal
+  # merge-blocking subset (one batch + one CDC) against the WARM dev stack that
+  # already lives on the self-hosted runner, rebuilding ONLY the service(s) this
+  # PR changed. Target wall-clock < 10 min (a warm run measured ~4 min) vs the
+  # full gate's ~40-45 min -- so every datapath PR gets correctness feedback
+  # without the full bring-up becoming the team's merge bottleneck.
+  #   * PR ONLY. The full gate stays push-to-main + nightly (its own `if`); the
+  #     two NEVER overlap, so a datapath change is smoke-checked pre-merge AND
+  #     fully gated post-merge.
+  #   * SAME concurrency group as the full gate -- both drive the ONE isolated
+  #     rsync-ci stack on the runner, so they must never run at once.
+  #   * Pins the compose project via STACK_PREFIX=rsync-ci (run_gate.sh: -p
+  #     rsync-ci / -p rsync-ci-mcp), a stack SEPARATE from the developer's local
+  #     rsync-ai dev/staging stack -- the two coexist on the 18 GB box (~2.7 GiB
+  #     idle each), which is the whole point of this isolation (it replaces the
+  #     old staging-hold mutex). Only the changed service images are rebuilt; the
+  #     rest of the warm rsync-ci stack is reused.
+  #   * No LLM key (same deterministic data plane as the full gate; tests
+  #     ack_warnings to bypass the assessment gate) -- stays hermetic.
+  #   * It does NOT run on pull_request. It is one of two jobs that stay on the
+  #     self-hosted Macs (they hold the deploy key), and a `pull_request` run
+  #     executes the workflow file FROM THE PR HEAD -- so a hostile fork PR can
+  #     delete any in-tree `if:` guard in the same diff that needs it. The only
+  #     guard that survives that is one a PR event cannot satisfy at all, which
+  #     is why this gates on push-to-`main` + `workflow_dispatch`. It is written
+  #     as `github.event_name == 'push'` with no `github.ref`, for two reasons:
+  #     this workflow's `on.push.branches` is already `[main]`, so the two say
+  #     the same thing here; and `scripts/flip/assert-ci-split.py` models only
+  #     `github.event_name`, so a `github.ref` term makes it fail CLOSED and
+  #     report this job as fork-reachable. If `on.push.branches` is ever
+  #     widened, this gate widens with it -- re-add the ref test and teach the
+  #     flip gate to model it, in that order.
+  #   * So it CANNOT be a required status check: a check that never runs on a PR
+  #     leaves the PR pending forever. The signal is post-merge (and `main` is
+  #     where a revert is cheap); `merge_group` is the closest pre-merge
+  #     replacement if merge queues are ever enabled.
+  data-pipeline-smoke:
+    name: Data pipeline smoke gate (post-merge)
+    needs: changes
+    if: ${{ ((github.event_name == 'push' || github.event_name == 'workflow_dispatch') && needs.changes.outputs.datapath == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: [self-hosted, macOS, ARM64]
+    concurrency:
+      group: rsync-ai-shared-stack
+      cancel-in-progress: false
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Classify the changed files into the data-plane SERVICES whose images must
+      # be rebuilt so the smoke test runs THIS PR's code, not stale warm images.
+      # A test-script-only PR (e2e/**) matches nothing here -> no rebuild (the
+      # scripts run from the checkout). Templates (llm-service tool_generator)
+      # deliberately match nothing: they affect connector GENERATION, not the
+      # already-built mysql/pg RUNTIME images smoke exercises -- that surface is
+      # the full gate's job. Kept in this job (not the shared `changes` job) so
+      # the per-service granularity stays co-located with the build that uses it.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: svc
+        with:
+          filters: |
+            orchestrator:
+              - 'backend-orchestrator/**'
+            apigateway:
+              - 'api-gateway/**'
+            # Pipeline workflow module (compose service `temporal-adapter`, build
+            # context ./backend-temporal-adapter — docker-compose.yml:221-223). The CI
+            # stack runs this container (run_gate.sh:355, :465), so without this entry
+            # the datapath filter added 2026-08-08 would fire the gate against a STALE
+            # adapter image and report green on code it never ran — exactly the
+            # kafka_connect trap recorded below. Trigger and rebuild must move together.
+            temporal_adapter:
+              - 'backend-temporal-adapter/**'
+            # Debezium/Kafka-Connect SOURCE image (compose service `kafka-connect`).
+            # It is NOT rebuilt by SMOKE_BUILD_MCP (that's the sink worker) and is
+            # never a "changed service" for a Go PR -- so before this entry a fix to
+            # the kafka-connect image (e.g. the Bug-G base-image bump, #682) only
+            # reached the warm rsync-ci stack via a nightly full-gate rebuild. Any
+            # datapath PR opened in that window reused a STALE kafka-connect image
+            # and red'd the CDC smoke on an image defect it never touched (#687).
+            # Rebuilding it here on a kafka-connect source change both tests that
+            # change AND refreshes the warm image for every later PR.
+            kafka_connect:
+              - 'shared/internal/infra/kafka-connect/**'
+            sink:
+              - 'shared/mcp-connectors/internal/kafka-mcp-sink/**'
+            # Planner image (compose service `planner`, build context ./llm-service --
+            # docker-compose.yml:1393-1396). Nothing rebuilt it before 2026-08-17, so the
+            # warm rsync-ci planner was ~3 weeks stale and no llm-service change was ever
+            # exercised by the gate. That is how the namespaced-topic work (#787) shipped
+            # its Go half against a planner that still emitted unprefixed names: the
+            # orchestrator produced into "rsync.pipeline.<id8>.data" while the sink was
+            # subscribed to "pipeline.<id8>.data", and the run failed closed reporting an
+            # unreachable destination. Scoped to the whole build context because that is
+            # what the image contains -- a subpath allowlist here would re-create the bug
+            # one level down, exactly as it did for temporal_adapter.
+            planner:
+              - 'llm-service/**'
+            mysql_conn:
+              - 'shared/mcp-connectors/public/database/mysql/**'
+            pg_conn:
+              - 'shared/mcp-connectors/public/postgresql/**'
+      - name: Run smoke gate (warm stack; rebuild only changed services)
+        env:
+          GATE_MODE: smoke
+          # Isolated CI stack (rsync-ci-*): own compose project + container names
+          # + host ports. smoke_ensure_up brings this stack up ONCE on the runner
+          # then reuses it warm on later PRs — it never touches a developer's
+          # local rsync-ai dev/staging stack (they coexist on the same daemon).
+          STACK_PREFIX: rsync-ci
+          # No E2E_SKIP_UP / E2E_BUILD: smoke mode defaults E2E_SKIP_UP=1 and uses
+          # run_gate.sh's lightweight `smoke_ensure_up` (reuse the warm dev stack;
+          # bring up only what's down; NO --force-recreate / 100k big_table re-seed
+          # the smoke subset never touches) instead of the heavy full bring_up_stack.
+          # Changed services are still rebuilt + recreated by SMOKE_BUILD_* below.
+          # Space-joined docker-compose.yml service names to rebuild (empty =>
+          # none). run_gate.sh's smoke_selective_build resolves + recreates them.
+          SMOKE_BUILD_MAIN: ${{ steps.svc.outputs.orchestrator == 'true' && 'orchestrator ' || '' }}${{ steps.svc.outputs.apigateway == 'true' && 'api-gateway ' || '' }}${{ steps.svc.outputs.temporal_adapter == 'true' && 'temporal-adapter ' || '' }}${{ steps.svc.outputs.kafka_connect == 'true' && 'kafka-connect ' || '' }}${{ steps.svc.outputs.planner == 'true' && 'planner ' || '' }}${{ steps.svc.outputs.sink == 'true' && 'kafka-mcp-sink-mcp' || '' }}
+          # Connector IDs (NOT service names): versioned names (mysql-v1-0-0-mcp)
+          # resolve in run_gate.sh via mcp_service_name -- never hardcode here.
+          SMOKE_BUILD_MCP: ${{ steps.svc.outputs.mysql_conn == 'true' && 'mysql ' || '' }}${{ steps.svc.outputs.pg_conn == 'true' && 'postgresql' || '' }}
+        run: |
+          chmod +x e2e/run_gate.sh
+          bash e2e/run_gate.sh
+
+  # OSS connector-lifecycle DEPLOY smoke — the runtime guard for the F1 class.
+  #
+  # The OSS image (llm-service/Dockerfile.oss, served by src.lifecycle.main) can import
+  # cleanly yet still be dead-on-arrival: docker_builder.py is fully gated on the `docker`
+  # Python SDK, so if `docker>=7.0.0` is missing from requirements-oss.txt every /v1/deploy
+  # returns "Docker not available" (the F1 bug PR #500 fixed). scripts/oss-leak-proof-test.sh
+  # only checks import + buildx PRESENCE — it never POSTs /v1/deploy, so it is green-but-blind
+  # over that path. This job stands up ONLY the lifecycle container in isolation (its own
+  # throwaway network/volume/container — never the shared rsync-ai / rsync-ai-mcp stack) and
+  # drives a REAL /v1/deploy of a lightweight connector to a running container. Its negative
+  # control: drop docker>=7.0.0, rebuild, and this smoke fails with "Docker not available".
+  #
+  # workflow_dispatch + nightly schedule ONLY — NEVER per-PR: it builds the OSS image AND
+  # JIT-builds+deploys a connector through the host docker daemon (~10-15 min, collision-prone
+  # on shared fixed names/ports), too heavy for the PR critical path. A regression here is
+  # still caught within 24h by the nightly cron (same cron as the a11y / data-pipeline gates).
+  oss-deploy-smoke:
+    name: OSS connector-lifecycle deploy smoke
+    # `github.repository ==` is an AVAILABILITY guard, not a fork guard: it skips runs
+    # happening inside someone's own fork (which lacks the self-hosted runner). On a fork
+    # PR against THIS repo it names the base repo and evaluates TRUE, so it never blocked
+    # fork-authored code. The head-repo predicate conjoined below is the fork guard; the
+    # control that actually holds is the repo setting "Require approval for all external
+    # contributors", because a pull_request run executes the workflow from the PR head.
+    #
+    # The list, rather than one slug: the public repo is `rsync-ai/rsync` and the
+    # private one keeps its own name and stays alive after the flip, so CI has to
+    # run on BOTH. Naming only one silently disables this job on the other -- a
+    # skipped job is indistinguishable from a passing one, which is the whole
+    # reason test_repo_slug_is_publishable.py asserts the guard admits the repo
+    # this checkout actually points at.
+    if: ${{ (contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync"]'), github.repository) && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    # Serialize: the smoke uses fixed isolated resource names (rsync-oss-smoke-*) and a fixed
+    # host port, so two concurrent runs would clobber each other. Queue (don't cancel) so an
+    # in-flight run tears its resources down cleanly rather than dying mid-deploy.
+    concurrency:
+      group: oss-deploy-smoke
+      cancel-in-progress: false
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Deploy a connector through the OSS lifecycle image (real /v1/deploy)
+        run: |
+          chmod +x scripts/oss-deploy-smoke.sh
+          bash scripts/oss-deploy-smoke.sh
+
+  # OSS moat-leak proof — builds BOTH published llm-service images and proves
+  # neither carries the connector-generation moat.
+  #
+  # This job did not exist. scripts/oss-leak-proof-test.sh was referenced in the
+  # comment above and in INVENTORY.md, and run by hand, but no workflow invoked
+  # it -- so the proof standing between the private moat and a public image had
+  # never run in CI even once. No check fails for a step that does not exist,
+  # which is why "the leak test is green" was never a claim anyone could check.
+  # It matters now specifically: the moat becomes irreversibly public the moment
+  # a leaked layer is pushed, and unlike a bug that cannot be fixed forward.
+  #
+  # Unlike oss-deploy-smoke (schedule/dispatch only), this is cheap enough for the
+  # PR path: it builds two images against a warm layer cache and runs short-lived
+  # containers. It JIT-builds no connector, binds no host port and touches no
+  # shared stack, so it does not need that job's serialization for correctness --
+  # the concurrency group below exists only because the image TAGS are fixed.
+  #
+  # test_oss_image_boundary.py already reasons about both Dockerfiles, but it
+  # reasons about COPY *lines*. It cannot see what a pip install, a base-layer
+  # file or a transitive copy actually leaves on disk. This job is the half that
+  # inspects the built artifact.
+  oss-leak-proof:
+    name: OSS images are moat-free
+    needs: changes
+    # Guard to the canonical repo: forks and mirrors lack the self-hosted runner
+    # and must never touch this box's docker daemon.
+    #
+    # Both halves are load-bearing. `github.repository ==` blocks a mirror's own
+    # scheduled run, but on a fork PULL REQUEST it names the BASE repo and evaluates
+    # TRUE -- which is how fork-authored code would have reached the Macs holding the
+    # prod deploy key. The head-repo comparison is the half that actually stops that,
+    # and it is the one llm-service/tests/test_self_hosted_jobs_are_fork_guarded.py
+    # requires on every self-hosted job reachable from a fork PR.
+    #
+    # Both slugs, for the reason spelled out on oss-deploy-smoke above: this job
+    # must keep running on the private repo before the flip and on the public one
+    # after it.
+    if: ${{ contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync"]'), github.repository) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.changes.outputs.llm == 'true' || github.event_name == 'schedule') }}
+    runs-on: ubuntu-latest
+    concurrency:
+      # The script tags its builds rsync-oss-leaktest:{community,lifecycle}. Two
+      # concurrent runs would overwrite each other's tags mid-scan. Queue rather
+      # than cancel so an in-flight run reaches its cleanup step.
+      group: oss-leak-proof
+      cancel-in-progress: false
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Both published OSS images carry none of the moat
+        run: |
+          chmod +x scripts/oss-leak-proof-test.sh
+          bash scripts/oss-leak-proof-test.sh
+      - name: Remove the leak-test images
+        if: always()
+        # The runner is a long-lived box; two ~1GB images per run would accumulate.
+        # Never fail the job on cleanup -- a red X here would be read as a leak.
+        run: |
+          docker rmi -f rsync-oss-leaktest:community rsync-oss-leaktest:lifecycle || true
+
+  frontend:
+    name: Frontend (lint + test + build)
+    needs: changes
+    # Runs on frontend PRs AND on the nightly schedule (the a11y job below
+    # needs this job's build artifact, so the build must run nightly too).
+    if: ${{ (needs.changes.outputs.frontend == 'true' || github.event_name == 'schedule') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          # MUST equal the major in frontend/Dockerfile (node:26-alpine in all
+          # three stages) — CI is only a gate on what we ship if it runs the
+          # same major. That is not self-enforcing and it already broke once:
+          # #902 bumped the image 24 -> 26 for the CVE count, and this pin, the
+          # four cache-key literals below, and @types/node all stayed on 24. For
+          # ~a day CI lint/test/build ran 24 while the image ran 26, so anything
+          # that only breaks on 26 would have shipped green. Six literals move
+          # together, four of them cache keys with the major glued into the
+          # string — so grep for the outgoing major's VALUE, not for a variable
+          # name. Deliberately not spelled out here: a retired version sitting
+          # in a comment is one a reader can paste back in, and it would go
+          # stale at the next bump anyway.
+          #
+          # There is also a floor, unrelated to the image: jsdom 29 pulls
+          # undici 7, whose cachestorage.js calls worker_threads.markAsUncloneable
+          # at import time. That API does not exist in Node 20 (verified
+          # undefined on 20.20.2, the version this runner resolves '20' to), so
+          # every one of the 50 test files died at worker startup. undici's own
+          # `engines: >=20.18.1` is optimistic and does not catch it.
+          node-version: '26'
+          # NO `cache: npm`. On self-hosted runners setup-node's npm cache
+          # ferries the global ~/.npm tree (had bloated to ~940 MB) over the
+          # GitHub cache backend every run — pure overhead. We cache
+          # frontend/node_modules directly below, so on a hit `npm ci` is
+          # skipped and ~/.npm is never read; on a miss the on-disk ~/.npm
+          # (persists on the self-hosted runner) still serves as a warm
+          # download cache. Same rationale as the Go/Python jobs above.
+      # CI SPEEDUP: cache the installed `frontend/node_modules` tree.
+      # Caching node_modules directly + a hash on package-lock.json
+      # cuts install to a few seconds on cache hit.
+      - name: Cache node_modules
+        id: nm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: frontend/node_modules
+          # Node major is IN the key: the two jobs share this cache, and a
+          # tree installed under one major must never be restored into another
+          # (platform/ABI-specific binaries: esbuild, @swc, lightningcss). The
+          # restore-keys prefix carries it too, else the old Node 20 caches
+          # would be restored by prefix match and defeat the point.
+          key: ${{ runner.os }}-node26-nm-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node26-nm-
+      - name: Install dependencies
+        if: steps.nm-cache.outputs.cache-hit != 'true'
+        working-directory: frontend
+        run: npm ci
+      # Vitest ran nowhere in CI until 2026-07-30 — `npm test` was not invoked by
+      # any of the four workflow files, so all 50 test files under
+      # frontend/src/__tests__ were local-only and a green "Frontend" check meant
+      # "compiles + lints", never "tests pass". Placed BEFORE the build: a failed
+      # assertion should not cost the 60-90s Next build first.
+      - name: Unit tests (vitest)
+        working-directory: frontend
+        run: npm test
+      # CI SPEEDUP: cache Next.js incremental build output (.next/cache).
+      # Next.js 13+ persists per-page/per-chunk RSC and webpack caches here.
+      # On a PR that only touches a few files this cuts the build from ~4-6
+      # min to ~60-90s. Key includes package-lock so a dep bump forces a
+      # cold build (new JS bundles). runner.os is implicit in the runner
+      # label but explicit here for clarity.
+      - name: Cache Next.js build cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: frontend/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**/*.ts', 'frontend/src/**/*.tsx') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('frontend/package-lock.json') }}-
+            ${{ runner.os }}-nextjs-
+      # CI SPEEDUP: run lint in the background while Next.js build compiles.
+      # Lint is CPU-light (ESLint pass) and finishes well before the build.
+      # Both must succeed; if lint fails its exit code surfaces at `wait`.
+      - name: Lint + Build (parallel)
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:5001
+          NEXT_PUBLIC_WS_URL: ws://localhost:5001/ws
+          NEXT_TELEMETRY_DISABLED: 1
+        run: |
+          npm run lint &
+          LINT_PID=$!
+          npm run build
+          wait $LINT_PID
+      - name: Archive build output
+        # Only the frontend-a11y job consumes this artifact, and it runs
+        # nightly/manual only (schedule || workflow_dispatch). Gate the archive +
+        # upload to the SAME condition so PR/push runs don't upload an artifact
+        # nothing downloads -- which previously failed the whole gate whenever the
+        # Actions artifact-storage quota was exhausted.
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        # Next.js 16 emits internal chunk files whose names contain ':' (e.g.
+        # `[externals]_node:inspector_*.js`). upload-artifact@v4 rejects colons
+        # for NTFS compatibility, so we tar the build first and ship a single
+        # archive that the a11y job extracts on the other side.
+        working-directory: frontend
+        run: tar -cf frontend-build.tar .next public
+      - name: Cache build output
+        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: frontend-build
+          path: frontend/frontend-build.tar
+          retention-days: 1
+
+  frontend-a11y:
+    name: Frontend a11y (axe-core)
+    needs: [changes, frontend]
+    # Nightly / manual only — NOT on PRs, and it MEASURES LESS THAN IT LOOKS.
+    #
+    # This job brings up only the Next frontend (playwright.a11y.config.ts
+    # `webServer` = `PORT=3100 npm run start`). It starts NO api-gateway, so
+    # e2e/fixtures/auth.setup.ts fails its `${API_URL}/health` probe and calls
+    # `setup.skip(...)`, and e2e/a11y/authenticated_pages.spec.ts then self-skips
+    # all four authenticated routes on the missing `.auth/user.json`. A skip is
+    # indistinguishable from a pass in the report. What actually gets measured
+    # here is the two PUBLIC route specs (login, signup). The runners are
+    # developer Macs, so on any run where something unrelated happens to serve
+    # :5001 the authenticated project runs instead — nondeterministic either way.
+    #
+    # The PR-lane guard for the authenticated pages is therefore a jsdom+axe unit
+    # test, frontend/src/__tests__/authenticated-pages-a11y.test.tsx, which the
+    # `frontend` job's `npm test` runs on every frontend PR. It applies the same
+    # blocking bar (zero serious/critical under wcag2a/2aa/21a/21aa) to
+    # /settings, /connections and the collapsed Sidebar, but it covers name/role/
+    # label rules ONLY — jsdom has no layout or paint, so `color-contrast` is
+    # disabled there and can only be measured by this job.
+    #
+    # Two prerequisites before this can become a blocking PR gate — do NOT flip
+    # the `if:` or drop either `continue-on-error` until both are met:
+    #   (a) the job must stand up an api-gateway (or set E2E_API_URL at a
+    #       reachable one) so the authenticated project runs deterministically
+    #       instead of depending on what the self-hosted Mac happens to serve;
+    #   (b) the remaining runtime violations on /dashboard and /pipelines — not
+    #       yet enumerated, most likely `color-contrast` — must be read out of
+    #       the playwright-a11y-report artifact and fixed.
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          # Kept in lockstep with the frontend job above — the two share one
+          # node_modules cache, so they must install under the same Node major.
+          node-version: '26'
+          # NO `cache: npm` — see the frontend job above for why (avoids
+          # ferrying the ~940 MB global ~/.npm cache over the network).
+      # CI SPEEDUP: share the same node_modules cache the frontend
+      # build job populated. Same key so warm hits skip `npm ci`.
+      - name: Cache node_modules
+        id: nm-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: frontend/node_modules
+          # Node major is IN the key: the two jobs share this cache, and a
+          # tree installed under one major must never be restored into another
+          # (platform/ABI-specific binaries: esbuild, @swc, lightningcss). The
+          # restore-keys prefix carries it too, else the old Node 20 caches
+          # would be restored by prefix match and defeat the point.
+          key: ${{ runner.os }}-node26-nm-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node26-nm-
+      - name: Install dependencies
+        if: steps.nm-cache.outputs.cache-hit != 'true'
+        working-directory: frontend
+        run: npm ci
+      - name: Restore build output
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: frontend-build
+          path: frontend
+      - name: Extract build output
+        working-directory: frontend
+        run: tar -xf frontend-build.tar && rm frontend-build.tar
+      # CI SPEEDUP: cache Playwright's chromium download. Without
+      # this, `playwright install` re-downloads ~100MB every run
+      # (~2-4 min). Keyed off package-lock.json so a Playwright
+      # version bump (which updates the lock) invalidates correctly.
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/Library/Caches/ms-playwright
+          key: ${{ runner.os }}-pw-${{ hashFiles('frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-pw-
+      - name: Install Playwright browsers
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        working-directory: frontend
+        run: npx playwright install --with-deps chromium
+      - name: Run axe-core a11y suite
+        working-directory: frontend
+        # Without an api-gateway on :5001 the four authenticated specs SKIP
+        # (see the job-level comment above) — so a green result here is not
+        # evidence that /dashboard, /connections, /pipelines or /settings are
+        # clean; it usually means they were never visited. The step-level
+        # `continue-on-error: true`, together with the job-level flag, keeps
+        # the check reporting green while still uploading the report.
+        # Both flags stay until the authenticated project runs deterministically
+        # AND the remaining /dashboard + /pipelines violations are enumerated
+        # and fixed; removing them now would turn the nightly red for
+        # violations nobody has listed yet.
+        continue-on-error: true
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:5001
+          NEXT_PUBLIC_WS_URL: ws://localhost:5001/ws
+        run: npm run test:a11y
+      - name: Upload report on failure
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: playwright-a11y-report
+          path: frontend/playwright-a11y-report
+          retention-days: 7

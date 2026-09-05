@@ -1,0 +1,50 @@
+<?xml version="1.0"?>
+<!--
+  rsync-ai ClickHouse hardening overlay (mounted into /etc/clickhouse-server/config.d/).
+
+  CONTEXT: signoz-clickhouse shares a small prod VM (4 cores / 15 GiB) with the ENTIRE
+  rsync-ai data plane. It repeatedly pegged ~2 cores and drove the VM load average to ~32,
+  starving kafka/orchestrator/temporal and making deploys crawl.
+
+  ROOT CAUSE (measured, not query load — only ~5 live queries at the time): ClickHouse's OWN
+  internal self-monitoring tables. `system.metric_log` collects ~1000 ProfileEvents/CurrentMetrics
+  every collect_interval (1s) and flushes every 7.5s, producing a relentless stream of very WIDE
+  parts; the background merger then thrashes compacting them forever. We saw 147 active parts on
+  system.metric_log plus 104 on a stale schema-drift twin `system.metric_log_0`. A previous
+  attempt added a 3-day TTL (see config.xml) — but TTL only deletes OLD rows, it never reduces the
+  live write+merge churn, so the CPU problem kept coming back.
+
+  These `system.*_log` tables are ClickHouse introspecting ITSELF. SigNoz's product data lives in
+  the signoz_* databases (traces/logs/metrics) and does NOT depend on them; the Prometheus /metrics
+  endpoint (port 9363) reads live system.metrics/events, not these historical tables. So disabling
+  them removes the churn with zero loss of SigNoz functionality. To debug ClickHouse internals,
+  temporarily drop the relevant remove="1" and restart.
+
+  This is a config.d OVERLAY: `remove="1"` deletes the element that config.xml defines, so we never
+  have to edit the 57 KB upstream config.xml. config.d is also merged AFTER config.xml, so these win.
+-->
+<clickhouse>
+    <!-- The CPU root cause: high-churn internal self-logs. Disable outright. -->
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <processors_profile_log remove="1"/>
+    <trace_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <part_log remove="1"/>
+    <text_log remove="1"/>
+
+    <!-- Deliberately KEPT (left as config.xml defines them):
+           * query_log      — 30-day TTL, low volume, genuinely useful for debugging
+           * crash_log      — only ever written on a crash
+           * opentelemetry_span_log — low churn
+         Do not add remove="1" for these. -->
+
+    <!-- OOM guard. Pin an ABSOLUTE server memory ceiling BELOW the 3 GiB container cap
+         (docker-compose mem_limit) so ClickHouse self-limits before the cgroup OOM-kills it
+         (exit 137 — the historical failure that took observability down for hours). This is
+         independent of max_server_memory_usage_to_ram_ratio (config.xml), which can misfire if
+         CH sizes against host RAM instead of the cgroup limit. 2.4 GiB = 2576980377 bytes leaves
+         the container ~0.6 GiB of headroom. -->
+    <max_server_memory_usage>2576980377</max_server_memory_usage>
+</clickhouse>

@@ -1,0 +1,163 @@
+{{- if .Values.redis.enabled }}
+{{/*
+Redis carries the correlation-claim ledger and the WebSocket fan-out state — it
+is a coordination store, not a cache, so losing it mid-run orphans in-flight
+correlations rather than merely costing a recompute. Hence a PVC and AOF.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-redis
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  clusterIP: None
+  ports:
+    - port: 6379
+      targetPort: redis
+      name: redis
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-redis
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: redis
+spec:
+  serviceName: {{ include "rsync-ai.fullname" . }}-redis
+  replicas: 1
+  selector:
+    matchLabels:
+{{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: redis
+      {{- with .Values.global.podAnnotations }}
+      annotations:
+{{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          {{/*
+            maxmemory-policy noeviction is deliberate and load-bearing. The default
+            allkeys-lru would silently evict a correlation claim under pressure, and
+            a dropped claim does not surface as a Redis error — it surfaces as a run
+            that waits for a reply that will never be matched. Failing the write is
+            loud; evicting the key is silent.
+          */}}
+          {{/*
+            The password goes into a 0600 file rather than onto --requirepass.
+            kubelet expands $(REDIS_PASSWORD) into the container's command line,
+            and the readiness probe below runs redis-cli every 5s — redis-cli does
+            NOT overwrite its own argv the way redis-server does, so -a would put
+            the password on a process listing twelve times a minute.
+          */}}
+          {{/*
+            Whether to require a password is decided at RUNTIME, from the same
+            Secret key the clients read, and that is the entire point.
+
+            It used to be decided at render time from the INLINE
+            `.Values.secrets.redisPassword`, while every client read
+            `secretKeyRef{secretName, REDIS_PASSWORD, optional: true}` — which
+            resolves to `secrets.existingSecret` when one is set. Set an
+            existingSecret carrying REDIS_PASSWORD (which README.md:164-166 tells
+            operators to do, and values.yaml:77-81 recommends for "anything that
+            leaves a laptop") and the two halves disagreed: a server with no
+            `requirepass` and clients all sending AUTH, answered with
+            `ERR Client sent AUTH, but no password is set`. Nothing failed at
+            install time — the server was healthy and its own probe passed,
+            because the probe was gated on the same value the server was.
+            validate.yaml's secrets block could not catch it either: that whole
+            block is skipped precisely when existingSecret is set.
+            (KI-CHART-REDIS-PASSWORD-SPLIT-SOURCE.)
+
+            Reading the resolved Secret with `optional: true` makes the two
+            halves agree in all four combinations — inline password, external
+            Secret carrying the key, external Secret without it, and no password
+            at all — because both sides now answer the same question about the
+            same key instead of two different questions about two different
+            sources.
+          */}}
+          args:
+            - "sh"
+            - "-c"
+            - |
+              if [ -n "${REDIS_PASSWORD:-}" ]; then
+                umask 077
+                printf 'requirepass %s\n' "$REDIS_PASSWORD" > /tmp/redis.conf
+                exec redis-server /tmp/redis.conf --appendonly yes --maxmemory-policy noeviction
+              fi
+              exec redis-server --appendonly yes --maxmemory-policy noeviction
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: REDIS_PASSWORD
+                  optional: true
+          ports:
+            - name: redis
+              containerPort: 6379
+          readinessProbe:
+            exec:
+              # Same runtime branch as the server, for the same reason. An empty
+              # REDISCLI_AUTH is not equivalent to an unset one, so this asks the
+              # question explicitly rather than relying on redis-cli's handling of
+              # an empty string.
+              command:
+                - "sh"
+                - "-c"
+                - |
+                  if [ -n "${REDIS_PASSWORD:-}" ]; then
+                    REDISCLI_AUTH="$REDIS_PASSWORD" redis-cli --no-auth-warning ping
+                  else
+                    redis-cli ping
+                  fi
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            tcpSocket:
+              port: redis
+            initialDelaySeconds: 20
+            periodSeconds: 15
+            failureThreshold: 6
+          resources:
+{{- toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{/*
+          Per-component first, global as the fallback. Both keys have shipped in
+          values.yaml since the chart landed, but ONLY the global one was ever
+          read: setting redis.persistence.storageClass was
+          silently ignored and the PVC fell through to the cluster default. An
+          inert key in values.yaml is worse than an absent one, because
+          values.yaml is the file an operator copies to build an overlay.
+          (KI-CHART-DEAD-PER-COMPONENT-STORAGECLASS.)
+        */}}
+        {{- with (default .Values.global.storageClass .Values.redis.persistence.storageClass) }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.redis.persistence.size | quote }}
+{{- end }}

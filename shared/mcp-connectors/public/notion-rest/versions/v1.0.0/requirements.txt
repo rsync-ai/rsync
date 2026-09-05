@@ -1,0 +1,21 @@
+# Auto-generated requirements for Notion connector
+# Generated: 2026-07-10T12:28:48.318613
+
+# Base dependencies (always required)
+# Note: base_connector.py is expected from parent directory
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# HTTP client for API requests
+requests>=2.28.0
+
+
+
+
+
+
+# Connector-specific dependencies
+

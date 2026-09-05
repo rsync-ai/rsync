@@ -1,0 +1,146 @@
+[
+  {
+    "input": "duplicate key value violates unique constraint; Key (email)=(jane@acme.com)",
+    "expected": "duplicate key value violates unique constraint; Key (email)=([redacted])"
+  },
+  {
+    "input": "null value violates not-null; Failing row contains (1, jane@acme.com, secret)",
+    "expected": "null value violates not-null; Failing row contains ([redacted])"
+  },
+  {
+    "input": "INSERT INTO t VALUES ('Jane', 'jane@acme.com', 41)",
+    "expected": "INSERT INTO t VALUES ([redacted])"
+  },
+  {
+    "input": "connect failed: postgres://user:hunter2@db:5432/app",
+    "expected": "connect failed: postgres://[redacted]@db:5432/app"
+  },
+  {
+    "input": "auth error: Bearer sk-abcdefghijklmnopqrstuvwxyz012345",
+    "expected": "auth error: Bearer [redacted]"
+  },
+  {
+    "input": "password: hunter2 and api_key=AKIA1234567890EXAMPLE",
+    "expected": "password=[redacted] and api_key=[redacted]"
+  },
+  {
+    "input": "ssn 123-45-6789 and phone 555-123-4567",
+    "expected": "ssn [num-redacted] and phone [num-redacted]"
+  },
+  {
+    "input": "record id 4111111111111111 not found",
+    "expected": "record id [num-redacted] not found"
+  },
+  {
+    "input": "jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.abcdef here",
+    "expected": "jwt [redacted] here"
+  },
+  {
+    "input": "relation \"orders\" does not exist at 2026-07-17T10:00:00",
+    "expected": "relation \"orders\" does not exist at 2026-07-17T10:00:00"
+  },
+  {
+    "input": "contact jane@acme.com for access",
+    "expected": "contact [email-redacted] for access"
+  },
+  {
+    "input": "invalid input syntax for type integer: \"jane\"",
+    "expected": "invalid input syntax for type integer: \"[redacted]\""
+  },
+  {
+    "input": "value was 'topsecret' in the row",
+    "expected": "value was '[redacted]' in the row"
+  },
+  {
+    "input": "unterminated literal: 'oops",
+    "expected": "unterminated literal: '[redacted]'"
+  },
+  {
+    "input": "payload {\"age\": 41, \"score\": 99}",
+    "expected": "payload {\"age\": [num-redacted], \"score\": [num-redacted]}"
+  },
+  {
+    "input": "token aGVsbG93b3JsZGRlYWRiZWVmY2FmZWJhYmUxMjM0NTY3ODkwYWJjZA==",
+    "expected": "token [redacted]=="
+  },
+  {
+    "input": "client ip 10.11.12.13 rejected",
+    "expected": "client ip [ip-redacted] rejected"
+  },
+  {
+    "input": "connection refused to 192.168.0.1:5432",
+    "expected": "connection refused to [ip-redacted]:5432"
+  },
+  {
+    "input": "failover from 10.0.0.5 to 10.0.0.6",
+    "expected": "failover from [ip-redacted] to [ip-redacted]"
+  },
+  {
+    "input": "mysql 8.0.32 listening on 5432",
+    "expected": "mysql 8.0.32 listening on 5432"
+  },
+  {
+    "input": "Couldn't apply schema change to pipeline 'orders-sync'.",
+    "expected": "Couldn't apply schema change to pipeline '[redacted]'."
+  },
+  {
+    "input": "We didn't apply the change for pipeline 'drift-test-batch' because the user's approval is pending.",
+    "expected": "We didn't apply the change for pipeline '[redacted]' because the user's approval is pending."
+  },
+  {
+    "input": "Duplicate entry 'jane@x.com' for key 'users.email'",
+    "expected": "Duplicate entry '[redacted]' for key '[redacted]'"
+  },
+  {
+    "input": "The connector won't retry until the credentials are refreshed.",
+    "expected": "The connector won't retry until the credentials are refreshed."
+  },
+  {
+    "input": "kafka connect failed: KAFKA_SASL_PASSWORD=s3cret-broker-pw mechanism PLAIN",
+    "expected": "kafka connect failed: KAFKA_SASL_PASSWORD=[redacted] mechanism PLAIN"
+  },
+  {
+    "input": "SASL_PASSWORD: s3cret-broker-pw",
+    "expected": "SASL_PASSWORD=[redacted]"
+  },
+  {
+    "input": "KafkaError: sasl_plain_password=s3cret-broker-pw sasl_plain_username=svc-rsync",
+    "expected": "KafkaError: sasl_plain_password=[redacted] sasl_plain_username=svc-rsync"
+  },
+  {
+    "input": "oauth handshake failed KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET=oauth-s3cret",
+    "expected": "oauth handshake failed KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET=[redacted]"
+  },
+  {
+    "input": "dial: kafkaclient.Config{SASLMechanism:PLAIN Username:svc Password:s3cret-broker-pw OAuthClientSecret:oauth-s3cret}",
+    "expected": "dial: kafkaclient.Config{SASLMechanism:PLAIN Username:svc Password=[redacted] OAuthClientSecret=[redacted]"
+  },
+  {
+    "input": "msk sign failed: AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMIK7MDENGbPxRfiCY AWS_SESSION_TOKEN=FQoGZXIvYXdz",
+    "expected": "msk sign failed: AWS_SECRET_ACCESS_KEY=[redacted] AWS_SESSION_TOKEN=[redacted]"
+  },
+  {
+    "input": "producer config {'security_protocol': 'SASL_SSL', 'sasl_plain_password': 's3cret-broker-pw'}",
+    "expected": "producer config {'[redacted]': '[redacted]', '[redacted]': '[redacted]'}"
+  },
+  {
+    "input": "KAFKA_SSL_KEY_PASSWORD=keystore-s3cret and KAFKA_SSL_CA_LOCATION=/etc/ssl/ca.pem",
+    "expected": "KAFKA_SSL_KEY_PASSWORD=[redacted] and KAFKA_SSL_CA_LOCATION=/etc/ssl/ca.pem"
+  },
+  {
+    "input": "jaas: org.apache.kafka.common.security.plain.PlainLoginModule required username=\"svc\" password=\"s3cret-broker-pw\";",
+    "expected": "jaas: org.apache.kafka.common.security.plain.PlainLoginModule required username=\"svc\" password=[redacted]"
+  },
+  {
+    "input": "bootstrap SASL_SSL://svc-rsync:s3cret-broker-pw@b-1.msk.amazonaws.com:9096 unreachable",
+    "expected": "bootstrap SASL_SSL://[redacted]@b-1.msk.amazonaws.com:9096 unreachable"
+  },
+  {
+    "input": "SASL_SSL requires both KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD to be set",
+    "expected": "SASL_SSL requires both KAFKA_SASL_USERNAME and KAFKA_SASL_PASSWORD to be set"
+  },
+  {
+    "input": "partition_key=customer_id",
+    "expected": "partition_key=customer_id"
+  }
+]

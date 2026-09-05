@@ -1,0 +1,30 @@
+#
+# OAuth2-refresh e2e overlay (OPT-IN, app-tier) — layered on top of
+# docker-compose.yml + docker-compose.e2e.yml by run_gate.sh's dc_main() ONLY
+# when E2E_INCLUDE_OAUTH=1. Normal PR/nightly gate runs (flag unset) never load
+# this file, so their rendered app stack is byte-identical to before.
+#
+# Purpose: give the service-to-service OAuth token-refresh path a shared,
+# non-empty INTERNAL_SERVICE_SECRET so the executor's refresh_client
+# (temporal-adapter/orchestrator) can POST the api-gateway internal refresh
+# endpoint (/api/v1/internal/oauth/tokens/:id/refresh) without a 401. The value
+# is a throwaway CI constant — it only needs to MATCH across the three services.
+# GITHUB_CLIENT_ID/SECRET + GITHUB_TOKEN_URL/API_BASE_URL (→ mock-github) already
+# live in docker-compose.e2e.yml; API_GATEWAY_URL is already set in the base file.
+#
+# Consumed by e2e/test_github_rest_oauth_refresh.py (see its docstring).
+#
+services:
+  api-gateway:
+    environment:
+      - INTERNAL_SERVICE_SECRET=e2e-oauth-internal-secret
+      # The SSRF guard (internal/safehttp) blocks Docker-internal/private targets.
+      # This e2e points GITHUB_TOKEN_URL/API_BASE_URL at mock-github (a private
+      # IP), so allowlist that one host here. Prod leaves SAFEHTTP_ALLOW_HOSTS unset.
+      - SAFEHTTP_ALLOW_HOSTS=mock-github
+  orchestrator:
+    environment:
+      - INTERNAL_SERVICE_SECRET=e2e-oauth-internal-secret
+  temporal-adapter:
+    environment:
+      - INTERNAL_SERVICE_SECRET=e2e-oauth-internal-secret

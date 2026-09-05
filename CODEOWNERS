@@ -1,0 +1,66 @@
+# CODEOWNERS — who GitHub automatically requests a review from on a pull request.
+#
+# WHY A SINGLE CONCRETE USER AND NOT A TEAM
+# The rsync-ai organisation currently has NO teams (`gh api orgs/rsync-ai/teams`
+# returns `[]`). A CODEOWNERS line naming a team that does not exist — or a user
+# without write access — is a SILENT no-op: GitHub requests no review, blocks
+# nothing, and reports no error anywhere. Only add `@rsync-ai/<team>` entries
+# after the team exists AND has write access to this repository.
+#
+# WHY THE SPECIFIC RULES LOOK REDUNDANT TODAY
+# Every rule below names the same owner as the global `*` rule, so today they
+# change no behaviour. They are here so that the moment a second maintainer or a
+# team is added to `*`, review on the security-sensitive trees does not silently
+# widen with it — the narrow rules keep it pinned. Update them together.
+#
+# SYNTAX: .gitignore-style patterns. The LAST matching line wins, so the global
+# rule must stay first. A trailing `/` matches the whole subtree.
+
+# ---------------------------------------------------------------------------
+# Global — everything not claimed by a more specific rule below.
+# ---------------------------------------------------------------------------
+*                                                   @rahulv8
+
+# ---------------------------------------------------------------------------
+# Authentication, sessions, OAuth, CSRF, RBAC, tenant isolation.
+# A regression here is an account-takeover or a cross-workspace data leak.
+# ---------------------------------------------------------------------------
+/api-gateway/internal/handlers/auth*.go             @rahulv8
+/api-gateway/internal/handlers/oauth*.go            @rahulv8
+/api-gateway/internal/handlers/*_middleware.go      @rahulv8
+/api-gateway/internal/security/                     @rahulv8
+/backend-orchestrator/internal/security/            @rahulv8
+
+# Credential encryption at rest and session-token hashing. Changing the key
+# derivation or the token format is a one-way door for already-stored data.
+/shared/go/crypto/                                  @rahulv8
+
+# ---------------------------------------------------------------------------
+# Change data capture and the self-healing agents.
+# CDC provisioning order (publication before replication slot) and the healer's
+# error classification both cause SILENT data loss when they are got wrong.
+# ---------------------------------------------------------------------------
+/backend-orchestrator/internal/cdc/                 @rahulv8
+/backend-orchestrator/internal/agents/sentinel/     @rahulv8
+/backend-orchestrator/internal/agents/heal/         @rahulv8
+/backend-orchestrator/internal/agents/healer/       @rahulv8
+
+# ---------------------------------------------------------------------------
+# CI and supply chain. These run on self-hosted runners and hold release
+# credentials, so a workflow edit is a privileged change.
+# ---------------------------------------------------------------------------
+/.github/workflows/                                 @rahulv8
+/.github/dependabot.yml                             @rahulv8
+/CODEOWNERS                                         @rahulv8
+
+# ---------------------------------------------------------------------------
+# Deployment artifacts users run in their own clusters.
+# ---------------------------------------------------------------------------
+/deploy/helm/                                       @rahulv8
+
+# ---------------------------------------------------------------------------
+# Licensing and security policy.
+# ---------------------------------------------------------------------------
+/LICENSE                                            @rahulv8
+/DCO                                                @rahulv8
+/SECURITY.md                                        @rahulv8

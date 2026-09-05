@@ -1,0 +1,46 @@
+#
+# E2E overrides for CORE stack services only.
+#
+# E2E infrastructure containers (mysql/postgres/minio/mock-github/etc) are intentionally
+# NOT defined here. They run as a separate Docker Desktop group:
+#   docker compose -f docker-compose.e2e.dbs.yml up -d
+#
+services:
+  # Enable GitHub OAuth in e2e using the mock server (no external network required).
+  api-gateway:
+    restart: unless-stopped   # gate stack lacks prod overlay's restart policy — see app-tier block below
+    environment:
+      - GITHUB_CLIENT_ID=e2e_dummy
+      - GITHUB_CLIENT_SECRET=e2e_dummy
+      - GITHUB_TOKEN_URL=http://mock-github:8080/login/oauth/access_token
+      - GITHUB_API_BASE_URL=http://mock-github:8080
+
+  # Ensure core services have MinIO defaults for internal staging.
+  orchestrator:
+    environment:
+      - MINIO_ENDPOINT_URL=http://minio:9000
+      - MINIO_ACCESS_KEY_ID=minioadmin
+      - MINIO_SECRET_ACCESS_KEY=minioadmin
+      - MINIO_REGION=us-east-1
+      - MINIO_BUCKET=pipeline-data
+
+  # OOM-stays-dead guard for the gate stack.
+  # The data-pipeline gate renders bare base + this e2e overlay (NO prod/staging
+  # overlay), so the stateless app tier inherits the base file's no-restart default
+  # (left off on purpose so dev sees crashes). On the gate's loaded runner a service
+  # can get OOM-killed (exit 137) mid-run and then STAY DEAD — e.g. planner died and
+  # never came back, so every batch pipeline failed planning with
+  #   Post "http://planner:5011/plan": dial tcp: lookup planner: no such host
+  # while CDC (which doesn't replan) stayed green. orchestrator + kafka-mcp-sink-mcp
+  # already carry restart in the base; mirror docker-compose.prod.yml's policy here
+  # for the remaining app tier so a transient OOM auto-recovers instead of reddening
+  # the gate. (Underlying runner-headroom fix is tracked separately.)
+  planner:
+    restart: unless-stopped
+  llm-service:
+    restart: unless-stopped
+  tool-generator:
+    restart: unless-stopped
+  temporal-adapter:
+    restart: unless-stopped
+

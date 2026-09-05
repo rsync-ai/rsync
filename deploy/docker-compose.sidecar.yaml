@@ -1,0 +1,276 @@
+# =============================================================================
+# Docker Compose - OTEL Sidecar Pattern Example
+# =============================================================================
+# This file demonstrates how to deploy services with OTEL Collector sidecars
+# for complete observability (traces, logs, metrics).
+#
+# Each service runs alongside its own OTEL Collector sidecar that:
+# 1. Receives traces via OTLP (localhost:4317)
+# 2. Scrapes logs from the service container
+# 3. Exports everything to SigNoz
+#
+# Usage:
+#   docker-compose -f docker-compose.sidecar.yaml up
+#
+# =============================================================================
+
+version: '3.8'
+
+# =============================================================================
+# SHARED VOLUMES FOR LOG COLLECTION
+# =============================================================================
+volumes:
+  # Shared volume for Docker socket (log collection)
+  docker_sock:
+    driver: local
+  postgres_data:
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+networks:
+  rsync-network:
+    driver: bridge
+  signoz-network:
+    external: true  # Assumes SigNoz is running externally
+
+# =============================================================================
+# SERVICES
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # BACKEND ORCHESTRATOR
+  # ---------------------------------------------------------------------------
+  backend-orchestrator:
+    build:
+      context: ../backend-orchestrator
+      dockerfile: Dockerfile
+    container_name: backend-orchestrator
+    environment:
+      # Server config
+      PORT: "8080"
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+      LOG_LEVEL: info
+      
+      # Database
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: user
+      DB_PASSWORD: password
+      DB_NAME: pipeline_db
+      
+      # Kafka
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      # This example ships no schema-registry; the code default for KAFKA_USE_AVRO is true.
+      KAFKA_USE_AVRO: "false"
+      # Durability for every topic the orchestrator creates. Same names the Go side
+      # reads (backend-orchestrator/internal/kafka/replication.go EnvReplicationFactor
+      # / EnvMinInsyncReplicas). Empty means "operator stated nothing", so the
+      # built-in derivation applies -- it is NOT the same as zero.
+      #
+      # These two must travel together. min.insync.replicas > replication factor
+      # produces a topic that is created, listed and subscribable, and then rejects
+      # every acks=all produce with NOT_ENOUGH_REPLICAS; the Go side clamps misr down
+      # to the topic's final RF so that setting one without the other is still safe.
+      KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-}
+      KAFKA_MIN_INSYNC_REPLICAS: ${KAFKA_MIN_INSYNC_REPLICAS:-}
+      
+      # Telemetry - Points to sidecar
+      OTEL_EXPORTER_OTLP_ENDPOINT: localhost:4317
+      OTEL_SERVICE_NAME: backend-orchestrator
+      OTEL_SERVICE_VERSION: "1.0.0"
+      OTEL_ENABLED: "true"
+      OTEL_SAMPLING_RATE: "1.0"
+      OTEL_INSECURE: "true"
+      
+      # Feature flags
+      ENABLE_SCHEDULER: "true"
+      ENABLE_CONSUMER_AGENT: "true"
+      ENABLE_RETENTION_AGENT: "true"
+    ports:
+      - "8080:8080"
+    networks:
+      - rsync-network
+    depends_on:
+      - postgres
+      - kafka
+    # Logs are written to stdout in JSON format
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+        labels: "service,environment"
+    labels:
+      service: backend-orchestrator
+      environment: production
+
+  # Sidecar for backend-orchestrator
+  otel-sidecar-orchestrator:
+    image: otel/opentelemetry-collector-contrib:0.91.0
+    container_name: otel-sidecar-orchestrator
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-sidecar-config.yaml:/etc/otel-collector-config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    environment:
+      SERVICE_NAME: backend-orchestrator
+      ENVIRONMENT: production
+      SIGNOZ_ENDPOINT: signoz-otel-collector:4317
+      SIGNOZ_INSECURE: "true"
+      SIGNOZ_ACCESS_TOKEN: ""
+    network_mode: "service:backend-orchestrator"  # Share network with service
+    depends_on:
+      - backend-orchestrator
+
+  # ---------------------------------------------------------------------------
+  # API GATEWAY
+  # ---------------------------------------------------------------------------
+  api-gateway:
+    build:
+      context: ../api-gateway
+      dockerfile: Dockerfile
+    container_name: api-gateway
+    environment:
+      PORT: "8081"
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+      
+      # Telemetry - Points to sidecar
+      OTEL_EXPORTER_OTLP_ENDPOINT: localhost:4317
+      OTEL_SERVICE_NAME: api-gateway
+      OTEL_SERVICE_VERSION: "1.0.0"
+      OTEL_ENABLED: "true"
+      OTEL_INSECURE: "true"
+    ports:
+      - "8081:8081"
+    networks:
+      - rsync-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      service: api-gateway
+      environment: production
+
+  # Sidecar for api-gateway
+  otel-sidecar-gateway:
+    image: otel/opentelemetry-collector-contrib:0.91.0
+    container_name: otel-sidecar-gateway
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-sidecar-config.yaml:/etc/otel-collector-config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    environment:
+      SERVICE_NAME: api-gateway
+      ENVIRONMENT: production
+      SIGNOZ_ENDPOINT: signoz-otel-collector:4317
+      SIGNOZ_INSECURE: "true"
+      SIGNOZ_ACCESS_TOKEN: ""
+    network_mode: "service:api-gateway"
+    depends_on:
+      - api-gateway
+
+  # ---------------------------------------------------------------------------
+  # LLM SERVICE
+  # ---------------------------------------------------------------------------
+  llm-service:
+    build:
+      context: ../llm-service
+      dockerfile: Dockerfile
+    container_name: llm-service
+    environment:
+      PORT: "5000"
+      ENVIRONMENT: production
+      LOG_FORMAT: json
+      
+      # Telemetry - Points to sidecar
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4317
+      OTEL_SERVICE_NAME: llm-service
+      OTEL_ENABLED: "true"
+    ports:
+      - "5000:5000"
+    networks:
+      - rsync-network
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    labels:
+      service: llm-service
+      environment: production
+
+  # Sidecar for llm-service
+  otel-sidecar-llm:
+    image: otel/opentelemetry-collector-contrib:0.91.0
+    container_name: otel-sidecar-llm
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-sidecar-config.yaml:/etc/otel-collector-config.yaml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    environment:
+      SERVICE_NAME: llm-service
+      ENVIRONMENT: production
+      SIGNOZ_ENDPOINT: signoz-otel-collector:4317
+      SIGNOZ_INSECURE: "true"
+      SIGNOZ_ACCESS_TOKEN: ""
+    network_mode: "service:llm-service"
+    depends_on:
+      - llm-service
+
+  # ---------------------------------------------------------------------------
+  # INFRASTRUCTURE SERVICES
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    environment:
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: pipeline_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - rsync-network
+    ports:
+      - "5432:5432"
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - rsync-network
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.1
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - rsync-network
+
+  redis:
+    image: redis:7
+    container_name: redis
+    networks:
+      - rsync-network
+    ports:
+      - "6379:6379"
+

@@ -1,0 +1,65 @@
+{
+  "id": "minio",
+  "name": "MinIO",
+  "display_name": "MinIO (Internal Staging)",
+  "version": "1.0.0",
+  "description": "Internal S3-compatible object storage used for large-payload staging (claim-check URLs)",
+  "category": "cloud_storage",
+  "internal": true,
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": false,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "auth_type": "basic",
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "endpoint_url": { "type": "string", "description": "S3 endpoint URL (e.g. http://minio:9000)" },
+      "access_key_id": { "type": "string" },
+      "secret_access_key": { "type": "string" },
+      "region": { "type": "string", "default": "us-east-1" },
+      "bucket": { "type": "string", "default": "pipeline-data" },
+      "prefix": { "type": "string", "default": "staging" }
+    },
+    "required": []
+  },
+  "capabilities": {
+    "supported_formats": ["json"],
+    "supported_compressions": ["none"],
+    "supports_cdc": false
+  },
+  "operations": [
+    {
+      "name": "upload_for_staging",
+      "type": "destination",
+      "description": "Upload a JSON payload to MinIO and return a claim_check_url (s3://bucket/key)",
+      "method": "minio_upload_for_staging",
+      "parameters": [
+        { "name": "data", "type": "object", "required": true },
+        { "name": "key", "type": "string", "required": false }
+      ]
+    },
+    {
+      "name": "read_from_staging",
+      "type": "core",
+      "description": "Read a staged JSON payload back using claim_check_url",
+      "method": "minio_read_from_staging",
+      "parameters": [
+        { "name": "claim_check_url", "type": "string", "required": true }
+      ]
+    },
+    {
+      "name": "delete_from_staging",
+      "type": "core",
+      "description": "Delete a staged object using claim_check_url",
+      "method": "minio_delete_from_staging",
+      "parameters": [
+        { "name": "claim_check_url", "type": "string", "required": true }
+      ]
+    }
+  ],
+  "aliases": []
+}
+
+

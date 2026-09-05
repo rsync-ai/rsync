@@ -1,0 +1,148 @@
+# EKS overlay — layer on top of values.yaml, do not use alone:
+#
+#   helm install rsync ./rsync-ai -f rsync-ai/values-eks.yaml -f my-secrets.yaml
+#
+# This file sets only what is genuinely AWS-shaped: storage class, ingress
+# class + annotations, IRSA, and the BYO toggles you should flip on a real
+# account. Everything else stays in values.yaml so there is exactly one place
+# to read a default from.
+
+global:
+  # gp3 is not the default StorageClass on a fresh EKS cluster — gp2 is, and on
+  # clusters built after the in-tree driver was removed there may be no default
+  # at all, in which case every PVC in this chart stays Pending and the pods sit
+  # in ContainerCreating with no error that names storage. Verify first:
+  #   kubectl get sc
+  # If gp3 is absent, either install the EBS CSI driver's gp3 class or set this
+  # to whatever `kubectl get sc` shows as (default).
+  storageClass: gp3
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Managed data services
+# ─────────────────────────────────────────────────────────────────────────────
+# The in-chart Postgres is a single StatefulSet replica with no backups, and it
+# holds every pipeline definition and every encrypted connection credential.
+# On AWS that belongs in RDS. Fill `external.host` and set enabled=false.
+postgresql:
+  enabled: false
+  external:
+    host: ""            # rsync.abc123.eu-west-1.rds.amazonaws.com
+    port: 5432
+    # RDS accepts TLS by default; `require` (not `verify-full`) matches what the
+    # api-gateway builds its DSN with and needs no CA bundle mounted.
+    sslMode: require
+
+redis:
+  enabled: false
+  external:
+    host: ""            # rsync.abc123.0001.euw1.cache.amazonaws.com
+    port: 6379
+
+# MSK. Two numbers matter more than the endpoint:
+#
+#   replicationFactor  — 3 across AZs, the point of a managed cluster.
+#   minInsyncReplicas  — MUST be <= replicationFactor. A topic created with
+#                        min.insync.replicas above its RF is created
+#                        successfully and can NEVER be written to; the platform
+#                        comes up healthy and every pipeline reports
+#                        "dispatched N rows ... no acks were recorded".
+#                        The chart refuses to render if you invert them.
+#
+# MSK IAM auth is not supported *by this chart*, and the reason matters because
+# it decides whether this is a doc fix or a feature. Two earlier versions of this
+# paragraph were both wrong; here is what the code says today.
+#
+# The Go data plane DOES speak AWS_MSK_IAM: shared/go/kafkaclient/config.go:62
+# names the mechanism, :454 validates it, tokenauth/msk.go signs the token off
+# the ambient AWS credential chain (so IRSA supplies it and nothing is stored in
+# a Secret), and saramaauth + kgoauth wire it into the real clients. OAUTHBEARER
+# is likewise supported chart-wide now — the old claim that validate.yaml
+# allowlists only PLAIN/SCRAM is stale.
+#
+# What is missing is the other two thirds of the platform:
+#   * llm-service lists AWS_MSK_IAM as unimplemented — the token would have to
+#     be a SigV4 signature and that module does not sign one
+#     (src/utils/kafka_security.py:123).
+#   * the Kafka Connect image ships no aws-msk-iam-auth jar, so there is no JAAS
+#     login module for the CDC plane to name.
+#   * this chart has no kafka.external.awsRegion knob, so even the Go half would
+#     fail its own region check.
+# The chart therefore rejects the mechanism at render time with all of the above
+# in the error, rather than installing a stack where the batch plane connects
+# and the CDC plane cannot.
+#
+# Use SCRAM-SHA-512 — MSK supports it, backed by Secrets Manager — or leave the
+# cluster on PLAINTEXT inside the VPC.
+kafka:
+  enabled: false
+  replicationFactor: "3"
+  minInsyncReplicas: "2"
+  external:
+    bootstrapServers: ""   # b-1...:9096,b-2...:9096,b-3...:9096  (CSV is preserved)
+    securityProtocol: SASL_SSL
+    saslMechanism: SCRAM-SHA-512
+    # REQUIRED whenever saslMechanism is set: the username is a plain value and
+    # the chart refuses to render without it. An empty username with a mechanism
+    # set is how a client ends up connecting anonymously to a cluster that was
+    # supposed to authenticate it.
+    saslUsername: ""   # <-- fill this in
+    # Prefer secrets.existingSecret with key KAFKA_SASL_PASSWORD over putting
+    # this in a values file — `helm get values` reads plaintext values back.
+    saslPassword: ""
+
+# S3 instead of the in-chart MinIO. Leave accessKeyId/secretAccessKey EMPTY and
+# use IRSA (below): the chart then sets no static credentials at all and the AWS
+# SDK picks the role up from the projected service-account token.
+objectStorage:
+  mode: s3
+  external:
+    endpointUrl: ""     # https://s3.eu-west-1.amazonaws.com
+    region: ""          # eu-west-1
+    accessKeyId: ""
+    secretAccessKey: ""
+
+serviceAccount:
+  create: true
+  annotations: {}
+    # eks.amazonaws.com/role-arn: arn:aws:iam::123456789012:role/rsync-ai
+    #
+    # The role needs s3:GetObject/PutObject/DeleteObject/ListBucket on the
+    # staging bucket and its `objectStorage.prefix`. Note this is the SAME
+    # service account every pod in the release uses — the connectors get it too,
+    # which is the point (they are the S3 callers) but also means the role's
+    # blast radius is the whole release, not one workload.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Ingress — AWS Load Balancer Controller
+# ─────────────────────────────────────────────────────────────────────────────
+# Two hostnames, one ALB. `group.name` is what merges them; without it each
+# Ingress rule provisions its own ALB and you pay for two.
+#
+# The API host must be externally routable and not just an internal name: the
+# browser calls it directly, so an in-cluster Service name will not do.
+ingress:
+  enabled: false
+  className: alb
+  annotations:
+    alb.ingress.kubernetes.io/scheme: internet-facing
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/group.name: rsync-ai
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/ssl-redirect: "443"
+    # alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:eu-west-1:...:certificate/...
+    #
+    # WebSockets: the pipeline progress stream is a long-lived upgrade. ALB
+    # supports it with no annotation, but the default 60s idle timeout will cut
+    # a quiet connection — raise it or the UI silently stops updating mid-run.
+    alb.ingress.kubernetes.io/load-balancer-attributes: idle_timeout.timeout_seconds=300
+  hosts:
+    app: ""   # app.example.com
+    api: ""   # api.example.com
+  tls: []
+
+# The AWS VPC CNI enforces NetworkPolicy only when the add-on is configured with
+# `enableNetworkPolicy=true`. Without it these objects apply cleanly, show up in
+# `kubectl get networkpolicy`, and enforce NOTHING — which reads as isolation
+# that is not there. Verify before relying on it.
+networkPolicy:
+  enabled: false

@@ -1,0 +1,15 @@
+# Requirements for the Oracle MCP connector
+#
+# Base dependencies (always required).
+# Note: base_connector.py is provided from the shared build context.
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Oracle driver: python-oracledb in THIN mode (pure Python, no Oracle Instant
+# Client / native libs). oracledb uses ':N' numbered bind placeholders, which
+# the connector's Oracle code path targets. cx_Oracle is intentionally NOT used
+# (it requires the Instant Client and is disallowed by the dependency policy).
+oracledb>=2.0.0

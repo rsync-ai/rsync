@@ -1,0 +1,498 @@
+name: Security
+
+# Standing security gate. Turns the one-time free-tool audit
+# (scripts/security-audit.sh) into CI. Runs on GitHub-hosted ubuntu-latest.
+#
+# This file has changed runner pools twice, and both times the reason was a
+# quota, not a platform. It ran on ubuntu-latest; it moved to the self-hosted
+# macOS/ARM64 Macs because a PRIVATE repo gets only 2,000 hosted-Actions
+# minutes a month, and once they are gone every hosted job queues ~15 min and
+# is auto-cancelled without ever being assigned a runner -- so the gate did not
+# run at all. It moved back to ubuntu-latest with the flip-day fork-safety
+# split, which is only sound on a tree that is about to be PUBLIC: public repos
+# get unlimited standard runners, so the quota that forced the first move no
+# longer applies.
+#
+# Do NOT move these jobs back to `[self-hosted, macOS, ARM64]`. A `pull_request`
+# run executes the workflow file FROM THE PR HEAD, so any fork-reachable
+# self-hosted job hands an arbitrary contributor code execution on the Macs that
+# hold the deploy key -- and the in-tree `if:` guard is deleted by the same diff
+# that needs it. `scripts/flip/assert-ci-split.py` fails the tree if one returns.
+#
+# Scanner notes that survive the move: setup-go keeps cache:false (ci.yml
+# convention), Trivy installs to $RUNNER_TEMP rather than needing sudo for
+# /usr/local/bin, and gitleaks runs from its multi-arch Docker image.
+#
+# Gate policy:
+#   * BLOCKING  -> gitleaks (no new secrets) + govulncheck (no new REACHABLE
+#                  Go vuln). Both are currently GREEN, so they only fail on a
+#                  NEW problem — a real merge gate with ~zero false positives.
+#   * REPORTING -> gosec / Semgrep / Trivy upload SARIF to the code-scanning
+#                  ("Security") tab and never block (there is a pre-existing
+#                  backlog of SAST smells; blocking on them would wedge every
+#                  PR). Triage them from the Security tab over time.
+#   * LICENSE   -> trivy-license classifies EVERY dependency's REAL license
+#                  (the scanner behind licenses.yml's fast name-grep denylist).
+#                  Lands non-blocking to calibrate noise against /.trivyignore;
+#                  flip to blocking by deleting its `continue-on-error: true`.
+# Flip a REPORTING job to blocking by removing its `continue-on-error: true`.
+#
+# 2026-08-24: the REPORTING tier had been delivering its findings NOWHERE, and
+# said so in a way nothing was reading. `actions: read` was missing from the
+# permissions block below, so every `Upload SARIF to code-scanning` step failed
+# with "Resource not accessible by integration" -- masked to conclusion=success
+# by its own `continue-on-error: true`, which is also why the REST jobs API
+# reports that step as green. The artifact below was therefore not a fallback at
+# all but the ONLY copy of the findings, and it had been silently piling up
+# 4,630 unexpired SARIF artifacts against an unbounded 90-day default until the
+# account artifact quota ran out -- at which point the sole remaining copy
+# stopped being written too, and six jobs went red with the scan itself clean.
+# Fixed by granting `actions: read` and bounding retention, NOT by muting the
+# archive step: while code-scanning is unreachable a failed archive means the
+# findings reached nobody, which is exactly when this must stay loud.
+#
+# That fix moved the failure one step along and, in doing so, answered what the
+# permission error had been hiding. upload-sarif now validates, fingerprints and
+# reaches "Uploading results" before failing on:
+#
+#     Advanced Security must be enabled for this repository to use code scanning.
+#
+# So GHAS is OFF for this private repo, and until somebody turns it on (an
+# org/billing action, not a code change) the "Security" tab CANNOT receive these
+# findings and the REPORTING triage path described above does not exist.
+#
+# 2026-08-29: two sentences that stood here were DELETED, because the steps below
+# had already outgrown them -- the same stale-prose defect the sink report exists
+# to end, one paragraph up from it. They are described, not reproduced: a retired
+# claim quoted verbatim in a live file greps as current guidance, which is the way
+# this class of defect survives being fixed.
+#
+#   * One said the artifact was the WHOLE delivery mechanism, and that this was
+#     why its retention had been bounded. False since #868 added
+#     `scripts/summarize-sarif.sh`. That is a HUMAN destination though, not a
+#     third sink: a rule-level TALLY (level / ruleId / count, capped at 40 rules)
+#     with no file, no line and no message. Nothing can be triaged from it, so
+#     "both sinks refused" still means the ACTIONABLE detail is discarded --
+#     which is why the artifact keeps its 14-day retention while it is the only
+#     machine-readable copy this repo has.
+#
+#   * The other told a reader who found the six reporting jobs red to suspect the
+#     artifact quota and to open the code-scanning upload step's RAW log by hand.
+#     DO NOT DO THAT; it is not the procedure any more. Also false since #868:
+#     `Archive SARIF` is `continue-on-error`, so a hit quota no longer reddens
+#     anything -- and no hand-read of a log is needed. `Report which SARIF sinks
+#     accepted the findings` states the delivery in the job summary and annotates
+#     it: `::warning` when one machine-readable sink refused, `::error` when both
+#     did. It reads each upload step's `outcome`, the field `continue-on-error`
+#     does NOT rewrite -- that step's `conclusion` is still rewritten to success
+#     and will still lie to you -- and it produces its delivery verdict without
+#     ever failing the job, because a red `gosec (api-gateway)` reads as "gosec
+#     found something", which gosec running `-no-fail` cannot produce. (It does
+#     not claim to exit 0 unconditionally: a wiring error -- calling it without
+#     the SARIF path -- still fails, on purpose.)
+#
+# The three post-scan steps in each reporting job are `if: ${{ !cancelled() }}`,
+# deliberately NOT `always()`. `cancel-in-progress: true` below means a second
+# push to a PR branch cancels the run in flight, and `always()` RUNS on
+# cancellation -- so `always()` would make every superseded run stamp four gosec
+# jobs + semgrep + trivy with a red security annotation blaming GHAS and billing
+# for a cancellation, and would run `summarize-sarif.sh` against a SARIF the
+# cancelled scanner never wrote (exit 2: "the scanner produced no SARIF").
+# `!cancelled()` is GitHub's documented spelling for "everything except that".
+
+on:
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'LICENSE*'
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 8 * * 1'   # Mondays 08:00 UTC — weekly full-tree sweep
+  workflow_dispatch:
+
+concurrency:
+  group: security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write   # required to upload SARIF to code-scanning
+  # ALSO required, and only on a PRIVATE repo: codeql-action/upload-sarif reads the
+  # workflow run itself (GET /repos/{o}/{r}/actions/runs/{id}) before uploading.
+  # Without it every SARIF upload died on "Resource not accessible by integration"
+  # -- and died SILENTLY, because that step is continue-on-error, so the step
+  # reported conclusion=success while its real outcome was failure.
+  actions: read
+  pull-requests: read
+
+jobs:
+  # ============ BLOCKING ============
+  secrets:
+    name: gitleaks (secrets)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: gitleaks (working-tree scan; free binary, no org license)
+        # The gitleaks ACTION requires a paid license for organization repos;
+        # the binary does not — run it via the official image. Scan the working
+        # tree (`dir`), NOT full git history, so the known history-only leaks
+        # (already rotated; see security-audit-results/REPORT.md) don't wedge
+        # the gate. Still fails on any NEW secret added to the tree.
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/repo" \
+            ghcr.io/gitleaks/gitleaks:latest dir /repo \
+            --config /repo/.gitleaks.toml --no-banner --redact --exit-code 1
+      - name: Allowlists are as narrow as they claim
+        # The scan above is only as honest as its allowlists, and gitleaks accepts an
+        # unknown allowlist key in total silence: `rules = [...]` (the real field is
+        # `targetRules`) reads as scoping and is a blanket exemption. That shipped —
+        # one '''.*_test\.go$''' entry exempted all 377 Go test files from every rule.
+        # Nothing about that is visible in a scan's output, so this asserts the
+        # property by mutation instead: plant a private key in each exempt file and
+        # require it to still be reported, with a control so a dead probe cannot pass.
+        run: ./scripts/check-gitleaks-allowlist.sh
+
+  govulncheck:
+    name: govulncheck (${{ matrix.module }})
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - api-gateway
+          - backend-orchestrator
+          - backend-temporal-adapter
+          # SEC-H-02 trusted socket-holder (holds docker.sock) — a NEW reachable
+          # Go vuln here must block, same as the three big service modules.
+          - connector-deployer
+          # The CDC sink worker. It was absent from this matrix until #830 and
+          # so had never been scanned once: the first run found 27 reachable
+          # vulns, most of them stdlib ones the other modules never had, because
+          # its go.mod carried no `toolchain` directive and setup-go therefore
+          # analyzed it against whatever stdlib the runner happened to have. It
+          # holds DB credentials and consumes attacker-influenced Kafka payloads,
+          # so it belongs here exactly as much as the services do.
+          - shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
+          # The shared PostgreSQL driver shim. Its own graph is much smaller than
+          # the services that import it, and MVS hides that: a vulnerable version
+          # here is invisible from every service module whose graph happens to
+          # pull a newer one. #830 found exactly that — a reachable x/text
+          # infinite-loop on the SCRAM password-normalization path that all four
+          # service modules reported clean.
+          - shared/go/pgdriver
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache: false   # self-hosted: setup-go auto-cache uploads ~3GB for hours and fails the job (ci.yml convention)
+      # Reachability-based: only fails when the vulnerable symbol is actually
+      # called. setup-go honors the go.mod `toolchain` directive (go1.25.13),
+      # so this analyzes against the PATCHED stdlib — matching the Docker base.
+      # A NEW stdlib CVE surfaces here until the toolchain pin is bumped.
+      # A module MAY carry a `.govulncheck-allow.txt` listing GO-XXXX-XXXX IDs it
+      # consciously accepts (with justification in that file). The gate still fails
+      # on ANY reachable vuln NOT listed there, so new/other/fixable vulns block.
+      # Modules without the file (the three big services) block on everything.
+      - name: govulncheck
+        working-directory: ${{ matrix.module }}
+        run: |
+          set -o pipefail
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./... | tee govulncheck.out || true
+          reachable=$(grep -oE 'GO-[0-9]{4}-[0-9]+' govulncheck.out | sort -u || true)
+          allow=""
+          if [ -f .govulncheck-allow.txt ]; then
+            allow=$(grep -oE 'GO-[0-9]{4}-[0-9]+' .govulncheck-allow.txt | sort -u || true)
+          fi
+          unexpected=$(comm -23 <(printf '%s\n' "$reachable" | grep -v '^$') <(printf '%s\n' "$allow" | grep -v '^$') || true)
+          if [ -n "$unexpected" ]; then
+            echo "::error::govulncheck found reachable vulnerabilities not in .govulncheck-allow.txt:"
+            printf '%s\n' "$unexpected"
+            exit 1
+          fi
+          echo "govulncheck OK — no unaccepted reachable vulnerabilities"
+
+  # ============ REPORTING (SARIF -> Security tab, never blocks) ============
+  gosec:
+    name: gosec (${{ matrix.module }})
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        module:
+          - api-gateway
+          - backend-orchestrator
+          - backend-temporal-adapter
+          # SEC-H-02 trusted socket-holder — SAST-scan the code that speaks the
+          # Docker API on behalf of untrusted callers.
+          - connector-deployer
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: ${{ matrix.module }}/go.mod
+          cache: false   # self-hosted: setup-go auto-cache uploads ~3GB for hours and fails the job (ci.yml convention)
+      - name: gosec
+        working-directory: ${{ matrix.module }}
+        # -no-fail: emit SARIF without a non-zero exit (reporting, not gating).
+        run: go run github.com/securego/gosec/v2/cmd/gosec@latest -no-fail -fmt sarif -out "${GITHUB_WORKSPACE}/gosec-${{ matrix.module }}.sarif" ./...
+      - name: Upload SARIF to code-scanning
+        id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
+        continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        with:
+          sarif_file: gosec-${{ matrix.module }}.sarif
+          category: gosec-${{ matrix.module }}
+      - name: Summarize SARIF into the job summary
+        # Always reachable -- no GHAS, no artifact quota -- but a rule-level TALLY
+        # only (level / ruleId / count, capped at 40 rules): no file, no line, no
+        # message, so it is a human readout and NOT a third machine-readable sink.
+        # See scripts/summarize-sarif.sh for why both of the real two were dead at
+        # the same time.
+        if: ${{ !cancelled() }}   # NOT always(): see the header -- always() runs on cancellation, and this script exits 2 on the SARIF a cancelled scanner never wrote
+        run: ./scripts/summarize-sarif.sh "gosec-${{ matrix.module }}.sarif" "gosec (${{ matrix.module }})"
+      - name: Archive SARIF (convenience copy; the job summary carries only a tally)
+        id: archive
+        if: ${{ !cancelled() }}   # NOT always(): see the header. Deliberately NOT gated on the upload above -- see retention-days
+        # A hit artifact quota must not turn a REPORTING job red. It did, on every
+        # run including main, from 2026-08-24 -- and a red `gosec (api-gateway)`
+        # reads as "gosec found something", which it cannot: gosec runs -no-fail.
+        # A rule-level TALLY of the findings is already in the job summary by the
+        # step above, which needs neither GHAS nor artifact storage, so this upload
+        # is allowed to degrade -- but the tally is not a substitute for it: no
+        # file, no line, no message. While code scanning is unreachable THIS is the
+        # only machine-readable copy, which is why the failure is now announced
+        # (next step) instead of the step being muted or gated. The job still goes
+        # red if the SCANNER fails, because summarize-sarif.sh exits 2 on a missing
+        # or unparseable SARIF.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: gosec-${{ matrix.module }}-sarif
+          path: gosec-${{ matrix.module }}.sarif
+          if-no-files-found: ignore
+          # Bounded on purpose. With no retention-days these inherit the 90-day repo
+          # default; six reporting jobs x every push/PR/nightly had accumulated 4,630
+          # SARIF artifacts (~189 MB, ~40% of live artifact storage) by 2026-08-24,
+          # which is how the account hit its artifact quota -- and a hit quota fails
+          # THIS step, the only place these findings land while code-scanning is down.
+          # Why 14 rather than less, TODAY: while code scanning is unreachable this
+          # artifact is the whole machine-readable record of a scan, and the window
+          # to re-triage one by hand is the window it exists for. Cutting it on the
+          # argument that "code scanning holds the durable copy" spends a real
+          # window today for a sink that is off today. Revisit when GHAS is on.
+          #
+          # That is a JUDGEMENT recorded here, not a rule enforced anywhere. The
+          # guard in test_sarif_findings_have_a_destination.py asserts only that
+          # retention is SET (>= 1); it deliberately asserts no minimum, because the
+          # likeliest correct change to this number is downward -- cutting retention
+          # is the obvious relief if the artifact quota is exhausted again, and a
+          # CI floor would have failed that fix until somebody edited the guard.
+          retention-days: 14
+      - name: Report which SARIF sinks accepted the findings
+        # Both uploads above are `continue-on-error`, which rewrites their API
+        # `conclusion` to success and leaves `outcome` at the truth. So "reached
+        # NEITHER machine-readable sink" and "reached both" looked identical from
+        # anywhere but a raw log -- the condition KI-SECURITY-SARIF-HAS-NOWHERE-TO-
+        # LAND describes, invisible inside the run that produced it. This states it:
+        # `::error` when both refused, `::warning` when one did, quiet otherwise.
+        # It never fails the job (see the script's header for why green is the
+        # deliberate choice), and it takes the SARIF PATH as well as the outcomes
+        # because `if-no-files-found: ignore` makes a zero-file upload succeed --
+        # a `success` alone would certify a copy containing nothing.
+        if: ${{ !cancelled() }}   # NOT always(): a cancelled run must not be annotated as a security failure
+        env:
+          # `.outcome`, never `.conclusion` -- see above.
+          CODE_SCANNING_OUTCOME: ${{ steps.code_scanning.outcome }}
+          ARCHIVE_OUTCOME: ${{ steps.archive.outcome }}
+        run: ./scripts/report-sarif-sinks.sh "gosec (${{ matrix.module }})" "gosec-${{ matrix.module }}.sarif"
+
+  semgrep:
+    name: Semgrep SAST
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The venv stays under RUNNER_TEMP — outside the workspace, so Semgrep does
+      # not scan its own dependencies. This job used to hard-code the brew
+      # interpreter because setup-python cannot write the hosted tool cache on
+      # the self-hosted Macs; the flip-day split moved it to ubuntu-latest,
+      # where the action works as designed.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: '3.11'
+      - name: Set up Semgrep venv
+        run: |
+          PY=python3
+          "$PY" -m venv "$RUNNER_TEMP/semgrep-venv"
+          "$RUNNER_TEMP/semgrep-venv/bin/python" -m pip install --upgrade pip
+          "$RUNNER_TEMP/semgrep-venv/bin/pip" install semgrep
+          echo "$RUNNER_TEMP/semgrep-venv/bin" >> "$GITHUB_PATH"
+      - name: Run Semgrep
+        # Explicit rule packs — NOT `--config auto`, which refuses to run with
+        # --metrics=off. --metrics=off: nothing leaves the runner (privacy).
+        run: |
+          semgrep --config p/default --config p/secrets --metrics=off \
+            --sarif --output semgrep.sarif . || true
+      - name: Upload SARIF to code-scanning
+        id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
+        continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+      - name: Summarize SARIF into the job summary
+        if: ${{ !cancelled() }}   # NOT always(): see gosec's step of the same name
+        run: ./scripts/summarize-sarif.sh semgrep.sarif "Semgrep SAST"
+      - name: Archive SARIF (convenience copy; the job summary carries only a tally)
+        id: archive
+        if: ${{ !cancelled() }}   # NOT always(): see the header. Deliberately NOT gated on the upload above -- see retention-days
+        # A hit artifact quota must not turn a REPORTING job red. It did, on every
+        # run including main, from 2026-08-24 -- and a red `gosec (api-gateway)`
+        # reads as "gosec found something", which it cannot: gosec runs -no-fail.
+        # A rule-level TALLY of the findings is already in the job summary by the
+        # step above, which needs neither GHAS nor artifact storage, so this upload
+        # is allowed to degrade -- but the tally is not a substitute for it: no
+        # file, no line, no message. While code scanning is unreachable THIS is the
+        # only machine-readable copy, which is why the failure is now announced
+        # (next step) instead of the step being muted or gated. The job still goes
+        # red if the SCANNER fails, because summarize-sarif.sh exits 2 on a missing
+        # or unparseable SARIF.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: semgrep-sarif
+          path: semgrep.sarif
+          if-no-files-found: ignore
+          retention-days: 14   # see gosec's Archive SARIF; semgrep-sarif alone was 162 MB
+      - name: Report which SARIF sinks accepted the findings
+        if: ${{ !cancelled() }}   # see gosec's step of the same name
+        env:
+          CODE_SCANNING_OUTCOME: ${{ steps.code_scanning.outcome }}
+          ARCHIVE_OUTCOME: ${{ steps.archive.outcome }}
+        run: ./scripts/report-sarif-sinks.sh "Semgrep SAST" semgrep.sarif
+
+  trivy:
+    name: Trivy (deps + IaC + secrets)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Trivy
+        # Official script auto-detects the runner's OS/arch. Install to
+        # RUNNER_TEMP: writing /usr/local/bin needs sudo.
+        run: |
+          # Supply-chain hardening: pin the Trivy installer to a tagged release and
+          # verify its sha256 before executing — never `curl | sh` from a mutable
+          # branch. Also pin the installed binary to the same version.
+          TRIVY_VERSION=v0.72.0
+          TRIVY_INSTALL_SHA256=e00df553be558995b994758bc8995956554a16937f456dc6615b0cc411bfec7a
+          curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" -o "$RUNNER_TEMP/trivy-install.sh"
+          echo "${TRIVY_INSTALL_SHA256}  $RUNNER_TEMP/trivy-install.sh" | shasum -a 256 -c -
+          sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin" "${TRIVY_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Trivy filesystem scan
+        # skip *.j2 — Jinja templates aren't valid Dockerfiles and only produce
+        # parser noise in the misconfig scanner.
+        run: trivy fs --scanners vuln,misconfig,secret --skip-files "**/*.j2" --format sarif --output trivy.sarif --severity HIGH,CRITICAL --exit-code 0 .
+      - name: Upload SARIF to code-scanning
+        id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
+        continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+      - name: Summarize SARIF into the job summary
+        if: ${{ !cancelled() }}   # NOT always(): see gosec's step of the same name
+        run: ./scripts/summarize-sarif.sh trivy.sarif "Trivy (deps + IaC + secrets)"
+      - name: Archive SARIF (convenience copy; the job summary carries only a tally)
+        id: archive
+        if: ${{ !cancelled() }}   # NOT always(): see the header. Deliberately NOT gated on the upload above -- see retention-days
+        # A hit artifact quota must not turn a REPORTING job red. It did, on every
+        # run including main, from 2026-08-24 -- and a red `gosec (api-gateway)`
+        # reads as "gosec found something", which it cannot: gosec runs -no-fail.
+        # A rule-level TALLY of the findings is already in the job summary by the
+        # step above, which needs neither GHAS nor artifact storage, so this upload
+        # is allowed to degrade -- but the tally is not a substitute for it: no
+        # file, no line, no message. While code scanning is unreachable THIS is the
+        # only machine-readable copy, which is why the failure is now announced
+        # (next step) instead of the step being muted or gated. The job still goes
+        # red if the SCANNER fails, because summarize-sarif.sh exits 2 on a missing
+        # or unparseable SARIF.
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: trivy-sarif
+          path: trivy.sarif
+          if-no-files-found: ignore
+          retention-days: 14   # see gosec's Archive SARIF
+      - name: Report which SARIF sinks accepted the findings
+        if: ${{ !cancelled() }}   # see gosec's step of the same name
+        env:
+          CODE_SCANNING_OUTCOME: ${{ steps.code_scanning.outcome }}
+          ARCHIVE_OUTCOME: ${{ steps.archive.outcome }}
+        run: ./scripts/report-sarif-sinks.sh "Trivy (deps + IaC + secrets)" trivy.sarif
+
+  trivy-license:
+    name: Trivy (license scan)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    # This is the REAL license scanner backing the fast name-grep denylist in
+    # .github/workflows/licenses.yml. That grep only fails on copyleft it knows
+    # by NAME (mysql-connector-python, pymssql, ...) or by an SPDX id literally
+    # printed in a manifest — a new GPL/AGPL package under an unlisted name
+    # (e.g. PyQt5, python-Levenshtein) sails through GREEN. Trivy instead reads
+    # EACH dependency's actual license from its metadata and classifies it by
+    # category, so those slip-throughs are caught.
+    #
+    # BLOCKING (calibrated 2026-07-11). Noise triaged: the only HIGH findings were
+    # sharp/libvips (weak-copyleft, documented in THIRD_PARTY_NOTICES.md). The frontend
+    # npm lockfile is scoped out of the scan step below — Trivy 0.72 cannot suppress a
+    # 3+-component SPDX AND compound (@img/sharp-wasm32) even with the exact string in
+    # .trivyignore — and its npm licenses stay covered by licenses.yml's package.json
+    # grep + the release-time license-checker. The gate STILL scans the Go modules, so a
+    # new GPL/AGPL/SSPL transitive Go dep fails it. A real HIGH finding now blocks merge:
+    # swap the dependency for a permissive/weak-copyleft one, do NOT allowlist copyleft.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Trivy
+        # Same install as the vuln/IaC/secret `trivy` job: the official script
+        # auto-detects the runner's OS/arch; install to RUNNER_TEMP because
+        # writing /usr/local/bin needs sudo.
+        run: |
+          # Supply-chain hardening: pin the Trivy installer to a tagged release and
+          # verify its sha256 before executing — never `curl | sh` from a mutable
+          # branch. Also pin the installed binary to the same version.
+          TRIVY_VERSION=v0.72.0
+          TRIVY_INSTALL_SHA256=e00df553be558995b994758bc8995956554a16937f456dc6615b0cc411bfec7a
+          curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" -o "$RUNNER_TEMP/trivy-install.sh"
+          echo "${TRIVY_INSTALL_SHA256}  $RUNNER_TEMP/trivy-install.sh" | shasum -a 256 -c -
+          sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin" "${TRIVY_VERSION}"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Trivy license scan (copyleft gate)
+        # --scanners license: classify every dependency's license by category.
+        #   RESTRICTED (GPL/AGPL/SSPL family) => HIGH/CRITICAL severity.
+        # --severity HIGH,CRITICAL: only the strong-copyleft classes gate;
+        #   permissive/notice licenses (MIT/Apache/BSD) are LOW and ignored.
+        # --exit-code 1: FAIL on any HIGH/CRITICAL license finding.
+        # Reviewed weak-copyleft that ELv2 permits (MPL-2.0, LGPL-3.0 — see
+        #   THIRD_PARTY_NOTICES.md) is allowlisted in /.trivyignore, which Trivy
+        #   reads automatically from the scan root.
+        # --skip-files "**/*.j2": mirror the vuln job — Jinja templates aren't
+        #   real manifests and only add parser noise.
+        # --skip-files "frontend/package-lock.json": Trivy 0.72 bug — it cannot suppress a
+        #   3+-component SPDX AND compound (@img/sharp-wasm32 = "Apache-2.0 AND
+        #   LGPL-3.0-or-later AND MIT") via .trivyignore even with the byte-exact string.
+        #   sharp/libvips is weak-copyleft (documented); frontend npm licenses are covered
+        #   by licenses.yml's package.json grep + the release-time license-checker. Scoping
+        #   the lockfile out keeps this gate GREEN + BLOCKING; the Go modules are still
+        #   scanned (195 license findings), so a new GPL Go dep still fails it.
+        run: trivy fs --scanners license --severity HIGH,CRITICAL --skip-files "**/*.j2" --skip-files "frontend/package-lock.json" --exit-code 1 .

@@ -1,0 +1,44 @@
+{
+  "name": "snowflake",
+  "display_name": "Snowflake",
+  "aliases": ["snowflake", "snowflake-warehouse"],
+  "version": "1.0.0",
+  "description": "Snowflake batch source + destination (cloud data warehouse, DB-API).",
+  "category": "data_warehouse",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": false,
+  "base_url": "http://localhost:9999",
+  "default_port": 443,
+  "connection_timeout": 30,
+  "auth": {
+    "type": "basic",
+    "username_env": "SNOWFLAKE_USER",
+    "password_env": "SNOWFLAKE_PASSWORD"
+  },
+  "config_fields": [
+    {"name": "account", "type": "string", "required": true, "secret": false, "description": "Snowflake account identifier", "env_var": "SNOWFLAKE_ACCOUNT", "ui_placeholder": "xy12345.us-east-1"},
+    {"name": "user", "type": "string", "required": true, "secret": false, "description": "Snowflake user", "env_var": "SNOWFLAKE_USER"},
+    {"name": "password", "type": "string", "required": false, "secret": true, "sensitive": true, "description": "User password (omit when using key-pair auth)", "env_var": "SNOWFLAKE_PASSWORD"},
+    {"name": "private_key_file", "type": "string", "required": false, "secret": false, "description": "Path to a PEM private key file for key-pair auth", "env_var": "SNOWFLAKE_PRIVATE_KEY_FILE"},
+    {"name": "private_key_file_pwd", "type": "string", "required": false, "secret": true, "sensitive": true, "description": "Passphrase for an encrypted private key file", "env_var": "SNOWFLAKE_PRIVATE_KEY_FILE_PWD"},
+    {"name": "warehouse", "type": "string", "required": false, "secret": false, "description": "Virtual warehouse", "env_var": "SNOWFLAKE_WAREHOUSE"},
+    {"name": "database", "type": "string", "required": true, "secret": false, "description": "Database name", "env_var": "SNOWFLAKE_DATABASE"},
+    {"name": "schema", "type": "string", "required": false, "secret": false, "default": "PUBLIC", "description": "Default schema for unqualified tables", "env_var": "SNOWFLAKE_SCHEMA"},
+    {"name": "role", "type": "string", "required": false, "secret": false, "description": "Role to assume for the session", "env_var": "SNOWFLAKE_ROLE"}
+  ],
+  "resources": [
+    {
+      "name": "health",
+      "endpoint": "/health",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": ["get"]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

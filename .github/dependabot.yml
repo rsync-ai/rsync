@@ -1,0 +1,346 @@
+# Dependabot — standing dependency-update + vulnerability-alert automation.
+# Complements .github/workflows/security.yml (which SCANS); Dependabot PROPOSES
+# the fix PRs. Grouped + scheduled weekly to keep PR volume manageable.
+#
+# Deliberate `ignore` rules below encode two coupling constraints this repo
+# guards by hand — auto-bumping either set breaks a runtime invariant:
+#   * next/react majors      -> reviewed step; postcss override already covers
+#                               the current advisory (see frontend/package.json).
+#   * opentelemetry + fastapi -> version-locked together (llm-service
+#                               telemetry.py _install_otel_route_guard); the
+#                               protobuf remediation rides on a *tested* otel
+#                               bump, not a piecemeal Dependabot PR.
+version: 2
+updates:
+  # ---- Go modules: 3 services + 4 shared libs + kafka-mcp-sink worker ----
+  - package-ecosystem: "gomod"
+    directories:
+      - "/api-gateway"
+      - "/backend-orchestrator"
+      - "/backend-temporal-adapter"
+      - "/shared/go/correlation"
+      - "/shared/go/crypto"
+      - "/shared/go/naming"
+      - "/shared/go/transforms"
+      - "/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      go-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    commit-message:
+      prefix: "chore(deps)"
+    labels: ["dependencies", "go"]
+
+  # ---- Frontend (npm) ----
+  - package-ecosystem: "npm"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      npm-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      - dependency-name: "next"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "react-dom"
+        update-types: ["version-update:semver-major"]
+      # eslint 10 cannot be installed: three of the plugins eslint-config-next
+      # pulls in cap their peer at 9 -- eslint-plugin-react 7.37.5 (^9.7),
+      # eslint-plugin-jsx-a11y 6.10.2 (^9), eslint-plugin-import 2.32.0 (^9).
+      # Verified in frontend/package-lock.json, not inferred.
+      #
+      # eslint-config-next 16.3.3 itself peers `eslint: >=9.0.0`, which reads
+      # like support for 10 and is why this keeps getting proposed. An
+      # open-ended peer on an umbrella config is not a statement of support --
+      # it is the umbrella declining to state a ceiling, and the real ceiling
+      # lives one level down in what it bundles. Check the plugins, not the
+      # config. (@typescript-eslint/* 8.63.0 and eslint-plugin-react-hooks 7.1.1
+      # already allow ^10; they are not the constraint.)
+      #
+      # Majors are not covered by the npm-minor-patch group above, so each one
+      # arrives as its own PR -- #901 was that, and it is a weekly recurrence
+      # until this entry exists. Drop it when those three plugins ship ^10
+      # peers, which in practice means when Next ships a config that requires
+      # them to.
+      - dependency-name: "eslint"
+        update-types: ["version-update:semver-major"]
+    commit-message:
+      prefix: "chore(deps)"
+    labels: ["dependencies", "frontend"]
+
+  # ---- LLM service (pip) ----
+  - package-ecosystem: "pip"
+    directory: "/llm-service"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # No `update-types` filter here, unlike the gomod and npm groups above.
+      # This is the only ecosystem whose manifest states requirements as
+      # unbounded ranges (`pkg>=X.Y.Z`), and with that style the filter never
+      # matched: the 2026-08-19 and 2026-08-26 runs opened eight individual PRs
+      # (#843 #845 #874 #875 #876 #877 #878 #879), all editing
+      # llm-service/requirements.txt and so all mutually conflicting — one merge
+      # invalidated the other seven. Patch-level bumps landed alone too
+      # (langgraph >=1.2.10 -> >=1.2.11), so this was not majors falling out of
+      # the filter, and every branch name lacked the group slug that the gomod,
+      # npm and actions branches carry. Dropping the filter is what makes the
+      # group apply; the `ignore` list below, not `update-types`, is what keeps
+      # the hand-locked packages out. Grouping majors as well costs nothing
+      # here: a `>=` floor does not decide what pip installs, so a major
+      # upgrade already reaches a fresh image without any PR at all.
+      pip-all:
+        patterns: ["*"]
+    ignore:
+      # otel + fastapi are a hand-tuned locked set (see header note).
+      - dependency-name: "opentelemetry-*"
+      - dependency-name: "fastapi"
+      - dependency-name: "starlette"
+      # cryptography is capped by presidio-anonymizer, not by us: 2.2.364 -- the
+      # newest release -- declares a floor of 48.0.1 and a ceiling below 49, so
+      # anything from 49 up is ResolutionImpossible. Re-verified against the
+      # wheel metadata, not inferred: `Requires-Dist: cryptography (>=48.0.1,
+      # <49.0.0)`, and a resolve of presidio 2.2.364 against 49 fails with
+      # "presidio-anonymizer 2.2.364 depends on cryptography<49.0.0". #898 hit
+      # that in both the test venv and the OSS image build. requirements.txt
+      # states the matching ceiling; drop both when presidio widens.
+      #
+      # Bounded by `versions`, NOT by `update-types`, and that is the whole point
+      # of this entry. #898 scoped it `update-types:
+      # ["version-update:semver-major"]` on the reasonable theory that a
+      # major-only ignore still lets the 48.x patch stream through -- the channel
+      # that carries the GHSA-537c-gmf6-5ccf class of fix, and the reason the
+      # floor exists at all. That scoping is INERT here, and it stayed inert for
+      # a month without anyone noticing, because nothing fails when an ignore
+      # rule quietly matches nothing. #922 proposed the 49 major straight onto
+      # the pin while the rule was in force, and its commit trailer says why: it
+      # carries `dependency-name` and `dependency-type` and NO `update-type` line
+      # at all. Editing a requirement RANGE in a requirements file is not
+      # classified as a semver upgrade of a resolved version, so no update-type
+      # is emitted -- and an ignore scoped by update-types cannot match an update
+      # that has none. A `versions` bound needs no classification to match, and
+      # it states the real constraint (presidio's ceiling) rather than a proxy
+      # for it, while still letting every 48.x proposal through.
+      #
+      # Retracted, because #922 is the counterexample: this entry used to claim
+      # the rule "holds the PIN but not the PROSE". It does not hold the pin --
+      # #922 rewrote the pin in requirements.txt directly. What actually happened
+      # is narrower. #916, under the same inert rule, rewrote only the COMMENT
+      # beside the pin, which at the time spelled these bounds in PEP 508 syntax,
+      # inverting it to say presidio *requires* 49. The likely mechanism -- an
+      # inference, not something this repo can prove without triggering another
+      # run -- is that the requirement-shaped string in the comment absorbed the
+      # edit, and removing it in #921 left the real pin as the only match. Under
+      # that reading, tidying the comment is what exposed the pin. Either way the
+      # rule was never the thing protecting it, so do not infer that an ignore
+      # entry shields a pin. Keep version constraints out of the prose in both
+      # files regardless: a comment is not a safety mechanism.
+      - dependency-name: "cryptography"
+        versions: [">=49.0.0"]
+    commit-message:
+      prefix: "chore(deps)"
+    labels: ["dependencies", "python"]
+
+  # ---- Container base images ----
+  #
+  # This list was the five service directories only, which left the base image of
+  # SEVEN published images unwatched -- every one of them built by
+  # docker-publish.yml: connector-deployer (moby/buildkit + golang:1.25), the
+  # Kafka Connect image (maven/eclipse-temurin), the connector seed (busybox),
+  # and the context7, kafka-mcp-sink, debezium and minio internal connectors.
+  # Nothing proposed a bump for those, so a base-image CVE there had no fix PR at
+  # all -- the security workflow scans, but only Dependabot opens the patch. The
+  # kind OIDC entry is the one addition that ships nothing; it is a test fixture,
+  # included so its python base does not rot in the other direction.
+  #
+  # The connector entries are globs on purpose. Per CLAUDE.md the code that
+  # actually builds is versions/<latest.json.current_version>/, so naming a
+  # version directory literally would silently stop matching the day a connector
+  # is bumped. Directories with no Dockerfile are simply skipped.
+  #
+  # `public/` needs TWO globs because the tree has two shapes: ten connectors sit
+  # at <conn>/versions/<v>, eleven are grouped one level deeper at
+  # <group>/<conn>/versions/<v> (database/, storage/). A single glob silently
+  # covers one shape and misses the other -- and a partial match looks exactly
+  # like a working one, since Dependabot reports only what it found.
+  #
+  # These 21 are the connector images USERS pull, and until now none of them was
+  # watched: the previous pass added the seven published service/internal images
+  # and stopped there. That was the larger hole of the two.
+  #
+  # Still bumped by hand, and not coverable here: these 21 Dockerfiles are
+  # RENDERED from llm-service/src/agents/tool_generator/templates/Dockerfile.j2,
+  # which Dependabot cannot parse. So a proposal on this glob is only half a
+  # change -- take it together with the template in the same commit, or the next
+  # regeneration quietly reverts every file the PR touched.
+  #
+  # And expect these 21 to propose NOTHING for the time being, which is not the
+  # same as being up to date. Connectors have exactly one base, `python`, and the
+  # `ignore` block below holds python at minor+major; `python:3.13-slim` carries
+  # no patch component, so minor+major is every update it can receive. The
+  # coverage is real but dormant until that hold clears. Worth stating, because a
+  # watched directory that proposes nothing looks exactly like a watched
+  # directory with nothing to propose -- which is how these 21 went unwatched
+  # this long.
+  #
+  # Triage note (2026-08-31, from the first grouped run of this config). A grouped
+  # base-image PR is NOT a single decision -- the group spans images with very
+  # different blast radius, and the CVE benefit is wildly uneven. Measured with
+  # trivy (CRITICAL+HIGH) on the BUILT images, not the bases alone:
+  #
+  #   TAKEN   connector-deployer  docker:27-cli -> 29-cli    171 -> 51   (-120)
+  #   TAKEN   frontend            node:24 -> 26-alpine        11 ->  6   (-5)
+  #   TAKEN   api-gw/orch/adapter alpine:3.19 -> 3.24          9 ->  9   (0, currency only)
+  #   TAKEN   seed + 3 internal connectors (busybox 1.38, python 3.13)
+  #   HELD    llm-service         python:3.11 -> 3.13/3.14   (-36 forgone)
+  #   HELD    context7            python:3.11 -> 3.13        (-36 forgone)
+  #   HELD    kafka-connect       debezium 3.1.3 -> 3.6.0     53 -> 28   (-25)
+  #   HELD    golang 1.25 -> 1.27, maven/temurin 21 -> 26     builder-only, 0 shipped
+  #
+  # Why the holds, so the next grouped PR can be split without re-deriving it:
+  #   * llm-service python: blocked on the SAME otel lock the pip `ignore` above
+  #     protects. On 3.13 the pinned opentelemetry-instrumentation imports
+  #     pkg_resources, which python:3.12-slim onward no longer ships (3.11-slim
+  #     does); on 3.14 protobuf 4.25.9's google._upb dies with "Metaclasses with
+  #     custom tp_new are not supported". Both are boot-time failures: the image
+  #     BUILDS clean and every library imports individually. Only starting the
+  #     service catches them. python:3.12-slim is not a way out (55 CVEs vs 57).
+  #     This bump rides on the tested otel/protobuf remediation, not on its own.
+  #   * context7: hard-pins pydantic==2.5.0, whose pydantic-core==2.14.1 has no
+  #     cp313 wheel. Unblocking it means changing a published connector's pins.
+  #   * debezium: real -25, and the hold is not caution -- the bump is BROKEN.
+  #     Verified on #897's built image, which crashed on all three boots it was
+  #     given (15:57, 16:43, 16:52 on 2026-08-31 -- one per failed gate run),
+  #     never opening its REST port. It dies 66s in, during the plugin scan, on
+  #     NoSuchMethodError ConfigDef$ValidList.anyNonDuplicateValues(boolean,boolean)
+  #     at WorkerConfig.baseConfigDef. Cause is the force-swap at
+  #     shared/internal/infra/kafka-connect/Dockerfile:64-77, which installs
+  #     kafka-clients 3.9.2 over the base's own jars to clear CVE-2025-27817.
+  #     That is in-minor against 3.1.3.Final (connect-runtime 3.9.0) but
+  #     CROSS-MAJOR against 3.6.0.Final, whose connect-runtime is Kafka 4.x --
+  #     exactly the skew that Dockerfile's own comment (lines 27-33) warns about,
+  #     re-created by an automated bump that cannot see the coupling. Taking this
+  #     bump means moving KAFKA_CLIENTS_VERSION and its sha512 in the SAME commit,
+  #     or dropping the swap once the base ships a patched client. The CDC
+  #     end-to-end run is the step after that, not the blocker.
+  #   * golang / maven: multi-stage BUILDER stages -- they never reach a shipped
+  #     layer, so the CVE benefit is exactly zero. golang additionally would ship
+  #     a binary whose stdlib is not the one `toolchain go1.25.13` pins for CI and
+  #     govulncheck (see the CVE note in the go.mod files).
+  #
+  # These holds ARE `ignore` entries below. The first version of this block left
+  # them as comments only, reasoning that an `ignore` hides a security update
+  # instead of deferring it. That was wrong about the cost of a re-proposal.
+  # Dependabot recreated the identical held set as #906 at 17:49:38Z on
+  # 2026-08-31 -- two minutes after #902 merged the safe subset at 17:47:59Z --
+  # because a comment is not enforcement. And a re-proposal is not just noise:
+  # the per-PR e2e gate BUILDS the PR's images into the shared warm
+  # `rsync-ci-*:latest` stack, so a broken base outlives its own PR's failure and
+  # breaks the NEXT, unrelated PR. #897 left two poisoned images that way
+  # (kafka-connect, then planner); they cost #902 and #904 about four hours.
+  # The CVE tracking stays in the triage note above, which is where the next
+  # reviewer already looks. Clearing a blocker is deleting one entry below.
+  - package-ecosystem: "docker"
+    directories:
+      - "/api-gateway"
+      - "/backend-orchestrator"
+      - "/backend-temporal-adapter"
+      - "/frontend"
+      - "/llm-service"
+      - "/connector-deployer"
+      - "/shared/internal/infra/kafka-connect"
+      - "/shared/mcp-connectors"
+      - "/shared/mcp-connectors/internal/*"
+      - "/shared/mcp-connectors/internal/*/versions/*"
+      - "/shared/mcp-connectors/public/*/versions/*"
+      - "/shared/mcp-connectors/public/*/*/versions/*"
+      - "/deploy/helm/rsync-ai/test/kind/oidc"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # Ungrouped, this ecosystem opened one PR per image: #871 #872 #873 were
+      # three copies of golang:1.25-alpine -> 1.27-alpine, one per service. With
+      # eleven directories now watched that would be far worse. One PR per run.
+      docker-base-images:
+        patterns: ["*"]
+    ignore:
+      # Each entry is a hold from the triage note above; that note carries the
+      # evidence. Scoped by update type so a patch-level CVE fix on the CURRENT
+      # line is still proposed -- though for tags with no patch component at all
+      # (`python:3.11-slim`, `golang:1.25-alpine`) that is vacuous, and minor +
+      # major is every update they can receive.
+      #
+      # python: 3.14 kills llm-service at boot -- protobuf's google._upb raises
+      # "Metaclasses with custom tp_new are not supported" -- and 3.12+ breaks the
+      # pinned otel instrumentation's pkg_resources import. Both are boot-time
+      # only; the image builds clean either way. Rides on otel remediation.
+      # Collateral: this also freezes the 3.13 bases (kind OIDC fixture, debezium
+      # and kafka-mcp-sink connectors) at 3.13, because `ignore` is per-ecosystem
+      # and cannot be scoped to one directory. They gain nothing from 3.14.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # debezium connect: 3.6.0.Final is cross-major against the kafka-clients
+      # force-swap in shared/internal/infra/kafka-connect/Dockerfile. The built
+      # image crashed on all three boots it was given, never opening its REST
+      # port. Taking it means moving KAFKA_CLIENTS_VERSION and its sha512 in the
+      # same commit -- which #914 now makes mandatory rather than merely wise:
+      # the Dockerfile asserts kafka-clients and connect-runtime agree to
+      # major.minor, so a bump that skews them fails the BUILD instead of
+      # shipping a worker that cannot boot. This entry is therefore no longer
+      # the only defense; it exists to stop the weekly re-proposal of a PR we
+      # already know needs a coordinated re-pin.
+      #
+      # The name has NO registry host. It used to carry one, copied straight
+      # from the FROM line -- the natural thing to write, and wrong. (Not
+      # repeated here: a dead identifier sitting in a comment is one a reader
+      # can paste back in.) Dependabot keeps the registry in `source`, not
+      # in the dependency name, so that entry matched nothing and the hold was
+      # dead the whole time it looked enforced. It landed on main at 19:03:02Z
+      # on 2026-08-31 and Dependabot opened #913 -- this exact bump -- at
+      # 19:06:43Z, 3m41s later. The authority for the string is Dependabot's own
+      # output: its commit trailer on #913 reads `dependency-name:
+      # debezium/connect`, and the PR title is "Bump debezium/connect from
+      # 3.1.3.Final to 3.6.0.Final". The PR title IS the dependency-name; copy
+      # it from there, never from the Dockerfile.
+      #
+      # The update-type scoping is correct and stays. `X.Y.Z.Final` looks
+      # unparseable but Dependabot classified 3.1.3.Final -> 3.6.0.Final as
+      # `version-update:semver-minor` (same trailer), so minor+major is caught
+      # and the 3.1.x patch stream -- in-minor against Kafka 3.9, and the
+      # channel a base-image CVE fix would arrive on -- is still proposed.
+      - dependency-name: "debezium/connect"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # golang: builder stage only, so the shipped-CVE benefit is exactly zero,
+      # and a newer base builds against a stdlib that `toolchain go1.25.13` does
+      # not pin for CI and govulncheck. Patch bumps still flow -- that is the
+      # channel that tracks the pin.
+      - dependency-name: "golang"
+        update-types: ["version-update:semver-minor", "version-update:semver-major"]
+      # maven: builder stage only -- nothing in it reaches a shipped layer, so
+      # there is no CVE to forgo. Unscoped because the JDK major rides in the tag
+      # suffix (`-eclipse-temurin-21` -> `-26`), which no semver update-type sees.
+      - dependency-name: "maven"
+    commit-message:
+      prefix: "chore(deps)"
+    labels: ["dependencies", "docker"]
+
+  # ---- GitHub Actions (pin drift + supply-chain) ----
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "chore(ci)"
+    labels: ["dependencies", "ci"]

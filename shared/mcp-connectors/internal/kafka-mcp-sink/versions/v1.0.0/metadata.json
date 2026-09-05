@@ -1,0 +1,167 @@
+{
+  "name": "Kafka MCP Sink",
+  "internal": true,
+  "version": "1.0.0",
+  "description": "Kafka \u2192 Destination sink connector with Go-based consumer for reliable data streaming",
+  "connector_type": "kafka-mcp-sink",
+  "category": "streaming",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": false,
+  "supports_destination": true,
+  "supports_cdc": true,
+  "spec_version": "1.0",
+  "generated_at": "2025-12-29T10:00:00Z",
+  "auth_type": "none",
+  "required_config": [],
+  "optional_config": [],
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "topics": {
+        "type": "string",
+        "description": "Kafka topic to consume from"
+      },
+      "consumer_group": {
+        "type": "string",
+        "description": "Kafka consumer group ID"
+      },
+      "kafka_bootstrap_servers": {
+        "type": "string",
+        "description": "Kafka bootstrap servers",
+        "default": "kafka:29092"
+      },
+      "destination_connector": {
+        "type": "string",
+        "description": "Type of destination connector (e.g., mysql, postgresql)"
+      },
+      "destination_config": {
+        "type": "object",
+        "description": "Configuration for the destination connector",
+        "properties": {
+          "table": {
+            "type": "string",
+            "description": "Destination table name"
+          },
+          "key_fields": {
+            "type": "array",
+            "description": "Primary key fields for CDC operations",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "id"
+            ]
+          }
+        },
+        "required": [
+          "table"
+        ]
+      },
+      "pipeline_id": {
+        "type": "string",
+        "description": "Optional pipeline identifier"
+      }
+    },
+    "required": [
+      "topics",
+      "consumer_group",
+      "destination_connector",
+      "destination_config"
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": [
+      "json"
+    ],
+    "supported_compressions": [
+      "none"
+    ],
+    "supports_cdc": true
+  },
+  "operations": [
+    {
+      "name": "start_sink",
+      "type": "destination",
+      "description": "Start a Kafka sink worker",
+      "method": "kafka-mcp-sink_start_sink",
+      "parameters": [
+        {
+          "name": "topics",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "consumer_group",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "destination_connector",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "destination_config",
+          "type": "object",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "stop_sink",
+      "type": "destination",
+      "description": "Stop a running sink worker",
+      "method": "kafka-mcp-sink_stop_sink",
+      "parameters": [
+        {
+          "name": "consumer_group",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "sink_status",
+      "type": "core",
+      "description": "Get status of a sink worker",
+      "method": "kafka-mcp-sink_sink_status",
+      "parameters": [
+        {
+          "name": "consumer_group",
+          "type": "string",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity",
+      "method": "kafka-mcp-sink_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration",
+      "method": "kafka-mcp-sink_validate_config"
+    },
+    {
+      "name": "health",
+      "type": "core",
+      "description": "Health check",
+      "method": "kafka-mcp-sink_health"
+    }
+  ],
+  "license": "MIT",
+  "id": "kafka-mcp-sink",
+  "display_name": "Kafka MCP Sink",
+  "aliases": [
+    "Kafka MCP Sink",
+    "kafka mcp sink",
+    "kafka-mcp-sink",
+    "v1.0.0",
+    "v100"
+  ]
+}

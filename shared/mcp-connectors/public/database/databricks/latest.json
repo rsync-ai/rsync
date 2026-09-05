@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-07-04T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-07-04T00:00:00.000000",
+      "changes": [
+        "Initial Databricks connector (DB-API via databricks-sql-connector): batch source + destination. Optimized reads (keyset/offset pagination). Optimized writes (batched multi-row INSERT). Flag-gated COPY-INTO from cloud storage dormant. Native Delta MERGE upsert present but dormant. PAT auth over a SQL warehouse."
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

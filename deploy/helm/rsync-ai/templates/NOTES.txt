@@ -1,0 +1,155 @@
+{{ .Chart.Name }} {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Watch it come up:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/instance={{ .Release.Name }} -w
+
+{{- if .Values.ingress.enabled }}
+
+  App: https://{{ .Values.ingress.hosts.app }}
+  API: https://{{ .Values.ingress.hosts.api }}
+{{- else }}
+
+No ingress. To reach it locally:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "rsync-ai.fullname" . }}-frontend 3000:{{ .Values.frontend.service.port }}
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "rsync-ai.fullname" . }}-api-gateway 8080:{{ .Values.apiGateway.service.port }}
+
+  Note the frontend was built to call {{ .Values.frontend.apiUrl | default "(unset)" }} from the BROWSER. If that is
+  not reachable from your machine, the page will render and every API call will fail.
+{{- end }}
+
+────────────────────────────────────────────────────────────────────────────────
+Read these before you call it working
+────────────────────────────────────────────────────────────────────────────────
+
+1. Pods Running is not a pipeline that moves rows. Run one real pipeline and
+   check the destination. The failure mode this platform has hit repeatedly is a
+   run that reports success while the destination stays empty.
+
+{{- if not .Values.connectors.fleet }}
+
+2. connectors.fleet is EMPTY, so no source/destination connectors exist.
+   Just-in-time deployment is unavailable on Kubernetes (connector-deployer
+   needs a Docker socket this chart does not mount).
+
+   Do NOT look for a stall. Pre-flight does not poll for these at all — the
+   120s poll in infra_preflight.go is checkMCPCore, and it covers only the core
+   services (minio, debezium, kafka-connect, the sink). A source/destination
+   goes through checkMCPUser, which has no poll loop, and the JIT deploy call
+   is skipped outright unless generation.enabled=true (the only thing that sets
+   TOOL_GENERATOR_URL). So the DNS miss is fast, and what you get is:
+
+     - CDC pipelines: a hard error, "requires Docker HTTP transport but no
+       container is reachable (no stdio fallback)".
+     - Batch pipelines: pre-flight still PASSES. Your signal is the run
+       progress line "<connector>: using stdio fallback" and the orchestrator
+       WARN "could not start Docker HTTP container". The run then executes the
+       connector as a subprocess out of the seeded catalog, building a venv and
+       running `pip install -r requirements.txt` at pipeline runtime — that
+       needs PyPI egress from the orchestrator pod, and it repeats after every
+       restart because the catalog volume is an emptyDir.
+
+   Declare what you need:
+
+     connectors:
+       fleet:
+         - id: postgresql
+           version: v1.0.0
+           image: { repository: mcp-postgresql }
+{{- else }}
+
+2. Connector Services rendered ({{ len .Values.connectors.fleet }}):
+{{- range $c := .Values.connectors.fleet }}
+     {{ include "rsync-ai.connectorServiceName" (dict "prefix" $.Values.global.stackPrefix "id" $c.id "version" $c.version) }}:8000
+{{- end }}
+   These names are resolved literally by the orchestrator, version included —
+   v1.0.0 and v1.0.1 are different Services. A pipeline asking for an id or
+   version that is not on this list does not fail in pre-flight: CDC fails
+   later in the executor, and batch degrades to the stdio path described above
+   while pre-flight still reports success.
+{{- end }}
+
+{{- if .Values.kafka.enabled }}
+
+3. Kafka is the in-chart single-node broker: replication factor 1, no
+   durability guarantee, and it will lose data if its node dies. Fine to
+   evaluate on, wrong for anything you care about. Point kafka.external at MSK
+   / Confluent / Event Hubs and set kafka.enabled=false.
+{{- else }}
+
+3. BYO Kafka at: {{ include "rsync-ai.kafka.bootstrap" . }}
+   Topic prefix "{{ .Values.kafka.topicPrefix }}" — every topic this platform
+   creates on your cluster starts with it. Verify min.insync.replicas <=
+   replication factor on that cluster: a topic created the other way round
+   EXISTS and is permanently unwritable, which surfaces as a pipeline that
+   produces nothing rather than as an error.
+{{- end }}
+
+{{- if .Values.postgresql.enabled }}
+
+4. Postgres is in-chart: one replica, no backups, no PITR. It holds every
+   pipeline definition and every encrypted connection credential. Set
+   postgresql.enabled=false and point at RDS / Cloud SQL / Azure Database
+   before this holds anything real.
+{{- end }}
+
+{{- if not .Values.secrets.existingSecret }}
+
+5. Secrets came from Helm values, so they are stored in the release's own Secret
+   in cleartext and `helm get values {{ .Release.Name }}` reads them back. Use
+   secrets.existingSecret with External Secrets / SOPS / sealed-secrets for
+   anything beyond a laptop.
+
+   ENCRYPTION_KEY specifically: every stored connection is encrypted with it.
+   Rotating it later WITHOUT carrying the old key in ENCRYPTION_KEYS makes every
+   saved connection permanently undecryptable. There is no recovery path.
+{{- end }}
+
+{{- if .Values.generation.enabled }}
+
+6. The generation tier is on: three pods on two images — {{ .Values.generation.image.repository }}
+   (llm-service + planner) and {{ .Values.generation.toolGenerator.image.repository }} (tool-generator).
+   Both are published by this repo's release workflow, so there is nothing here
+   for you to build by hand.
+
+   What the tier does NOT do: generate a brand-new connector from an API spec.
+   Both images are built from allowlists that omit the connector-generation
+   package (llm-service/oss-strip-list.txt). Everything else is present — /chat
+   pipeline creation, the Data Explorer, NL→SQL and the planner. For connectors,
+   use connectors.fleet, the same catalog the cloud runs.
+{{- end }}
+
+{{- if .Values.demo.enabled }}
+
+7. The bundled demo is ON. Open the dashboard and use "Start with sample data".
+   It wires two connections into your workspace — the credential-free
+   sample-data source, and this destination:
+     {{ include "rsync-ai.fullname" . }}-demo-warehouse:5432/{{ .Values.demo.database }}
+   From there you can build and run a real pipeline, end to end, without
+   producing a single credential of your own.
+
+   That warehouse is disposable. It is a separate database from the control
+   plane on purpose, it has its own credential, and nothing but demo rows should
+   ever land in it. Set demo.enabled=false once you are running real pipelines —
+   the connections it created stay behind, so delete those too.
+{{- else if not .Values.connectors.fleet }}
+
+7. Nothing here can move a row yet: no connectors are declared, and every
+   connector in the catalog except one wants a credential you have not created.
+
+   To try the platform end to end without producing any credential, enable the
+   bundled demo. It needs the postgresql connector as well, because Kubernetes
+   has no just-in-time connector deploy:
+
+     demo:
+       enabled: true
+     secrets:
+       demoWarehousePassword: "$(openssl rand -base64 32)"
+     connectors:
+       fleet:
+         - id: postgresql
+           version: v1.0.0
+           image: { repository: mcp-postgresql }
+
+   The chart refuses to install if you enable it without both, rather than
+   coming up healthy and failing at the first pipeline.
+{{- end }}

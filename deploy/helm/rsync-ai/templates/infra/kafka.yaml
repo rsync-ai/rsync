@@ -1,0 +1,201 @@
+{{- if .Values.kafka.enabled }}
+{{/*
+Single-node KRaft broker — the bundled convenience cluster, sized for the 4-core
+/ 16 GB target. Anything that needs durability past one node should set
+kafka.enabled=false and point kafka.external.bootstrapServers at MSK / Confluent
+/ Redpanda; templates/validate.yaml refuses replicationFactor > 1 here rather
+than letting you configure a cluster that cannot exist.
+
+Two Services on purpose. The headless one gives the pod the stable DNS name that
+KRaft's controller quorum needs to resolve at startup; the ClusterIP one is what
+clients bootstrap against, and is the name rsync-ai.kafka.bootstrap returns.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-kafka-headless
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  ports:
+    - port: 29093
+      name: controller
+    - port: 9092
+      name: kafka
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-kafka
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9092
+      targetPort: kafka
+      name: kafka
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-kafka
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka
+spec:
+  serviceName: {{ include "rsync-ai.fullname" . }}-kafka-headless
+  replicas: 1
+  selector:
+    matchLabels:
+{{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: kafka
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: kafka
+      {{- with .Values.global.podAnnotations }}
+      annotations:
+{{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: kafka
+          image: {{ .Values.kafka.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            - name: KAFKA_NODE_ID
+              value: "1"
+            - name: KAFKA_PROCESS_ROLES
+              value: "broker,controller"
+            {{/*
+              The quorum voter must be resolvable by the broker itself before the
+              client Service has any endpoints, which is why this is the headless
+              pod FQDN and not the ClusterIP name.
+            */}}
+            - name: KAFKA_CONTROLLER_QUORUM_VOTERS
+              value: "1@{{ include "rsync-ai.fullname" . }}-kafka-0.{{ include "rsync-ai.fullname" . }}-kafka-headless.{{ .Release.Namespace }}.svc.cluster.local:29093"
+            - name: KAFKA_LISTENERS
+              value: "PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:29093"
+            {{/*
+              Advertised as the ClusterIP Service name. Every client in the cluster
+              reaches the broker through it, and a single-broker cluster has no
+              per-broker addressing problem to solve.
+            */}}
+            - name: KAFKA_ADVERTISED_LISTENERS
+              value: "PLAINTEXT://{{ include "rsync-ai.fullname" . }}-kafka.{{ .Release.Namespace }}.svc.cluster.local:9092"
+            - name: KAFKA_LISTENER_SECURITY_PROTOCOL_MAP
+              value: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT"
+            - name: KAFKA_INTER_BROKER_LISTENER_NAME
+              value: "PLAINTEXT"
+            - name: KAFKA_CONTROLLER_LISTENER_NAMES
+              value: "CONTROLLER"
+            - name: KAFKA_LOG_DIRS
+              value: "/var/lib/kafka/data"
+            - name: CLUSTER_ID
+              value: {{ .Values.kafka.clusterId | quote }}
+            {{/*
+              One node, so every internal topic is RF=1 and ISR=1. These are not
+              tunable here by design: the platform's own RF clamp does not reach
+              Kafka Connect's three internal topics, so a value above 1 would take
+              the CDC plane down at worker startup rather than being clamped.
+            */}}
+            - name: KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR
+              value: "1"
+            - name: KAFKA_TRANSACTION_STATE_LOG_MIN_ISR
+              value: "1"
+            - name: KAFKA_OFFSETS_TOPIC_NUM_PARTITIONS
+              value: "8"
+            - name: KAFKA_TRANSACTION_STATE_LOG_NUM_PARTITIONS
+              value: "8"
+            {{/*
+              Session-timeout window copied from the compose stack. The 180s max is
+              load-bearing for the batch sink, whose poll loop can legitimately go
+              quiet while a destination write is in flight; the stock 30s ceiling
+              rebalances it mid-batch.
+            */}}
+            - name: KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS
+              value: "3000"
+            - name: KAFKA_GROUP_MIN_SESSION_TIMEOUT_MS
+              value: "6000"
+            - name: KAFKA_GROUP_MAX_SESSION_TIMEOUT_MS
+              value: "180000"
+            - name: KAFKA_HEAP_OPTS
+              value: {{ .Values.kafka.heapOpts | quote }}
+            {{/*
+              Broker cap on a single record. Kafka's 1 MiB default rejects CDC change
+              events for rows with large JSON/text/blob columns, which surfaces as a
+              Debezium task restart loop rather than as a bad row. Reads the same
+              kafka.maxMessageBytes as CONNECT_PRODUCER_MAX_REQUEST_SIZE in
+              templates/connectors/cdc.yaml, so the broker and producer halves cannot
+              drift; the sink worker's compiled-in 16 MiB consumer fetch cap is the
+              third leg and must stay above both.
+            */}}
+            - name: KAFKA_MESSAGE_MAX_BYTES
+              value: {{ .Values.kafka.maxMessageBytes | int64 | quote }}
+          ports:
+            - name: kafka
+              containerPort: 9092
+            - name: controller
+              containerPort: 29093
+          {{/*
+            Probe the API, not the port. A KRaft broker binds 9092 before it has
+            joined the quorum, so a tcpSocket check reports ready while every
+            metadata request still fails — and the dependent services would then
+            start, fail, and CrashLoopBackOff through their own backoff.
+          */}}
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 12
+          livenessProbe:
+            tcpSocket:
+              port: kafka
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+{{- toYaml .Values.kafka.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/kafka/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{/*
+          Per-component first, global as the fallback. Both keys have shipped in
+          values.yaml since the chart landed, but ONLY the global one was ever
+          read: setting kafka.persistence.storageClass was
+          silently ignored and the PVC fell through to the cluster default. An
+          inert key in values.yaml is worse than an absent one, because
+          values.yaml is the file an operator copies to build an overlay.
+          (KI-CHART-DEAD-PER-COMPONENT-STORAGECLASS.)
+        */}}
+        {{- with (default .Values.global.storageClass .Values.kafka.persistence.storageClass) }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.kafka.persistence.size | quote }}
+{{- end }}

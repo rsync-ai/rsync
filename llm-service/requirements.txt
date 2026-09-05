@@ -1,0 +1,94 @@
+# Main requirements for LLM Service and all AI agents
+
+# Core Framework
+# Pinned to the verified-working set: fastapi from 0.119 onward puts
+# `_IncludedRouter` (no `.path`) into app.routes, which the pinned
+# opentelemetry-instrumentation-fastapi 0.46b0 chokes on.
+# telemetry.py:_install_otel_route_guard handles it at runtime; these pins stop
+# silent drift from reintroducing the 500 on a rebuild. Versions are named in
+# prose here rather than in PEP 508 syntax -- see the cryptography note below
+# for why that distinction matters in this file.
+fastapi==0.137.1
+starlette==1.3.1
+uvicorn[standard]>=0.52.4
+python-multipart>=0.0.32
+
+# AI/LLM
+openai>=3.5.0
+tiktoken>=0.14.0
+langchain>=1.3.18
+langgraph>=1.2.11
+
+# HTTP & Networking
+requests>=2.34.2
+httpx>=0.28.1
+redis>=8.1.0
+inflect>=7.5.0
+
+# Docker SDK for container management
+docker>=7.2.0
+
+# Data & Validation
+pydantic>=2.13.5
+pyyaml>=6.0.3
+jinja2>=3.1.6
+
+# Messaging & Data
+kafka-python>=3.0.11
+boto3>=1.43.84
+duckdb>=1.5.5
+psycopg2-binary>=2.9.12
+fastavro>=1.12.2  # Avro serialization for Kafka
+
+# Security
+# Ceiling is not ours: presidio-anonymizer 2.2.364 -- the newest release --
+# floors cryptography at 48.0.1 and caps it below 49, so anything from 49 up
+# cannot resolve at all (verified against the package metadata on PyPI, not
+# inferred). Stated explicitly as a pin so pip reports a chosen bound instead
+# of a 20-line ResolutionImpossible dump. Raise it when presidio widens, not
+# before. The floor patches the GHSA-537c-gmf6-5ccf class of issue; it used to
+# be 42.0.0.
+#
+# Those bounds are written in prose deliberately. This comment previously
+# spelled them in PEP 508 syntax, and #916 rewrote THE COMMENT instead of the
+# pin below it -- flipping it to claim presidio *requires* 49, the opposite of
+# the truth -- while the pin itself did not move.
+#
+# The reason given here for that was wrong, and it lasted one day. It said the
+# pin was "correctly held by the ignore rule" in .github/dependabot.yml. It was
+# not held by anything: that rule was scoped by `update-types`, a Dependabot
+# requirement-range edit carries no update-type, so the rule matched nothing.
+# #922 then proposed >=49.0.0,<50.0.0 directly onto the line below -- the pin,
+# not the comment -- and would have shipped a requirements file that cannot
+# resolve. The ignore entry is now bounded by `versions` instead, which needs no
+# classification to match; the full account is in .github/dependabot.yml beside
+# the rule. Keep version constraints out of the prose in this file anyway, but
+# for the honest reason: a comment that looks like a requirement is noise a
+# reader can misread, not a shield for the pin.
+cryptography>=48.0.1,<49.0.0
+
+# PII Detection - Microsoft Presidio
+presidio-analyzer>=2.2.364
+presidio-anonymizer>=2.2.364
+spacy>=3.8.16
+# The en_core_web_sm spaCy model is installed in the Dockerfile via
+# `python -m spacy download en_core_web_sm` so cold-start doesn't trigger
+# a runtime download that blocks the first /suggestions/generate call.
+
+# OpenTelemetry - Distributed Tracing
+opentelemetry-api==1.25.0
+opentelemetry-sdk==1.25.0
+opentelemetry-exporter-otlp==1.25.0
+opentelemetry-instrumentation-fastapi==0.46b0
+opentelemetry-instrumentation-requests==0.46b0
+
+# Prometheus metrics (pull-only /prometheus endpoint, scraped by OTEL Collector → SigNoz). F-Obs-2.
+prometheus-client>=0.26.0
+
+# SQL Parsing & Transpilation
+sqlglot>=30.17.0
+
+# Development
+black>=26.5.1
+pytest>=9.1.1
+pytest-asyncio>=1.4.0

@@ -1,0 +1,131 @@
+# ─── Secrets & environment files — NEVER commit these ────────────────────────
+.env
+.env.local
+.env.prod
+.env.prod.*
+**/.env
+**/.env.local
+**/.env.prod
+frontend/.env
+llm-service/.env
+# Catch-all: ignore EVERY dotenv variant (.env.aztest, .env.dev, .env.staging,
+# …) so a newly-created environment file can never be committed by accident.
+# The earlier explicit lines only covered .env/.env.local/.env.prod; a file like
+# .env.aztest slipped through. The !…example negations below keep the tracked
+# templates visible.
+.env.*
+**/.env.*
+!.env.example
+!.env.prod.example
+!.env*.example
+!**/.env.example
+!**/.env.prod.example
+!**/.env*.example
+
+# ─── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+.venv/
+.venv*/
+venv/
+
+# ─── Build outputs ────────────────────────────────────────────────────────────
+.next/
+dist/
+build/
+bin/
+api-gateway/server
+
+# ─── Language artifacts ───────────────────────────────────────────────────────
+__pycache__/
+*.pyc
+*.py[cod]
+*.test
+*.out
+debug
+.gocache/
+
+# ─── OS / editor ──────────────────────────────────────────────────────────────
+.DS_Store
+.cursor/
+
+# ─── Project-specific ignores ─────────────────────────────────────────────────
+# Anchored to repo root: ignores a locally-cloned SigNoz runtime at /signoz/,
+# but NOT deploy/signoz/ (our committed dashboard + alert + README assets).
+/signoz/
+!deploy/signoz/
+logs/
+# docs/ is tracked in git — remove this line if you want to untrack it
+# docs/
+.promotion.lock
+**/.promotion.lock
+**/.tmp/
+**/_toolcache/
+.cursor_tmp_*.log
+e2e_run_output.txt
+backend-orchestrator/agent-logs/
+backend-orchestrator/backend-orchestrator/
+artifacts/
+artifacts_debug/
+test-results/
+
+# Local dev compose override — auto-loaded by `docker compose up`; keep it LOCAL
+# so personal ports/CORS origins never leak into everyone's stack. Copy
+# docker-compose.override.yml.example to start one.
+docker-compose.override.yml
+
+# Compiled Go binaries (no extension, named after dir)
+api-gateway/api-gateway
+backend-orchestrator/backend-orchestrator
+backend-temporal-adapter/adapter
+# kafka-mcp-sink Go worker — built from source by the Dockerfile (worker-builder
+# stage), so the binary must never be committed. The image overrides any checked-in
+# copy; committed copies are pure dead weight (~47MB) and look authoritative.
+# NOTE: the broad `**/kafka-sink-worker` glob also matched the SOURCE package dir
+# `worker-src/cmd/kafka-sink-worker/`, so git refused to descend into it and any
+# NEW .go file there was silently ignored (main.go only survived via `git add -f`).
+# That is a prod-correctness hazard: the sink is the CDC write path, so a dropped
+# source file means the image builds from stale code. Fix: re-include the source
+# package dir explicitly; the binary (built to worker-src/kafka-sink-worker and any
+# stray dev builds) stays ignored.
+**/kafka-sink-worker
+!**/cmd/kafka-sink-worker/
+!**/cmd/kafka-sink-worker/**
+
+# Untracked local connector cruft — public/api/ holds locally-generated connector
+# dirs with no tracked files; they show up in find/ls as "connectors" that don't
+# exist in the repo. (public/database/ IS tracked — do not ignore it.)
+shared/mcp-connectors/public/api/
+# IDE
+.cursor/
+.cursorignore
+
+# Editor swap & backup files (vim, emacs, etc.)
+*.swp
+*.swo
+*~
+
+# Per-developer agent config and worktree metadata — should never be committed.
+# The worktree dirs are created when devs run `git worktree add` under Claude
+# Code or Claire (different sessions can each spawn one), and the untracked dirs
+# were polluting `git status` across the repo.
+#
+# `.claude/` is ignored WHOLE, not just its worktrees: it is per-developer agent
+# scratch (plans, PRDs, a permissions allowlist, LAN-specific proxy scripts), it
+# is entry 7 of scripts/flip/excludes.txt so the public cut drops it anyway, and
+# without this line the 14 files untracked alongside this change would be silently
+# re-added by the next `git add -A`.
+.claude/
+.claire/worktrees/
+backend-orchestrator/orchestrator
+.env.staging
+
+# Security-audit scanner OUTPUT (scripts/security-audit.sh). Raw machine-
+# generated JSON/SARIF dumps (osv/govulncheck/trivy/bandit/gosec/…) run to
+# ~185k lines and are regenerated on every run — artifacts, not source.
+# The human-readable REPORT.md is kept (negated below) so the audit summary
+# stays reviewable in git.
+security-audit-results/*.json
+security-audit-results/*.sarif
+security-audit-results/_log_*.txt
+security-audit-results/*.txt
+!security-audit-results/REPORT.md

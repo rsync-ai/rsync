@@ -1,0 +1,70 @@
+# Stage S4 overlay: SASL_SSL + OAUTHBEARER against a real OIDC provider.
+#
+# Overlays values-kind-byo.yaml. The delta from S3 is ONE axis -- the mechanism
+# -- so anything that breaks under S4 and not under S3 is attributable to the
+# token path. (S2 isolated the mechanism axis against S1 the same way, and S3
+# isolated transport.)
+#
+# What is different about this stage, and why it needed its own values surface:
+# on every other mechanism the credential the chart holds IS the Kafka
+# credential. Here it is not. The chart holds an OIDC client secret; the Kafka
+# credential is a short-lived JWT that each client fetches for itself, and the
+# three client runtimes do not agree on how to be told that:
+#
+#   Go / Python   fetch the token themselves from oauth.tokenEndpoint
+#   JVM           is handed clientId/clientSecret/scope as JAAS *options* and
+#                 the endpoint as a separate client property, and fetches its own
+#
+# so all of it is supplied once here and fanned out by the chart.
+#
+# NO SECRET HERE, and no CA either. `kafka.external.oauth.clientSecret` and
+# `kafka.external.tls.caCert` are both deliberately omitted; both go in a third,
+# uncommitted `-f`, exactly as the password does for S1/S2 and the CA for S3:
+#
+#   { echo 'kafka:'; echo '  external:';
+#     echo '    oauth:';
+#     echo "      clientSecret: $(cat .oidc-client-secret)";
+#     echo '    tls:'; echo '      caCert: |';
+#     sed 's/^/        /' .tls/broker/ca.crt; } > /tmp/s4-secret.yaml
+
+kafka:
+  external:
+    securityProtocol: SASL_SSL
+    saslMechanism: OAUTHBEARER
+
+    # saslUsername is deliberately absent, and the chart FAILS the render if it
+    # is present alongside OAUTHBEARER. It is not merely unused: an operator who
+    # left it behind from a SCRAM deployment would otherwise be silently
+    # authenticating as whatever principal the token says, while the values file
+    # claims a different one.
+
+    oauth:
+      # The name the PODS dial, which is not the name the broker dials. The
+      # broker reaches the same provider over docker DNS (`oidc:8080`) because
+      # it is not in the cluster; only the JWKS fetch goes that way, and
+      # broker-up.sh sets it there. Nothing resolves both, which is exactly why
+      # the `iss` claim is compared as an opaque string rather than fetched.
+      tokenEndpoint: http://oidc.rsync.svc.cluster.local:8080/token
+      clientId: rsync
+      # clientSecret: supplied by the uncommitted third -f.
+
+      # scope is left empty on purpose. The provider mints `scope: kafka` into
+      # every token regardless, and the broker is configured with no expected
+      # scope, so setting it here would change nothing observable -- and a
+      # setting that cannot fail is a setting the stage is not testing. The
+      # rendered-shell tests in llm-service/tests/test_chart_kafka_security_env.py
+      # cover the scope and extensions branches instead, where a wrong value is
+      # visible in the output rather than swallowed by a permissive broker.
+      scope: ""
+      extensions: ""
+
+      # Empty = the chart's default, the promoted (Kafka 3.6+) class name. The
+      # broker image here is 3.7.0, which carries both spellings; the older
+      # `...oauthbearer.secured.` one was removed in 4.0. Overriding is for
+      # matching an older client library, not an older broker.
+      loginCallbackHandler: ""
+
+    # tls.caCert: supplied by the uncommitted third -f -- same private CA as S3,
+    # same reasoning. tls.insecureSkipVerify stays unset for the reason spelled
+    # out in values-kind-byo-s3.yaml: it does not mean the same thing in the Go,
+    # Python and JVM clients, so it produces a half-green run.

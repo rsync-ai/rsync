@@ -1,0 +1,47 @@
+# CI isolation override for docker-compose.mcp.yml — MCP connectors (dc_mcp)
+# AUTO-GENERATED (from worktree compose). Applied by run_gate.sh ONLY when STACK_PREFIX != rsync-ai.
+services:
+  aws-s3-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-aws-s3-v1-0-0-mcp
+  azure-blob-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-azure-blob-v1-0-0-mcp
+  bigquery-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-bigquery-v1-0-0-mcp
+  clickhouse-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-clickhouse-v1-0-0-mcp
+  databricks-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-databricks-v1-0-0-mcp
+  gcs-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-gcs-v1-0-0-mcp
+  github-rest-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-github-rest-v1-0-0-mcp
+  google-sheets-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-google-sheets-v1-0-0-mcp
+  mongodb-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-mongodb-v1-0-0-mcp
+  mysql-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-mysql-v1-0-0-mcp
+  oracle-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-oracle-v1-0-0-mcp
+  petstore-v1-0-3-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-petstore-v1-0-3-mcp
+  postgresql-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-postgresql-v1-0-0-mcp
+  redshift-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-redshift-v1-0-0-mcp
+  sample-data-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-sample-data-v1-0-0-mcp
+  shopify-admin-graphql-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-shopify-admin-graphql-v1-0-0-mcp
+  snowflake-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-snowflake-v1-0-0-mcp
+  sqlserver-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-sqlserver-v1-0-0-mcp
+  stripe-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-stripe-v1-0-0-mcp
+  widgets-graphql-v1-0-0-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-widgets-graphql-v1-0-0-mcp
+networks:
+  rsync-network:
+    external: true
+    name: ${STACK_PREFIX:-rsync-ai}-mcp

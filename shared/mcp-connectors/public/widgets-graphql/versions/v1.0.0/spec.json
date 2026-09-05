@@ -1,0 +1,197 @@
+{
+  "name": "widgets_graphql",
+  "display_name": "Widgets-Graphql",
+  "aliases": null,
+  "version": "1.0.0",
+  "description": "Widgets GraphQL test API (deterministic E2E fixture) \u2014 Relay widgets list.",
+  "logo_url": null,
+  "category": "api_saas",
+  "protocol": "graphql",
+  "supports_source": true,
+  "supports_destination": false,
+  "destination_modes": [],
+  "supports_cdc": false,
+  "supports_ddl": false,
+  "auto_create_destination_tables": false,
+  "api_category_hint": null,
+  "api_category_hint_source": null,
+  "api_category_hint_confidence": null,
+  "base_url": "https://api.widgets.test/graphql",
+  "default_port": null,
+  "connection_timeout": 30,
+  "write_content_type": "json",
+  "auth": {
+    "type": "bearer",
+    "supported_methods": [
+      {
+        "method": "bearer",
+        "header_name": "Authorization",
+        "header_prefix": "Bearer",
+        "query_param": null,
+        "config_keys": [
+          "access_token",
+          "token"
+        ],
+        "description": "",
+        "label": "",
+        "oauth_provider": null
+      }
+    ],
+    "extra_required_headers": [],
+    "header_name": "Authorization",
+    "header_prefix": "Bearer",
+    "env_var": "MCP_API_KEY",
+    "username_env": null,
+    "password_env": null,
+    "oauth_provider": null,
+    "oauth_scopes": null,
+    "token_url": null,
+    "authorize_url": null,
+    "refresh_url": null,
+    "grant_type": null,
+    "requires_subdomain": false,
+    "token_never_expires": false,
+    "custom_headers": null,
+    "query_param": null
+  },
+  "auth_undetermined": false,
+  "auth_undetermined_header": "X-API-Key",
+  "default_headers": {},
+  "header_config_keys": [],
+  "config_fields": [],
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity",
+      "parameters": [],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true,
+      "graphql": null
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration",
+      "parameters": [],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true,
+      "graphql": null
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover the upstream schema",
+      "parameters": [],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true,
+      "graphql": null
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities",
+      "parameters": [],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true,
+      "graphql": null
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Generic GraphQL query dispatcher",
+      "parameters": [
+        {
+          "name": "operation_name",
+          "type": "string",
+          "required": true,
+          "default": null,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "variables",
+          "type": "object",
+          "required": false,
+          "default": null,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        }
+      ],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true,
+      "graphql": null
+    },
+    {
+      "name": "widgets",
+      "type": "source",
+      "description": "List widgets (Relay connection).",
+      "parameters": [
+        {
+          "name": "first",
+          "type": "integer",
+          "required": false,
+          "default": null,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "after",
+          "type": "string",
+          "required": false,
+          "default": null,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        }
+      ],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true,
+      "graphql": {
+        "operation_type": "query",
+        "operation_name": "widgets",
+        "query_template": "query Widgets($first: Int, $after: String) {\n  widgets(first: $first, after: $after) {\n    edges {\n      node { id }\n      cursor\n    }\n    pageInfo {\n      hasNextPage\n      endCursor\n    }\n  }\n}",
+        "return_type": "WidgetConnection",
+        "selection_set": null,
+        "selected_fields": [
+          "id"
+        ],
+        "exportable_default": true
+      }
+    }
+  ],
+  "resources": [],
+  "max_batch_size": 10000,
+  "supported_formats": [
+    "json"
+  ],
+  "python_dependencies": [],
+  "spec_version": "1.1",
+  "author": null,
+  "license": "MIT",
+  "repository": null,
+  "documentation_url": null,
+  "metadata": {
+    "lazy_ops": false,
+    "graphql_operation_count": 1,
+    "custom_scalars": [],
+    "enums": []
+  },
+  "quality_tier": "silver",
+  "quality_score": null,
+  "authoritativeness_score": null,
+  "source": "generated",
+  "status": "active",
+  "qa_warnings": null,
+  "qa_metadata": null,
+  "curated_actions": null
+}

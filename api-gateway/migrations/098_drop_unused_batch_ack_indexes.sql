@@ -1,0 +1,105 @@
+-- 098: drop two never-scanned indexes on pipeline_batch_acks (F-BATCHACKS-UNUSED-INDEXES)
+--
+-- pipeline_batch_acks carries seven indexes. Two of them have never served a single
+-- scan, and every one of them pays write amplification on the hot sink path — the
+-- kafka-sink worker inserts into this table four times per drain cycle, and a btree
+-- that answers no query still gets an entry per insert and still bloats.
+--
+-- Measured on prod 2026-08-19, after the REINDEX that took the indexes from 66 MB to
+-- 104 kB (PRODUCT_STATUS §4). pg_stat_database.stats_reset was NULL for this
+-- database, so these counters have accumulated since the cluster was created and a
+-- zero really does mean never, not "not since the last reset" — that check is what
+-- the backlog item asked for, and it is the difference between evidence and a guess.
+--
+--   index                          idx_scan    verdict
+--   unique_batch_ack_kafka        1,650,000+   keep — the dedup path, and it enforces
+--   idx_batch_acks_kafka_lookup       1,095    keep
+--   idx_batch_acks_recent                91    keep
+--   idx_batch_acks_pipeline_exec         79    keep
+--   pipeline_batch_acks_pkey              -    keep — enforces identity
+--   idx_batch_acks_table                  0    DROP
+--   idx_batch_acks_cdc                    0    DROP
+--
+-- Why each drop is safe, from the code rather than from the counter alone (a zero
+-- proves an index is unused today; reading the queries is what proves it will stay
+-- that way):
+--
+--   idx_batch_acks_table (pipeline_id, table_name) — redundant. unique_batch_ack_kafka
+--   leads with (pipeline_id, execution_id, table_name), and no statement anywhere in
+--   the repo filters on (pipeline_id, table_name) without also pinning execution_id.
+--   Every ack read either names the execution or is the recency scan that
+--   idx_batch_acks_recent serves.
+--
+--   idx_batch_acks_cdc (pipeline_id, cdc_tx_id, cdc_lsn) WHERE cdc_op IS NOT NULL —
+--   dead by construction. cdc_tx_id and cdc_lsn appear in INSERT column lists in
+--   kafka-sink-worker/main.go and nowhere else in the tree: no WHERE, no JOIN, no
+--   ORDER BY, in Go or SQL. They are written and never read back, so the index has
+--   nothing it could ever answer.
+--
+-- Both are plain (non-constraint) indexes, so dropping them removes no guarantee.
+-- The two indexes that do enforce something — pipeline_batch_acks_pkey and
+-- unique_batch_ack_kafka, the one the sink's ON CONFLICT clause names — are
+-- untouched. Dropping either of those would turn the sink's idempotent insert into
+-- an error.
+--
+-- What a failure here costs, stated accurately because an earlier draft of this
+-- header got it wrong in both directions and a reader would have trusted it.
+--
+-- It is NOT the only file in this batch that takes a heavyweight lock. 097 takes
+-- ACCESS EXCLUSIVE on workspaces five times over, and workspaces is read on
+-- essentially every authenticated request, which makes 097 the riskier of the two by
+-- some distance — this table held one live row at the last measurement. Both files
+-- now carry the same lock_timeout for the same reason.
+--
+-- Nor does its failure "block nothing" because it is numbered last. Ordering does not
+-- help: api-gateway/internal/db/migrate.go returns on first error, and markSchemaReady()
+-- (migrate.go:53) sits AFTER the loop, so any migration that fails — first or last —
+-- leaves db.SchemaReady() false. main.go:311 logs the error and carries on, so the pod
+-- starts, but readinessVerdict (main.go:655) keeps /ready red for as long as it stays
+-- that way. A three-second lock timeout on a cleanup nobody is waiting for would hold
+-- back the whole deployment.
+--
+-- That risk is accepted here rather than designed away, and the reasoning is worth
+-- keeping because the obvious alternative is worse. Moving these drops into an
+-- operator script would take them out of the boot path, but 036 CREATEs both indexes,
+-- so any rebuilt environment would recreate them and nothing would ever drop them
+-- again — and this whole change exists because the infrastructure is about to be
+-- rebuilt. A schema change that does not survive the rebuild is not a schema change.
+--
+-- The risk is also smaller than it reads. This runs exactly once per database. On the
+-- rebuilt environment it runs at first boot against an empty database with no sink
+-- traffic and nothing to contend with; on the current one it is a single attempt at a
+-- lock on a one-row table. If it does fail it fails loudly, at deploy time, on a
+-- migration that is safe to re-run — which is the failure mode to prefer over a
+-- silent no-op recorded as applied.
+--
+-- DROP INDEX CONCURRENTLY is unavailable here: it cannot run inside a transaction
+-- block, and the runner wraps every file in one. Plain DROP INDEX takes ACCESS
+-- EXCLUSIVE, which on this table is a non-event — it held one live row at the last
+-- measurement — but a lock request that has to wait queues every later reader behind
+-- it, and the sink is a later reader. lock_timeout bounds that: if the lock is not
+-- free almost immediately we fail instead of forming a convoy, and re-running the
+-- migration is free.
+--
+-- SET LOCAL is scoped to the runner's surrounding transaction and reverts on commit,
+-- so it cannot leak a 3-second lock_timeout into the pooled connection's next user.
+--
+-- Recovery if this does time out: restart the api-gateway to re-run the migration,
+-- which is the whole fix in the common case — nothing was applied, so nothing is
+-- half-applied, and /ready goes green when it succeeds. If it keeps timing out,
+-- something is holding a long transaction against pipeline_batch_acks; find it in
+-- pg_stat_activity rather than raising the timeout. The two DROPs can also be run by
+-- hand during a quiet minute, using the credential rule in docs/runbook.md, after
+-- which this migration applies as a no-op on its next attempt.
+--
+-- What is NOT true is that "the cost of it never running is the status quo". The cost
+-- of it never running is a red /ready, and that is the correction that matters here.
+-- The cost of the DROPs themselves never happening is the status quo — two indexes
+-- that answer nothing and are paid for on every sink insert.
+--
+-- No transaction control in this file; see 097's header for why that matters.
+
+SET LOCAL lock_timeout = '3s';
+
+DROP INDEX IF EXISTS idx_batch_acks_table;
+DROP INDEX IF EXISTS idx_batch_acks_cdc;

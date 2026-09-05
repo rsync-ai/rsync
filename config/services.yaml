@@ -1,0 +1,74 @@
+# services.yaml — single source of truth for inter-service URLs and ports.
+#
+# Why: every prior outage in this repo started with one service believing
+# kafka:9092 while another believed kafka:29092, or one service hitting
+# llm-service:8000 while it actually listens on :5000. This file is THE
+# canonical answer; loaders in Go and Python read it and refuse to start
+# if a service it depends on is not declared.
+#
+# Rules:
+#   1. Hardcoded URLs in service code are forbidden once a key exists here.
+#      Read from this file (or its env-var equivalent) instead.
+#   2. The `internal_url` is what other containers in the docker-compose
+#      network use. The `external_url` is what the host browser uses
+#      (typically only set for user-facing services).
+#   3. Bumping a port here MUST be accompanied by the matching change in
+#      docker-compose.yml.
+#   4. Each entry's `health_path` is what /version drift check + the
+#      dependency probe will hit.
+
+services:
+
+  api-gateway:
+    internal_url: http://api-gateway:8080
+    external_url: http://localhost:8080
+    health_path: /health
+    version_path: /version
+    role: REST API + auth + canonical pipeline state.
+
+  backend-orchestrator:
+    internal_url: http://orchestrator:8080         # docker-compose service is `orchestrator`, NOT `backend-orchestrator`
+    health_path: /health
+    version_path: /version
+    role: MCP connector lifecycle + dependency liveness probe.
+
+  backend-temporal-adapter:
+    internal_url: http://temporal-adapter:8080
+    health_path: /health
+    version_path: /version
+    role: Translates pipeline requests into Temporal workflows.
+
+  llm-service:
+    internal_url: http://llm-service:5000          # NOT 8000; OpenAPI port is 5000
+    health_path: /health
+    version_path: /version
+    role: Planner + intent + diagnose. FastAPI on uvicorn.
+
+  kafka-mcp-sink:
+    # Stateless worker pool. No HTTP surface; emits heartbeats to Kafka.
+    role: Writes Debezium-captured events to destination MCP. CRITICAL constraint - reaches MCPs over Docker HTTP only.
+
+# Infrastructure that services connect to (not services themselves).
+infrastructure:
+
+  kafka:
+    bootstrap_internal: kafka:29092                # Inter-container listener
+    bootstrap_external: localhost:9092             # Host-machine listener
+    note: |
+      Inside docker-compose, services MUST use port 29092. Port 9092 is the
+      external listener for host tools (kafka-console-consumer from your
+      laptop). Mixing them is the most common config bug in this repo.
+
+  postgres:
+    internal_url: postgres:5432
+    external_url: localhost:5432
+    db_name: rsync_ai
+
+  temporal:
+    internal_url: temporal:7233
+    external_ui: http://localhost:8233
+
+  kafka-connect:
+    internal_url: http://kafka-connect:8083
+    external_url: http://localhost:8083
+    role: Hosts Debezium connector tasks for CDC pipelines.

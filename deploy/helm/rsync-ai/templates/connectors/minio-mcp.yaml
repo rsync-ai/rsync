@@ -1,0 +1,88 @@
+{{- if .Values.connectors.minio.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+{{/*
+The Service name is NOT cosmetic and is NOT release-prefixed. Batch pre-flight
+resolves this host literally:
+
+    http://<STACK_PREFIX>-minio-v1-0-0-mcp:8000/health
+    (internal/workers/infra_preflight.go, batch branch)
+
+Note the id is "minio", not "minio-mcp". Rename this Service and nothing errors:
+pre-flight polls the dead name for the full 120s and then continues on a slower
+path, so the only symptom is that every batch pipeline takes two extra minutes
+to start.
+*/}}
+{{- $name := include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "minio" "version" "v1.0.0") }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-mcp
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+  selector:
+    {{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-mcp
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-minio-mcp
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-mcp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: minio-mcp
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: minio-mcp
+        {{- with .Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: minio-mcp
+          image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.connectors.minio.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            {{- include "rsync-ai.commonEnv" . | nindent 12 }}
+            {{- include "rsync-ai.objectStorageEnv" . | nindent 12 }}
+            - name: PORT
+              value: "8000"
+            # Without this the connector starts in stdio mode and answers no
+            # HTTP at all, so discovery's GET /health never succeeds — which
+            # looks like a crash-looping pod that is in fact perfectly healthy.
+            - name: MCP_HTTP_MODE
+              value: "true"
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.connectors.minio.resources | nindent 12 }}
+{{- end }}

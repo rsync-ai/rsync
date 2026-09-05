@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-06-01T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-06-01T00:00:00.000000",
+      "changes": [
+        "Consolidated from v1.0.14: ensure_table, drop_table, REPLICA IDENTITY FULL, type-aware binding, synthetic PK, upsert_data, cross-DB schema strip, sslmode nil-stringify fix"
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

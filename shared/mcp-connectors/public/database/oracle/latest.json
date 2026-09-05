@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-07-09T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-07-09T00:00:00.000000",
+      "changes": [
+        "Oracle connector (python-oracledb, thin mode): test_connection, discover_schema (USER_*/ALL_* data-dictionary), keyset/offset export with Oracle pagination (OFFSET/FETCH, FETCH FIRST). Destination import_data / upsert_data (MERGE ... FROM dual) / delete_data / DDL helpers + transactional CDC offset tracking (offsets table provisioned before the data txn since Oracle DDL auto-commits). Batch source + destination + Debezium LogMiner CDC. Offline unit suite only; not yet live-verified against a real Oracle instance."
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

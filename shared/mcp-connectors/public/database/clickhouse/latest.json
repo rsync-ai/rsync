@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-07-14T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-07-14T00:00:00.000000",
+      "changes": [
+        "Initial ClickHouse connector (OLAP columnar warehouse) via the official clickhouse-connect HTTP driver (port 8123): batch source + destination. Reads are offset/keyset paginated with JSON-safe value coercion. Writes are INSERT ... FORMAT JSONEachRow (best-effort server-side type coercion). ensure_table creates ReplacingMergeTree ORDER BY (keys) when keys are known (else MergeTree ORDER BY tuple()), Nullable non-key columns; keyed upsert converges via OPTIMIZE ... FINAL. Full relational tool set (get_capabilities/ensure_table/upsert_data/import_data/drop_table) so the kafka-mcp-sink auto-creates and writes on the generic path."
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

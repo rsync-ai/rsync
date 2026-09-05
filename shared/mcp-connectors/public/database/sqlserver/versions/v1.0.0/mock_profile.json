@@ -1,0 +1,69 @@
+{
+  "name": "sqlserver-mock",
+  "description": "Mock profile for sqlserver database connector",
+  "base_url": "http://localhost:37366",
+  "endpoints": [
+    {
+      "path": "/health",
+      "methods": [
+        "GET"
+      ],
+      "description": "",
+      "matcher": null,
+      "response": {
+        "status_code": 200,
+        "headers": {
+          "Content-Type": "application/json"
+        },
+        "body": {
+          "status": "healthy"
+        },
+        "response_type": "static",
+        "template_vars": {},
+        "generator_expr": null,
+        "delay_ms": 0
+      },
+      "error_responses": {},
+      "request_validation": false,
+      "expected_request_schema": null
+    }
+  ],
+  "default_response": {
+    "status_code": 404,
+    "headers": {
+      "Content-Type": "application/json"
+    },
+    "body": {
+      "error": "Not Found",
+      "message": "Endpoint not found"
+    },
+    "response_type": "static",
+    "template_vars": {},
+    "generator_expr": null,
+    "delay_ms": 0
+  },
+  "auth": null,
+  "chaos_config": {
+    "enabled": true,
+    "latency_enabled": true,
+    "latency_range_ms": [
+      50,
+      200
+    ],
+    "error_rate": 0.05,
+    "error_types": [
+      "timeout",
+      "server_error"
+    ],
+    "rate_limit_enabled": false,
+    "rate_limit_requests": 100,
+    "rate_limit_window_seconds": 60,
+    "malformed_response_rate": 0.0
+  },
+  "global_response_headers": {
+    "X-Mock-Server": "true",
+    "Content-Type": "application/json"
+  },
+  "log_requests": true,
+  "spec_version": "1.0"
+}

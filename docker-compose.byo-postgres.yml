@@ -1,0 +1,118 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Bring-your-own PostgreSQL — drop the bundled metadata database.
+#
+#   docker compose -f docker-compose.quickstart.yml -f docker-compose.byo-postgres.yml up -d
+#
+# Requires the connection details in .env, e.g.:
+#   POSTGRES_HOST=my-instance.abc123.us-east-1.rds.amazonaws.com
+#   POSTGRES_PORT=5432
+#   POSTGRES_USER=rsync
+#   POSTGRES_PASSWORD=...
+#   POSTGRES_DB=pipeline_db
+#   POSTGRES_SSLMODE=require
+#   POSTGRES_TLS_ENABLED=true        # Temporal's own TLS switch, see below
+#
+# This is the metadata database: pipeline definitions, run history, and the
+# encrypted connection credentials. Pipeline *rows* never land here. Combine
+# freely with docker-compose.byo-kafka.yml — the two overlays are independent.
+#
+# ── What you must create first ───────────────────────────────────────────────
+# The database named by POSTGRES_DB, and a role that can create tables in it.
+# api-gateway and orchestrator both run their own migrations into it on first
+# boot, so that role needs DDL there.
+#
+# Then TWO MORE DATABASES, and these are mandatory, not a managed-instance
+# caveat. Temporal keeps its own state outside POSTGRES_DB entirely:
+#
+#   CREATE DATABASE temporal            OWNER rsync;
+#   CREATE DATABASE temporal_visibility OWNER rsync;
+#
+# This overlay sets SKIP_DB_CREATE=true on `temporal` (bottom of this file), so
+# nothing creates them for you. Both halves are required, and each alone fails:
+#
+#   * Without SKIP_DB_CREATE, auto-setup runs `CREATE DATABASE` as POSTGRES_USER
+#     whether or not the database is already there. Its only guard is the name
+#     test `[[ ${DBNAME} != ${POSTGRES_USER} && ${SKIP_DB_CREATE} != true ]]` —
+#     existence is never checked — so on a BYO instance it always runs, and
+#     exits 1 with `pq: permission denied to create database` for any role
+#     without CREATEDB. A managed instance's application role normally has none.
+#     Pre-creating the databases does NOT avoid this: the create is still
+#     attempted, and still denied.
+#   * With SKIP_DB_CREATE but without the two databases, the next step fails
+#     instead: `pq: database "temporal" does not exist` from setup-schema.
+#
+# Either failure takes the whole container down rather than degrading. The image
+# entrypoint is `auto-setup.sh && start-temporal.sh` under `set -e`, so a
+# non-zero create means the server is never reached: the stack crash-loops with
+# no workflow engine and every pipeline hangs.
+#
+# Also TWO EXTENSIONS, which a locked-down managed role usually cannot create:
+#
+#   uuid-ossp   001_init_schema.sql:5, 021_add_audit_logs.sql:4 -- uuid_generate_v4()
+#   pg_trgm     020b_workspace_connection_refs.sql:12 -- the gin_trgm_ops indexes
+#
+# `IF NOT EXISTS` does NOT make them optional: it only suppresses the error when
+# the extension is ALREADY there. Absent + unprivileged still raises. Pre-create
+# both as an admin against POSTGRES_DB and the migrations' statements become the
+# no-op they look like:
+#
+#   CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+#   CREATE EXTENSION IF NOT EXISTS pg_trgm;
+#
+# Skip this and the break is silent, not loud: the runner stops at the FIRST
+# failing file (migrate.go:127-129) and 001 is the first, so nothing migrates;
+# main.go:311-313 logs the error and starts serving anyway; and the healthcheck
+# hits /health, an unconditional 200 that never touches the DB. You get a
+# "healthy" stack on an empty schema. `/ready` is the endpoint that knows.
+# Full walkthrough + per-provider caveats (Azure's azure.extensions allow-list,
+# Cloud SQL's cloudsqlsuperuser): docs/deployment/self-hosting.md
+# § Bring Your Own PostgreSQL, step 2b.
+#
+# ── TLS is not one switch ────────────────────────────────────────────────────
+# POSTGRES_SSLMODE covers the three Go services (api-gateway's DSN,
+# orchestrator's DB_SSLMODE, temporal-adapter's POSTGRES_SSLMODE). Temporal
+# ignores it, and Temporal is really two programs: auto-setup runs
+# temporal-sql-tool to create the schemas, then starts the server, and they read
+# DIFFERENT env names for the same fact. The base file feeds both from one
+# POSTGRES_TLS_* key each, so you set these once:
+#
+#   POSTGRES_TLS_ENABLED      -> SQL_TLS_ENABLED (server) + SQL_TLS (schema tool)
+#   POSTGRES_TLS_CA_FILE      -> SQL_CA          + SQL_TLS_CA_FILE
+#   POSTGRES_TLS_SERVER_NAME  -> SQL_HOST_NAME   + SQL_TLS_SERVER_NAME
+#   POSTGRES_TLS_VERIFY_HOST  -> SQL_HOST_VERIFICATION
+#   POSTGRES_TLS_SKIP_HOST_VERIFY -> SQL_TLS_DISABLE_HOST_VERIFICATION (inverse!)
+#
+# Set sslmode alone against a database that mandates TLS and the schema step
+# fails before the server ever binds — no workflow engine, every pipeline hangs,
+# and no TLS error in any log to point at the cause.
+#
+# ── How the removal works, and why it is spelled this way ────────────────────
+# Compose overlays merge; they cannot delete a service. Assigning a profile that
+# is never activated is the supported way to exclude one, because a service in a
+# non-active profile is absent from the rendered project entirely.
+#
+# That half alone is a trap. A service excluded by profile is still named by
+# `depends_on` in the base file, and Compose rejects the whole project with
+# "depends on undefined service postgres" — nothing starts, which is strictly
+# worse than the waste this overlay removes. The pairing fix lives in the base
+# file: every `depends_on: postgres` there carries `required: false`. Both
+# halves are needed; either one alone takes the stack down.
+#
+# ── What still runs ──────────────────────────────────────────────────────────
+# `demo-warehouse` is a different service and is deliberately NOT excluded. It
+# is the sample destination behind "Start with sample data" — a throwaway
+# Postgres holding demo rows, nothing to do with the metadata database. Drop it
+# by removing the demo profile, not with this overlay.
+# ─────────────────────────────────────────────────────────────────────────────
+services:
+  postgres:
+    # Never activated => the bundled database is excluded from the project.
+    profiles: ["bundled-db-disabled"]
+
+  temporal:
+    environment:
+      # Pairs with the two pre-created databases above — see "What you must
+      # create first". The bundled path does not need this (its POSTGRES_USER is
+      # the postgres superuser), which is why it lives in this overlay and not in
+      # the base file: it must not change the bundled-database behaviour.
+      SKIP_DB_CREATE: "true"

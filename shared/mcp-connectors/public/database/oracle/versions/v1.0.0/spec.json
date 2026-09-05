@@ -1,0 +1,434 @@
+{
+  "name": "oracle",
+  "display_name": "Oracle Database",
+  "aliases": null,
+  "version": "1.0.0",
+  "description": "Connector for Oracle Database (batch source + destination + Debezium LogMiner CDC). python-oracledb thin mode.",
+  "category": "relational_db",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": true,
+  "api_category_hint": null,
+  "api_category_hint_source": null,
+  "api_category_hint_confidence": null,
+  "base_url": "http://localhost:9999",
+  "default_port": 1521,
+  "connection_timeout": 30,
+  "auth": {
+    "type": "basic",
+    "header_name": "Authorization",
+    "header_prefix": "Bearer",
+    "env_var": "ORACLE_API_KEY",
+    "username_env": "ORACLE_USER",
+    "password_env": "ORACLE_PASSWORD",
+    "oauth_provider": null,
+    "oauth_scopes": null,
+    "token_url": null,
+    "authorize_url": null,
+    "custom_headers": null
+  },
+  "config_fields": [
+    {
+      "name": "host",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "default": null,
+      "description": "Oracle host address",
+      "env_var": "ORACLE_HOST",
+      "validation_regex": null,
+      "enum_values": null,
+      "pattern": null,
+      "min_length": null,
+      "max_length": null,
+      "minimum": null,
+      "maximum": null,
+      "ui_widget": null,
+      "ui_order": null,
+      "ui_placeholder": null,
+      "ui_help_text": null,
+      "sensitive": null,
+      "depends_on": null
+    },
+    {
+      "name": "port",
+      "type": "integer",
+      "required": true,
+      "secret": false,
+      "default": 1521,
+      "description": "Oracle listener port number",
+      "env_var": "ORACLE_PORT",
+      "validation_regex": null,
+      "enum_values": null,
+      "pattern": null,
+      "min_length": null,
+      "max_length": null,
+      "minimum": null,
+      "maximum": null,
+      "ui_widget": null,
+      "ui_order": null,
+      "ui_placeholder": null,
+      "ui_help_text": null,
+      "sensitive": null,
+      "depends_on": null
+    },
+    {
+      "name": "service_name",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": null,
+      "description": "Oracle service name (modern; Easy-Connect). Prefer over SID. Falls back to 'database' if unset.",
+      "env_var": "ORACLE_SERVICE_NAME",
+      "validation_regex": null,
+      "enum_values": null,
+      "pattern": null,
+      "min_length": null,
+      "max_length": null,
+      "minimum": null,
+      "maximum": null,
+      "ui_widget": null,
+      "ui_order": null,
+      "ui_placeholder": null,
+      "ui_help_text": null,
+      "sensitive": null,
+      "depends_on": null
+    },
+    {
+      "name": "sid",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": null,
+      "description": "Oracle SID (legacy). Used only when no service_name/dsn is supplied.",
+      "env_var": "ORACLE_SID",
+      "validation_regex": null,
+      "enum_values": null,
+      "pattern": null,
+      "min_length": null,
+      "max_length": null,
+      "minimum": null,
+      "maximum": null,
+      "ui_widget": null,
+      "ui_order": null,
+      "ui_placeholder": null,
+      "ui_help_text": null,
+      "sensitive": null,
+      "depends_on": null
+    },
+    {
+      "name": "user",
+      "type": "string",
+      "required": true,
+      "secret": false,
+      "default": null,
+      "description": "Oracle username",
+      "env_var": "ORACLE_USER",
+      "validation_regex": null,
+      "enum_values": null,
+      "pattern": null,
+      "min_length": null,
+      "max_length": null,
+      "minimum": null,
+      "maximum": null,
+      "ui_widget": null,
+      "ui_order": null,
+      "ui_placeholder": null,
+      "ui_help_text": null,
+      "sensitive": null,
+      "depends_on": null
+    },
+    {
+      "name": "password",
+      "type": "string",
+      "required": true,
+      "secret": true,
+      "default": null,
+      "description": "Oracle password",
+      "env_var": "ORACLE_PASSWORD",
+      "validation_regex": null,
+      "enum_values": null,
+      "pattern": null,
+      "min_length": null,
+      "max_length": null,
+      "minimum": null,
+      "maximum": null,
+      "ui_widget": null,
+      "ui_order": null,
+      "ui_placeholder": null,
+      "ui_help_text": null,
+      "sensitive": null,
+      "depends_on": null
+    },
+    {
+      "name": "wallet_location",
+      "type": "string",
+      "required": false,
+      "secret": false,
+      "default": null,
+      "description": "Path to an Oracle wallet directory (Autonomous DB mTLS)",
+      "env_var": "ORACLE_WALLET_LOCATION",
+      "validation_regex": null,
+      "enum_values": null,
+      "pattern": null,
+      "min_length": null,
+      "max_length": null,
+      "minimum": null,
+      "maximum": null,
+      "ui_widget": null,
+      "ui_order": null,
+      "ui_placeholder": null,
+      "ui_help_text": null,
+      "sensitive": null,
+      "depends_on": null
+    }
+  ],
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity to the data source",
+      "parameters": [],
+      "returns_schema": null,
+      "requires_connection": false,
+      "idempotent": true
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration without connecting",
+      "parameters": [],
+      "returns_schema": null,
+      "requires_connection": false,
+      "idempotent": true
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover available tables and their schemas",
+      "parameters": [
+        {
+          "name": "include_columns",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include column metadata (names, types, nullability)",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "include_row_counts",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include estimated row counts (fast, no full scans)",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "include_relationships",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Include primary keys and foreign keys (for agents)",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "include_indexes",
+          "type": "boolean",
+          "required": false,
+          "default": false,
+          "description": "Include index metadata (for agents)",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "max_tables",
+          "type": "integer",
+          "required": false,
+          "default": 100,
+          "description": "Maximum number of tables to return",
+          "enum_values": null,
+          "secret": false
+        }
+      ],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities for agent interaction",
+      "parameters": [],
+      "returns_schema": null,
+      "requires_connection": false,
+      "idempotent": true
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export data from a table",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true,
+          "default": null,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 10000,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "offset",
+          "type": "integer",
+          "required": false,
+          "default": 0,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "where",
+          "type": "string",
+          "required": false,
+          "default": "",
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "columns",
+          "type": "array",
+          "required": false,
+          "default": [],
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        }
+      ],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Import data into a table",
+      "parameters": [
+        {
+          "name": "table",
+          "type": "string",
+          "required": true,
+          "default": null,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "data",
+          "type": "array",
+          "required": true,
+          "default": null,
+          "description": "",
+          "enum_values": null,
+          "secret": false
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "required": false,
+          "default": "append",
+          "description": "",
+          "enum_values": [
+            "append",
+            "replace",
+            "upsert"
+          ],
+          "secret": false
+        }
+      ],
+      "returns_schema": null,
+      "requires_connection": true,
+      "idempotent": true
+    }
+  ],
+  "resources": [
+    {
+      "name": "health",
+      "endpoint": "/health",
+      "id_field": "id",
+      "supports_list": false,
+      "supports_get": true,
+      "supports_create": false,
+      "supports_update": false,
+      "supports_delete": false,
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100
+    },
+    {
+      "name": "collections",
+      "endpoint": "/collections",
+      "id_field": "id",
+      "supports_list": true,
+      "supports_get": false,
+      "supports_create": false,
+      "supports_update": false,
+      "supports_delete": false,
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100
+    }
+  ],
+  "max_batch_size": 10000,
+  "supported_formats": [
+    "csv",
+    "json"
+  ],
+  "python_dependencies": [
+    "oracledb>=2.0.0"
+  ],
+  "spec_version": "1.0",
+  "author": null,
+  "license": "MIT",
+  "repository": null,
+  "documentation_url": null,
+  "quality_tier": "bronze",
+  "quality_score": 30.0,
+  "authoritativeness_score": null,
+  "status": "active",
+  "qa_warnings": [],
+  "qa_metadata": {
+    "export_validation_status": "unit_only",
+    "export_validated_with": null,
+    "export_attempts": [
+      {
+        "test": "relational_db_offline_unit",
+        "passed": true,
+        "status": "",
+        "error": null,
+        "warning": "Not yet live-verified against a real Oracle instance",
+        "response_sample": {
+          "success": true,
+          "message": "Offline unit suite (test_oracle_connector.py)"
+        }
+      }
+    ],
+    "tests_passed": 0,
+    "tests_failed": 0
+  },
+  "curated_actions": null
+}

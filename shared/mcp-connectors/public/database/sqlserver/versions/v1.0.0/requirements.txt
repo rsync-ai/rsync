@@ -1,0 +1,15 @@
+# Auto-generated requirements for SQL Server connector
+# Generated: 2026-07-04T00:00:00.000000
+
+# Base dependencies (always required)
+# Note: base_connector.py is expected from parent directory
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Database driver for SQL Server / Azure SQL (pyodbc + Microsoft ODBC Driver 18,
+# installed as a system package in the Dockerfile). pyodbc uses '?' qmark
+# paramstyle, which the connector's SQL Server code path targets.
+pyodbc>=5.0.0

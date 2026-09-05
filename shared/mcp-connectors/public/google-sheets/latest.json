@@ -1,0 +1,19 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-05-22T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-05-22T00:00:00.000000",
+      "changes": [
+        "Initial hand-curated Google Sheets destination connector. Operations: test_connection, validate_config, discover_schema, get_capabilities, ensure_table, import_data. OAuth2 via the 'google' provider with the spreadsheets scope.",
+        "Added source mode in-place: implemented export (offset-paged values:get over a row range; each tab is a table, row 1 is the header, data starts row 2) and flipped supports_source=true. Additive — destination behaviour unchanged."
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

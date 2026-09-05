@@ -1,0 +1,21 @@
+# CI isolation override for docker-compose.e2e.dbs.yml — e2e DB fixtures (dc_e2e)
+# AUTO-GENERATED (from worktree compose). Applied by run_gate.sh ONLY when STACK_PREFIX != rsync-ai.
+services:
+  mock-github:
+    container_name: ${STACK_PREFIX:-rsync-ai}-mock-github
+  mock-graphql:
+    container_name: ${STACK_PREFIX:-rsync-ai}-mock-graphql
+  mongo-e2e:
+    container_name: ${STACK_PREFIX:-rsync-ai}-mongo-e2e
+  mysql-e2e:
+    container_name: ${STACK_PREFIX:-rsync-ai}-mysql-e2e
+  postgres-e2e:
+    container_name: ${STACK_PREFIX:-rsync-ai}-postgres-e2e
+  minio-init:
+    # profiled service (excluded from `docker compose config`) — re-pin so the
+    # bucket-init one-shot doesn't collide with a rsync-ai-e2e minio-init.
+    container_name: ${STACK_PREFIX:-rsync-ai}-minio-init
+networks:
+  rsync-ai_default:
+    external: true
+    name: ${STACK_PREFIX:-rsync-ai}_default

@@ -1,0 +1,76 @@
+# kind + BYO-Kafka test values.
+#
+# Pairs with broker-up.sh, which runs a real Kafka broker as a Docker container
+# on the `kind` network -- OUTSIDE the cluster -- and wires a headless Service +
+# hand-written EndpointSlice so `byo-kafka.rsync.svc.cluster.local` resolves to
+# it from inside. That indirection is the point: the broker advertises the DNS
+# name, so clients reconnect through the in-cluster path rather than silently
+# bypassing it via the bootstrap address.
+#
+# NO SECRETS HERE. Pass them in a second `-f` file that is not committed.
+
+kafka:
+  enabled: false
+
+  # Both MUST be set for a BYO cluster. Left empty, cdc.yaml's
+  #   $rf := .Values.kafka.replicationFactor | default (ternary "1" "3" .Values.kafka.enabled)
+  # resolves to "3" the moment kafka.enabled=false, and Kafka Connect's three
+  # internal topics are then created with RF=3 against a one-broker cluster.
+  # values.yaml documents "set both for MSK/Confluent"; nothing enforces it.
+  replicationFactor: "1"
+  minInsyncReplicas: "1"
+
+  external:
+    bootstrapServers: byo-kafka.rsync.svc.cluster.local:9093
+    # S0 baseline. broker-up.sh raises this per stage (S1..S4); this file is
+    # overlaid with a per-stage file rather than edited in place, so the
+    # baseline stays reproducible.
+    securityProtocol: PLAINTEXT
+
+# The CDC plane is what actually exercises the BYO broker: kafka-connect is a
+# separate Kafka client from the Go services, with its own worker/producer/
+# consumer config, and it is where a partial security config fails silently.
+connectors:
+  cdc:
+    enabled: true
+
+  # One source/destination connector, so the pass criterion can be "N rows
+  # arrived" rather than "the pods are Ready". mcp-postgresql is NOT published by
+  # docker-publish.yml -- `build-and-load.sh fleet` builds it from this checkout
+  # and kind-loads it, which is the only reason this entry resolves.
+  fleet:
+    - id: postgresql
+      version: v1.0.0
+      image: { repository: mcp-postgresql, tag: "" }
+      resources:
+        requests: { cpu: 50m, memory: 96Mi }
+        limits: { memory: 256Mi }
+      env: {}
+
+# Off to fit the node budget below, not because the images are missing:
+# llm-service-oss and connector-lifecycle are both published. This harness
+# exercises broker wiring on a Go create+run data path that needs neither.
+generation:
+  enabled: false
+
+# ── Fit inside Docker Desktop's 7 CPU / 8.7 GiB ──────────────────────────────
+# Requests only; limits are left at chart defaults so an over-run still OOMs
+# rather than quietly starving the node. Single replicas: this harness tests
+# broker wiring, not HA.
+apiGateway:
+  replicaCount: 1
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+
+frontend:
+  replicaCount: 1
+  resources:
+    requests: { cpu: 50m, memory: 192Mi }
+
+orchestrator:
+  resources:
+    requests: { cpu: 250m, memory: 512Mi }
+
+temporalAdapter:
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }

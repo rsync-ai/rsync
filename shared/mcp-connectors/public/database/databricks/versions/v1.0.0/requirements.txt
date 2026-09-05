@@ -1,0 +1,10 @@
+# Requirements for the Databricks MCP connector.
+# Databricks ships a PEP-249 DB-API 2.0 driver (databricks-sql-connector).
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Databricks SQL driver (DB-API)
+databricks-sql-connector>=3.0.0

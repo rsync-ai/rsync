@@ -1,0 +1,19 @@
+# Traefik Static Configuration — local prod-mirror
+# FILE provider only — no Docker labels, no TLS conflicts.
+# All routes are defined in dynamic.local.yml.
+
+api:
+  dashboard: true
+  insecure: true  # dashboard at http://localhost:8090/dashboard/
+
+log:
+  level: INFO
+
+entryPoints:
+  web:
+    address: ":80"
+
+providers:
+  file:
+    filename: /etc/traefik/dynamic.yml
+    watch: true

@@ -1,0 +1,195 @@
+# =============================================================================
+# OTEL Collector Sidecar Configuration
+# =============================================================================
+# This configuration file defines a standard OTEL Collector sidecar deployment
+# pattern for all rsync-ai services.
+#
+# The sidecar:
+# 1. Receives OTLP traces/metrics from the application on localhost:4317
+# 2. Scrapes container logs from stdout/stderr (Docker filelog)
+# 3. Parses JSON logs and extracts trace_id for log-trace correlation
+# 4. Exports all telemetry data to SigNoz backend
+#
+# Usage:
+# - Deploy this collector as a sidecar container alongside each service
+# - Configure services to export OTLP to localhost:4317
+# - Configure services to output JSON logs to stdout
+#
+# Environment Variables:
+# - SIGNOZ_ENDPOINT: SigNoz OTLP endpoint (e.g., "signoz-otel-collector:4317")
+# - SERVICE_NAME: Name of the service for log enrichment
+# =============================================================================
+
+receivers:
+  # OTLP Receiver - Receives traces and metrics from the application
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Filelog Receiver - Scrapes container logs
+  # Configured to read Docker container stdout/stderr logs
+  filelog:
+    include:
+      # Docker container log paths
+      - /var/log/containers/*_${env:POD_NAMESPACE}_${env:SERVICE_NAME}*.log
+      # Alternative: Local Docker logs
+      - /var/lib/docker/containers/*/*.log
+    start_at: end
+    include_file_path: true
+    include_file_name: true
+    
+    # Operators to parse and enrich logs
+    operators:
+      # Parse Docker JSON log format
+      - type: json_parser
+        id: docker_parser
+        if: 'body matches "^\\{"'
+        timestamp:
+          parse_from: attributes.time
+          layout: '%Y-%m-%dT%H:%M:%S.%LZ'
+        
+      # Extract trace_id from parsed JSON if present
+      - type: move
+        id: move_trace_id
+        if: 'attributes.trace_id != nil'
+        from: attributes.trace_id
+        to: attributes["trace.id"]
+        
+      # Extract span_id from parsed JSON if present
+      - type: move
+        id: move_span_id
+        if: 'attributes.span_id != nil'
+        from: attributes.span_id
+        to: attributes["span.id"]
+        
+      # Add severity parsing
+      - type: severity_parser
+        if: 'attributes.level != nil'
+        parse_from: attributes.level
+        mapping:
+          debug: debug
+          info: info
+          warn: warn
+          warning: warn
+          error: error
+          fatal: fatal
+          panic: fatal
+
+  # Host metrics for infrastructure visibility
+  hostmetrics:
+    collection_interval: 30s
+    scrapers:
+      cpu:
+      memory:
+      disk:
+      network:
+
+processors:
+  # Batch processor for efficient export
+  batch:
+    send_batch_size: 1000
+    timeout: 10s
+    send_batch_max_size: 1500
+
+  # Memory limiter to prevent OOM
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 400
+    spike_limit_mib: 100
+
+  # Resource processor to add service metadata
+  resource:
+    attributes:
+      - key: service.name
+        value: ${env:SERVICE_NAME}
+        action: upsert
+      - key: deployment.environment
+        value: ${env:ENVIRONMENT}
+        action: upsert
+      - key: service.namespace
+        value: rsync-ai
+        action: upsert
+
+  # Attributes processor for log enrichment
+  attributes:
+    actions:
+      # Ensure trace.id is properly formatted for SigNoz correlation
+      - key: trace.id
+        from_attribute: trace_id
+        action: upsert
+      - key: span.id
+        from_attribute: span_id
+        action: upsert
+
+  # Transform processor for log-trace linking
+  transform:
+    log_statements:
+      - context: log
+        statements:
+          # Set TraceID and SpanID on log records for correlation
+          - set(trace_id, TraceID(attributes["trace.id"])) where attributes["trace.id"] != nil
+          - set(span_id, SpanID(attributes["span.id"])) where attributes["span.id"] != nil
+
+exporters:
+  # OTLP exporter to SigNoz
+  otlp:
+    endpoint: ${env:SIGNOZ_ENDPOINT}
+    tls:
+      insecure: ${env:SIGNOZ_INSECURE}
+    headers:
+      signoz-access-token: ${env:SIGNOZ_ACCESS_TOKEN}
+
+  # Debug exporter for local development
+  debug:
+    verbosity: detailed
+    sampling_initial: 5
+    sampling_thereafter: 200
+
+  # Logging exporter (logs to stdout for debugging)
+  logging:
+    loglevel: info
+
+extensions:
+  # Health check extension
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # Pprof for profiling
+  pprof:
+    endpoint: 0.0.0.0:1777
+
+  # Zpages for debugging
+  zpages:
+    endpoint: 0.0.0.0:55679
+
+service:
+  extensions: [health_check, pprof, zpages]
+  
+  pipelines:
+    # Traces pipeline
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch, resource]
+      exporters: [otlp]
+    
+    # Metrics pipeline
+    metrics:
+      receivers: [otlp, hostmetrics]
+      processors: [memory_limiter, batch, resource]
+      exporters: [otlp]
+    
+    # Logs pipeline (with trace correlation)
+    logs:
+      receivers: [otlp, filelog]
+      processors: [memory_limiter, attributes, transform, batch, resource]
+      exporters: [otlp]
+
+  telemetry:
+    logs:
+      level: info
+    metrics:
+      address: 0.0.0.0:8888
+

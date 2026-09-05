@@ -1,0 +1,38 @@
+# Build context hygiene for Dockerfile.seed.
+#
+# CI publishes this image from a clean checkout, so it only ever sees tracked
+# files. A LOCAL build (docker-compose.oss.yml `connector-seed`) uses the working
+# tree instead, and the seed is `cp -a`'d onto the mcp_connectors volume — so
+# anything stray here lands on a self-hoster's connector tree. Measured on a
+# developer tree: 87.5MB seeded instead of 25.4MB, of which 51.5MB was a stray
+# python3.11 venv and 29MB was 1224 stale .pyc files.
+#
+# The .pyc are the part that actually bites: connectors are patched in place
+# (see CLAUDE.md "patch the active version in place"), and CPython validates
+# cached bytecode on (source mtime-seconds, source size). A baked .pyc that
+# collides on both against a patched .py runs the OLD connector silently.
+#
+# Keeping this list aligned with .gitignore is what makes a local build produce
+# the same artifact CI publishes.
+
+# Stale bytecode — must never reach the volume.
+**/__pycache__/
+**/*.py[cod]
+
+# Developer virtualenvs (gitignored; pinned to a host interpreter, useless in-image).
+**/venv/
+**/.venv/
+**/env/
+
+# Not runtime artifacts.
+**/tests/
+**/test_*.py
+**/*_test.py
+**/.pytest_cache/
+**/*.md
+**/.DS_Store
+
+# The generation moat is already excluded by Dockerfile.seed's allowlist COPY;
+# listed here too so a future COPY . never silently reintroduces it.
+generators/
+oauth/

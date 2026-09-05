@@ -1,0 +1,789 @@
+{
+  "info": {
+    "name": "Rsync AI (Local Docker)",
+    "description": "Postman collection for Rsync AI running locally via docker-compose.\n\nBase URLs are driven by the environment variables in `rsync-ai.local.postman_environment.json`.\n\nNotes:\n- Most endpoints accept `X-User-ID` (dev-friendly) and will fall back to the seeded dev user.\n- Many workflow endpoints are asynchronous; use `GET /pipelines/:id/state` and events to observe progress.\n",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "API Gateway - Health",
+          "request": {
+            "method": "GET",
+            "url": "{{apiGatewayUrl}}/health"
+          }
+        },
+        {
+          "name": "Frontend - Health (proxy checks API)",
+          "request": {
+            "method": "GET",
+            "url": "http://localhost:3000/api/health"
+          }
+        },
+        {
+          "name": "Orchestrator - Health",
+          "request": {
+            "method": "GET",
+            "url": "{{orchestratorUrl}}/health"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auth (optional)",
+      "item": [
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"dev@rsync.ai\",\n  \"password\": \"dev\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/auth/login"
+          }
+        },
+        {
+          "name": "Me",
+          "request": {
+            "method": "GET",
+            "url": "{{apiBaseUrl}}/auth/me"
+          }
+        },
+        {
+          "name": "Logout",
+          "request": {
+            "method": "POST",
+            "url": "{{apiBaseUrl}}/auth/logout"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Feature flags",
+      "item": [
+        {
+          "name": "Get feature flags",
+          "request": {
+            "method": "GET",
+            "url": "{{apiBaseUrl}}/features"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Pipelines",
+      "item": [
+        {
+          "name": "List pipelines",
+          "request": {
+            "method": "GET",
+            "header": [
+              { "key": "X-User-ID", "value": "{{userId}}" },
+              { "key": "Authorization", "value": "Bearer {{authToken}}", "disabled": true }
+            ],
+            "url": "{{apiBaseUrl}}/pipelines?limit=20&offset=0"
+          }
+        },
+        {
+          "name": "Create pipeline",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Postman Pipeline\",\n  \"description\": \"Created from Postman\",\n  \"request\": \"Sync MySQL users table to S3\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/pipelines"
+          }
+        },
+        {
+          "name": "Get pipeline",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}"
+          }
+        },
+        {
+          "name": "Get pipeline state",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/state"
+          }
+        },
+        {
+          "name": "Run pipeline",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/run"
+          }
+        },
+        {
+          "name": "Pause pipeline",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/pause"
+          }
+        },
+        {
+          "name": "Resume pipeline",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/resume"
+          }
+        },
+        {
+          "name": "Stop pipeline",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/stop"
+          }
+        },
+        {
+          "name": "Delete pipeline",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}"
+          }
+        },
+        {
+          "name": "List pipeline events",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/events"
+          }
+        },
+        {
+          "name": "List checkpoints (advisory)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/checkpoints"
+          }
+        },
+        {
+          "name": "CDC status (Debezium/Kafka Connect)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/cdc/status"
+          }
+        },
+        {
+          "name": "CDC restart",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/cdc/restart"
+          }
+        },
+        {
+          "name": "HITL: submit selected tables",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"selected_tables\": [\"public.users\"]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/hitl/tables"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Schedules",
+      "item": [
+        {
+          "name": "Create schedule (interval)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"schedule_type\": \"interval\",\n  \"schedule_spec\": {\n    \"every_seconds\": 60,\n    \"timezone\": \"UTC\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/schedules"
+          }
+        },
+        {
+          "name": "List schedules",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/schedules"
+          }
+        },
+        {
+          "name": "Trigger schedule now",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/schedules/{{scheduleId}}/trigger"
+          }
+        },
+        {
+          "name": "Pause schedule",
+          "request": {
+            "method": "PATCH",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"reason\": \"Paused from Postman\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/schedules/{{scheduleId}}/pause"
+          }
+        },
+        {
+          "name": "Resume schedule",
+          "request": {
+            "method": "PATCH",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/schedules/{{scheduleId}}/resume"
+          }
+        },
+        {
+          "name": "Delete schedule",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/pipelines/{{pipelineId}}/schedules/{{scheduleId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Executions",
+      "item": [
+        {
+          "name": "List executions",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/executions?limit=20"
+          }
+        },
+        {
+          "name": "Get execution",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/executions/{{executionId}}"
+          }
+        },
+        {
+          "name": "Cancel execution",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/executions/{{executionId}}/cancel"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Connections",
+      "item": [
+        {
+          "name": "List connections",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/connections?type=source"
+          }
+        },
+        {
+          "name": "Create connection (MySQL example)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"mysql-e2e\",\n  \"connection_type\": \"source\",\n  \"connector_type\": \"mysql\",\n  \"sync_mode\": \"batch\",\n  \"config\": {\n    \"host\": \"mysql-e2e\",\n    \"port\": 3306,\n    \"user\": \"root\",\n    \"password\": \"password\",\n    \"database\": \"e2e\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/connections"
+          }
+        },
+        {
+          "name": "Test connection (pre-create)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"connector_type\": \"mysql\",\n  \"connection_type\": \"source\",\n  \"config\": {\n    \"host\": \"mysql-e2e\",\n    \"port\": 3306,\n    \"user\": \"root\",\n    \"password\": \"password\",\n    \"database\": \"e2e\"\n  }\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/connections/test"
+          }
+        },
+        {
+          "name": "Get connection",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/connections/{{connectionId}}"
+          }
+        },
+        {
+          "name": "Get connection metadata (tables/columns/counts)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/connections/{{connectionId}}/metadata"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Connectors",
+      "item": [
+        {
+          "name": "List connectors",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/connectors"
+          }
+        },
+        {
+          "name": "Get connector",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/connectors/{{connectorName}}"
+          }
+        },
+        {
+          "name": "Get connector logo",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/connectors/{{connectorName}}/logo"
+          }
+        },
+        {
+          "name": "Validate connector",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"connector_name\": \"mysql\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/connectors/validate"
+          }
+        },
+        {
+          "name": "Detect connector category (API/SaaS)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"api_name\": \"freshdesk\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/connectors/detect-category"
+          }
+        },
+        {
+          "name": "Generate connector",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"api_name\": \"freshdesk\",\n  \"docs_url\": \"\",\n  \"api_category_hint\": \"support\",\n  \"developer_mode\": false,\n  \"force_regenerate\": false\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/connectors/generate"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Transforms",
+      "item": [
+        {
+          "name": "Parse transforms from natural language",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"natural_language\": \"mask email and hash phone\",\n  \"schema\": {}\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/transforms/parse"
+          }
+        },
+        {
+          "name": "Preview transforms",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"rows\": [{\"email\": \"a@example.com\", \"phone\": \"123\"}],\n  \"transforms\": []\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/transforms/preview"
+          }
+        },
+        {
+          "name": "Get pipeline transforms",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/transforms/pipeline/{{pipelineId}}"
+          }
+        },
+        {
+          "name": "Save pipeline transforms",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"transforms\": [\n    {\n      \"transform_type\": \"consumer\",\n      \"transform_config\": {\"type\": \"mask_pii\", \"config\": {\"auto_detect\": true}},\n      \"enabled\": true\n    }\n  ]\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/transforms/pipeline/{{pipelineId}}"
+          }
+        },
+        {
+          "name": "Delete pipeline transforms",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/transforms/pipeline/{{pipelineId}}"
+          }
+        },
+        {
+          "name": "Update transform (by id)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"transform_config\": {\"type\": \"mask_pii\", \"config\": {\"auto_detect\": true}},\n  \"enabled\": true\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/transforms/{{transformId}}"
+          }
+        },
+        {
+          "name": "Delete transform (by id)",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/transforms/{{transformId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Suggestions (LLM proxy)",
+      "item": [
+        {
+          "name": "Generate suggestions",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"schema\": {},\n  \"intent\": {\"goal\": \"sync\"}\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/suggestions/generate"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Schema Registry",
+      "item": [
+        {
+          "name": "List subjects",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/schemas"
+          }
+        },
+        {
+          "name": "Registry info",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/schemas/info"
+          }
+        },
+        {
+          "name": "Get global config",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/schemas/config"
+          }
+        },
+        {
+          "name": "Set global config (compatibility)",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"compatibility\": \"BACKWARD\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/schemas/config"
+          }
+        },
+        {
+          "name": "Get subject versions",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/schemas/{{subject}}"
+          }
+        },
+        {
+          "name": "Get schema (subject + version)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/schemas/{{subject}}/versions/{{schemaVersion}}"
+          }
+        },
+        {
+          "name": "Register schema (subject)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"schema\": \"{\\\"type\\\":\\\"record\\\",\\\"name\\\":\\\"User\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"string\\\"}]}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/schemas/{{subject}}"
+          }
+        },
+        {
+          "name": "Check compatibility (subject)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"schema\": \"{\\\"type\\\":\\\"record\\\",\\\"name\\\":\\\"User\\\",\\\"fields\\\":[{\\\"name\\\":\\\"id\\\",\\\"type\\\":\\\"string\\\"}]}\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/schemas/{{subject}}/compatibility?version={{schemaVersion}}"
+          }
+        },
+        {
+          "name": "Get subject config",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/schemas/{{subject}}/config"
+          }
+        },
+        {
+          "name": "Set subject config",
+          "request": {
+            "method": "PUT",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" },
+              { "key": "X-User-ID", "value": "{{userId}}" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"compatibility\": \"BACKWARD\"\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{apiBaseUrl}}/schemas/{{subject}}/config"
+          }
+        },
+        {
+          "name": "Delete subject",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/schemas/{{subject}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "OAuth",
+      "item": [
+        {
+          "name": "List OAuth providers",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/oauth/providers"
+          }
+        },
+        {
+          "name": "Authorize (redirect URL)",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/oauth/{{oauthProvider}}/authorize"
+          }
+        },
+        {
+          "name": "List OAuth tokens",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/oauth/tokens"
+          }
+        },
+        {
+          "name": "Refresh OAuth token",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/oauth/tokens/{{tokenId}}/refresh"
+          }
+        },
+        {
+          "name": "Revoke OAuth token",
+          "request": {
+            "method": "DELETE",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/oauth/tokens/{{tokenId}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Monitoring (Sentinel)",
+      "item": [
+        {
+          "name": "Sentinel health",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/monitoring/sentinel/health"
+          }
+        },
+        {
+          "name": "Sentinel issues",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "X-User-ID", "value": "{{userId}}" }],
+            "url": "{{apiBaseUrl}}/monitoring/sentinel/issues"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Orchestrator helpers",
+      "item": [
+        {
+          "name": "Discover schema (orchestrator helper)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"connector_type\": \"mysql\",\n  \"config\": {\"host\": \"mysql-e2e\", \"port\": 3306, \"user\": \"root\", \"password\": \"password\", \"database\": \"e2e\"},\n  \"include_columns\": true,\n  \"include_row_counts\": true,\n  \"max_tables\": 50\n}",
+              "options": { "raw": { "language": "json" } }
+            },
+            "url": "{{orchestratorApiBaseUrl}}/agent/discover-schema"
+          }
+        },
+        {
+          "name": "CDC pipeline status (orchestrator helper)",
+          "request": {
+            "method": "GET",
+            "url": "{{orchestratorApiBaseUrl}}/cdc/pipelines/{{pipelineId}}/status"
+          }
+        },
+        {
+          "name": "CDC pipeline restart (orchestrator helper)",
+          "request": {
+            "method": "POST",
+            "url": "{{orchestratorApiBaseUrl}}/cdc/pipelines/{{pipelineId}}/restart"
+          }
+        }
+      ]
+    }
+  ]
+}
+

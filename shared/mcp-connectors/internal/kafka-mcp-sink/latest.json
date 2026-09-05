@@ -1,0 +1,19 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-01-06T15:20:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-01-06T15:20:00.000000",
+      "changes": [
+        "Initial kafka-mcp-sink connector for consuming Kafka topics and writing to MCP destinations"
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}
+

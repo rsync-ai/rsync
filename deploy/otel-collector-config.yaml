@@ -1,0 +1,230 @@
+# =============================================================================
+# OTEL Collector Configuration for Log Collection with Trace Correlation
+# =============================================================================
+
+receivers:
+  # OTLP receiver for traces from applications
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # Fluentforward receiver for logs from fluent-bit
+  fluentforward:
+    endpoint: 0.0.0.0:8006
+
+  # Prometheus receiver: pull the application-level domain metrics that
+  # api-gateway and orchestrator expose on their /metrics endpoints
+  # (promauto collectors — rsync_gateway_*, rsync_pipeline_*, rsync_mcp_*,
+  # rsync_kafka_*, rsync_healer_*, rsync_dlq_*). These are pull-only, so
+  # they never arrive over OTLP — the scraper bridges them into the metrics
+  # pipeline below and on to SigNoz. Both services listen on :8080 inside
+  # the compose `default` network. F-Obs-2.
+  prometheus:
+    config:
+      scrape_configs:
+        - job_name: rsync-api-gateway
+          scrape_interval: 15s
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["api-gateway:8080"]
+              labels:
+                service: api-gateway
+        - job_name: rsync-orchestrator
+          scrape_interval: 15s
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["orchestrator:9090"]
+              labels:
+                service: orchestrator
+        - job_name: rsync-temporal-adapter
+          scrape_interval: 15s
+          metrics_path: /metrics
+          static_configs:
+            - targets: ["temporal-adapter:8082"]
+              labels:
+                service: temporal-adapter
+        # llm-service apps expose Prometheus at /prometheus (their /metrics/*
+        # paths already serve business JSON — do not collide). F-Obs-2.
+        - job_name: rsync-llm-gateway
+          scrape_interval: 15s
+          metrics_path: /prometheus
+          static_configs:
+            - targets: ["llm-service:5000"]
+              labels:
+                service: llm-gateway
+        - job_name: rsync-llm-tool-generator
+          scrape_interval: 15s
+          metrics_path: /prometheus
+          static_configs:
+            - targets: ["tool-generator:5010"]
+              labels:
+                service: tool-generator
+        - job_name: rsync-llm-planner
+          scrape_interval: 15s
+          metrics_path: /prometheus
+          static_configs:
+            - targets: ["planner:5011"]
+              labels:
+                service: planner
+
+processors:
+  # Batch processor for efficiency
+  batch:
+    send_batch_size: 1000
+    timeout: 10s
+
+  # Memory limiter
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 512
+    spike_limit_mib: 128
+
+  # Resource processor to add service name for SigNoz
+  resource/logs:
+    attributes:
+      - key: deployment.environment
+        value: docker
+        action: upsert
+
+  # Split the single fluentforward Resource into one Resource per service BEFORE the
+  # transform sets service.name. fluent-bit forwards EVERY container's logs under one
+  # shared Resource; setting the resource-level service.name from a per-record attribute
+  # (context: log) then lets whichever record is processed last overwrite it for ALL
+  # records in the batch — misattributing logs (verified: sink "message routed to DLQ"
+  # lines landed under service.name=llm-service even though both the body "service" field
+  # and fluent.tag correctly said kafka-mcp-sink). groupbyattrs regroups records by these
+  # keys and promotes them to the resource level, so each service gets its own Resource and
+  # service.name can be set correctly per group. (contrib processor; image is
+  # otel/opentelemetry-collector-contrib.)
+  groupbyattrs/logs:
+    keys:
+      - service
+      - fluent.tag
+
+  # Transform processor: set service.name (a RESOURCE attribute) from the per-service
+  # fields groupbyattrs/logs has just promoted to the resource — preferring the app-emitted
+  # JSON "service" field, falling back to the docker fluentd "fluent.tag". Also promote the
+  # trace_id/span_id log *attributes* (emitted as JSON fields by the Go/Python structured
+  # loggers and parsed by fluent-bit) into the OTLP LogRecord's typed trace_id/span_id
+  # fields. SigNoz only indexes the typed fields for trace↔log correlation — without this the
+  # ids stay as plain attributes and the "jump from trace to its logs" view stays empty. F-Obs-2.
+  transform/logs:
+    log_statements:
+      - context: resource
+        statements:
+          - set(attributes["service.name"], attributes["service"]) where attributes["service"] != nil and attributes["service"] != ""
+          - set(attributes["service.name"], attributes["fluent.tag"]) where (attributes["service"] == nil or attributes["service"] == "") and attributes["fluent.tag"] != nil
+      - context: log
+        statements:
+          - set(trace_id.string, attributes["trace_id"]) where attributes["trace_id"] != nil and attributes["trace_id"] != ""
+          - set(span_id.string, attributes["span_id"]) where attributes["span_id"] != nil and attributes["span_id"] != ""
+          # Map the structured loggers' JSON "level" field (parsed by fluent-bit into the
+          # "level" log attribute) into the OTLP LogRecord's typed severity_text/severity_number.
+          # SigNoz only powers its log-level filter + colour coding off the typed severity fields;
+          # without this every log shows severity_text="" / severity_number=0 and the level filter
+          # is blind. Go (logf) emits "warning"/"error"; Python logging emits "WARNING"/"ERROR" —
+          # match case-insensitively and cover warn/warning + fatal/critical/panic. (F-Obs-3)
+          - set(severity_text, ConvertCase(attributes["level"], "upper")) where attributes["level"] != nil and attributes["level"] != ""
+          - set(severity_number, 1)  where attributes["level"] != nil and IsMatch(attributes["level"], "^(?i)trace$")
+          - set(severity_number, 5)  where attributes["level"] != nil and IsMatch(attributes["level"], "^(?i)debug$")
+          - set(severity_number, 9)  where attributes["level"] != nil and IsMatch(attributes["level"], "^(?i)info(rmation)?$")
+          - set(severity_number, 13) where attributes["level"] != nil and IsMatch(attributes["level"], "^(?i)warn(ing)?$")
+          - set(severity_number, 17) where attributes["level"] != nil and IsMatch(attributes["level"], "^(?i)error$")
+          - set(severity_number, 21) where attributes["level"] != nil and IsMatch(attributes["level"], "^(?i)(fatal|critical|panic)$")
+
+  # Attributes processor - ensure trace_id is in correct format for SigNoz
+  attributes/logs:
+    actions:
+      # Ensure trace_id and span_id are present as attributes
+      - key: trace_id
+        from_attribute: trace_id
+        action: upsert
+      - key: span_id  
+        from_attribute: span_id
+        action: upsert
+      # SigNoz also looks for these alternative names
+      - key: traceId
+        from_attribute: trace_id
+        action: upsert
+      - key: spanId
+        from_attribute: span_id
+        action: upsert
+
+exporters:
+  # Export to SigNoz OTEL Collector.
+  # Endpoint is env-driven so observability can be moved OFF the data-plane box onto a
+  # dedicated SigNoz VM (ends the ClickHouse/collector CPU contention that starved the CDC
+  # snapshot). SIGNOZ_OTLP_ENDPOINT is ALWAYS set by docker-compose (defaulting to the
+  # co-located host.docker.internal:4317 for OSS/dev), so ${env:...} is never empty — the
+  # collector's env-expansion has no bash-style default, an unset var would blank the endpoint.
+  # Prod points it at the SigNoz VM's private IP via the root .env.
+  otlp/signoz:
+    endpoint: ${env:SIGNOZ_OTLP_ENDPOINT}
+    tls:
+      insecure: true
+
+  # Debug exporter for troubleshooting (reduced verbosity)
+  debug:
+    verbosity: basic
+    sampling_initial: 2
+    sampling_thereafter: 500
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  
+  pipelines:
+    # Logs pipeline - receives from fluentforward (fluent-bit)
+    logs:
+      receivers: [fluentforward, otlp]
+      processors: [memory_limiter, attributes/logs, groupbyattrs/logs, resource/logs, transform/logs, batch]
+      exporters: [otlp/signoz, debug]
+    
+    # Traces pipeline - receives directly from applications
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/signoz]
+    
+    # Metrics pipeline — OTLP push (SDK metrics) + Prometheus scrape
+    # (application /metrics endpoints), both exported to SigNoz.
+    metrics:
+      receivers: [otlp, prometheus]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/signoz]
+
+  telemetry:
+    logs:
+      level: info
+      # When the SigNoz backend is absent, every export attempt fails and the
+      # collector logs the failure -- so the component whose job is to REDUCE
+      # log volume becomes the largest producer of it on the box. Measured:
+      # rsync-ai-otel-collector holding 106 MB, ~25% of the sampled lines being
+      # "Exporting failed" / "connection refused", each with its own stack.
+      #
+      # That is not a corner case here. SIGNOZ_OTLP_ENDPOINT defaults to
+      # host.docker.internal:4317 and prod runs zero SigNoz containers, so the
+      # default deployment IS the failing one, permanently.
+      #
+      # Sampling caps the repetition without touching delivery: the exporter
+      # still retries with its normal backoff and still drops nothing, only the
+      # collector's own log record for the Nth identical failure is suppressed.
+      # `initial: 2` keeps the first two of each message per tick so a real
+      # outage is still visible and still diagnosable; `thereafter: 500` means
+      # a permanent one costs a line every 500 rather than every attempt.
+      #
+      # Measured on 0.111.0, identical load into both, 90 s:
+      #   without sampling  84 lines / 26,768 B / 53 "Exporting failed"
+      #   with sampling     29 lines /  6,304 B /  4 "Exporting failed"
+      # i.e. -76% bytes, -92% error records, from one trivial trace stream.
+      sampling:
+        enabled: true
+        tick: 60s
+        initial: 2
+        thereafter: 500

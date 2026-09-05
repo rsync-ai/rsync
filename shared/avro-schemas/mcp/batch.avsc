@@ -1,0 +1,198 @@
+{
+  "namespace": "com.rsync.mcp",
+  "type": "record",
+  "name": "BatchOperation",
+  "doc": "Batch operation message for bulk data transfers",
+  "fields": [
+    {
+      "name": "trace_id",
+      "type": "string",
+      "doc": "Distributed trace identifier"
+    },
+    {
+      "name": "batch_id",
+      "type": "string",
+      "doc": "Unique batch identifier"
+    },
+    {
+      "name": "pipeline_id",
+      "type": "string",
+      "doc": "Pipeline identifier"
+    },
+    {
+      "name": "connection_id",
+      "type": "string",
+      "doc": "Connection identifier"
+    },
+    {
+      "name": "connector_type",
+      "type": "string",
+      "doc": "MCP connector type"
+    },
+    {
+      "name": "entity",
+      "type": {
+        "type": "record",
+        "name": "BatchEntity",
+        "fields": [
+          {
+            "name": "namespace",
+            "type": ["null", "string"],
+            "default": null
+          },
+          {
+            "name": "name",
+            "type": "string"
+          }
+        ]
+      },
+      "doc": "Target entity"
+    },
+    {
+      "name": "partition_key",
+      "type": "string",
+      "doc": "Partition key for Kafka routing"
+    },
+    {
+      "name": "operation",
+      "type": {
+        "type": "enum",
+        "name": "BatchOperationType",
+        "symbols": ["FULL_LOAD", "INCREMENTAL", "APPEND", "UPSERT", "MERGE", "TRUNCATE_LOAD"]
+      },
+      "doc": "Type of batch operation"
+    },
+    {
+      "name": "batch_sequence",
+      "type": {
+        "type": "record",
+        "name": "BatchSequence",
+        "fields": [
+          {
+            "name": "index",
+            "type": "int",
+            "doc": "Current batch index (0-based)"
+          },
+          {
+            "name": "total",
+            "type": ["null", "int"],
+            "default": null,
+            "doc": "Total number of batches (null if unknown)"
+          },
+          {
+            "name": "is_first",
+            "type": "boolean",
+            "default": false
+          },
+          {
+            "name": "is_last",
+            "type": "boolean",
+            "default": false
+          }
+        ]
+      },
+      "doc": "Batch sequencing information"
+    },
+    {
+      "name": "records",
+      "type": {
+        "type": "array",
+        "items": "com.rsync.mcp.GenericRecord"
+      },
+      "doc": "Array of records in this batch"
+    },
+    {
+      "name": "record_count",
+      "type": "int",
+      "doc": "Number of records in this batch"
+    },
+    {
+      "name": "size_bytes",
+      "type": "long",
+      "default": 0,
+      "doc": "Approximate size of records in bytes"
+    },
+    {
+      "name": "schema",
+      "type": ["null", {
+        "type": "record",
+        "name": "SchemaInfo",
+        "fields": [
+          {
+            "name": "schema_id",
+            "type": ["null", "int"],
+            "default": null,
+            "doc": "Schema Registry ID"
+          },
+          {
+            "name": "schema_name",
+            "type": "string"
+          },
+          {
+            "name": "version",
+            "type": "int",
+            "default": 1
+          },
+          {
+            "name": "fingerprint",
+            "type": ["null", "string"],
+            "default": null
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "Schema information for records"
+    },
+    {
+      "name": "watermarks",
+      "type": ["null", {
+        "type": "record",
+        "name": "Watermarks",
+        "fields": [
+          {
+            "name": "low",
+            "type": ["null", "string"],
+            "default": null,
+            "doc": "Low watermark (start of range)"
+          },
+          {
+            "name": "high",
+            "type": ["null", "string"],
+            "default": null,
+            "doc": "High watermark (end of range)"
+          },
+          {
+            "name": "column",
+            "type": ["null", "string"],
+            "default": null,
+            "doc": "Watermark column name"
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "Watermarks for incremental processing"
+    },
+    {
+      "name": "started_at",
+      "type": "long",
+      "logicalType": "timestamp-millis",
+      "doc": "Batch start timestamp"
+    },
+    {
+      "name": "completed_at",
+      "type": ["null", "long"],
+      "default": null,
+      "logicalType": "timestamp-millis",
+      "doc": "Batch completion timestamp"
+    },
+    {
+      "name": "metadata",
+      "type": ["null", {
+        "type": "map",
+        "values": "string"
+      }],
+      "default": null,
+      "doc": "Additional batch metadata"
+    }
+  ]
+}

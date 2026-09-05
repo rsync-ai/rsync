@@ -1,0 +1,20 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-07-09T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-07-04T00:00:00.000000",
+      "changes": [
+        "MongoDB connector (pymongo): test_connection (replica-set aware), discover_schema (list databases/collections with counts + sampled fields), _id-keyset export with batching. Batch source + CDC via Debezium change streams (packed _id + document mapping).",
+        "Destination write path (additive, patched in place): import_data (insert, duplicate-key-tolerant), upsert_data (idempotent ReplaceOne keyed on _id / relational key_fields — CDC insert+update), delete_data (delete by key via $in — CDC delete). Collections auto-create on first write; no DDL. supports_destination flipped true.",
+        "Destination perf: upsert_data/delete_data ensure a (cached, non-unique) index on the write key when it is not _id — without it each keyed op is a full collection scan (~80x slower at 50k docs; measured 434s→1.2s). Index-creation failures are swallowed so they never fail a batch."
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

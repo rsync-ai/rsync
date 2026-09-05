@@ -1,0 +1,194 @@
+{
+  "hubspot": {
+    "name": "hubspot_rest_v3",
+    "auth_url": "https://app.hubspot.com/oauth/authorize",
+    "token_url": "https://api.hubapi.com/oauth/v1/token",
+    "scopes": "crm.objects.contacts.read crm.objects.contacts.write crm.objects.companies.read crm.objects.companies.write crm.objects.deals.read crm.objects.deals.write crm.schemas.contacts.read crm.schemas.companies.read crm.schemas.deals.read",
+    "client_id_env": "HUBSPOT_CLIENT_ID",
+    "client_secret_env": "HUBSPOT_CLIENT_SECRET",
+    "category": "crm",
+    "base_url": "https://api.hubapi.com"
+  },
+  "salesforce": {
+    "name": "Salesforce",
+    "auth_url": "https://login.salesforce.com/services/oauth2/authorize",
+    "token_url": "https://login.salesforce.com/services/oauth2/token",
+    "scopes": "api refresh_token offline_access",
+    "client_id_env": "SALESFORCE_CLIENT_ID",
+    "client_secret_env": "SALESFORCE_CLIENT_SECRET",
+    "extra_auth_params": {
+      "prompt": "consent"
+    },
+    "category": "crm"
+  },
+  "pipedrive": {
+    "name": "Pipedrive",
+    "auth_url": "https://oauth.pipedrive.com/oauth/authorize",
+    "token_url": "https://oauth.pipedrive.com/oauth/token",
+    "scopes": "",
+    "client_id_env": "PIPEDRIVE_CLIENT_ID",
+    "client_secret_env": "PIPEDRIVE_CLIENT_SECRET",
+    "category": "crm"
+  },
+  "zoho-crm": {
+    "name": "Zoho CRM",
+    "auth_url": "https://accounts.zoho.com/oauth/v2/auth",
+    "token_url": "https://accounts.zoho.com/oauth/v2/token",
+    "scopes": "ZohoCRM.modules.ALL ZohoCRM.settings.ALL",
+    "client_id_env": "ZOHO_CLIENT_ID",
+    "client_secret_env": "ZOHO_CLIENT_SECRET",
+    "extra_auth_params": {
+      "access_type": "offline",
+      "prompt": "consent"
+    },
+    "category": "crm"
+  },
+  "zendesk": {
+    "name": "Zendesk",
+    "auth_url": "https://{subdomain}.zendesk.com/oauth/authorizations/new",
+    "token_url": "https://{subdomain}.zendesk.com/oauth/tokens",
+    "scopes": "read write",
+    "client_id_env": "ZENDESK_CLIENT_ID",
+    "client_secret_env": "ZENDESK_CLIENT_SECRET",
+    "requires_subdomain": true,
+    "category": "support"
+  },
+  "freshdesk": {
+    "name": "Freshdesk",
+    "auth_url": "https://{domain}.freshdesk.com/oauth/authorize",
+    "token_url": "https://{domain}.freshdesk.com/oauth/token",
+    "scopes": "",
+    "client_id_env": "FRESHDESK_CLIENT_ID",
+    "client_secret_env": "FRESHDESK_CLIENT_SECRET",
+    "requires_subdomain": true,
+    "category": "support"
+  },
+  "jira": {
+    "name": "Jira Cloud",
+    "auth_url": "https://auth.atlassian.com/authorize",
+    "token_url": "https://auth.atlassian.com/oauth/token",
+    "scopes": "read:jira-user read:jira-work write:jira-work offline_access",
+    "client_id_env": "JIRA_CLIENT_ID",
+    "client_secret_env": "JIRA_CLIENT_SECRET",
+    "extra_auth_params": {
+      "audience": "api.atlassian.com",
+      "prompt": "consent"
+    },
+    "category": "project_management"
+  },
+  "slack": {
+    "name": "Slack",
+    "auth_url": "https://slack.com/oauth/v2/authorize",
+    "token_url": "https://slack.com/api/oauth.v2.access",
+    "scopes": "channels:read channels:history users:read chat:write",
+    "client_id_env": "SLACK_CLIENT_ID",
+    "client_secret_env": "SLACK_CLIENT_SECRET",
+    "category": "communication"
+  },
+  "github": {
+    "name": "github_graphql_v4",
+    "auth_url": "https://github.com/login/oauth/authorize",
+    "token_url": "https://github.com/login/oauth/access_token",
+    "scopes": "repo read:user read:org",
+    "client_id_env": "GITHUB_CLIENT_ID",
+    "client_secret_env": "GITHUB_CLIENT_SECRET",
+    "category": "devtools",
+    "base_url": "https://api.github.com/graphql"
+  },
+  "notion": {
+    "name": "Notion",
+    "auth_url": "https://api.notion.com/v1/oauth/authorize",
+    "token_url": "https://api.notion.com/v1/oauth/token",
+    "scopes": "",
+    "client_id_env": "NOTION_CLIENT_ID",
+    "client_secret_env": "NOTION_CLIENT_SECRET",
+    "extra_auth_params": {
+      "owner": "user"
+    },
+    "category": "productivity"
+  },
+  "shopify": {
+    "name": "shopify_admin_graphql",
+    "auth_url": "https://{shop}.myshopify.com/admin/oauth/authorize",
+    "token_url": "https://{shop}.myshopify.com/admin/oauth/access_token",
+    "scopes": "read_products write_products read_orders read_customers read_inventory read_locations read_markets_home read_collections",
+    "client_id_env": "SHOPIFY_CLIENT_ID",
+    "client_secret_env": "SHOPIFY_CLIENT_SECRET",
+    "requires_subdomain": true,
+    "token_never_expires": true,
+    "category": "ecommerce",
+    "base_url": "https://{shop}.myshopify.com/admin/api/{version}/graphql.json"
+  },
+  "google": {
+    "name": "Google",
+    "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+    "token_url": "https://oauth2.googleapis.com/token",
+    "scopes": "https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.file",
+    "client_id_env": "GOOGLE_CLIENT_ID",
+    "client_secret_env": "GOOGLE_CLIENT_SECRET",
+    "extra_auth_params": {
+      "access_type": "offline",
+      "prompt": "consent"
+    },
+    "category": "analytics",
+    "base_url": "https://sheets.googleapis.com/v4"
+  },
+  "dropbox": {
+    "name": "Dropbox",
+    "auth_url": "https://www.dropbox.com/oauth2/authorize",
+    "token_url": "https://api.dropboxapi.com/oauth2/token",
+    "scopes": "",
+    "client_id_env": "DROPBOX_CLIENT_ID",
+    "client_secret_env": "DROPBOX_CLIENT_SECRET",
+    "extra_auth_params": {
+      "token_access_type": "offline"
+    },
+    "category": "storage"
+  },
+  "stripe": {
+    "name": "Stripe",
+    "auth_url": "https://connect.stripe.com/oauth/authorize",
+    "token_url": "https://connect.stripe.com/oauth/token",
+    "scopes": "read_write",
+    "client_id_env": "STRIPE_CLIENT_ID",
+    "client_secret_env": "STRIPE_SECRET_KEY",
+    "extra_auth_params": {
+      "stripe_landing": "login"
+    },
+    "category": "payments"
+  },
+  "mailchimp": {
+    "name": "Mailchimp",
+    "auth_url": "https://login.mailchimp.com/oauth2/authorize",
+    "token_url": "https://login.mailchimp.com/oauth2/token",
+    "scopes": "",
+    "client_id_env": "MAILCHIMP_CLIENT_ID",
+    "client_secret_env": "MAILCHIMP_CLIENT_SECRET",
+    "category": "marketing"
+  },
+  "intercom": {
+    "name": "Intercom",
+    "auth_url": "https://app.intercom.com/oauth",
+    "token_url": "https://api.intercom.io/auth/eagle/token",
+    "scopes": "",
+    "client_id_env": "INTERCOM_CLIENT_ID",
+    "client_secret_env": "INTERCOM_CLIENT_SECRET",
+    "category": "support"
+  },
+  "linear": {
+    "name": "linear_graphql",
+    "auth_url": "https://linear.app/oauth/authorize",
+    "token_url": "https://api.linear.app/oauth/token",
+    "scopes": "read,write",
+    "client_id_env": "LINEAR_CLIENT_ID",
+    "client_secret_env": "LINEAR_CLIENT_SECRET",
+    "category": "devtools",
+    "base_url": "https://api.linear.app/graphql"
+  },
+  "petstore": {
+    "name": "petstore",
+    "client_id_env": "PETSTORE_CLIENT_ID",
+    "client_secret_env": "PETSTORE_CLIENT_SECRET",
+    "base_url": "https://petstore3.swagger.io/api/v3"
+  }
+}

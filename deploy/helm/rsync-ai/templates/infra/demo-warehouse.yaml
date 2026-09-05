@@ -1,0 +1,123 @@
+{{- if .Values.demo.enabled }}
+{{/*
+The destination half of the zero-credential try-it path, and the Kubernetes twin
+of the `demo-warehouse` service in docker-compose.quickstart.yml.
+
+Why it exists at all: `sample-data` gives a fresh install a SOURCE it can connect
+to with no credentials, but a pipeline needs two steps — intent.go:417 returns
+"plan has insufficient steps" for len(steps) < 2 — and every destination in the
+catalog wants a credential the new operator has not produced yet. Without a
+bundled destination the demo ends at a green connection test and never moves a
+row.
+
+Deliberately NOT the control-plane postgres StatefulSet. That one is the metadata
+database; landing demo rows in it mixes pipeline data with control-plane data,
+and it is the database an operator is told to point at RDS. This one is
+disposable by design.
+
+Opt-in (demo.enabled defaults to false) because a cluster install is usually a
+real deployment, and because it is not free: it costs a pod and a PVC. The
+compose quickstart ships it always-on instead, where both are free.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-demo-warehouse
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo-warehouse
+spec:
+  {{/* Headless, for the same reason as postgres: stable per-pod DNS, one writer. */}}
+  clusterIP: None
+  ports:
+    - port: 5432
+      targetPort: postgres
+      name: postgres
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: demo-warehouse
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-demo-warehouse
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo-warehouse
+spec:
+  serviceName: {{ include "rsync-ai.fullname" . }}-demo-warehouse
+  replicas: 1
+  selector:
+    matchLabels:
+{{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: demo-warehouse
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: demo-warehouse
+      annotations:
+        {{/*
+          Rolls the pod when the password changes. Without it the StatefulSet
+          keeps serving the old credential while the api-gateway has already
+          picked up the new one, and the demo destination fails its connection
+          test with an authentication error that names no setting.
+        */}}
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+      {{- with .Values.global.podAnnotations }}
+{{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: postgres
+          image: {{ .Values.demo.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.demo.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.demo.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: DEMO_WAREHOUSE_PASSWORD
+            {{/* Same initdb-on-a-non-empty-mount reason as the postgres StatefulSet. */}}
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.demo.username | quote }}, "-d", {{ .Values.demo.database | quote }}]
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", {{ .Values.demo.username | quote }}]
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+{{- toYaml .Values.demo.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with (default .Values.global.storageClass .Values.demo.persistence.storageClass) }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.demo.persistence.size | quote }}
+{{- end }}

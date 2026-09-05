@@ -1,0 +1,1039 @@
+#
+# Production overrides for the rsync-ai stack.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod up -d
+#
+# This file MUST be used together with docker-compose.yml (base).
+# It hardens dev defaults for production: env-var secrets, restart policies,
+# resource limits, no exposed internal ports, and a Traefik reverse proxy.
+#
+
+services:
+  # ============================================
+  # REVERSE PROXY
+  # ============================================
+
+  # Proxies the Docker socket to Traefik over TCP so Traefik never touches the
+  # raw socket directly. This sidesteps the API-version negotiation bug in
+  # Traefik's embedded Go Docker client (requests v1.24 which Docker 27+
+  # rejects) and is the recommended secure deployment pattern.
+  docker-socket-proxy:
+    # Pinned -- see docker-compose.yml's copy. `latest` moved v0.4.2 -> v0.5.0 on 2026-07-27;
+    # v0.5.0 is what `latest` resolves to today, so this pin is a no-op that stops the drift.
+    image: tecnativa/docker-socket-proxy:v0.5.0
+    container_name: rsync-ai-docker-socket-proxy
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    environment:
+      CONTAINERS: 1
+      NETWORKS: 1
+      SERVICES: 1
+      TASKS: 1
+      VERSION: 1
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+
+  traefik:
+    image: traefik:v3.6.1
+    container_name: rsync-ai-traefik
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    depends_on:
+      - docker-socket-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./deploy/traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - traefik_certs:/letsencrypt
+    environment:
+      - TRAEFIK_CERTIFICATESRESOLVERS_letsencrypt_ACME_EMAIL=${ACME_EMAIL}
+      - CF_DNS_API_TOKEN=${CF_DNS_API_TOKEN}
+    networks:
+      - default
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ============================================
+  # INFRASTRUCTURE
+  # ============================================
+
+  # Local postgres is DISABLED for both staging and prod — both use managed
+  # Azure PostgreSQL. The profile keeps the service defined (so the compose
+  # project is valid) but it never starts unless explicitly requested with
+  # `--profile local-db`. All services connect to POSTGRES_HOST (Azure).
+  postgres:
+    profiles: ["local-db"]
+    restart: unless-stopped
+    ports: !override []
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-pipeline_db}
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-user} -d ${POSTGRES_DB:-pipeline_db}"]
+    deploy:
+      resources:
+        limits:
+          # 256M was below the floor Postgres needs to serve this stack at all:
+          # its own default shared_buffers is 128 MiB, so half the budget is gone
+          # before a single backend starts, and every service here opens a pool.
+          # Only reachable via `--profile local-db` (prod/staging use managed
+          # Azure), which is exactly why it went unnoticed — the one deployment
+          # that would hit it is a self-hoster opting out of managed Postgres.
+          memory: 1024M
+
+  kafka:
+    restart: unless-stopped
+    ports: !override []
+    environment:
+      # Keep Kafka lean on small VPS (2c/8GB).
+      # This is the single biggest memory win for the stack.
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+    deploy:
+      resources:
+        limits:
+          memory: 1536M
+
+  kafka-init:
+    restart: "no"
+
+  # kafka-connect had NO cgroup limit anywhere -- not here, not in the base
+  # compose -- so on a box this size it was the one JVM with nothing between it
+  # and the host. The base compose caps its HEAP at -Xmx768M, which bounds only
+  # the Java heap: metaspace, code cache, thread stacks and NIO direct buffers
+  # all sit outside it, and the process was measured peaking at 773 MB RSS.
+  #
+  # 1024M, not the 896M originally budgeted: 896 leaves ~128 MB for everything
+  # non-heap, which a Connect worker with Debezium loaded routinely exceeds --
+  # and an under-set cgroup limit does not degrade, it OOM-kills the connector
+  # mid-stream. The limit is here to stop a leak from taking the box, not to
+  # reclaim memory the process was never using.
+  kafka-connect:
+    deploy:
+      resources:
+        limits:
+          memory: 1024M
+
+  redis:
+    restart: unless-stopped
+    ports: !override []
+    command:
+      - sh
+      - -c
+      # The password is written to a 0600 file and never appears on the
+      # redis-server ARGV, so it stays out of `ps` on the host and out of
+      # the rendered compose spec (`docker inspect` / `compose config`).
+      - |
+        umask 077
+        : > /tmp/redis.conf
+        printf 'requirepass %s\n' "$$REDIS_PASSWORD" > /tmp/redis.conf
+        exec redis-server /tmp/redis.conf --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    deploy:
+      resources:
+        limits:
+          memory: 768M
+
+  # ============================================
+  # TEMPORAL
+  # ============================================
+
+  # No separate db-init container needed — the auto-setup image creates its
+  # schema itself over SSL. SKIP_DB_CREATE=true is required against ANY external
+  # database, and not for the reason it looks like: the image's create step is not
+  # guarded on whether the database exists, only on `${DBNAME} != ${POSTGRES_USER}`
+  # (auto-setup.sh, two call sites — `temporal` and `temporal_visibility`). So it
+  # runs unconditionally and exits 1 with `permission denied to create database`
+  # for any role without CREATEDB, which an external instance's application role
+  # normally is. "Already exists" is NOT a failure mode here — CREATE DATABASE on
+  # an existing name returns 0 for a role that may create databases at all.
+  # Both halves are needed: skipping the create means the two databases must
+  # already exist, or `setup-schema` fails instead. See docker-compose.byo-postgres.yml.
+  temporal:
+    restart: unless-stopped
+    ports: !override []
+    # Base compose depended on local postgres only; now external (Azure), so
+    # no service dependency remains.
+    depends_on: !override []
+    environment:
+      - DB=postgresql
+      - DB_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PWD=${POSTGRES_PASSWORD}
+      - POSTGRES_SEEDS=${POSTGRES_HOST}
+      - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
+      # Paired with pre-created `temporal` + `temporal_visibility` databases.
+      # Unset, auto-setup attempts CREATE DATABASE as ${POSTGRES_USER} and the
+      # container crash-loops; pre-creating alone does not help, because the
+      # create is attempted regardless of whether the database is there.
+      - SKIP_DB_CREATE=true
+      # ── TLS to the metadata database ───────────────────────────────────────
+      # Temporal does NOT read DB_SSLMODE. It is really two programs, and they
+      # read DIFFERENT env names for the same fact: auto-setup runs
+      # temporal-sql-tool to create the schemas (SQL_TLS*), then starts the
+      # server, which reads its config_template.yaml (SQL_TLS_ENABLED, SQL_CA,
+      # SQL_HOST_*). Both families must be written together or the schema step
+      # connects in plaintext to a TLS-mandatory database, fails before the
+      # server ever binds, and the operator sees hung pipelines with no TLS
+      # error in any log.
+      #
+      # POSTGRES_TLS_ENABLED defaults to `true` here, NOT `false`. This file is
+      # the EXTERNAL-database path: POSTGRES_HOST is required, every service
+      # carries RSYNC_REQUIRE_REMOTE_DB=true, and DB_SSLMODE already defaults to
+      # `require` three services down. A `false` default made Temporal the one
+      # component that silently disagreed with that posture — an operator who
+      # set the documented knob (DB_SSLMODE=require) still got Temporal on
+      # plaintext, which is the failure above. The two defaults are one fact and
+      # are asserted to agree by
+      # llm-service/tests/test_prod_compose_postgres_tls_is_coherent.py.
+      #
+      # Pointing this file at a plaintext database is still supported — it just
+      # takes both halves now, exactly as turning TLS on always did:
+      #   DB_SSLMODE=disable  POSTGRES_TLS_ENABLED=false
+      # The bundled-postgres path (docker-compose.yml, docker-compose.quickstart.yml)
+      # is untouched and still defaults to plaintext.
+      #
+      # Schema-setup step (temporal-sql-tool) reads SQL_TLS.
+      - SQL_TLS=${POSTGRES_TLS_ENABLED:-true}
+      - SQL_TLS_CA_FILE=${POSTGRES_TLS_CA_FILE:-}
+      - SQL_TLS_SERVER_NAME=${POSTGRES_TLS_SERVER_NAME:-}
+      # Stated as "disable", the INVERSE of SQL_HOST_VERIFICATION below — not a
+      # copy of it. Default `true` (skip verification) keeps the behaviour this
+      # line has always had: a managed provider's cert chain is not mounted into
+      # the container by default, so demanding hostname verification here would
+      # turn TLS-on into a boot failure. Mount a CA and set
+      # POSTGRES_TLS_SKIP_HOST_VERIFY=false / POSTGRES_TLS_VERIFY_HOST=true to
+      # get verify-full-equivalent behaviour.
+      - SQL_TLS_DISABLE_HOST_VERIFICATION=${POSTGRES_TLS_SKIP_HOST_VERIFY:-true}
+      # Server runtime (config_template.yaml) reads SQL_TLS_ENABLED.
+      - SQL_TLS_ENABLED=${POSTGRES_TLS_ENABLED:-true}
+      - SQL_CA=${POSTGRES_TLS_CA_FILE:-}
+      - SQL_HOST_NAME=${POSTGRES_TLS_SERVER_NAME:-}
+      - SQL_HOST_VERIFICATION=${POSTGRES_TLS_VERIFY_HOST:-false}
+      # Connection pool caps — Temporal runs 4 roles, each opening its own pool
+      # per datastore. Keep these LOW on a shared managed DB. Worst case here:
+      # (4 roles x 6) default + (4 roles x 4) visibility = ~40 connections.
+      - SQL_MAX_CONNS=6
+      - SQL_MAX_IDLE_CONNS=2
+      - SQL_VIS_MAX_CONNS=4
+      - SQL_VIS_MAX_IDLE_CONNS=2
+
+  temporal-ui:
+    restart: unless-stopped
+    ports: !override []
+    # Optional on small VPS: enable only when needed.
+    profiles: ["ops"]
+
+  temporal-admin-tools:
+    restart: unless-stopped
+    # Optional on small VPS: enable only when needed.
+    profiles: ["ops"]
+
+  # ============================================
+  # APPLICATION SERVICES
+  # ============================================
+
+  temporal-adapter:
+    restart: unless-stopped
+    ports: !override []
+    healthcheck:
+      test: ["CMD", "/bin/sh", "-c", "kill -0 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    environment:
+      - TEMPORAL_ADDRESS=temporal:7233
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BROKERS:-kafka:29092}
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
+      - LOG_LEVEL=info
+      - ENVIRONMENT=production
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_PORT=${POSTGRES_PORT:-5432}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB:-pipeline_db}
+      - POSTGRES_SSLMODE=${DB_SSLMODE:-require}
+      # Fail loud if this remote-DB deployment (prod, and staging which overlays
+      # this file) silently fell back to the in-cluster dev Postgres (POSTGRES_HOST
+      # unset → "postgres") — i.e. launched without `--env-file .env.staging`. The
+      # adapter owns control-plane state + resolves scheduled runs; on the wrong DB
+      # every scheduled run silently skips as "pipeline not found (orphaned)". The
+      # base docker-compose.yml (dev/e2e) does NOT set this, so local Postgres stays
+      # valid there. Enforced in adapter main.go::requireRemoteDatabase.
+      - RSYNC_REQUIRE_REMOTE_DB=true
+      # Connection pool caps for shared managed DB.
+      - POSTGRES_MAX_OPEN_CONNS=${ADAPTER_DB_MAX_OPEN_CONNS:-6}
+      - POSTGRES_MAX_IDLE_CONNS=${ADAPTER_DB_MAX_IDLE_CONNS:-3}
+      - REDIS_ADDRESS=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      # Scheduled saved-query model runs (RunModelActivity) call the gateway's internal
+      # endpoint over authenticated S2S. Without both of these a fired schedule fails
+      # closed instead of rebuilding its table.
+      - API_GATEWAY_URL=http://api-gateway:8080
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
+      - OTEL_SERVICE_NAME=temporal-adapter
+      - OTEL_ENABLED=true
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  orchestrator:
+    restart: unless-stopped
+    ports: !override []
+    # Drop the base postgres dependency (DB is now external Azure).
+    depends_on: !override
+      kafka:
+        condition: service_healthy
+        # Other half of docker-compose.byo-kafka.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        # It has to be repeated HERE and not only in docker-compose.yml:
+        # `depends_on: !override` REPLACES the base mapping rather than merging
+        # into it, so the base file's required:false never reaches this stack.
+        required: false
+      redis:
+        condition: service_healthy
+      fluent-bit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    environment:
+      - DB_HOST=${POSTGRES_HOST}
+      - DB_PORT=${POSTGRES_PORT:-5432}
+      - DB_USER=${POSTGRES_USER}
+      - DB_PASSWORD=${POSTGRES_PASSWORD}
+      - DB_NAME=${POSTGRES_DB:-pipeline_db}
+      - DB_SSLMODE=${DB_SSLMODE:-require}
+      # Fail loud if this remote-DB deployment (prod, and staging which overlays
+      # this file) silently fell back to the in-cluster dev Postgres (DB_HOST unset
+      # → "localhost") — i.e. launched without `--env-file .env.staging`, as a CI
+      # job does. The orchestrator serves connections + drives the agent workflow;
+      # on the wrong DB the UI shows an empty/mismatched connection list and
+      # pipelines 404. The base docker-compose.yml (dev/e2e) does NOT set this, so
+      # local Postgres stays valid there. Enforced in main.go::requireRemoteDatabase.
+      - RSYNC_REQUIRE_REMOTE_DB=true
+      # Connection pool caps for shared managed DB.
+      - DB_MAX_OPEN_CONNS=${ORCHESTRATOR_DB_MAX_OPEN_CONNS:-10}
+      - DB_MAX_IDLE_CONNS=${ORCHESTRATOR_DB_MAX_IDLE_CONNS:-4}
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:29092}
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
+      - JWT_SECRET=${JWT_SECRET}
+      - CDC_RECOVERY_ENABLED=${CDC_RECOVERY_ENABLED:-false}
+      # Autonomous CDC sink self-heal (Bug B, #678): default OFF; arm by setting
+      # CDC_SINK_AUTORESTART_ENABLED=true in prod .env (op-safety gate, not edition gate).
+      - CDC_SINK_AUTORESTART_ENABLED=${CDC_SINK_AUTORESTART_ENABLED:-false}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - TOOLS_DIR=/app/shared/mcp-connectors
+      - TOOL_GENERATOR_URL=http://tool-generator:5010
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_DB=0
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - CORRELATION_CLAIM_TTL=1h
+      - KAFKA_USE_AVRO=false
+      - LOG_FORMAT=json
+      - LOG_LEVEL=info
+      - ENVIRONMENT=production
+      - ENABLE_SCHEDULER=false
+      - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
+      - OTEL_SERVICE_NAME=orchestrator
+      - OTEL_ENABLED=true
+      - ENABLE_CDC_TABLE_STATS=true
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.orchestrator.rule=Host(`${DOMAIN}`) && PathPrefix(`/orchestrator`)"
+      - "traefik.http.routers.orchestrator.entrypoints=websecure"
+      - "traefik.http.routers.orchestrator.service=orchestrator"
+      - "traefik.http.routers.orchestrator.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.orchestrator.middlewares=orchestrator-strip@docker,security-headers@file,rate-limit@file"
+      - "traefik.http.services.orchestrator.loadbalancer.server.port=8080"
+      - "traefik.http.middlewares.orchestrator-strip.stripprefix.prefixes=/orchestrator"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  api-gateway:
+    restart: unless-stopped
+    ports: !override []
+    # Drop the base postgres dependency (DB is now external Azure).
+    depends_on: !override
+      kafka:
+        condition: service_healthy
+        # Other half of docker-compose.byo-kafka.yml — see that file's header:
+        # profiles: without required:false = "depends on undefined service".
+        # It has to be repeated HERE and not only in docker-compose.yml:
+        # `depends_on: !override` REPLACES the base mapping rather than merging
+        # into it, so the base file's required:false never reaches this stack.
+        required: false
+      redis:
+        condition: service_healthy
+      # Order after Temporal so the startup client.Dial is more likely to win the
+      # cold-boot race. Intentionally service_started (NOT service_healthy): the
+      # gateway's own bounded retry + lazy reconnect already handles a not-yet-
+      # ready Temporal, so we must not block gateway boot (and its non-workflow
+      # endpoints) on a Temporal healthcheck that could flake in prod.
+      temporal:
+        condition: service_started
+      orchestrator:
+        condition: service_started
+      fluent-bit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    environment:
+      # sslmode is ${DB_SSLMODE:-require}, not a hardcoded `require`: DB_SSLMODE
+      # is the one knob the other services already read (orchestrator's
+      # DB_SSLMODE, temporal-adapter's POSTGRES_SSLMODE). Hardcoded, this DSN
+      # was the one place an operator could not turn TLS off, so a prod-compose
+      # deploy against a plaintext database failed here alone.
+      - DATABASE_URL=${DATABASE_URL:-postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-pipeline_db}?sslmode=${DB_SSLMODE:-require}}
+      # Fail loud if this remote-DB deployment (prod, and staging which overlays
+      # this file) silently fell back to the in-cluster dev Postgres because
+      # DATABASE_URL was unset — i.e. launched without `--env-file .env.staging`.
+      # The base docker-compose.yml (dev/e2e) does NOT set this, so local Postgres
+      # stays valid there. Enforced in api-gateway main.go::requireRemoteDatabase.
+      - RSYNC_REQUIRE_REMOTE_DB=true
+      # Connection pool caps for shared managed DB.
+      - DB_MAX_OPEN_CONNS=${APIGW_DB_MAX_OPEN_CONNS:-10}
+      - DB_MAX_IDLE_CONNS=${APIGW_DB_MAX_IDLE_CONNS:-4}
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:29092}
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
+      - RSYNC_ALLOW_INTERNAL_CONNECTORS=false
+      - RSYNC_ADMIN_EMAILS=${RSYNC_ADMIN_EMAILS:-}
+      - TEMPORAL_ADDRESS=temporal:7233
+      - ORCHESTRATOR_URL=http://orchestrator:8080
+      - AGENT_ORCHESTRATOR_URL=http://orchestrator:8080
+      - TOOL_GENERATOR_URL=http://tool-generator:5010
+      - JWT_SECRET=${JWT_SECRET}
+      - REDIS_ADDRESS=redis:6379
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - ENCRYPTION_KEY=${ENCRYPTION_KEY}
+      - RSYNC_CSRF_ENFORCE=true
+      - KAFKA_USE_AVRO=false
+      - LOG_FORMAT=json
+      - LOG_LEVEL=info
+      - ENVIRONMENT=production
+      - OAUTH_CALLBACK_URL=${OAUTH_CALLBACK_URL:-https://${DOMAIN}/oauth/callback}
+      - GITHUB_CLIENT_ID=${GITHUB_CLIENT_ID:-}
+      - GITHUB_CLIENT_SECRET=${GITHUB_CLIENT_SECRET:-}
+      - GOOGLE_CLIENT_ID=${GOOGLE_CLIENT_ID:-}
+      - GOOGLE_CLIENT_SECRET=${GOOGLE_CLIENT_SECRET:-}
+      - HUBSPOT_CLIENT_ID=${HUBSPOT_CLIENT_ID:-}
+      - HUBSPOT_CLIENT_SECRET=${HUBSPOT_CLIENT_SECRET:-}
+      - SALESFORCE_CLIENT_ID=${SALESFORCE_CLIENT_ID:-}
+      - SALESFORCE_CLIENT_SECRET=${SALESFORCE_CLIENT_SECRET:-}
+      - PIPEDRIVE_CLIENT_ID=${PIPEDRIVE_CLIENT_ID:-}
+      - PIPEDRIVE_CLIENT_SECRET=${PIPEDRIVE_CLIENT_SECRET:-}
+      - SLACK_CLIENT_ID=${SLACK_CLIENT_ID:-}
+      - SLACK_CLIENT_SECRET=${SLACK_CLIENT_SECRET:-}
+      - SHOPIFY_CLIENT_ID=${SHOPIFY_CLIENT_ID:-}
+      - SHOPIFY_CLIENT_SECRET=${SHOPIFY_CLIENT_SECRET:-}
+      # Notifier — delivers pipeline failure alerts to Slack + email. If unset,
+      # notifications still persist in pipeline_notifications (queryable via UI)
+      # but no external send happens. See .env.prod.example for setup.
+      - NOTIFIER_SLACK_WEBHOOK_URL=${NOTIFIER_SLACK_WEBHOOK_URL:-}
+      # Slack one-click drift approvals (inbound interactivity). Both unset ⇒ the
+      # receiver is inert and drift alerts keep the plain link button. See
+      # .env.prod.example for the required Slack app setup.
+      - SLACK_SIGNING_SECRET=${SLACK_SIGNING_SECRET:-}
+      - SLACK_BOT_TOKEN=${SLACK_BOT_TOKEN:-}
+      - SMTP_HOST=${SMTP_HOST:-}
+      - SMTP_PORT=${SMTP_PORT:-587}
+      - SMTP_USER=${SMTP_USER:-}
+      - SMTP_PASSWORD=${SMTP_PASSWORD:-}
+      - SMTP_FROM=${SMTP_FROM:-}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
+      - OTEL_SERVICE_NAME=api-gateway
+      - OTEL_ENABLED=true
+      - FEATURE_MONITORING_OVERVIEW=true
+      - FEATURE_MONITORING_INFRA=true
+      - FEATURE_MONITORING_TRACES=true
+      - FEATURE_SIGNOZ_DEEPLINKS=true
+      - SIGNOZ_UI_URL=${SIGNOZ_UI_URL:-http://localhost:3301}
+      - TOOLS_PATH=/app/shared/mcp-connectors
+      # Used by admin invitation creation to generate signup URLs.
+      - FRONTEND_URL=${FRONTEND_URL:-https://${DOMAIN}}
+      - RESEND_API_KEY=${RESEND_API_KEY:-}
+      - RESEND_FROM_ADDR=${RESEND_FROM_ADDR:-}
+      - APP_BASE_URL=${APP_BASE_URL:-https://${DOMAIN}}
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
+    labels:
+      - "traefik.enable=true"
+      # API route — explicit service= required when multiple services exist on one container
+      - "traefik.http.routers.api.rule=Host(`${DOMAIN}`) && PathPrefix(`/api`)"
+      - "traefik.http.routers.api.entrypoints=websecure"
+      - "traefik.http.routers.api.service=api"
+      - "traefik.http.routers.api.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.api.middlewares=security-headers@file,rate-limit@file"
+      - "traefik.http.services.api.loadbalancer.server.port=8080"
+      # WebSocket route
+      - "traefik.http.routers.ws.rule=Host(`${DOMAIN}`) && PathPrefix(`/ws`)"
+      - "traefik.http.routers.ws.entrypoints=websecure"
+      - "traefik.http.routers.ws.service=ws"
+      - "traefik.http.routers.ws.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.ws.middlewares=security-headers@file"
+      - "traefik.http.services.ws.loadbalancer.server.port=8080"
+      # OAuth callback route
+      - "traefik.http.routers.oauth.rule=Host(`${DOMAIN}`) && PathPrefix(`/oauth/callback`)"
+      - "traefik.http.routers.oauth.entrypoints=websecure"
+      - "traefik.http.routers.oauth.service=api"
+      - "traefik.http.routers.oauth.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.oauth.middlewares=security-headers@file"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  llm-service:
+    restart: unless-stopped
+    env_file: !override []
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    environment:
+      - PORT=5000
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - LLM_MODEL=${LLM_MODEL:-gpt-4o-mini}
+      - OLLAMA_URL=${OLLAMA_URL:-http://host.docker.internal:11434}
+      # OLLAMA_BASE_URL wins over OLLAMA_URL (openai_client.py _ollama_base_url) and is
+      # the name docs/deployment/env-vars.md tells operators to set. This service runs
+      # with `env_file: !override []`, so without an explicit passthrough the value they
+      # set never arrives. Empty is falsy in that helper — unset falls through to
+      # OLLAMA_URL above.
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - USE_MOCK_LLM=false
+      - LOG_FORMAT=json
+      - LOG_LEVEL=info
+      - ENVIRONMENT=production
+      # Control-plane DB for LLM cost/usage logging (llm_usage_events). The base
+      # docker-compose.yml default is `user:password@postgres/...?sslmode=disable`
+      # — dev credentials, the bundled hostname, and plaintext. This file is the
+      # external-database path, so an operator who configures POSTGRES_* +
+      # DB_SSLMODE but not DATABASE_URL had this one service still aimed at a
+      # bundled Postgres that is not in the project, over plaintext. Rebuild it
+      # from the same parts every other service here uses.
+      - DATABASE_URL=${DATABASE_URL:-postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-pipeline_db}?sslmode=${DB_SSLMODE:-require}}
+      # Sent as X-Internal-Secret on service-to-service calls to the orchestrator
+      # topology API (requirePrincipal). Empty = topology calls 401 in production,
+      # so this is :?-required like the other six sites in this file. It was the
+      # lone :- outlier: unreachable today (one :? aborts interpolation for the
+      # whole merged config, so the render already fails before reaching it) but a
+      # silent empty-secret hole the moment any of those six is relaxed.
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
+      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION:-2025-01-01-preview}
+      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
+      - GROQ_API_KEY=${GROQ_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - EXPLORER_OFFLINE_ONLY=${EXPLORER_OFFLINE_ONLY:-false}
+      # env_file is !override [] above, so Explorer overrides need explicit
+      # passthrough. All soft-default empty: unset ⇒ the code's own defaults
+      # (LLM_MODEL for openai/azure, llama3/sqlcoder for ollama).
+      - EXPLORER_LLM_PROVIDER=${EXPLORER_LLM_PROVIDER:-}
+      - EXPLORER_TABLE_LINK_MODEL=${EXPLORER_TABLE_LINK_MODEL:-}
+      - EXPLORER_COLUMN_LINK_MODEL=${EXPLORER_COLUMN_LINK_MODEL:-}
+      - EXPLORER_NEXT_STEPS_MODEL=${EXPLORER_NEXT_STEPS_MODEL:-}
+      - EXPLORER_QUERY_SPEC_MODEL=${EXPLORER_QUERY_SPEC_MODEL:-}
+      - EXPLORER_SQL_MODEL=${EXPLORER_SQL_MODEL:-}
+      - EXPLORER_SQL_MODEL_MYSQL=${EXPLORER_SQL_MODEL_MYSQL:-}
+      # /agents/rank-tables. Unset inherits EXPLORER_LLM_PROVIDER then LLM_PROVIDER.
+      - RANK_TABLES_LLM_PROVIDER=${RANK_TABLES_LLM_PROVIDER:-}
+      - RANK_TABLES_MODEL=${RANK_TABLES_MODEL:-}
+      - EXPLORER_SQL_PROVIDER=${EXPLORER_SQL_PROVIDER:-}
+      - EXPLORER_SQL_ALLOW_ONLINE=${EXPLORER_SQL_ALLOW_ONLINE:-}
+      - EXPLORER_SQL_OPENAI_MODEL=${EXPLORER_SQL_OPENAI_MODEL:-}
+      - EXPLORER_SQL_FALLBACK_MODELS=${EXPLORER_SQL_FALLBACK_MODELS:-}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-}
+      - REDIS_URL=redis://:${REDIS_PASSWORD}@redis:6379/0
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BROKERS:-kafka:29092}
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
+      - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:29092}
+      # Pin Avro OFF to match the producers (api-gateway/orchestrator both set
+      # KAFKA_USE_AVRO=false). llm-service's planner consumer defaults this to
+      # "true" when the avro libs are importable, so leaving it unset risks a
+      # consumer that expects Avro while the producers emit JSON. Explicit here
+      # keeps the whole Kafka path on one wire format.
+      - KAFKA_USE_AVRO=false
+      - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
+      - OTEL_SERVICE_NAME=llm-service
+      - OTEL_ENABLED=true
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  # Connector Deployer (SEC-H-02): the trusted socket-holder. Base
+  # docker-compose.yml defines the build, mounts (RW docker.sock + RO connector
+  # artifacts + the OAuth-tokens volume), networks and env; this overlay only
+  # hardens it for prod — restart policy, resource limit, bounded logging, and
+  # the two env vars that must change in prod: ENVIRONMENT=production (so the
+  # deployer's S2S auth fail-closes) and the fail-closed INTERNAL_SERVICE_SECRET.
+  connector-deployer:
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    environment:
+      # Prod => the deployer's require_internal_secret fails closed (503) when the
+      # secret is unset, instead of the dev "allow with a warning" path.
+      - ENVIRONMENT=production
+      # C3 fail-closed: refuse to start without the S2S secret in prod (mirrors the
+      # MINIO_ROOT_USER/PASSWORD :? pattern below). Same value tool-generator sends.
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
+      # SEC-H-02 increment 2: BUILD moves OFF the host daemon to the rootless
+      # buildkitd sidecar + local registry (both defined below). The deployer keeps
+      # CREATE/START on the socket (flat-name reachability unchanged); only the
+      # untrusted Dockerfile RUN/FROM steps leave the daemon.
+      #
+      # OPT-IN, deliberately. This defaulted to `tcp://buildkitd:1234`, which meant the
+      # next routine `compose up` would silently move every connector build onto a plane
+      # that has never been exercised on prod — an operator would have armed a rollout
+      # they never chose (KI-DEPLOYER-BUILDKIT-AUTOARM). Prod only avoided it because the
+      # running connector-deployer container predates the change. Empty ⇒ the deployer
+      # takes the legacy in-daemon `docker build` path (dockerx/backend.go buildLegacy).
+      #
+      # To arm: set DEPLOYER_BUILDKIT_HOST=tcp://buildkitd:1234 in the prod .env, bring up
+      # the buildkitd + mcp-registry sidecars defined below with `--profile buildkit`
+      # (they are profile-gated, so a default `up` omits them), recreate connector-deployer,
+      # then generate one connector end-to-end before trusting it. Unset ⇒ legacy path,
+      # so blanking the var is still the instant revert.
+      - BUILDKIT_HOST=${DEPLOYER_BUILDKIT_HOST-}
+      # buildkitd pushes to the compose-DNS alias; the HOST daemon pulls the loopback
+      # alias (127.0.0.1 is auto-insecure — no daemon.json change). Both address the
+      # one mcp-registry:2 instance; the manifest is keyed by repository path.
+      - DEPLOYER_REGISTRY_PUSH=mcp-registry:5000
+      - DEPLOYER_REGISTRY_PULL=127.0.0.1:5000
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+    # Also join the rootless-build plane (rsync-build, declared in the networks:
+    # block at the end of this file) to reach buildkitd; keep the base default +
+    # rsync-ai-mcp nets (listed in full since this overlay list replaces the base's).
+    networks:
+      - default
+      - rsync-ai-mcp
+      - rsync-build
+    # required:false + the sidecars' `buildkit` profile means an UNARMED stack
+    # neither starts them nor waits on them. Without both halves, a routine
+    # `compose up -d` aborts the WHOLE stack the moment buildkitd is unhealthy —
+    # api-gateway and frontend are left Created, i.e. the site goes down — even
+    # though an unarmed deployer never contacts buildkitd at all
+    # (KI-BUILDKIT-SIDECAR-ABORTS-STACK). Rootless buildkitd cannot start on hosts
+    # with kernel.apparmor_restrict_unprivileged_userns=1 (Ubuntu 23.10+), which is
+    # exactly where this bites.
+    depends_on:
+      buildkitd:
+        condition: service_healthy
+        required: false
+      mcp-registry:
+        condition: service_started
+        required: false
+
+  # === SEC-H-02 increment 2: rootless build plane ==========================
+  # Rootless BuildKit builds JIT connector images OFF the host daemon. Unprivileged:
+  # NO docker.sock, NO privileged; runs as uid 1000 inside a user namespace, so a
+  # malicious connector Dockerfile RUN lands as an unprivileged uid in a userns — not
+  # host root. seccomp/apparmor unconfined are REQUIRED for the nested build sandbox's
+  # userns syscalls; --oci-worker-no-process-sandbox is the documented rootless-in-
+  # docker knob. Image tag is version-locked to the deployer's buildctl via the shared
+  # BUILDKIT_VERSION build-arg passed to connector-deployer's build in the base file.
+  buildkitd:
+    image: moby/buildkit:${BUILDKIT_VERSION:-v0.31.2}-rootless
+    # Opt-in: absent from a default `up`, so an unarmed prod never starts a
+    # sidecar it does not use. Arm with `--profile buildkit`.
+    profiles: ["buildkit"]
+    restart: unless-stopped
+    command:
+      - --addr=tcp://0.0.0.0:1234
+      - --oci-worker-no-process-sandbox
+    security_opt:
+      - seccomp=unconfined
+      - apparmor=unconfined
+    networks:
+      - rsync-build
+    volumes:
+      - buildkit-cache:/home/user/.local/share/buildkit
+    healthcheck:
+      test: ["CMD", "buildctl", "--addr", "tcp://localhost:1234", "debug", "workers"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # Private image registry for the rootless-build plane. buildkitd pushes here over
+  # the compose network; the HOST daemon pulls 127.0.0.1:5000, the ONLY published port
+  # — the registry is never reachable off-host. Anonymous (no auth) by construction.
+  mcp-registry:
+    image: registry:2
+    profiles: ["buildkit"]
+    restart: unless-stopped
+    environment:
+      # Enable `registry garbage-collect` to reclaim deleted blobs (retention is a
+      # follow-up; JIT builds otherwise accumulate one repo/tag per connector version).
+      - REGISTRY_STORAGE_DELETE_ENABLED=true
+    ports:
+      - "127.0.0.1:5000:5000"
+    networks:
+      - rsync-build
+    volumes:
+      - mcp-registry-data:/var/lib/registry
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  tool-generator:
+    restart: unless-stopped
+    ports: !override []
+    env_file: !override []
+    environment:
+      - PORT=5010
+      - TOOLS_DIR=/app/shared/mcp-connectors
+      # Universal default: managed mode on. Override to "false" when
+      # production deploys an external docker-compose.mcp.yml stack.
+      # SEC-H-02: tool-generator no longer holds the docker socket or runs
+      # as root — the base docker-compose.yml removed both. Managed-mode JIT
+      # build/run is delegated to the connector-deployer (DEPLOYER_URL, S2S
+      # secret below), which is the sole trusted socket holder in every stack.
+      - RSYNC_MANAGED_CONNECTORS=${RSYNC_MANAGED_CONNECTORS:-true}
+      - LOG_FORMAT=json
+      - LOG_LEVEL=info
+      - ENVIRONMENT=production
+      - LLM_GATEWAY_URL=http://llm-service:5000
+      - CONTEXT7_MCP_URL=http://context7-mcp:8080
+      - CONTEXT7_VALIDATE_MIN_SCORE=0.90
+      - CONTEXT7_RESOLVE_MIN_SCORE=0.85
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434/v1
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-qwen2.5:7b}
+      # LLM provider for the agentic generation pipeline. The tool-generator
+      # agents build an OpenAI/Azure client directly (agents/base.py), so they
+      # need the same Azure passthrough the llm-service block has above. WITHOUT
+      # these the provider auto-detects to a non-existent Ollama and every
+      # generation fails at the Research stage with a misleading "Connection
+      # error". env_file:!override [] above drops ./llm-service/.env, so these
+      # must be passed through explicitly here.
+      - LLM_PROVIDER=${LLM_PROVIDER:-openai}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
+      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION:-2025-01-01-preview}
+      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
+      # Logo.dev token for the connector logo downloader. env_file:!override []
+      # drops ./llm-service/.env, so it must be passed through explicitly here.
+      - LOGO_DEV_TOKEN=${LOGO_DEV_TOKEN:-}
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
+      - OTEL_SERVICE_NAME=tool-generator
+      - OTEL_ENABLED=true
+      # SEC-H-03: S2S secret so /v1/deploy can require X-Internal-Secret. Orchestrator
+      # (:279) already carries the same value; unset => auth disabled (dev/e2e no-op).
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  planner:
+    restart: unless-stopped
+    ports: !override []
+    env_file: !override []
+    environment:
+      - PORT=5011
+      - LOG_FORMAT=json
+      - LOG_LEVEL=info
+      - ENVIRONMENT=production
+      - TOOL_GENERATOR_URL=http://tool-generator:5010
+      - API_GATEWAY_URL=http://api-gateway:8080
+      - LLM_GATEWAY_URL=http://llm-service:5000
+      - KAFKA_BOOTSTRAP_SERVERS=${KAFKA_BROKERS:-kafka:29092}
+      # Namespace for every Kafka topic this product creates, so an operator can
+      # tell them apart from other applications' topics on a shared (BYO-Kafka)
+      # cluster. Every service that touches Kafka must agree on this value: a
+      # producer and a consumer resolving different names do not error, the
+      # consumer just blocks on a topic nobody writes. `-` not `:-` on purpose --
+      # an explicit empty value means "disable" (keep pre-prefix topic names) and
+      # `:-` would silently turn that back into the default.
+      - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
+      - ENABLE_KAFKA_CONSUMER=false
+      - CONNECTORS_DIR=/app/shared/mcp-connectors
+      - KAFKA_USE_AVRO=false
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+      - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
+      - OTEL_SERVICE_NAME=planner
+      - OTEL_ENABLED=true
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  frontend:
+    restart: unless-stopped
+    ports: !override []
+    build:
+      args:
+        # NEXT_PUBLIC_* vars are baked into the client bundle at build time —
+        # runtime environment variables have no effect on them.
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://${DOMAIN}}
+        NEXT_PUBLIC_WS_URL: ${NEXT_PUBLIC_WS_URL:-wss://${DOMAIN}/ws}
+        NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL: ${NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL:-https://${DOMAIN}/orchestrator}
+        NEXT_PUBLIC_WS_ORCHESTRATOR_URL: ${NEXT_PUBLIC_WS_ORCHESTRATOR_URL:-wss://${DOMAIN}/ws/orchestrator}
+        NEXT_PUBLIC_LLM_SERVICE_URL: ${NEXT_PUBLIC_LLM_SERVICE_URL:-https://${DOMAIN}/llm}
+        NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW: "true"
+        NEXT_PUBLIC_FEATURE_MONITORING_INFRA: "true"
+        NEXT_PUBLIC_FEATURE_MONITORING_TRACES: "true"
+        NEXT_PUBLIC_FEATURE_SIGNOZ_DEEPLINKS: "true"
+        NEXT_PUBLIC_SIGNOZ_UI_URL: ${SIGNOZ_UI_URL:-}
+        NEXT_PUBLIC_OTEL_ENDPOINT: ${NEXT_PUBLIC_OTEL_ENDPOINT:-}
+        NEXT_PUBLIC_OTEL_SERVICE_NAME: "frontend"
+    environment:
+      - API_GATEWAY_INTERNAL_URL=http://api-gateway:8080
+      - ORCHESTRATOR_INTERNAL_URL=http://orchestrator:8080
+      # Server-only (NOT NEXT_PUBLIC): lets the RSC dashboard authenticate its
+      # server-side call to the orchestrator's now-gated CDC endpoints.
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
+      # Frontend appends /api/v1/... to NEXT_PUBLIC_API_URL, so this must be the origin (no /api).
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-https://${DOMAIN}}
+      - NEXT_PUBLIC_WS_URL=${NEXT_PUBLIC_WS_URL:-wss://${DOMAIN}/ws}
+      - NEXTAUTH_URL=${NEXTAUTH_URL:-https://${DOMAIN}}
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET}
+      - NEXT_PUBLIC_OTEL_ENDPOINT=${NEXT_PUBLIC_OTEL_ENDPOINT:-}
+      - NEXT_PUBLIC_OTEL_SERVICE_NAME=frontend
+      - NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW=true
+      - NEXT_PUBLIC_FEATURE_MONITORING_INFRA=true
+      - NEXT_PUBLIC_FEATURE_MONITORING_TRACES=true
+      - NEXT_PUBLIC_FEATURE_SIGNOZ_DEEPLINKS=true
+      - NEXT_PUBLIC_SIGNOZ_UI_URL=${SIGNOZ_UI_URL:-http://localhost:3301}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.service=frontend"
+      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.frontend.middlewares=security-headers@file"
+      - "traefik.http.services.frontend.loadbalancer.server.port=3000"
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ============================================
+  # INTERNAL MCP SERVICES
+  # ============================================
+
+  debezium-mcp:
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=production
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # Fail-closed prod object-store credentials. The base compose defaults to
+  # minioadmin/minioadmin for local-dev convenience; in production that default
+  # is a full customer-data-plane takeover, so require real values here —
+  # `docker compose up` aborts if the prod .env does not set them. (OSS/quickstart
+  # runs its own standalone compose and keeps the convenience default.)
+  minio:
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY_ID:?MINIO_ACCESS_KEY_ID must be set in prod .env (refusing the minioadmin default)}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_ACCESS_KEY:?MINIO_SECRET_ACCESS_KEY must be set in prod .env (refusing the minioadmin default)}
+
+  minio-mcp:
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=production
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # kafka-mcp-sink writes its exactly-once ACK ledger to the control-plane
+  # Postgres. The base docker-compose.yml builds POSTGRES_URL with
+  # ?sslmode=${DB_SSLMODE:-disable} — the right default for the local `postgres`
+  # container in dev, the wrong one here, where POSTGRES_HOST is an external
+  # managed instance and every other service in this file defaults to `require`.
+  # An operator who never sets DB_SSLMODE therefore got a stack where the sink
+  # alone tried plaintext: the ledger ping fails ("no pg_hba.conf entry ... no
+  # encryption"), the worker refuses to start to preserve exactly-once, never
+  # drains the Kafka topic, and 0 rows reach the destination while the pipeline
+  # still reports "completed".
+  #
+  # docker-compose.staging.yml:300 already carries this override with a
+  # hardcoded `require`. Repeating it here with ${DB_SSLMODE:-require} keeps the
+  # single knob working in both directions instead of pinning TLS on.
+  kafka-mcp-sink-mcp:
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=production
+      - POSTGRES_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-pipeline_db}?sslmode=${DB_SSLMODE:-require}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  context7-mcp:
+    restart: unless-stopped
+    ports: !override []
+    environment:
+      - ENVIRONMENT=production
+    healthcheck:
+      # context7 is a python:3.11-slim service that listens on 8080 (PORT env,
+      # default 8080) and has NO curl in the image — unlike the other internal
+      # MCP services (curl on :8000). The shared curl :8000 check therefore
+      # always failed here ("curl: not found" + wrong port), pinning the
+      # container to "unhealthy" even though /health returns 200. Use the
+      # image's own python+httpx against the real port instead (matches the
+      # HEALTHCHECK in shared/mcp-connectors/internal/context7/Dockerfile).
+      test: ["CMD-SHELL", "python -c \"import httpx,sys; sys.exit(0 if httpx.get('http://localhost:8080/health', timeout=3).status_code==200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ============================================
+  # OBSERVABILITY
+  # ============================================
+
+  fluent-bit:
+    restart: unless-stopped
+    # Only Docker daemon should reach this (log driver).
+    ports: !override
+      - "127.0.0.1:24224:24224"
+      - "127.0.0.1:24224:24224/udp"
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+
+  otel-collector:
+    restart: unless-stopped
+    ports: !override
+      # Keep collector ports local-only; services talk over the Docker network.
+      - "127.0.0.1:14317:4317"
+      - "127.0.0.1:14318:4318"
+      - "127.0.0.1:8006:8006"
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+networks:
+  # SEC-H-02 increment 2 — the rootless build plane (connector-deployer ↔ buildkitd ↔
+  # mcp-registry). NOT internal: true — buildkitd needs docker.io egress to pull the
+  # connectors' FROM base images. The registry stays private because only its loopback
+  # port (127.0.0.1:5000) is published; nothing on this net is otherwise exposed.
+  # (Base docker-compose.yml's default + rsync-ai-mcp networks merge in unchanged.)
+  rsync-build:
+    name: ${STACK_PREFIX:-rsync-ai}-build
+
+volumes:
+  traefik_certs:
+  # SEC-H-02 increment 2 rootless-build plane state.
+  buildkit-cache:
+  mcp-registry-data:

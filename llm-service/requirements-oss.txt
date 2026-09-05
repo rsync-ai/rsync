@@ -1,0 +1,22 @@
+# OSS connector-lifecycle image dependencies.
+#
+# Deliberately minimal: the community image serves only /health + /v1/deploy. It
+# carries NONE of the generation / NLP / LLM libraries (spaCy, presidio, openai,
+# anthropic, ...) — smaller image, smaller attack surface, and no path to the moat.
+#
+# The `docker` Python SDK IS required: deployment/docker_builder.py orchestrates every
+# JIT connector build/start through it (docker.from_env(); client.images.build/get;
+# client.containers.run; client.networks.get). Without it DOCKER_SDK_AVAILABLE=False and
+# /v1/deploy returns "Docker not available" for every connector — a dead-on-arrival
+# self-host. (Dockerfile.oss additionally ships docker-ce-cli + buildx because the build
+# step shells out to `docker build` for the shared `public/` build context, but the image
+# load after build and the container start are SDK calls.) Pinned to match the private image.
+#
+# Framework versions pinned to match the private llm-service (requirements.txt) so the
+# relocated /v1/deploy handler behaves identically.
+fastapi==0.137.1
+starlette==1.3.1
+uvicorn[standard]>=0.52.4
+httpx>=0.28.1
+pydantic>=2.13.5
+docker>=7.2.0

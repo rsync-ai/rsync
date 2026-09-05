@@ -1,0 +1,123 @@
+name: Licenses
+
+# Lightweight strong-copyleft guard for the source-available (Elastic License 2.0)
+# release: fail the build if a NEW GPL / AGPL / SSPL / BUSL dependency is introduced
+# in any dependency manifest. These licenses conflict with redistributing the combined
+# work under ELv2. LGPL / MPL are weak-copyleft (dynamically linked, kept as separate
+# components) and are allowed.
+#
+# Implemented as a pure `grep` scan — no go-licenses / pip-licenses / npm install — so it
+# runs instantly on any runner, with no interpreter or package manager to provision.
+# That is what let both jobs move to GitHub-hosted ubuntu-latest unchanged in the
+# flip-day fork-safety split. The FULL transitive
+# license inventory (with texts) is produced separately by
+# scripts/gen-third-party-notices.sh at release time.
+
+on:
+  pull_request:
+    paths:
+      - '**/requirements*.txt'
+      - '**/go.mod'
+      - '**/go.sum'
+      - 'frontend/package.json'
+      - 'THIRD_PARTY_NOTICES.md'
+      - 'scripts/gen-third-party-notices.sh'
+      - 'scripts/check-third-party-notices.sh'
+      - '.github/workflows/licenses.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: licenses-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  denylist:
+    name: Copyleft denylist (GPL/AGPL/SSPL)
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Strong-copyleft denylist scan
+        run: |
+          set -uo pipefail
+          # License identifiers OR known strong-copyleft package names in manifests.
+          PATTERN='GPL-2\.0|GPL-3\.0|AGPLv?-?[0-9]|\bAGPL\b|SSPL|BUSL|Server Side Public|mysql-connector-python|\bpymssql\b'
+          # Documented exceptions, COMMENT-ANCHORED (matched per line). Anchoring `# *` means an
+          # ACTIVE (uncommented) re-introduction of the GPLv2 driver in a SHIPPED manifest FAILS —
+          # only the inert commented driver-menu hint that appears in every DB connector manifest
+          # is allowed:
+          #   mysql-connector-python — GPLv2. SWAPPED to MIT PyMySQL in the shipped mysql connector
+          #     (#499); it no longer ships in any distributed image. Dev/test manifests (e2e/,
+          #     tests/) — which DO still install it and are never redistributed — are excluded from
+          #     the scan below via --exclude-dir, not via a broad ALLOW (a broad `mysql-connector-
+          #     python` ALLOW would let an active re-add in a real connector pass silently).
+          #   pymssql — present ONLY as a commented-out line (not installed); SQL Server uses pyodbc.
+          ALLOW='# *mysql-connector-python|# *pymssql'
+          hits=$(grep -RniE "$PATTERN" \
+                   --include='requirements*.txt' --include='go.mod' --include='package.json' \
+                   --exclude-dir=e2e --exclude-dir=tests --exclude-dir=node_modules . \
+                 | grep -viE "$ALLOW" || true)
+          if [ -n "$hits" ]; then
+            echo "::error::New strong-copyleft (GPL/AGPL/SSPL/BUSL) dependency detected in a manifest:"
+            echo "$hits"
+            echo ""
+            echo "GPL/AGPL/SSPL/BUSL conflict with redistribution under ELv2. Use a permissive"
+            echo "or weak-copyleft (LGPL/MPL) alternative, or add a reviewed exception to ALLOW."
+            exit 1
+          fi
+          echo "✓ No new strong-copyleft dependencies in manifests."
+
+  notices:
+    name: THIRD_PARTY_NOTICES lists what ships (Go)
+    # Same fork guard as `denylist`. Both jobs are GitHub-hosted since the
+    # fork-safety split, so the guard is now defence-in-depth rather than the
+    # control -- keep it: it is what stops a fork PR spending this repo's
+    # Actions budget, and it must still be there if a job ever returns to a Mac.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # Deliberately NOT `scripts/gen-third-party-notices.sh`: that regenerates the whole
+      # file and would drop the hand-curated container/OS-packages section, including the
+      # msodbcsql18 Microsoft-EULA flag awaiting legal review. This checks one property --
+      # that the Go table names exactly the module@version set the shipped binaries build.
+      # check-third-party-notices.sh runs `go list -deps` over every shipped
+      # module, so it needs a toolchain satisfying go.mod. On the Macs `go` was
+      # simply present; ubuntu-latest ships whatever Go its image pinned, which
+      # drifts from go.mod and fails the whole closure with a version error.
+      # Install it explicitly rather than inheriting the image's.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: api-gateway/go.mod
+          cache: false
+      - name: Go table matches the shipped dependency closure
+        run: ./scripts/check-third-party-notices.sh
+
+      # The answer must not depend on who is asking. `go list -deps` resolves
+      # build constraints for the HOST unless told otherwise, and every artifact
+      # this notice describes is a Linux container image -- so run on a macOS
+      # runner it measures a platform the product does not ship on. That is not
+      # hypothetical: it silently omitted github.com/prometheus/procfs
+      # (Apache-2.0, reached from client_golang by api-gateway, orchestrator and
+      # temporal-adapter) for the whole life of the file. The scripts now pin
+      # GOOS=linux; this step is what keeps them pinned.
+      #
+      # It asserts the PROPERTY, not the implementation: re-run the checker with
+      # a hostile GOOS/GOARCH exported and require the same verdict. Grepping
+      # the script for the string `GOOS=linux` would pass just as happily
+      # against a pin that had been moved somewhere it no longer covers the
+      # `go list` call. Deleting the pin makes this step go red on ANY runner --
+      # including a Linux one, where the unpinned closure would otherwise agree
+      # with the table and the regression would reach a Mac silently.
+      - name: ...and does not depend on the runner's own platform
+        env:
+          GOOS: darwin
+          GOARCH: arm64
+        run: ./scripts/check-third-party-notices.sh

@@ -1,0 +1,696 @@
+{
+  "_comment": "Captured from staging GET /api/v1/connectors (:8080) on 2026-06-21 after Phase A2 backfill + D deploy. Hermetic fixture for the data-driven render test. Regenerate if connector auth metadata changes.",
+  "connectors": [
+    {
+      "name": "aws-s3",
+      "display_name": "AWS S3",
+      "version": "1.0.0",
+      "description": "Connector for AWS S3 cloud storage service, allowing operations on buckets and objects.",
+      "category": "cloud_storage",
+      "icon": "",
+      "color": "",
+      "source": "built_in",
+      "lifecycle": "draft",
+      "status": "active",
+      "quality_tier": "bronze",
+      "quality_score": 44,
+      "confidence_level": "medium",
+      "api_category_hint": "storage",
+      "qa_metadata": {
+        "export_attempts": [],
+        "export_validated_with": null,
+        "export_validation_status": "unknown",
+        "tests_failed": 0,
+        "tests_passed": 4
+      },
+      "capabilities": {
+        "inference": {
+          "capability_inference": {
+            "confidence": 0.9,
+            "evidence": [
+              "Documentation analysis (source: context7)",
+              "Source indicators: ['read', 'fetch', 'retrieve', 'list']",
+              "Destination indicators: ['create', 'load', 'put', 'save']",
+              "CDC indicators: ['change data capture', 'streaming']",
+              "Operation analysis: 6 operations",
+              "Source operations: ['read', 'discover_schema']",
+              "Destination operations: ['import_data']",
+              "CDC operations: []",
+              "Category defaults for 'cloud_storage': source=True, dest=True, cdc=False",
+              "CDC disabled by policy: only Debezium-supported databases advertise CDC"
+            ],
+            "source": "documentation",
+            "supports_cdc": false,
+            "supports_destination": true,
+            "supports_source": true
+          }
+        },
+        "max_batch_size": 10000,
+        "supported_compressions": [
+          "none",
+          "gzip",
+          "bzip2",
+          "snappy",
+          "lz4",
+          "zstd"
+        ],
+        "supported_formats": [
+          "csv",
+          "tsv",
+          "json",
+          "jsonl",
+          "parquet",
+          "avro",
+          "orc",
+          "arrow",
+          "xlsx"
+        ],
+        "supports_cdc": false,
+        "supports_incremental_batch": false
+      },
+      "configuration_schema": {
+        "properties": {
+          "access_key_id": {
+            "description": "AWS Access Key ID",
+            "secret": true,
+            "type": "string"
+          },
+          "bucket": {
+            "description": "S3 bucket name",
+            "type": "string"
+          },
+          "compression": {
+            "default": "none",
+            "description": "Compression type",
+            "enum": [
+              "none",
+              "gzip",
+              "bzip2",
+              "snappy",
+              "lz4",
+              "zstd"
+            ],
+            "type": "string",
+            "ui_order": 11,
+            "ui_widget": "select"
+          },
+          "file_format": {
+            "default": "json",
+            "description": "Output file format",
+            "enum": [
+              "csv",
+              "tsv",
+              "json",
+              "jsonl",
+              "parquet",
+              "avro",
+              "orc",
+              "arrow",
+              "xlsx"
+            ],
+            "type": "string",
+            "ui_order": 10,
+            "ui_widget": "select"
+          },
+          "path_prefix": {
+            "default": "",
+            "description": "Path prefix for files",
+            "type": "string"
+          },
+          "region": {
+            "default": "us-east-1",
+            "description": "AWS region",
+            "enum": [
+              "us-east-1",
+              "us-east-2",
+              "us-west-1",
+              "us-west-2",
+              "eu-west-1",
+              "eu-west-2",
+              "eu-west-3",
+              "eu-central-1",
+              "ap-south-1",
+              "ap-southeast-1",
+              "ap-southeast-2",
+              "ap-northeast-1"
+            ],
+            "type": "string",
+            "ui_order": 5,
+            "ui_widget": "select"
+          },
+          "secret_access_key": {
+            "description": "AWS Secret Access Key",
+            "secret": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_key_id",
+          "secret_access_key",
+          "region",
+          "bucket"
+        ],
+        "type": "object"
+      },
+      "supports_source": true,
+      "supports_destination": true,
+      "supports_cdc": false,
+      "auth_type": "api_key",
+      "supported_auth_methods": [
+        {
+          "config_keys": [
+            "access_key_id",
+            "secret_access_key"
+          ],
+          "description": "AWS access key ID and secret access key (SigV4 request signing).",
+          "header_name": "",
+          "header_prefix": "",
+          "method": "api_key"
+        }
+      ],
+      "docker_deployed": false,
+      "docker_status": "auto_deploys_on_use",
+      "has_dockerfile": true,
+      "logo_url": "/api/v1/connectors/aws-s3/logo"
+    },
+    {
+      "name": "countries-gql",
+      "display_name": "Countries-Gql",
+      "version": "1.0.1",
+      "description": "Countries GraphQL (regression after metadata base_url change)",
+      "category": "api_saas",
+      "icon": "",
+      "color": "",
+      "source": "built_in",
+      "lifecycle": "draft",
+      "status": "active",
+      "quality_tier": "gold",
+      "confidence_level": "unknown",
+      "capabilities": {
+        "auto_create_destination_tables": false,
+        "max_batch_size": 10000,
+        "supported_formats": [
+          "json"
+        ],
+        "supports_cdc": false,
+        "supports_ddl": false,
+        "supports_incremental_batch": false
+      },
+      "configuration_schema": {
+        "properties": {},
+        "required": [],
+        "type": "object"
+      },
+      "supports_source": true,
+      "supports_destination": false,
+      "supports_cdc": false,
+      "auth_type": "none",
+      "docker_deployed": false,
+      "docker_status": "auto_deploys_on_use",
+      "has_dockerfile": true,
+      "logo_url": "/api/v1/connectors/countries-gql/logo"
+    },
+    {
+      "name": "github-rest",
+      "display_name": "Github-Rest",
+      "version": "1.0.0",
+      "description": "github-rest connector",
+      "category": "api_saas",
+      "icon": "",
+      "color": "",
+      "source": "built_in",
+      "lifecycle": "draft",
+      "status": "active",
+      "quality_tier": "silver",
+      "confidence_level": "unknown",
+      "capabilities": {
+        "auto_create_destination_tables": false,
+        "max_batch_size": 10000,
+        "supported_formats": [
+          "json"
+        ],
+        "supports_cdc": false,
+        "supports_ddl": false,
+        "supports_incremental_batch": true
+      },
+      "configuration_schema": {
+        "properties": {
+          "access_token": {
+            "description": "GitHub personal access token, sent as a Bearer token in the Authorization header.",
+            "secret": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_token"
+        ],
+        "type": "object"
+      },
+      "supports_source": true,
+      "supports_destination": false,
+      "supports_cdc": false,
+      "auth_type": "bearer",
+      "supported_auth_methods": [
+        {
+          "config_keys": [
+            "access_token"
+          ],
+          "description": "GitHub personal access token sent as a Bearer token in the Authorization header.",
+          "header_name": "Authorization",
+          "header_prefix": "Bearer",
+          "method": "bearer"
+        }
+      ],
+      "docker_deployed": false,
+      "docker_status": "auto_deploys_on_use",
+      "has_dockerfile": true,
+      "logo_url": "/api/v1/connectors/github-rest/logo"
+    },
+    {
+      "name": "google-sheets",
+      "display_name": "Google Sheets",
+      "version": "1.0.0",
+      "description": "Source + destination connector for Google Sheets via the Sheets v4 REST API. Each sheet tab is treated as a table; the first row is the header. As a source it reads rows offset-paged (export); as a destination it appends rows (import_data) and auto-creates tabs. OAuth2 with the 'google' provider.",
+      "category": "api_saas",
+      "icon": "",
+      "color": "",
+      "source": "built_in",
+      "lifecycle": "draft",
+      "status": "active",
+      "confidence_level": "unknown",
+      "capabilities": {
+        "auto_create_destination_tables": true,
+        "max_batch_size": 1000,
+        "supported_formats": [
+          "json"
+        ],
+        "supports_cdc": false,
+        "supports_ddl": true,
+        "supports_incremental_batch": false
+      },
+      "configuration_schema": {
+        "properties": {
+          "access_token": {
+            "description": "OAuth2 access token with the spreadsheets scope.",
+            "secret": true,
+            "type": "string"
+          },
+          "spreadsheet_id": {
+            "description": "Google Sheets workbook ID \u2014 the long string between /d/ and /edit in the URL.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "spreadsheet_id",
+          "access_token"
+        ],
+        "type": "object"
+      },
+      "supports_source": true,
+      "supports_destination": true,
+      "supports_cdc": false,
+      "auth_type": "oauth2",
+      "oauth_provider": "google",
+      "supported_auth_methods": [
+        {
+          "config_keys": [
+            "access_token",
+            "oauth_token_id",
+            "token"
+          ],
+          "description": "OAuth 2.0 via the 'google' provider with the spreadsheets scope.",
+          "header_name": "Authorization",
+          "header_prefix": "Bearer",
+          "method": "oauth2"
+        }
+      ],
+      "docker_deployed": false,
+      "docker_status": "auto_deploys_on_use",
+      "has_dockerfile": true,
+      "logo_url": "/api/v1/connectors/google-sheets/logo"
+    },
+    {
+      "name": "mysql",
+      "display_name": "MySQL",
+      "version": "1.0.0",
+      "description": "Connector for MySQL relational database.",
+      "category": "relational_db",
+      "icon": "",
+      "color": "",
+      "source": "built_in",
+      "lifecycle": "preview",
+      "status": "active",
+      "quality_tier": "bronze",
+      "quality_score": 34,
+      "confidence_level": "medium",
+      "qa_metadata": {
+        "export_attempts": [
+          {
+            "error": null,
+            "passed": true,
+            "response_sample": {
+              "message": "Skipped (no runtime fixture)",
+              "success": true
+            },
+            "status": "",
+            "test": "relational_db_export_smoke",
+            "warning": null
+          }
+        ],
+        "export_validated_with": null,
+        "export_validation_status": "validated",
+        "tests_failed": 0,
+        "tests_passed": 6
+      },
+      "capabilities": {
+        "auto_create_destination_tables": true,
+        "max_batch_size": 10000,
+        "supported_formats": [
+          "csv",
+          "json"
+        ],
+        "supports_cdc": true,
+        "supports_ddl": true,
+        "supports_incremental_batch": false
+      },
+      "configuration_schema": {
+        "properties": {
+          "database": {
+            "description": "Database name",
+            "type": "string"
+          },
+          "host": {
+            "description": "Database host address",
+            "type": "string"
+          },
+          "password": {
+            "description": "Database password",
+            "secret": true,
+            "type": "string"
+          },
+          "port": {
+            "description": "Database port number",
+            "type": "integer"
+          },
+          "user": {
+            "description": "Database user",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host",
+          "port",
+          "database",
+          "user",
+          "password"
+        ],
+        "type": "object"
+      },
+      "supports_source": true,
+      "supports_destination": true,
+      "supports_cdc": true,
+      "supported_versions": {
+        "batch": "MySQL 5.7 and later, including 8.0 (8.0+ recommended); MariaDB 10.x compatible",
+        "cdc": "MySQL 5.7 and later, including 8.0 \u2014 via Debezium (requires binlog_format=ROW and binlog_row_image=FULL)"
+      },
+      "auth_type": "basic",
+      "supported_auth_methods": [
+        {
+          "config_keys": [
+            "user",
+            "password"
+          ],
+          "description": "Username/password authentication to the MySQL server.",
+          "header_name": "",
+          "header_prefix": "",
+          "method": "basic"
+        }
+      ],
+      "docker_deployed": false,
+      "docker_status": "auto_deploys_on_use",
+      "has_dockerfile": true,
+      "logo_url": "/api/v1/connectors/mysql/logo"
+    },
+    {
+      "name": "petstore",
+      "display_name": "Petstore",
+      "version": "1.0.3",
+      "description": "Swagger Petstore OpenAPI 3.0 sample API",
+      "category": "api_saas",
+      "icon": "",
+      "color": "",
+      "source": "built_in",
+      "lifecycle": "draft",
+      "status": "active",
+      "quality_tier": "silver",
+      "confidence_level": "unknown",
+      "capabilities": {
+        "auto_create_destination_tables": false,
+        "max_batch_size": 10000,
+        "supported_formats": [
+          "json"
+        ],
+        "supports_cdc": false,
+        "supports_ddl": false,
+        "supports_incremental_batch": true
+      },
+      "configuration_schema": {
+        "properties": {
+          "access_token": {
+            "description": "Access token / bearer credential used to authenticate requests.",
+            "secret": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "access_token"
+        ],
+        "type": "object"
+      },
+      "supports_source": true,
+      "supports_destination": true,
+      "supports_cdc": false,
+      "auth_type": "oauth2",
+      "oauth_provider": "petstore",
+      "supported_auth_methods": [
+        {
+          "config_keys": [
+            "access_token",
+            "oauth_token_id",
+            "token"
+          ],
+          "description": "OAuth 2.0 via the 'petstore' provider; the access token is sent as a Bearer token in the Authorization header.",
+          "header_name": "Authorization",
+          "header_prefix": "Bearer",
+          "method": "oauth2",
+          "oauth_provider": "petstore"
+        }
+      ],
+      "docker_deployed": false,
+      "docker_status": "auto_deploys_on_use",
+      "has_dockerfile": true,
+      "logo_url": "/api/v1/connectors/petstore/logo"
+    },
+    {
+      "name": "postgresql",
+      "display_name": "PostgreSQL",
+      "version": "1.0.0",
+      "description": "Connector for integrating with PostgreSQL databases.",
+      "category": "relational_db",
+      "icon": "",
+      "color": "",
+      "source": "built_in",
+      "lifecycle": "preview",
+      "status": "active",
+      "quality_tier": "bronze",
+      "quality_score": 32,
+      "confidence_level": "medium",
+      "qa_metadata": {
+        "export_attempts": [
+          {
+            "error": null,
+            "passed": true,
+            "response_sample": {
+              "message": "Skipped (no runtime fixture)",
+              "success": true
+            },
+            "status": "",
+            "test": "relational_db_export_smoke",
+            "warning": null
+          }
+        ],
+        "export_validated_with": null,
+        "export_validation_status": "validated",
+        "tests_failed": 0,
+        "tests_passed": 6
+      },
+      "capabilities": {
+        "inference": {
+          "capability_inference": {
+            "confidence": 0.6,
+            "evidence": [
+              "Operation analysis: 6 operations",
+              "Source operations: ['export', 'discover_schema']",
+              "Destination operations: ['import_data']",
+              "CDC operations: []",
+              "Category defaults for 'relational_db': source=True, dest=True, cdc=False",
+              "CDC enabled by policy: 'postgresql' is in debezium_supported_databases"
+            ],
+            "source": "operations",
+            "supports_cdc": true,
+            "supports_destination": true,
+            "supports_source": true
+          }
+        },
+        "max_batch_size": 10000,
+        "supported_compressions": [
+          "none",
+          "gzip"
+        ],
+        "supported_formats": [
+          "csv",
+          "json"
+        ],
+        "supports_cdc": true,
+        "supports_incremental_batch": false
+      },
+      "configuration_schema": {
+        "properties": {
+          "database": {
+            "description": "Database name",
+            "type": "string"
+          },
+          "host": {
+            "description": "Database host address",
+            "type": "string"
+          },
+          "password": {
+            "description": "Database password",
+            "secret": true,
+            "type": "string"
+          },
+          "port": {
+            "description": "Database port number",
+            "type": "integer"
+          },
+          "user": {
+            "description": "Database user",
+            "type": "string"
+          }
+        },
+        "required": [
+          "host",
+          "port",
+          "database",
+          "user",
+          "password"
+        ],
+        "type": "object"
+      },
+      "supports_source": true,
+      "supports_destination": true,
+      "supports_cdc": true,
+      "supported_versions": {
+        "batch": "PostgreSQL 9.4 and later (12+ recommended)",
+        "cdc": "PostgreSQL 10 and later \u2014 logical replication via Debezium pgoutput (requires wal_level=logical)"
+      },
+      "auth_type": "basic",
+      "supported_auth_methods": [
+        {
+          "config_keys": [
+            "user",
+            "password"
+          ],
+          "description": "Username/password authentication to the PostgreSQL server.",
+          "header_name": "",
+          "header_prefix": "",
+          "method": "basic"
+        }
+      ],
+      "docker_deployed": false,
+      "docker_status": "auto_deploys_on_use",
+      "has_dockerfile": true,
+      "logo_url": "/api/v1/connectors/postgresql/logo"
+    },
+    {
+      "name": "shopify-admin-graphql",
+      "display_name": "Shopify",
+      "version": "1.0.0",
+      "description": "GraphQL connector for Shopify (source + products destination)",
+      "category": "api_saas",
+      "icon": "",
+      "color": "",
+      "source": "built_in",
+      "lifecycle": "draft",
+      "confidence_level": "unknown",
+      "capabilities": {
+        "auto_create_destination_tables": false,
+        "bulk_export_protocol": "shopify_bulk_operations",
+        "bulk_export_threshold_default": 10000,
+        "bulk_export_threshold_env": "SHOPIFY_BULK_OPS_THRESHOLD",
+        "max_batch_size": 10000,
+        "supported_formats": [
+          "json"
+        ],
+        "supports_bulk_export": true,
+        "supports_cdc": false,
+        "supports_ddl": false,
+        "supports_incremental_batch": false
+      },
+      "configuration_schema": {
+        "properties": {
+          "access_token": {
+            "description": "Shopify Admin API access token",
+            "secret": true,
+            "type": "string"
+          },
+          "shop": {
+            "description": "Your Shopify store subdomain (e.g. 'acme' for acme.myshopify.com)",
+            "type": "string"
+          },
+          "version": {
+            "default": "2024-10",
+            "description": "Shopify API version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "shop",
+          "access_token"
+        ],
+        "type": "object"
+      },
+      "supports_source": true,
+      "supports_destination": true,
+      "supports_cdc": false,
+      "auth_type": "custom_header",
+      "oauth_provider": "shopify",
+      "supported_auth_methods": [
+        {
+          "config_keys": [
+            "access_token",
+            "token"
+          ],
+          "description": "Shopify Admin API access token (private app or custom app token)",
+          "header_name": "X-Shopify-Access-Token",
+          "header_prefix": "",
+          "method": "custom_header"
+        },
+        {
+          "config_keys": [
+            "oauth_token_id",
+            "access_token"
+          ],
+          "description": "OAuth 2.0 \u2014 for public/custom Shopify Apps installed on a shop",
+          "header_name": "X-Shopify-Access-Token",
+          "header_prefix": "",
+          "method": "oauth2"
+        }
+      ],
+      "docker_deployed": false,
+      "docker_status": "auto_deploys_on_use",
+      "has_dockerfile": true,
+      "logo_url": "/api/v1/connectors/shopify-admin-graphql/logo"
+    }
+  ]
+}

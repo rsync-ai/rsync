@@ -1,0 +1,1 @@
+"""Widgets-Graphql MCP Connector"""

@@ -1,0 +1,54 @@
+# Traefik Dynamic Configuration — local prod-mirror
+# Uses the FILE provider to define routes so Docker label TLS conflicts don't apply.
+# (Docker labels with tls.* keys force TLS mode even with empty certresolver.)
+
+http:
+  # ── Routers ────────────────────────────────────────────────────────────────
+  routers:
+    api:
+      rule: "Host(`localhost`) && PathPrefix(`/api`)"
+      entryPoints: ["web"]
+      service: api-gateway
+      middlewares: ["security-headers", "rate-limit"]
+
+    ws:
+      rule: "Host(`localhost`) && PathPrefix(`/ws`)"
+      entryPoints: ["web"]
+      service: api-gateway
+
+    oauth:
+      rule: "Host(`localhost`) && PathPrefix(`/oauth/callback`)"
+      entryPoints: ["web"]
+      service: api-gateway
+
+    frontend:
+      rule: "Host(`localhost`)"
+      entryPoints: ["web"]
+      service: frontend
+      middlewares: ["security-headers"]
+
+  # ── Services (point to internal Docker container IPs) ────────────────────
+  services:
+    api-gateway:
+      loadBalancer:
+        servers:
+          - url: "http://rsync-ai-api-gateway:8080"
+
+    frontend:
+      loadBalancer:
+        servers:
+          - url: "http://rsync-ai-frontend:3000"
+
+  # ── Middlewares ────────────────────────────────────────────────────────────
+  middlewares:
+    security-headers:
+      headers:
+        contentTypeNosniff: true
+        browserXssFilter: true
+        referrerPolicy: strict-origin-when-cross-origin
+
+    rate-limit:
+      rateLimit:
+        average: 200
+        burst: 100
+        period: 1s

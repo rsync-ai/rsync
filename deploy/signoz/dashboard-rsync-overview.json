@@ -1,0 +1,207 @@
+{
+  "title": "rsync-ai — Pipeline & Gateway Overview",
+  "description": "Domain SLIs for rsync-ai: gateway request/latency/auth, pipeline success & duration, MCP connector health, Kafka/DLQ throughput, and healer activity. Source metrics are scraped by the otel-collector prometheus receiver from api-gateway:8080/metrics and orchestrator:8080/metrics, then forwarded to SigNoz. Import via SigNoz UI → Dashboards → Import JSON. F-Obs-2.",
+  "tags": ["rsync-ai", "observability", "F-Obs-2"],
+  "layout": [
+    { "i": "gw-req-rate", "x": 0, "y": 0, "w": 6, "h": 3 },
+    { "i": "gw-5xx-rate", "x": 6, "y": 0, "w": 6, "h": 3 },
+    { "i": "gw-latency-p95", "x": 0, "y": 3, "w": 6, "h": 3 },
+    { "i": "gw-auth-failures", "x": 6, "y": 3, "w": 6, "h": 3 },
+    { "i": "gw-run-triggers", "x": 0, "y": 6, "w": 6, "h": 3 },
+    { "i": "pipe-runs", "x": 6, "y": 6, "w": 6, "h": 3 },
+    { "i": "pipe-duration-p95", "x": 0, "y": 9, "w": 6, "h": 3 },
+    { "i": "mcp-failure-rate", "x": 6, "y": 9, "w": 6, "h": 3 },
+    { "i": "kafka-published", "x": 0, "y": 12, "w": 6, "h": 3 },
+    { "i": "dlq-rate", "x": 6, "y": 12, "w": 6, "h": 3 },
+    { "i": "healer-actions", "x": 0, "y": 15, "w": 12, "h": 3 }
+  ],
+  "widgets": [
+    {
+      "id": "gw-req-rate",
+      "title": "Gateway request rate by status",
+      "description": "req/s per HTTP status class.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (status) (rate(rsync_gateway_http_requests_total[5m]))", "legend": "{{status}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "gw-5xx-rate",
+      "title": "Gateway 5xx error rate",
+      "description": "Server-error responses per second.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (route) (rate(rsync_gateway_http_requests_total{status=~\"5..\"}[5m]))", "legend": "{{route}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "gw-latency-p95",
+      "title": "Gateway p95 latency by route",
+      "description": "95th-percentile request latency.",
+      "panelTypes": "graph",
+      "yAxisUnit": "s",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "histogram_quantile(0.95, sum by (le, route) (rate(rsync_gateway_http_request_duration_seconds_bucket[5m])))", "legend": "{{route}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "gw-auth-failures",
+      "title": "Auth failures (401/403)",
+      "description": "Leading signal of credential-stuffing or broken tokens after a deploy.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (reason) (rate(rsync_gateway_auth_failures_total[5m]))", "legend": "{{reason}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "gw-run-triggers",
+      "title": "Pipeline run triggers (accepted vs rejected)",
+      "description": "User-initiated POST /pipelines/:id/run by result.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (result) (rate(rsync_gateway_pipeline_run_triggers_total[5m]))", "legend": "{{result}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "pipe-runs",
+      "title": "Pipeline runs by terminal status",
+      "description": "Executions reaching completed/failed/cancelled.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (status) (rate(rsync_pipeline_runs_total[15m]))", "legend": "{{status}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "pipe-duration-p95",
+      "title": "Pipeline sync duration p95",
+      "description": "Wall-clock execution time by sync_mode — 'is sync getting slower?'",
+      "panelTypes": "graph",
+      "yAxisUnit": "s",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "histogram_quantile(0.95, sum by (le, sync_mode) (rate(rsync_pipeline_sync_duration_seconds_bucket[30m])))", "legend": "{{sync_mode}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "mcp-failure-rate",
+      "title": "MCP call failure rate by connector",
+      "description": "Connector-specific failure spikes (executor → connector).",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (connector) (rate(rsync_mcp_calls_total{status=\"failure\"}[5m]))", "legend": "{{connector}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "kafka-published",
+      "title": "Kafka messages published by topic",
+      "description": "Producer progress per topic + result.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (topic, result) (rate(rsync_kafka_messages_published_total[5m]))", "legend": "{{topic}} ({{result}})", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "dlq-rate",
+      "title": "DLQ message rate by source topic",
+      "description": "Is data being silently dropped? Any sustained > 0 is a problem.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (source_topic) (rate(rsync_dlq_messages_total[5m]))", "legend": "{{source_topic}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+    {
+      "id": "healer-actions",
+      "title": "Healer actions by outcome",
+      "description": "success/failure/escalated — detect healer thrashing and escalations.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (action, outcome) (rate(rsync_healer_actions_total[15m]))", "legend": "{{action}} ({{outcome}})", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    }
+  ]
+}

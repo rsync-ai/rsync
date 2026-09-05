@@ -1,0 +1,84 @@
+# Community (OSS / self-host) LLM service — moat-free.
+#
+# This is the image `docker-compose.quickstart.yml` pulls for `llm-service` and
+# `planner`. It is the reason the quickstart can be pull-only: the private
+# ./Dockerfile bakes the connector-generation moat (src/agents/tool_generator/config
+# — vendor_apis.yaml, auth_rules.yaml, capability_rules.yaml, learned_apis.jsonl)
+# into a pullable artifact, which is irreversible once the registry is public, so
+# that image is deliberately absent from .github/workflows/docker-publish.yml.
+#
+# What ships here: the LLM gateway (/chat — the ONLY pipeline-creation path in the
+# product today), the planner, the Data Explorer, suggestions, the PII scanner, and
+# the moat-free connector-deploy runtime. What does not: every path in
+# ./oss-strip-list.txt.
+#
+# ── ALLOWLIST, not a deny-list ──────────────────────────────────────────────────
+# The COPY lines below name what enters the image. A stripped path can therefore
+# never reach a layer — not even an intermediate one a cache export could publish,
+# which a `COPY src/ ./src/` + `RUN rm -rf` build could not promise.
+#
+# The cost of an allowlist is that a NEW top-level module is silently omitted
+# instead of loudly leaked. tests/test_oss_image_boundary.py closes that: it walks
+# `git ls-files` and asserts every tracked file under src/ and prompts/ is either
+# covered by a COPY line here or listed in oss-strip-list.txt — never neither, and
+# never both. Add a module → add a COPY line or a strip entry, or CI fails.
+#
+# The sibling ./Dockerfile.oss builds the much smaller connector-lifecycle image
+# (deploy only, no LLM dependencies). Both are published; see docker-publish.yml.
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Same dependency set as the private image so the shared modules behave
+# identically. No docker-ce-cli / buildx here: this image never builds a
+# connector — the connector-lifecycle image (Dockerfile.oss) and the
+# connector-deployer own that, and they hold the socket.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pre-install the spaCy model Presidio uses. Without it the first /suggestions
+# call after a cold start downloads ~13MB inline and trips the gateway timeout.
+RUN python -m spacy download en_core_web_sm
+
+RUN useradd -m -u 1000 appuser
+
+# ── ALLOWLIST COPY — moat-free modules ONLY ─────────────────────────────────────
+# Keep in lockstep with oss-strip-list.txt (enforced by tests/test_oss_image_boundary.py).
+COPY src/__init__.py ./src/__init__.py
+COPY src/gateway/ ./src/gateway/
+COPY src/lifecycle/ ./src/lifecycle/
+COPY src/models/ ./src/models/
+COPY src/text2sql/ ./src/text2sql/
+COPY src/utils/ ./src/utils/
+
+COPY src/agents/__init__.py ./src/agents/__init__.py
+COPY src/agents/connector_resolver/ ./src/agents/connector_resolver/
+COPY src/agents/dag_planner/ ./src/agents/dag_planner/
+COPY src/agents/explorer/ ./src/agents/explorer/
+COPY src/agents/pii_scanner/ ./src/agents/pii_scanner/
+COPY src/agents/planner/ ./src/agents/planner/
+COPY src/agents/suggestions/ ./src/agents/suggestions/
+COPY src/agents/telemetry/ ./src/agents/telemetry/
+
+# The generation package's __init__ and its moat-free deploy runtime only.
+# NOTHING else under src/agents/tool_generator/ may be added here.
+COPY src/agents/tool_generator/__init__.py ./src/agents/tool_generator/__init__.py
+COPY src/agents/tool_generator/deployment/ ./src/agents/tool_generator/deployment/
+
+# prompts/standards + prompts/tool_generator are generation prompts — stripped.
+COPY prompts/chat/ ./prompts/chat/
+COPY prompts/diagnose/ ./prompts/diagnose/
+COPY prompts/explorer/ ./prompts/explorer/
+COPY prompts/hitl/ ./prompts/hitl/
+COPY prompts/planner/ ./prompts/planner/
+
+RUN chown -R appuser:appuser /app
+
+USER appuser
+
+ENV PYTHONPATH=/app
+
+# `llm-service` runs this default; `planner` overrides it with
+# `python -m src.agents.planner.service` in the compose file.
+CMD ["python", "-m", "src.gateway.main"]

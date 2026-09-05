@@ -1,0 +1,186 @@
+# Why this is its own workflow and not a job in ci.yml.
+#
+# The check lived in ci.yml carrying a deliberate "no path filter on purpose"
+# comment: a link dies when its TARGET is deleted, and that deletion lands in a
+# commit touching no *.md at all, so gating on doc paths would blind it to the
+# way it usually breaks. That reasoning was correct and is preserved here.
+#
+# What defeated it was one level up. ci.yml's `pull_request` trigger carries
+# `paths-ignore: ['**.md', 'docs/**', ...]` so docs-only changes skip the whole
+# run -- which meant a PR that touched ONLY markdown never triggered ci.yml, and
+# the one gate whose entire subject is markdown never ran on it. The job's own
+# filter said "always"; the workflow's filter said "never" for exactly the
+# markdown case, and the workflow won.
+#
+# Both intents are legitimate: docs-only PRs should not spin up the full Go /
+# frontend / e2e matrix on the self-hosted Macs, AND the link gate should run on
+# every change of either kind. A separate workflow is the only shape that gets
+# both. It is ~1s, so running it unconditionally costs nothing.
+#
+# 2026-08-29: the same bug was still live for the OTHER markdown-subject gates,
+# because only the link script was ever moved here. `doc-links` was fixed; its
+# siblings in ci.yml's `llm-service-unit` job were not, and that job is gated on
+# a paths-filter listing `llm-service/**`, `shared/mcp-connectors/**`, ... and no
+# `.md` at all. So `test_doc_merge_claims_are_true.py`, whose only input is
+# CAPABILITIES.md, could not run on a change to CAPABILITIES.md. It fired only
+# when a PR happened to touch code too -- which is how #883 caught ten rows
+# claiming "NOT merged" about code that had just merged. The docs-only follow-up
+# that fixed those rows, #884, ran exactly ONE check (the link script), never the
+# gate it existed to satisfy, and merged into a `main` that reported success by
+# SKIPPING it. A wrong fix would have looked identical.
+#
+# The rule, stated once: a guard whose subject is markdown belongs in THIS file,
+# not in a path-filtered job. Adding one is a `pytest` argument below.
+# Asserted by llm-service/tests/test_doc_link_gate_runs_on_markdown_only_prs.py.
+#
+# The FILE stays doc-links.yml though the workflow is now named for the wider job:
+# renaming it would orphan this workflow's run history and break the link to this
+# path in CAPABILITIES.md, which the gate below would then correctly fail on.
+# (Deliberately not cited as a line number -- adding a row above it moves the line,
+#  which is this PR's own bug class pointed at its own comment.)
+name: Doc guards
+
+on:
+  pull_request:
+    # Intentionally NO paths / paths-ignore. See the header comment: filtering
+    # this workflow in either direction reintroduces the bug it exists to close.
+    # Asserted by llm-service/tests/test_doc_link_gate_runs_on_markdown_only_prs.py
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: doc-guards-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  doc-links:
+    name: Doc links resolve
+    # Fork guard. These runners double as dev machines and hold the prod deploy
+    # key, so a fork pull_request must not reach them. The event disjunct is
+    # load-bearing: on push/schedule `github.event.pull_request` is null and a
+    # bare equality would be FALSE, silently disabling the job.
+    # Enforced by llm-service/tests/test_self_hosted_jobs_are_fork_guarded.py
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - run: ./scripts/check-doc-links.sh
+
+  doc-guards:
+    name: Doc guards (markdown-subject tests)
+    # Same fork guard, load-bearing for the same reason. See the job above.
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # test_doc_merge_claims_are_true.py probes `origin/main` to decide whether
+          # a row claiming "NOT merged" is contradicted by main. A shallow checkout
+          # has no such ref, and that test's answer to a missing ref is to SKIP --
+          # which would make this job green having checked nothing. So this line and
+          # DOC_GUARDS_REQUIRE_MAIN_REF below are one mechanism in two files: drop
+          # the fetch-depth and the env var turns the skip into a named failure.
+          fetch-depth: 0
+      - name: Set up Python
+        run: |
+          # setup-python@v5 cannot install on these self-hosted Macs -- it hard-codes
+          # /Users/runner/hostedtoolcache/... in its post-script and the mkdir fails
+          # with "Permission denied" whatever RUNNER_TOOL_CACHE says. Use the brew
+          # python already on the host, same as ci.yml's llm-service job.
+          #
+          # These suites import only the stdlib, pytest, PyYAML and the local
+          # `doclinks` helper, so this is a ~10s venv rather than the heavyweight
+          # cached one ci.yml maintains. Keep it that way: the value of this
+          # workflow is that it is cheap enough to run unfiltered on every PR.
+          #
+          # PyYAML is not decoration: test_connector_reference_matches_disk.py
+          # drives scripts/generate_connector_reference.py, which reads the CDC
+          # allowlist out of capability_rules.yaml rather than hardcoding a third
+          # copy of it. Without PyYAML that suite errors on import -- which is a
+          # red job, not a silent skip, but still the wrong failure to debug.
+          #
+          # Resolved, not hard-coded. /opt/homebrew/opt/python@3.11 exists because
+          # these runners are developer Macs; it exists on no GitHub-hosted runner and
+          # on no contributor's fork. ci.yml's llm-service job hard-codes the same path
+          # and gets away with it because it is `[self-hosted, macOS]` by definition --
+          # this workflow is the one that has to keep working when the flip moves CI to
+          # hosted runners, and the failure mode of a missing interpreter here is the
+          # whole doc-guard suite not running, which reads as green.
+          PY=""
+          for candidate in \
+            /opt/homebrew/opt/python@3.11/bin/python3.11 \
+            python3.11 python3.12 python3.13 python3
+          do
+            if command -v "$candidate" >/dev/null 2>&1; then PY="$candidate"; break; fi
+          done
+          if [ -z "$PY" ]; then
+            echo "::error::no python3 found; the doc guards cannot run" >&2
+            exit 1
+          fi
+          echo "Using $PY -- $("$PY" --version)"
+          "$PY" -m venv "$RUNNER_TEMP/docguards"
+          "$RUNNER_TEMP/docguards/bin/pip" -q install 'pytest>=9.1.1' 'pytest-asyncio>=0.23.0' 'PyYAML>=6.0'
+          echo "$RUNNER_TEMP/docguards/bin" >> "$GITHUB_PATH"
+      - name: Guards whose subject IS markdown
+        working-directory: llm-service
+        env:
+          # Turns "no origin/main" from a skip into a failure. Set ONLY here,
+          # because only here is the ref promised (fetch-depth: 0 above).
+          DOC_GUARDS_REQUIRE_MAIN_REF: "1"
+        run: |
+          # test_repo_slug_is_publishable.py is the same rule one step wider. Its
+          # subject is every copyable reference to this repo: README.md, docs/**,
+          # LICENSE and TRADEMARK.md -- but also install.sh and ci.yml, which is why
+          # it reads as a code test and was left in ci.yml's `llm-service-unit` job.
+          # That job is gated on the `llm` paths-filter, which covers exactly ONE
+          # of those six subjects: ci.yml itself, via the '.github/workflows/**'
+          # glob added for the fork-guard census (ci.yml:155). The other five --
+          # install.sh, README.md, docs/**, LICENSE, TRADEMARK.md, which is every
+          # reference a reader actually copies -- match nothing in its 13 paths.
+          # So a slug change skipped the guard, twice over for docs: a docs-only PR
+          # never triggers ci.yml at all (`paths-ignore: ['**.md', 'docs/**',
+          # 'LICENSE*']`), and an install.sh PR triggers ci.yml but not the llm job.
+          # It fired on #886 and #892 only because both happened to touch
+          # llm-service/ too -- a guard that runs on its subject by
+          # coincidence is not a guard.
+          # Stdlib-only (json/pathlib/re/subprocess), so the light venv above covers it.
+          #
+          # test_selfhost_doc_boundary_holds.py is half markdown and half code:
+          # the two connector guides, the self-host boundary doc, CAPABILITIES.md
+          # and every file delink-docs.sh rewrites on one side; routes.py,
+          # oss-strip-list.txt and docker-compose.prod.yml on the other. A
+          # docs-only PR can make its claims false and so can a code-only one,
+          # so it needs a workflow filtered in neither direction -- this one.
+          #
+          # test_documented_shell_blocks_parse.py runs `bash -n` over every
+          # ```bash fence in a tracked *.md. Its subject is markdown, but note
+          # it needs `bash` on PATH -- guaranteed on these macOS runners and on
+          # ubuntu-latest, and the suite fails rather than skips if it is ever
+          # absent, because a syntax probe that returns 0 for everything is
+          # exactly the shape that goes green having checked nothing.
+          # test_readme_connector_claims_match_the_catalogue.py is the second hop
+          # of the connector-catalogue guard. The first hop (reference.md vs the
+          # connector tree) is test_connector_reference_matches_disk.py above and
+          # runs on code; this one is pure markdown -- README.md against the
+          # generated table -- and so belongs here rather than in a paths-filtered
+          # job, for the same reason as everything else on this list.
+          pytest -q \
+            tests/test_doc_merge_claims_are_true.py \
+            tests/test_doc_links_resolve.py \
+            tests/test_documented_install_commands_render.py \
+            tests/test_no_infrastructure_ips_in_docs.py \
+            tests/test_pii_policies_are_not_advertised_as_enforced.py \
+            tests/test_connector_reference_matches_disk.py \
+            tests/test_no_doc_claims_a_live_prod_environment.py \
+            tests/test_ci_python_version_claims_match_workflows.py \
+            tests/test_archive_entry_count_is_measured.py \
+            tests/test_repo_slug_is_publishable.py \
+            tests/test_markdown_tables_do_not_drop_cells.py \
+            tests/test_selfhost_doc_boundary_holds.py \
+            tests/test_changelog_versions_name_real_tags.py \
+            tests/test_documented_shell_blocks_parse.py \
+            tests/test_readme_connector_claims_match_the_catalogue.py

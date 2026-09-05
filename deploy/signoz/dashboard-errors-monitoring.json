@@ -1,0 +1,256 @@
+{
+  "title": "rsync-ai — Errors & Issues Monitor",
+  "description": "Real-time error and issue tracking for rsync-ai: silent drops, pipeline failures, CDC errors, sink worker restarts, DLQ events, healer escalations, and auth failures. Import via SigNoz UI → Dashboards → + New Dashboard → Import JSON.",
+  "tags": ["rsync-ai", "errors", "monitoring", "oncall"],
+  "layout": [
+    { "i": "dlq-rate",              "x": 0,  "y": 0,  "w": 6,  "h": 3 },
+    { "i": "pipe-failed-rate",      "x": 6,  "y": 0,  "w": 6,  "h": 3 },
+    { "i": "gw-5xx-rate",           "x": 0,  "y": 3,  "w": 6,  "h": 3 },
+    { "i": "healer-escalations",    "x": 6,  "y": 3,  "w": 6,  "h": 3 },
+    { "i": "mcp-failure-rate",      "x": 0,  "y": 6,  "w": 6,  "h": 3 },
+    { "i": "auth-failures",         "x": 6,  "y": 6,  "w": 6,  "h": 3 },
+    { "i": "pipe-failure-ratio",    "x": 0,  "y": 9,  "w": 4,  "h": 3 },
+    { "i": "dlq-total-value",       "x": 4,  "y": 9,  "w": 4,  "h": 3 },
+    { "i": "mcp-error-ratio",       "x": 8,  "y": 9,  "w": 4,  "h": 3 },
+    { "i": "gw-5xx-by-route",       "x": 0,  "y": 12, "w": 12, "h": 3 },
+    { "i": "healer-actions-all",    "x": 0,  "y": 15, "w": 12, "h": 3 },
+    { "i": "kafka-failure-rate",    "x": 0,  "y": 18, "w": 6,  "h": 3 },
+    { "i": "pipe-run-trigger-rej",  "x": 6,  "y": 18, "w": 6,  "h": 3 }
+  ],
+  "widgets": [
+
+    {
+      "id": "dlq-rate",
+      "title": "DLQ message rate (data loss signal)",
+      "description": "Any value > 0 means rows are being silently dropped. Alert threshold: >0 sustained for 2 min.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "softMin": 0,
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (source_topic) (rate(rsync_dlq_messages_total[5m]))", "legend": "DLQ → {{source_topic}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "pipe-failed-rate",
+      "title": "Pipeline failed runs rate",
+      "description": "Rate of pipelines reaching terminal status=failed. Spike = new failure class.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum(rate(rsync_pipeline_runs_total{status=\"failed\"}[15m]))", "legend": "failed/s", "disabled": false },
+          { "name": "B", "query": "sum(rate(rsync_pipeline_runs_total{status=\"completed\"}[15m]))", "legend": "completed/s", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "gw-5xx-rate",
+      "title": "Gateway 5xx error rate",
+      "description": "Server errors per second at the API boundary. >5% = critical.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (route) (rate(rsync_gateway_http_requests_total{status=~\"5..\"}[5m]))", "legend": "5xx {{route}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "healer-escalations",
+      "title": "Healer escalations (action=escalate)",
+      "description": "Escalations mean the healer could not auto-recover — manual intervention required. Any sustained escalation rate needs investigation.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (outcome) (rate(rsync_healer_actions_total{action=\"escalate\"}[15m]))", "legend": "escalate ({{outcome}})", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "mcp-failure-rate",
+      "title": "MCP connector call failures by connector",
+      "description": "Failed executor→connector calls. Per-connector spikes reveal individual connector health issues.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (connector, operation) (rate(rsync_mcp_calls_total{status=\"failure\"}[5m]))", "legend": "{{connector}}/{{operation}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "auth-failures",
+      "title": "Auth failures (401/403)",
+      "description": "Unauthorized or forbidden responses. Spike after a deploy = broken token/middleware regression.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (reason) (rate(rsync_gateway_auth_failures_total[5m]))", "legend": "auth fail ({{reason}})", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "pipe-failure-ratio",
+      "title": "Pipeline failure % (current window)",
+      "description": "Percentage of pipeline runs that failed. Target: <10%.",
+      "panelTypes": "value",
+      "yAxisUnit": "percent",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "100 * sum(rate(rsync_pipeline_runs_total{status=\"failed\"}[1h])) / clamp_min(sum(rate(rsync_pipeline_runs_total[1h])), 1)", "legend": "failure %", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "dlq-total-value",
+      "title": "DLQ messages (total, 1h)",
+      "description": "Total rows routed to dead-letter queue in the last hour. Should be 0.",
+      "panelTypes": "value",
+      "yAxisUnit": "short",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum(increase(rsync_dlq_messages_total[1h]))", "legend": "DLQ rows", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "mcp-error-ratio",
+      "title": "MCP connector error % (1h)",
+      "description": "Percentage of MCP calls that failed. Target: <1%.",
+      "panelTypes": "value",
+      "yAxisUnit": "percent",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "100 * sum(rate(rsync_mcp_calls_total{status=\"failure\"}[1h])) / clamp_min(sum(rate(rsync_mcp_calls_total[1h])), 1)", "legend": "MCP error %", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "gw-5xx-by-route",
+      "title": "Gateway 5xx errors — all routes (bar chart)",
+      "description": "Which routes are producing the most server errors? Useful for post-deploy regression check.",
+      "panelTypes": "bar",
+      "yAxisUnit": "short",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sort_desc(sum by (route) (increase(rsync_gateway_http_requests_total{status=~\"5..\"}[1h])))", "legend": "{{route}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "healer-actions-all",
+      "title": "All healer actions by type and outcome",
+      "description": "backoff_retry / refresh_auth / request_user_config / escalate — broken down by success/failure. Thrashing = retry loop not converging.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (action, outcome) (rate(rsync_healer_actions_total[15m]))", "legend": "{{action}} ({{outcome}})", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "kafka-failure-rate",
+      "title": "Kafka publish failures by topic",
+      "description": "Failed producer writes — executor could not put rows on Kafka. Any failures block the downstream sink.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (topic) (rate(rsync_kafka_messages_published_total{result=\"failure\"}[5m]))", "legend": "{{topic}}", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    },
+
+    {
+      "id": "pipe-run-trigger-rej",
+      "title": "Pipeline run trigger rejections",
+      "description": "POST /pipelines/:id/run calls rejected (assessment gate, plan limit, draft connector, etc.). High rejection rate = UX issue.",
+      "panelTypes": "graph",
+      "yAxisUnit": "reqps",
+      "nullZeroValues": "zero",
+      "query": {
+        "queryType": "promql",
+        "promql": [
+          { "name": "A", "query": "sum by (result) (rate(rsync_gateway_pipeline_run_triggers_total{result=\"rejected\"}[5m]))", "legend": "rejected/s", "disabled": false }
+        ],
+        "builder": { "queryData": [], "queryFormulas": [] },
+        "clickhouse_sql": []
+      },
+      "timePreferance": "GLOBAL"
+    }
+
+  ]
+}

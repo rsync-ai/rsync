@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-06-22T00:00:00.000000",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-06-22T00:00:00.000000",
+      "changes": [
+        "Hand-built GCS connector: first-class source (batch + last-modified incremental) via shared ObjectStorageSourceMixin; basic destination"
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}

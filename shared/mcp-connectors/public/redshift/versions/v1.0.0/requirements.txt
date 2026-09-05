@@ -1,0 +1,10 @@
+# Requirements for the Amazon Redshift MCP connector.
+# Redshift speaks the PostgreSQL wire protocol, so psycopg2 is the driver.
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Redshift driver (PostgreSQL-wire compatible)
+psycopg2-binary>=2.9.0

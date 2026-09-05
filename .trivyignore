@@ -1,0 +1,43 @@
+# Trivy ignore file — https://aquasecurity.github.io/trivy/latest/docs/configuration/filtering/
+#
+# Allowlist for the `trivy fs --scanners license` gate in
+# .github/workflows/licenses.yml's real backing scanner (security.yml → trivy-license).
+# Trivy's plain .trivyignore matches license findings by their LICENSE ID (the SPDX-ish
+# name Trivy prints), one id per line — the same way it matches CVE ids for vulns and
+# AVD ids for misconfig. Each entry below silences one reviewed weak-copyleft license
+# that Elastic License 2.0 redistribution permits AND that THIRD_PARTY_NOTICES.md
+# documents as a separable, dynamically-linked component.
+#
+# Every entry here must be a reviewed weak-copyleft license already in
+# THIRD_PARTY_NOTICES.md. Do NOT silence a strong-copyleft (GPL/AGPL/SSPL/BUSL)
+# finding by adding it here — swap the dependency for a permissive/weak-copyleft one.
+#
+# NOTE: the plain format ignores a license id repo-wide (it cannot scope the ignore to
+# one package/path). If a future NEW dep ships one of these exact licenses it would also
+# pass silently; to pin an allow to a specific path instead, migrate to .trivyignore.yaml
+# (`licenses: [{ id: ..., paths: [...] }]`). Today the only shippers are the three below.
+
+# MPL-2.0 — file-level weak copyleft; dynamically linked, unmodified; ELv2-redistributable.
+#   Shippers: github.com/go-sql-driver/mysql (Go MySQL driver) and
+#   github.com/hashicorp/go-uuid (indirect). Both documented in THIRD_PARTY_NOTICES.md.
+#   (Trivy classes MPL-2.0 as RECIPROCAL/MEDIUM, below the HIGH,CRITICAL gate, so this is
+#   defensive — it keeps the allow explicit if the gate severity is ever widened.)
+MPL-2.0
+
+# LGPL-3.0 — weak copyleft; shipped as a pre-compiled binary wheel, dynamically imported
+#   as a separable component; ELv2-redistributable. Its LGPL text ships with the wheel.
+#   Shipper: psycopg2-binary (postgresql + redshift connectors) — the only copyleft dep
+#   on the shipped Python language surface. Documented in THIRD_PARTY_NOTICES.md.
+#   Two forms are listed because Trivy may normalize psycopg2's "LGPLv3+" classifier to
+#   either the bare id or the "-or-later" SPDX id depending on Trivy version.
+LGPL-3.0
+LGPL-3.0-or-later
+
+# The `@img/sharp-*` (libvips) frontend findings are NOT suppressed here. Trivy 0.72 cannot
+# match a 3+-component SPDX AND compound ("Apache-2.0 AND LGPL-3.0-or-later AND MIT" on
+# @img/sharp-wasm32) via this file even with the byte-exact string (single/2-component
+# strings DO match — a Trivy bug, not a config error). sharp/libvips is weak-copyleft
+# (documented in THIRD_PARTY_NOTICES.md); the frontend npm lockfile is therefore scoped OUT
+# of the trivy-license scan (security.yml `--skip-files frontend/package-lock.json`), with
+# its licenses covered by licenses.yml's package.json grep + the release-time license-checker.
+# So this file only needs the Go weak-copyleft ids above.

@@ -1,0 +1,88 @@
+{
+  "__schema": {
+    "queryType": { "name": "Query" },
+    "mutationType": null,
+    "subscriptionType": null,
+    "types": [
+      {
+        "kind": "OBJECT",
+        "name": "Query",
+        "description": "Root query type for the Widgets test API.",
+        "fields": [
+          {
+            "name": "widgets",
+            "description": "List widgets (Relay connection).",
+            "args": [
+              { "name": "first", "description": null, "type": { "kind": "SCALAR", "name": "Int", "ofType": null }, "defaultValue": null },
+              { "name": "after", "description": null, "type": { "kind": "SCALAR", "name": "String", "ofType": null }, "defaultValue": null }
+            ],
+            "type": { "kind": "OBJECT", "name": "WidgetConnection", "ofType": null },
+            "isDeprecated": false,
+            "deprecationReason": null
+          }
+        ],
+        "inputFields": null,
+        "enumValues": null,
+        "interfaces": [],
+        "possibleTypes": null
+      },
+      {
+        "kind": "OBJECT",
+        "name": "WidgetConnection",
+        "description": "Relay connection of Widget.",
+        "fields": [
+          { "name": "edges", "description": null, "args": [], "type": { "kind": "LIST", "name": null, "ofType": { "kind": "OBJECT", "name": "WidgetEdge", "ofType": null } }, "isDeprecated": false, "deprecationReason": null },
+          { "name": "pageInfo", "description": null, "args": [], "type": { "kind": "NON_NULL", "name": null, "ofType": { "kind": "OBJECT", "name": "PageInfo", "ofType": null } }, "isDeprecated": false, "deprecationReason": null }
+        ],
+        "inputFields": null,
+        "enumValues": null,
+        "interfaces": [],
+        "possibleTypes": null
+      },
+      {
+        "kind": "OBJECT",
+        "name": "WidgetEdge",
+        "description": "Relay edge for Widget.",
+        "fields": [
+          { "name": "node", "description": null, "args": [], "type": { "kind": "OBJECT", "name": "Widget", "ofType": null }, "isDeprecated": false, "deprecationReason": null },
+          { "name": "cursor", "description": null, "args": [], "type": { "kind": "NON_NULL", "name": null, "ofType": { "kind": "SCALAR", "name": "String", "ofType": null } }, "isDeprecated": false, "deprecationReason": null }
+        ],
+        "inputFields": null,
+        "enumValues": null,
+        "interfaces": [],
+        "possibleTypes": null
+      },
+      {
+        "kind": "OBJECT",
+        "name": "Widget",
+        "description": "A widget.",
+        "fields": [
+          { "name": "id", "description": "Unique id.", "args": [], "type": { "kind": "NON_NULL", "name": null, "ofType": { "kind": "SCALAR", "name": "ID", "ofType": null } }, "isDeprecated": false, "deprecationReason": null },
+          { "name": "name", "description": "Widget name.", "args": [], "type": { "kind": "SCALAR", "name": "String", "ofType": null }, "isDeprecated": false, "deprecationReason": null },
+          { "name": "value", "description": "Widget value.", "args": [], "type": { "kind": "SCALAR", "name": "Int", "ofType": null }, "isDeprecated": false, "deprecationReason": null }
+        ],
+        "inputFields": null,
+        "enumValues": null,
+        "interfaces": [],
+        "possibleTypes": null
+      },
+      {
+        "kind": "OBJECT",
+        "name": "PageInfo",
+        "description": "Relay pagination info.",
+        "fields": [
+          { "name": "hasNextPage", "description": null, "args": [], "type": { "kind": "NON_NULL", "name": null, "ofType": { "kind": "SCALAR", "name": "Boolean", "ofType": null } }, "isDeprecated": false, "deprecationReason": null },
+          { "name": "endCursor", "description": null, "args": [], "type": { "kind": "SCALAR", "name": "String", "ofType": null }, "isDeprecated": false, "deprecationReason": null }
+        ],
+        "inputFields": null,
+        "enumValues": null,
+        "interfaces": [],
+        "possibleTypes": null
+      },
+      { "kind": "SCALAR", "name": "String", "description": null, "fields": null, "inputFields": null, "enumValues": null, "interfaces": null, "possibleTypes": null },
+      { "kind": "SCALAR", "name": "Int", "description": null, "fields": null, "inputFields": null, "enumValues": null, "interfaces": null, "possibleTypes": null },
+      { "kind": "SCALAR", "name": "ID", "description": null, "fields": null, "inputFields": null, "enumValues": null, "interfaces": null, "possibleTypes": null },
+      { "kind": "SCALAR", "name": "Boolean", "description": null, "fields": null, "inputFields": null, "enumValues": null, "interfaces": null, "possibleTypes": null }
+    ]
+  }
+}

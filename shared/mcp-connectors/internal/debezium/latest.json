@@ -1,0 +1,23 @@
+{
+  "current_version": "v1.0.0",
+  "updated_at": "2026-01-06T00:00:00Z",
+  "changelog": {
+    "v1.0.0": {
+      "released": "2026-01-06T00:00:00Z",
+      "changes": [
+        "Initial Debezium CDC MCP connector (Kafka Connect source connector manager)",
+        "Generic database_type-driven start_sync/stop_sync/get_status",
+        "Hybrid batch+CDC handoff: snapshot_mode 'schema_recovery'/'recovery' → Debezium 'recovery' (MySQL: rebuild schema history + resume from seeded offset) / 'no_data' (PostgreSQL: resume from slot's confirmed_flush_lsn)",
+        "PostgreSQL slot.drop.on.stop defaults to false so the orchestrator-managed replication slot (the position anchor) survives connector restarts"
+      ],
+      "breaking_changes": false,
+      "validation_passed": false
+    }
+  },
+  "all_versions": [
+    "v1.0.0"
+  ],
+  "deprecated_versions": []
+}
+
+

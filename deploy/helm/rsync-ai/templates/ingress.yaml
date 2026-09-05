@@ -1,0 +1,51 @@
+{{- if .Values.ingress.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+{{/*
+Two hosts, not one host with a /api path prefix.
+
+The API is called from the BROWSER using NEXT_PUBLIC_API_URL, and the gateway's
+CORS middleware fails closed with no wildcard branch. A path-prefix layout would
+also require the gateway to be mounted under a base path it does not implement,
+so requests would 404 with a correct-looking ingress. Two hostnames keeps both
+halves honest, at the cost of one extra DNS record and one extra SAN.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  rules:
+    - host: {{ required "ingress.hosts.app is required when ingress.enabled" .Values.ingress.hosts.app | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-frontend
+                port:
+                  number: {{ .Values.frontend.service.port }}
+    - host: {{ required "ingress.hosts.api is required when ingress.enabled: the frontend calls the API from the browser, so it needs its own routable address" .Values.ingress.hosts.api | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ $fullname }}-api-gateway
+                port:
+                  number: {{ .Values.apiGateway.service.port }}
+{{- end }}

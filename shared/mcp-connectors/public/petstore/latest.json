@@ -1,0 +1,18 @@
+{
+  "current_version": "v1.0.3",
+  "updated_at": "2026-06-19T16:08:42Z",
+  "changelog": {
+    "v1.0.3": {
+      "released": "2026-06-19T16:08:42Z",
+      "changes": [
+        "Regenerated via discovery flow \u2014 supersedes v1.0.2"
+      ],
+      "breaking_changes": false,
+      "validation_passed": true
+    }
+  },
+  "all_versions": [
+    "v1.0.3"
+  ],
+  "deprecated_versions": []
+}

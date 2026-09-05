@@ -1,0 +1,4806 @@
+#!/usr/bin/env python3
+"""
+Oracle MCP Connector
+
+JSON-RPC server for Oracle Database operations (batch source + destination + CDC).
+Category: relational_db
+
+Hand-curated from the shared multi-dialect database connector, pinned to the
+``oracledb`` (python-oracledb) driver in THIN mode (no Oracle Instant Client).
+Source: test_connection / discover_schema / keyset+offset export.
+Destination: import_data / upsert_data (MERGE) / delete_data / DDL helpers +
+transactional CDC offset tracking. Kept in lockstep with
+``llm-service/src/agents/tool_generator/templates/connector_database.py.j2``.
+"""
+
+import sys
+import os
+import logging
+import ipaddress
+from typing import Dict, Any, List, Optional
+import hashlib
+import re
+import json
+from datetime import datetime
+
+# Add parent directory for base_connector imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+from base_connector import (
+    BaseMCPConnector,
+    DatabaseHandler,
+    DestinationLoadMixin,
+    DestinationLoadSpec,
+    ExportResult,
+    ImportResult,
+    ErrorItem,
+)
+
+# Canonical type authority — shipped into the image via
+# `COPY --from=shared canonical_types.py` (see Dockerfile). Discovery emits
+# canonical types so the destination provisions correct columns instead of
+# falling back to all-TEXT. Dev/test resolves it from the public/ root.
+try:
+    from canonical_types import canonicalize_type, canonical_to_ddl
+except ImportError:  # pragma: no cover - dev/test path
+    sys.path.insert(0, os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "..")))
+    from canonical_types import canonicalize_type, canonical_to_ddl
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# =============================================================================
+# DATABASE DRIVER CONFIGURATION
+# =============================================================================
+# This template supports multiple database drivers.
+# The driver_config is passed from the ConnectorSpec.
+
+
+# =============================================================================
+# DRIVER PATTERNS (Embedded for common databases)
+# =============================================================================
+
+DRIVER_PATTERNS = {
+    # Relational Databases
+    "mysql": {
+        "module": "mysql.connector",
+        "connect": "mysql.connector.connect",
+        "params": ["host", "port", "database", "user", "password"],
+        "default_port": 3306,
+        "dict_cursor": "dictionary=True",
+        "list_tables": "SHOW TABLES",
+        "describe_table": "DESCRIBE `{table}`",
+    },
+    "postgresql": {
+        "module": "psycopg2",
+        "connect": "psycopg2.connect",
+        "params": ["host", "port", "dbname", "user", "password"],
+        "default_port": 5432,
+        "dict_cursor": "cursor_factory=psycopg2.extras.RealDictCursor",
+        "list_tables": "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'",
+        "describe_table": "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '{table}'",
+    },
+    "sqlite": {
+        "module": "sqlite3",
+        "connect": "sqlite3.connect",
+        "params": ["database"],
+        "default_port": None,
+        "dict_cursor": "row_factory=sqlite3.Row",
+        "list_tables": "SELECT name FROM sqlite_master WHERE type='table'",
+        "describe_table": "PRAGMA table_info({table})",
+    },
+    "oracle": {
+        "module": "oracledb",
+        "connect": "oracledb.connect",
+        "params": ["host", "port", "service_name", "user", "password"],
+        "default_port": 1521,
+        "dict_cursor": None,
+        "list_tables": "SELECT table_name FROM user_tables",
+        "describe_table": "SELECT column_name, data_type FROM user_tab_columns WHERE table_name = UPPER('{table}')",
+    },
+    "sqlserver": {
+        "module": "pyodbc",
+        "connect": "pyodbc.connect",
+        "connection_string": True,
+        "default_port": 1433,
+        "dict_cursor": None,
+        "list_tables": "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'",
+        "describe_table": "SELECT COLUMN_NAME, DATA_TYPE FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = '{table}'",
+    },
+    # NoSQL Document Databases
+    "mongodb": {
+        "module": "pymongo",
+        "connect": "pymongo.MongoClient",
+        "params": ["host", "port", "username", "password", "authSource"],
+        "default_port": 27017,
+        "is_nosql": True,
+    },
+    "redis": {
+        "module": "redis",
+        "connect": "redis.Redis",
+        "params": ["host", "port", "password", "db"],
+        "default_port": 6379,
+        "is_nosql": True,
+    },
+    "cassandra": {
+        "module": "cassandra.cluster",
+        "connect": "Cluster",
+        "params": ["contact_points", "port", "auth_provider"],
+        "default_port": 9042,
+        "is_nosql": True,
+    },
+}
+
+def _is_local_db_host(host: Any) -> bool:
+    """Classify a DB host as local/docker-internal (vs remote/on-network).
+
+    Used to pick secure-by-default transport: remote hosts get TLS by default,
+    local/docker-internal hosts keep plaintext (they rarely run a TLS listener).
+
+      * empty / localhost / 127.0.0.1 / ::1 / host.docker.internal -> local
+      * IP literal (``[]`` stripped): local iff loopback / private (RFC1918) /
+        link-local, or CGNAT 100.64.0.0/10; any other IP -> remote
+      * hostname: bare/dotless name (e.g. ``oracle``, a docker service) -> local;
+        dotted FQDN (e.g. ``ora.acme.com``) -> remote
+    """
+    h = str(host or "").strip().lower()
+    if h in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal"):
+        return True
+    h = h.strip("[]")  # tolerate bracketed IPv6 literals
+    try:
+        ip = ipaddress.ip_address(h)
+        if ip.is_loopback or ip.is_private or ip.is_link_local:
+            return True
+        # RFC 6598 carrier-grade NAT space is effectively internal too.
+        return ip in ipaddress.ip_network("100.64.0.0/10")
+    except ValueError:
+        # Not an IP literal -> treat as a hostname: dotless = local service name.
+        return "." not in h
+
+
+# Detect driver pattern from connector type
+def _get_driver_pattern(connector_type: str) -> Dict:
+    """Get driver pattern based on connector type"""
+    connector_lower = connector_type.lower()
+    for pattern_name, pattern in DRIVER_PATTERNS.items():
+        if pattern_name in connector_lower:
+            return pattern
+    return {}
+
+# Global driver detection
+_DRIVER_PATTERN = _get_driver_pattern("oracle")
+
+
+# Source-dialect (MySQL information_schema DATA_TYPE) → canonical type.
+# Inlined from shared/mcp-connectors/schemas/response_schemas.py because
+# the schemas module isn't bundled into the connector container image.
+# Used by _discover_mysql_schema_v2 so sources emit the canonical
+# vocabulary the orchestrator / sinks expect.
+_MYSQL_SQL_TO_CANONICAL = {
+    "tinyint": "integer", "smallint": "integer", "mediumint": "integer",
+    "int": "integer", "integer": "integer", "bigint": "integer",
+    "year": "integer",
+    "float": "number", "double": "number",
+    "decimal": "decimal", "numeric": "decimal",
+    "char": "string", "varchar": "string",
+    "text": "string", "tinytext": "string", "mediumtext": "string", "longtext": "string",
+    "boolean": "boolean", "bool": "boolean",
+    "datetime": "timestamp", "timestamp": "timestamp",
+    "date": "date", "time": "time",
+    "blob": "binary", "tinyblob": "binary", "mediumblob": "binary", "longblob": "binary",
+    "binary": "binary", "varbinary": "binary", "bit": "binary",
+    "json": "json",
+}
+
+
+def _canonical_mysql_type(t: Any) -> str:
+    """Coerce a MySQL DATA_TYPE string to canonical.
+
+    Strips precision (``varchar(255)`` -> ``varchar``); unknown -> ``"string"``.
+    """
+    if not isinstance(t, str):
+        return "string"
+    raw = t.strip()
+    if not raw:
+        return "string"
+    base = raw.lower().split("(", 1)[0].strip()
+    return _MYSQL_SQL_TO_CANONICAL.get(base, "string")
+
+
+# Synthetic PK columns for sources that don't declare PKs. Mirrors the
+# postgres sink (same constants) so users see a consistent shape across
+# warehouses. See postgresql/connector.py for the rationale.
+SYNTHETIC_PK_COL = "_rsync_row_hash"
+SYNTHETIC_TS_COL = "_rsync_synced_at"
+
+
+def _compute_row_hash(row: Dict[str, Any], source_cols: List[str]) -> str:
+    """sha256 over canonical JSON of the source columns only."""
+    payload = {c: row.get(c) for c in sorted(source_cols) if not c.startswith("_rsync_")}
+    try:
+        serialised = json.dumps(payload, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        serialised = str(sorted(payload.items()))
+    return hashlib.sha256(serialised.encode("utf-8")).hexdigest()
+
+
+def _mysql_normalize_timestamp(v: Any) -> Any:
+    """Normalize ISO-8601 timestamps to MySQL DATETIME format.
+
+    Shopify (and most JSON APIs) emit ISO-8601 with 'T' separator and
+    trailing 'Z' (UTC): ``2026-05-14T08:26:43Z``. MySQL's DATETIME
+    column rejects both characters (error 1292 "Incorrect datetime
+    value"). This helper converts to ``2026-05-14 08:26:43.fff`` which
+    DATETIME(6) accepts.
+
+    Non-string / non-ISO inputs pass through unchanged so the driver's
+    native handling (datetime objects, None) still works.
+    """
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if not s:
+        return None
+    # Detect ISO-8601 shape: YYYY-MM-DDTHH:MM:SS(.fff)?(Z|+HH:MM)?
+    if "T" not in s:
+        return v
+    try:
+        from datetime import datetime
+        # fromisoformat supports trailing Z only in Python 3.11+; strip it.
+        candidate = s.replace("Z", "+00:00") if s.endswith("Z") else s
+        dt = datetime.fromisoformat(candidate)
+        # MySQL accepts naive UTC; strip tzinfo and format with microseconds.
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(tz=None).replace(tzinfo=None)
+        return dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+    except Exception:
+        return v
+
+
+def _mysql_bind_value(v: Any, canonical_type: Optional[str] = None) -> Any:
+    """Coerce a Python value for the MySQL driver's parameter binding.
+
+    Type-aware:
+      - ``json``:       None/empty-string -> NULL; dict/list -> JSON
+                        text; bare strings pass through if JSON-shaped,
+                        else wrapped as JSON string literal.
+      - ``timestamp``:  ISO-8601 strings (with T/Z) -> 'YYYY-MM-DD HH:MM:SS.ffffff'.
+                        None and empty string -> NULL.
+      - ``boolean``:    truthy bools -> 1/0 (TINYINT(1)). Strings like
+                        'true'/'false' coerced. None passes through.
+      - other types:    only nested dict/list get json.dumps'd.
+
+    Without ``canonical_type``, falls back to the generic
+    "dict/list -> json.dumps" rule.
+    """
+    if v is None:
+        return None
+    ct = (canonical_type or "").strip().lower()
+    if ct == "json":
+        if isinstance(v, str):
+            stripped = v.strip()
+            if stripped == "":
+                return None
+            if stripped[:1] in ("{", "[", '"') or stripped in ("null", "true", "false"):
+                return stripped
+            return json.dumps(v)
+        if isinstance(v, (dict, list)):
+            try:
+                return json.dumps(v, default=str)
+            except (TypeError, ValueError):
+                return json.dumps(str(v))
+        try:
+            return json.dumps(v, default=str)
+        except (TypeError, ValueError):
+            return json.dumps(str(v))
+    if ct == "timestamp":
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return _mysql_normalize_timestamp(v)
+    if ct == "boolean":
+        if isinstance(v, bool):
+            return 1 if v else 0
+        if isinstance(v, str):
+            low = v.strip().lower()
+            if low in ("true", "1", "yes"):
+                return 1
+            if low in ("false", "0", "no"):
+                return 0
+        return v
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v, default=str)
+        except (TypeError, ValueError):
+            return str(v)
+    return v
+
+
+def _oracle_normalize_timestamp(v: Any) -> Any:
+    """Coerce an ISO-8601 string (or datetime) into a naive-UTC datetime for
+    oracledb TIMESTAMP/DATE binding. oracledb binds a datetime object natively
+    to TIMESTAMP/DATE; binding a bare string relies on NLS formats and is
+    fragile. Returns the input unchanged on parse failure."""
+    from datetime import datetime as _dt, timezone as _tz
+    if isinstance(v, _dt):
+        return v.astimezone(_tz.utc).replace(tzinfo=None) if v.tzinfo else v
+    if not isinstance(v, str):
+        return v
+    s = v.strip()
+    if not s:
+        return None
+    try:
+        # Python 3.11 fromisoformat accepts a space separator and 'Z'.
+        dt = _dt.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(_tz.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return v
+
+
+def _oracle_bind_value(v: Any, canonical_type: Optional[str] = None) -> Any:
+    """Coerce a Python value for oracledb (:N) positional binding.
+
+    - timestamp/date -> naive-UTC datetime (bound to TIMESTAMP/DATE)
+    - boolean        -> 1/0 (NUMBER(1); Oracle has no native BOOLEAN pre-23c)
+    - json           -> JSON text (bound into a CLOB column)
+    - dict/list      -> json.dumps
+    - other          -> passthrough (oracledb binds str/int/float/None natively)
+    """
+    if v is None:
+        return None
+    ct = (canonical_type or "").strip().lower()
+    if ct in ("timestamp", "date"):
+        if isinstance(v, str) and v.strip() == "":
+            return None
+        return _oracle_normalize_timestamp(v)
+    if ct == "boolean":
+        if isinstance(v, bool):
+            return 1 if v else 0
+        if isinstance(v, str):
+            low = v.strip().lower()
+            if low in ("true", "1", "yes"):
+                return 1
+            if low in ("false", "0", "no"):
+                return 0
+        return v
+    if ct == "json":
+        if isinstance(v, (dict, list)):
+            try:
+                return json.dumps(v, default=str)
+            except (TypeError, ValueError):
+                return json.dumps(str(v))
+        if isinstance(v, str):
+            return v
+        return json.dumps(v, default=str)
+    if isinstance(v, (dict, list)):
+        try:
+            return json.dumps(v, default=str)
+        except (TypeError, ValueError):
+            return str(v)
+    return v
+
+
+class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
+    """MCP Server for Oracle Database"""
+    
+    def __init__(self):
+        # MUST call super().__init__() first
+        super().__init__()
+        
+        # REQUIRED: Set connector metadata
+        self.connector_type = "oracle"
+        self.connector_category = "relational_db"
+        self.supports_source = True
+        self.supports_destination = True
+        self.supports_cdc = True
+        # DDL helpers (used by kafka-mcp-sink when enabled)
+        self.supports_ddl = True
+        self.auto_create_destination_tables = True
+        
+        # Database driver configuration
+        self.driver_pattern = _DRIVER_PATTERN
+        
+        # Capability Stats
+        self.supported_formats = ['csv', 'json']
+        self.max_batch_size = 10000
+
+        # Declare this destination's load strategy in the shared framework
+        # (DestinationLoadMixin), so Oracle is a DECLARED participant rather than
+        # an undeclared parallel bulk path. Oracle does NOT stage: the upsert is
+        # a per-row ``MERGE ... USING (SELECT ... FROM dual)`` (ANSI MERGE) driven
+        # by executemany, so neither a staging temp nor a dedupe pass is needed.
+        # supports_staging=False -> supports_staged_load() is False -> the mixin's
+        # staged_upsert is bypassed and _ora_upsert_data keeps its direct MERGE
+        # executemany path. max_batch_rows mirrors the 1000-row chunking
+        # _ora_import_data/_ora_upsert_data use.
+        self.load_spec = DestinationLoadSpec(
+            load_method="multi_insert",
+            merge_method="merge",
+            supports_staging=False,
+            max_batch_rows=1000,
+        )
+
+        # Initialize database handler for contract-driven operations
+        self._db_handler = DatabaseHandler(connector=self)
+
+        self.log("Oracle MCP Server initialized")
+    
+    # =========================================================================
+    # CONFIGURATION HELPERS
+    # =========================================================================
+    
+    def _get_config(self, params: Dict) -> Dict:
+        """Extract and validate configuration from params"""
+        config = params.get('config', params) if params else {}
+        
+        # Apply environment variable defaults.
+        #
+        # ORACLE_*, not MYSQL_* — this block was copied from the mysql connector
+        # and the names were never re-pointed, so the five slots this image's
+        # Dockerfile actually bakes (ENV ORACLE_HOST="" … ORACLE_PASSWORD="")
+        # were dead, while the connector read five variables it never declares.
+        # Harmless only because nothing sets MYSQL_* in this container; had a
+        # self-host ever put a shared env_file on the MCP services, the Oracle
+        # connector would have silently connected with MySQL's credentials.
+        # ORACLE_SERVICE_NAME lands on config["database"] deliberately: the DSN
+        # builder below reads service_name -> service -> database (see the
+        # makedsn branch), so the alias is honoured and the key flow is unchanged.
+        # `os.getenv(k) or default`, never the two-arg form — the Dockerfile
+        # bakes these SET-but-empty, so a two-arg default would be unreachable.
+        if not config.get('host'):
+            config['host'] = os.getenv('ORACLE_HOST') or ''
+        if not config.get('port'):
+            config['port'] = os.getenv('ORACLE_PORT') or ''
+        if not config.get('database'):
+            config['database'] = os.getenv('ORACLE_SERVICE_NAME') or ''
+        if not config.get('user'):
+            config['user'] = os.getenv('ORACLE_USER') or ''
+        if not config.get('password'):
+            config['password'] = os.getenv('ORACLE_PASSWORD') or ''
+        
+        # Ensure port is integer if present
+        if config.get('port'):
+            try:
+                config['port'] = int(config['port'])
+            except (ValueError, TypeError):
+                pass
+        
+        return config
+
+    def _is_safe_ident(self, s: str) -> bool:
+        s = str(s or "").strip()
+        if not s:
+            return False
+        # fullmatch (not match) so a trailing newline can't sneak past `$`
+        # (re.match's `$` also matches just before a final \n) — defense-in-depth
+        # against identifier injection via the namespace param.
+        return re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", s) is not None
+
+    def _mk_index_name(self, schema: str, table: str, cols: List[str]) -> str:
+        base = f"idx_{schema}_{table}_" + "_".join(cols[:2]) + "_uniq"
+        base = re.sub(r"[^A-Za-z0-9_]+", "_", base)
+        # MySQL index name limit is 64 chars (keep <= 63 to be safe across dialects)
+        if len(base) <= 63:
+            return base
+        h = abs(hash(base)) % (10**8)
+        return (base[:54] + f"_{h:08d}")[:63]
+
+    def _split_mysql_db_table(self, config: Dict, table: str, params: Dict = None) -> (str, str):
+        """Single source of truth for resolving (database, bare_table).
+
+        Precedence:
+          1. Qualified ``db.table`` in the table spec itself (caller was explicit).
+          2. ``params["namespace"]`` / ``params["db_or_schema"]`` — the per-pipeline
+             destination namespace the sink forwards alongside a BARE table name.
+             The planner's generic "default" placeholder is skipped, and the value
+             is identifier-validated to prevent injection.
+          3. ``config["database"]`` / ``config["db_name"]`` — the shared connection
+             default (e.g. "pipeline_test"). Legacy / no-namespace behavior.
+
+        Also collapses accidental double-qualification (``db.db.table``), folding in
+        the de-dup defense that _normalize_table_for_mysql provides for its callers.
+        """
+        raw = str(table or "").strip().strip("`").strip('"')
+        config = config or {}
+        config_db = str(config.get("database") or config.get("db_name") or "").strip().strip("`").strip('"')
+        # Tier 1: explicitly qualified table wins.
+        if "." in raw:
+            db = raw.split(".", 1)[0].strip("`").strip('"')
+            name = raw.split(".", 1)[1].strip("`").strip('"')
+            # Collapse "db.db.table" -> "db", "table".
+            prefix = db + "."
+            while name.lower().startswith(prefix.lower()) and len(name) > len(prefix):
+                name = name[len(prefix):]
+            return db, name
+        # Tier 2: explicit per-pipeline namespace (bare table only).
+        if params:
+            ns = str(params.get("namespace") or params.get("db_or_schema") or "").strip().strip('"').strip("`")
+            if ns and ns.lower() != "default" and self._is_safe_ident(ns):
+                return ns, raw
+        # Tier 3: shared connection default.
+        return config_db, raw
+
+    def _ensure_table_for_mysql(self, cursor, config: Dict, table: str, columns: List[str], key_fields: List[str], params: Dict = None) -> None:
+        db, name = self._split_mysql_db_table(config, table, params)
+        if not db or not self._is_safe_ident(db) or not self._is_safe_ident(name):
+            raise Exception(f"Unsafe or missing database/table identifier: {db}.{name}")
+
+        safe_cols = [c for c in (columns or []) if self._is_safe_ident(c)]
+        if not safe_cols:
+            raise Exception("No safe columns to create destination table")
+
+        cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db}`")
+        col_defs = ", ".join([f"`{c}` TEXT" for c in safe_cols])
+        cursor.execute(f"CREATE TABLE IF NOT EXISTS `{db}`.`{name}` ({col_defs})")
+
+        # Add missing columns (best-effort by querying information_schema)
+        try:
+            cursor.execute(
+                "SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
+                (db, name),
+            )
+            existing = set()
+            for row in cursor.fetchall() or []:
+                if isinstance(row, dict):
+                    v = row.get("column_name") or row.get("COLUMN_NAME")
+                else:
+                    v = row[0] if row else None
+                if v:
+                    existing.add(str(v))
+            for c in safe_cols:
+                if c in existing:
+                    continue
+                cursor.execute(f"ALTER TABLE `{db}`.`{name}` ADD COLUMN `{c}` TEXT")
+        except Exception:
+            pass
+
+        safe_keys = [c for c in (key_fields or []) if self._is_safe_ident(c)]
+        if safe_keys:
+            idx = self._mk_index_name(db, name, safe_keys)
+            try:
+                cursor.execute(
+                    "SELECT 1 FROM information_schema.statistics WHERE table_schema=%s AND table_name=%s AND index_name=%s LIMIT 1",
+                    (db, name, idx),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    cols_sql = ", ".join([f"`{c}`" for c in safe_keys])
+                    cursor.execute(f"CREATE UNIQUE INDEX `{idx}` ON `{db}`.`{name}` ({cols_sql})")
+            except Exception:
+                pass
+
+    # MySQL DDL type keyword → DATA_TYPE from information_schema (used for safe widening).
+    _KEYWORD_TO_DATA_TYPE = {
+        "tinyint": "tinyint", "smallint": "smallint", "mediumint": "mediumint",
+        "int": "int", "integer": "int", "bigint": "bigint",
+        "float": "float", "double": "double", "decimal": "decimal",
+        "varchar": "varchar", "char": "char", "text": "text",
+        "mediumtext": "mediumtext", "longtext": "longtext",
+        "datetime": "datetime", "timestamp": "timestamp", "date": "date",
+        "tinyblob": "tinyblob", "blob": "blob", "mediumblob": "mediumblob", "longblob": "longblob",
+        "json": "json", "boolean": "tinyint", "bool": "tinyint",
+    }
+    # Source type → set of safe widened types (only allow non-lossy promotions).
+    _WIDEN = {
+        "tinyint":   {"smallint", "mediumint", "int", "bigint", "float", "double", "decimal", "text"},
+        "smallint":  {"mediumint", "int", "bigint", "float", "double", "decimal", "text"},
+        "mediumint": {"int", "bigint", "float", "double", "decimal", "text"},
+        "int":       {"bigint", "double", "decimal", "text"},
+        "bigint":    {"decimal", "text"},
+        "float":     {"double", "decimal", "text"},
+        "double":    {"decimal", "text"},
+        "varchar":   {"text", "mediumtext", "longtext"},
+        "char":      {"varchar", "text", "mediumtext", "longtext"},
+        "text":      {"mediumtext", "longtext"},
+        "mediumtext": {"longtext"},
+        "tinyblob":  {"blob", "mediumblob", "longblob"},
+        "blob":      {"mediumblob", "longblob"},
+        "mediumblob": {"longblob"},
+        "date":      {"datetime", "text"},
+        "datetime":  {"text"},
+        "timestamp": {"datetime", "text"},
+    }
+
+    def _normalize_mysql_ddl_type(self, t: str) -> str:
+        """Normalise a DDL type string to a canonical MySQL keyword (lowercase, strip precision)."""
+        t = str(t or "").strip().lower()
+        base = t.split("(")[0].strip()
+        # unsigned / zerofill suffix
+        base = base.replace(" unsigned", "").replace(" zerofill", "").strip()
+        aliases = {"integer": "int", "boolean": "tinyint", "bool": "tinyint",
+                   "double precision": "double", "character varying": "varchar",
+                   "character": "char", "national varchar": "varchar"}
+        return aliases.get(base, base)
+
+    def _introspect_dest_column_types(self, config: Dict, table: str, db: str = None) -> Optional[Dict[str, str]]:
+        """Read column data types for an existing destination table and
+        map them to canonical names the bind helper understands.
+
+        Used as a fallback in upsert_data/import_data when the caller didn't
+        pass column_types. Returns None on any error (caller treats this as
+        "no type hints available" and falls back to generic binding —
+        no exception path needed).
+
+        ``db`` is the resolved destination database. It MUST be honored: once
+        writes are namespace-redirected (e.g. shopify_sync), introspecting via
+        DATABASE() (the connection default, e.g. pipeline_test) would read the
+        WRONG table's schema — or none — reintroducing the JSON-bind bug. The
+        db is bound as a STRING LITERAL in information_schema, never backticked.
+
+        Only the canonical types _mysql_bind_value actually keys on are
+        mapped (json/timestamp/boolean); the rest are left absent, which
+        is the same as the legacy behavior for non-JSON columns.
+        """
+        # `table` may arrive qualified; introspection needs the bare name.
+        bare = str(table or "").strip().strip("`").strip('"')
+        if "." in bare:
+            bare = bare.split(".", 1)[1].strip("`").strip('"')
+        db = str(db or "").strip().strip("`").strip('"')
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            if db and self._is_safe_ident(db):
+                cursor.execute(
+                    "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.columns "
+                    "WHERE table_schema = %s AND table_name = %s",
+                    (db, bare),
+                )
+            else:
+                cursor.execute(
+                    "SELECT COLUMN_NAME, DATA_TYPE FROM information_schema.columns "
+                    "WHERE table_schema = DATABASE() AND table_name = %s",
+                    (bare,),
+                )
+            out: Dict[str, str] = {}
+            for row in cursor.fetchall():
+                name, dtype = row[0], (row[1] or "").lower()
+                if dtype == "json":
+                    out[name] = "json"
+                elif dtype in ("datetime", "timestamp"):
+                    out[name] = "timestamp"
+                elif dtype in ("tinyint",):
+                    # MySQL booleans surface as TINYINT(1) — keep TINYINT as int
+                    # to stay backward-compatible; only an explicit "boolean"
+                    # hint from the caller should trigger boolean coercion.
+                    continue
+            cursor.close()
+            return out
+        except Exception:
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def upsert_data(self, params: Dict = None) -> Dict[str, Any]:
+        """CDC upsert: INSERT ... ON DUPLICATE KEY UPDATE (MySQL syntax)."""
+        if self._is_oracle_dialect():
+            return self._ora_upsert_data(params)
+        params = params or {}
+        prepared = self.prepare_import_data(params)
+        if not prepared.get("success", True):
+            return prepared
+
+        data = prepared.get("data", [])
+        if not data:
+            return {"success": True, "rows_upserted": 0, "message": "No data to upsert"}
+
+        config = prepared["config"]
+        table = prepared.get("table")
+        if not table:
+            return {"success": False, "error": "Target table not specified"}
+        # Fail-closed write-path SQLi guard: reject an unsafe (tenant-controlled)
+        # destination table before it is split/interpolated into write SQL.
+        if self._safe_qualified_table(table) is None:
+            return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
+        # Resolve (db, name) via the centralized resolver so the per-pipeline
+        # namespace (forwarded as params["namespace"]) routes the write to the
+        # right database. Build the fully-qualified, properly-quoted target —
+        # NEVER backtick-wrap a string that still contains a dot (the old
+        # `INSERT INTO `{table}`` turned "ns.tbl" into one literal table name in
+        # the default DB).
+        db, name = self._split_mysql_db_table(config, table, params)
+        if not name or not self._is_safe_ident(name):
+            return {"success": False, "error": f"Unsafe or missing table identifier: {name}"}
+        if db and not self._is_safe_ident(db):
+            return {"success": False, "error": f"Unsafe database identifier: {db}"}
+        qualified_target = f"`{db}`.`{name}`" if db else f"`{name}`"
+        table = name
+
+        key_fields = (
+            params.get("key_fields")
+            or params.get("primary_key_fields")
+            or config.get("key_fields")
+            or config.get("primary_key_fields")
+            or ["id"]
+        )
+        if isinstance(key_fields, str):
+            key_fields = [key_fields]
+        if not isinstance(key_fields, list) or len(key_fields) == 0:
+            key_fields = ["id"]
+
+        col_types = params.get("column_types") or {}
+
+        # Fallback: when the caller didn't pass column_types (e.g. legacy
+        # batch path where the executor publishes rows to Kafka without the
+        # schema envelope, or any non-CDC source), introspect the
+        # destination table for its actual column types and synthesize a
+        # canonical map so _mysql_bind_value can do type-aware encoding.
+        # Without this, JSON-typed destination columns receive bare strings
+        # like ACTIVE and MySQL rejects every row with
+        # `Invalid JSON text: "Invalid value." at position 0` — the bug
+        # that blocked PG (JSONB) → MySQL (JSON) batch pipelines end-to-end.
+        # Bounded to a single SELECT per upsert; safe even when introspection
+        # fails (we just fall back to no type-aware binding).
+        if not col_types:
+            col_types = self._introspect_dest_column_types(config, name, db) or {}
+
+        # Synthetic-PK upsert path (Fivetran-style). When the orchestrator
+        # flagged this run as PK-less, compute _rsync_row_hash per row
+        # from the source columns and inject _rsync_synced_at; the unique
+        # index ensure_table created on _rsync_row_hash drives the
+        # ON DUPLICATE KEY UPDATE conflict.
+        if bool(params.get("synthetic_pk")):
+            from datetime import datetime, timezone
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+            source_cols = [c for c in data[0].keys() if not c.startswith("_rsync_")]
+            for row in data:
+                if SYNTHETIC_PK_COL not in row:
+                    row[SYNTHETIC_PK_COL] = _compute_row_hash(row, source_cols)
+                if SYNTHETIC_TS_COL not in row:
+                    row[SYNTHETIC_TS_COL] = now_str
+            key_fields = [SYNTHETIC_PK_COL]
+
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+
+            # Union keys across ALL rows (ragged-row safe; wide-format transforms
+            # like json_flatten emit differing key sets per row). Binding uses
+            # row.get(col), so columns absent from a row bind to NULL.
+            columns = []
+            _seen_cols = set()
+            for _row in data:
+                if not isinstance(_row, dict):
+                    continue
+                for _k in _row.keys():
+                    if _k not in _seen_cols:
+                        _seen_cols.add(_k)
+                        columns.append(_k)
+            placeholders = ", ".join(["%s"] * len(columns))
+            col_str = ", ".join([f"`{c}`" for c in columns])
+            conflict_cols = [k for k in key_fields if k in columns]
+            if not conflict_cols:
+                conflict_cols = ["id"] if "id" in columns else [columns[0]]
+
+            update_cols = [c for c in columns if c not in conflict_cols]
+            if update_cols:
+                update_clause = ", ".join([f"`{c}`=VALUES(`{c}`)" for c in update_cols])
+                upsert_query = (
+                    f"INSERT INTO {qualified_target} ({col_str}) VALUES ({placeholders}) "
+                    f"ON DUPLICATE KEY UPDATE {update_clause}"
+                )
+            else:
+                # All columns are conflict keys -> nothing to update on a dup. Use a
+                # no-op self-update (`k`=`k`) rather than INSERT IGNORE: IGNORE
+                # downgrades data truncation/coercion to a WARNING even under strict
+                # sql_mode, which would silently corrupt a drifted all-key row. A no-op
+                # ON DUPLICATE KEY UPDATE keeps the identical dedup semantics while
+                # letting strict mode RAISE on genuine data loss.
+                noop_col = conflict_cols[0]
+                upsert_query = (
+                    f"INSERT INTO {qualified_target} ({col_str}) VALUES ({placeholders}) "
+                    f"ON DUPLICATE KEY UPDATE `{noop_col}`=`{noop_col}`"
+                )
+
+            rows_upserted = 0
+            batch_size = min(self.max_batch_size, 1000)
+            type_lookup = col_types if isinstance(col_types, dict) else {}
+            for i in range(0, len(data), batch_size):
+                batch = data[i:i + batch_size]
+                values = [
+                    tuple(
+                        _mysql_bind_value(row.get(col), type_lookup.get(col))
+                        for col in columns
+                    )
+                    for row in batch
+                ]
+                try:
+                    cursor.executemany(upsert_query, values)
+                    rows_upserted += len(batch)
+                except Exception:
+                    # Unreachable on this image: upsert_data dispatches to the
+                    # dialect-native _*_upsert_data at method entry. The MySQL
+                    # auto-create-and-retry here previously called the removed
+                    # _ensure_table_for_cdc; re-raise instead of resurrecting it.
+                    raise
+
+            # Diagnostic mirror of import_data: surface the resolved target and the
+            # submitted row count. Under STRICT_ALL_TABLES + the no-IGNORE dedup path
+            # above, a genuine truncation/coercion now RAISES (caught by the except
+            # and returned as success:False) instead of silently shrinking the write,
+            # so rows_upserted reflects rows actually written rather than a blind
+            # len(batch). (ON DUPLICATE KEY UPDATE per-statement rowcount is 1/2/0 per
+            # row — insert/update/no-op — so it is not a usable row count here.)
+            logger.info(
+                "upsert_data: target=%s submitted=%d upserted=%d",
+                table, len(data), rows_upserted,
+            )
+
+            # Record the Kafka high-water offset in the SAME transaction as the
+            # data (see _write_cdc_offsets) so data + offset commit atomically.
+            self._write_cdc_offsets(cursor, params)
+            conn.commit()
+            cursor.close()
+            return {"success": True, "rows_upserted": rows_upserted}
+
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def delete_data(self, params: Dict = None) -> Dict[str, Any]:
+        """CDC delete: physically remove rows identified by key_fields."""
+        if self._is_oracle_dialect():
+            return self._ora_delete_data(params)
+        normalized = params or {}
+        if isinstance(normalized, dict):
+            d = normalized.get("data")
+            if d is None:
+                for k in ("before", "key", "kafka_key", "record_key", "primary_key", "keys"):
+                    if isinstance(normalized.get(k), dict):
+                        normalized = {**normalized, "data": [normalized.get(k)]}
+                        break
+                if normalized.get("data") is None and isinstance(normalized.get("keys"), list):
+                    normalized = {**normalized, "data": normalized.get("keys")}
+            elif isinstance(d, dict):
+                normalized = {**normalized, "data": [d]}
+
+        prepared = self.prepare_import_data(normalized)
+        if not prepared.get("success", True):
+            return prepared
+
+        config = prepared.get("config") or {}
+        table = prepared.get("table")
+        data = prepared.get("data", []) or []
+
+        if not table:
+            return {"success": False, "error": "Target table not specified"}
+        # Fail-closed write-path SQLi guard: reject an unsafe (tenant-controlled)
+        # destination table before it is split/interpolated into the DELETE SQL.
+        if self._safe_qualified_table(table) is None:
+            return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
+        # Resolve (db, name) so a CDC delete on a namespaced dest hits the same
+        # database the insert/upsert wrote to — the executor forwards a BARE table
+        # and the per-pipeline namespace separately. Mirrors import_data/upsert_data;
+        # without this, deletes fall back to the connection's config-default DB and
+        # silently no-op against the namespaced rows.
+        db, name = self._split_mysql_db_table(config, table, params)
+        if not name or not self._is_safe_ident(name):
+            return {"success": False, "error": f"Unsafe or missing table identifier: {name}"}
+        if db and not self._is_safe_ident(db):
+            return {"success": False, "error": f"Unsafe database identifier: {db}"}
+        qualified_target = f"`{db}`.`{name}`" if db else f"`{name}`"
+        if not data:
+            return {"success": True, "rows_deleted": 0, "message": "No rows to delete"}
+
+        key_fields = (
+            (params.get("key_fields") if isinstance(params, dict) else None)
+            or config.get("key_fields") or config.get("primary_key") or config.get("pk_fields")
+            or ["id"]
+        )
+        if isinstance(key_fields, str):
+            key_fields = [key_fields]
+        if not isinstance(key_fields, list) or not key_fields:
+            return {"success": False, "error": "delete_data requires key_fields"}
+
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+
+            # Cast both sides to CHAR to handle type mismatches (e.g. INT PK in a TEXT column).
+            where_clause = " AND ".join([f"CAST(`{k}` AS CHAR) = CAST(%s AS CHAR)" for k in key_fields])
+            delete_query = f"DELETE FROM {qualified_target} WHERE {where_clause}"
+
+            rows_deleted = 0
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                missing = [k for k in key_fields if k not in row]
+                if missing:
+                    return {"success": False, "error": f"delete_data missing key fields in row: {missing}"}
+                values = tuple(str(row.get(k)) if row.get(k) is not None else None for k in key_fields)
+                cursor.execute(delete_query, values)
+                rows_deleted += cursor.rowcount if cursor.rowcount is not None else 0
+
+            # Record the Kafka high-water offset in the SAME transaction as the
+            # delete so progress + data stay atomic (replaces Redis dedup).
+            self._write_cdc_offsets(cursor, params)
+            conn.commit()
+            cursor.close()
+            return {"success": True, "rows_deleted": rows_deleted}
+
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # ==================================================================
+    # Oracle (oracledb, thin mode) DESTINATION write path.
+    #
+    # The base render of this connector is MySQL-shaped (backtick quoting,
+    # %s params, ON DUPLICATE KEY UPDATE, CREATE DATABASE-per-namespace,
+    # information_schema) — none of which is valid on Oracle. So the
+    # destination entrypoints (ensure_schema / ensure_table / drop_table /
+    # import_data / upsert_data / delete_data / get_cdc_offsets) dispatch
+    # here when the driver is oracledb. Dialect: "double-quoted" identifiers
+    # (case-preserving), :N positional binds, MERGE ... USING (SELECT ... FROM
+    # dual) upsert, user_*/all_* catalog probes, VARCHAR2/NUMBER/TIMESTAMP/CLOB
+    # storage (bounded VARCHAR2 on indexed key columns to respect Oracle's
+    # index-key byte limit).
+    #
+    # Two Oracle-specific invariants:
+    #   1. Writes are confined to the connecting user's own schema in v1. The
+    #      per-pipeline namespace is NOT mapped to a foreign owner (that needs
+    #      cross-schema grants + CREATE USER the connector cannot provision); an
+    #      explicitly "owner.table"-qualified target still routes to that owner.
+    #   2. Oracle DDL auto-commits. The CDC offset table is therefore provisioned
+    #      BEFORE the data transaction begins (never mid-txn), so the data batch
+    #      and its Kafka high-water offset still commit atomically — the property
+    #      exactly-once recovery depends on.
+    # ==================================================================
+    def _is_oracle_dialect(self) -> bool:
+        try:
+            return "oracledb" in (self.driver_pattern.get("module") or "")
+        except Exception:
+            return False
+
+    @staticmethod
+    def _ora_quote(ident: str) -> str:
+        """Double-quote an Oracle identifier ( " -> "" ), preserving case."""
+        return '"' + str(ident).replace('"', '""') + '"'
+
+    def _ora_qname(self, owner: Optional[str], name: str) -> str:
+        """Build a quoted, optionally owner-qualified object name."""
+        if owner:
+            return f"{self._ora_quote(owner)}.{self._ora_quote(name)}"
+        return self._ora_quote(name)
+
+    def _ora_col_type(self, canonical: Optional[str], is_key: bool = False, single_key: bool = True) -> str:
+        """Map a canonical type to an Oracle column type.
+
+        Non-key text columns are CLOB (unbounded, mirrors SQL Server's
+        NVARCHAR(MAX)); indexed key columns are bounded VARCHAR2 so the unique
+        index stays within Oracle's index-key byte limit. Oracle has no native
+        BOOLEAN in SQL (pre-23c) -> NUMBER(1); NUMBER covers integer/decimal.
+
+        Delegated to the shared canonical->DDL authority (single source of truth
+        across every sink). Behavior-preserving for CANONICAL inputs — what every
+        source now emits after #525/#526/#527: integer->NUMBER(19),
+        number/decimal->NUMBER, boolean->NUMBER(1), timestamp/datetime2->TIMESTAMP,
+        date->DATE, time->VARCHAR2(64), string/json/binary->CLOB, and key text
+        bounded to VARCHAR2(400) lone / VARCHAR2(200) composite (shared
+        _KEY_BOUNDED_DDL["oracle"]). Two RAW-dialect aliases that only a
+        non-canonical source could still leak change: raw `float`/`double`/`real`
+        -> NUMBER (was BINARY_DOUBLE) and raw `bit` -> CLOB (was NUMBER(1));
+        canonical `number`/`boolean` are unaffected.
+        """
+        return canonical_to_ddl("oracle", canonical, is_key=is_key, single_key=single_key)
+
+    def _split_oracle_schema_table(self, config: Dict, table: str, params: Dict = None):
+        """Resolve (owner, bare_table). Precedence: explicit ``owner.table`` >
+        own schema (owner=None). The per-pipeline namespace is intentionally
+        NOT mapped to a foreign Oracle owner in v1 — that requires cross-schema
+        privileges + CREATE USER the connector cannot provision, so writes land
+        in the connecting user's own schema unless the caller qualifies the
+        table. Identifiers are returned case-preserved (quoted downstream).
+        """
+        raw = str(table or "").strip().strip('"').strip("`")
+        if "." in raw:
+            owner = raw.split(".", 1)[0].strip('"').strip("`")
+            name = raw.split(".", 1)[1].strip('"').strip("`")
+            prefix = owner + "."
+            while name.lower().startswith(prefix.lower()) and len(name) > len(prefix):
+                name = name[len(prefix):]
+            return owner, name
+        return None, raw
+
+    @staticmethod
+    def _ora_index_name(owner: Optional[str], name: str, keys: List[str]) -> str:
+        """Deterministic unique-index name, hashed to stay <= 30 bytes so it is
+        valid on every Oracle version (pre-12.2 caps identifiers at 30)."""
+        raw = f"{owner or ''}.{name}.{'|'.join(keys)}"
+        h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:16]
+        return f"RSYNC_UK_{h}".upper()
+
+    def _ora_ensure_offsets_table(self, cursor) -> None:
+        """Create ``_rsync_cdc_offsets`` if absent (Oracle has no CREATE TABLE
+        IF NOT EXISTS — swallow ORA-00955 'name already used'). MUST be called
+        BEFORE the data DML because Oracle DDL auto-commits."""
+        ddl = (
+            'CREATE TABLE "_rsync_cdc_offsets" ('
+            "pipeline_id VARCHAR2(128), topic VARCHAR2(255), "
+            "kafka_partition NUMBER(10), last_offset NUMBER(19), "
+            "updated_at TIMESTAMP DEFAULT SYSTIMESTAMP, "
+            'CONSTRAINT "pk_rsync_cdc_offsets" PRIMARY KEY '
+            "(pipeline_id, topic, kafka_partition))"
+        )
+        try:
+            cursor.execute(ddl)
+        except Exception as e:
+            if "ORA-00955" not in str(e):
+                raise
+
+    def _ora_ensure_table_ddl(self, cursor, config, table, columns, key_fields, column_types, params):
+        """Create/evolve the destination table; returns (owner, name)."""
+        owner, name = self._split_oracle_schema_table(config, table, params)
+        if not name or not self._is_safe_ident(name) or (owner and not self._is_safe_ident(owner)):
+            raise Exception(f"Unsafe or missing owner/table identifier: {owner}.{name}")
+        safe_cols = [c for c in (columns or []) if self._is_safe_ident(c)]
+        if not safe_cols:
+            raise Exception("No safe columns to create destination table")
+        safe_keys = [c for c in (key_fields or []) if self._is_safe_ident(c) and c in safe_cols]
+        key_set = set(safe_keys)
+        single_key = len(safe_keys) <= 1
+        ctypes = column_types if isinstance(column_types, dict) else {}
+        qname = self._ora_qname(owner, name)
+
+        # Existence probe (case-sensitive: we create identifiers quoted).
+        if owner:
+            cursor.execute(
+                "SELECT 1 FROM all_tables WHERE owner = :1 AND table_name = :2",
+                (owner, name),
+            )
+        else:
+            cursor.execute("SELECT 1 FROM user_tables WHERE table_name = :1", (name,))
+        exists = cursor.fetchone() is not None
+
+        if not exists:
+            col_defs = ", ".join(
+                f"{self._ora_quote(c)} {self._ora_col_type(ctypes.get(c), c in key_set, single_key)}"
+                for c in safe_cols
+            )
+            cursor.execute(f"CREATE TABLE {qname} ({col_defs})")
+        else:
+            # Add columns absent from a pre-existing table (schema evolution).
+            if owner:
+                cursor.execute(
+                    "SELECT column_name FROM all_tab_columns WHERE owner = :1 AND table_name = :2",
+                    (owner, name),
+                )
+            else:
+                cursor.execute(
+                    "SELECT column_name FROM user_tab_columns WHERE table_name = :1",
+                    (name,),
+                )
+            existing = set()
+            for r in cursor.fetchall() or []:
+                v = r[0] if isinstance(r, (list, tuple)) else r
+                if v:
+                    existing.add(str(v))
+            for c in safe_cols:
+                if c not in existing:
+                    cursor.execute(
+                        f"ALTER TABLE {qname} ADD ({self._ora_quote(c)} "
+                        f"{self._ora_col_type(ctypes.get(c), c in key_set, single_key)})"
+                    )
+
+        # Unique index backing the MERGE key (idempotent upserts).
+        if safe_keys:
+            idx = self._ora_index_name(owner, name, safe_keys)
+            if owner:
+                cursor.execute(
+                    "SELECT 1 FROM all_indexes WHERE owner = :1 AND index_name = :2",
+                    (owner, idx),
+                )
+            else:
+                cursor.execute("SELECT 1 FROM user_indexes WHERE index_name = :1", (idx,))
+            if not cursor.fetchone():
+                cols_sql = ", ".join(self._ora_quote(c) for c in safe_keys)
+                cursor.execute(f"CREATE UNIQUE INDEX {self._ora_quote(idx)} ON {qname} ({cols_sql})")
+        return owner, name
+
+    def _ora_introspect_dest_column_types(self, config: Dict, table: str, params: Dict = None) -> Optional[Dict[str, str]]:
+        """Read dest column types -> canonical hints (timestamp) for binding."""
+        owner, name = self._split_oracle_schema_table(config, table, params)
+        if not name:
+            return None
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            if owner:
+                cursor.execute(
+                    "SELECT column_name, data_type FROM all_tab_columns "
+                    "WHERE owner = :1 AND table_name = :2",
+                    (owner, name),
+                )
+            else:
+                cursor.execute(
+                    "SELECT column_name, data_type FROM user_tab_columns WHERE table_name = :1",
+                    (name,),
+                )
+            out: Dict[str, str] = {}
+            for row in cursor.fetchall() or []:
+                cname, dtype = row[0], str(row[1] or "").upper()
+                if dtype.startswith("TIMESTAMP") or dtype == "DATE":
+                    out[cname] = "timestamp"
+            cursor.close()
+            return out
+        except Exception:
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _ora_write_cdc_offsets(self, cursor, params) -> None:
+        """Persist Kafka high-water offsets in the current (uncommitted) txn.
+
+        Assumes ``_rsync_cdc_offsets`` already exists (provisioned up-front by
+        _ora_ensure_offsets_table before the data DML, because Oracle DDL
+        auto-commits). Keyed on (pipeline_id, topic, kafka_partition); MERGE
+        keeps the max offset via GREATEST. No-op when kafka_offset is absent.
+        """
+        ko = (params or {}).get("kafka_offset")
+        if not ko:
+            return
+        offsets = ko if isinstance(ko, list) else [ko]
+        merge = (
+            'MERGE INTO "_rsync_cdc_offsets" t USING ('
+            "SELECT :1 AS pipeline_id, :2 AS topic, :3 AS kafka_partition, "
+            ":4 AS last_offset FROM dual) s "
+            "ON (t.pipeline_id = s.pipeline_id AND t.topic = s.topic "
+            "AND t.kafka_partition = s.kafka_partition) "
+            "WHEN MATCHED THEN UPDATE SET "
+            "t.last_offset = GREATEST(t.last_offset, s.last_offset), "
+            "t.updated_at = SYSTIMESTAMP "
+            "WHEN NOT MATCHED THEN INSERT "
+            "(pipeline_id, topic, kafka_partition, last_offset) "
+            "VALUES (s.pipeline_id, s.topic, s.kafka_partition, s.last_offset)"
+        )
+        for o in offsets:
+            if not isinstance(o, dict):
+                continue
+            pid = o.get("pipeline_id") or ""
+            topic = o.get("topic") or ""
+            part = o.get("partition")
+            off = o.get("offset")
+            if not topic or part is None or off is None:
+                continue
+            cursor.execute(merge, (str(pid)[:128], str(topic)[:255], int(part), int(off)))
+
+    def _ora_get_cdc_offsets(self, params: Dict = None) -> Dict[str, Any]:
+        """Oracle variant of get_cdc_offsets (reads "_rsync_cdc_offsets")."""
+        conn = None
+        try:
+            config = self._get_config(params) if hasattr(self, "_get_config") else ((params or {}).get("config") or {})
+            pipeline_id = (params or {}).get("pipeline_id") or ""
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            try:
+                cursor.execute(
+                    'SELECT topic, kafka_partition, last_offset FROM "_rsync_cdc_offsets" '
+                    "WHERE pipeline_id = :1",
+                    (str(pipeline_id),),
+                )
+                rows = cursor.fetchall()
+            except Exception:
+                # Table absent / not provisioned yet -> no offsets recorded.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return {"success": True, "offsets": []}
+            finally:
+                cursor.close()
+            offsets = [
+                {"topic": r[0], "partition": int(r[1]), "offset": int(r[2])}
+                for r in (rows or [])
+            ]
+            return {"success": True, "offsets": offsets}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _ora_ensure_schema(self, params: Dict = None) -> Dict[str, Any]:
+        """Oracle variant of ensure_schema. In Oracle a schema IS a database
+        user; the connector cannot CREATE USER, and v1 writes land in the
+        connecting user's own schema (which always exists), so this is a
+        success no-op that simply confirms connectivity."""
+        if not bool(getattr(self, "supports_ddl", False)):
+            return {"success": False, "error": "DDL helpers not supported by this connector"}
+        params = params or {}
+        schema = str(params.get("schema") or "").strip().strip('"')
+        return {
+            "success": True,
+            "schema": schema or None,
+            "message": "Oracle schema maps to the connecting user; no DDL needed",
+        }
+
+    def _ora_ensure_table(self, params: Dict = None) -> Dict[str, Any]:
+        """Oracle variant of ensure_table (table + unique key index)."""
+        if not bool(getattr(self, "supports_ddl", False)):
+            return {"success": False, "error": "DDL helpers not supported by this connector"}
+        params = params or {}
+        config = self._get_config(params)
+        table = str(params.get("table") or "").strip()
+        if not table:
+            return {"success": False, "error": "Missing table"}
+
+        cols_raw = params.get("columns") or []
+        columns: List[str] = []
+        if isinstance(cols_raw, list):
+            for c in cols_raw:
+                cc = str(c or "").strip()
+                if cc:
+                    columns.append(cc)
+
+        keys_raw = params.get("key_fields") or params.get("keys") or []
+        key_fields: List[str] = []
+        if isinstance(keys_raw, list):
+            for c in keys_raw:
+                cc = str(c or "").strip()
+                if cc:
+                    key_fields.append(cc)
+
+        col_types_raw = params.get("column_types") or {}
+        column_types: Dict[str, str] = {}
+        if isinstance(col_types_raw, dict):
+            for k, v in col_types_raw.items():
+                if k and v:
+                    column_types[str(k)] = str(v)
+
+        # Synthetic-PK fallback (Fivetran-style), identical policy to the MySQL
+        # / SQL Server paths: append-only history (synthetic_pk=false /
+        # append_mode=true) is a hard opt-out; otherwise a missing PK injects
+        # _rsync_row_hash + _synced_at.
+        _append_mode = bool(params.get("append_mode"))
+        _synthetic_pk_param = params.get("synthetic_pk")
+        _synthetic_pk_disabled = (_synthetic_pk_param is False) or _append_mode
+        synthetic_pk_requested = (
+            bool(_synthetic_pk_param) or (not key_fields)
+        ) and not _synthetic_pk_disabled
+        synthetic_pk_applied = False
+        if synthetic_pk_requested and not key_fields:
+            if SYNTHETIC_PK_COL not in columns:
+                columns.append(SYNTHETIC_PK_COL)
+            if SYNTHETIC_TS_COL not in columns:
+                columns.append(SYNTHETIC_TS_COL)
+            column_types.setdefault(SYNTHETIC_PK_COL, "string")
+            column_types.setdefault(SYNTHETIC_TS_COL, "timestamp")
+            key_fields = [SYNTHETIC_PK_COL]
+            synthetic_pk_applied = True
+
+        conn = None
+        cursor = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            self._ora_ensure_table_ddl(cursor, config, table, columns, key_fields, column_types, params)
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "table": table,
+                "synthetic_pk": synthetic_pk_applied,
+                "key_fields": key_fields,
+            }
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return {"success": False, "error": str(e)}
+        finally:
+            try:
+                if cursor is not None:
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    def _ora_drop_table(self, params: Dict = None) -> Dict[str, Any]:
+        """Oracle variant of drop_table (reload semantics). DROP TABLE ...
+        CASCADE CONSTRAINTS; missing table is a success no-op."""
+        if not bool(getattr(self, "supports_ddl", False)):
+            return {"success": False, "error": "DDL helpers not supported by this connector"}
+        params = params or {}
+        config = self._get_config(params)
+        table = str(params.get("table") or "").strip()
+        if not table:
+            return {"success": False, "error": "Missing table"}
+        owner, name = self._split_oracle_schema_table(config, table, params)
+        if not name or not self._is_safe_ident(name) or (owner and not self._is_safe_ident(owner)):
+            return {"success": False, "error": f"Unsafe or missing owner/table identifier: {owner}.{name}"}
+        conn = None
+        cursor = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            if owner:
+                cursor.execute(
+                    "SELECT 1 FROM all_tables WHERE owner = :1 AND table_name = :2",
+                    (owner, name),
+                )
+            else:
+                cursor.execute("SELECT 1 FROM user_tables WHERE table_name = :1", (name,))
+            if not cursor.fetchone():
+                return {"success": True, "table": table, "dropped": False, "message": "table does not exist"}
+            qname = self._ora_qname(owner, name)
+            cursor.execute(f"DROP TABLE {qname} CASCADE CONSTRAINTS")
+            return {"success": True, "table": table, "dropped": True}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            try:
+                if cursor is not None:
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    def _ora_import_data(self, params: Dict = None) -> Dict[str, Any]:
+        """Oracle batch INSERT (append). Auto-creates the table on first write."""
+        prepared = self.prepare_import_data(params)
+        if not prepared.get("success", True):
+            return prepared
+        data = prepared.get("data", [])
+        if not data:
+            return {"success": True, "rows_inserted": 0, "message": "No data to import"}
+        config = prepared["config"]
+        table = prepared.get("table")
+        if not table:
+            return {"success": False, "error": "Target table not specified"}
+        owner, name = self._split_oracle_schema_table(config, table, params)
+        if not name or not self._is_safe_ident(name) or (owner and not self._is_safe_ident(owner)):
+            return {"success": False, "error": f"Unsafe or missing owner/table identifier: {owner}.{name}"}
+        qname = self._ora_qname(owner, name)
+
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            # Oracle DDL auto-commits: provision the offsets table BEFORE any
+            # data DML so the data batch + offset MERGE still commit atomically.
+            if (params or {}).get("kafka_offset"):
+                self._ora_ensure_offsets_table(cursor)
+
+            columns: List[str] = []
+            _seen = set()
+            for _row in data:
+                if not isinstance(_row, dict):
+                    continue
+                for _k in _row.keys():
+                    if _k not in _seen:
+                        _seen.add(_k)
+                        columns.append(_k)
+            safe_columns = [c for c in columns if self._is_safe_ident(c)]
+            if not safe_columns:
+                return {"success": False, "error": "No safe columns to import"}
+            placeholders = ", ".join(f":{i + 1}" for i in range(len(safe_columns)))
+            col_str = ", ".join(self._ora_quote(c) for c in safe_columns)
+            insert_query = f"INSERT INTO {qname} ({col_str}) VALUES ({placeholders})"
+
+            col_types = (params or {}).get("column_types") or {}
+            if not isinstance(col_types, dict):
+                col_types = {}
+            if not col_types:
+                col_types = self._ora_introspect_dest_column_types(config, table, params) or {}
+
+            def _rows(batch):
+                return [
+                    tuple(_oracle_bind_value(row.get(col), col_types.get(col)) for col in safe_columns)
+                    for row in batch
+                ]
+
+            rows_inserted = 0
+            batch_size = min(self.max_batch_size, 1000)
+            for i in range(0, len(data), batch_size):
+                batch = data[i:i + batch_size]
+                values = _rows(batch)
+                try:
+                    cursor.executemany(insert_query, values)
+                except Exception as e:
+                    if "ORA-00942" in str(e):  # table or view does not exist
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        cursor = self._get_cursor(conn, as_dict=False)
+                        self._ora_ensure_table_ddl(cursor, config, table, safe_columns, [], col_types, params)
+                        cursor.executemany(insert_query, values)
+                    else:
+                        raise
+                affected = cursor.rowcount
+                rows_inserted += affected if (affected is not None and affected >= 0) else len(batch)
+
+            logger.info("import_data[oracle]: target=%s.%s submitted=%d affected=%d",
+                        owner or "", name, len(data), rows_inserted)
+            self._ora_write_cdc_offsets(cursor, params)
+            conn.commit()
+            cursor.close()
+            return {"success": True, "rows_inserted": rows_inserted}
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _ora_upsert_data(self, params: Dict = None) -> Dict[str, Any]:
+        """Oracle CDC upsert via per-row MERGE ... USING (SELECT ... FROM dual)."""
+        params = params or {}
+        prepared = self.prepare_import_data(params)
+        if not prepared.get("success", True):
+            return prepared
+        data = prepared.get("data", [])
+        if not data:
+            return {"success": True, "rows_upserted": 0, "message": "No data to upsert"}
+        config = prepared["config"]
+        table = prepared.get("table")
+        if not table:
+            return {"success": False, "error": "Target table not specified"}
+        owner, name = self._split_oracle_schema_table(config, table, params)
+        if not name or not self._is_safe_ident(name) or (owner and not self._is_safe_ident(owner)):
+            return {"success": False, "error": f"Unsafe or missing owner/table identifier: {owner}.{name}"}
+        qname = self._ora_qname(owner, name)
+
+        key_fields = (
+            params.get("key_fields")
+            or params.get("primary_key_fields")
+            or config.get("key_fields")
+            or config.get("primary_key_fields")
+            or ["id"]
+        )
+        if isinstance(key_fields, str):
+            key_fields = [key_fields]
+        if not isinstance(key_fields, list) or len(key_fields) == 0:
+            key_fields = ["id"]
+
+        col_types = params.get("column_types") or {}
+        if not isinstance(col_types, dict):
+            col_types = {}
+        if not col_types:
+            col_types = self._ora_introspect_dest_column_types(config, table, params) or {}
+
+        if bool(params.get("synthetic_pk")):
+            from datetime import datetime, timezone
+            now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S.%f")
+            source_cols = [c for c in data[0].keys() if not c.startswith("_rsync_")]
+            for row in data:
+                if SYNTHETIC_PK_COL not in row:
+                    row[SYNTHETIC_PK_COL] = _compute_row_hash(row, source_cols)
+                if SYNTHETIC_TS_COL not in row:
+                    row[SYNTHETIC_TS_COL] = now_str
+            key_fields = [SYNTHETIC_PK_COL]
+
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            if (params or {}).get("kafka_offset"):
+                self._ora_ensure_offsets_table(cursor)
+
+            columns: List[str] = []
+            _seen = set()
+            for _row in data:
+                if not isinstance(_row, dict):
+                    continue
+                for _k in _row.keys():
+                    if _k not in _seen:
+                        _seen.add(_k)
+                        columns.append(_k)
+            columns = [c for c in columns if self._is_safe_ident(c)]
+            if not columns:
+                return {"success": False, "error": "No safe columns to upsert"}
+
+            conflict_cols = [k for k in key_fields if k in columns and self._is_safe_ident(k)]
+            if not conflict_cols:
+                conflict_cols = ["id"] if "id" in columns else [columns[0]]
+            update_cols = [c for c in columns if c not in conflict_cols]
+
+            using_cols = ", ".join(f":{i + 1} AS {self._ora_quote(c)}" for i, c in enumerate(columns))
+            on_clause = " AND ".join(f"t.{self._ora_quote(k)} = s.{self._ora_quote(k)}" for k in conflict_cols)
+            if update_cols:
+                set_clause = ", ".join(f"t.{self._ora_quote(c)} = s.{self._ora_quote(c)}" for c in update_cols)
+                matched = f"WHEN MATCHED THEN UPDATE SET {set_clause} "
+            else:
+                matched = ""  # all columns are keys -> insert-if-absent only
+            insert_cols = ", ".join(self._ora_quote(c) for c in columns)
+            insert_vals = ", ".join(f"s.{self._ora_quote(c)}" for c in columns)
+            merge_query = (
+                f"MERGE INTO {qname} t USING (SELECT {using_cols} FROM dual) s "
+                f"ON ({on_clause}) {matched}"
+                f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+            )
+
+            def _rows(batch):
+                return [
+                    tuple(_oracle_bind_value(row.get(col), col_types.get(col)) for col in columns)
+                    for row in batch
+                ]
+
+            rows_upserted = 0
+            batch_size = min(self.max_batch_size, 1000)
+            for i in range(0, len(data), batch_size):
+                batch = data[i:i + batch_size]
+                values = _rows(batch)
+                try:
+                    cursor.executemany(merge_query, values)
+                except Exception as e:
+                    if "ORA-00942" in str(e):  # table or view does not exist
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                        cursor = self._get_cursor(conn, as_dict=False)
+                        self._ora_ensure_table_ddl(cursor, config, table, columns, conflict_cols, col_types, params)
+                        cursor.executemany(merge_query, values)
+                    else:
+                        raise
+                rows_upserted += len(batch)
+
+            logger.info("upsert_data[oracle]: target=%s.%s submitted=%d",
+                        owner or "", name, rows_upserted)
+            self._ora_write_cdc_offsets(cursor, params)
+            conn.commit()
+            cursor.close()
+            return {"success": True, "rows_upserted": rows_upserted}
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _ora_delete_data(self, params: Dict = None) -> Dict[str, Any]:
+        """Oracle CDC delete by key fields."""
+        normalized = params or {}
+        if isinstance(normalized, dict):
+            d = normalized.get("data")
+            if d is None:
+                for k in ("before", "key", "kafka_key", "record_key", "primary_key", "keys"):
+                    if isinstance(normalized.get(k), dict):
+                        normalized = {**normalized, "data": [normalized.get(k)]}
+                        break
+                if normalized.get("data") is None and isinstance(normalized.get("keys"), list):
+                    normalized = {**normalized, "data": normalized.get("keys")}
+            elif isinstance(d, dict):
+                normalized = {**normalized, "data": [d]}
+
+        prepared = self.prepare_import_data(normalized)
+        if not prepared.get("success", True):
+            return prepared
+        config = prepared.get("config") or {}
+        table = prepared.get("table")
+        data = prepared.get("data", []) or []
+        if not table:
+            return {"success": False, "error": "Target table not specified"}
+        owner, name = self._split_oracle_schema_table(config, table, params)
+        if not name or not self._is_safe_ident(name) or (owner and not self._is_safe_ident(owner)):
+            return {"success": False, "error": f"Unsafe or missing owner/table identifier: {owner}.{name}"}
+        qname = self._ora_qname(owner, name)
+        if not data:
+            return {"success": True, "rows_deleted": 0, "message": "No rows to delete"}
+
+        key_fields = (
+            (params.get("key_fields") if isinstance(params, dict) else None)
+            or config.get("key_fields") or config.get("primary_key") or config.get("pk_fields")
+            or ["id"]
+        )
+        if isinstance(key_fields, str):
+            key_fields = [key_fields]
+        if not isinstance(key_fields, list) or not key_fields:
+            return {"success": False, "error": "delete_data requires key_fields"}
+        key_fields = [k for k in key_fields if self._is_safe_ident(k)]
+        if not key_fields:
+            return {"success": False, "error": "delete_data: no safe key fields"}
+
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            if (params or {}).get("kafka_offset"):
+                self._ora_ensure_offsets_table(cursor)
+            # TO_CHAR both sides to tolerate type mismatch (e.g. NUMBER key vs text key).
+            where_clause = " AND ".join(
+                f"TO_CHAR({self._ora_quote(k)}) = :{i + 1}" for i, k in enumerate(key_fields)
+            )
+            delete_query = f"DELETE FROM {qname} WHERE {where_clause}"
+            rows_deleted = 0
+            for row in data:
+                if not isinstance(row, dict):
+                    continue
+                missing = [k for k in key_fields if k not in row]
+                if missing:
+                    return {"success": False, "error": f"delete_data missing key fields in row: {missing}"}
+                values = tuple(str(row.get(k)) if row.get(k) is not None else None for k in key_fields)
+                cursor.execute(delete_query, values)
+                rows_deleted += cursor.rowcount if cursor.rowcount is not None and cursor.rowcount >= 0 else 0
+            self._ora_write_cdc_offsets(cursor, params)
+            conn.commit()
+            cursor.close()
+            return {"success": True, "rows_deleted": rows_deleted}
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def oracle_upsert_data(self, params: Dict = None) -> Dict[str, Any]:
+        """JSON-RPC entrypoint: upsert_data (CDC sink)."""
+        return self.upsert_data(params)
+
+    def oracle_delete_data(self, params: Dict = None) -> Dict[str, Any]:
+        """JSON-RPC entrypoint: delete_data (CDC sink)."""
+        return self.delete_data(params)
+
+    def oracle_get_cdc_offsets(self, params: Dict = None) -> Dict[str, Any]:
+        """JSON-RPC entrypoint: get_cdc_offsets (CDC sink startup recovery)."""
+        return self.get_cdc_offsets(params)
+
+    # ------------------------------------------------------------------
+    # Transactional CDC offset tracking (replaces Redis-based dedup).
+    #
+    # Each CDC batch flush passes the Kafka high-water offset(s) it is about to
+    # apply via params["kafka_offset"]; we persist them into _rsync_cdc_offsets
+    # in the SAME transaction as the data (InnoDB is transactional), so data and
+    # the progress marker commit atomically. On restart the sink reads these
+    # back via get_cdc_offsets and skips any message at or below the recorded
+    # high-water mark — true exactly-once even for non-idempotent ops.
+    # ------------------------------------------------------------------
+    _CDC_OFFSETS_TABLE = "_rsync_cdc_offsets"
+
+    def _write_cdc_offsets(self, cursor, params) -> None:
+        """Record Kafka high-water offsets in the current (uncommitted) txn.
+
+        params["kafka_offset"] may be a single dict or a list of dicts, each
+        shaped {pipeline_id, topic, partition, offset}. No-op when absent so
+        non-CDC callers (plain batch loads) are unaffected. Must be called with
+        an open cursor BEFORE conn.commit() so it shares the data transaction.
+        """
+        ko = (params or {}).get("kafka_offset")
+        if not ko:
+            return
+        offsets = ko if isinstance(ko, list) else [ko]
+        cursor.execute(
+            f"CREATE TABLE IF NOT EXISTS `{self._CDC_OFFSETS_TABLE}` ("
+            " pipeline_id VARCHAR(255) NOT NULL,"
+            " topic VARCHAR(255) NOT NULL,"
+            " kafka_partition INT NOT NULL,"
+            " last_offset BIGINT NOT NULL,"
+            " updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP"
+            " ON UPDATE CURRENT_TIMESTAMP,"
+            " PRIMARY KEY (pipeline_id, topic, kafka_partition))"
+            " ENGINE=InnoDB"
+        )
+        for o in offsets:
+            if not isinstance(o, dict):
+                continue
+            pid = o.get("pipeline_id") or ""
+            topic = o.get("topic") or ""
+            part = o.get("partition")
+            off = o.get("offset")
+            if not topic or part is None or off is None:
+                continue
+            cursor.execute(
+                f"INSERT INTO `{self._CDC_OFFSETS_TABLE}`"
+                " (pipeline_id, topic, kafka_partition, last_offset)"
+                " VALUES (%s, %s, %s, %s)"
+                " ON DUPLICATE KEY UPDATE"
+                "  last_offset = GREATEST(last_offset, VALUES(last_offset))",
+                (str(pid), str(topic), int(part), int(off)),
+            )
+
+    def get_cdc_offsets(self, params: Dict = None) -> Dict[str, Any]:
+        """Return the durable per-partition high-water marks for a pipeline.
+
+        Called by the sink on startup to seed its in-memory high-water map.
+        Returns {"success": True, "offsets": [{topic, partition, offset}, ...]}.
+        Empty list when the table does not exist yet (fresh pipeline).
+        """
+        if self._is_oracle_dialect():
+            return self._ora_get_cdc_offsets(params)
+        conn = None
+        try:
+            config = self._get_config(params) if hasattr(self, "_get_config") else ((params or {}).get("config") or {})
+            pipeline_id = (params or {}).get("pipeline_id") or ""
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            try:
+                cursor.execute(
+                    f"SELECT topic, kafka_partition, last_offset FROM `{self._CDC_OFFSETS_TABLE}`"
+                    " WHERE pipeline_id = %s",
+                    (str(pipeline_id),),
+                )
+                rows = cursor.fetchall()
+            except Exception:
+                # Table absent / not provisioned yet → no offsets recorded.
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                return {"success": True, "offsets": []}
+            finally:
+                cursor.close()
+            offsets = [
+                {"topic": r[0], "partition": int(r[1]), "offset": int(r[2])}
+                for r in (rows or [])
+            ]
+            return {"success": True, "offsets": offsets}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _get_connection(self, config: Dict):
+        """
+        Establish database connection using detected driver pattern.
+        
+        This method dynamically loads and uses the appropriate database driver
+        based on the connector type.
+        """
+        pattern = self.driver_pattern
+        
+        if not pattern:
+            raise NotImplementedError(
+                f"No driver pattern found for {self.connector_type}. "
+                "Please add a pattern to DRIVER_PATTERNS or use a specific template."
+            )
+        
+        try:
+            # Import the driver module
+            module_name = pattern.get("module", "")
+            if not module_name:
+                raise ImportError(f"No module specified for driver")
+            
+            import importlib
+            driver_module = importlib.import_module(module_name)
+            
+            # Handle different connection styles
+            if pattern.get("is_nosql"):
+                return self._get_nosql_connection(driver_module, pattern, config)
+            elif pattern.get("connection_string"):
+                return self._get_connection_string_style(driver_module, pattern, config)
+            else:
+                return self._get_param_style_connection(driver_module, pattern, config)
+                
+        except ImportError as e:
+            raise Exception(f"Database driver not installed: {e}. Install with: pip install {pattern.get('module', 'driver')}")
+        except Exception as e:
+            raise Exception(f"Database connection failed: {e}")
+    
+    def _get_param_style_connection(self, driver_module, pattern: Dict, config: Dict):
+        """Standard parameter-based connection (MySQL, PostgreSQL, etc.)"""
+        connect_path = pattern.get("connect", "connect")
+        
+        # Extract the function name from the connect path
+        # For "mysql.connector.connect", the module is already imported as "mysql.connector"
+        # So we just need the last part: "connect"
+        # For "psycopg2.connect", module is "psycopg2", we need "connect"
+        if "." in connect_path:
+            # Get the last part of the path (the actual function name)
+            func_name = connect_path.split(".")[-1]
+            connect_func = getattr(driver_module, func_name)
+        else:
+            # Simple case: just "connect"
+            connect_func = getattr(driver_module, connect_path)
+
+        # Oracle (oracledb) needs DSN/SID/wallet handling the generic param
+        # mapping can't express — hand off to a dedicated builder.
+        if "oracledb" in (pattern.get("module", "") or "").lower():
+            return self._get_oracle_connection(driver_module, connect_func, config)
+
+        # Build connection params
+        conn_params = {}
+        for param in pattern.get("params", []):
+            # Map config keys to driver-specific param names
+            if param == "dbname":  # PostgreSQL uses dbname
+                conn_params[param] = config.get("database")
+            else:
+                if config.get(param):
+                    conn_params[param] = config.get(param)
+        
+        # Add default port if not specified
+        if "port" not in conn_params and pattern.get("default_port"):
+            conn_params["port"] = pattern["default_port"]
+
+        # Add connect timeout so unreachable hosts fail fast (better UX for "Test Connection")
+        module_lower = (pattern.get("module", "") or "").lower()
+        if "mysql.connector" in module_lower:
+            conn_params.setdefault("connect_timeout", 10)
+            # Force a strict SQL mode so a type/length mismatch against a drifted
+            # destination column RAISES instead of being silently truncated/coerced.
+            # On a permissive server (sql_mode='') MySQL stored e.g. a 10-char value
+            # into VARCHAR(5) as 5 chars, returned no error, the connector reported
+            # the full batch as written, and the pipeline "completed" with corrupted
+            # data. The connector must not depend on the server's sql_mode (self-hosted
+            # MySQL is frequently permissive). STRICT_ALL_TABLES targets exactly the
+            # data-loss classes (data-too-long 1406, out-of-range 1264, wrong-value
+            # 1366) without adding unrelated zero-date / group-by strictness. An
+            # explicit config sql_mode always wins.
+            conn_params.setdefault("sql_mode", config.get("sql_mode") or "STRICT_ALL_TABLES")
+        elif module_lower == "psycopg2":
+            # psycopg2 uses connect_timeout (seconds)
+            conn_params.setdefault("connect_timeout", 10)
+
+        # Host-aware TLS, mirroring api-gateway resolveMySQLTLSMode / resolvePostgresSSLMode.
+        # Remote hosts (e.g. Azure Database for MySQL/PostgreSQL, RDS) enforce TLS
+        # server-side; local/docker-internal hosts rarely run it. An explicit ssl_mode/
+        # sslmode/tls config key always wins. Default for remote = encrypt-in-transit
+        # without CA/hostname verification (the libpq "require" equivalent), since cloud
+        # provider CAs are frequently absent from the container trust store.
+        host_val = str(config.get("host", "") or "").strip().lower()
+        is_local_host = (
+            host_val in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal")
+            or "." not in host_val
+        )
+        explicit_tls = any(
+            config.get(k) not in (None, "")
+            for k in ("ssl_mode", "sslmode", "tls", "tls_mode")
+        )
+        if "mysql.connector" in module_lower and not explicit_tls:
+            # ssl_disabled=False negotiates TLS; ssl_verify_cert defaults to False
+            # (encrypt without verifying the server cert).
+            conn_params.setdefault("ssl_disabled", is_local_host)
+        elif module_lower == "psycopg2" and not explicit_tls:
+            conn_params.setdefault("sslmode", "disable" if is_local_host else "require")
+
+        return connect_func(**conn_params)
+
+    def _get_oracle_connection(self, driver_module, connect_func, config: Dict):
+        """Oracle (python-oracledb) connection in THIN mode — no Instant Client.
+
+        Supports several DSN forms, in precedence order:
+          1. explicit ``dsn`` / ``tns`` / ``connect_string`` (Easy-Connect
+             ``host:port/service`` or a full DESCRIPTION or a tnsnames alias)
+          2. ``sid`` (legacy) -> makedsn(host, port, sid=...)
+          3. ``service_name`` (or ``database`` treated as the service) ->
+             makedsn(host, port, service_name=...)
+        Oracle Autonomous DB mTLS wallets are honored via
+        ``wallet_location``/``config_dir`` (+ optional ``wallet_password``).
+        LOBs are fetched as str/bytes (fetch_lobs=False) so CLOB/BLOB columns
+        round-trip as plain values instead of LOB locators.
+        """
+        try:
+            driver_module.defaults.fetch_lobs = False
+        except Exception:
+            pass
+
+        user = config.get("user") or config.get("username")
+        password = config.get("password")
+        host = str(config.get("host") or "localhost")
+        port = int(config.get("port") or 1521)
+
+        dsn = config.get("dsn") or config.get("tns") or config.get("connect_string")
+        sid = config.get("sid")
+        service_name = config.get("service_name") or config.get("service") or config.get("database")
+
+        kwargs: Dict[str, Any] = {"user": user, "password": password}
+        if dsn:
+            # Explicit DSN/TNS/connect_string is user-authored — honor it verbatim
+            # (its own DESCRIPTION carries whatever PROTOCOL the operator chose).
+            kwargs["dsn"] = dsn
+        else:
+            # Secure-by-default transport. makedsn() always emits PROTOCOL=TCP, so a
+            # remote Oracle host with no explicit config would send the login + every
+            # row over PLAINTEXT :1521 — an on-path attacker reads creds and data.
+            # Default remote hosts to PROTOCOL=TCPS (Oracle native TLS); keep local/
+            # docker-internal hosts on TCP (they rarely run a TLS listener). An
+            # explicit protocol/TLS config key opts out: a disable-family value
+            # (disable/false/off/0/no/none/tcp) forces plaintext TCP.
+            # PORT CAVEAT: TCPS conventionally listens on 2484, not 1521, and may need
+            # ssl_server_dn_match / a wallet. We deliberately DO NOT rewrite the port —
+            # we honor whatever port was configured (default 1521). If a remote host has
+            # no TLS listener on the configured port, TCPS fails-closed at connect time,
+            # which is strictly safer than silently leaking credentials over plaintext.
+            raw_proto = str(
+                config.get("protocol")
+                or config.get("ssl_mode")
+                or config.get("sslmode")
+                or config.get("tls")
+                or config.get("tls_mode")
+                or ""
+            ).strip().lower()
+            if raw_proto in ("disable", "disabled", "false", "off", "0", "no", "none", "tcp"):
+                use_tcps = False
+            elif raw_proto:  # any other explicit value (tcps/require/true/…) opts in
+                use_tcps = True
+            else:
+                use_tcps = not _is_local_db_host(host)
+
+            if sid:
+                built = driver_module.makedsn(host, port, sid=sid)
+            else:
+                built = driver_module.makedsn(host, port, service_name=service_name)
+            if use_tcps:
+                # makedsn emits exactly "(PROTOCOL=TCP)"; the trailing ")" keeps this
+                # from matching an already-TCPS descriptor.
+                built = built.replace("(PROTOCOL=TCP)", "(PROTOCOL=TCPS)")
+            kwargs["dsn"] = built
+
+        wallet = (
+            config.get("wallet_location")
+            or config.get("wallet_dir")
+            or config.get("config_dir")
+        )
+        if wallet:
+            kwargs["config_dir"] = wallet
+            kwargs["wallet_location"] = wallet
+            wp = config.get("wallet_password")
+            if wp:
+                kwargs["wallet_password"] = wp
+
+        return connect_func(**kwargs)
+
+    def _get_connection_string_style(self, driver_module, pattern: Dict, config: Dict):
+        """Connection-string based connection (SQL Server via pyodbc).
+
+        Encryption is host-aware, mirroring the orchestrator's
+        resolveSQLServerEncrypt (backend-orchestrator/internal/cdc/sqlserver.go):
+        Azure SQL (``*.database.windows.net``) MANDATES TLS and presents a real
+        CA cert, so Encrypt=yes + TrustServerCertificate=no. Local/boxed SQL
+        Server typically has a self-signed cert, so Encrypt=yes +
+        TrustServerCertificate=yes (encrypt in transit without CA verification).
+        An explicit ``encrypt`` / ``sslmode`` / ``tls`` config key always wins.
+        Without this, ODBC Driver 17's default (Encrypt=no) fails against Azure.
+        """
+        import pyodbc
+
+        # Pick the newest installed "ODBC Driver NN for SQL Server" (18 preferred,
+        # 17 fallback). Driver 18 defaults Encrypt=yes which Azure requires.
+        driver = "ODBC Driver 18 for SQL Server"
+        try:
+            installed = [d for d in pyodbc.drivers() if "ODBC Driver" in d and "SQL Server" in d]
+            if installed:
+                def _ver(name):
+                    for tok in name.split():
+                        if tok.isdigit():
+                            return int(tok)
+                    return 0
+                driver = sorted(installed, key=_ver)[-1]
+        except Exception:
+            pass
+
+        host = str(config.get("host", "localhost") or "localhost")
+        port = config.get("port", 1433) or 1433
+        server = f"{host},{port}"
+        database = config.get("database", "master") or "master"
+        uid = config.get("user", "") or config.get("username", "") or ""
+        pwd = config.get("password", "") or ""
+
+        host_l = host.strip().lower()
+        is_azure = host_l.endswith(".database.windows.net")
+        is_local = host_l in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal")
+
+        # Host-aware encryption defaults; explicit config overrides.
+        raw_tls = str(
+            config.get("encrypt")
+            or config.get("sslmode")
+            or config.get("tls")
+            or config.get("tls_mode")
+            or ""
+        ).strip().lower()
+        if raw_tls in ("disable", "disabled", "false", "no", "off", "0"):
+            encrypt, trust = "no", "no"
+        elif is_azure:
+            encrypt, trust = "yes", "no"       # real DigiCert CA — verify it
+        elif is_local:
+            encrypt, trust = "yes", "yes"      # self-signed box cert — don't verify
+        else:
+            encrypt, trust = "yes", "yes"      # generic remote/self-hosted
+
+        parts = [
+            f"DRIVER={{{driver}}}",
+            f"SERVER={server}",
+            f"DATABASE={database}",
+            f"UID={uid}",
+            f"PWD={pwd}",
+            f"Encrypt={encrypt}",
+            f"TrustServerCertificate={trust}",
+            "Connection Timeout=10",
+        ]
+        conn_str = ";".join(parts)
+        return pyodbc.connect(conn_str)
+    
+    def _get_nosql_connection(self, driver_module, pattern: Dict, config: Dict):
+        """NoSQL database connection (MongoDB, Redis, etc.)"""
+        module_name = pattern.get("module", "")
+        
+        if "mongo" in module_name:
+            from pymongo import MongoClient
+            host = config.get('host', 'localhost')
+            port = config.get('port', 27017)
+            user = config.get('user')
+            password = config.get('password')
+            
+            if user and password:
+                auth_source = config.get('auth_source', 'admin')
+                uri = f"mongodb://{user}:{password}@{host}:{port}/?authSource={auth_source}"
+            else:
+                uri = f"mongodb://{host}:{port}/"
+            
+            return MongoClient(uri)
+        
+        elif "redis" in module_name:
+            import redis
+            return redis.Redis(
+                host=config.get('host', 'localhost'),
+                port=config.get('port', 6379),
+                password=config.get('password'),
+                db=config.get('db', 0)
+            )
+        
+        else:
+            raise NotImplementedError(f"NoSQL driver {module_name} not yet supported")
+    
+    def _get_cursor(self, conn, as_dict: bool = True):
+        """Get cursor with optional dictionary mode"""
+        pattern = self.driver_pattern
+        
+        # MongoDB doesn't use cursors the same way
+        if pattern.get("is_nosql"):
+            return None
+        
+        # SQLite special handling
+        if "sqlite" in pattern.get("module", ""):
+            import sqlite3
+            if as_dict:
+                conn.row_factory = sqlite3.Row
+            return conn.cursor()
+        
+        # PostgreSQL special handling
+        if "psycopg2" in pattern.get("module", ""):
+            from psycopg2.extras import RealDictCursor
+            return conn.cursor(cursor_factory=RealDictCursor) if as_dict else conn.cursor()
+        
+        # MySQL special handling
+        if "mysql" in pattern.get("module", ""):
+            return conn.cursor(dictionary=True) if as_dict else conn.cursor()
+        
+        # Default cursor
+        return conn.cursor()
+
+    # =========================================================================
+    # DDL HELPERS (explicit tools; called by sink worker when advertised)
+    # =========================================================================
+
+    def ensure_schema(self, params: Dict = None) -> Dict[str, Any]:
+        if self._is_oracle_dialect():
+            return self._ora_ensure_schema(params)
+        if not bool(getattr(self, "supports_ddl", False)):
+            return {"success": False, "error": "DDL helpers not supported by this connector"}
+        params = params or {}
+        config = self._get_config(params)
+        schema = str(params.get("schema") or "").strip()
+        if not schema:
+            return {"success": False, "error": "Missing schema/database"}
+        if not self._is_safe_ident(schema):
+            return {"success": False, "error": f"Unsafe database identifier: {schema}"}
+
+        conn = None
+        cursor = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=False)
+            cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{schema}`")
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            return {"success": True, "database": schema}
+        finally:
+            try:
+                if cursor is not None:
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    def drop_table(self, params: Dict = None) -> Dict[str, Any]:
+        """DROP destination table for run_mode=reload.
+
+        Mirror of postgres `drop_table`. Reload semantics: rebuild the
+        destination from scratch — data AND schema. TRUNCATE preserves
+        the old column list which leaks stale columns and type
+        mismatches across reloads; DROP lets ensure_table recreate
+        with the latest source schema.
+
+        MySQL has no per-column CASCADE on DROP TABLE, but it does
+        permit `SET FOREIGN_KEY_CHECKS = 0` for the duration of the
+        statement, which is the practical equivalent for reload
+        semantics where dropping FK-referenced tables is expected.
+        Defaults to that behaviour; strict mode (cascade=false) leaves
+        FOREIGN_KEY_CHECKS at its session default so the DROP fails
+        loudly when dependents exist.
+
+        Returns ``{success, table, dropped: bool}``. Missing-table is
+        success-no-op for idempotent first-run reloads.
+        """
+        if self._is_oracle_dialect():
+            return self._ora_drop_table(params)
+        if not bool(getattr(self, "supports_ddl", False)):
+            return {"success": False, "error": "DDL helpers not supported by this connector"}
+        params = params or {}
+        config = self._get_config(params)
+        table = str(params.get("table") or "").strip()
+        if not table:
+            return {"success": False, "error": "Missing table"}
+
+        # Resolve (db, name) via the centralized resolver. The orchestrator sends a
+        # BARE table + the per-pipeline destination database as `namespace`; for MySQL
+        # the database is load-bearing, so a bare name would otherwise fall back to
+        # config["database"] (e.g. "pipeline_test") and DROP the wrong DB while the
+        # sink INSERTs into the namespace. Resolver precedence (qualified > namespace
+        # > config) keeps drop and insert in agreement. Mirrors PG drop_table (#175).
+        db, name = self._split_mysql_db_table(config, table, params)
+        if not db or not self._is_safe_ident(db) or not self._is_safe_ident(name):
+            return {"success": False, "error": f"Unsafe or missing database/table identifier: {db}.{name}"}
+
+        cascade = params.get("cascade")
+        if cascade is None:
+            cascade = True  # default: drop through FK constraints
+
+        conn = None
+        cursor = None
+        try:
+            conn = self._get_connection(config)
+            cursor = self._get_cursor(conn, as_dict=True)
+
+            # Reload-mode ownership tracking (connection+namespace model).
+            # Industry-aligned with Fivetran / Airbyte / DMS full-load
+            # semantics, and kept in lockstep with the PostgreSQL connector
+            # (see postgresql/.../connector.py drop_table): a reload targeting
+            # a namespace on THIS connection is authorized to overwrite it
+            # regardless of which pipeline first registered the namespace.
+            #
+            # The PREVIOUS behavior here was a hard refuse-on-mismatch gate
+            # (refused the DROP when _rsync_pipelines showed another
+            # pipeline_id owning this database). That gate misfired on every
+            # reload of a SHARED namespace — pipelines that legitimately share
+            # a database with disjoint table sets each saw the others' ledger
+            # rows and refused, silently dropping data. Collision safety now
+            # lives UPSTREAM at first-run namespace resolution (api-gateway
+            # picks a non-colliding namespace / rsync_ prefix before the run),
+            # so by the time we reach DROP the namespace is ours by
+            # construction. We co-register the reloading pipeline to keep an
+            # accurate owner set, then fall through to DROP.
+            #
+            # MySQL's _rsync_pipelines lives in the target DB itself
+            # (vs. PG's public._rsync_pipelines). Backward-compat: when
+            # pipeline_id isn't passed or the metadata table doesn't exist
+            # yet, skip co-registration and fall through.
+            pipeline_id = (
+                params.get("pipeline_id")
+                or (params.get("config") or {}).get("pipeline_id")
+                or ""
+            )
+            pipeline_id = str(pipeline_id).strip()
+            if pipeline_id and db:
+                try:
+                    cursor.execute(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = %s AND table_name = %s LIMIT 1",
+                        (db, "_rsync_pipelines"),
+                    )
+                    has_meta = cursor.fetchone() is not None
+                except Exception:
+                    has_meta = False
+                if has_meta:
+                    try:
+                        cursor.execute(
+                            f"INSERT IGNORE INTO `{db}`.`_rsync_pipelines` "
+                            f"(pipeline_id, namespace) VALUES (%s, %s)",
+                            (pipeline_id, db),
+                        )
+                        logger.info(
+                            "drop_table: co-registered pipeline=%s namespace=%s "
+                            "table=%s (reload, connection+namespace model)",
+                            pipeline_id, db, name,
+                        )
+                    except Exception as reg_err:
+                        # Non-fatal: ownership tracking is best-effort; the
+                        # DROP below is the load-bearing step.
+                        logger.warning(
+                            "drop_table: co-register failed for pipeline=%s "
+                            "namespace=%s: %s", pipeline_id, db, reg_err,
+                        )
+
+            cursor.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = %s AND table_name = %s LIMIT 1",
+                (db, name),
+            )
+            existed = cursor.fetchone() is not None
+            if not existed:
+                try:
+                    conn.commit()
+                except Exception:
+                    pass
+                return {"success": True, "table": table, "dropped": False, "message": "table does not exist"}
+
+            # MySQL's CASCADE on DROP TABLE isn't a per-column option;
+            # bypass FK checks for the DROP if the caller asked for
+            # cascading semantics, then restore the session default.
+            if cascade:
+                cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+            try:
+                cursor.execute(f"DROP TABLE IF EXISTS `{db}`.`{name}`")
+            finally:
+                if cascade:
+                    try:
+                        cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+                    except Exception:
+                        pass
+
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            return {"success": True, "table": table, "dropped": True}
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            return {"success": False, "error": str(e)}
+        finally:
+            try:
+                if cursor is not None:
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+
+    def ensure_table(self, params: Dict = None) -> Dict[str, Any]:
+        if self._is_oracle_dialect():
+            return self._ora_ensure_table(params)
+        if not bool(getattr(self, "supports_ddl", False)):
+            return {"success": False, "error": "DDL helpers not supported by this connector"}
+        params = params or {}
+        config = self._get_config(params)
+        table = str(params.get("table") or "").strip()
+        if not table:
+            return {"success": False, "error": "Missing table"}
+
+        cols_raw = params.get("columns") or []
+        columns: List[str] = []
+        if isinstance(cols_raw, list):
+            for c in cols_raw:
+                cc = str(c or "").strip()
+                if cc:
+                    columns.append(cc)
+
+        keys_raw = params.get("key_fields") or params.get("keys") or []
+        key_fields: List[str] = []
+        if isinstance(keys_raw, list):
+            for c in keys_raw:
+                cc = str(c or "").strip()
+                if cc:
+                    key_fields.append(cc)
+
+        col_types_raw = params.get("column_types") or {}
+        column_types: Dict[str, str] = {}
+        if isinstance(col_types_raw, dict):
+            for k, v in col_types_raw.items():
+                if k and v:
+                    column_types[str(k)] = str(v)
+
+        # Synthetic-PK fallback (Fivetran-style). When the source didn't
+        # declare PKs, inject ``_rsync_row_hash`` + ``_rsync_synced_at``
+        # and key the unique index on the row hash. Upsert path in
+        # upsert_data computes the hash per row from the source columns
+        # before write. See postgres sink for the matching logic.
+        # Append-only history mode (CDC sink, cdc_write_mode=append): the table is
+        # INSERT-only and stores every change version, so it must have NO PK/unique
+        # index — neither a business key nor a synthetic _rsync_row_hash. The worker
+        # signals this with synthetic_pk=false (+ append_mode=true). An EXPLICIT
+        # synthetic_pk=False (or append_mode=True) is a hard opt-out of the fallback,
+        # even though key_fields is empty.
+        _append_mode = bool(params.get("append_mode"))
+        _synthetic_pk_param = params.get("synthetic_pk")
+        _synthetic_pk_disabled = (_synthetic_pk_param is False) or _append_mode
+        synthetic_pk_requested = (
+            bool(_synthetic_pk_param) or (not key_fields)
+        ) and not _synthetic_pk_disabled
+        synthetic_pk_applied = False
+        if synthetic_pk_requested and not key_fields:
+            if SYNTHETIC_PK_COL not in columns:
+                columns.append(SYNTHETIC_PK_COL)
+            if SYNTHETIC_TS_COL not in columns:
+                columns.append(SYNTHETIC_TS_COL)
+            column_types.setdefault(SYNTHETIC_PK_COL, "string")
+            column_types.setdefault(SYNTHETIC_TS_COL, "timestamp")
+            key_fields = [SYNTHETIC_PK_COL]
+            synthetic_pk_applied = True
+
+        conn = None
+        cursor = None
+        try:
+            conn = self._get_connection(config)
+            # _ensure_table_for_mysql introspects information_schema with
+            # row.get("column_name"), which requires dict-style rows. Opening
+            # the cursor with
+            # as_dict=False raised 'tuple has no attribute get' after CREATE
+            # TABLE succeeded, aborting the operation before the response
+            # returned.
+            cursor = self._get_cursor(conn, as_dict=True)
+            # Use CDC-aware ensure when column_types are provided (called from CDC pipeline setup).
+            # Pass params so the per-pipeline namespace resolves the target database
+            # (table is bare; namespace travels separately from the sink).
+            # Unreachable on this image: ensure_table dispatches to the dialect-
+            # native _*_ensure_table at method entry. CDC-aware creation here
+            # previously routed to the removed _ensure_table_for_cdc; the generic
+            # MySQL creation covers this dead branch.
+            self._ensure_table_for_mysql(cursor, config, table, columns, key_fields, params)
+
+            # Per-pipeline database (namespace) ownership tracking. In
+            # MySQL the namespace = database, so `_rsync_pipelines` lives
+            # in the target database alongside the namespaced tables
+            # (vs. PG which keeps a single public._rsync_pipelines). See
+            # .design/destination-namespace.md. Backward-compat: skip
+            # INSERT when pipeline_id isn't supplied (older orchestrator).
+            try:
+                db, _name = self._split_mysql_db_table(config, table, params)
+                if db and self._is_safe_ident(db):
+                    cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db}`")
+                    cursor.execute(
+                        f"CREATE TABLE IF NOT EXISTS `{db}`.`_rsync_pipelines` ("
+                        f"pipeline_id VARCHAR(64) PRIMARY KEY, "
+                        f"namespace VARCHAR(64) NOT NULL, "
+                        f"created_at DATETIME(6) DEFAULT CURRENT_TIMESTAMP(6), "
+                        f"INDEX idx_namespace (namespace))"
+                    )
+                    pipeline_id = (
+                        params.get("pipeline_id")
+                        or (params.get("config") or {}).get("pipeline_id")
+                        or ""
+                    )
+                    pipeline_id = str(pipeline_id).strip()
+                    if pipeline_id:
+                        cursor.execute(
+                            f"INSERT IGNORE INTO `{db}`.`_rsync_pipelines` "
+                            f"(pipeline_id, namespace) VALUES (%s, %s)",
+                            (pipeline_id, db),
+                        )
+            except Exception:
+                # Non-fatal: ownership tracking is best-effort; the
+                # actual table create above is the load-bearing step.
+                pass
+
+            try:
+                conn.commit()
+            except Exception:
+                pass
+            return {
+                "success": True,
+                "table": table,
+                "synthetic_pk": synthetic_pk_applied,
+                "key_fields": key_fields,
+            }
+        finally:
+            try:
+                if cursor is not None:
+                    cursor.close()
+            except Exception:
+                pass
+            try:
+                if conn is not None:
+                    conn.close()
+            except Exception:
+                pass
+    
+    # =========================================================================
+    # CORE OPERATIONS (Required by BaseMCPConnector)
+    # =========================================================================
+    
+    def get_capabilities(self, params: Dict = None) -> Dict[str, Any]:
+        """Return connector capabilities with method keys for auto-dispatch."""
+        runtime_version = (os.getenv("MCP_CONNECTOR_VERSION") or os.getenv("CONNECTOR_VERSION") or "").strip()
+        if runtime_version and not runtime_version.startswith("v"):
+            runtime_version = f"v{runtime_version}"
+        return {
+            "success": True,
+            "connector_type": self.connector_type,
+            "connector_category": self.connector_category,
+            "connector_version": runtime_version or None,
+            "supports_source": self.supports_source,
+            "supports_destination": self.supports_destination,
+            "supports_cdc": self.supports_cdc,
+            "supports_ddl": bool(getattr(self, "supports_ddl", False)),
+            "auto_create_destination_tables": bool(getattr(self, "auto_create_destination_tables", False)),
+            "driver_pattern": self.driver_pattern.get("module", "generic"),
+            "operations": [
+                {
+                    "name": "test_connection",
+                    "method": "oracle_test_connection",
+                    "type": "core",
+                    "description": "Test connectivity to the data source"
+                },
+                {
+                    "name": "validate_config",
+                    "method": "oracle_validate_config",
+                    "type": "core",
+                    "description": "Validate configuration without connecting"
+                },
+                {
+                    "name": "discover_schema",
+                    "method": "oracle_discover_schema",
+                    "type": "core",
+                    "description": "Discover available tables/collections and their schemas"
+                },
+                {
+                    "name": "get_capabilities",
+                    "method": "oracle_get_capabilities",
+                    "type": "core",
+                    "description": "Return connector capabilities for agent interaction"
+                },
+                {
+                    "name": "export",
+                    "method": "oracle_export",
+                    "type": "source",
+                    "description": "Export data from a table"
+                },
+                {
+                    "name": "import_data",
+                    "method": "oracle_import_data",
+                    "type": "destination",
+                    "description": "Import data into a table"
+                },
+                {
+                    "name": "upsert_data",
+                    "method": "oracle_upsert_data",
+                    "type": "destination",
+                    "description": "Upsert rows (CDC insert/update events)"
+                },
+                {
+                    "name": "delete_data",
+                    "method": "oracle_delete_data",
+                    "type": "destination",
+                    "description": "Delete rows by key fields (CDC delete events)"
+                },
+                {
+                    "name": "get_cdc_offsets",
+                    "method": "oracle_get_cdc_offsets",
+                    "type": "destination",
+                    "description": "Return durable per-partition Kafka high-water offsets for CDC exactly-once recovery"
+                },
+                {
+                    "name": "ensure_schema",
+                    "method": "oracle_ensure_schema",
+                    "type": "destination",
+                    "description": "Ensure database exists (DDL)"
+                },
+                {
+                    "name": "ensure_table",
+                    "method": "oracle_ensure_table",
+                    "type": "destination",
+                    "description": "Ensure destination table exists (DDL)"
+                },
+                {
+                    "name": "drop_table",
+                    "method": "oracle_drop_table",
+                    "type": "destination",
+                    "description": "Drop destination table (used by run_mode=reload to rebuild schema from scratch)"
+                },
+            ],
+            "capabilities": {
+                "max_batch_size": self.max_batch_size,
+                "supported_formats": self.supported_formats,
+                "supports_cdc": self.supports_cdc,
+                "supports_ddl": bool(getattr(self, "supports_ddl", False)),
+                "auto_create_destination_tables": bool(getattr(self, "auto_create_destination_tables", False)),
+            }
+        }
+    
+    def validate_config(self, params: Dict = None):
+        """Validate configuration without connecting."""
+        if not params:
+            return {"valid": False, "errors": ["No configuration provided"]}
+        
+        config = self._get_config(params)
+        errors = []
+        warnings = []
+        
+        # Check required fields
+        if not config.get('host'):
+            errors.append("Missing required field: host")
+        if not config.get('port'):
+            errors.append("Missing required field: port")
+        if not config.get('database'):
+            errors.append("Missing required field: database")
+        if not config.get('user'):
+            errors.append("Missing required field: user")
+        if not config.get('password'):
+            errors.append("Missing required field: password")
+        
+        # Check driver availability
+        if not self.driver_pattern:
+            warnings.append(f"No driver pattern found for {self.connector_type}")
+        
+        return {
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings
+        }
+    
+    def test_connection(self, params: Dict = None):
+        """Test connectivity to database."""
+        config = self._get_config(params)
+        conn = None
+        
+        try:
+            conn = self._get_connection(config)
+            
+            # Validate connection based on type
+            if self.driver_pattern.get("is_nosql"):
+                # NoSQL ping test
+                if hasattr(conn, 'admin'):
+                    conn.admin.command('ping')
+                elif hasattr(conn, 'ping'):
+                    conn.ping()
+            else:
+                # SQL test query
+                cursor = self._get_cursor(conn)
+                cursor.execute("SELECT 1")
+                cursor.fetchone()
+                cursor.close()
+            
+            return {"success": True, "message": "Connection successful"}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    
+    def discover_schema(self, params: Dict = None):
+        """
+        Discover available tables/collections and their schemas (v2).
+        
+        Supports all major SQL databases with optional relationships/indexes for agents.
+        Returns structured warnings for partial failures (no hard errors).
+        """
+        import time
+        from datetime import datetime
+        
+        start_time_ms = int(time.time() * 1000)
+        params = params or {}
+        config = self._get_config(params)
+        conn = None
+        
+        # Extract flags
+        include_columns = bool(params.get("include_columns", True))
+        include_row_counts = bool(params.get("include_row_counts", True))
+        include_relationships = bool(params.get("include_relationships", False))
+        include_indexes = bool(params.get("include_indexes", False))
+        try:
+            max_tables = int(params.get("max_tables", 100))
+        except Exception:
+            max_tables = 100
+        if max_tables <= 0:
+            max_tables = 100
+        
+        # Result envelope
+        result = {
+            "schema_version": "2.0",
+            "discovered_at": datetime.utcnow().isoformat() + "Z",
+            "connector_type": self.connector_type,
+            "connector_version": getattr(self, 'version', '1.0.0'),
+            "database_version": None,
+            "total_tables_available": 0,
+            "total_tables_discovered": 0,
+            "discovery_duration_ms": 0,
+            "overall_status": "success",
+            "warnings_objects": [],
+            "warnings_messages": [],
+            "tables": [],
+        }
+        
+        def add_warning(category: str, severity: str, message: str, table: str = None, subsystem: str = None):
+            """Helper to add structured + legacy warnings"""
+            wo = {"category": category, "severity": severity, "message": message}
+            if table:
+                wo["table"] = table
+            if subsystem:
+                wo["subsystem"] = subsystem
+            result["warnings_objects"].append(wo)
+            result["warnings_messages"].append(message)
+            if severity == "error":
+                result["overall_status"] = "partial_success"
+        
+        try:
+            conn = self._get_connection(config)
+            pattern = self.driver_pattern
+            
+            # NoSQL databases
+            if pattern.get("is_nosql"):
+                return self._discover_nosql_schema(conn, config)
+            
+            # === Get database version (best-effort) ===
+            try:
+                cursor_tmp = self._get_cursor(conn, as_dict=False)
+                if "mysql" in (pattern.get("module") or ""):
+                    cursor_tmp.execute("SELECT VERSION()")
+                    result["database_version"] = "MySQL " + str((cursor_tmp.fetchone() or [""])[0])
+                elif "psycopg2" in (pattern.get("module") or ""):
+                    cursor_tmp.execute("SELECT version()")
+                    ver_str = str((cursor_tmp.fetchone() or [""])[0])
+                    result["database_version"] = ver_str.split(",")[0] if "," in ver_str else ver_str[:50]
+                elif "pyodbc" in (pattern.get("module") or ""):
+                    cursor_tmp.execute("SELECT @@VERSION")
+                    ver_str = str((cursor_tmp.fetchone() or [""])[0])
+                    result["database_version"] = "SQL Server " + ver_str.split("\\n")[0][:50]
+                elif "sqlite" in (pattern.get("module") or ""):
+                    cursor_tmp.execute("SELECT sqlite_version()")
+                    result["database_version"] = "SQLite " + str((cursor_tmp.fetchone() or [""])[0])
+                elif "oracledb" in (pattern.get("module") or ""):
+                    result["database_version"] = f"Oracle {conn.version}"
+                cursor_tmp.close()
+            except Exception as e:
+                add_warning("catalog_missing", "warning", f"Could not retrieve database version: {e}", subsystem="database_version")
+            
+            # === MySQL ===
+            if "mysql" in (pattern.get("module") or ""):
+                return self._discover_mysql_schema_v2(conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning)
+            
+            # === PostgreSQL ===
+            elif "psycopg2" in (pattern.get("module") or ""):
+                return self._discover_postgres_schema_v2(conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning)
+            
+            # === SQL Server ===
+            elif "pyodbc" in (pattern.get("module") or ""):
+                return self._discover_sqlserver_schema_v2(conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning)
+
+            # === SQLite ===
+            elif "sqlite" in (pattern.get("module") or ""):
+                return self._discover_sqlite_schema_v2(conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning)
+
+            # === Oracle ===
+            elif "oracledb" in (pattern.get("module") or ""):
+                return self._discover_oracle_schema_v2(conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning)
+
+            # === Generic fallback (table names only) ===
+            else:
+                add_warning("not_supported", "warning", f"Schema discovery for {pattern.get('module')} uses generic fallback (table names only)", subsystem="tables")
+                cursor = self._get_cursor(conn)
+                list_query = pattern.get("list_tables", "SELECT table_name FROM information_schema.tables")
+                cursor.execute(list_query)
+                tables = []
+                for row in cursor.fetchall():
+                    table_name = row[0] if isinstance(row, tuple) else list(row.values())[0]
+                    tables.append({"name": table_name, "discovery_status": "complete"})
+                cursor.close()
+                result["tables"] = tables[:max_tables]
+                result["total_tables_available"] = len(tables)
+                result["total_tables_discovered"] = len(result["tables"])
+                result["discovery_duration_ms"] = int(time.time() * 1000) - start_time_ms
+                return result
+                
+        except Exception as e:
+            result["overall_status"] = "failed"
+            add_warning("connection_error", "error", f"Schema discovery failed: {str(e)}", subsystem="tables")
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_time_ms
+            return result
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    
+    def _discover_mysql_schema_v2(self, conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning):
+        """MySQL schema discovery v2 using information_schema"""
+        import time
+        start_ms = int(time.time() * 1000)
+        
+        database = config.get("database") or ""
+        if not database:
+            result["overall_status"] = "failed"
+            add_warning("config_missing", "error", "Missing required config: database", subsystem="tables")
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            return result
+        
+        cursor = self._get_cursor(conn, as_dict=True)
+        tables = []
+        
+        try:
+            # Total count
+            cursor.execute(
+                "SELECT COUNT(*) AS cnt FROM information_schema.tables WHERE table_schema = %s AND table_type = 'BASE TABLE'",
+                (database,)
+            )
+            result["total_tables_available"] = int((cursor.fetchone() or {}).get("cnt", 0))
+            
+            # Fetch table list with estimated row counts
+            cursor.execute(
+                "SELECT TABLE_NAME AS name, TABLE_SCHEMA AS schema_name, TABLE_ROWS AS row_estimate "
+                "FROM information_schema.tables "
+                "WHERE table_schema = %s AND table_type = 'BASE TABLE' ORDER BY TABLE_NAME LIMIT %s",
+                (database, max_tables)
+            )
+            table_rows = cursor.fetchall() or []
+            
+            for r in table_rows:
+                name = (r.get("name") if isinstance(r, dict) else None) or ""
+                if not name:
+                    continue
+                
+                obj = {
+                    "name": name,
+                    "schema": (r.get("schema_name") if isinstance(r, dict) else None) or database,
+                    "discovery_status": "complete",
+                }
+                
+                if include_row_counts:
+                    obj["row_count"] = int((r.get("row_estimate") if isinstance(r, dict) else 0) or 0)
+                    obj["is_exact_count"] = False
+                
+                if include_columns:
+                    obj["columns"] = []
+                # primary_keys is always populated — needed for NO_PRIMARY_KEY assessment
+                # and batch executor PK detection regardless of include_relationships flag.
+                obj["primary_keys"] = []
+                if include_relationships:
+                    obj["foreign_keys"] = []
+                if include_indexes:
+                    obj["indexes"] = []
+
+                tables.append(obj)
+
+            table_names = [t["name"] for t in tables]
+
+            # === Columns ===
+            if include_columns and table_names:
+                try:
+                    placeholders = ",".join(["%s"] * len(table_names))
+                    q = (
+                        "SELECT TABLE_NAME AS table_name, COLUMN_NAME AS name, DATA_TYPE AS data_type, IS_NULLABLE AS is_nullable "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = %s AND TABLE_NAME IN (" + placeholders + ") "
+                        "ORDER BY TABLE_NAME, ORDINAL_POSITION"
+                    )
+                    cursor.execute(q, tuple([database] + table_names))
+                    col_rows = cursor.fetchall() or []
+                    
+                    by_name = {t["name"]: t for t in tables}
+                    for cr in col_rows:
+                        if not isinstance(cr, dict):
+                            continue
+                        tname = cr.get("table_name")
+                        if not tname or tname not in by_name:
+                            continue
+                        raw_dt = cr.get("data_type") or ""
+                        col_obj = {
+                            "name": cr.get("name") or "",
+                            # Canonical type for the generic pipeline;
+                            # keep dialect string for debugging / UI.
+                            "type": _canonical_mysql_type(raw_dt),
+                            "source_type": raw_dt,
+                            "nullable": str(cr.get("is_nullable") or "").upper() == "YES",
+                        }
+                        if include_relationships:
+                            col_obj["is_primary_key"] = False
+                            col_obj["is_foreign_key"] = False
+                        if include_indexes:
+                            col_obj["is_indexed"] = False
+                        by_name[tname]["columns"].append(col_obj)
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve columns: {e}", subsystem="columns")
+                    for t in tables:
+                        t["discovery_status"] = "partial"
+                        t["discovery_error"] = f"Columns: {e}"
+
+            # === Primary Keys ===
+            # Always fetch PKs regardless of include_relationships flag — needed for
+            # NO_PRIMARY_KEY assessment and batch executor PK detection.
+            if table_names:
+                try:
+                    placeholders = ",".join(["%s"] * len(table_names))
+                    q = (
+                        "SELECT tc.TABLE_NAME AS table_name, kcu.COLUMN_NAME AS column_name "
+                        "FROM information_schema.table_constraints tc "
+                        # IMPORTANT: In MySQL, PRIMARY KEY constraint_name is often just 'PRIMARY' for ALL tables.
+                        # Joining only on (constraint_name, schema) causes a cross-product across tables and corrupts
+                        # primary_keys (mixing PK columns from other tables). Always join on TABLE_NAME too.
+                        "JOIN information_schema.key_column_usage kcu ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA AND tc.TABLE_NAME = kcu.TABLE_NAME "
+                        # Exclude INVISIBLE key columns. MySQL 8.0.30+ with
+                        # sql_generate_invisible_primary_key=ON (default on Azure MySQL Flexible Server)
+                        # auto-creates an INVISIBLE primary key (my_row_id). Invisible columns are
+                        # excluded from SELECT * and never propagate to the destination, so reporting
+                        # them as a PK makes the table look keyed when it isn't, producing silent row
+                        # drops at the sink. Filtering them out makes the table honestly report as
+                        # keyless, routing it to the sink's content-hash surrogate key path.
+                        # NOTE: '%%' escapes the literal '%' for the driver's %s param substitution.
+                        "JOIN information_schema.columns col ON col.TABLE_SCHEMA = kcu.TABLE_SCHEMA AND col.TABLE_NAME = kcu.TABLE_NAME AND col.COLUMN_NAME = kcu.COLUMN_NAME "
+                        "WHERE tc.TABLE_SCHEMA = %s AND tc.CONSTRAINT_TYPE = 'PRIMARY KEY' AND tc.TABLE_NAME IN (" + placeholders + ") "
+                        "AND col.EXTRA NOT LIKE '%%INVISIBLE%%' "
+                        "ORDER BY tc.TABLE_NAME, kcu.ORDINAL_POSITION"
+                    )
+                    cursor.execute(q, tuple([database] + table_names))
+                    pk_rows = cursor.fetchall() or []
+                    
+                    by_name = {t["name"]: t for t in tables}
+                    for pkr in pk_rows:
+                        if not isinstance(pkr, dict):
+                            continue
+                        tname = pkr.get("table_name")
+                        colname = pkr.get("column_name")
+                        if not tname or not colname or tname not in by_name:
+                            continue
+                        by_name[tname]["primary_keys"].append(colname)
+                        # Mark column as PK
+                        for c in by_name[tname].get("columns", []):
+                            if c.get("name") == colname:
+                                c["is_primary_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve primary keys: {e}", subsystem="relationships")
+            
+            # === Foreign Keys ===
+            if include_relationships and table_names:
+                try:
+                    placeholders = ",".join(["%s"] * len(table_names))
+                    q = (
+                        "SELECT kcu.TABLE_NAME AS table_name, kcu.COLUMN_NAME AS column_name, "
+                        "kcu.REFERENCED_TABLE_NAME AS ref_table, kcu.REFERENCED_COLUMN_NAME AS ref_column, "
+                        "rc.CONSTRAINT_NAME AS constraint_name, rc.UPDATE_RULE, rc.DELETE_RULE "
+                        "FROM information_schema.key_column_usage kcu "
+                        "JOIN information_schema.referential_constraints rc ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME AND kcu.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA "
+                        "WHERE kcu.TABLE_SCHEMA = %s AND kcu.REFERENCED_TABLE_NAME IS NOT NULL AND kcu.TABLE_NAME IN (" + placeholders + ") "
+                        "ORDER BY kcu.TABLE_NAME, kcu.ORDINAL_POSITION"
+                    )
+                    cursor.execute(q, tuple([database] + table_names))
+                    fk_rows = cursor.fetchall() or []
+                    
+                    by_name = {t["name"]: t for t in tables}
+                    for fkr in fk_rows:
+                        if not isinstance(fkr, dict):
+                            continue
+                        tname = fkr.get("table_name")
+                        colname = fkr.get("column_name")
+                        if not tname or not colname or tname not in by_name:
+                            continue
+                        fk_obj = {
+                            "column": colname,
+                            "references_table": fkr.get("ref_table") or "",
+                            "references_column": fkr.get("ref_column") or "",
+                            "constraint_name": fkr.get("constraint_name") or "",
+                            "on_delete": fkr.get("DELETE_RULE") or "NO ACTION",
+                            "on_update": fkr.get("UPDATE_RULE") or "NO ACTION",
+                        }
+                        by_name[tname]["foreign_keys"].append(fk_obj)
+                        # Mark column as FK
+                        for c in by_name[tname].get("columns", []):
+                            if c.get("name") == colname:
+                                c["is_foreign_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve foreign keys: {e}", subsystem="relationships")
+            
+            # === Indexes ===
+            if include_indexes and table_names:
+                try:
+                    placeholders = ",".join(["%s"] * len(table_names))
+                    q = (
+                        "SELECT TABLE_NAME AS table_name, INDEX_NAME AS index_name, COLUMN_NAME AS column_name, "
+                        "NON_UNIQUE, SEQ_IN_INDEX, INDEX_TYPE "
+                        "FROM information_schema.statistics "
+                        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME IN (" + placeholders + ") "
+                        "ORDER BY TABLE_NAME, INDEX_NAME, SEQ_IN_INDEX"
+                    )
+                    cursor.execute(q, tuple([database] + table_names))
+                    idx_rows = cursor.fetchall() or []
+                    
+                    by_name = {t["name"]: t for t in tables}
+                    idx_map = {}
+                    for ir in idx_rows:
+                        if not isinstance(ir, dict):
+                            continue
+                        tname = ir.get("table_name")
+                        idx_name = ir.get("index_name")
+                        colname = ir.get("column_name")
+                        if not tname or not idx_name or not colname or tname not in by_name:
+                            continue
+                        key = (tname, idx_name)
+                        if key not in idx_map:
+                            idx_map[key] = {
+                                "name": idx_name,
+                                "columns": [],
+                                "unique": int(ir.get("NON_UNIQUE", 1)) == 0,
+                                "type": (ir.get("INDEX_TYPE") or "BTREE").lower(),
+                                "is_primary": idx_name == "PRIMARY",
+                            }
+                        idx_map[key]["columns"].append(colname)
+                    
+                    for (tname, idx_name), idx_obj in idx_map.items():
+                        by_name[tname]["indexes"].append(idx_obj)
+                        # Mark columns as indexed
+                        for colname in idx_obj["columns"]:
+                            for c in by_name[tname].get("columns", []):
+                                if c.get("name") == colname:
+                                    c["is_indexed"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve indexes: {e}", subsystem="indexes")
+            
+            result["tables"] = tables
+            result["total_tables_discovered"] = len(tables)
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+            
+        except Exception as e:
+            result["overall_status"] = "failed"
+            add_warning("catalog_error", "error", f"MySQL discovery failed: {e}", subsystem="tables")
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+    
+    def _discover_postgres_schema_v2(self, conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning):
+        """PostgreSQL schema discovery v2 using pg_catalog"""
+        import time
+        start_ms = int(time.time() * 1000)
+        
+        schema = config.get("schema", "public")
+        database = config.get("database", "")
+        
+        cursor = self._get_cursor(conn, as_dict=False)
+        tables = []
+        
+        try:
+            # Total count
+            cursor.execute(
+                "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = %s AND table_type = 'BASE TABLE'",
+                (schema,)
+            )
+            result["total_tables_available"] = int((cursor.fetchone() or [0])[0])
+            
+            # Fetch table list with estimated row counts (using pg_class.reltuples)
+            cursor.execute(
+                "SELECT tablename, %s as schema_name, c.reltuples::bigint AS row_estimate "
+                "FROM pg_tables pt "
+                "LEFT JOIN pg_class c ON c.relname = pt.tablename "
+                "WHERE pt.schemaname = %s "
+                "ORDER BY pt.tablename LIMIT %s",
+                (schema, schema, max_tables)
+            )
+            table_rows = cursor.fetchall() or []
+            
+            for r in table_rows:
+                name = r[0] if len(r) > 0 else ""
+                if not name:
+                    continue
+                
+                obj = {
+                    "name": name,
+                    "schema": schema,
+                    "discovery_status": "complete",
+                }
+                
+                if include_row_counts:
+                    obj["row_count"] = int(r[2]) if len(r) > 2 and r[2] is not None else 0
+                    obj["is_exact_count"] = False
+                
+                if include_columns:
+                    obj["columns"] = []
+                if include_relationships:
+                    obj["primary_keys"] = []
+                    obj["foreign_keys"] = []
+                if include_indexes:
+                    obj["indexes"] = []
+                
+                tables.append(obj)
+            
+            table_names = [t["name"] for t in tables]
+            
+            # === Columns ===
+            if include_columns and table_names:
+                try:
+                    placeholders = ",".join(["%s"] * len(table_names))
+                    q = (
+                        "SELECT table_name, column_name, data_type, is_nullable "
+                        "FROM information_schema.columns "
+                        "WHERE table_schema = %s AND table_name IN (" + placeholders + ") "
+                        "ORDER BY table_name, ordinal_position"
+                    )
+                    cursor.execute(q, tuple([schema] + table_names))
+                    col_rows = cursor.fetchall() or []
+                    
+                    by_name = {t["name"]: t for t in tables}
+                    for cr in col_rows:
+                        tname = cr[0]
+                        if not tname or tname not in by_name:
+                            continue
+                        col_obj = {
+                            "name": cr[1],
+                            "type": cr[2],
+                            "nullable": cr[3].upper() == "YES",
+                        }
+                        if include_relationships:
+                            col_obj["is_primary_key"] = False
+                            col_obj["is_foreign_key"] = False
+                        if include_indexes:
+                            col_obj["is_indexed"] = False
+                        by_name[tname]["columns"].append(col_obj)
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve columns: {e}", subsystem="columns")
+                    for t in tables:
+                        t["discovery_status"] = "partial"
+                        t["discovery_error"] = f"Columns: {e}"
+            
+            # === Primary Keys ===
+            if include_relationships and table_names:
+                try:
+                    placeholders = ",".join(["%s"] * len(table_names))
+                    q = (
+                        "SELECT tc.table_name, kcu.column_name "
+                        "FROM information_schema.table_constraints tc "
+                        "JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+                        "WHERE tc.table_schema = %s AND tc.constraint_type = 'PRIMARY KEY' AND tc.table_name IN (" + placeholders + ") "
+                        "ORDER BY tc.table_name, kcu.ordinal_position"
+                    )
+                    cursor.execute(q, tuple([schema] + table_names))
+                    pk_rows = cursor.fetchall() or []
+                    
+                    by_name = {t["name"]: t for t in tables}
+                    for pkr in pk_rows:
+                        tname = pkr[0]
+                        colname = pkr[1]
+                        if not tname or not colname or tname not in by_name:
+                            continue
+                        by_name[tname]["primary_keys"].append(colname)
+                        # Mark column as PK
+                        for c in by_name[tname].get("columns", []):
+                            if c.get("name") == colname:
+                                c["is_primary_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve primary keys: {e}", subsystem="relationships")
+            
+            # === Foreign Keys ===
+            if include_relationships and table_names:
+                try:
+                    placeholders = ",".join(["%s"] * len(table_names))
+                    q = (
+                        "SELECT tc.table_name, kcu.column_name, ccu.table_name AS ref_table, ccu.column_name AS ref_column, tc.constraint_name, "
+                        "rc.update_rule, rc.delete_rule "
+                        "FROM information_schema.table_constraints tc "
+                        "JOIN information_schema.key_column_usage kcu ON tc.constraint_name = kcu.constraint_name AND tc.table_schema = kcu.table_schema "
+                        "JOIN information_schema.constraint_column_usage ccu ON tc.constraint_name = ccu.constraint_name AND tc.table_schema = ccu.table_schema "
+                        "JOIN information_schema.referential_constraints rc ON tc.constraint_name = rc.constraint_name AND tc.table_schema = rc.constraint_schema "
+                        "WHERE tc.table_schema = %s AND tc.constraint_type = 'FOREIGN KEY' AND tc.table_name IN (" + placeholders + ") "
+                        "ORDER BY tc.table_name, kcu.ordinal_position"
+                    )
+                    cursor.execute(q, tuple([schema] + table_names))
+                    fk_rows = cursor.fetchall() or []
+                    
+                    by_name = {t["name"]: t for t in tables}
+                    for fkr in fk_rows:
+                        tname = fkr[0]
+                        colname = fkr[1]
+                        if not tname or not colname or tname not in by_name:
+                            continue
+                        fk_obj = {
+                            "column": colname,
+                            "references_table": fkr[2] or "",
+                            "references_column": fkr[3] or "",
+                            "constraint_name": fkr[4] or "",
+                            "on_update": fkr[5] or "NO ACTION",
+                            "on_delete": fkr[6] or "NO ACTION",
+                        }
+                        by_name[tname]["foreign_keys"].append(fk_obj)
+                        # Mark column as FK
+                        for c in by_name[tname].get("columns", []):
+                            if c.get("name") == colname:
+                                c["is_foreign_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve foreign keys: {e}", subsystem="relationships")
+            
+            # === Indexes ===
+            if include_indexes and table_names:
+                try:
+                    placeholders = ",".join(["%s"] * len(table_names))
+                    q = (
+                        "SELECT tablename AS table_name, indexname AS index_name, indexdef "
+                        "FROM pg_indexes "
+                        "WHERE schemaname = %s AND tablename IN (" + placeholders + ") "
+                        "ORDER BY tablename, indexname"
+                    )
+                    cursor.execute(q, tuple([schema] + table_names))
+                    idx_rows = cursor.fetchall() or []
+                    
+                    by_name = {t["name"]: t for t in tables}
+                    for ir in idx_rows:
+                        tname = ir[0]
+                        idx_name = ir[1]
+                        idx_def = ir[2] or ""
+                        if not tname or not idx_name or tname not in by_name:
+                            continue
+                        
+                        # Parse column names from indexdef (basic parsing)
+                        cols = []
+                        if "(" in idx_def and ")" in idx_def:
+                            col_part = idx_def[idx_def.index("(")+1:idx_def.rindex(")")]
+                            cols = [c.strip() for c in col_part.split(",")]
+                        
+                        idx_obj = {
+                            "name": idx_name,
+                            "columns": cols,
+                            "unique": "UNIQUE" in idx_def.upper(),
+                            "type": "btree" if "USING btree" in idx_def else ("gin" if "USING gin" in idx_def else "btree"),
+                            "is_primary": "_pkey" in idx_name,
+                        }
+                        by_name[tname]["indexes"].append(idx_obj)
+                        # Mark columns as indexed
+                        for colname in cols:
+                            for c in by_name[tname].get("columns", []):
+                                if c.get("name") == colname:
+                                    c["is_indexed"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve indexes: {e}", subsystem="indexes")
+            
+            result["tables"] = tables
+            result["total_tables_discovered"] = len(tables)
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+            
+        except Exception as e:
+            result["overall_status"] = "failed"
+            add_warning("catalog_error", "error", f"PostgreSQL discovery failed: {e}", subsystem="tables")
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+
+    def _discover_sqlserver_schema_v2(self, conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning):
+        """SQL Server schema discovery v2 using sys catalogs"""
+        import time
+        start_ms = int(time.time() * 1000)
+
+        schema = config.get("schema", "dbo")
+        cursor = self._get_cursor(conn, as_dict=False)
+        tables = []
+
+        try:
+            # Total count
+            cursor.execute(
+                "SELECT COUNT(*) FROM sys.tables t JOIN sys.schemas s ON t.schema_id = s.schema_id WHERE s.name = ?",
+                (schema,),
+            )
+            result["total_tables_available"] = int((cursor.fetchone() or [0])[0])
+
+            # Table list + estimated row counts from sys.partitions (heap/clustered)
+            cursor.execute(
+                "SELECT t.name AS table_name, "
+                "SUM(CASE WHEN p.index_id IN (0,1) THEN p.rows ELSE 0 END) AS row_estimate "
+                "FROM sys.tables t "
+                "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                "LEFT JOIN sys.partitions p ON p.object_id = t.object_id "
+                "WHERE s.name = ? "
+                "GROUP BY t.name "
+                "ORDER BY t.name "
+                "OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY",
+                (schema, max_tables),
+            )
+            table_rows = cursor.fetchall() or []
+
+            for r in table_rows:
+                name = r[0]
+                obj = {"name": name, "schema": schema, "discovery_status": "complete"}
+                if include_row_counts:
+                    obj["row_count"] = int(r[1] or 0)
+                    obj["is_exact_count"] = False
+                if include_columns:
+                    obj["columns"] = []
+                if include_relationships:
+                    obj["primary_keys"] = []
+                    obj["foreign_keys"] = []
+                if include_indexes:
+                    obj["indexes"] = []
+                tables.append(obj)
+
+            table_names = [t["name"] for t in tables]
+
+            # Columns
+            if include_columns and table_names:
+                try:
+                    by_name = {t["name"]: t for t in tables}
+                    for tname in table_names:
+                        cursor.execute(
+                            "SELECT c.name, ty.name AS data_type, c.is_nullable "
+                            "FROM sys.columns c "
+                            "JOIN sys.types ty ON c.user_type_id = ty.user_type_id "
+                            "JOIN sys.tables t ON c.object_id = t.object_id "
+                            "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                            "WHERE s.name = ? AND t.name = ? "
+                            "ORDER BY c.column_id",
+                            (schema, tname),
+                        )
+                        rows = cursor.fetchall() or []
+                        for cr in rows:
+                            col_obj = {"name": cr[0], "type": cr[1], "nullable": bool(cr[2])}
+                            if include_relationships:
+                                col_obj["is_primary_key"] = False
+                                col_obj["is_foreign_key"] = False
+                            if include_indexes:
+                                col_obj["is_indexed"] = False
+                            by_name[tname]["columns"].append(col_obj)
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve columns: {e}", subsystem="columns")
+                    for t in tables:
+                        t["discovery_status"] = "partial"
+                        t["discovery_error"] = f"Columns: {e}"
+
+            # Relationships (PK/FK)
+            if include_relationships and table_names:
+                by_name = {t["name"]: t for t in tables}
+                # PK columns
+                try:
+                    for tname in table_names:
+                        cursor.execute(
+                            "SELECT c.name "
+                            "FROM sys.key_constraints kc "
+                            "JOIN sys.index_columns ic ON kc.parent_object_id = ic.object_id AND kc.unique_index_id = ic.index_id "
+                            "JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id "
+                            "JOIN sys.tables t ON kc.parent_object_id = t.object_id "
+                            "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                            "WHERE kc.type = 'PK' AND s.name = ? AND t.name = ? "
+                            "ORDER BY ic.key_ordinal",
+                            (schema, tname),
+                        )
+                        pk_cols = [row[0] for row in (cursor.fetchall() or [])]
+                        by_name[tname]["primary_keys"] = pk_cols
+                        for c in by_name[tname].get("columns", []):
+                            if c.get("name") in pk_cols:
+                                c["is_primary_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve primary keys: {e}", subsystem="relationships")
+
+                # FK columns
+                try:
+                    for tname in table_names:
+                        cursor.execute(
+                            "SELECT "
+                            "pc.name AS column_name, "
+                            "rt.name AS ref_table, "
+                            "rc.name AS ref_column, "
+                            "fk.name AS constraint_name, "
+                            "fk.delete_referential_action_desc AS on_delete, "
+                            "fk.update_referential_action_desc AS on_update "
+                            "FROM sys.foreign_keys fk "
+                            "JOIN sys.foreign_key_columns fkc ON fk.object_id = fkc.constraint_object_id "
+                            "JOIN sys.tables pt ON fkc.parent_object_id = pt.object_id "
+                            "JOIN sys.schemas ps ON pt.schema_id = ps.schema_id "
+                            "JOIN sys.columns pc ON fkc.parent_object_id = pc.object_id AND fkc.parent_column_id = pc.column_id "
+                            "JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id "
+                            "JOIN sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id "
+                            "WHERE ps.name = ? AND pt.name = ? "
+                            "ORDER BY fk.name",
+                            (schema, tname),
+                        )
+                        fk_rows = cursor.fetchall() or []
+                        for fr in fk_rows:
+                            fk_obj = {
+                                "column": fr[0],
+                                "references_table": fr[1],
+                                "references_column": fr[2],
+                                "constraint_name": fr[3] or "",
+                                "on_delete": fr[4] or "NO ACTION",
+                                "on_update": fr[5] or "NO ACTION",
+                            }
+                            by_name[tname]["foreign_keys"].append(fk_obj)
+                            for c in by_name[tname].get("columns", []):
+                                if c.get("name") == fr[0]:
+                                    c["is_foreign_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve foreign keys: {e}", subsystem="relationships")
+
+            # Indexes
+            if include_indexes and table_names:
+                by_name = {t["name"]: t for t in tables}
+                try:
+                    for tname in table_names:
+                        cursor.execute(
+                            "SELECT i.name, i.is_unique, i.type_desc, i.is_primary_key "
+                            "FROM sys.indexes i "
+                            "JOIN sys.tables t ON i.object_id = t.object_id "
+                            "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                            "WHERE s.name = ? AND t.name = ? AND i.name IS NOT NULL "
+                            "ORDER BY i.name",
+                            (schema, tname),
+                        )
+                        idx_rows = cursor.fetchall() or []
+                        for ir in idx_rows:
+                            idx_name = ir[0]
+                            cursor.execute(
+                                "SELECT c.name "
+                                "FROM sys.index_columns ic "
+                                "JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id "
+                                "JOIN sys.tables t ON ic.object_id = t.object_id "
+                                "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                                "WHERE s.name = ? AND t.name = ? AND ic.index_id = (SELECT index_id FROM sys.indexes WHERE object_id=t.object_id AND name=?) "
+                                "ORDER BY ic.key_ordinal",
+                                (schema, tname, idx_name),
+                            )
+                            cols = [row[0] for row in (cursor.fetchall() or [])]
+                            idx_obj = {
+                                "name": idx_name,
+                                "columns": cols,
+                                "unique": bool(ir[1]),
+                                "type": (ir[2] or "").lower(),
+                                "is_primary": bool(ir[3]),
+                            }
+                            by_name[tname]["indexes"].append(idx_obj)
+                            for colname in cols:
+                                for c in by_name[tname].get("columns", []):
+                                    if c.get("name") == colname:
+                                        c["is_indexed"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve indexes: {e}", subsystem="indexes")
+
+            result["tables"] = tables
+            result["total_tables_discovered"] = len(tables)
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+        except Exception as e:
+            result["overall_status"] = "failed"
+            add_warning("catalog_error", "error", f"SQL Server discovery failed: {e}", subsystem="tables")
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+
+    def _discover_sqlite_schema_v2(self, conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning):
+        """SQLite schema discovery v2 using sqlite_master and PRAGMA"""
+        import time
+        start_ms = int(time.time() * 1000)
+
+        cursor = self._get_cursor(conn, as_dict=False)
+        tables = []
+
+        try:
+            # Total count
+            cursor.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+            result["total_tables_available"] = int((cursor.fetchone() or [0])[0])
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?", (max_tables,))
+            table_rows = cursor.fetchall() or []
+
+            for r in table_rows:
+                name = r[0]
+                obj = {"name": name, "schema": "", "discovery_status": "complete"}
+                if include_row_counts:
+                    obj["row_count"] = None
+                    obj["is_exact_count"] = False
+                if include_columns:
+                    obj["columns"] = []
+                if include_relationships:
+                    obj["primary_keys"] = []
+                    obj["foreign_keys"] = []
+                if include_indexes:
+                    obj["indexes"] = []
+                tables.append(obj)
+
+            by_name = {t["name"]: t for t in tables}
+
+            # Columns + PK info
+            if include_columns:
+                try:
+                    for t in tables:
+                        tname = t["name"]
+                        cursor.execute(f"PRAGMA table_info('{tname}')")
+                        col_rows = cursor.fetchall() or []
+                        for cr in col_rows:
+                            # pragma: cid, name, type, notnull, dflt_value, pk
+                            nullable = (cr[3] == 0)
+                            col_obj = {"name": cr[1], "type": cr[2], "nullable": bool(nullable)}
+                            if include_relationships:
+                                col_obj["is_primary_key"] = bool(cr[5])
+                                col_obj["is_foreign_key"] = False
+                            if include_indexes:
+                                col_obj["is_indexed"] = False
+                            by_name[tname]["columns"].append(col_obj)
+                            if include_relationships and cr[5]:
+                                by_name[tname]["primary_keys"].append(cr[1])
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve columns: {e}", subsystem="columns")
+                    for t in tables:
+                        t["discovery_status"] = "partial"
+                        t["discovery_error"] = f"Columns: {e}"
+
+            # Foreign keys
+            if include_relationships:
+                try:
+                    for t in tables:
+                        tname = t["name"]
+                        cursor.execute(f"PRAGMA foreign_key_list('{tname}')")
+                        fk_rows = cursor.fetchall() or []
+                        for fr in fk_rows:
+                            # id, seq, table, from, to, on_update, on_delete, match
+                            fk_obj = {
+                                "column": fr[3],
+                                "references_table": fr[2],
+                                "references_column": fr[4],
+                                "constraint_name": "",
+                                "on_delete": fr[6] or "NO ACTION",
+                                "on_update": fr[5] or "NO ACTION",
+                            }
+                            by_name[tname]["foreign_keys"].append(fk_obj)
+                            for c in by_name[tname].get("columns", []):
+                                if c.get("name") == fr[3]:
+                                    c["is_foreign_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve foreign keys: {e}", subsystem="relationships")
+
+            # Indexes
+            if include_indexes:
+                try:
+                    for t in tables:
+                        tname = t["name"]
+                        cursor.execute(f"PRAGMA index_list('{tname}')")
+                        idx_rows = cursor.fetchall() or []
+                        for ir in idx_rows:
+                            # seq, name, unique, origin, partial
+                            idx_name = ir[1]
+                            cursor.execute(f"PRAGMA index_info('{idx_name}')")
+                            cols = [row[2] for row in (cursor.fetchall() or [])]  # cid, seqno, name
+                            idx_obj = {
+                                "name": idx_name,
+                                "columns": cols,
+                                "unique": bool(ir[2]),
+                                "type": "btree",
+                                "is_primary": (ir[3] == "pk"),
+                            }
+                            by_name[tname]["indexes"].append(idx_obj)
+                            for colname in cols:
+                                for c in by_name[tname].get("columns", []):
+                                    if c.get("name") == colname:
+                                        c["is_indexed"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve indexes: {e}", subsystem="indexes")
+
+            result["tables"] = tables
+            result["total_tables_discovered"] = len(tables)
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+        except Exception as e:
+            result["overall_status"] = "failed"
+            add_warning("catalog_error", "error", f"SQLite discovery failed: {e}", subsystem="tables")
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+
+    def _discover_oracle_schema_v2(self, conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning):
+        """Oracle schema discovery v2 across schemas/owners using all_* catalogs.
+
+        The old implementation queried the ``user_*`` data-dictionary views,
+        which expose ONLY the connecting login user's own objects. A source
+        table owned by any other schema was therefore never enumerated, so no
+        column types or primary keys were threaded to the destination -> every
+        destination fell back to all-String columns + a synthetic
+        ``_rsync_row_hash`` PK, and the per-table ``schema`` field was emitted
+        as "". This now reads the ``all_*`` views (every object the connection
+        can see): when no explicit ``owner``/``schema`` is configured it
+        enumerates every non-system owner and keys columns/PKs/FKs/indexes by
+        ``(owner, table)``; an explicit ``owner``/``schema`` still pins
+        discovery to that one schema (back-compat + noise control). The real
+        owner is populated into each table's ``schema`` field.
+        """
+        import time
+        start_ms = int(time.time() * 1000)
+
+        # Oracle folds unquoted identifiers to upper case and the data
+        # dictionary stores owners upper-cased, so an explicit owner/schema is
+        # upper-cased before matching (`schema=hr` -> owner `HR`).
+        explicit_owner = str(config.get("owner") or config.get("schema") or "").strip()
+        explicit_owner = explicit_owner.upper() if explicit_owner else ""
+
+        # Oracle-maintained / internal owners we never surface as user data.
+        # Under-filtering is safe (the user still picks the tables to sync);
+        # over-filtering would hide a real schema, so this list stays
+        # conservative + explicit and matches on exact name or a known prefix.
+        system_owners = frozenset({
+            "SYS", "SYSTEM", "XDB", "OUTLN", "DBSNMP", "APPQOSSYS",
+            "GSMADMIN_INTERNAL", "GSMCATUSER", "GSMUSER", "GSMROOTUSER",
+            "CTXSYS", "MDSYS", "MDDATA", "ORDSYS", "ORDDATA", "ORDPLUGINS",
+            "OLAPSYS", "WMSYS", "EXFSYS", "AUDSYS", "LBACSYS", "DVSYS", "DVF",
+            "DBSFWUSER", "GGSYS", "ANONYMOUS", "REMOTE_SCHEDULER_AGENT",
+            "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC", "SYS$UMF", "OJVMSYS",
+            "SI_INFORMTN_SCHEMA", "SPATIAL_CSW_ADMIN_USR",
+            "SPATIAL_WFS_ADMIN_USR", "FLOWS_FILES", "APEX_PUBLIC_USER",
+            "ORACLE_OCM", "XS$NULL", "PDBADMIN", "DGPDB_INT", "DIP",
+            "VECSYS", "GGSHAREDCAP",
+        })
+
+        def _is_system_owner(o):
+            ou = str(o).upper()
+            return (ou in system_owners
+                    or ou.startswith("APEX_")
+                    or ou.startswith("FLOWS_")
+                    or ou.startswith("SYS$"))
+
+        def _q(ident):
+            # Double-quote an Oracle identifier ( " -> "" ), preserving case.
+            return '"' + str(ident).replace('"', '""') + '"'
+
+        def _in_binds(vals, start):
+            # Build an Oracle positional-bind IN list ( :start .. ) plus the
+            # next free 1-based bind index.
+            ph = ",".join(":%d" % (start + i) for i in range(len(vals)))
+            return ph, start + len(vals)
+
+        cursor = self._get_cursor(conn, as_dict=False)
+        tables = []
+
+        try:
+            # Resolve the owner(s) to scan.
+            if explicit_owner:
+                owners = [explicit_owner]
+            else:
+                # Prefer the Oracle-sanctioned all_users.oracle_maintained flag
+                # (present since 12.1): it excludes EVERY Oracle-internal schema,
+                # including ones no static list would know (e.g. 23ai's VECSYS /
+                # GGSHAREDCAP). The explicit denylist below is a belt-and-braces
+                # secondary filter and the fallback for older Oracle that lacks
+                # the column.
+                owners = []
+                try:
+                    cursor.execute(
+                        "SELECT DISTINCT t.owner FROM all_tables t "
+                        "JOIN all_users u ON u.username = t.owner "
+                        "WHERE u.oracle_maintained = 'N' ORDER BY t.owner"
+                    )
+                    owners = [
+                        row[0] for row in (cursor.fetchall() or [])
+                        if row and row[0] and not _is_system_owner(row[0])
+                    ]
+                except Exception:
+                    owners = []
+                if not owners:
+                    # oracle_maintained unavailable / nothing matched -> plain
+                    # owner scan filtered by the explicit system-owner denylist.
+                    try:
+                        cursor.execute("SELECT DISTINCT owner FROM all_tables ORDER BY owner")
+                        owners = [
+                            row[0] for row in (cursor.fetchall() or [])
+                            if row and row[0] and not _is_system_owner(row[0])
+                        ]
+                    except Exception:
+                        owners = []
+                if not owners:
+                    # Last resort: the connection's current schema, so a normal
+                    # single-schema login never regresses to zero tables.
+                    try:
+                        cursor.execute("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")
+                        cur_schema = (cursor.fetchone() or [None])[0]
+                        owners = [cur_schema] if cur_schema else []
+                    except Exception:
+                        owners = []
+
+            if not owners:
+                result["tables"] = []
+                result["total_tables_available"] = 0
+                result["total_tables_discovered"] = 0
+                result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+                cursor.close()
+                return result
+
+            # Total available across the target owners.
+            owner_ph, _ = _in_binds(owners, 1)
+            cursor.execute(
+                "SELECT COUNT(*) FROM all_tables WHERE owner IN (%s)" % owner_ph,
+                tuple(owners),
+            )
+            result["total_tables_available"] = int((cursor.fetchone() or [0])[0])
+
+            # Table list across owners, capped at max_tables (deterministic order).
+            owner_ph, nxt = _in_binds(owners, 1)
+            cursor.execute(
+                "SELECT owner, table_name, num_rows FROM all_tables "
+                "WHERE owner IN (%s) ORDER BY owner, table_name "
+                "FETCH FIRST :%d ROWS ONLY" % (owner_ph, nxt),
+                tuple(owners) + (max_tables,),
+            )
+            table_rows = cursor.fetchall() or []
+
+            for r in table_rows:
+                owner = r[0]
+                name = r[1] if len(r) > 1 else None
+                num_rows = r[2] if len(r) > 2 else None
+                if not name:
+                    continue
+                obj = {"name": name, "schema": owner, "discovery_status": "complete"}
+                if include_row_counts:
+                    if num_rows is not None:
+                        obj["row_count"] = int(num_rows)
+                        obj["is_exact_count"] = False
+                    else:
+                        # No optimizer stats: bounded ROWNUM count on the
+                        # owner-qualified table (<= 10000 -> exact, else omit).
+                        try:
+                            cursor.execute(
+                                "SELECT COUNT(*) FROM (SELECT 1 FROM %s.%s WHERE ROWNUM <= 10001)"
+                                % (_q(owner), _q(name))
+                            )
+                            c = int((cursor.fetchone() or [0])[0])
+                            if c <= 10000:
+                                obj["row_count"] = c
+                                obj["is_exact_count"] = True
+                            else:
+                                obj["row_count"] = None
+                                obj["is_exact_count"] = False
+                        except Exception as e:
+                            add_warning("catalog_error", "warning", f"Could not estimate/count rows for {owner}.{name}: {e}", table=name, subsystem="row_counts")
+                            obj["row_count"] = None
+                            obj["is_exact_count"] = False
+                if include_columns:
+                    obj["columns"] = []
+                if include_relationships:
+                    obj["primary_keys"] = []
+                    obj["foreign_keys"] = []
+                if include_indexes:
+                    obj["indexes"] = []
+                tables.append(obj)
+
+            # Lookups keyed by (owner, table) so same-named tables in different
+            # schemas never cross-assign columns/keys/indexes.
+            by_key = {(t["schema"], t["name"]): t for t in tables}
+            owners_seen = sorted({t["schema"] for t in tables})
+            table_names = sorted({t["name"] for t in tables})
+
+            # Columns
+            if include_columns and table_names and owners_seen:
+                try:
+                    o_ph, nxt = _in_binds(owners_seen, 1)
+                    t_ph, _ = _in_binds(table_names, nxt)
+                    cursor.execute(
+                        "SELECT owner, table_name, column_name, data_type, nullable, data_precision, data_scale "
+                        "FROM all_tab_columns WHERE owner IN (%s) AND table_name IN (%s) "
+                        "ORDER BY owner, table_name, column_id" % (o_ph, t_ph),
+                        tuple(owners_seen) + tuple(table_names),
+                    )
+                    for cr in (cursor.fetchall() or []):
+                        key = (cr[0], cr[1])
+                        if key not in by_key:
+                            continue
+                        # Emit CANONICAL types (precision/scale-aware so NUMBER(p,0)
+                        # -> integer, NUMBER(p,s) -> decimal) instead of raw Oracle
+                        # tokens; keeps the raw token in source_type for reference.
+                        _raw_type = cr[3]
+                        _prec = int(cr[5]) if len(cr) > 5 and cr[5] is not None else None
+                        _scale = int(cr[6]) if len(cr) > 6 and cr[6] is not None else None
+                        col_obj = {
+                            "name": cr[2],
+                            "type": canonicalize_type(_raw_type, dialect="oracle", scale=_scale, precision=_prec),
+                            "source_type": _raw_type,
+                            "nullable": (str(cr[4]).upper() == "Y"),
+                        }
+                        if include_relationships:
+                            col_obj["is_primary_key"] = False
+                            col_obj["is_foreign_key"] = False
+                        if include_indexes:
+                            col_obj["is_indexed"] = False
+                        by_key[key]["columns"].append(col_obj)
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve columns: {e}", subsystem="columns")
+                    for t in tables:
+                        t["discovery_status"] = "partial"
+                        t["discovery_error"] = f"Columns: {e}"
+
+            # Relationships
+            if include_relationships and table_names and owners_seen:
+                try:
+                    o_ph, nxt = _in_binds(owners_seen, 1)
+                    t_ph, _ = _in_binds(table_names, nxt)
+                    # Primary key cols. Join all_cons_columns on BOTH owner and
+                    # constraint_name (constraint names are unique only per
+                    # owner, so an owner-blind join would cross-match schemas).
+                    cursor.execute(
+                        "SELECT cons.owner, cons.table_name, cols.column_name "
+                        "FROM all_constraints cons "
+                        "JOIN all_cons_columns cols ON cons.owner = cols.owner AND cons.constraint_name = cols.constraint_name "
+                        "WHERE cons.constraint_type = 'P' AND cons.owner IN (%s) AND cons.table_name IN (%s) "
+                        "ORDER BY cons.owner, cons.table_name, cols.position" % (o_ph, t_ph),
+                        tuple(owners_seen) + tuple(table_names),
+                    )
+                    for row in (cursor.fetchall() or []):
+                        key = (row[0], row[1])
+                        colname = row[2]
+                        if not colname or key not in by_key:
+                            continue
+                        by_key[key]["primary_keys"].append(colname)
+                        for c in by_key[key].get("columns", []):
+                            if c.get("name") == colname:
+                                c["is_primary_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve primary keys: {e}", subsystem="relationships")
+
+                try:
+                    o_ph, nxt = _in_binds(owners_seen, 1)
+                    t_ph, _ = _in_binds(table_names, nxt)
+                    # Foreign keys (with delete rule; update rule isn't exposed the
+                    # same way; default NO ACTION). r_owner carries the referenced
+                    # constraint's owner so cross-schema FKs resolve correctly.
+                    cursor.execute(
+                        "SELECT "
+                        "cons.owner AS owner, "
+                        "cons.table_name AS table_name, "
+                        "fcc.column_name AS column_name, "
+                        "rcons.table_name AS ref_table, "
+                        "rcc.column_name AS ref_column, "
+                        "cons.constraint_name AS constraint_name, "
+                        "cons.delete_rule AS on_delete "
+                        "FROM all_constraints cons "
+                        "JOIN all_cons_columns fcc ON cons.owner = fcc.owner AND cons.constraint_name = fcc.constraint_name "
+                        "JOIN all_constraints rcons ON cons.r_owner = rcons.owner AND cons.r_constraint_name = rcons.constraint_name "
+                        "JOIN all_cons_columns rcc ON rcons.owner = rcc.owner AND rcons.constraint_name = rcc.constraint_name AND rcc.position = fcc.position "
+                        "WHERE cons.constraint_type = 'R' AND cons.owner IN (%s) AND cons.table_name IN (%s)" % (o_ph, t_ph),
+                        tuple(owners_seen) + tuple(table_names),
+                    )
+                    fk_rows = cursor.fetchall() or []
+                    for fr in fk_rows:
+                        key = (fr[0], fr[1])
+                        if key not in by_key:
+                            continue
+                        fk_obj = {
+                            "column": fr[2],
+                            "references_table": fr[3],
+                            "references_column": fr[4],
+                            "constraint_name": fr[5] or "",
+                            "on_delete": fr[6] or "NO ACTION",
+                            "on_update": "NO ACTION",
+                        }
+                        by_key[key]["foreign_keys"].append(fk_obj)
+                        for c in by_key[key].get("columns", []):
+                            if c.get("name") == fr[2]:
+                                c["is_foreign_key"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve foreign keys: {e}", subsystem="relationships")
+
+            # Indexes
+            if include_indexes and table_names and owners_seen:
+                try:
+                    # Index columns first (batched), keyed by (index_owner, index_name).
+                    o_ph, nxt = _in_binds(owners_seen, 1)
+                    t_ph, _ = _in_binds(table_names, nxt)
+                    cursor.execute(
+                        "SELECT index_owner, index_name, column_name "
+                        "FROM all_ind_columns WHERE table_owner IN (%s) AND table_name IN (%s) "
+                        "ORDER BY index_owner, index_name, column_position" % (o_ph, t_ph),
+                        tuple(owners_seen) + tuple(table_names),
+                    )
+                    idx_cols = {}
+                    for ic in (cursor.fetchall() or []):
+                        idx_cols.setdefault((ic[0], ic[1]), []).append(ic[2])
+
+                    o_ph, nxt = _in_binds(owners_seen, 1)
+                    t_ph, _ = _in_binds(table_names, nxt)
+                    cursor.execute(
+                        "SELECT table_owner, table_name, owner AS index_owner, index_name, uniqueness "
+                        "FROM all_indexes WHERE table_owner IN (%s) AND table_name IN (%s) "
+                        "ORDER BY table_owner, table_name, index_name" % (o_ph, t_ph),
+                        tuple(owners_seen) + tuple(table_names),
+                    )
+                    for ir in (cursor.fetchall() or []):
+                        key = (ir[0], ir[1])
+                        if key not in by_key:
+                            continue
+                        idx_name = ir[3]
+                        unique = (str(ir[4]).upper() == "UNIQUE")
+                        cols = idx_cols.get((ir[2], idx_name), [])
+                        idx_obj = {"name": idx_name, "columns": cols, "unique": unique, "type": "btree", "is_primary": False}
+                        by_key[key]["indexes"].append(idx_obj)
+                        for colname in cols:
+                            for c in by_key[key].get("columns", []):
+                                if c.get("name") == colname:
+                                    c["is_indexed"] = True
+                except Exception as e:
+                    add_warning("catalog_error", "warning", f"Could not retrieve indexes: {e}", subsystem="indexes")
+
+            result["tables"] = tables
+            result["total_tables_discovered"] = len(tables)
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+        except Exception as e:
+            result["overall_status"] = "failed"
+            add_warning("catalog_error", "error", f"Oracle discovery failed: {e}", subsystem="tables")
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            cursor.close()
+            return result
+
+    def _discover_nosql_schema(self, conn, config: Dict) -> Dict[str, Any]:
+        """Discover schema for NoSQL databases"""
+        if "mongo" in self.driver_pattern.get("module", ""):
+            database = config.get("database")
+            if not database:
+                return {"success": False, "error": "Database name required"}
+            
+            db = conn[database]
+            collections = db.list_collection_names()
+            
+            return {
+                "success": True,
+                "tables": [{"name": c} for c in collections],
+                "total_tables": len(collections),
+                "database": database
+            }
+        
+        elif "redis" in self.driver_pattern.get("module", ""):
+            # Redis doesn't have traditional schema
+            keys = conn.keys("*")[:100]  # Sample first 100 keys
+            return {
+                "success": True,
+                "tables": [{"name": "redis_keys", "sample_count": len(keys)}],
+                "total_tables": 1
+            }
+        
+        return {"success": False, "error": "Schema discovery not supported for this NoSQL database"}
+    
+    # =========================================================================
+    # SOURCE OPERATIONS
+    # =========================================================================
+    
+    def _safe_column_identifier(self, col: str) -> Optional[str]:
+        """
+        Allow only simple identifiers for ORDER BY / PK lookups.
+        Keeps generated keyset paging safe across DBs.
+        """
+        if not isinstance(col, str):
+            return None
+        col = col.strip()
+        if not col:
+            return None
+        for ch in col:
+            if not (ch.isalnum() or ch == "_"):
+                return None
+        return col
+
+    def _safe_qualified_table(self, table: str, quote: str = '"') -> Optional[str]:
+        """Validate a (possibly schema-qualified) relation name and re-quote each
+        segment with the driver quote char for safe read-SQL interpolation.
+        Rejects any segment that is not a plain identifier (mirrors the write
+        path's _is_safe_ident guard). Returns None when unsafe."""
+        raw = str(table or '').strip()
+        raw_parts = raw.split('.')
+        # Fail closed on malformed qualification: reject an empty segment
+        # (``schema..table`` / ``schema.``) or more than ``schema.table``
+        # (``a.b.c``) instead of silently dropping empties. Not a bypass while
+        # the output stays quoted, but keeps the validator honest for callers
+        # (the write-path guard) that only check the None/not-None verdict.
+        if len(raw_parts) > 2:
+            return None
+        segments = [p.strip().strip('"').strip('`') for p in raw_parts]
+        if not segments or any(not seg for seg in segments):
+            return None
+        out = []
+        for seg in segments:
+            s = self._safe_column_identifier(seg)
+            if not s:
+                return None
+            out.append(f'{quote}{s}{quote}')
+        return '.'.join(out)
+
+    def _split_qualified_table(self, table: str) -> Dict[str, Optional[str]]:
+        """
+        Best-effort split for qualified table names.
+        Supports: schema.table or db.schema.table (takes last two as schema/table).
+        """
+        t = (table or "").strip()
+        parts = [p for p in t.split(".") if p]
+        if len(parts) >= 2:
+            return {"schema": parts[-2], "table": parts[-1]}
+        return {"schema": None, "table": t or None}
+
+    def _normalize_table_for_mysql(self, config: Dict, table: str) -> str:
+        """
+        Normalize table identifiers for MySQL.
+
+        Rationale: callers may provide qualified forms like "db.table" while also
+        providing config.database="db". Some pipeline layers may accidentally
+        double-qualify (e.g. "db.db.table"). This connector accepts both forms
+        and normalizes to an unqualified table name when config.database is set.
+        """
+        t = (table or "").strip()
+        if not t:
+            return t
+        db = (config or {}).get("database") or ""
+        db = str(db).strip()
+        if not db:
+            return t
+
+        # Strip outer backticks (best-effort; keep inner segments intact)
+        raw = t.strip("`")
+        prefix = db.strip("`") + "."
+        # Repeatedly strip leading "<db>." to avoid db.db.table
+        while raw.lower().startswith(prefix.lower()):
+            raw = raw[len(prefix) :]
+        return raw
+
+    def _get_primary_key_column(self, cursor, table: str) -> Optional[str]:
+        """
+        Best-effort: return the first PRIMARY KEY column name for keyset pagination.
+        Works across common relational DBs; falls back to None.
+        """
+        module = (self.driver_pattern.get("module", "") or "").lower()
+        table_parts = self._split_qualified_table(table)
+        schema = table_parts.get("schema")
+        tbl = table_parts.get("table")
+        if not tbl:
+            return None
+
+        try:
+            # MySQL
+            if "mysql" in module:
+                safe_tbl = self._safe_column_identifier(tbl)
+                if not safe_tbl:
+                    return None
+                fq = f'`{safe_tbl}`'
+                if schema:
+                    safe_schema = self._safe_column_identifier(schema)
+                    if not safe_schema:
+                        return None
+                    fq = f'`{safe_schema}`.`{safe_tbl}`'
+                cursor.execute(f"SHOW KEYS FROM {fq} WHERE Key_name = 'PRIMARY'")
+                rows = cursor.fetchall() or []
+                if rows and isinstance(rows[0], dict):
+                    rows_sorted = sorted(rows, key=lambda r: int(r.get("Seq_in_index") or 9999))
+                    pk = rows_sorted[0].get("Column_name")
+                    return self._safe_column_identifier(pk)
+                if rows and isinstance(rows[0], (list, tuple)) and len(rows[0]) >= 5:
+                    pk = rows[0][4]
+                    return self._safe_column_identifier(str(pk))
+                return None
+
+            # PostgreSQL (psycopg2)
+            if module == "psycopg2":
+                # Default schema is public if not provided
+                schema_val = schema or "public"
+                cursor.execute(
+                    """
+                    SELECT kcu.column_name
+                    FROM information_schema.table_constraints tc
+                    JOIN information_schema.key_column_usage kcu
+                      ON tc.constraint_name = kcu.constraint_name
+                     AND tc.table_schema = kcu.table_schema
+                    WHERE tc.constraint_type = 'PRIMARY KEY'
+                      AND tc.table_schema = %s
+                      AND tc.table_name = %s
+                    ORDER BY kcu.ordinal_position
+                    LIMIT 1
+                    """,
+                    (schema_val, tbl),
+                )
+                r = cursor.fetchone()
+                if isinstance(r, dict):
+                    return self._safe_column_identifier(r.get("column_name"))
+                if isinstance(r, (list, tuple)) and len(r) >= 1:
+                    return self._safe_column_identifier(str(r[0]))
+                return None
+
+            # SQLite
+            if "sqlite" in module:
+                cursor.execute(f"PRAGMA table_info({tbl})")
+                rows = cursor.fetchall() or []
+                # Row shape: cid, name, type, notnull, dflt_value, pk
+                for row in rows:
+                    if isinstance(row, dict):
+                        if int(row.get("pk") or 0) == 1:
+                            return self._safe_column_identifier(row.get("name"))
+                    elif isinstance(row, (list, tuple)) and len(row) >= 6:
+                        if int(row[5] or 0) == 1:
+                            return self._safe_column_identifier(str(row[1]))
+                return None
+
+            # SQL Server (pyodbc): first PK column via sys catalogs. Qmark
+            # paramstyle; schema defaults to dbo when the table is unqualified.
+            if "pyodbc" in module:
+                schema_val = schema or "dbo"
+                cursor.execute(
+                    "SELECT c.name "
+                    "FROM sys.key_constraints kc "
+                    "JOIN sys.index_columns ic ON kc.parent_object_id = ic.object_id "
+                    "  AND kc.unique_index_id = ic.index_id "
+                    "JOIN sys.columns c ON ic.object_id = c.object_id "
+                    "  AND ic.column_id = c.column_id "
+                    "JOIN sys.tables t ON kc.parent_object_id = t.object_id "
+                    "JOIN sys.schemas s ON t.schema_id = s.schema_id "
+                    "WHERE kc.type = 'PK' AND s.name = ? AND t.name = ? "
+                    "ORDER BY ic.key_ordinal",
+                    (schema_val, tbl),
+                )
+                r = cursor.fetchone()
+                if not r:
+                    return None
+                # pyodbc.Row is neither dict nor list/tuple, but supports r[0].
+                val = r.get("name") if isinstance(r, dict) else r[0]
+                return self._safe_column_identifier(str(val)) if val is not None else None
+
+            # Oracle (oracledb): first PK column via the data-dictionary. :N
+            # binds; own-schema (user_*) when unqualified, owner-qualified
+            # (all_*) otherwise. Table names default to Oracle's uppercase fold.
+            if "oracledb" in module:
+                if schema:
+                    cursor.execute(
+                        "SELECT cc.column_name "
+                        "FROM all_constraints c "
+                        "JOIN all_cons_columns cc ON c.owner = cc.owner "
+                        "  AND c.constraint_name = cc.constraint_name "
+                        "WHERE c.constraint_type = 'P' AND c.owner = :1 "
+                        "  AND c.table_name = :2 ORDER BY cc.position",
+                        (schema, tbl.upper() if tbl.islower() else tbl),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT cc.column_name "
+                        "FROM user_constraints c "
+                        "JOIN user_cons_columns cc "
+                        "  ON c.constraint_name = cc.constraint_name "
+                        "WHERE c.constraint_type = 'P' AND c.table_name = :1 "
+                        "ORDER BY cc.position",
+                        (tbl.upper() if tbl.islower() else tbl,),
+                    )
+                r = cursor.fetchone()
+                if not r:
+                    return None
+                val = r[0] if isinstance(r, (list, tuple)) else r
+                return self._safe_column_identifier(str(val)) if val is not None else None
+        except Exception:
+            return None
+
+    def _is_invisible_column(self, cursor, table: str, column: str) -> bool:
+        """MySQL 8: report whether ``column`` is INVISIBLE (omitted from
+        ``SELECT *``). A table whose ONLY primary key is an invisible generated
+        key (GIPK — e.g. ``my_row_id``, auto-added to a CTAS table that has no
+        PK when ``sql_generate_invisible_primary_key=ON``) is found by
+        ``SHOW KEYS`` (so ``_get_primary_key_column`` returns it) but the column
+        is excluded from ``SELECT *``. The keyset cursor value then can't be read
+        back from the returned rows, ``next_cursor`` stays None, and pagination
+        silently truncates to the first page. Detecting invisibility lets
+        ``export`` project the column explicitly so the cursor advances.
+
+        Best-effort: returns False on any error (caller keeps existing behavior).
+        Only meaningful for MySQL — other dialects have no invisible columns.
+        """
+        module = (self.driver_pattern.get("module", "") or "").lower()
+        if "mysql" not in module:
+            return False
+        table_parts = self._split_qualified_table(table)
+        schema = table_parts.get("schema")
+        tbl = table_parts.get("table")
+        if not tbl or not column:
+            return False
+        try:
+            # information_schema.COLUMNS lists invisible columns (unlike
+            # SELECT *). COALESCE falls back to the connection's current DB when
+            # the table reference is unqualified.
+            cursor.execute(
+                "SELECT EXTRA FROM information_schema.COLUMNS "
+                "WHERE TABLE_SCHEMA = COALESCE(%s, DATABASE()) "
+                "AND TABLE_NAME = %s AND COLUMN_NAME = %s",
+                (schema, tbl, column),
+            )
+            rows = cursor.fetchall() or []
+            if not rows:
+                return False
+            first = rows[0]
+            extra = first.get("EXTRA") if isinstance(first, dict) else (first[0] if len(first) else "")
+            return "INVISIBLE" in str(extra or "").upper()
+        except Exception:
+            return False
+
+        return None
+
+    # ------------------------------------------------------------------
+    # Incremental sync helpers (T2-6 — see INCREMENTAL.md). Mirrors the
+    # PG connector's helpers; behavior must stay byte-identical so a
+    # MySQL→PG round-trip with the same watermark advances together.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _normalize_since(raw) -> Optional[str]:
+        if raw is None:
+            return None
+        try:
+            from datetime import datetime, timezone
+            if isinstance(raw, datetime):
+                if raw.tzinfo is None:
+                    raw = raw.replace(tzinfo=timezone.utc)
+                return raw.isoformat()
+        except Exception:
+            pass
+        if isinstance(raw, (int, float)):
+            try:
+                from datetime import datetime, timezone
+                ts = float(raw)
+                if ts > 10_000_000_000:
+                    ts = ts / 1000.0
+                return datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+            except Exception:
+                return None
+        if isinstance(raw, str):
+            s = raw.strip()
+            return s if s else None
+        return None
+
+    @staticmethod
+    def _max_field_value(rows: List, field: str) -> Optional[str]:
+        if not rows:
+            return None
+        best = None
+        best_cmp = None
+        from datetime import datetime
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            v = row.get(field)
+            if v is None or v == "":
+                continue
+            cmp_v = v
+            if isinstance(v, datetime):
+                cmp_v = v
+            elif isinstance(v, str):
+                try:
+                    cmp_v = datetime.fromisoformat(v.replace("Z", "+00:00"))
+                except Exception:
+                    cmp_v = v
+            if best_cmp is None or cmp_v > best_cmp:
+                best_cmp = cmp_v
+                best = v
+        if best is None:
+            return None
+        if isinstance(best, datetime):
+            return best.isoformat()
+        return str(best)
+
+    def export(self, params: Dict = None):
+        """Export data from database. Supports incremental sync via the
+        cross-connector contract documented in
+        ``shared/mcp-connectors/INCREMENTAL.md`` (T2-6 — see the PG
+        connector for the reference implementation; MySQL mirrors it).
+        """
+        prepared = self.prepare_export_data(params)
+
+        config = prepared['config']
+        table = prepared.get('table')
+        limit = prepared.get('limit', 10000)
+        offset = prepared.get('offset', 0)
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 10000
+        try:
+            offset = int(offset)
+        except (TypeError, ValueError):
+            offset = 0
+        use_keyset = bool((params or {}).get("use_keyset_paging") or (params or {}).get("use_cursor_paging"))
+        cursor_value = (params or {}).get("cursor")
+        cursor_column = (params or {}).get("cursor_column") or (params or {}).get("primary_key")
+        # PK high-water from the PREVIOUS run (INCREMENTAL.md §5). Distinct
+        # from `cursor`, which is this run's paging position: `since_cursor`
+        # is half of the delta predicate, `cursor` is pagination.
+        since_cursor = (params or {}).get("since_cursor")
+
+        # Incremental sync params (INCREMENTAL.md §1).
+        raw_since = None
+        for k in ("since", "updated_since", "modified_since", "modified_after"):
+            v = (params or {}).get(k)
+            if v:
+                raw_since = v
+                break
+        incremental_field = str((params or {}).get("incremental_field") or "updated_at").strip()
+        normalized_since = self._normalize_since(raw_since) if raw_since else None
+        if raw_since and not normalized_since:
+            try:
+                import logging
+                logging.warning(
+                    "[Incremental] %s: malformed since value, falling back to full fetch",
+                    table,
+                )
+            except Exception:
+                pass
+
+        if not table:
+            return {"success": False, "error": "Missing 'table' parameter"}
+        table = self._normalize_table_for_mysql(config, table)
+
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            pattern = self.driver_pattern
+
+            # Handle NoSQL
+            if pattern.get("is_nosql"):
+                return self._export_nosql(conn, config, table, limit, offset, prepared)
+
+            # SQL export
+            cursor = self._get_cursor(conn)
+
+            module = (self.driver_pattern.get("module", "") or "").lower()
+            # Prefer keyset paging when requested or when cursor provided.
+            pk = self._safe_column_identifier(str(cursor_column)) if cursor_column else None
+            if (use_keyset or cursor_value is not None) and not pk:
+                pk = self._get_primary_key_column(cursor, table)
+
+            # GIPK fix: a MySQL table whose only PK is an INVISIBLE generated key
+            # (my_row_id) is found by SHOW KEYS (so pk is set) but excluded from
+            # `SELECT *`, so the keyset cursor value can't be read back and
+            # pagination silently truncates to the first page. Detect the
+            # invisible PK so we project it explicitly below and advance the
+            # cursor. No-op for visible PKs and non-MySQL dialects.
+            pk_is_invisible = self._is_invisible_column(cursor, table, pk) if pk else False
+
+            # Choose placeholder style for parameterized queries.
+            # pyodbc (SQL Server) and sqlite3 use qmark paramstyle ("?");
+            # mysql-connector / psycopg2 use pyformat ("%s"); oracledb uses
+            # numbered positional binds (":1", ":2", ...) built via _ph() below.
+            is_sqlserver = "pyodbc" in module
+            is_oracle = "oracledb" in module
+            placeholder = "%s"
+            if "sqlite" in module or is_sqlserver:
+                placeholder = "?"
+
+            # Choose identifier quoting per driver. SQL Server accepts
+            # double-quoted identifiers with QUOTED_IDENTIFIER ON (ODBC default);
+            # Oracle uses double quotes (case-preserving).
+            quote = "`" if "mysql" in module else "\""
+
+            safe_table = self._safe_qualified_table(table, quote)
+            if not safe_table:
+                return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
+
+            # Incremental sync: compose WHERE clause (T2-6). Two DIFFERENT
+            # fields, deliberately kept apart — `inc_field_safe` drives the
+            # WHERE filter and only exists once we have a `since` to compare
+            # against; `watermark_field` drives the watermark we REPORT and
+            # must be populated on the very first run too, or the contract
+            # can never bootstrap. See PG connector for full rationale.
+            inc_field_safe = None
+            inc_bind_value = None
+            watermark_field = self._safe_column_identifier(incremental_field)
+            if watermark_field and normalized_since:
+                inc_field_safe = watermark_field
+                inc_bind_value = normalized_since
+
+            where_parts = []
+            bind_values = []
+
+            def _ph():
+                # Oracle needs :N positional binds; the count is the current
+                # length before appending the next value (so first -> :1).
+                return f":{len(bind_values) + 1}" if is_oracle else placeholder
+
+            # `cursor` is this run's PAGING position and always narrows with
+            # AND. The delta predicate decides which rows this run cares
+            # about at all, and its two halves are OR'ed:
+            #
+            #     WHERE pk > <page cursor>
+            #       AND ( updated_at > <watermark> OR pk > <last run's pk> )
+            #
+            # Timestamp alone would drop every INSERT whose incremental
+            # column is NULL or hand-maintained; AND-ing the halves (the
+            # behavior this replaces) dropped every UPDATE to an
+            # already-synced row, since an updated row keeps its old PK.
+            # Each bind is appended as its placeholder is minted, so the
+            # Oracle :N numbering stays in lockstep with the emitted SQL.
+            if pk and cursor_value is not None and cursor_value != "":
+                where_parts.append(f"{quote}{pk}{quote} > {_ph()}")
+                bind_values.append(cursor_value)
+
+            delta_parts = []
+            if inc_field_safe is not None and inc_bind_value is not None:
+                delta_parts.append(f"{quote}{inc_field_safe}{quote} > {_ph()}")
+                bind_values.append(inc_bind_value)
+            if pk and since_cursor is not None and since_cursor != "":
+                delta_parts.append(f"{quote}{pk}{quote} > {_ph()}")
+                bind_values.append(since_cursor)
+            if delta_parts:
+                where_parts.append("(" + " OR ".join(delta_parts) + ")")
+
+            where_clause = ""
+            if where_parts:
+                where_clause = " WHERE " + " AND ".join(where_parts)
+
+            if pk:
+                # Project the keyset PK explicitly when it is INVISIBLE so it
+                # survives `SELECT *` and yields a usable next_cursor (GIPK fix).
+                # An invisible column is never part of `*`, so this never
+                # duplicates a column; visible PKs keep plain `SELECT *`.
+                projection = f"*, {quote}{pk}{quote}" if pk_is_invisible else "*"
+                if is_sqlserver:
+                    # SQL Server has no LIMIT; a keyset page is ORDER BY pk + TOP.
+                    query = f"SELECT TOP ({int(limit)}) {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote}"
+                elif is_oracle:
+                    # Oracle (12c+): ORDER BY pk + FETCH FIRST N ROWS ONLY.
+                    query = f"SELECT {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote} FETCH FIRST {int(limit)} ROWS ONLY"
+                else:
+                    query = f"SELECT {projection} FROM {safe_table}{where_clause} ORDER BY {quote}{pk}{quote} LIMIT {limit}"
+                if bind_values:
+                    cursor.execute(query, tuple(bind_values))
+                else:
+                    # pyodbc treats execute(sql, None) as ONE None parameter
+                    # ("0 markers, 1 supplied"); mysql/psycopg2 treat it as no
+                    # params. Omit the arg entirely when there are no binds.
+                    cursor.execute(query)
+            else:
+                if is_sqlserver:
+                    # SQL Server: OFFSET/FETCH requires an ORDER BY; use a stable
+                    # no-op ordering so unkeyed offset paging is still valid SQL.
+                    query = f"SELECT * FROM {safe_table}{where_clause} ORDER BY (SELECT NULL) OFFSET {int(offset)} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
+                elif is_oracle:
+                    # Oracle (12c+): OFFSET n ROWS FETCH NEXT m ROWS ONLY.
+                    query = f"SELECT * FROM {safe_table}{where_clause} OFFSET {int(offset)} ROWS FETCH NEXT {int(limit)} ROWS ONLY"
+                else:
+                    query = f"SELECT * FROM {safe_table}{where_clause} LIMIT {limit} OFFSET {offset}"
+                if bind_values:
+                    cursor.execute(query, tuple(bind_values))
+                else:
+                    # pyodbc treats execute(sql, None) as ONE None parameter
+                    # ("0 markers, 1 supplied"); mysql/psycopg2 treat it as no
+                    # params. Omit the arg entirely when there are no binds.
+                    cursor.execute(query)
+
+            # Convert rows to dicts
+            columns = [desc[0] for desc in cursor.description] if cursor.description else []
+            rows = cursor.fetchall()
+
+            if rows and isinstance(rows[0], dict):
+                data = rows
+            else:
+                data = [dict(zip(columns, row)) for row in rows]
+
+            cursor.close()
+            # Include next_cursor for keyset pagination if we can.
+            next_cursor = None
+            if pk and data:
+                last = data[-1]
+                if isinstance(last, dict):
+                    next_cursor = last.get(pk)
+                else:
+                    try:
+                        idx = columns.index(pk)
+                        next_cursor = last[idx]
+                    except Exception:
+                        next_cursor = None
+
+            # GIPK fix: when we explicitly projected an INVISIBLE keyset PK,
+            # (1) emit next_cursor as a STRING so a BIGINT id beyond 2**53
+            #     round-trips through the orchestrator's JSON hop without
+            #     float64 precision loss (which would skip rows = a NEW silent
+            #     drop), and
+            # (2) strip the injected PK from every row + the columns list so the
+            #     invisible column never reaches the destination — schema
+            #     discovery intentionally reports such tables as keyless (routed
+            #     to the content-hash surrogate), and leaking my_row_id would
+            #     break that contract / add an unexpected column.
+            # next_cursor is read ABOVE (from data[-1]) before this strip runs.
+            if pk_is_invisible:
+                if next_cursor is not None:
+                    next_cursor = str(next_cursor)
+                for r in data:
+                    if isinstance(r, dict):
+                        r.pop(pk, None)
+                columns = [c for c in columns if c != pk]
+
+            result = self.finalize_export_result(data, prepared, columns)
+            if next_cursor is not None:
+                result["next_cursor"] = next_cursor
+                result["paging_mode"] = "keyset"
+                result["cursor_column"] = pk
+
+            # Incremental watermark (T2-6) — see PG connector for
+            # full rationale on edge cases. Emitted whenever the incremental
+            # field is a REAL column on this table, INCLUDING the first run
+            # when no `since` has been supplied; that first emission is what
+            # bootstraps the contract. `columns` comes from
+            # cursor.description, so this is an existence check against the
+            # actual result set: a table with no `updated_at` emits no
+            # watermark and correctly stays on the append-only keyset path.
+            # Matched case-insensitively because Oracle folds unquoted
+            # identifiers to upper case, and reported with the column's real
+            # spelling so the next run binds a name the driver recognizes.
+            watermark_col = None
+            if watermark_field:
+                for col in (columns or []):
+                    if str(col).lower() == watermark_field.lower():
+                        watermark_col = col
+                        break
+            if watermark_col is not None:
+                max_val = self._max_field_value(data, watermark_col)
+                if max_val is None and normalized_since:
+                    max_val = normalized_since
+                if max_val is not None:
+                    result.setdefault("stats", {})
+                    result["stats"]["watermark"] = {
+                        "field": watermark_col,
+                        "value": max_val,
+                    }
+                    result["max_watermark"] = max_val
+            return result
+            
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    
+    def _export_nosql(self, conn, config: Dict, collection: str, limit: int, offset: int, prepared: Dict) -> Dict:
+        """Export from NoSQL database"""
+        if "mongo" in self.driver_pattern.get("module", ""):
+            import json
+            from bson.json_util import dumps
+            
+            database = config.get("database")
+            db = conn[database]
+            coll = db[collection]
+            
+            docs = list(coll.find().skip(offset).limit(limit))
+            data = json.loads(dumps(docs))
+            
+            return self.finalize_export_result(data, prepared)
+        
+        return {"success": False, "error": "Export not supported for this NoSQL database"}
+    
+    # =========================================================================
+    # DESTINATION OPERATIONS
+    # =========================================================================
+    
+    def import_data(self, params: Dict = None):
+        """Import data into database"""
+        if self._is_oracle_dialect():
+            return self._ora_import_data(params)
+        prepared = self.prepare_import_data(params)
+        
+        if not prepared.get('success', True):
+            return prepared
+        
+        data = prepared.get('data', [])
+        if not data:
+            return {"success": True, "rows_inserted": 0, "message": "No data to import"}
+        
+        config = prepared['config']
+        table = prepared.get('table')
+
+        if not table:
+            return {"success": False, "error": "Target table not specified"}
+        # Fail-closed write-path SQLi guard: reject an unsafe (tenant-controlled)
+        # destination table before it is split/interpolated into the INSERT SQL.
+        if self._safe_qualified_table(table) is None:
+            return {"success": False, "error": f"Unsafe table identifier: {table!r}"}
+        # Resolve (db, name) so the per-pipeline namespace routes the write to the
+        # right database; build a properly-quoted qualified target.
+        db, name = self._split_mysql_db_table(config, table, params)
+        if not name or not self._is_safe_ident(name):
+            return {"success": False, "error": f"Unsafe or missing table identifier: {name}"}
+        if db and not self._is_safe_ident(db):
+            return {"success": False, "error": f"Unsafe database identifier: {db}"}
+        qualified_target = f"`{db}`.`{name}`" if db else f"`{name}`"
+        table = name
+
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            pattern = self.driver_pattern
+
+            # Handle NoSQL
+            if pattern.get("is_nosql"):
+                return self._import_nosql(conn, config, table, data)
+
+            # SQL import
+            cursor = self._get_cursor(conn, as_dict=False)
+
+            if data:
+                # Union keys across ALL rows, not just data[0]. Wide-format transforms
+                # (json_flatten / array_expand) emit ragged rows, so the first row's key
+                # set is not the full column set — deriving from data[0] alone silently
+                # drops columns unique to later rows. Value binding uses row.get(col).
+                columns = []
+                _seen_cols = set()
+                for _row in data:
+                    if not isinstance(_row, dict):
+                        continue
+                    for _k in _row.keys():
+                        if _k not in _seen_cols:
+                            _seen_cols.add(_k)
+                            columns.append(_k)
+                placeholders = ", ".join(["%s"] * len(columns))
+                # Backticks for MySQL identifier quoting — same case-sensitivity
+                # rationale as postgres double-quoting; matches ensure_table DDL.
+                col_str = ", ".join([f"`{c}`" for c in columns])
+
+                insert_query = f"INSERT INTO {qualified_target} ({col_str}) VALUES ({placeholders})"
+
+                # Per-column canonical types from the orchestrator; drives
+                # type-aware value coercion (ISO-8601 -> DATETIME(6), etc.).
+                col_types = (params or {}).get("column_types") or {}
+                if not isinstance(col_types, dict):
+                    col_types = {}
+                # Same introspection fallback as upsert_data: legacy batch
+                # path (executor → Kafka → sink → import_data) may arrive
+                # without column_types, and JSON-typed destination columns
+                # then receive bare strings that MySQL rejects.
+                if not col_types:
+                    col_types = self._introspect_dest_column_types(config, name, db) or {}
+
+                # Batch insert
+                rows_inserted = 0
+                batch_size = min(self.max_batch_size, 1000)
+
+                for i in range(0, len(data), batch_size):
+                    batch = data[i:i + batch_size]
+                    values = [
+                        tuple(
+                            _mysql_bind_value(row.get(col), col_types.get(col))
+                            for col in columns
+                        )
+                        for row in batch
+                    ]
+                    cursor.executemany(insert_query, values)
+                    # Count rows the DB actually wrote (cursor.rowcount), NOT len(batch).
+                    # Returning len(batch) unconditionally masked silent data loss: a write
+                    # that affected 0 rows still reported success+N, the sink ack'd it, and
+                    # the pipeline reported "completed" with 0 rows landed. Fall back to
+                    # len(batch) only when the driver doesn't report a count (rowcount < 0).
+                    affected = cursor.rowcount
+                    rows_inserted += affected if (affected is not None and affected >= 0) else len(batch)
+
+                # Diagnostic: resolved target + submitted-vs-affected. A shortfall
+                # (affected < submitted) is the silent-data-loss signature.
+                logger.info(
+                    "import_data: target=%s submitted=%d affected=%d",
+                    table, len(data), rows_inserted,
+                )
+
+                # Persist the Kafka high-water offset in the SAME transaction as the
+                # inserted rows so data + progress commit atomically (exactly-once for
+                # append-only CDC, replaces Redis dedup). No-op for full-load callers,
+                # which do not supply kafka_offset.
+                self._write_cdc_offsets(cursor, params)
+                conn.commit()
+
+            cursor.close()
+            return {"success": True, "rows_inserted": rows_inserted}
+            
+        except Exception as e:
+            if conn:
+                try:
+                    conn.rollback()
+                except:
+                    pass
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except:
+                    pass
+    
+    def _import_nosql(self, conn, config: Dict, collection: str, data: List) -> Dict:
+        """Import into NoSQL database"""
+        if "mongo" in self.driver_pattern.get("module", ""):
+            database = config.get("database")
+            db = conn[database]
+            coll = db[collection]
+            
+            result = coll.insert_many(data)
+            return {"success": True, "rows_inserted": len(result.inserted_ids)}
+        
+        return {"success": False, "error": "Import not supported for this NoSQL database"}
+
+    # DO NOT implement handle_request, _handle_tool_call, run, or list_tools
+    # The base class handles these automatically!
+
+
+# =============================================================================
+# HTTP SERVER MODE (for Docker deployment)
+# =============================================================================
+
+def create_http_app():
+    """Create FastAPI app for HTTP-based MCP server"""
+    from fastapi import FastAPI, HTTPException
+    # Decimal crosses this boundary as a STRING, never a float. FastAPI's
+    # jsonable_encoder maps Decimal -> float (ENCODERS_BY_TYPE), which silently
+    # destroys precision on the way to the sink: a numeric 123456789012345678.5
+    # arrives as 1.2345678901234568e+17, and the orchestrator writes that back
+    # out as 123456789012345680 -- a changed value, with no error raised anywhere.
+    # The stdio path already serialises with json.dumps(..., default=str), so
+    # HTTP mode was the only lossy leg -- and it is the leg every containerised
+    # deployment uses, which is why no stdio-based test could ever see it.
+    from decimal import Decimal as _Decimal
+    from fastapi.encoders import ENCODERS_BY_TYPE as _ENCODERS_BY_TYPE
+    _ENCODERS_BY_TYPE[_Decimal] = str
+    from pydantic import BaseModel
+    from typing import Optional, Any
+    
+    runtime_version = os.getenv("MCP_CONNECTOR_VERSION") or os.getenv("CONNECTOR_VERSION") or "1.0.0"
+    runtime_version = str(runtime_version).strip()
+    if runtime_version and not runtime_version.startswith("v"):
+        runtime_version = f"v{runtime_version}"
+
+    app = FastAPI(
+        title="MySQL MCP Connector",
+        description="Connector for MySQL relational database.",
+        version=runtime_version or "1.0.0"
+    )
+    
+    server = OracleMCPServer()
+    
+    class MCPRequest(BaseModel):
+        method: str
+        params: Optional[dict] = None
+    
+    @app.get("/health")
+    async def health():
+        return {
+            "status": "healthy",
+            "connector": server.connector_type,
+            "version": runtime_version or "1.0.0",
+        }
+    
+    @app.post("/mcp")
+    async def mcp_handler(request: MCPRequest):
+        """Handle MCP JSON-RPC requests over HTTP"""
+        import asyncio
+        try:
+            req_data = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": request.method,
+                "params": request.params or {}
+            }
+            # Run the synchronous DB call in a thread pool so concurrent
+            # requests from multiple pipelines don't block each other on the
+            # asyncio event loop. A fresh OracleMCPServer instance is created
+            # per call because mysql.connector connections are not thread-safe.
+            def _handle():
+                s = OracleMCPServer()
+                return s.handle_request(req_data)
+            result = await asyncio.to_thread(_handle)
+            return result
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.post("/invoke/{tool_name}")
+    async def invoke_tool(tool_name: str, params: Optional[dict] = None):
+        """Direct tool invocation endpoint"""
+        params = params or {}
+        try:
+            method_name = tool_name.replace("-", "_")
+            # Security: this route bypasses _handle_tool_call, so it needs its own
+            # copy of that dispatcher's guard. Without it a crafted name like
+            # "_cleanup_worker" resolves via getattr and exposes internals to any
+            # caller that can reach the container. Tool handlers are always public.
+            if method_name.startswith("_"):
+                raise HTTPException(status_code=404, detail=f"Tool not found: {tool_name}")
+            if hasattr(server, method_name):
+                method = getattr(server, method_name)
+                return method(params)
+            
+            prefixed = f"mysql_{method_name}"
+            if hasattr(server, prefixed):
+                method = getattr(server, prefixed)
+                return method(params)
+            
+            raise HTTPException(status_code=404, detail=f"Tool not found: {tool_name}")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+    
+    @app.get("/capabilities")
+    async def api_get_capabilities():
+        return server.get_capabilities()
+    
+    @app.post("/test_connection")
+    async def api_test_connection(params: Optional[dict] = None):
+        return server.test_connection(params or {})
+    
+    @app.post("/validate_config")
+    async def api_validate_config(params: Optional[dict] = None):
+        return server.validate_config(params or {})
+    
+    @app.post("/discover_schema")
+    async def api_discover_schema(params: Optional[dict] = None):
+        return server.discover_schema(params or {})
+    
+    return app
+
+
+if __name__ == "__main__":
+    import os
+    
+    # Check if running in HTTP mode (Docker)
+    http_mode = os.getenv("MCP_HTTP_MODE", "false").lower() == "true"
+    port = int(os.getenv("MCP_PORT", os.getenv("PORT", "8000")))
+    
+    if http_mode or os.getenv("DOCKER_CONTAINER"):
+        # HTTP mode for Docker
+        import uvicorn
+        app = create_http_app()
+        logger.info(f"🚀 Starting MySQL MCP Server in HTTP mode on port {port}")
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    else:
+        # Stdio mode for local/CLI usage
+        server = OracleMCPServer()
+        server.run()

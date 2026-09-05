@@ -1,0 +1,93 @@
+{{- if .Values.frontend.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fullname }}-frontend
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  type: {{ .Values.frontend.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.frontend.service.port }}
+      targetPort: http
+  selector:
+    {{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-frontend
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: {{ .Values.frontend.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: frontend
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: frontend
+        {{- with .Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: frontend
+          image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.frontend.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            {{- include "rsync-ai.commonEnv" . | nindent 12 }}
+            # Server-side (Next route handlers) calls stay in-cluster.
+            - name: API_GATEWAY_INTERNAL_URL
+              value: "http://{{ $fullname }}-api-gateway:{{ .Values.apiGateway.service.port }}"
+            # The next three are read by the BROWSER, so they must be the
+            # external addresses. A Service name here renders a page whose every
+            # API call fails DNS on the user's machine — the pods stay green and
+            # the app is blank.
+            #
+            # NEXT_PUBLIC_* are baked at build time in a normal Next build; this
+            # image reads them at runtime, which is why setting them here works
+            # at all. If you swap in a self-built image that inlines them, these
+            # values are inert and the URLs must be set at docker build time.
+            - name: NEXT_PUBLIC_API_URL
+              value: {{ required "frontend.apiUrl is required: it is the address the BROWSER calls the API on" .Values.frontend.apiUrl | quote }}
+            - name: NEXT_PUBLIC_WS_URL
+              value: {{ .Values.frontend.wsUrl | default (printf "%s/ws" (.Values.frontend.apiUrl | replace "https://" "wss://" | replace "http://" "ws://")) | quote }}
+            - name: NEXTAUTH_URL
+              value: {{ required "frontend.publicUrl is required: NextAuth builds its callback URLs from it and a wrong value breaks every OAuth login" .Values.frontend.publicUrl | quote }}
+            - name: INTERNAL_SERVICE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: INTERNAL_SERVICE_SECRET
+                  optional: true
+          readinessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          livenessProbe:
+            httpGet: { path: /api/health, port: http }
+            initialDelaySeconds: 45
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.frontend.resources | nindent 12 }}
+{{- end }}

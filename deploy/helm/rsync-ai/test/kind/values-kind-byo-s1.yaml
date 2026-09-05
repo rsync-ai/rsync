@@ -1,0 +1,17 @@
+# Stage S1 overlay: SASL_PLAINTEXT + SCRAM-SHA-512.
+#
+# Layered ON TOP of values-kind-byo.yaml (`-f values-kind-byo.yaml -f this`), so
+# the S0 baseline stays byte-reproducible and each stage's delta is exactly the
+# security config -- nothing else moves between stages. That isolation is what
+# makes "S0 green, S1 red" attributable to the broker's security posture rather
+# than to an incidental values change.
+#
+# NO SECRET HERE. `kafka.external.saslPassword` is the one value this file
+# deliberately omits; pass it in a third, uncommitted `-f`. broker-up.sh writes
+# the generated password to ./.broker-sasl-password (gitignored, chmod 600).
+
+kafka:
+  external:
+    securityProtocol: SASL_PLAINTEXT
+    saslMechanism: SCRAM-SHA-512
+    saslUsername: rsync

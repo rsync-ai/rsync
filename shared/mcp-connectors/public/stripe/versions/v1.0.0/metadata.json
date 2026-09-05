@@ -1,0 +1,406 @@
+{
+  "id": "stripe",
+  "name": "Stripe",
+  "display_name": "Stripe",
+  "aliases": [
+    "stripe",
+    "stripe",
+    "Stripe",
+    "stripe"
+  ],
+  "version": "1.0.0",
+  "description": "REST connector for stripe",
+  "connector_type": "stripe",
+  "category": "api_saas",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "destination_modes": ["append", "upsert", "delete"],
+  "supports_cdc": false,
+  "supports_ddl": false,
+  "auto_create_destination_tables": false,
+  "spec_version": "1.1",
+  "generated_at": "2026-08-29T11:56:37.728469",
+  "status": "active",  "quality_tier": "gold",  "default_headers": {},
+  "header_config_keys": [],
+  "base_url": "https://api.stripe.com/v1",
+  "auth_type": "bearer",  "supported_auth_methods": [    {
+      "method": "bearer",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer ",
+      "config_keys": ["access_token", "token", "secret_key", "api_key"],      "description": "Stripe secret key used as HTTP Basic auth password (Bearer in header)"    }  ],  "required_config": [
+  ],
+  "config_aliases": {},
+  "optional_config": [
+    "base_url",
+    "access_token"
+  ],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "base_url": {
+        "type": "string",
+        "description": "Base URL of your API instance (e.g. https://your-host). Defaults to the value from the API spec \u2014 override it to point at your own self-hosted server.",
+        "default": "https://api.stripe.com/v1"      },
+      "access_token": {
+        "type": "string",
+        "description": "Access token / bearer credential used to authenticate requests.",
+        "secret": true      }
+    },
+    "required": [
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "base_url": {
+        "type": "string",
+        "description": "Base URL of your API instance (e.g. https://your-host). Defaults to the value from the API spec \u2014 override it to point at your own self-hosted server.",
+        "default": "https://api.stripe.com/v1"      },
+      "access_token": {
+        "type": "string",
+        "description": "Access token / bearer credential used to authenticate requests.",
+        "secret": true      }
+    },
+    "required": [
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": ["json"],
+    "supported_modalities": ["structured"],    "supports_cdc": false,
+    "supports_ddl": false,
+    "auto_create_destination_tables": false  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity to the API",
+      "method": "stripe_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate connection configuration",
+      "method": "stripe_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover available resources and their schemas",
+      "method": "stripe_discover_schema"
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities",
+      "method": "stripe_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export records from a REST resource with automatic pagination",
+      "method": "stripe_export",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Resource name to export"
+        },
+        {
+          "name": "max_pages",
+          "type": "integer",
+          "required": false,
+          "default": 10,
+          "description": "Maximum pages to fetch"
+        },
+        {
+          "name": "max_records",
+          "type": "integer",
+          "required": false,
+          "default": 10000,
+          "description": "Maximum records to return"
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "required": false,
+          "description": "Incremental sync cursor (ISO-8601 timestamp)"
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination resumption cursor"
+        }
+      ]
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Append records into a REST resource (POST)",
+      "method": "stripe_import_data",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Target resource name"
+        },
+        {
+          "name": "records",
+          "type": "array",
+          "required": true,
+          "description": "Records to import"
+        }
+      ]
+    },
+    {
+      "name": "upsert_data",
+      "type": "destination",
+      "description": "Idempotently upsert records into a REST resource (PUT on id, POST on miss)",
+      "method": "stripe_upsert_data",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Target resource name"
+        },
+        {
+          "name": "records",
+          "type": "array",
+          "required": true,
+          "description": "Records to upsert"
+        },
+        {
+          "name": "key_fields",
+          "type": "array",
+          "required": false,
+          "description": "Columns identifying a row (defaults to the resource id field)"
+        }
+      ]
+    },
+    {
+      "name": "delete_data",
+      "type": "destination",
+      "description": "Delete records from a REST resource by id (DELETE)",
+      "method": "stripe_delete_data",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Target resource name"
+        },
+        {
+          "name": "records",
+          "type": "array",
+          "required": true,
+          "description": "Records (each carrying the key) to delete"
+        },
+        {
+          "name": "key_fields",
+          "type": "array",
+          "required": false,
+          "description": "Columns identifying a row (defaults to the resource id field)"
+        }
+      ]
+    },
+    {
+      "name": "customers",
+      "type": "source",
+      "description": "Export records from customers (/customers)",
+      "method": "stripe_customers"
+    },
+    {
+      "name": "invoices",
+      "type": "source",
+      "description": "Export records from invoices (/invoices)",
+      "method": "stripe_invoices"
+    },
+    {
+      "name": "charges",
+      "type": "source",
+      "description": "Export records from charges (/charges)",
+      "method": "stripe_charges"
+    },
+    {
+      "name": "payment_intents",
+      "type": "source",
+      "description": "Export records from payment_intents (/payment_intents)",
+      "method": "stripe_payment_intents"
+    },
+    {
+      "name": "subscriptions",
+      "type": "source",
+      "description": "Export records from subscriptions (/subscriptions)",
+      "method": "stripe_subscriptions"
+    },
+    {
+      "name": "products",
+      "type": "source",
+      "description": "Export records from products (/products)",
+      "method": "stripe_products"
+    },
+    {
+      "name": "prices",
+      "type": "source",
+      "description": "Export records from prices (/prices)",
+      "method": "stripe_prices"
+    },
+    {
+      "name": "refunds",
+      "type": "source",
+      "description": "Export records from refunds (/refunds)",
+      "method": "stripe_refunds"
+    }
+  ],
+  "resources": [
+    {
+      "name": "customers",
+      "endpoint": "/customers",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "cursor",
+      "cursor_mode": "last_item_id",
+      "cursor_path": "",
+      "pagination_param": "starting_after",
+      "limit_param": "limit",
+      "response_data_key": "data",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get",
+        "create",
+        "update",
+        "delete"
+      ]
+    },
+    {
+      "name": "invoices",
+      "endpoint": "/invoices",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "cursor",
+      "cursor_mode": "last_item_id",
+      "cursor_path": "",
+      "pagination_param": "starting_after",
+      "limit_param": "limit",
+      "response_data_key": "data",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    },
+    {
+      "name": "charges",
+      "endpoint": "/charges",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "cursor",
+      "cursor_mode": "last_item_id",
+      "cursor_path": "",
+      "pagination_param": "starting_after",
+      "limit_param": "limit",
+      "response_data_key": "data",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    },
+    {
+      "name": "payment_intents",
+      "endpoint": "/payment_intents",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "cursor",
+      "cursor_mode": "last_item_id",
+      "cursor_path": "",
+      "pagination_param": "starting_after",
+      "limit_param": "limit",
+      "response_data_key": "data",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    },
+    {
+      "name": "subscriptions",
+      "endpoint": "/subscriptions",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "cursor",
+      "cursor_mode": "last_item_id",
+      "cursor_path": "",
+      "pagination_param": "starting_after",
+      "limit_param": "limit",
+      "response_data_key": "data",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    },
+    {
+      "name": "products",
+      "endpoint": "/products",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "cursor",
+      "cursor_mode": "last_item_id",
+      "cursor_path": "",
+      "pagination_param": "starting_after",
+      "limit_param": "limit",
+      "response_data_key": "data",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get",
+        "create",
+        "update"
+      ]
+    },
+    {
+      "name": "prices",
+      "endpoint": "/prices",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "cursor",
+      "cursor_mode": "last_item_id",
+      "cursor_path": "",
+      "pagination_param": "starting_after",
+      "limit_param": "limit",
+      "response_data_key": "data",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    },
+    {
+      "name": "refunds",
+      "endpoint": "/refunds",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "cursor",
+      "cursor_mode": "last_item_id",
+      "cursor_path": "",
+      "pagination_param": "starting_after",
+      "limit_param": "limit",
+      "response_data_key": "data",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    }
+  ],
+  "license": "MIT"
+}
+

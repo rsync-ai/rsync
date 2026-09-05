@@ -1,0 +1,203 @@
+{{- if eq .Values.objectStorage.mode "minio" }}
+{{/*
+Bundled object storage — the batch staging area between the export and the sink.
+objectStorage.mode=external swaps this for S3 / GCS / Azure Blob and renders
+nothing here; on EKS/GKE/AKS that is the recommended shape, because this is a
+single pod on a ReadWriteOnce volume and the data in it is live pipeline state
+between the two halves of a transfer, not a cache.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-minio
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9000
+      targetPort: api
+      name: api
+    - port: 9001
+      targetPort: console
+      name: console
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-minio
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio
+spec:
+  serviceName: {{ include "rsync-ai.fullname" . }}-minio
+  replicas: 1
+  selector:
+    matchLabels:
+{{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: minio
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: minio
+      {{- with .Values.global.podAnnotations }}
+      annotations:
+{{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: minio
+          image: {{ .Values.objectStorage.minio.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          args: ["server", "/data", "--console-address", ":9001"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: MINIO_ACCESS_KEY
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: MINIO_SECRET_KEY
+          ports:
+            - name: api
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+{{- toYaml .Values.objectStorage.minio.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{/*
+          Per-component first, global as the fallback. Both keys have shipped in
+          values.yaml since the chart landed, but ONLY the global one was ever
+          read: setting objectStorage.minio.persistence.storageClass was
+          silently ignored and the PVC fell through to the cluster default. An
+          inert key in values.yaml is worse than an absent one, because
+          values.yaml is the file an operator copies to build an overlay.
+          (KI-CHART-DEAD-PER-COMPONENT-STORAGECLASS.)
+        */}}
+        {{- with (default .Values.global.storageClass .Values.objectStorage.minio.persistence.storageClass) }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.objectStorage.minio.persistence.size | quote }}
+---
+{{/*
+Bucket creation. The compose stack does this with a one-shot `mc` container;
+here it is a post-install/post-upgrade Hook so it runs after MinIO is up and is
+not left behind as a permanently-Completed pod in `kubectl get pods`.
+
+Idempotent by construction: `mb --ignore-existing` is a no-op on re-run, which
+matters because a Hook re-runs on every `helm upgrade`.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-minio-mb
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: minio-mb
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: minio-mb
+    spec:
+      restartPolicy: OnFailure
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: mc
+          image: {{ .Values.objectStorage.minio.mcImage | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            - name: MINIO_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: MINIO_ACCESS_KEY
+            - name: MINIO_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: MINIO_SECRET_KEY
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              # mc writes its configuration under $MC_CONFIG_DIR, defaulting to
+              # $HOME/.mc. This pod runs as uid 1000 with no home directory, so HOME
+              # is "/" and the default path is unwritable -- mc then fails with
+              # "mkdir /.mc: permission denied" on every attempt, forever.
+              export MC_CONFIG_DIR=/tmp/.mc
+              # Bounded, and it reports what actually failed. The unbounded form of
+              # this loop discarded mc's stderr, which turned a PERMANENT error into
+              # "waiting for minio..." repeated until the end of time -- and because
+              # this Job is a post-install hook, `helm install` never returned either.
+              # The operator was told MinIO was slow; MinIO was healthy the whole time.
+              attempt=0
+              until mc alias set rsync {{ include "rsync-ai.minio.endpoint" . }} "$MINIO_ACCESS_KEY" "$MINIO_SECRET_KEY" >/tmp/mc-alias.err 2>&1; do
+                attempt=$((attempt + 1))
+                if [ "$attempt" -ge 40 ]; then
+                  echo "ERROR: could not reach MinIO at {{ include "rsync-ai.minio.endpoint" . }} after ${attempt} attempts. Last error:" >&2
+                  cat /tmp/mc-alias.err >&2
+                  exit 1
+                fi
+                echo "waiting for minio (attempt ${attempt}/40)..."
+                sleep 3
+              done
+              mc mb --ignore-existing rsync/{{ .Values.objectStorage.bucket }}
+              # Expire abandoned staging objects. Newer mc spells this `ilm rule add`,
+              # older `ilm add`; neither failing is fatal, because sink-side delete is
+              # the primary cleanup and this rule only reaps what a failed run left.
+              mc ilm rule add rsync/{{ .Values.objectStorage.bucket }} \
+                    --expire-days "{{ .Values.objectStorage.stagingExpireDays }}" \
+                    --prefix "{{ .Values.objectStorage.prefix }}/" \
+                || mc ilm add rsync/{{ .Values.objectStorage.bucket }} \
+                    --expiry-days "{{ .Values.objectStorage.stagingExpireDays }}" \
+                    --prefix "{{ .Values.objectStorage.prefix }}/" \
+                || echo "WARN: could not set ILM rule (mc version?); sink-side delete is primary cleanup"
+              echo "bucket {{ .Values.objectStorage.bucket }} ready"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+{{- end }}

@@ -1,0 +1,10 @@
+# Requirements for the Snowflake MCP connector.
+# Snowflake ships a PEP-249 DB-API 2.0 driver (snowflake-connector-python).
+
+# HTTP server for Docker deployment
+fastapi>=0.100.0
+uvicorn>=0.22.0
+pydantic>=2.0.0
+
+# Snowflake driver (DB-API)
+snowflake-connector-python>=3.0.0

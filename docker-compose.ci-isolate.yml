@@ -1,0 +1,90 @@
+# CI isolation override for docker-compose.yml (+e2e) — app stack (dc_main)
+# AUTO-GENERATED (from worktree compose). Applied by run_gate.sh ONLY when STACK_PREFIX != rsync-ai.
+services:
+  api-gateway:
+    container_name: ${STACK_PREFIX:-rsync-ai}-api-gateway
+  connector-deployer:
+    # Same-name-collision class as schema-registry below: the base
+    # container_name (rsync-ai-connector-deployer) is hardcoded, so without this
+    # re-pin the isolated CI stack squats the bare rsync-ai-connector-deployer
+    # name and collides with a warm rsync-ai staging/prod deployer.
+    container_name: ${STACK_PREFIX:-rsync-ai}-connector-deployer
+  connector-fs-init:
+    # Same collision class: the base one-shot (#648) hardcodes
+    # container_name: rsync-ai-connector-fs-init (which MUST stay that exact name
+    # in the prod render — preflight-prod-config.sh asserts it). Without this
+    # re-pin the isolated CI stack reuses the bare rsync-ai-connector-fs-init
+    # name, so a leftover Exited(0) busybox from a prior warm-stack run blocks
+    # recreate and fails compose-up on the shared self-hosted runner.
+    container_name: ${STACK_PREFIX:-rsync-ai}-connector-fs-init
+  context7-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-context7-v1-0-0-mcp
+  debezium-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-debezium-v1-0-0-mcp
+  docker-socket-proxy:
+    container_name: ${STACK_PREFIX:-rsync-ai}-docker-socket-proxy
+  fluent-bit:
+    container_name: ${STACK_PREFIX:-rsync-ai}-fluent-bit
+  frontend:
+    container_name: ${STACK_PREFIX:-rsync-ai}-frontend
+  kafka:
+    container_name: ${STACK_PREFIX:-rsync-ai}-kafka
+  kafka-connect:
+    container_name: ${STACK_PREFIX:-rsync-ai}-kafka-connect
+  kafka-init:
+    container_name: ${STACK_PREFIX:-rsync-ai}-kafka-init
+  kafka-mcp-sink-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-kafka-mcp-sink-v1-0-0-mcp
+    environment:
+      # docker-compose.yml defaults this to the dev stack's CONTAINER name
+      # (rsync-ai-minio), which does not exist once STACK_PREFIX renames it.
+      # Claim-check staging of >256KB pages then fails against a dead host and
+      # the batch silently falls back, so 100k-row loads time out at
+      # stage=executor. The orchestrator escapes this only because
+      # docker-compose.e2e.yml:21 already pins it.
+      MINIO_ENDPOINT_URL: http://${STACK_PREFIX:-rsync-ai}-minio:9000
+  llm-service:
+    container_name: ${STACK_PREFIX:-rsync-ai}-llm-service
+  minio:
+    container_name: ${STACK_PREFIX:-rsync-ai}-minio
+  minio-lifecycle-init:
+    container_name: ${STACK_PREFIX:-rsync-ai}-minio-lifecycle-init
+  minio-mcp:
+    container_name: ${STACK_PREFIX:-rsync-ai}-minio-v1-0-0-mcp
+    environment:
+      # See kafka-mcp-sink-mcp above — same STACK_PREFIX gap.
+      MINIO_ENDPOINT_URL: http://${STACK_PREFIX:-rsync-ai}-minio:9000
+  orchestrator:
+    container_name: ${STACK_PREFIX:-rsync-ai}-orchestrator
+  otel-collector:
+    container_name: ${STACK_PREFIX:-rsync-ai}-otel-collector
+  planner:
+    container_name: ${STACK_PREFIX:-rsync-ai}-planner
+  postgres:
+    container_name: ${STACK_PREFIX:-rsync-ai}-postgres
+  redis:
+    container_name: ${STACK_PREFIX:-rsync-ai}-redis
+  schema-registry:
+    # NOTE: schema-registry is behind a compose `profiles:` gate, so it is
+    # excluded from `docker compose config` and was missed by the override
+    # generator. It MUST be re-pinned or the isolated stack creates a bare
+    # `schema-registry` that collides with a warm rsync-ai stack.
+    container_name: ${STACK_PREFIX:-rsync-ai}-schema-registry
+  temporal:
+    container_name: ${STACK_PREFIX:-rsync-ai}-temporal
+  temporal-adapter:
+    container_name: ${STACK_PREFIX:-rsync-ai}-temporal-adapter
+  temporal-admin-tools:
+    container_name: ${STACK_PREFIX:-rsync-ai}-temporal-admin-tools
+  temporal-ui:
+    container_name: ${STACK_PREFIX:-rsync-ai}-temporal-ui
+  tool-generator:
+    container_name: ${STACK_PREFIX:-rsync-ai}-tool-generator
+networks:
+  default:
+    name: ${STACK_PREFIX:-rsync-ai}_default
+  rsync-ai-mcp:
+    name: ${STACK_PREFIX:-rsync-ai}-mcp
+volumes:
+  tool_generator_oauth_tokens:
+    name: ${STACK_PREFIX:-rsync-ai}-oauth-tokens

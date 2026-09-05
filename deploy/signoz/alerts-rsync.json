@@ -1,0 +1,130 @@
+{
+  "_comment": "SigNoz metric alert rules for rsync-ai (F-Obs-2). Each object is a separate alert created via SigNoz UI (Alerts -> New Alert -> PromQL) or the SigNoz alerts API (POST /api/v1/rules). Queries reference the domain metrics scraped by the otel-collector prometheus receiver. Tune targets to your traffic before enabling in prod. Token-expiry alerting is intentionally NOT here: no token-expiry gauge is emitted yet (tracked separately); these alerts cover only metrics the services actually export.",
+  "rules": [
+    {
+      "alert": "rsync — DLQ messages detected",
+      "alertType": "METRIC_BASED_ALERT",
+      "ruleType": "threshold_rule",
+      "condition": {
+        "compositeQuery": {
+          "queryType": "promql",
+          "panelType": "graph",
+          "promQueries": {
+            "A": { "query": "sum(rate(rsync_dlq_messages_total[5m]))", "disabled": false }
+          }
+        },
+        "op": ">",
+        "target": 0,
+        "matchType": "1",
+        "targetUnit": ""
+      },
+      "labels": { "severity": "critical", "service": "orchestrator" },
+      "annotations": {
+        "summary": "Messages are being routed to a dead-letter queue",
+        "description": "rsync_dlq_messages_total is increasing — data may be silently dropped. Inspect the DLQ topic and the healer replay status."
+      },
+      "evalWindow": "5m0s",
+      "frequency": "1m0s"
+    },
+    {
+      "alert": "rsync — Gateway 5xx error rate high",
+      "alertType": "METRIC_BASED_ALERT",
+      "ruleType": "threshold_rule",
+      "condition": {
+        "compositeQuery": {
+          "queryType": "promql",
+          "panelType": "graph",
+          "promQueries": {
+            "A": { "query": "sum(rate(rsync_gateway_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(rsync_gateway_http_requests_total[5m])), 1)", "disabled": false }
+          }
+        },
+        "op": ">",
+        "target": 0.05,
+        "matchType": "2",
+        "targetUnit": ""
+      },
+      "labels": { "severity": "critical", "service": "api-gateway" },
+      "annotations": {
+        "summary": "api-gateway is returning 5xx for >5% of requests",
+        "description": "Server-error ratio exceeded 5% for the evaluation window. Check api-gateway logs and downstream (orchestrator, DB) health."
+      },
+      "evalWindow": "5m0s",
+      "frequency": "1m0s"
+    },
+    {
+      "alert": "rsync — Auth-failure spike",
+      "alertType": "METRIC_BASED_ALERT",
+      "ruleType": "threshold_rule",
+      "condition": {
+        "compositeQuery": {
+          "queryType": "promql",
+          "panelType": "graph",
+          "promQueries": {
+            "A": { "query": "sum(rate(rsync_gateway_auth_failures_total[5m]))", "disabled": false }
+          }
+        },
+        "op": ">",
+        "target": 5,
+        "matchType": "2",
+        "targetUnit": ""
+      },
+      "labels": { "severity": "warning", "service": "api-gateway" },
+      "annotations": {
+        "summary": "Elevated 401/403 rate at the gateway",
+        "description": "Sustained auth failures (>5/s) — possible credential stuffing, or broken/expired tokens after a deploy. Correlate with recent releases."
+      },
+      "evalWindow": "5m0s",
+      "frequency": "1m0s"
+    },
+    {
+      "alert": "rsync — Healer escalations",
+      "alertType": "METRIC_BASED_ALERT",
+      "ruleType": "threshold_rule",
+      "condition": {
+        "compositeQuery": {
+          "queryType": "promql",
+          "panelType": "graph",
+          "promQueries": {
+            "A": { "query": "sum(rate(rsync_healer_actions_total{outcome=\"escalated\"}[15m]))", "disabled": false }
+          }
+        },
+        "op": ">",
+        "target": 0,
+        "matchType": "1",
+        "targetUnit": ""
+      },
+      "labels": { "severity": "warning", "service": "orchestrator" },
+      "annotations": {
+        "summary": "Sentinel healer is escalating to a human operator",
+        "description": "rsync_healer_actions_total{outcome=\"escalated\"} increased — automated recovery could not resolve a fault. Check the escalation reason in the healer logs."
+      },
+      "evalWindow": "15m0s",
+      "frequency": "1m0s"
+    },
+    {
+      "alert": "rsync — Pipeline failure rate high",
+      "alertType": "METRIC_BASED_ALERT",
+      "ruleType": "threshold_rule",
+      "condition": {
+        "compositeQuery": {
+          "queryType": "promql",
+          "panelType": "graph",
+          "promQueries": {
+            "A": { "query": "sum(rate(rsync_pipeline_runs_total{status=\"failed\"}[30m])) / clamp_min(sum(rate(rsync_pipeline_runs_total[30m])), 1)", "disabled": false }
+          }
+        },
+        "op": ">",
+        "target": 0.2,
+        "matchType": "2",
+        "targetUnit": ""
+      },
+      "labels": { "severity": "warning", "service": "orchestrator" },
+      "annotations": {
+        "summary": "More than 20% of pipeline runs are failing",
+        "description": "Failed-run ratio exceeded 20% over 30m. Inspect recent executions and connector health (rsync_mcp_calls_total{status=\"failure\"})."
+      },
+      "evalWindow": "30m0s",
+      "frequency": "5m0s"
+    }
+  ]
+}

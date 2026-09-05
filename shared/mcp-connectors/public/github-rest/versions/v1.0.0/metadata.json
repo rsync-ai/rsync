@@ -1,0 +1,172 @@
+{
+  "id": "github-rest",
+  "name": "Github-Rest",
+  "display_name": "GitHub REST",
+  "aliases": [
+    "github-rest",
+    "github_rest",
+    "Github-Rest",
+    "github-rest"
+  ],
+  "version": "1.0.0",
+  "description": "github-rest connector",
+  "connector_type": "github-rest",
+  "category": "api_saas",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": false,
+  "destination_modes": [],
+  "supports_cdc": false,
+  "supports_ddl": false,
+  "auto_create_destination_tables": false,
+  "spec_version": "1.1",
+  "generated_at": "2026-06-19T14:11:28.695382",
+  "status": "active",
+  "quality_tier": "silver",
+  "default_headers": {},
+  "header_config_keys": [],
+  "auth_type": "bearer",
+  "supported_auth_methods": [
+    {
+      "method": "bearer",
+      "header_name": "Authorization",
+      "header_prefix": "Bearer",
+      "config_keys": [
+        "access_token"
+      ],
+      "description": "GitHub personal access token sent as a Bearer token in the Authorization header."
+    }
+  ],
+  "required_config": [
+    "access_token"
+  ],
+  "optional_config": [],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "access_token": {
+        "type": "string",
+        "description": "GitHub personal access token, sent as a Bearer token in the Authorization header.",
+        "secret": true
+      }
+    },
+    "required": [
+      "access_token"
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "access_token": {
+        "type": "string",
+        "description": "GitHub personal access token, sent as a Bearer token in the Authorization header.",
+        "secret": true
+      }
+    },
+    "required": [
+      "access_token"
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": [
+      "json"
+    ],
+    "supports_cdc": false,
+    "supports_ddl": false,
+    "auto_create_destination_tables": false
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity to the API",
+      "method": "github-rest_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate connection configuration",
+      "method": "github-rest_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover available resources and their schemas",
+      "method": "github-rest_discover_schema"
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities",
+      "method": "github-rest_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export records from a REST resource with automatic pagination",
+      "method": "github-rest_export",
+      "parameters": [
+        {
+          "name": "resource",
+          "type": "string",
+          "required": true,
+          "description": "Resource name to export"
+        },
+        {
+          "name": "max_pages",
+          "type": "integer",
+          "required": false,
+          "default": 10,
+          "description": "Maximum pages to fetch"
+        },
+        {
+          "name": "max_records",
+          "type": "integer",
+          "required": false,
+          "default": 10000,
+          "description": "Maximum records to return"
+        },
+        {
+          "name": "since",
+          "type": "string",
+          "required": false,
+          "description": "Incremental sync cursor (ISO-8601 timestamp)"
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Pagination resumption cursor"
+        }
+      ]
+    },
+    {
+      "name": "licenses",
+      "type": "source",
+      "description": "Export records from licenses (/licenses)",
+      "method": "github-rest_licenses"
+    }
+  ],
+  "resources": [
+    {
+      "name": "licenses",
+      "endpoint": "/licenses",
+      "path_params": [],
+      "id_field": "id",
+      "pagination_type": "none",
+      "cursor_mode": "response",
+      "cursor_path": "",
+      "pagination_param": "",
+      "limit_param": "limit",
+      "response_data_key": "",
+      "max_page_size": 100,
+      "supports": [
+        "list",
+        "get"
+      ]
+    }
+  ],
+  "license": "MIT"
+}

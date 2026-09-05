@@ -1,0 +1,45 @@
+apiVersion: v2
+name: rsync-ai
+description: >-
+  rsync.ai data-movement platform — cloud-agnostic Kubernetes chart. Runs the
+  same images as the compose stack; EKS, GKE and AKS differ only by values file.
+type: application
+
+# Chart version. Released in lockstep with appVersion: the workflow derives both
+# from the same git tag, so a chart and the images it points at are never skewed.
+version: 0.1.1
+
+# appVersion is the image tag the chart defaults to (global.image.tag is empty,
+# so every component resolves through here). The release job overwrites BOTH this
+# and `version` with the git tag via `helm package --version/--app-version`, so
+# the values below only matter for `helm install ./deploy/helm/rsync-ai` from a
+# checkout. Keep them at the latest COMPLETE release.
+#
+# 0.1.1, not 0.1.0, and this is load-bearing rather than cosmetic: the chart pins
+# mcp-minio, whose build job is the one job that FAILED in the v0.1.0 release run
+# (it pointed at a Dockerfile deleted by #184; fixed in #854). ghcr.io/rsync-ai/
+# mcp-minio:0.1.0 therefore does not exist, and a chart pinning 0.1.0 comes up
+# with five healthy pods and one permanent ImagePullBackOff. v0.1.1 published
+# 31/31. Do not "revert" this to 0.1.0 without re-checking that run.
+appVersion: "0.1.1"
+
+keywords:
+  - etl
+  - cdc
+  - data-pipeline
+  - kafka
+  - debezium
+home: https://rsync.ai
+sources:
+  - https://github.com/rsync-ai/rsync
+maintainers:
+  - name: rsync.ai
+    url: https://github.com/rsync-ai/rsync
+
+annotations:
+  # There are no chart dependencies on purpose. Bitnami's postgresql/kafka/redis
+  # subcharts would drag in their own image registries, their own upgrade
+  # semantics and their own CVE cadence — and the whole point of the BYO toggles
+  # is that a customer running managed RDS/MSK/ElastiCache disables ours anyway.
+  # The in-chart infra is a *dev-grade* single replica, spelled out in values.yaml.
+  artifacthub.io/prerelease: "true"

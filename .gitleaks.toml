@@ -1,0 +1,64 @@
+# gitleaks configuration — https://github.com/gitleaks/gitleaks
+#
+# Extends the default ruleset and allowlists ONLY known dummy secrets that live in
+# test fixtures (they exercise our secret-scrubbing code paths). Every entry here
+# must be a verified non-secret. Do NOT silence a real finding by adding it here.
+#
+# TWO INVARIANTS, both enforced by scripts/check-gitleaks-allowlist.sh in CI:
+#
+#   1. Every block is rule-scoped (`targetRules`). No block may exempt a file from
+#      EVERY rule. A file that trips `generic-api-key` keeps being scanned for AWS
+#      keys, private keys and the ~180 other rules.
+#   2. Every path names one real file and matches it. A pattern is sized to the
+#      thing that was actually verified, never to what was convenient to write.
+#
+# Why so strict: gitleaks accepts unknown allowlist keys in silence. Writing
+# `rules = [...]` (not a field — the real one is `targetRules`) looks like scoping
+# and is in fact a blanket exemption for those paths, with no warning at any log
+# level. That shipped here: one '''.*_test\.go$''' entry exempted all 377 Go test
+# files from every rule, so a real key committed into any of them would never have
+# been reported. Invariant 1 is what makes that mistake loud — a block that loses
+# its scope reads as blanket and fails the check.
+[extend]
+useDefault = true
+
+# Filler encryption keys, session tokens and Slack signing secrets passed to
+# t.Setenv or declared as test constants; fake canary secrets that MUST look real
+# to prove the PII/secret scrubber redacts them (#624); and the public Azurite
+# well-known devstoreaccount1 key in one e2e script.
+#
+# Each value was checked against the live production environment by hash and length:
+# none of them matches a real credential.
+[[allowlists]]
+description = "Fixtures that trip generic-api-key — verified non-credentials."
+# The field is `targetRules`, NOT `rules`. See the header: `rules` is ignored in
+# silence and turns this block back into a blanket exemption.
+targetRules = ["generic-api-key"]
+paths = [
+  '''api-gateway/internal/email/resend_test\.go$''',
+  '''api-gateway/internal/handlers/connection_mutation_scoping_test\.go$''',
+  '''api-gateway/internal/handlers/session_token_at_rest_test\.go$''',
+  '''api-gateway/internal/handlers/slack_interactions_test\.go$''',
+  '''api-gateway/internal/handlers/workspace_create_role_gate_test\.go$''',
+  '''api-gateway/internal/handlers/workspace_scoping_test\.go$''',
+  '''api-gateway/internal/slack/verify_test\.go$''',
+  '''shared/go/crypto/session_token_test\.go$''',
+  # Fake Shopify access token in the shopify connector's secret-scrubbing unit test.
+  '''shared/mcp-connectors/public/shopify-admin-graphql/versions/.*/test_bulk_operations\.py$''',
+  # Security scrubber test + golden (#624): the scrubber's own test inputs.
+  '''shared/mcp-connectors/tests/test_log_scrubbing\.py$''',
+  '''shared/scrubber_golden\.json$''',
+  # PUBLIC Azurite / Azure Storage Emulator well-known devstoreaccount1 key —
+  # documented, not secret. Was '''e2e/.*\.sh$''' across all rules, exempting 20
+  # scripts for one key that appears in one of them.
+  '''e2e/test_blob_passthrough_objstore\.sh$''',
+]
+
+[[allowlists]]
+description = "In-app curl placeholder — no credential."
+# "Paste a curl from the docs" placeholder in the connector discovery UI; the
+# curl-auth-header rule misfires on the word curl.
+targetRules = ["curl-auth-header"]
+paths = [
+  '''frontend/src/components/connectors/discovery/DiscoveryFlow\.tsx$''',
+]

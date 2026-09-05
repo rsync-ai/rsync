@@ -1,0 +1,118 @@
+{{- if .Values.temporalAdapter.enabled }}
+{{- $fullname := include "rsync-ai.fullname" . }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fullname }}-temporal-adapter
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: temporal-adapter
+spec:
+  replicas: {{ .Values.temporalAdapter.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: temporal-adapter
+  template:
+    metadata:
+      labels:
+        {{- include "rsync-ai.labels" . | nindent 8 }}
+        app.kubernetes.io/component: temporal-adapter
+        {{- with .Values.global.podLabels }}{{- toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      initContainers:
+        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.temporalAdapter.image) | nindent 8 }}
+        {{- /*
+        Same local-filesystem dependency as the api-gateway: the connector-check
+        activity resolves a connector by stat-ing the catalog on THIS pod's disk
+        (backend-temporal-adapter/internal/workflows/connector_check_activity.go
+        :79-135 walks /app/shared/mcp-connectors{,/public,/internal} and /app/tools).
+        Without the catalog every connector reads as missing, and
+        nl_pipeline_v2_workflow.go:869-880 then transitions the run to
+        StateFailed with "Missing connector: <type>" -- the workflow-side twin of
+        the gateway's 422. Invisible on compose, where this arrives as a bind mount.
+        */}}
+        {{- include "rsync-ai.catalogInitContainer" . | nindent 8 }}
+      containers:
+        - name: temporal-adapter
+          image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.temporalAdapter.image) }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          ports:
+            - name: metrics
+              containerPort: 8082
+          env:
+            {{- include "rsync-ai.commonEnv" . | nindent 12 }}
+            {{- include "rsync-ai.kafkaEnv" . | nindent 12 }}
+            - name: TEMPORAL_ADDRESS
+              value: {{ include "rsync-ai.temporal.address" . | quote }}
+            - name: TEMPORAL_NAMESPACE
+              value: {{ .Values.temporal.external.namespace | default "default" | quote }}
+            # This service reads POSTGRES_* (not the DB_* the orchestrator uses).
+            # The names are not interchangeable — it refuses to start when it
+            # cannot resolve a DSN, which is the intended behaviour but reads as
+            # a crash-loop with no obvious cause if you set the wrong family.
+            - name: POSTGRES_HOST
+              value: {{ include "rsync-ai.postgres.host" . | quote }}
+            - name: POSTGRES_PORT
+              value: {{ include "rsync-ai.postgres.port" . | quote }}
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.database | quote }}
+            # internal/db/db.go:23, default "disable" -- see the DB_SSLMODE note
+            # in _helpers.tpl. Omitted, this connects in plaintext regardless of
+            # what postgresql.external.sslMode says.
+            - name: POSTGRES_SSLMODE
+              value: {{ include "rsync-ai.postgres.sslmode" . | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: POSTGRES_PASSWORD
+            - name: REDIS_ADDRESS
+              value: {{ include "rsync-ai.redis.address" . | quote }}
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: REDIS_PASSWORD
+                  optional: true
+            - name: ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: ENCRYPTION_KEY
+            - name: METRICS_ADDR
+              value: ":8082"
+          # This service serves NO /health — port 8082 is the Prometheus
+          # /metrics endpoint and nothing else (cmd/adapter/main.go:145-162).
+          # A TCP check therefore proves the process is up and past its DSN
+          # guard; it does NOT prove the Temporal worker registered or is
+          # polling its task queue. Do not read a green probe here as "workflows
+          # are being served" — check the Temporal UI / tctl for that.
+          readinessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            tcpSocket: { port: metrics }
+            initialDelaySeconds: 60
+            periodSeconds: 30
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.temporalAdapter.resources | nindent 12 }}
+          volumeMounts:
+            - name: connector-catalog
+              mountPath: /app/shared/mcp-connectors
+            {{- include "rsync-ai.kafkaTLSVolumeMount" . | nindent 12 }}
+      volumes:
+        {{- include "rsync-ai.catalogVolume" . | nindent 8 }}
+        {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
+{{- end }}

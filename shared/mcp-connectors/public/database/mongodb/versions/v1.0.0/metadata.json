@@ -1,0 +1,321 @@
+{
+  "id": "mongodb",
+  "name": "MongoDB",
+  "display_name": "MongoDB",
+  "aliases": [
+    "mongodb",
+    "mongo",
+    "mongodb_atlas",
+    "atlas"
+  ],
+  "version": "1.0.0",
+  "description": "Connector for MongoDB / MongoDB Atlas. Batch + CDC source (pymongo / Debezium change streams) AND destination (import/upsert/delete keyed on _id; collections auto-create, no DDL).",
+  "connector_type": "mongodb",
+  "category": "document_db",
+  "supported_versions": {
+    "batch": "MongoDB 4.4 and later; MongoDB Atlas (all tiers). pymongo 4.x driver.",
+    "cdc": "MongoDB 4.4+ / Atlas via Debezium change streams — requires a replica set or sharded cluster (a standalone mongod cannot emit change streams). capture.mode=change_streams_update_full so every update carries a full post-image.",
+    "destination": "Any writable MongoDB / Atlas deployment. Idempotent upsert/delete keyed on _id (or a relational source's key_fields); collections auto-create on first write."
+  },
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": true,
+  "supports_cdc": true,
+  "supports_ddl": false,
+  "auto_create_destination_tables": true,
+  "spec_version": "1.0",
+  "generated_at": "2026-07-04T00:00:00.000000",
+  "status": "active",
+  "production_verified": true,
+  "quality_tier": "bronze",
+  "quality_score": 34.0,
+  "qa_metadata": {
+    "export_attempts": [
+      {
+        "error": null,
+        "passed": true,
+        "response_sample": {
+          "message": "Skipped (no runtime fixture)",
+          "success": true
+        },
+        "status": "",
+        "test": "document_db_export_smoke",
+        "warning": null
+      }
+    ],
+    "export_validated_with": null,
+    "export_validation_status": "validated",
+    "tests_failed": 0,
+    "tests_passed": 6
+  },
+  "auth_type": "basic",
+  "supported_auth_methods": [
+    {
+      "method": "basic",
+      "header_name": "",
+      "header_prefix": "",
+      "config_keys": [
+        "user",
+        "password"
+      ],
+      "description": "MongoDB username/password (SCRAM) authentication. Omit for an unauthenticated deployment."
+    }
+  ],
+  "required_config": [
+    "host",
+    "database"
+  ],
+  "optional_config": [
+    "port",
+    "user",
+    "password",
+    "replica_set",
+    "auth_source",
+    "connection_string",
+    "tls"
+  ],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string",
+        "description": "MongoDB host (e.g. mongo.internal or cluster0.abcd.mongodb.net). Ignored when connection_string is set."
+      },
+      "port": {
+        "type": "integer",
+        "description": "MongoDB port (default 27017). Ignored for mongodb+srv:// / connection_string."
+      },
+      "database": {
+        "type": "string",
+        "description": "Database name whose collections are discovered/captured."
+      },
+      "user": {
+        "type": "string",
+        "description": "MongoDB username (SCRAM). Optional for an unauthenticated deployment."
+      },
+      "password": {
+        "type": "string",
+        "description": "MongoDB password",
+        "secret": true
+      },
+      "replica_set": {
+        "type": "string",
+        "description": "Replica set name (e.g. rs0). Required for CDC unless connection_string encodes it. Enables replica-set topology discovery."
+      },
+      "auth_source": {
+        "type": "string",
+        "description": "Authentication database (default 'admin')."
+      },
+      "connection_string": {
+        "type": "string",
+        "description": "Full MongoDB URI (mongodb:// or mongodb+srv://). Wins over discrete fields — required for Atlas SRV."
+      },
+      "tls": {
+        "type": "string",
+        "description": "TLS mode: 'true'/'require' to force TLS. Auto-on for *.mongodb.net (Atlas)."
+      }
+    },
+    "required": [
+      "host",
+      "database"
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+      "host": {
+        "type": "string",
+        "description": "MongoDB host"
+      },
+      "port": {
+        "type": "integer",
+        "description": "MongoDB port"
+      },
+      "database": {
+        "type": "string",
+        "description": "Database name"
+      },
+      "user": {
+        "type": "string",
+        "description": "MongoDB username"
+      },
+      "password": {
+        "type": "string",
+        "description": "MongoDB password",
+        "secret": true
+      },
+      "replica_set": {
+        "type": "string",
+        "description": "Replica set name (e.g. rs0)"
+      },
+      "connection_string": {
+        "type": "string",
+        "description": "Full MongoDB URI (wins over discrete fields)"
+      }
+    },
+    "required": [
+      "host",
+      "database"
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": [
+      "json"
+    ],
+    "supports_cdc": true,
+    "supports_ddl": false,
+    "auto_create_destination_tables": true
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Test connectivity to MongoDB (replica-set aware)",
+      "method": "mongodb_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration without connecting",
+      "method": "mongodb_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "Discover collections and their sampled fields",
+      "method": "mongodb_discover_schema",
+      "parameters": [
+        {
+          "name": "include_columns",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include sampled field metadata"
+        },
+        {
+          "name": "include_row_counts",
+          "type": "boolean",
+          "required": false,
+          "default": true,
+          "description": "Include exact collection document counts"
+        },
+        {
+          "name": "max_tables",
+          "type": "integer",
+          "required": false,
+          "default": 100,
+          "description": "Maximum number of collections to return"
+        },
+        {
+          "name": "sample_size",
+          "type": "integer",
+          "required": false,
+          "default": 20,
+          "description": "Documents sampled per collection to infer fields"
+        }
+      ]
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities for agent interaction",
+      "method": "mongodb_get_capabilities"
+    },
+    {
+      "name": "get_primary_key",
+      "type": "core",
+      "description": "Return the primary key (_id) for a collection",
+      "method": "mongodb_get_primary_key"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export documents from a collection (_id keyset paging)",
+      "method": "mongodb_export",
+      "parameters": [
+        {
+          "name": "collection",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 10000
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "default": ""
+        }
+      ]
+    },
+    {
+      "name": "import_data",
+      "type": "destination",
+      "description": "Insert documents into a collection (batch / CDC insert). upsert_data and delete_data are advertised at runtime via get_capabilities for the CDC update/delete paths.",
+      "method": "mongodb_import_data",
+      "parameters": [
+        {
+          "name": "collection",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "data",
+          "type": "array",
+          "required": true
+        },
+        {
+          "name": "mode",
+          "type": "string",
+          "required": false,
+          "default": "append",
+          "enum_values": [
+            "append",
+            "replace",
+            "upsert"
+          ]
+        },
+        {
+          "name": "key_fields",
+          "type": "array",
+          "required": false,
+          "description": "Write key column(s); defaults to _id. A relational source passes its own primary key here."
+        }
+      ]
+    }
+  ],
+  "resources": [
+    {
+      "name": "health",
+      "endpoint": "/health",
+      "id_field": "id",
+      "pagination_type": "offset",
+      "pagination_param": "offset",
+      "limit_param": "limit",
+      "max_page_size": 100,
+      "supports": [
+        "get"
+      ]
+    },
+    {
+      "name": "collections",
+      "endpoint": "/collections",
+      "id_field": "_id",
+      "pagination_type": "keyset",
+      "pagination_param": "cursor",
+      "limit_param": "limit",
+      "max_page_size": 10000,
+      "supports": [
+        "list"
+      ]
+    }
+  ],
+  "license": "MIT",
+  "source": "built_in"
+}

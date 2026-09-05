@@ -1,0 +1,74 @@
+{
+  "id": "sample-data",
+  "name": "Sample Data",
+  "display_name": "Sample Data (Demo)",
+  "connector_type": "sample-data",
+  "version": "1.0.0",
+  "description": "Zero-setup demo source with bundled customers, orders and products datasets — run a real sync without connecting a database of your own.",
+  "category": "sample",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": true,
+  "supports_destination": false,
+  "supports_cdc": false,
+  "supports_ddl": false,
+  "auth_type": "none",
+  "production_verified": true,
+  "status": "active",
+  "config_schema": {
+    "type": "object",
+    "properties": {},
+    "required": []
+  },
+  "configuration_schema": {
+    "type": "object",
+    "properties": {},
+    "required": []
+  },
+  "capabilities": {
+    "max_batch_size": 10000,
+    "supported_formats": ["json"],
+    "supports_cdc": false,
+    "supports_source": true,
+    "supports_destination": false
+  },
+  "operations": [
+    {
+      "name": "test_connection",
+      "type": "core",
+      "description": "Verify the sample source is ready (no credentials required)",
+      "method": "sample-data_test_connection"
+    },
+    {
+      "name": "validate_config",
+      "type": "core",
+      "description": "Validate configuration (always valid — no config required)",
+      "method": "sample-data_validate_config"
+    },
+    {
+      "name": "discover_schema",
+      "type": "core",
+      "description": "List the bundled demo tables (customers, orders, products) and their schemas",
+      "method": "sample-data_discover_schema"
+    },
+    {
+      "name": "get_capabilities",
+      "type": "core",
+      "description": "Return connector capabilities",
+      "method": "sample-data_get_capabilities"
+    },
+    {
+      "name": "export",
+      "type": "source",
+      "description": "Export rows from a bundled demo table",
+      "method": "sample-data_export",
+      "parameters": [
+        { "name": "table", "type": "string", "required": true, "description": "One of: customers, orders, products" },
+        { "name": "limit", "type": "integer", "required": false, "default": 10000, "description": "Max rows per page" },
+        { "name": "offset", "type": "integer", "required": false, "default": 0, "description": "Row offset for paging" }
+      ]
+    }
+  ],
+  "aliases": [],
+  "license": "MIT"
+}

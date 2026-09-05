@@ -1,0 +1,135 @@
+{
+  "namespace": "com.rsync.cdc",
+  "type": "record",
+  "name": "CDCEnvelope",
+  "doc": "Debezium-compatible CDC envelope for change data capture events",
+  "fields": [
+    {
+      "name": "before",
+      "type": ["null", "bytes"],
+      "default": null,
+      "doc": "Record state before the change (Avro-encoded)"
+    },
+    {
+      "name": "after",
+      "type": ["null", "bytes"],
+      "default": null,
+      "doc": "Record state after the change (Avro-encoded)"
+    },
+    {
+      "name": "source",
+      "type": {
+        "type": "record",
+        "name": "Source",
+        "doc": "Source database metadata",
+        "fields": [
+          {
+            "name": "version",
+            "type": "string",
+            "doc": "Debezium version"
+          },
+          {
+            "name": "connector",
+            "type": "string",
+            "doc": "Connector type (mysql, postgresql, mongodb, etc.)"
+          },
+          {
+            "name": "name",
+            "type": "string",
+            "doc": "Logical server name"
+          },
+          {
+            "name": "ts_ms",
+            "type": "long",
+            "doc": "Timestamp when change occurred in source"
+          },
+          {
+            "name": "snapshot",
+            "type": ["null", "string"],
+            "default": null,
+            "doc": "Snapshot phase (true, last, false)"
+          },
+          {
+            "name": "db",
+            "type": "string",
+            "doc": "Database name"
+          },
+          {
+            "name": "sequence",
+            "type": ["null", "string"],
+            "default": null,
+            "doc": "Event sequence in transaction"
+          },
+          {
+            "name": "schema",
+            "type": ["null", "string"],
+            "default": null,
+            "doc": "Schema/namespace name"
+          },
+          {
+            "name": "table",
+            "type": "string",
+            "doc": "Table/collection name"
+          },
+          {
+            "name": "txId",
+            "type": ["null", "long"],
+            "default": null,
+            "doc": "Transaction ID"
+          },
+          {
+            "name": "lsn",
+            "type": ["null", "long"],
+            "default": null,
+            "doc": "Log sequence number"
+          },
+          {
+            "name": "xmin",
+            "type": ["null", "long"],
+            "default": null,
+            "doc": "PostgreSQL xmin"
+          }
+        ]
+      },
+      "doc": "Source metadata about where the change originated"
+    },
+    {
+      "name": "op",
+      "type": {
+        "type": "enum",
+        "name": "Operation",
+        "symbols": ["c", "u", "d", "r", "t"],
+        "doc": "c=create, u=update, d=delete, r=read (snapshot), t=truncate"
+      },
+      "doc": "Type of database operation"
+    },
+    {
+      "name": "ts_ms",
+      "type": "long",
+      "doc": "Timestamp when Debezium processed the event"
+    },
+    {
+      "name": "transaction",
+      "type": ["null", {
+        "type": "record",
+        "name": "TransactionInfo",
+        "fields": [
+          {
+            "name": "id",
+            "type": "string"
+          },
+          {
+            "name": "total_order",
+            "type": "long"
+          },
+          {
+            "name": "data_collection_order",
+            "type": "long"
+          }
+        ]
+      }],
+      "default": null,
+      "doc": "Transaction metadata for ordering"
+    }
+  ]
+}
