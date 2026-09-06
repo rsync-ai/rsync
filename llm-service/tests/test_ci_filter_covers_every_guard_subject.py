@@ -67,6 +67,10 @@ GUARDS = [
     # `.github/workflows/**`. Same reason as the two entries above: being absent
     # from this literal is indistinguishable from being covered.
     "test_flip_drops_a_job_with_the_comment_that_documents_it.py",
+    # Enrolled 2026-09-06, same subjects and the same reason as the entry
+    # directly above: scripts/flip/apply-ci-split.py plus the ci.yml it
+    # rewrites, covered by `scripts/flip/**` and `.github/workflows/**`.
+    "test_flip_drops_a_changes_output_no_job_reads.py",
 ]
 
 

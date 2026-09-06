@@ -57,7 +57,6 @@ jobs:
       sink: ${{ steps.filter.outputs.sink }}
       llm: ${{ steps.filter.outputs.llm }}
       e2e: ${{ steps.filter.outputs.e2e }}
-      datapath: ${{ steps.filter.outputs.datapath }}
       frontend: ${{ steps.filter.outputs.frontend }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -231,80 +230,13 @@ jobs:
             e2e:
               - 'e2e/_support/**'
               - '.github/workflows/ci.yml'
-            # Data-fidelity surface: any hop that schema metadata (column_types,
-            # primary_keys) must survive on its way from source to destination.
-            # When any of these change, run the data-pipeline correctness gate
-            # (batch + CDC). Covers every hop that source->destination data
-            # fidelity, CDC ordering, and reload/resume correctness flow through.
-            datapath:
-              - 'backend-orchestrator/internal/agents/executor/**'
-              - 'backend-orchestrator/internal/agents/sentinel/**'
-              - 'backend-orchestrator/internal/cdc/**'
-              - 'api-gateway/internal/projector/**'
-              # Pipeline WORKFLOW module. Scoped whole-module on purpose, unlike the
-              # orchestrator above: the orchestrator is a large repo with genuinely
-              # unrelated surfaces (billing, auth, registry) so it is subpath-scoped,
-              # whereas every package here exists to run pipeline workflows —
-              # workflows/ (nl_pipeline_v2_workflow.go: park/resume/chunk-continuation,
-              # i.e. reload+resume correctness), adapter/ + correlation/ (the Kafka ->
-              # workflow-signal return path; break it and every run hangs waiting for a
-              # signal that never arrives), cmd/ (worker registration — an unregistered
-              # activity is invisible to unit tests and fatal at runtime). A subpath
-              # allowlist inside this module would just re-create THIS bug one level
-              # down, which is how the module got omitted in the first place.
-              # Cost measured over the 90 days to 2026-08-08: 45 commits touched it, 15
-              # already tripped datapath via another dir, and only 10 touched none of
-              # workflows/adapter/correlation/cmd — so whole-module scoping costs ~1
-              # extra smoke run per 9 days over a narrower filter. Added 2026-08-08
-              # after #758 changed control flow at all 6 HITL park sites and the smoke
-              # gate reported SKIPPING (KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW).
-              # A skipped check is not a passing one.
-              # NB: this needs the matching `temporal_adapter` entry in the `svc`
-              # filter in data-pipeline-smoke — triggering the gate without rebuilding
-              # the image runs it against a STALE adapter (the #682 -> #687 trap below).
-              - 'backend-temporal-adapter/**'
-              # DELIBERATELY NOT LISTED: backend-orchestrator/internal/agents/heal/**.
-              # The healer is out-of-band failure recovery, not a source->destination
-              # hop: sweepCandidatesQuery (heal/worker.go:343-347) only selects
-              # executions whose status is already failed/error/silent_drop_detected/
-              # silent_partial_drop_detected/credential_check_failed, so a GREEN smoke
-              # run exercises none of it and the gate would burn 25 min of the shared
-              # serialized stack for zero signal. Its coverage is the real-Postgres
-              # suite (heal/issue_sweep_pg_test.go) plus the nightly full gate.
-              - 'shared/mcp-connectors/internal/kafka-mcp-sink/**'
-              # Debezium/Kafka-Connect SOURCE image: a change here must trigger the
-              # smoke gate so the fast PR path both tests it and refreshes the warm
-              # rsync-ci kafka-connect image (see the `kafka_connect` svc filter in
-              # data-pipeline-smoke). Omitting it let a kafka-connect-only fix merge
-              # without ever refreshing the CI warm stack (#682 -> stale image -> #687).
-              - 'shared/internal/infra/kafka-connect/**'
-              - 'shared/mcp-connectors/public/postgresql/**'
-              - 'shared/mcp-connectors/public/database/mysql/**'
-              # Also absent from the public repo (llm-service/oss-strip-list.txt), so
-              # this glob is a no-op there for the same reason as
-              # security-audit-results/** above: the code it gates is gone too.
-              - 'llm-service/src/agents/tool_generator/templates/**'
-              # The PLANNER names the batch data topic, and the orchestrator hands
-              # that name to the sink as its SUBSCRIPTION -- so this directory is on
-              # the data path even though nothing in it moves a row. It is also the
-              # Python half of the two-language naming contract with
-              # shared/go/kafkaclient (src/utils/kafka_topics.py); a divergence there
-              # does not raise, it just subscribes the sink to a topic nobody writes.
-              # NB: needs the matching `planner` entry in the `svc` filter below --
-              # triggering the gate without rebuilding the image runs it against a
-              # STALE planner, which is the same trap as temporal_adapter / kafka_connect.
-              - 'llm-service/src/agents/planner/**'
-              - 'llm-service/src/utils/kafka_topics.py'
-              - 'e2e/run_gate.sh'
-              - 'e2e/test_*'
-              - '.github/workflows/ci.yml'
             frontend:
               - 'frontend/**'
 
   # Deliberately NOT behind `needs: changes`. It is a sub-second pure-grep check, and
   # a paths-filter that excluded the very file it protects is exactly how
-  # KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW happened (see the datapath comments
-  # above). Running it unconditionally costs nothing and cannot be filtered wrong.
+  # KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW happened. Running it unconditionally
+  # costs nothing and cannot be filtered wrong.
   #
   # Guards a failure mode that no other job can see: a `${VAR:?}` in a shipped compose
   # file whose value no shipped template supplies. One `:?` aborts interpolation for
@@ -837,7 +769,8 @@ jobs:
           run_tree public
           run_tree internal
           echo "ran per-connector regression suites: public=$count_public internal=$count_internal; aggregate_fail=$fail"
-          # A gate that runs ZERO tests must NOT report success (see data-pipeline-gate).
+          # A gate that runs ZERO tests must NOT report success: an empty set reads
+          # exactly like a pass, and no downstream reader can tell the two apart.
           # Checked per tree, not on the sum: `internal` currently contributes 1 dir out of
           # 23, so a total-only floor would still pass with the entire internal tree silently
           # dropped -- which is precisely the failure this step shipped with.

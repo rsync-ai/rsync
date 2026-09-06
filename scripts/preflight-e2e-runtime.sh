@@ -7,9 +7,9 @@
 #   The CI e2e gate and manual staging testing intentionally SHARE one Docker
 #   stack: both drive compose project `rsync-ai` with the same hard-pinned
 #   container_names, and neither tears the shared services down. Each side must
-#   therefore RECONCILE the wiring to its own target at start-up — that is the
-#   stack's documented idempotent-reconcile model (see ci.yml data-pipeline-gate
-#   comment: "reconcile the stack idempotently on each run").
+#   therefore RECONCILE the wiring to its own target at start-up. The stack is
+#   reconciled idempotently on each run rather than torn down and rebuilt, so
+#   whichever side starts next owns correcting whatever the last one left behind.
 #
 #   `preflight-staging-runtime.sh` handles "a gate run left base/e2e wiring →
 #   re-wire for Azure staging." This script handles the SYMMETRIC reverse:

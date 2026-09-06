@@ -17,12 +17,12 @@ import (
 //
 // Why no existing check caught it, and why this one is a *test* rather than a CI step:
 // every Go CI job runs `go build ./...` — the package form — so CI was green on code
-// whose image could not be built. The only job that builds this image is the PR smoke
-// gate, and that gate fires on the `datapath` filter, which does not include
-// api-gateway/cmd/**. So the PR that broke it never ran the gate, and the failure
-// surfaced two PRs later on an unrelated change. A `go test ./...` guard runs in the
-// default suite on every Go PR, which is the one thing CI does reliably (a build-tagged
-// test would be zero protection — CI passes no -tags).
+// whose image could not be built. The one job that built this image at the time was
+// gated on a paths filter that did not list api-gateway/cmd/**, so the PR that broke
+// it never ran that job, and the failure surfaced two PRs later on an unrelated
+// change. A `go test ./...` guard runs in the default suite on every Go PR, which is
+// the one thing CI does reliably (a build-tagged test would be zero protection — CI
+// passes no -tags).
 //
 // This lives beside the file whose sibling was invisible, on purpose.
 
