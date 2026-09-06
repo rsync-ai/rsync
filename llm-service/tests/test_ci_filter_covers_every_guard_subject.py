@@ -62,6 +62,11 @@ GUARDS = [
     # passes.
     "test_chart_ships_no_developer_scaffolding.py",
     "test_published_image_platforms_match_the_docs.py",
+    # Enrolled 2026-09-06. Subjects are scripts/flip/apply-ci-split.py and
+    # .github/workflows/ci.yml, covered by `scripts/flip/**` and
+    # `.github/workflows/**`. Same reason as the two entries above: being absent
+    # from this literal is indistinguishable from being covered.
+    "test_flip_drops_a_job_with_the_comment_that_documents_it.py",
 ]
 
 
