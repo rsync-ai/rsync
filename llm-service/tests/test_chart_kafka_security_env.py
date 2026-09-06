@@ -581,9 +581,12 @@ def test_the_login_module_is_derived_from_the_mechanism_and_fails_closed():
 # Measured against kafka-clients 3.7.0, not inferred -- reproduce the table with
 # deploy/helm/rsync-ai/test/kind/jaas-probe/OAuthProbe.java.
 #
-# These are static because CI has no `helm` binary (see .github/workflows/ci.yml:316
-# -- the llm-service lane installs Python only), so a render-based test would skip
-# there and protect nothing.
+# These are static because reading the table off the templates needs no `helm`
+# binary and no render, so it holds on any checkout. It used to say CI has none
+# and cite the lane's Python-only setup; the setup steps are Python-only, but
+# ci.yml now sets helm up for that job and asserts it before pytest, so the
+# render-based chart tests run there too. See the `helm is present` step in
+# .github/workflows/ci.yml.
 
 _OAUTH_ENV = (
     "KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT",
@@ -848,7 +851,7 @@ def test_the_missing_username_check_cannot_fire_without_a_mechanism():
     It survived every stage render because S1..S4 all set a mechanism; only the
     baseline broke, and a baseline is exactly what nobody re-renders once it is
     green. The detector was rendering EVERY stage including the base, and this is
-    the static half of that, because CI has no helm binary.
+    the static half of that, because a text scan needs no helm binary.
 
     Asserted on the enclosing *guard*, not on the message: the message was correct
     the entire time the behaviour was wrong -- it named a mechanism that was not set.

@@ -1,6 +1,59 @@
 # GKE overlay — layer on top of values.yaml, do not use alone:
 #
-#   helm install rsync ./rsync-ai -f rsync-ai/values-gke.yaml -f my-secrets.yaml
+#   helm install rsync ./rsync-ai -f rsync-ai/values-gke.yaml -f my-values.yaml
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# What goes in that second file
+# ─────────────────────────────────────────────────────────────────────────────
+# Nothing you own is in this overlay -- no secret, no hostname, no URL --
+# because helm stores every `-f` value in the release Secret in cleartext and
+# `helm get values` reads it back. Six keys therefore live in your file and in
+# no file this chart ships. The first four abort the render ONE AT A TIME, so
+# skipping this block costs four consecutive failed installs; the last two do
+# NOT abort -- they render as an EMPTY password, the install succeeds, and the
+# failure arrives later as an auth error from Cloud SQL or Memorystore that
+# names neither key.
+#
+#   # my-values.yaml
+#   secrets:
+#     jwtSecret: ""             # <-- fill this in
+#                               #     openssl rand -base64 32
+#     encryptionKey: ""         # <-- fill this in
+#                               #     openssl rand -base64 32 -- and BACK IT UP
+#                               #     BEFORE YOU INSTALL. It encrypts every
+#                               #     stored connection credential, and
+#                               #     replacing it later without the old key in
+#                               #     ENCRYPTION_KEYS makes every saved
+#                               #     connection permanently undecryptable.
+#     postgresPassword: ""      # <-- fill this in
+#                               #     The Cloud SQL password. Its host is set
+#                               #     under postgresql.external below; only the
+#                               #     password is a secret, so the two live
+#                               #     apart on purpose. Empty is correct ONLY
+#                               #     for Cloud SQL IAM database
+#                               #     authentication.
+#     redisPassword: ""         # <-- fill this in
+#                               #     The Memorystore AUTH string. Empty is
+#                               #     correct ONLY when the instance has AUTH
+#                               #     disabled.
+#   frontend:
+#     apiUrl: ""                # <-- fill this in
+#                               #     https://api.example.com -- the address
+#                               #     the BROWSER calls. Not an in-cluster
+#                               #     Service name; the browser is outside the
+#                               #     cluster.
+#     publicUrl: ""             # <-- fill this in
+#                               #     https://app.example.com -- NextAuth
+#                               #     builds its callback URLs from it, and a
+#                               #     wrong value breaks every OAuth login.
+#
+# Two more to CHECK rather than fill: `postgresql.username` (default `rsync`)
+# and `postgresql.database` (default `pipeline_db`) are what every service
+# connects as, and a fresh Cloud SQL instance has neither. Temporal needs two
+# further databases on that same instance which the chart cannot create for
+# you. Both, and `secrets.existingSecret` for keeping the four secrets out of
+# your values file entirely, are in the chart README under "External
+# PostgreSQL" and "Secrets".
 
 global:
   # premium-rwo = SSD persistent disk; `standard-rwo` is the balanced/HDD-backed

@@ -101,6 +101,21 @@ secrets:
   # closed (503) rather than open, but you want this set.
   internalServiceSecret: ""
 
+  # RESTRICTED ALPHABET -- these three, plus demoWarehousePassword below, must
+  # avoid whitespace and  "  '  \  @  :  /  ?  #  [  ]  %
+  #
+  # Each is spliced into a URL by one consumer and handed to another verbatim,
+  # and those two want opposite escapings: percent-encode and the verbatim
+  # reader authenticates as the literal `%40`; leave it raw and the URL parser
+  # reads the password as a hostname. There is no value that satisfies both, so
+  # the chart refuses the characters instead of choosing a side.
+  #
+  # Generate with:  openssl rand -hex 24
+  #
+  # validate.yaml enforces this, but ONLY for a value set here. With
+  # existingSecret the chart never sees the password and cannot check it -- the
+  # restriction still applies, and breaking it fails silently at runtime (the
+  # api-gateway logs one warning, stays Ready, and serves mock data).
   postgresPassword: ""
   redisPassword: ""
 
@@ -108,7 +123,9 @@ secrets:
   # postgresPassword on purpose: the demo warehouse is a DESTINATION any
   # workspace member can run SQL against, so sharing the control-plane password
   # with it would hand that member an offline crack of pg_authid away from the
-  # metadata database. validate.yaml refuses to render without it.
+  # metadata database. validate.yaml refuses to render without it, and the
+  # restricted alphabet above applies to it too -- it both builds a URL and is
+  # what initdb SETS the warehouse role's password to.
   demoWarehousePassword: ""
 
   # Only read when objectStorage.mode == "minio". Deliberately empty: the

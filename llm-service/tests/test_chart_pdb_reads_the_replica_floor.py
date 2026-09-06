@@ -17,8 +17,8 @@ real floor. KI-CHART-PDB-GATE-IGNORES-HPA was templates/pdb.yaml gating on
 Both directions are render-verified. What this file guards is that the plumbing
 stays: that pdb.yaml keeps reading the shared floor helper and does not quietly
 go back to reading replicaCount, and that the helper keeps consulting
-autoscaling at all. Text-only -- CI has no helm binary, so a render check here
-would skip in the one place it needs to run.
+autoscaling at all. Text-only -- parsing the templates needs no `helm` binary and no render, so it holds on any checkout. (Not
+because "CI has no helm binary": that was false, and the `helm is present` step in .github/workflows/ci.yml carries the correction.)
 """
 
 import os

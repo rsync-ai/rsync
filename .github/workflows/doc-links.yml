@@ -87,10 +87,12 @@ jobs:
           fetch-depth: 0
       - name: Set up Python
         run: |
-          # setup-python@v5 cannot install on these self-hosted Macs -- it hard-codes
-          # /Users/runner/hostedtoolcache/... in its post-script and the mkdir fails
-          # with "Permission denied" whatever RUNNER_TOOL_CACHE says. Use the brew
-          # python already on the host, same as ci.yml's llm-service job.
+          # Deliberately not actions/setup-python: this job needs any 3.11+
+          # interpreter, not a pinned one, and the resolver below finds whatever
+          # the runner already ships. That also keeps the workflow working on a
+          # self-hosted runner, where setup-python hard-codes
+          # /Users/runner/hostedtoolcache/... in its post-script and the mkdir
+          # fails with "Permission denied" whatever RUNNER_TOOL_CACHE says.
           #
           # These suites import only the stdlib, pytest, PyYAML and the local
           # `doclinks` helper, so this is a ~10s venv rather than the heavyweight
@@ -103,13 +105,13 @@ jobs:
           # copy of it. Without PyYAML that suite errors on import -- which is a
           # red job, not a silent skip, but still the wrong failure to debug.
           #
-          # Resolved, not hard-coded. /opt/homebrew/opt/python@3.11 exists because
-          # these runners are developer Macs; it exists on no GitHub-hosted runner and
-          # on no contributor's fork. ci.yml's llm-service job hard-codes the same path
-          # and gets away with it because it is `[self-hosted, macOS]` by definition --
-          # this workflow is the one that has to keep working when the flip moves CI to
-          # hosted runners, and the failure mode of a missing interpreter here is the
-          # whole doc-guard suite not running, which reads as green.
+          # Resolved, not hard-coded. The brew path is tried first because it is
+          # where a macOS self-hosted runner keeps 3.11; it exists on no
+          # GitHub-hosted runner and on no contributor's fork, so the loop falls
+          # through to whatever `python3` the image ships. The failure mode of a
+          # missing interpreter here is the whole doc-guard suite not running,
+          # which reads as green -- hence the explicit error below rather than a
+          # single hard-coded path that silently is not there.
           PY=""
           for candidate in \
             /opt/homebrew/opt/python@3.11/bin/python3.11 \
@@ -125,6 +127,17 @@ jobs:
           "$PY" -m venv "$RUNNER_TEMP/docguards"
           "$RUNNER_TEMP/docguards/bin/pip" -q install 'pytest>=9.1.1' 'pytest-asyncio>=0.23.0' 'PyYAML>=6.0'
           echo "$RUNNER_TEMP/docguards/bin" >> "$GITHUB_PATH"
+      # This list includes test_documented_install_commands_render.py, whose
+      # test_every_documented_install_block_renders is
+      # `skipif(shutil.which("helm") is None)`. Nothing in this workflow installs
+      # helm by default and this job runs on ubuntu-latest, whose image makes no
+      # promise to carry one -- so arrange it and then assert it, exactly as the
+      # step below already reasons about `bash`: a probe that returns 0 for
+      # everything is the shape that goes green having checked nothing, and a
+      # skip is the silent version of the same thing.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: helm is present (a chart render case skips silently without it)
+        run: helm version --short
       - name: Guards whose subject IS markdown
         working-directory: llm-service
         env:

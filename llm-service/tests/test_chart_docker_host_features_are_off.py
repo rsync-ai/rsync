@@ -19,13 +19,16 @@ real cause in a tool-generator log line nobody was told to read.
 
 Two layers, matching test_documented_install_commands_render.py:
 
-  1. the static layer runs everywhere, including CI, which has NO helm binary.
+  1. the static layer runs everywhere, with or without a helm binary.
   2. the render layer runs `helm template` and asserts the guard actually fires.
      It skips without helm -- and a skip is not a pass, which is why the whole
      property is also pinned statically above it.
 
-The static layer is the load-bearing one precisely because CI cannot run the
-other.
+The static layer is the load-bearing one because it needs nothing installed, not
+because "CI cannot run the other" -- that was this file's stated reason and it
+was false. ci.yml sets helm up for the job that collects this suite and asserts
+it before pytest, so the render layer runs there too. See the `helm is present`
+step in .github/workflows/ci.yml.
 """
 
 import pathlib
@@ -84,7 +87,7 @@ def _overlay_files():
 
 
 # ---------------------------------------------------------------------------
-# static layer -- runs in CI, which has no helm
+# static layer -- needs no helm, so it runs anywhere
 # ---------------------------------------------------------------------------
 
 

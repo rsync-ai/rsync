@@ -67,6 +67,36 @@ frontend:
   resources:
     requests: { cpu: 50m, memory: 192Mi }
 
+  # Required, not optional: templates/apps/frontend.yaml:68 and :72 wrap both in
+  # `required`, so without them a `helm template` against this file fails at
+  # RENDER -- before a pod is scheduled, and before any of the broker wiring this
+  # harness exists to test is reached. They are not secrets, so they belong here
+  # rather than in the uncommitted secrets file where every reader would have to
+  # rediscover them.
+  #
+  # They live INSIDE this block deliberately. A second top-level `frontend:` key
+  # parses fine and silently discards everything above it (last-wins), costing
+  # you the replica and resource caps this section exists to impose -- observed
+  # while writing this, not theorised: the render came back rc=0 with replicas: 2
+  # and the chart's own 100m/256Mi.
+  #
+  # kind publishes nothing, so these are the port-forwards a human opens after
+  # the install:
+  #
+  #   kubectl -n rsync port-forward svc/rsync-frontend    3000:3000
+  #   kubectl -n rsync port-forward svc/rsync-api-gateway 8080:8080
+  #
+  # (Service names read back out of `helm template`, not guessed from the release
+  # name: the chart's fullname helper collapses the "rsync" release name into the
+  # "rsync-ai" chart name, so `rsync-rsync-ai-api-gateway` -- the obvious guess --
+  # names nothing.)
+  #
+  # Both are read by the BROWSER, so an in-cluster Service name here would render
+  # a page whose every API call fails DNS on the operator's machine while the
+  # pods stay green -- the exact silent shape this harness exists to catch.
+  publicUrl: http://localhost:3000
+  apiUrl: http://localhost:8080
+
 orchestrator:
   resources:
     requests: { cpu: 250m, memory: 512Mi }

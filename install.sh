@@ -157,6 +157,64 @@ check_docker() {
   info "Docker ${dv:-(version unknown)} detected"
 }
 
+check_arch() {
+  # Every ghcr.io/rsync-ai/* image is built by .github/workflows/docker-publish.yml
+  # on `runs-on: ubuntu-latest`, and NEITHER docker/build-push-action step sets a
+  # `platforms:` key -- so buildx tags each image for the runner's own platform and
+  # nothing else. All 14 images the quickstart compose pulls are linux/amd64, with
+  # no arm64 entry in the manifest index.
+  #
+  # Without this check the operator pays the entire prompt sequence, the .env
+  # write and the compose download before finding out, and what they get is
+  # `no matching manifest for linux/arm64/v8 in the manifest list entries` from
+  # deep inside `docker compose pull` -- a message that names neither the cause
+  # nor anything to do about it.
+  #
+  # Ask the DAEMON, not `uname -m`. The daemon resolves the manifest, it can be
+  # remote, and on Docker Desktop for Apple Silicon a host `uname -m` of arm64
+  # still runs amd64 images under emulation. `{{.Server.Arch}}` is the canonical
+  # Go spelling (`amd64`/`arm64`); `docker info --format '{{.Architecture}}'` is
+  # the uname spelling (`x86_64`/`aarch64`) and would need two cases apiece.
+  local darch=""
+  darch=$(docker version --format '{{.Server.Arch}}' 2>/dev/null) || darch=""
+
+  if [[ "$darch" == "amd64" ]]; then
+    info "linux/amd64 daemon — matches the published images"
+    return 0
+  fi
+
+  # Three outcomes, not two -- the same rule check_ram follows. A pre-flight
+  # check that cannot read the machine must say so; it must not certify it, and
+  # it must not condemn it either.
+  if [[ -z "$darch" ]]; then
+    warn "Could not read the Docker daemon's architecture."
+    warn "rsync.ai publishes linux/amd64 images only — if this host is arm64, the pull will fail."
+    return 0
+  fi
+
+  # arm64 and anything else. Deliberately NOT a hard exit: Docker Desktop on
+  # Apple Silicon runs amd64 images under emulation -- slower, but correct, and a
+  # legitimate way to evaluate the product. On a Linux arm64 host (Oracle
+  # A1.Flex, AWS Graviton, Azure Ampere, a Raspberry Pi) the qemu-x86_64 binfmt
+  # handler is usually not registered, and every container instead dies with
+  # `exec format error` after the pull appears to succeed. Exiting here would
+  # break the first case to protect the second; naming both lets the operator
+  # decide, which is the only thing this script can honestly do.
+  warn "This Docker daemon is linux/${darch}; rsync.ai publishes linux/amd64 images only."
+  echo "  On Docker Desktop (Apple Silicon) these images run under emulation — correct, but slow."
+  echo "  On a Linux ${darch} host without qemu-x86_64 binfmt registered, containers will instead"
+  echo "  fail with 'exec format error' after the pull succeeds. Register it with:"
+  echo "    docker run --privileged --rm tonistiigi/binfmt --install amd64"
+  echo "  To run natively instead, build from source: https://github.com/rsync-ai/rsync"
+  local go_on=""
+  ask go_on "  Continue anyway? [y/N] " "n"
+  case "$go_on" in
+    [yY]*) warn "Continuing on linux/${darch} — expect emulation overhead or exec format errors." ;;
+    *) error "Stopped before writing anything. Re-run on an amd64 host, or build from source."
+       exit 1 ;;
+  esac
+}
+
 check_ram() {
   local ram_gb=0
   if [[ "$OSTYPE" == "linux-gnu"* ]]; then
@@ -853,6 +911,7 @@ main() {
   banner
   section "Pre-flight checks"
   check_docker
+  check_arch
   check_ram
 
   # If .env already exists in install dir, skip prompts

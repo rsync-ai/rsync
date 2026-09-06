@@ -1,0 +1,48 @@
+# kind + BYO-Postgres overlay. Layer it AFTER values-kind-byo.yaml:
+#
+#   helm install rsync ./deploy/helm/rsync-ai -n rsync \
+#     -f .../values-kind-byo.yaml -f .../values-kind-byo-pg.yaml -f <secrets>
+#
+# Pairs with postgres-up.sh, which runs a real PostgreSQL as a Docker container
+# on the `kind` network -- OUTSIDE the cluster -- and wires a headless Service +
+# hand-written EndpointSlice so the name below resolves. Together with
+# values-kind-byo.yaml this makes the cluster run on external Kafka AND external
+# Postgres, which is the configuration a self-hoster on a managed cloud actually
+# has, and the one the chart's own defaults never exercise.
+#
+# NO SECRETS HERE. postgres-up.sh writes the password it generated to
+# test/kind/.byo-postgres-password (gitignored); pass it on the command line or
+# in a second, uncommitted `-f` file.
+
+postgresql:
+  enabled: false
+
+  # Read whether postgresql.enabled is true or false -- they are not inside the
+  # `external` block. They must match what postgres-up.sh created: initdb makes
+  # the role and its database from POSTGRES_USER/POSTGRES_DB, and the chart
+  # never derives either, so a mismatch surfaces as a password-authentication
+  # failure that reads like a wrong password.
+  username: rsync
+  database: pipeline_db
+
+  external:
+    host: byo-postgres.rsync.svc.cluster.local
+    port: 5432
+
+    # MUST be set explicitly. The chart defaults external Postgres to `require`,
+    # which is right for RDS / Cloud SQL / Azure Database and wrong for a plain
+    # container with no server certificate. Left at the default, every component
+    # here fails to connect -- and the api-gateway does that SILENTLY: it logs
+    # one warning, stays 1/1 Ready and serves mock data, so the install looks
+    # successful. Anything testing TLS behaviour belongs in a stage file that
+    # gives the container a certificate, not in a quiet edit here.
+    sslMode: disable
+
+    tls:
+      # Empty is correct while sslMode is `disable`: with TLS off the chart
+      # renders Temporal's TLS switches off too, and there is no CA to trust.
+      caFile: ""
+      # Empty means "verify against external.host". Nothing verifies anything
+      # at sslMode=disable, so this is inert here and set only for the stage
+      # files that turn TLS on.
+      serverName: ""

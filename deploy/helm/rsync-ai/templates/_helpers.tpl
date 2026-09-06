@@ -849,3 +849,43 @@ for it is always the real count.
 {{- .replicaCount -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+rsync-ai.assertDeliverableSecret — one alphabet check, three call sites.
+
+The chart holds three secrets that are each spliced into a URL by one consumer
+AND handed to another consumer verbatim. Those two readings want opposite
+escapings, so past a reserved character there is no value that satisfies both:
+percent-encode and the verbatim reader authenticates as the literal `%40`;
+leave it raw and the URL parser reads the password as a hostname. Neither
+failure is loud.
+
+The three, with their conflict:
+
+  secrets.postgresPassword      URL (api-gateway DATABASE_URL, CDC POSTGRES_URL)
+                                vs libpq keyword string, built by concatenation
+                                in backend-orchestrator/internal/config/config.go
+                                and backend-temporal-adapter/internal/db/db.go,
+                                vs Temporal's verbatim POSTGRES_PWD.
+  secrets.demoWarehousePassword URL (api-gateway RSYNC_DEMO_DESTINATION_DSN)
+                                vs the demo warehouse's own POSTGRES_PASSWORD,
+                                which is what initdb SETS the role's password to.
+  secrets.redisPassword         URL (CDC REDIS_URL) vs go-redis/redis-py
+                                Options.Password at a dozen call sites, vs the
+                                in-chart server's `requirepass` line.
+
+Restricting the alphabet costs nothing -- `openssl rand -hex 24` is 96 bits and
+lands entirely inside it -- and it is the only fix available to a chart that
+cannot re-encode a value it hands to consumers with different parsers.
+
+Only reachable for an inline value. With secrets.existingSecret the chart never
+sees the password, so the same restriction is stated in prose in values.yaml and
+the chart README.
+
+Args: dict "key" <values path> "value" <the value> "sites" <what reads it> "tail" <extra>
+*/}}
+{{- define "rsync-ai.assertDeliverableSecret" -}}
+{{- if and .value (regexMatch "[\\s\"'\\\\@:/?#\\[\\]%]" (.value | toString)) }}
+{{- fail (printf "%s contains a character this chart cannot deliver to every service that reads it.\n\nDisallowed: whitespace, and any of  \" ' \\ @ : / ? # [ ] %%\n\n%s\nPercent-encoding satisfies the URL side and breaks the verbatim side; leaving\nthe value raw does the reverse. No single value works for both, so the chart\nrefuses it at render time rather than picking a side -- at runtime this fails\nsilently, which is the one thing a render-time check can still prevent.\n\nGenerate one from the safe alphabet:\n\n    openssl rand -hex 24\n%s" .key .sites .tail) }}
+{{- end }}
+{{- end -}}

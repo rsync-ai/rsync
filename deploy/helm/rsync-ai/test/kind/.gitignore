@@ -7,3 +7,6 @@
 # Client secret for the throwaway OIDC provider used by stage S4. Generated on
 # demand by broker-up.sh; a real credential for as long as that provider is up.
 .oidc-client-secret
+# Password for the throwaway BYO Postgres started by postgres-up.sh. A real
+# credential for as long as that container is up, and regenerated on demand.
+.byo-postgres-password

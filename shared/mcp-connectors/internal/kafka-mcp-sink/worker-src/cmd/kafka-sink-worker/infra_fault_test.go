@@ -64,6 +64,34 @@ func TestClassifyDestFault_InfraShapesTheDestinationActuallyProduces(t *testing.
 	}
 }
 
+func TestClassifyDestFault_DNSFailuresOtherThanNXDOMAINAreStillOutages(t *testing.T) {
+	// The gap this closes, caught on CI 2026-09-06: the resolver answered
+	// SERVFAIL rather than NXDOMAIN, so the text read "server misbehaving"
+	// instead of "no such host". classifyDestFault returned unclassified, and a
+	// destination that was never reached had its batch condemned to the DLQ with
+	// the offsets committed -- the exact silent loss this file exists to prevent.
+	//
+	// The cases below are not the one wording that was observed. They are every
+	// error the Go resolver itself defines (the var block in
+	// net/dnsclient_unix.go, plus errNoSuchHost covered above) and the glibc
+	// getaddrinfo wording for EAI_AGAIN, so the class is closed against the
+	// resolver rather than patched against the failure that happened to be seen.
+	dns := []string{
+		`Post "http://rsync-ai-postgresql-mcp:8000/mcp": dial tcp: lookup rsync-ai-postgresql-mcp on 127.0.0.53:53: server misbehaving`,
+		`Post "http://postgresql-mcp:8000/mcp": dial tcp: lookup postgresql-mcp on 10.96.0.10:53: no answer from DNS server`,
+		`Post "http://postgresql-mcp:8000/mcp": dial tcp: lookup postgresql-mcp on 10.96.0.10:53: lame referral`,
+		`Post "http://postgresql-mcp:8000/mcp": dial tcp: lookup postgresql-mcp on 10.96.0.10:53: invalid DNS response`,
+		`Post "http://postgresql-mcp:8000/mcp": dial tcp: lookup postgresql-mcp on 10.96.0.10:53: cannot unmarshal DNS message`,
+		`Post "http://postgresql-mcp:8000/mcp": dial tcp: lookup postgresql-mcp on 10.96.0.10:53: cannot marshal DNS message`,
+		`dest error: [Errno -3] Temporary failure in name resolution`,
+	}
+	for _, e := range dns {
+		if got := classifyDestFault(errors.New(e)); got != faultInfra {
+			t.Errorf("classifyDestFault(%q) = %s, want infra -- a resolver failing in any wording but NXDOMAIN still means the row never reached a destination that could judge it", e, got)
+		}
+	}
+}
+
 func TestClassifyDestFault_DataFaultsStillReachTheDLQ(t *testing.T) {
 	// The DLQ exists for exactly these. Reclassifying any of them as infra would
 	// crash-loop the pipeline on a single bad row — the trap poisonError exists to
