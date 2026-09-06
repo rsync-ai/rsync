@@ -189,7 +189,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: ${{ matrix.module }}/go.mod
-          cache: false   # self-hosted: setup-go auto-cache uploads ~3GB for hours and fails the job (ci.yml convention)
+          cache: false   # setup-go auto-cache uploads ~3GB per job for no gain here (ci.yml convention)
       # Reachability-based: only fails when the vulnerable symbol is actually
       # called. setup-go honors the go.mod `toolchain` directive (go1.25.13),
       # so this analyzes against the PATCHED stdlib — matching the Docker base.
@@ -237,7 +237,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: ${{ matrix.module }}/go.mod
-          cache: false   # self-hosted: setup-go auto-cache uploads ~3GB for hours and fails the job (ci.yml convention)
+          cache: false   # setup-go auto-cache uploads ~3GB per job for no gain here (ci.yml convention)
       - name: gosec
         working-directory: ${{ matrix.module }}
         # -no-fail: emit SARIF without a non-zero exit (reporting, not gating).
@@ -399,6 +399,36 @@ jobs:
           echo "${TRIVY_INSTALL_SHA256}  $RUNNER_TEMP/trivy-install.sh" | shasum -a 256 -c -
           sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin" "${TRIVY_VERSION}"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Pull Trivy's databases anonymously
+        # Trivy fetches both of its databases as OCI artifacts
+        # (mirror.gcr.io/aquasec/trivy-db for vulnerabilities, trivy-checks for
+        # the misconfig rules) and resolves registry credentials the way Docker
+        # does — by reading ~/.docker/config.json and shelling out to whatever
+        # `credsStore` it names. On the self-hosted Macs that was Docker
+        # Desktop's helper, and when the helper wedged the child never returned,
+        # never timed out and never printed: the scan simply stopped after
+        # "Downloading artifact..." and held the runner until the job was
+        # cancelled.
+        #
+        # Measured 2026-09-06 — three of the four org runners sat on this job for
+        # 18, 19 and 54 minutes with a `docker-credential-desktop get` child that
+        # had accumulated 0.03s of CPU, and every other job in the org queued
+        # behind them. Same binary, same tree, same command, A/B: with the host
+        # config the download produced no bytes past 60 minutes; with an empty
+        # config it downloaded 111 MiB and finished in 8.5s.
+        #
+        # Neither database needs credentials — both are public. Pointing
+        # DOCKER_CONFIG at a directory whose config.json declares no credsStore
+        # makes Trivy resolve anonymously and never invoke a helper, which is
+        # also the correct dependency shape: a scan of a public database must not
+        # be able to hang on a developer machine's credential daemon. It is a
+        # no-op on this runner, which ships no credential helper to wedge, and it
+        # is kept anyway: the alternative is a step that has to be re-derived
+        # from the incident the day any job runs somewhere that does.
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-docker-config"
+          printf '{"auths":{}}\n' > "$RUNNER_TEMP/trivy-docker-config/config.json"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/trivy-docker-config" >> "$GITHUB_ENV"
       - name: Trivy filesystem scan
         # skip *.j2 — Jinja templates aren't valid Dockerfiles and only produce
         # parser noise in the misconfig scanner.
@@ -477,6 +507,36 @@ jobs:
           echo "${TRIVY_INSTALL_SHA256}  $RUNNER_TEMP/trivy-install.sh" | shasum -a 256 -c -
           sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin" "${TRIVY_VERSION}"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Pull Trivy's databases anonymously
+        # Trivy fetches both of its databases as OCI artifacts
+        # (mirror.gcr.io/aquasec/trivy-db for vulnerabilities, trivy-checks for
+        # the misconfig rules) and resolves registry credentials the way Docker
+        # does — by reading ~/.docker/config.json and shelling out to whatever
+        # `credsStore` it names. On the self-hosted Macs that was Docker
+        # Desktop's helper, and when the helper wedged the child never returned,
+        # never timed out and never printed: the scan simply stopped after
+        # "Downloading artifact..." and held the runner until the job was
+        # cancelled.
+        #
+        # Measured 2026-09-06 — three of the four org runners sat on this job for
+        # 18, 19 and 54 minutes with a `docker-credential-desktop get` child that
+        # had accumulated 0.03s of CPU, and every other job in the org queued
+        # behind them. Same binary, same tree, same command, A/B: with the host
+        # config the download produced no bytes past 60 minutes; with an empty
+        # config it downloaded 111 MiB and finished in 8.5s.
+        #
+        # Neither database needs credentials — both are public. Pointing
+        # DOCKER_CONFIG at a directory whose config.json declares no credsStore
+        # makes Trivy resolve anonymously and never invoke a helper, which is
+        # also the correct dependency shape: a scan of a public database must not
+        # be able to hang on a developer machine's credential daemon. It is a
+        # no-op on this runner, which ships no credential helper to wedge, and it
+        # is kept anyway: the alternative is a step that has to be re-derived
+        # from the incident the day any job runs somewhere that does.
+        run: |
+          mkdir -p "$RUNNER_TEMP/trivy-docker-config"
+          printf '{"auths":{}}\n' > "$RUNNER_TEMP/trivy-docker-config/config.json"
+          echo "DOCKER_CONFIG=$RUNNER_TEMP/trivy-docker-config" >> "$GITHUB_ENV"
       - name: Trivy license scan (copyleft gate)
         # --scanners license: classify every dependency's license by category.
         #   RESTRICTED (GPL/AGPL/SSPL family) => HIGH/CRITICAL severity.

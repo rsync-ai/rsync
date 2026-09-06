@@ -13,9 +13,9 @@
 # markdown case, and the workflow won.
 #
 # Both intents are legitimate: docs-only PRs should not spin up the full Go /
-# frontend / e2e matrix on the self-hosted Macs, AND the link gate should run on
-# every change of either kind. A separate workflow is the only shape that gets
-# both. It is ~1s, so running it unconditionally costs nothing.
+# frontend / e2e matrix, AND the link gate should run on every change of either
+# kind. A separate workflow is the only shape that gets both. It is ~1s, so
+# running it unconditionally costs nothing.
 #
 # 2026-08-29: the same bug was still live for the OTHER markdown-subject gates,
 # because only the link script was ever moved here. `doc-links` was fixed; its
@@ -171,10 +171,10 @@ jobs:
           #
           # test_documented_shell_blocks_parse.py runs `bash -n` over every
           # ```bash fence in a tracked *.md. Its subject is markdown, but note
-          # it needs `bash` on PATH -- guaranteed on these macOS runners and on
-          # ubuntu-latest, and the suite fails rather than skips if it is ever
-          # absent, because a syntax probe that returns 0 for everything is
-          # exactly the shape that goes green having checked nothing.
+          # it needs `bash` on PATH -- guaranteed on ubuntu-latest, and the suite
+          # fails rather than skips if it is ever absent, because a syntax probe
+          # that returns 0 for everything is exactly the shape that goes green
+          # having checked nothing.
           # test_readme_connector_claims_match_the_catalogue.py is the second hop
           # of the connector-catalogue guard. The first hop (reference.md vs the
           # connector tree) is test_connector_reference_matches_disk.py above and

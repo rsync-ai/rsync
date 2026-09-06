@@ -41,6 +41,14 @@
 # a real /v1/deploy to a running connector.
 #
 # Usage:  bash scripts/oss-leak-proof-test.sh
+#
+# Env: LEAKTEST_TAG_SUFFIX -- appended to both build tags. CI sets it from the run
+# id so two concurrent runs cannot collide on one tag. It exists because the fix
+# for that collision used to be a repository-wide GitHub `concurrency` group, and
+# a group holds exactly ONE pending job: a third queued run CANCELS the second,
+# which renders as a red X on the PR and is indistinguishable from a real leak.
+# Measured over 60 ci.yml runs before this was removed: 12 of 53 non-skipped runs
+# of this job were cancelled with zero steps executed. Unique tags let the mutex go.
 set -uo pipefail
 
 CTX="llm-service"
@@ -155,7 +163,10 @@ fi
 # nothing else in the repo would notice.
 run_image() {
   local dockerfile="$1" tag="$2" entry="$3" want_buildx="$4" extra_absent="$5" must_ship="$6"
-  local img="rsync-oss-leaktest:$tag"
+  # Run-scoped so concurrent runs never share a tag (see LEAKTEST_TAG_SUFFIX above).
+  # `:-` keeps this safe under `set -u` when the variable is unset, which is the
+  # local-developer case: the tags then read exactly as they always have.
+  local img="rsync-oss-leaktest:${tag}${LEAKTEST_TAG_SUFFIX:-}"
 
   head2 "$tag  ($dockerfile)"
 
