@@ -36,6 +36,40 @@ func TestTransientTransportErrors_BackoffRetry(t *testing.T) {
 	}
 }
 
+// TestDNSFailuresOtherThanNXDOMAIN_BackoffRetry closes the gap its sibling
+// classifier had (destInfraFaultMarkers in the CDC sink worker, which this rule
+// is the mirror of): the transient set named only NXDOMAIN's wording, "no such
+// host", so a resolver that failed any other way -- SERVFAIL, a truncated or
+// unparseable answer, a temporary getaddrinfo failure -- fell through to
+// escalate instead of a bounded backoff, sending a human after an outage that
+// resolves itself. The cases are every error net/dnsclient_unix.go defines,
+// plus the glibc getaddrinfo wording, so the class is closed against the
+// resolver rather than against the one wording that was seen in the wild.
+func TestDNSFailuresOtherThanNXDOMAIN_BackoffRetry(t *testing.T) {
+	d := New()
+	cases := []struct {
+		msg  string
+		desc string
+	}{
+		{"dial tcp: lookup pg-dest on 127.0.0.53:53: server misbehaving", "SERVFAIL"},
+		{"dial tcp: lookup pg-dest on 10.96.0.10:53: no answer from DNS server", "no answer"},
+		{"dial tcp: lookup pg-dest on 10.96.0.10:53: lame referral", "lame referral"},
+		{"dial tcp: lookup pg-dest on 10.96.0.10:53: invalid DNS response", "invalid response"},
+		{"dial tcp: lookup pg-dest on 10.96.0.10:53: cannot unmarshal DNS message", "unparseable answer"},
+		{"dial tcp: lookup pg-dest on 10.96.0.10:53: cannot marshal DNS message", "unencodable query"},
+		{"could not connect: [Errno -3] Temporary failure in name resolution", "getaddrinfo EAI_AGAIN"},
+	}
+	for _, c := range cases {
+		got := d.Diagnose(Signal{ErrorMessage: c.msg})
+		if got.Category != CategoryNetwork {
+			t.Errorf("desc=%q msg=%q: want network, got %s", c.desc, c.msg, got.Category)
+		}
+		if got.SuggestedAction != ActionBackoffRetry {
+			t.Errorf("desc=%q msg=%q: want backoff_retry, got %s", c.desc, c.msg, got.SuggestedAction)
+		}
+	}
+}
+
 // TestCertificateErrors_NotAutoRetried is a deliberate-exclusion guard. TLS /
 // x509 failures (expired cert, unknown CA, hostname mismatch) are persistent
 // configuration faults: a backoff-retry loop can never fix them and would just

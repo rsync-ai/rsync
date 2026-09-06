@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react"
 import { PageHeader } from "@/components/layout/PageHeader"
+import { isNameResolutionFailure } from "@/lib/errors/name-resolution"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -2861,7 +2862,9 @@ function classifyApiError(
   }
 
   if (context === "schema") {
-    const isDnsFailure = lower.includes("no such host") || lower.includes("name or service not known")
+    // Every wording the resolver can produce, not just NXDOMAIN -- see the
+    // module for why the one-marker test missed most real outages.
+    const isDnsFailure = isNameResolutionFailure(lower)
     const isConnRefused = lower.includes("connection refused") || lower.includes("connect: refused")
     const hint = isDnsFailure
       ? "The database hostname could not be resolved. If running locally, check that the database Docker container is running (`docker compose up -d`)."

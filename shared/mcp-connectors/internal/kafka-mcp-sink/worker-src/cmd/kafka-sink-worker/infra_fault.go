@@ -134,6 +134,27 @@ var destInfraFaultMarkers = []string{
 	"connection refused",
 	"no such host",
 	"name or service not known",
+	// DNS answered, but not with an address. NXDOMAIN is the only resolver
+	// failure whose wording appears above, and Go reports every OTHER one in a
+	// wording of its own -- so a resolver outage read as unclassified, which is
+	// DLQ + commit, the silent loss this file exists to prevent. Caught on CI
+	// 2026-09-06 by a runner whose resolver answered SERVFAIL: `lookup
+	// rsync-ai-postgresql-mcp on 127.0.0.53:53: server misbehaving`. Enumerated
+	// from net/dnsclient_unix.go's own error block rather than from that one
+	// wording, so the class is closed against the resolver instead of patched
+	// against the instance.
+	"server misbehaving",
+	"no answer from dns server",
+	"lame referral",
+	"invalid dns response",
+	"cannot unmarshal dns message",
+	"cannot marshal dns message",
+	// getaddrinfo EAI_AGAIN, as glibc words it -- what the cgo resolver produces
+	// and what a Python connector relaying its own socket error sends back
+	// through `dest error:`. The BSD/macOS wording for the same errno is the
+	// bare "try again", too generic to allowlist without sweeping up unrelated
+	// text, and its Linux counterpart is what actually runs in the cluster.
+	"temporary failure in name resolution",
 	"network is unreachable",
 	"no route to host",
 	"i/o timeout",

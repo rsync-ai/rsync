@@ -497,6 +497,16 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 	// (see TestCertificateErrors_NotAutoRetried).
 	if matchesAny(low, []string{
 		"connection refused", "no such host", "name or service not known",
+		// DNS answered, but not with an address. "no such host" is only
+		// NXDOMAIN; Go reports every other resolver failure in a wording of its
+		// own, so naming that one text left a SERVFAIL or a truncated answer
+		// escalating to a human over an outage that clears itself. Enumerated
+		// from net/dnsclient_unix.go's error block plus the glibc getaddrinfo
+		// wording, and kept in lockstep with destInfraFaultMarkers in the CDC
+		// sink worker, which mirrors this rule.
+		"server misbehaving", "no answer from dns server", "lame referral",
+		"invalid dns response", "cannot unmarshal dns message",
+		"cannot marshal dns message", "temporary failure in name resolution",
 		"network is unreachable", "i/o timeout", "context deadline exceeded",
 		// Peer dropped an established connection mid-stream — retryable.
 		"connection reset", "broken pipe", "unexpected eof",

@@ -43,6 +43,35 @@ func SendError(c *gin.Context, status int, code string, message string, details 
 	c.JSON(status, resp)
 }
 
+// isNameResolutionFailure reports whether an error is DNS declining to produce
+// an address, rather than the database declining the write. "no such host" is
+// only NXDOMAIN: Go words every other resolver failure differently
+// (net/dnsclient_unix.go's error block), and a resolver outage that fell
+// through this test was reported to the user as a permanent 500 "contact
+// support" instead of the retryable 503 it is. Lowercased because those other
+// wordings carry capitals that err.Error() preserves verbatim. Kept in lockstep
+// with pkg/diagnose's transient network set (backend-orchestrator) and the CDC
+// sink worker's destInfraFaultMarkers.
+func isNameResolutionFailure(errStr string) bool {
+	low := strings.ToLower(errStr)
+	for _, marker := range []string{
+		"no such host",
+		"name or service not known",
+		"server misbehaving",
+		"no answer from dns server",
+		"lame referral",
+		"invalid dns response",
+		"cannot unmarshal dns message",
+		"cannot marshal dns message",
+		"temporary failure in name resolution",
+	} {
+		if strings.Contains(low, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 // ParseDBError converts database errors into user-friendly messages
 func ParseDBError(err error, resourceType string, resourceName string) (message string, code string, status int) {
 	errStr := err.Error()
@@ -85,8 +114,8 @@ func ParseDBError(err error, resourceType string, resourceName string) (message 
 			http.StatusBadRequest
 	}
 
-	// Connection refused (database not available)
-	if strings.Contains(errStr, "connection refused") || strings.Contains(errStr, "no such host") {
+	// Connection refused, or the host name never resolved (database not available)
+	if strings.Contains(errStr, "connection refused") || isNameResolutionFailure(errStr) {
 		return "Database service is temporarily unavailable. Please try again later.",
 			ErrCodeDatabaseError,
 			http.StatusServiceUnavailable
