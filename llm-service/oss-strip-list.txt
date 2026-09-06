@@ -33,7 +33,6 @@ src/agents/tool_generator/generator
 src/agents/tool_generator/harness
 src/agents/tool_generator/mock_server
 src/agents/tool_generator/prompts
-src/agents/tool_generator/requirements.txt
 src/agents/tool_generator/schemas
 src/agents/tool_generator/service.py
 src/agents/tool_generator/templates

@@ -67,9 +67,32 @@ done < "$STRIP_LIST"
 # A shrunken denominator would let every B check below pass while testing almost
 # nothing -- the failure mode where the list is empty and "no leaks found" is
 # vacuously true.
-if [ "${#STRIP[@]}" -lt 20 ]; then
-  echo "FATAL: $STRIP_LIST yielded only ${#STRIP[@]} paths; expected the full moat list (>=20)."
+#
+# This was a bare `-lt 20` against a list that had exactly 20 entries, so it
+# carried no headroom: the first legitimate deletion tripped it, and the only
+# way to get green again was to edit the literal -- which is also the edit that
+# would hide a real truncation. A floor pinned to the current value does not
+# measure the property it names.
+#
+# Two checks instead, because "under-read" and "gutted" are different faults.
+# The first needs no maintained number at all: count the list's entries by an
+# independent method and require the parse to agree. That catches the fault the
+# comment above actually describes (a loop that reads nothing, or half, because
+# of a bad path, a CRLF, or an early `break`) at ANY list size, forever.
+DECLARED=$(grep -cvE '^[[:space:]]*(#|$)' "$STRIP_LIST" || true)
+if [ "${#STRIP[@]}" -ne "$DECLARED" ]; then
+  echo "FATAL: parsed ${#STRIP[@]} paths from $STRIP_LIST but it declares $DECLARED."
   echo "       Refusing to run: an under-read list makes check B pass by testing nothing."
+  exit 1
+fi
+
+# The second is the absolute floor, and it is 15 to match the guard on the same
+# file in llm-service/tests/test_oss_image_boundary.py -- one list, one floor.
+# Deliberately below the current count: this number exists to catch the list
+# being gutted, not to notice that one entry left.
+if [ "${#STRIP[@]}" -lt 15 ]; then
+  echo "FATAL: $STRIP_LIST yielded only ${#STRIP[@]} paths; expected the moat list (>=15)."
+  echo "       Refusing to run: a gutted list makes check B pass by testing almost nothing."
   exit 1
 fi
 
