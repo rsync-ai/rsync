@@ -5,14 +5,42 @@
 #
 #   helm install rsync ./rsync-ai \
 #     -f rsync-ai/values-byo-everything.yaml \
-#     -f my-secrets.yaml
+#     -f my-values.yaml
 #
 # This file is also the honest inventory of what "production" costs: five
 # external dependencies, four of which hold state you cannot lose.
 #
-# Every `""` below is REQUIRED. The chart fails to render for the ones it can
-# check (bootstrap servers, ingress hosts, the three secrets); the rest fail at
-# runtime as a connection error naming the empty host.
+# Every `""` below is REQUIRED, and it is yours to fill in your own file, not
+# here -- helm stores every `-f` value in the release Secret in cleartext and
+# `helm get values` reads it back. The chart aborts the render for the ones it
+# can check (bootstrap servers, ingress hosts); the rest fail at runtime as a
+# connection error naming the empty host.
+#
+# Four more are required that appear NOWHERE below, because a secret has no
+# business having a slot in a shipped file. Two of them abort the render one at
+# a time; the other two do NOT -- they render as an EMPTY credential, the
+# install succeeds, and the failure arrives later as an auth error that names
+# neither key.
+#
+#   # my-values.yaml
+#   secrets:
+#     jwtSecret: ""            # <-- fill this in
+#                              #     openssl rand -base64 32
+#     encryptionKey: ""        # <-- fill this in
+#                              #     openssl rand -base64 32 -- and BACK IT UP
+#                              #     BEFORE YOU INSTALL. See the note below.
+#     postgresPassword: ""     # <-- fill this in
+#                              #     The password for postgresql.external.host
+#                              #     below. Only the password is a secret, so
+#                              #     the two live apart on purpose. Empty is
+#                              #     correct ONLY for IAM database auth.
+#     redisPassword: ""        # <-- fill this in
+#                              #     Empty is correct ONLY when the instance
+#                              #     has no AUTH string configured.
+#
+# Setting `secrets.existingSecret` instead moves all four into a Secret you
+# manage yourself and none of them into any values file -- see the next block,
+# which is the recommended path for exactly this overlay.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Secrets — do not put them in this file

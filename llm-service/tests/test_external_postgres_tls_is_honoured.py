@@ -20,7 +20,7 @@ proof the setting had taken. And on a database that REFUSES plaintext the
 failure lands on Temporal, which then cannot create its schemas, so the symptom
 is not "TLS error" but "every pipeline hangs".
 
-Two layers, because CI has no helm binary:
+Two layers, because one of them must hold without anything installed:
 
   1. static, runs everywhere: any template that wires up a Postgres connection
      must also reference one of the sslmode/TLS helpers.
@@ -149,7 +149,7 @@ def test_the_server_and_schema_tool_tls_families_are_set_together():
     )
 
 
-@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed (CI has none)")
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed on this machine")
 @pytest.mark.parametrize(
     "sslmode,tls_enabled,host_verification",
     [

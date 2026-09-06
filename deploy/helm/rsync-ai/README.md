@@ -8,7 +8,7 @@ helm install rsync ./deploy/helm/rsync-ai \
   --namespace rsync --create-namespace \
   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
-  --set secrets.postgresPassword="$(openssl rand -base64 24)" \
+  --set secrets.postgresPassword="$(openssl rand -hex 24)" \
   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
   --set frontend.publicUrl=https://app.example.com \
@@ -110,6 +110,62 @@ created the other way round is created *successfully* and can never be written
 to; the platform comes up healthy and every pipeline reports `dispatched N rows
 … no acks were recorded`. The chart refuses to render if you invert them.
 
+### External PostgreSQL
+
+Set `postgresql.enabled: false` and fill in `postgresql.external.host`. Four
+things the host alone does not cover:
+
+**The password is not next to the host.** It is `secrets.postgresPassword`,
+because the host is not a secret and this chart keeps the two apart. Nothing
+validates it when `postgresql.enabled: false` — an empty one renders a valid
+install that fails later as an authentication error naming neither value. That
+is deliberate: an empty password is *correct* under Cloud SQL IAM database
+authentication and RDS IAM database authentication.
+
+**The password cannot contain whitespace or any of `" ' \ @ : / ? # [ ] %`.**
+This is the one place a BYO database bites, because the password already exists
+and you did not pick its alphabet. The chart splices the same value into a
+`postgres://` URL for one service and hands it to another verbatim, and those
+two want opposite escapings — percent-encode it and Temporal authenticates as
+the literal `%40`; leave it raw and the URL parser reads the password as a
+hostname. No value satisfies both, so `helm template` refuses the characters
+rather than choosing a side. If your managed instance already uses one, change
+it at the server (`ALTER ROLE rsync PASSWORD '…'`), not only in the values file.
+`openssl rand -hex 24` lands inside the allowed set.
+
+The same restriction applies to `secrets.redisPassword` and
+`secrets.demoWarehousePassword`, for the same reason. It is checked only for a
+value set in the values file: under `secrets.existingSecret` the chart never
+sees the password, and breaking the rule then fails **silently** — the
+api-gateway logs one warning on a failed connect, stays `1/1` Ready, and serves
+mock data.
+
+**The role and the database must already exist.** The chart connects as
+`postgresql.username` (default `rsync`) to `postgresql.database` (default
+`pipeline_db`); a freshly created managed instance has neither. The role needs
+DDL on that database — `api-gateway` and `orchestrator` each run their own
+migrations at startup.
+
+**Temporal needs two more databases, and nothing creates them for you.** With
+`postgresql.enabled: false` the chart sets `SKIP_DB_CREATE=true` on the Temporal
+pod, so create them on the same instance before installing:
+
+```sql
+CREATE DATABASE temporal OWNER rsync;
+CREATE DATABASE temporal_visibility OWNER rsync;
+```
+
+Skip this and the Temporal pod CrashLoopBackOffs — its image runs
+`auto-setup.sh && start-temporal.sh` under `set -e` — and with no workflow
+engine every pipeline hangs rather than failing. `SKIP_DB_CREATE` is set
+unconditionally rather than only where `CREATE DATABASE` is forbidden, because
+auto-setup's own create step is guarded only by the name test
+`${DBNAME} != ${POSTGRES_USER}` and never on whether the database is there.
+
+TLS is derived from `postgresql.external.sslMode` alone, including Temporal's
+own switches, which have no `sslmode` concept. The mapping table is in
+[docs/deployment/kubernetes.md](../../../docs/deployment/kubernetes.md#postgres-you-already-run).
+
 ### Pointing at a Kafka cluster you already run
 
 Set `kafka.enabled: false` and describe the cluster once under `kafka.external`.
@@ -157,7 +213,7 @@ Layer on top of `values.yaml`; none of them is usable alone.
 ```bash
 helm install rsync ./deploy/helm/rsync-ai \
   -f deploy/helm/rsync-ai/values-eks.yaml \
-  -f my-secrets.yaml
+  -f my-values.yaml
 ```
 
 - [`values-eks.yaml`](values-eks.yaml) — gp3, ALB ingress, IRSA, MSK/SCRAM
@@ -168,6 +224,24 @@ helm install rsync ./deploy/helm/rsync-ai \
 Each one carries the cloud-specific traps in comments (the ALB 60 s idle timeout
 that silently kills the progress WebSocket, GKE's 5–10 minute ingress
 provisioning, Event Hubs ignoring client-specified replication factor).
+
+**None of them carries anything that is yours**, so `my-values.yaml` above is
+not optional and is not only secrets. Six keys live there and in no file this
+chart ships:
+
+| Key | If you omit it |
+|---|---|
+| `secrets.jwtSecret` | render aborts |
+| `secrets.encryptionKey` | render aborts |
+| `frontend.apiUrl` | render aborts — it is what the *browser* calls, not a Service name |
+| `frontend.publicUrl` | render aborts — NextAuth builds its callback URLs from it |
+| `secrets.postgresPassword` | **renders empty.** Install succeeds; the managed database rejects the connection later. Correct to leave empty only under IAM database authentication |
+| `secrets.redisPassword` | **renders empty.** Same shape. Correct to leave empty only where the cache has no AUTH token |
+
+Helm reports one render failure at a time, so the first four cost four
+consecutive failed `helm install` attempts if you meet them by trial. Each
+overlay's own header carries the paste-ready skeleton with that provider's
+service names filled in.
 
 ## Secrets
 

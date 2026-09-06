@@ -96,8 +96,13 @@ naming the fleet.
 {{- fail "demo.enabled=true requires a `postgresql` entry in connectors.fleet.\n\nThe demo warehouse is reached through the postgresql connector, and Kubernetes\nhas no just-in-time connector deploy: with no Service for it the platform falls\nback to a stdio subprocess that pip-installs the connector at runtime inside the\ncalling pod. Add:\n\n  connectors:\n    fleet:\n      - id: postgresql\n        version: v1.0.0\n        image: { repository: mcp-postgresql, tag: \"\" }" }}
 {{- end }}
 {{- if and (not .Values.secrets.existingSecret) (not .Values.secrets.demoWarehousePassword) }}
-{{- fail "demo.enabled=true requires secrets.demoWarehousePassword (or set secrets.existingSecret with a DEMO_WAREHOUSE_PASSWORD key). Generate with: openssl rand -base64 32\n\nDeliberately not secrets.postgresPassword. The demo warehouse is a destination\nevery workspace member can run SQL against; sharing the control-plane password\nwith it puts an offline crack of pg_authid between a member and the metadata\ndatabase." }}
+{{- fail "demo.enabled=true requires secrets.demoWarehousePassword (or set secrets.existingSecret with a DEMO_WAREHOUSE_PASSWORD key). Generate with: openssl rand -hex 24\n\nDeliberately not secrets.postgresPassword. The demo warehouse is a destination\nevery workspace member can run SQL against; sharing the control-plane password\nwith it puts an offline crack of pg_authid between a member and the metadata\ndatabase." }}
 {{- end }}
+{{- include "rsync-ai.assertDeliverableSecret" (dict
+      "key" "secrets.demoWarehousePassword"
+      "value" .Values.secrets.demoWarehousePassword
+      "sites" "It is read two ways: inside a postgres:// URL (api-gateway's\nRSYNC_DEMO_DESTINATION_DSN) and verbatim as POSTGRES_PASSWORD on the demo\nwarehouse container, which is what initdb SETS the role's password to.\n"
+      "tail" "\nNothing outside this chart owns that password, so regenerating it is free --\nthere is no server-side change to keep in step.") }}
 {{- end }}
 
 {{/*
@@ -128,6 +133,21 @@ invalid on restart.
 {{- if and .Values.postgresql.enabled (not .Values.secrets.postgresPassword) }}
 {{- fail "secrets.postgresPassword is required when postgresql.enabled=true (or set secrets.existingSecret)." }}
 {{- end }}
+{{/*
+Three secrets are read two incompatible ways each; the reasoning, the alphabet
+and the message live in one place, rsync-ai.assertDeliverableSecret
+(_helpers.tpl), so the three cannot drift apart.
+*/}}
+{{- include "rsync-ai.assertDeliverableSecret" (dict
+      "key" "secrets.postgresPassword"
+      "value" .Values.secrets.postgresPassword
+      "sites" "It is read three ways: inside a postgres:// URL (api-gateway DATABASE_URL, CDC\nsink POSTGRES_URL), inside a libpq `password=` keyword string built by\nconcatenation (orchestrator, temporal-adapter), and verbatim (Temporal\nPOSTGRES_PWD).\n"
+      "tail" "\nThe silent failure is the worst of the three: the api-gateway logs one warning\non a failed connect, stays 1/1 Ready, and serves mock data, so `helm install`\nand `kubectl get pods` both look successful.\n\nFor an EXTERNAL database this is the password of the role named in\npostgresql.username -- change it at the server (ALTER ROLE ... PASSWORD ...),\nnot only here.") }}
+{{- include "rsync-ai.assertDeliverableSecret" (dict
+      "key" "secrets.redisPassword"
+      "value" .Values.secrets.redisPassword
+      "sites" "It is read two ways: inside a redis:// URL (the CDC sink's REDIS_URL) and\nverbatim as Options.Password by every other Go and Python client -- and, when\nredis.enabled=true, by the server itself, whose entrypoint writes\n`requirepass <value>` into redis.conf, where whitespace splits the directive and\n`#` starts a comment.\n"
+      "tail" "\nAn empty value is fine and means no password; this only constrains a value you\ndo set.") }}
 {{- if and (eq .Values.objectStorage.mode "minio") (not .Values.secrets.minioAccessKey) }}
 {{- fail "secrets.minioAccessKey is required when objectStorage.mode=minio (or set secrets.existingSecret). Generate with: openssl rand -hex 16" }}
 {{- end }}

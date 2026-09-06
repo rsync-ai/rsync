@@ -592,6 +592,26 @@ jobs:
         # setuptools, so this is a CI-only divergence — without the pin, tests/ fails at
         # COLLECTION with ModuleNotFoundError: pkg_resources, not at runtime in prod.
         run: pip install pymongo 'setuptools<81'
+      # Eight cases across six suites are `skipif(shutil.which("helm") is None)`.
+      # They render the chart: the documented `helm install` blocks, the four
+      # cloud overlays, the external-Postgres TLS wiring, the docker-host
+      # feature gates, and what `helm package` actually ships. A skip is
+      # silent -- pytest prints one summary line whether a case ran or not.
+      #
+      # NOTHING in this repo installs helm by default, and this job runs on
+      # ubuntu-latest, whose image makes no promise to carry one. Comments in
+      # those suites used to assert the opposite -- "CI has NO helm binary" --
+      # and used it to justify staying text-only, which was the wrong argument
+      # for a decision that was right anyway: a text parse needs no binary.
+      #
+      # So arrange the dependency once, here, where a runner without helm is a
+      # red job instead of eight quiet skips. Same action and same pin as
+      # docker-publish.yml already uses for publish-chart, and the version
+      # print after it turns a broken setup into a named failure rather than a
+      # later skip.
+      - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+      - name: helm is present (eight chart cases skip silently without it)
+        run: helm version --short
       - name: Run unit tests
         working-directory: llm-service
         env:
@@ -1287,9 +1307,9 @@ jobs:
     # `setup.skip(...)`, and e2e/a11y/authenticated_pages.spec.ts then self-skips
     # all four authenticated routes on the missing `.auth/user.json`. A skip is
     # indistinguishable from a pass in the report. What actually gets measured
-    # here is the two PUBLIC route specs (login, signup). The runners are
-    # developer Macs, so on any run where something unrelated happens to serve
-    # :5001 the authenticated project runs instead — nondeterministic either way.
+    # here is the two PUBLIC route specs (login, signup). And if anything else
+    # on the runner happens to serve :5001, the authenticated project runs
+    # after all — nondeterministic either way.
     #
     # The PR-lane guard for the authenticated pages is therefore a jsdom+axe unit
     # test, frontend/src/__tests__/authenticated-pages-a11y.test.tsx, which the
@@ -1303,7 +1323,7 @@ jobs:
     # the `if:` or drop either `continue-on-error` until both are met:
     #   (a) the job must stand up an api-gateway (or set E2E_API_URL at a
     #       reachable one) so the authenticated project runs deterministically
-    #       instead of depending on what the self-hosted Mac happens to serve;
+    #       instead of depending on what the runner happens to serve;
     #   (b) the remaining runtime violations on /dashboard and /pipelines — not
     #       yet enumerated, most likely `color-contrast` — must be read out of
     #       the playwright-a11y-report artifact and fixed.

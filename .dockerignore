@@ -1,0 +1,69 @@
+# Build context exclusions for the FOUR images whose context is the repo root:
+# api-gateway, backend-orchestrator, backend-temporal-adapter and
+# shared/mcp-connectors/internal/kafka-mcp-sink. (Census, not memory:
+# `context: .` appears at docker-compose.yml:401, :840, :1002, :1213 and at
+# .github/workflows/docker-publish.yml:44, :49, :54, :122 -- those eight sites
+# are the same four Dockerfiles.)
+#
+# Docker reads .dockerignore ONLY from the context root. The three nested ones
+# the repo already had -- frontend/, shared/mcp-connectors/ and
+# connector-deployer/ -- therefore do nothing for a root-context build, and
+# without this file the context those four builds ship is the WHOLE checkout.
+#
+# Measured on a developer machine, same checkout, same command:
+#
+#   without this file   context = the whole 2.7 GB tree
+#                       (frontend/.next 1.7 GB + frontend/node_modules 819 MB)
+#   with this file      21.09 MB transferred in 0.2 s, 46 MB materialised
+#
+# The `ls` of that materialised context still shows api-gateway,
+# backend-orchestrator, backend-temporal-adapter and shared -- every directory
+# the four Dockerfiles name -- and no longer shows frontend, llm-service, docs,
+# e2e, deploy, .git, .github or .claude, none of which they can reach.
+#
+# A fresh CI checkout has neither .next nor node_modules, so CI never paid this
+# and nothing ever went red. It is charged entirely to the person building from
+# a working tree, which after the public flip is every user who builds from
+# source.
+#
+# Nothing excluded here is reachable from those four Dockerfiles. Their COPY
+# lines name only shared/go/*, api-gateway/, backend-orchestrator/,
+# backend-temporal-adapter/ and shared/mcp-connectors/internal/kafka-mcp-sink/.
+# The list below is deliberately a DENY list rather than an allowlist: a new
+# root-context Dockerfile that needs a path nobody denied keeps working, and if
+# one ever does need a denied path it fails loudly at COPY, not silently.
+
+# --- the two that dominate the context ---
+frontend/
+llm-service/
+
+# --- other trees no root-context Dockerfile COPYs ---
+.git/
+.github/
+.claude/
+docs/
+e2e/
+deploy/
+connector-deployer/
+tests/
+site/
+examples/
+
+# --- build and tool output, anywhere in the tree ---
+**/node_modules/
+**/.next/
+**/__pycache__/
+**/*.pyc
+**/.venv/
+**/venv/
+**/.mypy_cache/
+**/.ruff_cache/
+.pytest_cache/
+.test-evidence/
+**/*.log
+
+# --- local state that must never enter a build cache ---
+.env
+.env.*
+**/*.pem
+**/*.key

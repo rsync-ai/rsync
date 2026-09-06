@@ -31,8 +31,10 @@ Three things have to stay true, and each is one test below:
      back into `allow-intra-release` -- the original bug, reintroduced by a
      rename with no other visible effect.
 
-Text-only: CI has no helm binary, so a render-based check here would skip in the
-one place it needs to run.
+Text-only because parsing the templates needs no `helm` binary and no render, so it holds on any checkout -- not
+because "CI has no helm binary", which is what this said and was false as a
+reason: ci.yml sets helm up for the job that collects this suite and asserts it
+before pytest. See the `helm is present` step in .github/workflows/ci.yml.
 """
 
 import os

@@ -25,9 +25,24 @@ Both run the same `ghcr.io/rsync-ai/*` images at the same version.
 
 ## Install
 
-**Requirements:** Kubernetes ≥ 1.25, Helm ≥ 3.8 (OCI support), a default
-StorageClass, and — for anything beyond evaluation — managed Postgres, Redis,
-Kafka and object storage.
+**Requirements:** Kubernetes ≥ 1.25, Helm ≥ 3.8 (OCI support), **`linux/amd64`
+nodes**, a default StorageClass, and — for anything beyond evaluation — managed
+Postgres, Redis, Kafka and object storage.
+
+<!-- published-platforms: linux/amd64 -->
+<!-- The prose below was written against that platform set, which is computed from
+     .github/workflows/docker-publish.yml, not asserted here. If the workflow starts
+     building another platform, test_published_image_platforms_match_the_docs.py goes
+     red and points at this block. -->
+> [!WARNING]
+> **The node architecture is a hard requirement, and it fails late.** Every
+> `ghcr.io/rsync-ai/*` image is `linux/amd64` only — `docker-publish.yml` sets no
+> `platforms:` key, so buildx tags each image for its `ubuntu-latest` runner and
+> nothing else. On an arm64 node pool (GKE T2A/Axion, EKS Graviton, AKS Ampere)
+> `helm install` reports success and every pod then sits in `ImagePullBackOff`
+> with no arm64 candidate. Nothing in the chart can catch this: a manifest is
+> resolved by the kubelet, long after the render the chart is able to validate.
+> Pin an amd64 pool, or build the images yourself from a checkout.
 
 ### From the published chart
 
@@ -45,6 +60,34 @@ helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
 ```
 
 No registry login is needed — the chart and every image it pulls are public.
+
+**Reaching a cloud overlay from here.** The `values-gke.yaml` / `values-eks.yaml`
+/ `values-aks.yaml` overlays *are* packaged inside the published chart, but `-f`
+resolves against your filesystem, not against the chart — so on this path there
+is no local file to name, and the two halves of the documentation do not compose.
+`-f` does accept a URL, so pin the overlay to the same tag as the chart:
+
+```bash
+helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
+  --version 0.1.2 \
+  --namespace rsync --create-namespace \
+  -f https://raw.githubusercontent.com/rsync-ai/rsync/v0.1.2/deploy/helm/rsync-ai/values-gke.yaml \
+  -f my-values.yaml
+```
+
+Keep the two versions equal. The URL carries the tag `v0.1.2` and `--version`
+carries `0.1.2` — the same release, spelled the two different ways the tag and
+the chart version use. If you would rather not fetch over the network at install
+time, unpack the chart and use the copy that shipped with it, which cannot skew
+from the chart at all:
+
+```bash
+helm pull oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.2 --untar
+helm install rsync ./rsync-ai \
+  --namespace rsync --create-namespace \
+  -f ./rsync-ai/values-gke.yaml \
+  -f my-values.yaml
+```
 
 ### From a checkout
 
@@ -87,7 +130,7 @@ install (in-chart Postgres/Redis/Kafka/MinIO):
 secrets:
   jwtSecret: "<openssl rand -base64 32>"
   encryptionKey: "<openssl rand -base64 32>"
-  postgresPassword: "<openssl rand -base64 24>"
+  postgresPassword: "<openssl rand -hex 24>"
   minioAccessKey: "<openssl rand -base64 16>"
   minioSecretKey: "<openssl rand -base64 24>"
 frontend:
@@ -99,6 +142,18 @@ frontend:
 > stored connection credential. Replacing it later without carrying the old key
 > in `ENCRYPTION_KEYS` makes every saved connection permanently undecryptable,
 > and there is no recovery path.
+
+> **`postgresPassword`, `redisPassword` and `demoWarehousePassword` may not
+> contain whitespace or any of `" ' \ @ : / ? # [ ] %`.** Each is spliced into
+> a URL by one service and read verbatim by another, and those two want opposite
+> escapings — percent-encode it and the verbatim reader authenticates as the
+> literal `%40`, leave it raw and the URL parser reads the password as a
+> hostname. No value satisfies both, so the chart refuses the characters at
+> render time. `openssl rand -hex 24` stays inside the allowed set. For a
+> **managed** database whose password already exists, change it at the server
+> rather than only here. The check is skipped under `secrets.existingSecret`,
+> where the chart never sees the value and the failure is silent instead: the
+> api-gateway logs one warning, stays `1/1` Ready, and serves mock data.
 
 ---
 
@@ -117,7 +172,8 @@ gp3 is sufficient and EFS is not needed.
 secrets:
   jwtSecret: "…"
   encryptionKey: "…"
-  postgresPassword: "…"
+  postgresPassword: "…"        # the RDS password; restricted alphabet, see above
+  redisPassword: "…"           # the ElastiCache AUTH token; same alphabet. Omit only if there is none
 frontend:
   apiUrl: https://api.example.com
   publicUrl: https://app.example.com
@@ -161,14 +217,83 @@ have no controller to claim it.
   comma-separated list end to end; collapsing it to one hostname gives you a
   single point of failure that looks like it works.
 
-### GKE and AKS
+## GKE
 
-[`values-gke.yaml`](../../deploy/helm/rsync-ai/values-gke.yaml) and
-[`values-aks.yaml`](../../deploy/helm/rsync-ai/values-aks.yaml) are the same
-shape. Two provider quirks are called out in the chart README: GCS's
-S3-compatible endpoint needs an **HMAC key** (workload identity does not work
-there), and Azure Cache for Redis is TLS-only on 6380 while the chart wires
-`redis://`, not `rediss://`.
+Start from [`values-gke.yaml`](../../deploy/helm/rsync-ai/values-gke.yaml). It
+sets `global.storageClass: premium-rwo`, disables all four in-chart data stores,
+selects the GCE ingress class, and pre-fills the GCS object-storage block —
+leaving you the endpoints and credentials.
+
+**Provision first:** Cloud SQL for PostgreSQL, Memorystore for Redis, a Kafka
+cluster (Google's Managed Service for Apache Kafka, or Confluent Cloud — both
+speak `SASL_SSL`/`PLAIN`), a GCS bucket, and an **HMAC key** for the service
+account that will reach it.
+
+```yaml
+# my-values.yaml — layered over values-gke.yaml
+secrets:
+  jwtSecret: "…"
+  encryptionKey: "…"
+  postgresPassword: "…"        # the Cloud SQL password; restricted alphabet, see above
+  redisPassword: "…"           # the Memorystore AUTH string; same alphabet. Omit only if AUTH is off
+frontend:
+  apiUrl: https://api.example.com
+  publicUrl: https://app.example.com
+
+postgresql:
+  external: { host: 10.20.0.3 }        # Cloud SQL private IP
+redis:
+  external: { host: 10.30.0.4 }        # Memorystore private IP
+kafka:
+  external:
+    bootstrapServers: "bootstrap.mycluster.europe-west1.managedkafka.myproject.cloud.goog:9092"
+    saslUsername: rsync
+    saslPassword: "…"
+objectStorage:
+  external:
+    accessKeyId: "GOOG1E…"             # HMAC access ID
+    secretAccessKey: "…"               # HMAC secret
+```
+
+```bash
+helm install rsync ./deploy/helm/rsync-ai \
+  --namespace rsync --create-namespace \
+  -f deploy/helm/rsync-ai/values-gke.yaml \
+  -f my-values.yaml
+```
+
+**Four GKE-specific things that are easy to get wrong:**
+
+- **The GCS credentials are not optional and workload identity does not replace
+  them.** The object-storage connectors speak S3 and nothing else, so `mode: gcs`
+  means the S3-compatible XML endpoint, which does not accept a Workload Identity
+  token. Leaving `accessKeyId`/`secretAccessKey` empty falls back to no
+  credentials at all, not to the service account.
+- **Cloud SQL is reached by private IP or by a proxy you run yourself.** The
+  chart does not template the Cloud SQL Auth Proxy. If you need it, run it as its
+  own Deployment + Service and point `postgresql.external.host` at that Service.
+- **Create Temporal's two databases on the Cloud SQL instance before installing**
+  — see [Postgres you already run](#postgres-you-already-run). Nothing creates
+  them for you, and without them no workflow engine starts and every pipeline
+  hangs.
+- **GCE ingress takes 5–10 minutes to serve traffic** and looks identical to a
+  broken install for the first few. `values-gke.yaml` ships
+  `ingress.enabled: false`; turn it on once the rest is healthy.
+
+On **Autopilot**, every workload in this chart declares CPU/memory requests, so
+it is supported as-is. Autopilot also blocks `hostPath` and privileged pods,
+neither of which the chart uses.
+
+## AKS
+
+[`values-aks.yaml`](../../deploy/helm/rsync-ai/values-aks.yaml) is the same
+shape, over Azure Database for PostgreSQL Flexible Server, Azure Cache for
+Redis, and Event Hubs' Kafka endpoint. Three Azure-specific notes: **Azure Cache
+for Redis is TLS-only on 6380** while this chart wires `redis://`, not
+`rediss://` — either enable the non-TLS 6379 port or keep Redis in-chart;
+Event Hubs' SASL username is the literal string `$ConnectionString` and the
+password is the whole connection string; and Event Hubs **ignores**
+client-specified replication factor.
 
 ---
 
@@ -301,8 +426,9 @@ explicitly once you are certain you no longer need the data.
 
 The chart is verified **manually** on a local `kind` cluster, using the scripts
 under [`deploy/helm/rsync-ai/test/`](../../deploy/helm/rsync-ai/test/). There is
-no CI gate on chart correctness — `helm` appears in `.github/workflows/` only in
-the tag-gated publish job, so a chart defect reaches `main` with nothing red.
+no CI gate on chart correctness: CI lints, renders and text-parses the chart, but
+never stands up a cluster, so a defect that only a real install exposes reaches
+`main` with nothing red.
 Run the kind scripts yourself before trusting a change here. A
 managed-cluster install (EKS/GKE/AKS against real RDS/MSK/S3) has **not** been
 run end to end — treat the cloud value files as reviewed starting points rather

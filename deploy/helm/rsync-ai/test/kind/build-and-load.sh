@@ -24,6 +24,7 @@
 #   ./build-and-load.sh              # build the Kafka-path images (default)
 #   ./build-and-load.sh all          # every first-party image
 #   ./build-and-load.sh fleet        # the connectors.fleet images
+#   ./build-and-load.sh default      # what a default `helm install` renders
 #   ./build-and-load.sh api-gateway orchestrator
 set -euo pipefail
 
@@ -60,6 +61,12 @@ ALL_IMAGES=(
   "connector-seed|./shared/mcp-connectors|shared/mcp-connectors/Dockerfile.seed"
   "kafka-connect|./shared/internal/infra/kafka-connect|shared/internal/infra/kafka-connect/Dockerfile"
   "mcp-postgresql|./shared/mcp-connectors/public/postgresql/versions/v1.0.0|shared/mcp-connectors/public/postgresql/versions/v1.0.0/Dockerfile|--build-context shared=@ROOT@/shared/mcp-connectors/public"
+  # connectors.sampleData.enabled DEFAULTS TO TRUE (values.yaml), so a plain
+  # `helm install` renders rsync-sample-data-mcp and it sits in ErrImagePull
+  # without this line -- the same defect the generation tier note below records,
+  # found by censusing a default render against this list rather than by eye.
+  # test_every_default_rendered_image_is_buildable_here keeps them in step.
+  "mcp-sample-data|./shared/mcp-connectors/public/sample-data/versions/v1.0.0|shared/mcp-connectors/public/sample-data/versions/v1.0.0/Dockerfile|--build-context shared=@ROOT@/shared/mcp-connectors/public"
   # The generation tier. Two images, not one, and both are allowlist builds that
   # omit the connector-generation moat (llm-service/oss-strip-list.txt).
   # generation.enabled now DEFAULTS TO TRUE in values.yaml, so a plain
@@ -78,10 +85,17 @@ KAFKA_PATH=(api-gateway orchestrator temporal-adapter mcp-debezium mcp-kafka-sin
 # The source/destination connectors a pipeline actually moves rows through.
 FLEET=(mcp-postgresql)
 
+# What a DEFAULT `helm install` renders, and therefore the minimum a cluster
+# needs before any pod can start. Named separately from FLEET because FLEET
+# mirrors the `connectors.fleet` values key and sample-data is a different key
+# (connectors.sampleData) that is on by default.
+DEFAULTSET=(api-gateway orchestrator temporal-adapter frontend connector-seed mcp-minio mcp-sample-data llm-service-oss connector-lifecycle)
+
 case "${1:-}" in
   ""    ) WANT=("${KAFKA_PATH[@]}") ;;
   "all"  ) WANT=() ; for e in "${ALL_IMAGES[@]}"; do WANT+=("${e%%|*}"); done ;;
   "fleet") WANT=("${FLEET[@]}") ;;
+  "default") WANT=("${DEFAULTSET[@]}") ;;
   *     ) WANT=("$@") ;;
 esac
 

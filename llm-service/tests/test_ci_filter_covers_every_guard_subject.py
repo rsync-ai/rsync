@@ -54,6 +54,14 @@ GUARDS = [
     # Measured on the day it was written: absent from GUARDS, the census reported
     # `104 passed` with zero cases naming it.
     "test_flip_excludes_name_paths_that_exist.py",
+    # Enrolled 2026-09-05 with the arm64 pass. Subjects are deploy/helm/rsync-ai/**,
+    # .github/workflows/docker-publish.yml, install.sh and docs/deployment/*.md -- all
+    # four already covered, by `deploy/helm/**`, `.github/workflows/**`, `install.sh` and
+    # `docs/**` respectively. Listed for the same reason as the entry above: GUARDS is a
+    # hand-maintained literal, so a guard that is never added looks exactly like one that
+    # passes.
+    "test_chart_ships_no_developer_scaffolding.py",
+    "test_published_image_platforms_match_the_docs.py",
 ]
 
 
@@ -118,7 +126,10 @@ def _repo_relative_files(literal):
     if os.path.isabs(literal):
         return set()
     found = set()
-    for hit in glob.glob(os.path.join(REPO_ROOT, literal)):
+    # recursive=True so a `**` literal means every level, not one. Without it a
+    # `**` subject expands to nothing and is dropped in silence -- the same
+    # shape as a guard that never ran.
+    for hit in glob.glob(os.path.join(REPO_ROOT, literal), recursive=True):
         if not os.path.isfile(hit):
             continue
         rel = os.path.relpath(hit, REPO_ROOT)

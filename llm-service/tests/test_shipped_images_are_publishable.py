@@ -40,6 +40,7 @@ opt-in, so an unpublished image there does not break the default install.
 
 import os
 import re
+import shutil
 import subprocess
 
 import pytest
@@ -409,6 +410,123 @@ def test_every_kind_build_path_exists(name, context, dockerfile):
     assert os.path.isfile(os.path.join(REPO_ROOT, dockerfile)), (
         f"{name}: kind dockerfile {dockerfile} does not exist -- "
         "`build-and-load.sh all` will fail on it"
+    )
+
+
+# --- ...and it has to build every image a DEFAULT install renders ---------------
+
+_KIND_SET = re.compile(r"^(?P<name>[A-Z_]+)=\((?P<members>[^)]*)\)\s*$", re.M)
+
+# The chart's own default registry prefix, so "first-party" is read out of the
+# chart rather than hardcoded here. A third-party pin (postgres:16-alpine,
+# temporalio/auto-setup) is pulled from its own registry and is not ours to build.
+_REGISTRY_KEY = re.compile(r"^\s{4}registry:\s*(?P<v>\S+)\s*$", re.M)
+
+
+def _kind_named_set(name):
+    """The members of a `NAME=(a b c)` array in the kind build script."""
+    with open(KIND_BUILD_SCRIPT) as fh:
+        for m in _KIND_SET.finditer(fh.read()):
+            if m.group("name") == name:
+                return [w for w in m.group("members").split() if not w.startswith("#")]
+    return None
+
+
+def _chart_registry():
+    with open(CHART_VALUES) as fh:
+        m = _REGISTRY_KEY.search(fh.read())
+    assert m, "could not read global.image.registry out of values.yaml"
+    return m.group("v").strip('"\'')
+
+
+def _default_render():
+    """`helm template` with only the values the chart marks `required:`."""
+    cmd = ["helm", "template", "r", os.path.join("deploy", "helm", "rsync-ai")]
+    for v in [
+        "secrets.jwtSecret=FAKEPLACEHOLDER",
+        "secrets.encryptionKey=FAKEPLACEHOLDERFAKEPLACEHOLDER32",
+        "secrets.postgresPassword=FAKEPLACEHOLDER",
+        "secrets.minioAccessKey=FAKEPLACEHOLDER",
+        "secrets.minioSecretKey=FAKEPLACEHOLDER",
+        "secrets.redisPassword=FAKEPLACEHOLDER",
+        "frontend.apiUrl=https://rsync.example.com",
+        "frontend.publicUrl=https://rsync.example.com",
+    ]:
+        cmd += ["--set", v]
+    return subprocess.run(cmd, capture_output=True, text=True, cwd=REPO_ROOT)
+
+
+def _first_party_images_in(rendered, registry):
+    """Bare image names under the chart's own registry, from every rendered doc."""
+    prefix = registry.rstrip("/") + "/"
+    names = set()
+    for m in re.finditer(r"^\s*image:\s*\"?(?P<ref>[^\"\s]+)", rendered, re.M):
+        ref = m.group("ref")
+        if ref.startswith(prefix):
+            names.add(ref[len(prefix):].rsplit(":", 1)[0])
+    return names
+
+
+def test_the_kind_named_set_parser_works():
+    """Vacuity floor for the two tests below -- a parser returning None or []
+    would make both of them assert nothing at all."""
+    assert _kind_named_set("KAFKA_PATH"), "KAFKA_PATH did not parse"
+    assert _kind_named_set("DEFAULTSET"), "DEFAULTSET did not parse"
+    assert _kind_named_set("NO_SUCH_SET") is None, "the parser invents sets"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_every_default_rendered_image_is_buildable_here():
+    """`build-and-load.sh all` must cover everything a plain `helm install` starts.
+
+    Found by census, not by eye: mcp-sample-data was rendered by the chart under
+    DEFAULT values (connectors.sampleData.enabled is true) and was absent from
+    ALL_IMAGES, so `build-and-load.sh all` left rsync-sample-data-mcp in
+    ErrImagePull -- on kind, where the private GHCR org cannot be pulled from,
+    that pod never starts and nothing says why.
+
+    The direction matters. ALL_IMAGES may legitimately be a SUPERSET: mcp-debezium,
+    mcp-kafka-sink and kafka-connect render only with connectors.cdc.enabled, and
+    mcp-postgresql only with a connectors.fleet entry. What must never happen is
+    the other way round -- an image the chart renders by default that the harness
+    cannot build.
+    """
+    registry = _chart_registry()
+    out = _default_render()
+    assert out.returncode == 0, f"default render failed:\n{out.stderr}"
+
+    rendered = _first_party_images_in(out.stdout, registry)
+    # Vacuity floor: an empty set would satisfy the subset assertion trivially.
+    assert len(rendered) >= 8, (
+        f"only found {sorted(rendered)} first-party images under {registry!r} -- "
+        "the render or the prefix match is broken, and an empty census passes"
+    )
+
+    buildable = {name for name, _ctx, _df in _kind_images()}
+    missing = sorted(rendered - buildable)
+    assert not missing, (
+        f"the chart renders {missing} under default values, but build-and-load.sh "
+        "cannot build them. On kind they land in ErrImagePull -- add them to "
+        "ALL_IMAGES with the context and dockerfile from docker-publish.yml."
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_the_default_build_set_is_exactly_the_default_render():
+    """DEFAULTSET is a second copy of a derivable list, so it is derived-checked.
+
+    `build-and-load.sh default` exists so an operator can build precisely what a
+    plain install needs. A hand-maintained list rots the way the README install
+    block did; pinning it to the render in both directions is what stops that.
+    """
+    out = _default_render()
+    assert out.returncode == 0, f"default render failed:\n{out.stderr}"
+    rendered = _first_party_images_in(out.stdout, _chart_registry())
+    declared = set(_kind_named_set("DEFAULTSET"))
+    assert declared == rendered, (
+        f"build-and-load.sh DEFAULTSET is {sorted(declared)} but a default render "
+        f"needs {sorted(rendered)}; missing={sorted(rendered - declared)} "
+        f"extra={sorted(declared - rendered)}"
     )
 
 

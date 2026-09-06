@@ -614,6 +614,11 @@ spec:
                 secretKeyRef:
                   name: {{ include "rsync-ai.secretName" . }}
                   key: POSTGRES_PASSWORD
+            # The third place secrets.postgresPassword is spliced into a URL --
+            # api-gateway's DATABASE_URL and RSYNC_DEMO_DESTINATION_DSN are the
+            # others. `$(VAR)` expansion does not percent-encode, and the same
+            # key is consumed raw elsewhere, so validate.yaml restricts the
+            # password alphabet rather than any of these three encoding.
             - name: POSTGRES_URL
               value: "postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@$(POSTGRES_HOST):$(POSTGRES_PORT)/$(POSTGRES_DB)?sslmode={{ include "rsync-ai.postgres.sslmode" . }}"
             - name: REDIS_PASSWORD

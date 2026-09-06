@@ -18,12 +18,19 @@ README did.
 
 Two layers, because CI and a laptop can check different things:
 
-  1. the static layer runs everywhere, including CI, which has NO helm binary.
-     It parses the `--set` flags out of each documented block and compares them
-     against the derived required set.
+  1. the static layer runs everywhere, with or without a helm binary. It parses
+     the `--set` flags out of each documented block and compares them against
+     the derived required set.
   2. the render layer actually runs `helm template` on the extracted command and
      asserts exit 0. It skips without helm -- and a skip is not a pass, which is
      exactly why layer 1 does not depend on it.
+
+This used to say CI "has NO helm binary", and that was the wrong reason for a
+right decision. Layer 1 is load-bearing because it needs nothing installed, not
+because of what any runner happens to carry -- and what a runner carries is not
+something to inherit either way. ci.yml's llm-service-unit job now arranges helm
+itself, `azure/setup-helm` followed by an explicit `helm version`, so a runner
+without it reds the job instead of quietly skipping eight cases.
 
 Scope, stated so the next reader does not think it is broader than it is: only
 blocks that set secrets INLINE are checked. Blocks of the shape
@@ -41,6 +48,7 @@ import shutil
 import subprocess
 
 import pytest
+import yaml
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CHART_DIR = os.path.join(REPO_ROOT, "deploy", "helm", "rsync-ai")
@@ -226,6 +234,83 @@ objectStorage:
         assert stray == [], f"{doc}: unexpected command line(s) in install block: {stray}"
 
         script = script.replace("helm install", "helm template", 1)
+
+        # An `oci://` reference is rewritten to the local chart, and the rewrite
+        # carries an assertion rather than replacing one.
+        #
+        # Executing it as written would make this offline unit test reach ghcr.io
+        # on every run: 5m20s and a failure on the machine this was written on,
+        # where Docker Desktop's `credsStore: desktop` helper never returns for
+        # ghcr.io and Helm blocks on it after the 401. A registry round-trip in a
+        # unit lane is a flake generator wherever it does not simply hang.
+        #
+        # What the block is here to prove is local anyway -- that the flags, the
+        # overlay paths and the values combination still render. The chart bytes
+        # behind `oci://` are the same tree, so the assertion is that the
+        # coordinates name THIS chart; then the render runs against it directly.
+        m_oci = re.search(r"oci://\S+/(?P<name>[a-z0-9-]+)(?:\s|\\)", script)
+        if m_oci:
+            chart = yaml.safe_load(
+                open(os.path.join(REPO_ROOT, "deploy", "helm", "rsync-ai", "Chart.yaml"), encoding="utf-8")
+            )
+            assert m_oci.group("name") == chart["name"], (
+                f"{doc}: the block installs {m_oci.group('name')!r} from oci://, but this chart is "
+                f"named {chart['name']!r}. One of the two is wrong and only readers find out."
+            )
+            m_ver = re.search(r"--version\s+(\S+)", script)
+            assert m_ver and m_ver.group(1) == chart["version"], (
+                f"{doc}: the block pins --version {m_ver.group(1) if m_ver else '<absent>'}, but the "
+                f"chart is {chart['version']}. A published older version still installs, so the "
+                "reader gets a silently stale release rather than an error."
+            )
+            script = re.sub(r"oci://\S+", "./deploy/helm/rsync-ai", script, count=1)
+            script = re.sub(r"--version\s+\S+\s*\\?\n?", "", script, count=1)
+
+        # `helm -f` takes a URL as well as a path, and the OCI install path in
+        # kubernetes.md uses one: the cloud overlays ship inside the published
+        # chart, but `-f` resolves against the filesystem, so an operator
+        # installing from `oci://` cannot reach them by relative path. A raw
+        # URL is one of the two documented ways across that gap.
+        #
+        # It is checked, not skipped. A raw.githubusercontent URL rots exactly
+        # like a relative link -- and worse, it rots for the READER while every
+        # local path in the same block still resolves. Both halves are pinned:
+        # the tag has to exist, and the path it names has to be a file in this
+        # tree. Then it is rewritten to that local file so the render runs
+        # offline, which also means a URL whose path is a typo cannot be
+        # swapped for the stand-in and go green.
+        for url in re.findall(r"-f\s+(https://raw\.githubusercontent\.com/\S+\.ya?ml)", script):
+            m = re.match(r"https://raw\.githubusercontent\.com/([^/]+/[^/]+)/([^/]+)/(.+)$", url)
+            assert m, f"{doc}: cannot parse the raw URL {url}"
+            slug, ref, path = m.group(1), m.group(2), m.group(3)
+            # Deliberately NOT `git tag --list`. The URL is served by the PUBLIC
+            # repo, whose tags this checkout does not have -- v0.1.2 is a tag on
+            # `<owner>/rsync` and not on the private mirror, so a local tag lookup
+            # rejects the one URL that actually works.
+            #
+            # The version the ref must track is knowable offline, though: the
+            # overlays are published as part of the chart, so the tag serving them
+            # is the chart's own version. That also catches the drift that matters
+            # -- a chart bump leaves this URL pointing at the previous release,
+            # which still returns 200 and quietly hands the reader stale values.
+            owner = "rsync" + "-ai"
+            assert slug == f"{owner}/rsync", (
+                f"{doc}: the overlay URL points at {slug!r}. Readers can only fetch it from "
+                f"{owner}/rsync; any other slug is a 404 for everyone outside the org."
+            )
+            chart_version = yaml.safe_load(
+                open(os.path.join(REPO_ROOT, "deploy", "helm", "rsync-ai", "Chart.yaml"), encoding="utf-8")
+            )["version"]
+            assert ref == f"v{chart_version}", (
+                f"{doc}: the install block fetches an overlay at ref {ref!r}, but the chart is "
+                f"version {chart_version}. The URL serves the previous release's values with a "
+                "200, so nothing about the failure looks like a failure."
+            )
+            assert os.path.isfile(os.path.join(REPO_ROOT, path)), (
+                f"{doc}: install block fetches {url}, whose path is not a file in the repo"
+            )
+            script = script.replace(f"-f {url}", f"-f {path}")
+
         for ref in re.findall(r"-f\s+(\S+\.ya?ml)", script):
             # A BARE filename is the reader's own file -- `my-values.yaml`,
             # `my-secrets.yaml` -- written in whatever directory they are
@@ -262,10 +347,11 @@ objectStorage:
 # this repo has now hit in several forms: a zero-length work list looks exactly
 # like a completed one unless something asserts the denominator.
 #
-# This check is deliberately TEXT-ONLY. There is no `helm` binary on the CI
-# runners, so the render test above skips there; a helm-dependent assertion would
-# silently protect nothing in the one place that matters. Reading the templates
-# as text works everywhere.
+# This check is deliberately TEXT-ONLY, though not for the reason it used to
+# give ("there is no helm binary on the CI runners" -- untrue, see the module
+# docstring). Reading the templates as text needs no chart render, no values
+# resolution and no binary, so it holds on a contributor's laptop as firmly as
+# on a runner. A helm-dependent form would buy nothing and could only lose.
 _HELM_TEST_CMD = re.compile(r"\bhelm\b[^\n|&;]*\btest\b")
 _TEST_HOOK = re.compile(r"helm\.sh/hook:\s*(?![^\n]*\bpost-)[^\n]*\btest\b")
 

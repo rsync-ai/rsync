@@ -85,10 +85,13 @@ spec:
             # EARLIER in this same list, which is why the postgres block is
             # included above.
             #
-            # A password containing '@', ':' or '/' will break this URL. Those
-            # need percent-encoding in `secrets.postgresPassword`; the chart
-            # cannot encode it here because the value is only known inside the
-            # container.
+            # A password containing '@', ':' or '/' breaks this URL, and
+            # percent-encoding it in `secrets.postgresPassword` is NOT the fix:
+            # the same key is also read verbatim by Temporal (POSTGRES_PWD) and
+            # concatenated into libpq keyword strings by the orchestrator and the
+            # temporal-adapter, both of which would then authenticate as the
+            # literal `%40`. No single value satisfies all three, so validate.yaml
+            # refuses the character set outright rather than encoding here.
             - name: DATABASE_URL
               value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode={{ include "rsync-ai.postgres.sslmode" . }}"
             - name: TEMPORAL_ADDRESS
@@ -134,10 +137,11 @@ spec:
             # readable by anyone with get on Deployments. $(VAR) only resolves
             # names declared EARLIER in this list, hence the ordering.
             #
-            # A password containing '@', ':' or '/' will break this URL and has
-            # to be percent-encoded in secrets.demoWarehousePassword -- the chart
-            # cannot encode it here because the value is only known inside the
-            # container.
+            # Same alphabet restriction as secrets.postgresPassword, and for the
+            # same reason: this value both builds the URL below and is what
+            # infra/demo-warehouse.yaml hands Postgres as POSTGRES_PWD to SET the
+            # role's password. Percent-encoding would fix the URL and change the
+            # password. validate.yaml rejects the characters instead.
             - name: DEMO_WAREHOUSE_PASSWORD
               valueFrom:
                 secretKeyRef:

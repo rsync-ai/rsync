@@ -73,7 +73,7 @@ helm install rsync ./deploy/helm/rsync-ai \
   --namespace rsync --create-namespace \
   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
-  --set secrets.postgresPassword="$(openssl rand -base64 24)" \
+  --set secrets.postgresPassword="$(openssl rand -hex 24)" \
   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
   --set frontend.publicUrl=https://app.example.com \
@@ -101,7 +101,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 >   --namespace rsync --create-namespace \
 >   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
 >   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
->   --set secrets.postgresPassword="$(openssl rand -base64 24)" \
+>   --set secrets.postgresPassword="$(openssl rand -hex 24)" \
 >   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
 >   --set secrets.minioSecretKey="$(openssl rand -base64 32)"
 > ```

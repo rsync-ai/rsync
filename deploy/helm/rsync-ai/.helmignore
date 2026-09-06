@@ -3,3 +3,20 @@
 .gitignore
 *.tmproj
 .vscode/
+
+# The kind harness is developer scaffolding, not part of what an operator
+# installs -- but the reason this rule exists is the second-order one, not the
+# bloat. `helm package` reads the DISK, and `.gitignore` has no authority over
+# it. test/kind/.gitignore hides the harness's generated credentials from git
+# (.tls/, .broker-sasl-password, .oidc-client-secret), so they look contained;
+# packaging a checkout where broker-up.sh has been run picks all of them up
+# anyway, including .tls/ca.key, .tls/broker.key and .tls/broker/broker.pem.
+# Measured here: 57 packaged files, 23 of them under test/kind, against 34 with
+# this rule. The published 0.1.2 chart is built from a fresh checkout, so it
+# carries no key material -- 12 of its 46 files are the harness's tracked half,
+# which is only useless, not dangerous. The rule closes both, and closes the
+# local one before someone packages by hand.
+#
+# `templates/tests/connection.yaml` is deliberately NOT covered by this: it is a
+# `helm test` hook, it lives under templates/, and it must ship.
+test/

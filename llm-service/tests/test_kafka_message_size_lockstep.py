@@ -34,9 +34,11 @@ Everything is derived from ONE source -- the chart's kafka.maxMessageBytes -- so
 raising the cap means editing one number and watching this test tell you which
 of the other five sites you forgot.
 
-Text-only by design: CI has no helm binary (`helm` appears in .github/workflows
-only inside the tag-gated chart-publish job), so a render-based check here would
-skip in the one place it needs to run.
+Text-only by design: parsing the templates needs no `helm` binary and no render, so it holds on any checkout. This
+used to claim CI has no helm binary because `helm` appeared in .github/workflows
+only inside the tag-gated chart-publish job. That is no longer true of the
+workflows either: the job collecting this suite sets helm up and asserts it
+before pytest. See the `helm is present` step in .github/workflows/ci.yml.
 """
 
 import os
