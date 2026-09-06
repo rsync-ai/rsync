@@ -55,7 +55,13 @@ GUARDS = (SCRIPT, MERGE_GUARD, "test_doc_links_resolve.py",
           # markdown table, so a docs-only PR is precisely the change that can
           # introduce the defect -- a row gaining one unescaped `|` inside a code
           # span silently loses everything after it.
-          "test_markdown_tables_do_not_drop_cells.py")
+          "test_markdown_tables_do_not_drop_cells.py",
+          # Added 2026-09-06. Its subject is an existence claim about a
+          # connector, written in prose and falsified by a commit in a
+          # different tree -- so the PR that makes it true is a code PR and
+          # the PR that repairs the sentence is a docs-only one. Both must
+          # reach it.
+          "test_docs_do_not_call_built_connectors_unbuilt.py")
 
 # The half of the ref promise that lives in the test module. Named in both files;
 # asserted equal below, because a rename on one side disarms the other silently.

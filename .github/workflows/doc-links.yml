@@ -181,6 +181,13 @@ jobs:
           # runs on code; this one is pure markdown -- README.md against the
           # generated table -- and so belongs here rather than in a paths-filtered
           # job, for the same reason as everything else on this list.
+          #
+          # test_docs_do_not_call_built_connectors_unbuilt.py checks the other
+          # direction of the same class: not a table that drifted, but a
+          # sentence of prose that calls a connector unbuilt after the commit
+          # that built it landed. The subject is markdown, but the event that
+          # falsifies it is a code commit in another tree, so neither a
+          # docs-filtered nor a code-filtered job would see both halves.
           pytest -q \
             tests/test_doc_merge_claims_are_true.py \
             tests/test_doc_links_resolve.py \
@@ -196,4 +203,5 @@ jobs:
             tests/test_selfhost_doc_boundary_holds.py \
             tests/test_changelog_versions_name_real_tags.py \
             tests/test_documented_shell_blocks_parse.py \
-            tests/test_readme_connector_claims_match_the_catalogue.py
+            tests/test_readme_connector_claims_match_the_catalogue.py \
+            tests/test_docs_do_not_call_built_connectors_unbuilt.py
