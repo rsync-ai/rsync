@@ -114,8 +114,11 @@ secrets:
   #
   # validate.yaml enforces this, but ONLY for a value set here. With
   # existingSecret the chart never sees the password and cannot check it -- the
-  # restriction still applies, and breaking it fails silently at runtime (the
-  # api-gateway logs one warning, stays Ready, and serves mock data).
+  # restriction still applies, and breaking it moves the failure to runtime: the
+  # api-gateway logs one warning, keeps answering /health, and never becomes
+  # Ready, because its readinessProbe is /ready and /ready answers
+  # 503 db_ping_failed. `helm install` without --wait still exits 0; the pod
+  # sits at 0/1 and its Service has no endpoints.
   postgresPassword: ""
   redisPassword: ""
 

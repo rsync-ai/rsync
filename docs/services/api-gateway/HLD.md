@@ -59,7 +59,7 @@ The API Gateway is the **product-facing REST + WebSocket edge** for rsync-ai. It
 - Fluent Bit logs → OTel Collector for trace/log correlation.
 
 ### Failure Modes
-- **DB down**: gateway may run with limited “mock data” behavior (degraded).
+- **DB down**: `/ready` returns 503 and the pod leaves its Service endpoints; `/health` stays 200.
 - **Temporal down**: falls back to direct Kafka publishing (reduced UI timeline fidelity).
 - **Tool generator down**: connector generation endpoints fail; existing connectors still list.
 - **Docker socket unavailable**: connector docker status fields degrade (still list metadata).

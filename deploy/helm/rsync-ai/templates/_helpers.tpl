@@ -774,12 +774,17 @@ docker-compose.yml gives every one of these `postgres: condition: service_health
 a startup Dial loses and workflows come up disabled. Kubernetes has no depends_on,
 and the chart shipped without an equivalent, so that race was wide open here.
 
-It matters more on Kubernetes than it did on compose, because the api-gateway does
-not crash when the database is missing at boot: it logs one warning, falls back to
-"using mock data", never retries, and answers /health 200 forever. A pod that lost
-the race is Running, Ready, and serving nothing real -- with no signal anywhere in
-`kubectl get pods`. Waiting here is what makes the boot order deterministic instead
-of leaving it to whichever pod the scheduler starts first.
+It matters more on Kubernetes than it did on compose, because losing the race here
+is not self-correcting. The api-gateway does not crash: db.Init retries the ping
+for 60s (DB_CONNECT_TIMEOUT, api-gateway/internal/db/db.go), and if the deadline
+passes it logs one warning and carries on -- but main() only runs migrations inside
+Init's success branch (cmd/server/main.go:306), so schemaReady stays false for the
+life of the process. Postgres arriving a minute later does not fix it: the pool
+pings fine and /ready still answers 503 schema_not_migrated, so the pod sits at 0/1
+until something restarts it. That failure is loud -- readiness is /ready, not
+/health -- but "loud and permanent" is still a broken install. Waiting here is what
+makes the boot order deterministic instead of leaving it to whichever pod the
+scheduler starts first.
 
 Uses the calling service's OWN image so this adds no image to pull; every app image
 in this chart carries sh and nc (verified in-cluster, not assumed).
@@ -912,7 +917,8 @@ AND handed to another consumer verbatim. Those two readings want opposite
 escapings, so past a reserved character there is no value that satisfies both:
 percent-encode and the verbatim reader authenticates as the literal `%40`;
 leave it raw and the URL parser reads the password as a hostname. Neither
-failure is loud.
+failure names the value: what surfaces is an authentication error from a
+consumer, one process away from the setting that caused it.
 
 The three, with their conflict:
 
@@ -940,6 +946,6 @@ Args: dict "key" <values path> "value" <the value> "sites" <what reads it> "tail
 */}}
 {{- define "rsync-ai.assertDeliverableSecret" -}}
 {{- if and .value (regexMatch "[\\s\"'\\\\@:/?#\\[\\]%]" (.value | toString)) }}
-{{- fail (printf "%s contains a character this chart cannot deliver to every service that reads it.\n\nDisallowed: whitespace, and any of  \" ' \\ @ : / ? # [ ] %%\n\n%s\nPercent-encoding satisfies the URL side and breaks the verbatim side; leaving\nthe value raw does the reverse. No single value works for both, so the chart\nrefuses it at render time rather than picking a side -- at runtime this fails\nsilently, which is the one thing a render-time check can still prevent.\n\nGenerate one from the safe alphabet:\n\n    openssl rand -hex 24\n%s" .key .sites .tail) }}
+{{- fail (printf "%s contains a character this chart cannot deliver to every service that reads it.\n\nDisallowed: whitespace, and any of  \" ' \\ @ : / ? # [ ] %%\n\n%s\nPercent-encoding satisfies the URL side and breaks the verbatim side; leaving\nthe value raw does the reverse. No single value works for both, so the chart\nrefuses it at render time rather than picking a side -- at runtime the error\nsurfaces one process away and names neither this chart nor this key, which is\nwhat a render-time check can still prevent.\n\nGenerate one from the safe alphabet:\n\n    openssl rand -hex 24\n%s" .key .sites .tail) }}
 {{- end }}
 {{- end -}}

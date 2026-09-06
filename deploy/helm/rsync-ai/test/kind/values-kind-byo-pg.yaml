@@ -32,10 +32,12 @@ postgresql:
     # MUST be set explicitly. The chart defaults external Postgres to `require`,
     # which is right for RDS / Cloud SQL / Azure Database and wrong for a plain
     # container with no server certificate. Left at the default, every component
-    # here fails to connect -- and the api-gateway does that SILENTLY: it logs
-    # one warning, stays 1/1 Ready and serves mock data, so the install looks
-    # successful. Anything testing TLS behaviour belongs in a stage file that
-    # gives the container a certificate, not in a quiet edit here.
+    # here fails to connect -- and the api-gateway does not crash when it does:
+    # it logs one warning, keeps answering /health, and stalls at 0/1, because
+    # its readinessProbe is /ready and /ready answers 503 db_ping_failed. An
+    # install without --wait still exits 0. Anything testing TLS behaviour
+    # belongs in a stage file that gives the container a certificate, not in a
+    # quiet edit here.
     sslMode: disable
 
     tls:

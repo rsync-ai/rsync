@@ -142,7 +142,7 @@ and the message live in one place, rsync-ai.assertDeliverableSecret
       "key" "secrets.postgresPassword"
       "value" .Values.secrets.postgresPassword
       "sites" "It is read three ways: inside a postgres:// URL (api-gateway DATABASE_URL, CDC\nsink POSTGRES_URL), inside a libpq `password=` keyword string built by\nconcatenation (orchestrator, temporal-adapter), and verbatim (Temporal\nPOSTGRES_PWD).\n"
-      "tail" "\nThe silent failure is the worst of the three: the api-gateway logs one warning\non a failed connect, stays 1/1 Ready, and serves mock data, so `helm install`\nand `kubectl get pods` both look successful.\n\nFor an EXTERNAL database this is the password of the role named in\npostgresql.username -- change it at the server (ALTER ROLE ... PASSWORD ...),\nnot only here.") }}
+      "tail" "\nA wrong value costs the most to diagnose: nothing fails at render time. The\napi-gateway logs one warning on a failed connect and keeps answering /health, so\n`helm install` exits 0 -- but its readinessProbe is /ready, which answers\n503 db_ping_failed, so the pod stays 0/1 and its Service has no endpoints.\n\nFor an EXTERNAL database this is the password of the role named in\npostgresql.username -- change it at the server (ALTER ROLE ... PASSWORD ...),\nnot only here.") }}
 {{- include "rsync-ai.assertDeliverableSecret" (dict
       "key" "secrets.redisPassword"
       "value" .Values.secrets.redisPassword
