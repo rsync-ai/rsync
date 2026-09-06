@@ -225,8 +225,11 @@ suites, and the PR process.
 
 rsync.ai is young and self-hosted. It runs, it has been driven end to end, and the
 connector and deployment claims on this page are checked by tests rather than asserted —
-but you are early, and the two release-tag gaps called out under [Install](#install) are
-the current rough edges. There is no hosted offering: every install is yours.
+but you are early. The rough edge today is Kubernetes: a managed-cluster install
+(EKS, GKE or AKS against real RDS, MSK and S3) has not been run end to end, so the cloud
+value files are reviewed starting points rather than verified recipes — the
+[Kubernetes guide](docs/deployment/kubernetes.md) says so where you meet it. There is no
+hosted offering: every install is yours.
 
 What that means in practice: pin a tag rather than tracking `main` if you want
 reproducibility, keep `ENCRYPTION_KEY` somewhere durable before you store a credential,
