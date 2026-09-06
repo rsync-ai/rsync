@@ -8,7 +8,9 @@ bronze** path (4c), `partition_by` extended to the **batch** part-file path (4d)
 **dropped** — object-storage CDC is append-only bronze by design (immutable objects, no in-place
 merge; deduped current-state is a downstream transform over the bronze files, not a sink option).
 **Scope:** the shared configuration contract for the **hand-built** object-storage connectors
-`aws-s3` (exists, `v1.0.0`), `gcs` (to build), `azure-blob` (to build). These are **not**
+`aws-s3`, `gcs` and `azure-blob`. All three ship today and are built by
+`docker-compose.mcp.yml`; each one's current version lives in its own `latest.json` rather
+than as a literal repeated here. These are **not**
 tool-generator output — edit them by hand and keep them in lockstep with this doc.
 
 This file is the single source of truth the Phase 2–4 code mirrors. When a field changes,
