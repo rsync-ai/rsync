@@ -1,22 +1,12 @@
 module github.com/rsync-ai/backend-orchestrator
 
-go 1.25.7
-
-// Pin the patched toolchain so CI/local builds analyze against the fixed
-// stdlib. go1.25.13 clears the six reachable stdlib CVEs go1.25.12 carries --
-// GO-2026-6218 (net/url), GO-2026-6091 (html/template), GO-2026-6090
-// (crypto/tls), GO-2026-6089 + GO-2026-5026 (net/http), GO-2026-5972
-// (encoding/asn1) -- on top of the crypto/tls, crypto/x509, net and
-// html/template CVEs earlier patches fixed. The golang:1.25-alpine Docker base
-// already floats to this patch; this makes the guarantee explicit for
-// `go test` / govulncheck outside the container.
-toolchain go1.25.13
+go 1.26.0
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/IBM/sarama v1.60.2
 	github.com/gin-gonic/gin v1.12.0
-	github.com/go-sql-driver/mysql v1.10.0
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/google/uuid v1.6.0
 	github.com/linkedin/goavro/v2 v2.15.0
 	github.com/microsoft/go-mssqldb v1.11.0
@@ -148,7 +138,7 @@ require (
 	go.temporal.io/api v1.63.5 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/arch v0.22.0 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/crypto v0.56.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect
