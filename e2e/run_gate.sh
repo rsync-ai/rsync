@@ -694,6 +694,7 @@ UNGATED_TESTS=(
   test_clickhouse_batch_roundtrip.py           # needs a ClickHouse service (not in the gate compose)
   test_db_cdc_to_local_minio.sh                # needs the external-MinIO overlay bring-up
   test_db_cdc_to_emulated_gcs_azure.sh         # needs fake-gcs-server + Azurite emulator overlay
+  test_mongodb_multi_collection_to_gcs_batch.py # provisions its own mongod + fake-gcs-server fixtures
   test_pg_bulk_copy_parity.py                  # needs the copytest-pg fixture + a mounted edited connector.py
   test_pg_bulk_copy_merge.py                   # needs the copytest-pg fixture + RSYNC_PG_BULK_COPY overlay
   test_claim_check_gzip.py                     # needs the RSYNC_CLAIM_CHECK_GZIP opt-in overlay
