@@ -71,6 +71,13 @@ GUARDS = [
     # directly above: scripts/flip/apply-ci-split.py plus the ci.yml it
     # rewrites, covered by `scripts/flip/**` and `.github/workflows/**`.
     "test_flip_drops_a_changes_output_no_job_reads.py",
+    # Enrolled 2026-09-06. Subjects are the chart helper, plus
+    # backend-temporal-adapter/cmd/adapter/main.go and api-gateway/cmd/server/main.go
+    # -- the two Go files that say why one component waits for Temporal and the other
+    # must not. The helper was already covered by `deploy/helm/**`; the two Go paths
+    # were added to the `llm` filter in the same change, because a PR deleting the
+    # adapter's dial retry touched nothing this job was gated on.
+    "test_chart_waits_for_the_dependency_that_is_fatal_to_miss.py",
 ]
 
 

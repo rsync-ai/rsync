@@ -25,7 +25,12 @@ spec:
     spec:
       {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
       initContainers:
-        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.temporalAdapter.image) | nindent 8 }}
+        {{- /*
+        This is the one caller that passes `temporal`: the adapter Fatalf-s on its
+        first failed Dial and every worker it registers takes that client, so a
+        lost race here is a crash-loop, not a degraded mode. See the helper.
+        */}}
+        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.temporalAdapter.image "temporal" true) | nindent 8 }}
         {{- /*
         Same local-filesystem dependency as the api-gateway: the connector-check
         activity resolves a connector by stat-ing the catalog on THIS pod's disk

@@ -180,14 +180,41 @@ func main() {
 		log.Info("✅ Database connection established")
 	}
 
-	// Create Temporal client
+	// Create Temporal client.
+	//
+	// Bounded startup retry, the same shape api-gateway uses (cmd/server/main.go)
+	// and for the same cold-boot race: this process can win the start against the
+	// Temporal frontend and dial a port nothing is listening on yet. The two
+	// services differ in what happens when the retries run out, and the difference
+	// is not stylistic. The gateway carries on with a nil client because it serves
+	// its whole read surface without Temporal; this adapter cannot -- every worker
+	// below is constructed from this client -- so exhausting the budget is still
+	// fatal here. What changes is that it is fatal after 60s of trying instead of
+	// on the first refused connection.
+	//
+	// The chart's wait-for-deps initContainer waits on this port too, which is the
+	// deterministic fix; this is the one that also holds on compose, on bare metal,
+	// and in the window where the frontend accepts a connection just before it is
+	// ready to serve -- none of which an initContainer can see.
 	temporalAddress := getEnv("TEMPORAL_ADDRESS", "temporal:7233")
-	temporalClient, err := client.Dial(client.Options{
-		HostPort:  temporalAddress,
-		Namespace: "default",
-	})
-	if err != nil {
-		log.Fatalf("Failed to create Temporal client: %v", err)
+	var temporalClient client.Client
+	temporalDeadline := time.Now().Add(60 * time.Second)
+	for attempt := 1; ; attempt++ {
+		c, dialErr := client.Dial(client.Options{
+			HostPort:  temporalAddress,
+			Namespace: "default",
+		})
+		if dialErr == nil {
+			temporalClient = c
+			break
+		}
+		if time.Now().After(temporalDeadline) {
+			log.Fatalf("Failed to create Temporal client at %s after %d attempts over 60s: %v",
+				temporalAddress, attempt, dialErr)
+		}
+		log.Warnf("⏳ Temporal not reachable yet at %s (attempt %d): %v — retrying in 3s",
+			temporalAddress, attempt, dialErr)
+		time.Sleep(3 * time.Second)
 	}
 	defer temporalClient.Close()
 

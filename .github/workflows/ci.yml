@@ -233,6 +233,17 @@ jobs:
               # install.sh-only PR ran none of them.
               - 'install.sh'
               - 'scripts/mcp_generate_compose.py'
+              # An eighth time, and the two paths are a matched pair rather than two
+              # separate subjects. test_chart_waits_for_the_dependency_that_is_fatal_to_miss.py
+              # asserts that the chart's dependency wait is opt-in, that
+              # backend-temporal-adapter opts in because it dies without Temporal, and
+              # that api-gateway does NOT because it serves the whole UI without one.
+              # The chart half is already covered by `deploy/helm/**` above; these two
+              # Go files are the halves that say WHY each side is what it is, and a PR
+              # deleting the adapter's retry -- or the gateway's tolerance that earns
+              # its exemption -- would otherwise touch nothing this filter matches.
+              - 'backend-temporal-adapter/cmd/adapter/main.go'
+              - 'api-gateway/cmd/server/main.go'
             e2e:
               - 'e2e/_support/**'
               - '.github/workflows/ci.yml'
