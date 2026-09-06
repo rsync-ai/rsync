@@ -14,7 +14,7 @@ notices are reproduced here to satisfy their redistribution terms. Nothing here 
 > release tree and commit the result. A blocking [`Licenses`](.github/workflows/licenses.yml)
 > CI check independently fails any PR that introduces a new GPL / AGPL / SSPL / BUSL dependency.
 
-_Inventory: 135 Go module@version rows, 27 Python packages, 49 frontend (npm) direct
+_Inventory: 137 Go module@version rows, 27 Python packages, 49 frontend (npm) direct
 production dependencies._
 
 > **Provenance, honestly.** The Go table was rebuilt on 2026-08-25 directly from
@@ -53,7 +53,7 @@ must remain separable and replaceable.
 
 ## License distribution (shipped surface)
 
-- **Go** (135 module@version rows): Apache-2.0 x 57; MIT x 43; BSD-3-Clause x 24; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
+- **Go** (137 module@version rows): Apache-2.0 x 59; MIT x 43; BSD-3-Clause x 24; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
 - **Python** (27 packages): Apache-2.0 x 9; MIT x 7; BSD-3-Clause x 6; Apache-2.0 OR BSD-3-Clause x 2; LGPL-3.0-or-later x 1; MIT-0 x 1; UPL-1.0 OR Apache-2.0 x 1
 - **Frontend** (49 direct prod deps): MIT x 46; Apache-2.0 x 2; ISC x 1
 
@@ -87,11 +87,13 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/beorn7/perks](https://github.com/beorn7/perks) | v1.0.1 | MIT |
 | [github.com/cenkalti/backoff/v5](https://github.com/cenkalti/backoff) | v5.0.3 | MIT |
 | [github.com/cespare/xxhash/v2](https://github.com/cespare/xxhash) | v2.3.0 | MIT |
+| [github.com/containerd/errdefs](https://github.com/containerd/errdefs) | v1.0.0 | Apache-2.0 |
+| [github.com/containerd/errdefs/pkg](https://github.com/containerd/errdefs) | v0.3.0 | Apache-2.0 |
 | [github.com/davecgh/go-spew](https://github.com/davecgh/go-spew) | v1.1.1 | ISC |
 | [github.com/davecgh/go-spew](https://github.com/davecgh/go-spew) | v1.1.2-0.20180830191138-d8f796af33cc | ISC |
 | [github.com/dgryski/go-rendezvous](https://github.com/dgryski/go-rendezvous) | v0.0.0-20200823014737-9f7001d12a5f | MIT |
 | [github.com/distribution/reference](https://github.com/distribution/reference) | v0.6.0 | Apache-2.0 |
-| [github.com/docker/docker](https://github.com/docker/docker) | v27.5.1+incompatible | Apache-2.0 |
+| [github.com/docker/docker](https://github.com/docker/docker) | v28.5.2+incompatible | Apache-2.0 |
 | [github.com/docker/go-connections](https://github.com/docker/go-connections) | v0.6.0 | Apache-2.0 |
 | [github.com/docker/go-units](https://github.com/docker/go-units) | v0.5.0 | Apache-2.0 |
 | [github.com/eapache/go-resiliency](https://github.com/eapache/go-resiliency) | v1.7.0 | MIT |
