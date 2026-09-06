@@ -53,14 +53,21 @@ GO_MODULES=(
   shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
 )
 
-# Python requirement manifests. Grouped by the image/venv they install into.
-# Each is resolved into its own throwaway venv so pip-licenses sees exactly
-# that image's dependency closure.
+# Python requirement manifests. Grouped by the image/venv they install into --
+# and ONLY those, which is the property that keeps this list honest. Each is
+# resolved into its own throwaway venv so pip-licenses sees exactly that image's
+# dependency closure.
+#
+# src/agents/{planner,tool_generator}/requirements.txt used to sit here and broke
+# that premise: no Dockerfile ever installed either one (llm-service/Dockerfile:31
+# and Dockerfile.community:38 take requirements.txt, Dockerfile.oss:38 takes
+# requirements-oss.txt), so the notices attested to a closure that ships in no
+# image. Both files are deleted; every package they named is already declared in
+# llm-service/requirements.txt. Adding a manifest here is a claim that an image
+# installs it -- check the Dockerfile before you do.
 PY_MANIFESTS=(
   llm-service/requirements.txt
   llm-service/requirements-oss.txt
-  llm-service/src/agents/planner/requirements.txt
-  llm-service/src/agents/tool_generator/requirements.txt
 )
 # Every connector requirements.txt (public + internal), auto-discovered so new
 # connectors are covered without editing this script.
