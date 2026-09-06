@@ -42,8 +42,8 @@ EVENT_DISJUNCT = "github.event_name != 'pull_request'"
 _SELF_HOSTED_RUNS_ON = re.compile(r"^\s*runs-on:\s*\[\s*self-hosted", re.M)
 
 
-def _workflows():
-    return sorted(WORKFLOWS.glob("*.yml"))
+def _workflows(root=None):
+    return sorted((root or WORKFLOWS).glob("*.yml"))
 
 
 def _load(p):
@@ -52,9 +52,9 @@ def _load(p):
     return d, (d.get(True) or d.get("on") or {})
 
 
-def _pr_reachable_self_hosted():
+def _pr_reachable_self_hosted(root=None):
     out = []
-    for p in _workflows():
+    for p in _workflows(root):
         doc, on = _load(p)
         if "pull_request" not in (on if isinstance(on, dict) else {str(on): 1}):
             continue
@@ -64,7 +64,7 @@ def _pr_reachable_self_hosted():
     return out
 
 
-def _grepped_self_hosted_lines():
+def _grepped_self_hosted_lines(root=None):
     """Count self-hosted `runs-on:` LINES in PR-triggered workflows, by regex.
 
     Deliberately a second, independent measurement of the quantity
@@ -72,7 +72,7 @@ def _grepped_self_hosted_lines():
     what makes the denominator below self-calibrating.
     """
     total = 0
-    for p in _workflows():
+    for p in _workflows(root):
         _doc, on = _load(p)
         if "pull_request" not in (on if isinstance(on, dict) else {str(on): 1}):
             continue
@@ -80,27 +80,121 @@ def _grepped_self_hosted_lines():
     return total
 
 
-def test_the_census_is_not_empty():
-    """A zero here is not a pass.
+# A workflow with one self-hosted job and one hosted one, triggered by
+# pull_request. Both mechanisms must report exactly 1 against it. It is written
+# out to a tmp_path rather than kept as a file in the tree so that nothing in
+# CI can ever try to run it.
+_PR_TRIGGERED_FIXTURE = """\
+name: fixture (pull_request-triggered)
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  hosted:
+    runs-on: ubuntu-latest
+    steps:
+      - run: "true"
+  on-the-macs:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - run: "true"
+"""
+
+# The same job, on a workflow no pull_request can reach. Both mechanisms must
+# report 0. Without this second fixture the first one proves only that the
+# mechanisms count SOMETHING, not that the pull_request filter discriminates.
+_SCHEDULE_ONLY_FIXTURE = """\
+name: fixture (schedule-only)
+on:
+  schedule:
+    - cron: "0 3 * * *"
+jobs:
+  on-the-macs:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - run: "true"
+"""
+
+
+def _fixture_dir(tmp_path, name, body):
+    d = tmp_path / name
+    d.mkdir()
+    (d / "fixture.yml").write_text(body)
+    return d
+
+
+def test_both_mechanisms_see_a_self_hosted_job_that_is_known_to_be_there(tmp_path):
+    """The positive control. Without it the equality below can pass on nothing.
+
+    This test exists because of what the previous version of it did. The floor
+    was the literal `len(jobs) >= 15`, calibrated to the private tree, which
+    made the suite fail BY CONSTRUCTION at the one moment it matters most --
+    the public flip's CI split, which correctly brings the census down. That
+    was recognised and the literal was lowered to `>= 2`, on the reasoning that
+    the two data-pipeline gate jobs stay self-hosted forever. They do not: the
+    org runner group does not admit public repositories, so in the public tree
+    those two jobs can never be allocated a runner and the correct census there
+    is ZERO. A floor of 2 is the same defect one notch down -- a number in this
+    file mirroring a fact that lives in `.github/workflows`, going red on
+    exactly the change the tree needs.
+
+    The invariant that is actually wanted is "both mechanisms still work", and
+    that is a property of the mechanisms, not of the repo's current job count.
+    So it is measured where the answer is known by construction: a synthetic
+    workflow written to a temp directory. The real tree is then held only to
+    the cross-check the two mechanisms make of each other, which needs no
+    number at all and is true at 23, at 2, and at 0.
+    """
+    root = _fixture_dir(tmp_path, "pr-triggered", _PR_TRIGGERED_FIXTURE)
+
+    walked = _pr_reachable_self_hosted(root)
+    grepped = _grepped_self_hosted_lines(root)
+
+    assert [j for _wf, j, _c in walked] == ["on-the-macs"], (
+        f"the YAML walk found {walked} in a fixture containing exactly one "
+        "self-hosted job on a pull_request-triggered workflow. The walk is no "
+        "longer recognising the `runs-on` shape, or no longer reading `on:`."
+    )
+    assert grepped == 1, (
+        f"the regex found {grepped} self-hosted `runs-on:` line(s) in a fixture "
+        "containing exactly one. _SELF_HOSTED_RUNS_ON has stopped matching the "
+        "line form the workflows use."
+    )
+
+
+def test_neither_mechanism_counts_a_job_no_pull_request_can_reach(tmp_path):
+    """The negative control, which is what makes the positive one mean anything.
+
+    A mechanism that counted every self-hosted job regardless of trigger would
+    also return 1 above. Both must return 0 here.
+    """
+    root = _fixture_dir(tmp_path, "schedule-only", _SCHEDULE_ONLY_FIXTURE)
+
+    assert _pr_reachable_self_hosted(root) == [], (
+        "the YAML walk counted a self-hosted job on a schedule-only workflow, "
+        "so its pull_request filter is not discriminating and the census above "
+        "is measuring the wrong set."
+    )
+    assert _grepped_self_hosted_lines(root) == 0, (
+        "the regex counted a self-hosted `runs-on:` line in a schedule-only "
+        "workflow, so it is not honouring the pull_request filter either."
+    )
+
+
+def test_the_two_mechanisms_agree_about_the_real_tree():
+    """A zero here is not a pass on its own -- the controls above are what arm it.
 
     If a refactor renames `runs-on` targets or moves the workflow directory,
     every parametrised test below silently vanishes and the suite reports green
-    while enforcing nothing. Pin the denominator so that failure is loud.
+    while enforcing nothing. That is guarded in two halves. The fixtures above
+    prove both mechanisms still see a self-hosted job when there is one to see;
+    this test then requires the two to agree about the real tree.
 
-    The floor used to be the literal `>= 15`, calibrated to the private tree.
-    That made this test fail BY CONSTRUCTION at the one moment it matters most:
-    the public flip's CI split (public-flip-runbook.md 4a-4d) moves every job
-    except the two data-pipeline gate jobs to ubuntu-latest, so the correct
-    census becomes 2 and a floor of 15 goes red. The runbook's answer was for
-    the flip-day diff to hand-edit the number in the same commit -- a literal
-    hand-mirroring a fact that lives in another file, which is the drift shape
-    this repo keeps paying for, and whose failure mode here is an operator
-    reading a red suite as "a guard regressed" and skipping the gate.
-
-    So the floor is derived instead. The invariant is not "there are >= N jobs",
-    it is "the YAML walk saw every self-hosted job there is" -- checked against
-    a regex count of the same lines, an independent mechanism. It holds at 23
-    today and at 2 after the split, with no number to maintain in either place.
+    There is deliberately no floor on the count. The correct number is 23 in
+    the private tree, 2 in a tree with §4a-4c of the flip runbook applied, and
+    0 in the public tree, whose runner group admits no public repository -- so
+    any literal here would be a number in one file mirroring a fact in another,
+    which is the drift shape this repo keeps paying for.
     """
     files = _workflows()
     assert len(files) >= 4, f"expected >=4 workflow files, found {[f.name for f in files]}"
@@ -108,12 +202,6 @@ def test_the_census_is_not_empty():
     jobs = _pr_reachable_self_hosted()
     grepped = _grepped_self_hosted_lines()
 
-    assert grepped >= 2, (
-        f"only {grepped} self-hosted `runs-on:` line(s) in PR-triggered workflows. "
-        "Even after the flip's CI split the two data-pipeline gate jobs stay "
-        "self-hosted, so a count below 2 means the regex stopped matching or the "
-        "workflows moved -- not that the runners were retired."
-    )
     assert len(jobs) == grepped, (
         f"the YAML walk found {len(jobs)} PR-reachable self-hosted job(s) but a "
         f"regex over the same files found {grepped} self-hosted `runs-on:` line(s). "
