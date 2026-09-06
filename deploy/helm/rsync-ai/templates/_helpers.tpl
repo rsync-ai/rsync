@@ -782,10 +782,46 @@ the race is Running, Ready, and serving nothing real -- with no signal anywhere 
 of leaving it to whichever pod the scheduler starts first.
 
 Uses the calling service's OWN image so this adds no image to pull; every app image
-in this chart carries sh and nc (verified in-cluster, not assumed). Args: root, image.
+in this chart carries sh and nc (verified in-cluster, not assumed).
+
+TEMPORAL IS OPT-IN, AND ONLY ONE CALLER OPTS IN
+-----------------------------------------------
+`temporal: true` appends a third wait. Exactly one deployment sets it, and the
+asymmetry is deliberate rather than an oversight:
+
+  temporal-adapter  waits.      `cmd/adapter/main.go` calls log.Fatalf the first
+                               time client.Dial fails, and every worker it would
+                               register takes that client, so there is no
+                               degraded mode to fall back to. Without this wait
+                               the pod simply crash-loops until Temporal wins the
+                               race -- observed at 3 restarts on a cold `helm
+                               install`, with backoff, for a dependency that was
+                               up 20 seconds later.
+  api-gateway       does NOT.   It holds a Temporal client too, but
+                               `cmd/server/main.go` already dials in a bounded
+                               60s retry and then carries on with a nil client,
+                               because the gateway serves the whole UI and every
+                               read API without Temporal. Blocking its
+                               initContainer would convert a Temporal outage --
+                               today: pipeline runs are refused -- into a total
+                               UI outage. That is a worse failure, so it keeps
+                               its own retry and stays out of this gate.
+  orchestrator      does NOT.   It holds no Temporal client at all; it reaches
+                               workflows through the adapter.
+
+The postgres and redis waits above are unconditional because all three services
+genuinely cannot serve without them. This one is not, because one of them can.
+
+A TCP accept is necessary but not sufficient: the frontend can be listening a
+moment before it is serving, so this narrows the race rather than closing it.
+The adapter's own bounded retry is what closes it; this keeps the pod from
+burning restarts on the common case.
+
+Args: root, image, temporal (bool, optional -- defaults to false).
 */}}
 {{- define "rsync-ai.waitForDepsInitContainer" -}}
 {{- $root := .root -}}
+{{- $waitTemporal := .temporal | default false -}}
 - name: wait-for-deps
   image: {{ include "rsync-ai.image" (dict "root" $root "image" .image) }}
   imagePullPolicy: {{ $root.Values.global.image.pullPolicy }}
@@ -809,6 +845,24 @@ in this chart carries sh and nc (verified in-cluster, not assumed). Args: root, 
       }
       wait_for {{ include "rsync-ai.postgres.host" $root }} {{ include "rsync-ai.postgres.port" $root }} postgres
       wait_for {{ include "rsync-ai.redis.host" $root }} {{ include "rsync-ai.redis.port" $root }} redis
+{{- if $waitTemporal }}
+      # The address is one string everywhere else in this chart (the Go client
+      # takes host:port), so it is split here rather than carried as two values
+      # that could drift apart. `%:*` / `##*:` cut at the LAST colon, which is
+      # what makes an IPv6 literal work -- and the brackets Go's own host:port
+      # convention requires around one are then stripped, because nc takes a
+      # bare address. An address with no colon is refused out loud: the Go
+      # client would reject it too, several seconds later, from a log line that
+      # does not mention the chart.
+      temporal_addr="{{ include "rsync-ai.temporal.address" $root }}"
+      case "$temporal_addr" in
+        *:*) ;;
+        *) echo "ERROR: temporal address '${temporal_addr}' has no port" >&2; exit 1 ;;
+      esac
+      temporal_host="${temporal_addr%:*}"
+      temporal_host="${temporal_host#[}"
+      wait_for "${temporal_host%]}" "${temporal_addr##*:}" temporal
+{{- end }}
   securityContext:
 {{- toYaml $root.Values.global.containerSecurityContext | nindent 4 }}
   resources:
