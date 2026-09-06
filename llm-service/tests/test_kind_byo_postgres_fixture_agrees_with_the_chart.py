@@ -84,8 +84,9 @@ def test_the_script_and_the_values_file_agree_on_role_database_and_host():
 def test_the_fixture_disables_tls_because_the_container_has_no_certificate():
     """The chart defaults external Postgres to sslMode=require, which is right
     for a managed instance and impossible for a plain container. Inheriting the
-    default here would fail every connection -- and the api-gateway fails that
-    one silently, staying 1/1 Ready and serving mock data."""
+    default here would fail every connection -- and `helm install` would still
+    exit 0, leaving the api-gateway at 0/1 with /ready answering
+    503 db_ping_failed."""
     v = _values()["postgresql"]
     assert v["enabled"] is False, "this overlay exists to turn the in-chart Postgres off"
     assert v["external"]["sslMode"] == "disable", (

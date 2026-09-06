@@ -28,10 +28,11 @@ literal `%40`; leave it raw and the URL parser reads the password as a hostname.
 The chart cannot re-encode a value it hands to consumers with different parsers,
 so it restricts the alphabet instead.
 
-Why this is fatal at render rather than a warning: the runtime failure is
-silent. The api-gateway logs one warning on a failed connect, stays 1/1 Ready
-and serves mock data, so `helm install` and `kubectl get pods` both look
-successful and the operator finds out from the data.
+Why this is fatal at render rather than a warning: the runtime failure is the
+expensive one to diagnose. `helm install` exits 0; the api-gateway logs one
+warning on a failed connect and keeps answering /health 200 -- but its
+readinessProbe is /ready, which answers 503 db_ping_failed, so the pod stalls at
+0/1 and its Service has no endpoints. Nothing in that chain names the password.
 
 The second test here is the one that would have caught the regression this pair
 was written with. Adding the guard turned three shipped

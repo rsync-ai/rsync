@@ -23,8 +23,9 @@
 # with it under `set -e`). So `temporal` and `temporal_visibility` must exist
 # before the chart is installed. `pipeline_db` likewise: api-gateway migrates a
 # SCHEMA into a database, it does not create the database. Miss any of the three
-# and the failure arrives minutes later as a CrashLoopBackOff or a pod that is
-# Ready and serving mock data.
+# and the failure arrives minutes later: Temporal in CrashLoopBackOff, or an
+# api-gateway that never leaves 0/1 because its readinessProbe is /ready and
+# /ready answers 503 while /health answers 200 unconditionally.
 #
 #   ./postgres-up.sh          bring it up and verify it
 #   ./postgres-up.sh --down   remove the container and the in-cluster wiring

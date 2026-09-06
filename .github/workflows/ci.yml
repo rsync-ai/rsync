@@ -226,6 +226,22 @@ jobs:
               # them: a docs-only edit adding a fourth link into the moat.
               - 'docs/**'
               - '*.md'
+              # Same shape again, and the widest subject of any guard here.
+              # test_no_doc_promises_a_silent_gateway_db_failure.py sweeps EVERY
+              # tracked file -- not `git ls-files '*.md'` like every other doc
+              # guard -- because that markdown restriction is exactly how the
+              # retired claim survived an earlier sweep in 10 of the 12 files
+              # that carried it, all .tpl/.yaml/.sh/.py. It declares no literal
+              # path, so the census in
+              # test_ci_filter_covers_every_guard_subject.py cannot see it either.
+              # No new pattern is added for it: every tree that has ever carried
+              # the claim is already matched above (`deploy/helm/**`, `docs/**`,
+              # `*.md`, `llm-service/**`). Recorded rather than left implicit,
+              # because that coverage is a fact about today's tree, not a
+              # property of the guard -- the same claim written into, say,
+              # `api-gateway/internal/handlers/` would land on a PR this filter
+              # does not match. The unfiltered `push: [main]` after the PR is
+              # what still sweeps it.
               # `install.sh` is the whole Docker-install acceptance path and is read by four
               # guards (test_install_reachability, test_byo_overlays_are_complete,
               # test_repo_slug_is_publishable, test_shipped_images_are_publishable -- 18

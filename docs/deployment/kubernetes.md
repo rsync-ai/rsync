@@ -152,8 +152,10 @@ frontend:
 > render time. `openssl rand -hex 24` stays inside the allowed set. For a
 > **managed** database whose password already exists, change it at the server
 > rather than only here. The check is skipped under `secrets.existingSecret`,
-> where the chart never sees the value and the failure is silent instead: the
-> api-gateway logs one warning, stays `1/1` Ready, and serves mock data.
+> where the chart never sees the value and the failure moves to runtime instead:
+> the api-gateway logs one warning, keeps answering `/health`, and never becomes
+> Ready — its readinessProbe is `/ready`, which answers `503 db_ping_failed`, so
+> the pod sits at `0/1` and its Service has no endpoints.
 
 ---
 
@@ -395,12 +397,12 @@ helm -n rsync test rsync
 `helm test` runs one throwaway pod
 ([`templates/tests/connection.yaml`](../../deploy/helm/rsync-ai/templates/tests/connection.yaml))
 that calls each Service **through cluster DNS**. It asserts more than
-`kubectl get pods` can: the api-gateway check hits `/ready`, which pings the
-connection pool *and* asserts the migrations ran, so a gateway that lost the
-cold-boot race against Postgres and is quietly serving mock data fails the
-test while its pod still reports `Ready`. Going through the Service name also
-catches a selector typo — zero endpoints behind a Service is valid YAML and
-leaves every pod Ready.
+`kubectl get pods` can, because it arrives the way a client does: a selector
+typo leaves a Service with zero endpoints, which is valid YAML and leaves every
+pod `Ready`. The api-gateway check hits `/ready` — the same endpoint the pod's
+readinessProbe uses, which pings the connection pool *and* asserts the
+migrations ran — so a gateway that lost the cold-boot race against Postgres
+fails this test for the same reason it never reached `1/1`.
 
 The api-gateway, orchestrator, temporal-adapter and the three generation pods
 (`llm-service`, `planner`, `tool-generator`) each run a `connector-catalog`

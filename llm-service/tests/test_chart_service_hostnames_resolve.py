@@ -6,9 +6,11 @@ templates/infra/postgresql.yaml declares the Service as `<fullname>-postgres`.
 Both render as perfectly valid YAML, both pass lint, and CI was green -- the
 mismatch is only decidable against a live cluster's DNS. On kind it surfaced as
 the orchestrator and temporal-adapter dying on `lookup rsync-postgresql ... no
-such host`, Temporal wedged on `nc: bad address`, and -- worst of the three --
-the api-gateway staying 1/1 Ready and serving MOCK DATA, because it logs one
-warning on a failed DB connect and never retries.
+such host`, Temporal wedged on `nc: bad address`, and -- worst of the three at
+the time -- the api-gateway reporting 1/1 Ready through all of it, because
+readiness then pointed at the static /health. Readiness now points at /ready,
+so that pod would stall at 0/1 instead; the other two would fail exactly as
+before, and a wrong hostname is still valid YAML that no render can decide.
 
 So the check is static and cheap: pull the suffix out of every hostname helper
 that points at something inside the chart, pull the suffix out of every Service

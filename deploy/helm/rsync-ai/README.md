@@ -136,9 +136,10 @@ it at the server (`ALTER ROLE rsync PASSWORD '…'`), not only in the values fil
 The same restriction applies to `secrets.redisPassword` and
 `secrets.demoWarehousePassword`, for the same reason. It is checked only for a
 value set in the values file: under `secrets.existingSecret` the chart never
-sees the password, and breaking the rule then fails **silently** — the
-api-gateway logs one warning on a failed connect, stays `1/1` Ready, and serves
-mock data.
+sees the password, and breaking the rule then fails at **runtime** instead — the
+api-gateway logs one warning on a failed connect, keeps answering `/health`, and
+stalls at `0/1`, because its readinessProbe is `/ready` and `/ready` answers
+`503 db_ping_failed`.
 
 **The role and the database must already exist.** The chart connects as
 `postgresql.username` (default `rsync`) to `postgresql.database` (default
@@ -235,7 +236,7 @@ chart ships:
 | `secrets.encryptionKey` | render aborts |
 | `frontend.apiUrl` | render aborts — it is what the *browser* calls, not a Service name |
 | `frontend.publicUrl` | render aborts — NextAuth builds its callback URLs from it |
-| `secrets.postgresPassword` | **renders empty.** Install succeeds; the managed database rejects the connection later. Correct to leave empty only under IAM database authentication |
+| `secrets.postgresPassword` | **renders empty.** `helm install` exits 0; the managed database then rejects the connection and the api-gateway never leaves `0/1`. Correct to leave empty only under IAM database authentication |
 | `secrets.redisPassword` | **renders empty.** Same shape. Correct to leave empty only where the cache has no AUTH token |
 
 Helm reports one render failure at a time, so the first four cost four

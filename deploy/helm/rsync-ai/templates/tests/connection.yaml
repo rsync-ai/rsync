@@ -13,14 +13,16 @@ into "I checked and it is fine".
 WHY IT DOES NOT JUST CURL /health. Two of the three services here answer a
 static 200 that cannot fail for the reason that matters:
 
-  - api-gateway /health is a literal (api-gateway/cmd/server/main.go:614). A
-    gateway that lost the cold-boot race against Postgres logs one warning,
-    falls back to mock data, never retries, and answers /health 200 forever --
-    the exact failure the #859 kind run hit, with a Ready pod serving fiction.
-    /ready is the one that pings the pool AND asserts migrations applied
-    (api-gateway/cmd/server/ready.go readinessVerdict). This test asserts the
-    BODY too: a 200 whose body is not `"status":"ready"` cannot happen today,
-    but pinning it means a future handler cannot quietly widen what counts.
+  - api-gateway /health is a literal (api-gateway/cmd/server/main.go:621). A
+    gateway that lost the cold-boot race against Postgres answers /health 200
+    forever while every request it serves 503s -- in the #859 kind run that pod
+    also stayed Ready, because readiness pointed at /health too. /ready is the
+    one that pings the pool AND asserts migrations applied
+    (api-gateway/cmd/server/ready.go readinessVerdict), and the Deployment's
+    readinessProbe now points there as well, so this test and pod readiness
+    agree on what "up" means. This test asserts the BODY too: a 200 whose body
+    is not `"status":"ready"` cannot happen today, but pinning it means a future
+    handler cannot quietly widen what counts.
 
 WHAT IT ADDS OVER POD READINESS, which is the only other post-install signal:
 readiness is evaluated by the kubelet against the pod's own IP, so it proves
