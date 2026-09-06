@@ -18,7 +18,9 @@ on:
   # critical path for zero gating value. Moved off PRs onto a nightly
   # cron so violations are still tracked without slowing every push.
   schedule:
-    - cron: '0 9 * * *'  # 09:00 UTC daily (off-peak for the mac runners)
+    # 09:00 UTC. The hour was chosen to be off-peak on the self-hosted Macs
+    # this workflow ran on; on hosted runners nothing makes one hour cheaper.
+    - cron: '0 9 * * *'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -31,13 +33,17 @@ permissions:
   contents: read
   pull-requests: read
 
-# Self-hosted-runner tool cache. The setup-go / setup-python /
-# setup-node actions default their cache to /Users/runner/hostedtoolcache
-# (the GitHub-hosted-runner user). That path doesn't exist on a
-# self-hosted Mac. AGENT_TOOLSDIRECTORY is exported by each runner's
-# own ~/.env so every parallel runner uses its own _work/_tool dir
-# (avoids concurrent-write races on a shared cache). Don't set it at
-# workflow level — that would override the per-runner value.
+# No workflow-level AGENT_TOOLSDIRECTORY, and none needed. The setup-go /
+# setup-python / setup-node actions default their tool cache to
+# /Users/runner/hostedtoolcache, which is the hosted runner's own user and
+# where they write here. That path did not exist on the self-hosted Macs this
+# workflow ran on before the flip-day split, so each of those runners exported
+# its own AGENT_TOOLSDIRECTORY from ~/.env, giving every parallel runner a
+# private _work/_tool dir instead of racing on a shared one.
+#
+# The note outlives the runners because the wrong fix does: setting the
+# variable at workflow level would override a per-runner value, and would still
+# be the wrong place if any job ever went back.
 
 jobs:
   # Detect which directories changed in this PR, so downstream jobs can
@@ -273,27 +279,38 @@ jobs:
         with:
           go-version-file: ${{ matrix.module }}/go.mod
           cache-dependency-path: ${{ matrix.module }}/go.sum
-          # CRITICAL: disable setup-go's built-in auto-cache. It saves the
-          # entire global ~/go/pkg/mod (~2.95 GB) at job end via a "Post Run"
-          # step. At 0.1-0.2 MB/s on our self-hosted runners that upload runs
-          # for hours, hits a GitHub cache-API auth error, and fails the job
-          # even though all tests passed. Our explicit "Cache go build + modules"
-          # step below handles caching with per-module keys and a much smaller
-          # scope, so setup-go's auto-cache is redundant.
+          # Disable setup-go's built-in auto-cache. It saves the entire global
+          # ~/go/pkg/mod (~2.95 GB) at job end via a "Post Run" step, and
+          # nothing here restores a Go cache either -- see the note below -- so
+          # this flag is not compensating for a cache step, it is the whole Go
+          # caching policy for this job.
+          #
+          # It was CRITICAL while these jobs ran on the self-hosted Macs: at the
+          # 0.1-0.2 MB/s those boxes uploaded at, the Post Run step ran for
+          # hours, hit a GitHub cache-API auth error and failed the job with
+          # every test passed. On a hosted runner the same upload is merely
+          # wasted, since the next run gets a fresh box with nothing to restore
+          # into. (It used to cite an explicit "Cache go build + modules" step;
+          # that step was removed with the module cache and the citation
+          # outlived it, describing a saving no run has made since.)
           cache: false
-      # NO GitHub actions/cache for Go caches on self-hosted runners.
+      # NO GitHub actions/cache for the Go caches -- and unlike most notes in
+      # this file, this one does NOT simply carry over the runner move.
       #
-      # actions/cache exists to ferry state between EPHEMERAL runners. Our
-      # runners are persistent Macs (m1-m4): both ~/go/pkg/mod AND
-      # ~/Library/Caches/go-build already survive on local disk between runs,
-      # so `go test` reuses a warm build cache with zero round-trip.
+      # actions/cache exists to ferry state between EPHEMERAL runners, and the
+      # reason there was none here is that these runners were not ephemeral:
+      # the jobs ran on persistent Macs where both ~/go/pkg/mod and
+      # ~/Library/Caches/go-build survived on local disk between runs, so
+      # `go test` reused a warm build cache with zero round-trip. Uploading the
+      # ~1.4 GB build cache via actions/cache@v6 at ~1 MB/s added a ~9-min
+      # "Post Cache" step to every Go job for no benefit, so it was removed.
       #
-      # The build cache had grown to ~1.4 GB; uploading it via actions/cache@v6
-      # at ~1 MB/s added a ~9-min "Post Cache" step to every Go job for no
-      # benefit (and slow cold-key restores on top). Removed — same reasoning
-      # already applied to the excluded ~/go/pkg/mod module cache. First build
-      # of a module on a runner that's never seen it is a one-time cold compile,
-      # strictly cheaper than a 1.4 GB upload every run.
+      # ubuntu-latest is ephemeral. Every run is now a cold compile and that
+      # argument is gone, so the absence here is a not-yet rather than a
+      # conclusion: a cache would be a real speedup, and one added without a
+      # measured key is the opposite failure -- a warm-looking job restoring a
+      # stale tree. Measure before adding one. Do not add one merely because
+      # this comment no longer forbids it.
       - name: go test (includes build + vet via compiler)
         working-directory: ${{ matrix.module }}
         # `go test ./...` compiles every package, so the explicit
@@ -345,8 +362,8 @@ jobs:
           go-version-file: ${{ matrix.module }}/go.mod
           cache-dependency-path: ${{ matrix.module }}/go.sum
           cache: false  # see go job above for why auto-cache is disabled
-      # No actions/cache — see go job above: build cache persists on local disk
-      # on these self-hosted runners; uploading it added ~9 min/job for nothing.
+      # No actions/cache — see go job above, including why that job's reason
+      # for having none did not survive the move to ephemeral runners.
       - name: go test (includes build via compiler)
         working-directory: ${{ matrix.module }}
         # `go test ./...` runs the compiler so the prior explicit
@@ -374,8 +391,8 @@ jobs:
           go-version-file: shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/go.mod
           cache-dependency-path: shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/go.sum
           cache: false  # see go job above for why auto-cache is disabled
-      # No actions/cache — see go job above: build cache persists on local disk
-      # on these self-hosted runners; uploading it added ~9 min/job for nothing.
+      # No actions/cache — see go job above, including why that job's reason
+      # for having none did not survive the move to ephemeral runners.
       - name: go test (includes build via compiler)
         # The worker `replace`s ../../../../go/transforms (shared/go/transforms);
         # actions/checkout pulls the whole repo so that relative path resolves.
@@ -736,9 +753,10 @@ jobs:
           cd "$GITHUB_WORKSPACE"
           fail=0
           # Two plain counters rather than one associative array: `shell: bash` resolves to
-          # whatever bash is first on PATH, and on the macOS runners that can still be the
-          # system 3.2, which has no `declare -A`. A gate that dies on its own syntax is a
-          # worse outcome than a slightly longer script.
+          # whatever bash is first on PATH. That is bash 5 on ubuntu-latest, but it was the
+          # system 3.2 on the macOS runners this ran on, and 3.2 has no `declare -A`. Kept
+          # portable: a gate that dies on its own syntax is a worse outcome than a slightly
+          # longer script.
           count_public=0
           count_internal=0
           run_tree() {
@@ -825,11 +843,13 @@ jobs:
   oss-deploy-smoke:
     name: OSS connector-lifecycle deploy smoke
     # `github.repository ==` is an AVAILABILITY guard, not a fork guard: it skips runs
-    # happening inside someone's own fork (which lacks the self-hosted runner). On a fork
-    # PR against THIS repo it names the base repo and evaluates TRUE, so it never blocked
-    # fork-authored code. The head-repo predicate conjoined below is the fork guard; the
-    # control that actually holds is the repo setting "Require approval for all external
-    # contributors", because a pull_request run executes the workflow from the PR head.
+    # happening inside someone's own fork, which has no reason to run this repo's nightly
+    # deploy smoke against its own docker daemon -- and, while the job was self-hosted, had
+    # no runner to run it on at all. On a fork PR against THIS repo it names the base repo
+    # and evaluates TRUE, so it never blocked fork-authored code. The head-repo predicate
+    # conjoined below is the fork guard; the control that actually holds is the repo
+    # setting "Require approval for all external contributors", because a pull_request run
+    # executes the workflow from the PR head.
     #
     # The list, rather than one slug: the public repo is `rsync-ai/rsync` and the
     # private one keeps its own name and stays alive after the flip, so CI has to
@@ -877,27 +897,44 @@ jobs:
   oss-leak-proof:
     name: OSS images are moat-free
     needs: changes
-    # Guard to the canonical repo: forks and mirrors lack the self-hosted runner
-    # and must never touch this box's docker daemon.
+    # Guard to the canonical repo: a fork or mirror has no business running this
+    # repo's moat proof against its own docker daemon.
     #
     # Both halves are load-bearing. `github.repository ==` blocks a mirror's own
     # scheduled run, but on a fork PULL REQUEST it names the BASE repo and evaluates
-    # TRUE -- which is how fork-authored code would have reached the Macs holding the
-    # prod deploy key. The head-repo comparison is the half that actually stops that,
-    # and it is the one llm-service/tests/test_self_hosted_jobs_are_fork_guarded.py
-    # requires on every self-hosted job reachable from a fork PR.
+    # TRUE -- which is how fork-authored code would have reached the self-hosted Macs
+    # that held the prod deploy key, while this job still ran on them. The head-repo
+    # comparison is the half that actually stops that, and it is the one
+    # llm-service/tests/test_self_hosted_jobs_are_fork_guarded.py requires on every
+    # self-hosted job reachable from a fork PR. It has no such job to require it of
+    # in this tree, which is the reason to keep the test rather than delete it with
+    # them: it is what goes red if one comes back.
     #
     # Both slugs, for the reason spelled out on oss-deploy-smoke above: this job
     # must keep running on the private repo before the flip and on the public one
     # after it.
     if: ${{ contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync"]'), github.repository) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.changes.outputs.llm == 'true' || github.event_name == 'schedule') }}
     runs-on: ubuntu-latest
-    concurrency:
-      # The script tags its builds rsync-oss-leaktest:{community,lifecycle}. Two
-      # concurrent runs would overwrite each other's tags mid-scan. Queue rather
-      # than cancel so an in-flight run reaches its cleanup step.
-      group: oss-leak-proof
-      cancel-in-progress: false
+    # NO job-level `concurrency` here, deliberately. There used to be one -- a
+    # repository-wide group `oss-leak-proof` with `cancel-in-progress: false` --
+    # whose only stated job was to stop two runs overwriting the fixed image tags
+    # rsync-oss-leaktest:{community,lifecycle}. A concurrency group holds exactly
+    # ONE pending entry, so with several PRs in flight each newly queued run
+    # CANCELLED the one waiting ahead of it. The guard then did not execute at all,
+    # and the PR showed a red X that reads exactly like a real moat leak. Measured
+    # over 60 ci.yml runs: 12 of this job's 53 non-skipped runs ended `cancelled`
+    # with ZERO steps -- the tell, since a run that really executes has 6 steps and
+    # takes 19-47s. The collision it was protecting against is fixed properly below,
+    # by making the tags unique per run; two 20s cache-warm builds on this box cost
+    # nothing, so there is no second reason to serialize.
+    #
+    # llm-service/tests/test_moat_job_is_not_serialized_by_a_shared_tag.py holds
+    # this shape: the env below, the script reading it, and the absence of a
+    # constant-named group on any PR-reachable job.
+    env:
+      # run_id alone would collide across re-runs of the same run; run_attempt
+      # separates those. Both are plain digits, so the result is a legal tag.
+      LEAKTEST_TAG_SUFFIX: -${{ github.run_id }}-${{ github.run_attempt }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -909,8 +946,25 @@ jobs:
         if: always()
         # The runner is a long-lived box; two ~1GB images per run would accumulate.
         # Never fail the job on cleanup -- a red X here would be read as a leak.
+        #
+        # Scoped to THIS run's tags. Removing the bare `:community` / `:lifecycle`
+        # names here was the second collision the mutex was masking: with unique
+        # tags but a fixed cleanup, run A's teardown would untag run B's image
+        # mid-scan.
+        #
+        # The obvious worry about `rmi -f` is the opposite one -- that it deletes a
+        # shared image out from under a concurrent scan -- so this was measured on
+        # the runner daemon rather than reasoned about. It is safe by two
+        # independent routes: two builds of one UNCHANGED context are assigned
+        # different image ids (so concurrent runs do not share an image at all),
+        # and even when two tags do point at one id, `docker rmi -f <tag>` only
+        # untags that reference -- the other tag survives and stays inspectable.
+        # The first route is why the earlier version of this comment, which
+        # asserted that concurrent builds share an id, was wrong about the
+        # mechanism while right about the conclusion.
         run: |
-          docker rmi -f rsync-oss-leaktest:community rsync-oss-leaktest:lifecycle || true
+          docker rmi -f "rsync-oss-leaktest:community${LEAKTEST_TAG_SUFFIX}" \
+                        "rsync-oss-leaktest:lifecycle${LEAKTEST_TAG_SUFFIX}" || true
 
   frontend:
     name: Frontend (lint + test + build)
@@ -943,13 +997,17 @@ jobs:
           # every one of the 50 test files died at worker startup. undici's own
           # `engines: >=20.18.1` is optimistic and does not catch it.
           node-version: '26'
-          # NO `cache: npm`. On self-hosted runners setup-node's npm cache
-          # ferries the global ~/.npm tree (had bloated to ~940 MB) over the
-          # GitHub cache backend every run — pure overhead. We cache
-          # frontend/node_modules directly below, so on a hit `npm ci` is
-          # skipped and ~/.npm is never read; on a miss the on-disk ~/.npm
-          # (persists on the self-hosted runner) still serves as a warm
-          # download cache. Same rationale as the Go/Python jobs above.
+          # NO `cache: npm`. We cache frontend/node_modules directly below, so
+          # on a hit `npm ci` is skipped and ~/.npm is never read at all --
+          # setup-node's cache would be ferrying a tree to serve a step that
+          # mostly does not run.
+          #
+          # On the self-hosted Macs it was worse than redundant: that tree had
+          # bloated to ~940 MB, and it persisted on local disk anyway, so a miss
+          # still found a warm download cache and the upload bought nothing.
+          # Same rationale, and the same not-yet, as the Go jobs above -- an
+          # ephemeral runner pays a full cold download on a miss, which is a
+          # case for measuring rather than a reason this must stay absent.
       # CI SPEEDUP: cache the installed `frontend/node_modules` tree.
       # Caching node_modules directly + a hash on package-lock.json
       # cuts install to a few seconds on cache hit.
@@ -1101,11 +1159,17 @@ jobs:
       # this, `playwright install` re-downloads ~100MB every run
       # (~2-4 min). Keyed off package-lock.json so a Playwright
       # version bump (which updates the lock) invalidates correctly.
+      #
+      # The path is Playwright's LINUX browser cache, and it has to move with
+      # the runner. It was ~/Library/Caches/ms-playwright while this job ran on
+      # macOS; that directory does not exist on ubuntu-latest, so leaving it
+      # would cache nothing and quietly pay the ~100 MB download every run --
+      # the speedup this step exists for, not happening and not saying so.
       - name: Cache Playwright browsers
         id: pw-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          path: ~/Library/Caches/ms-playwright
+          path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-pw-${{ hashFiles('frontend/package-lock.json') }}
           restore-keys: |
             ${{ runner.os }}-pw-
