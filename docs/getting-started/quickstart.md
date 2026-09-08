@@ -8,7 +8,7 @@ The fastest way to run rsync.ai is the one-command installer — no source code 
 curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
 ```
 
-The installer will prompt for an OpenAI API key, your domain or IP, and an admin email. It generates all secrets, pulls Docker images, and starts the full stack. Open `http://localhost:3000` when it finishes.
+The installer asks three things: which LLM you want, your domain or IP, and an admin email. Everything else it does itself — generates every secret, pulls the images, starts the full stack. For the LLM you can bring an OpenAI key, or pick the bundled Ollama, which needs no key and no manual `ollama pull`: the stack runs its own Ollama container and downloads the model before any service that would ask for one starts. Open `http://localhost:3000` when it finishes.
 
 The full stack includes the change-data-capture services, so streaming pipelines work
 on a fresh install with nothing extra to run. Those three containers reserve 2816 MB
@@ -36,11 +36,15 @@ For detailed self-hosting instructions (TLS, secrets management, backup, upgrade
 # 1. Clone and configure
 git clone https://github.com/rsync-ai/rsync.git
 cd rsync
-cp .env.example .env          # fill in OPENAI_API_KEY and secrets
+cp .env.example .env          # secrets; OPENAI_API_KEY only if you have one
 cp llm-service/.env.example llm-service/.env
 
 # 2. Start the full stack
 docker compose -p rsync-ai up -d
+
+#    ...or without an OpenAI key, adding the bundled LLM:
+#    docker compose -p rsync-ai -f docker-compose.yml -f docker-compose.ollama.yml up -d
+#    (naming files explicitly also stops compose picking up docker-compose.override.yml)
 
 # 3. Verify health (~30s startup)
 curl http://localhost:5001/health   # api-gateway

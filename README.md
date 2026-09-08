@@ -49,9 +49,12 @@ a real pipeline end to end on the first-run checklist —
 curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
 ```
 
-Requires Docker. The installer prompts for an OpenAI API key, generates every other
-secret, and starts the full stack. Open `http://localhost:3000` when it finishes. If the
-stack does not come up, the installer says so and exits non-zero — it does not print a
+Requires Docker and nothing else. The installer asks which LLM you want — your own
+OpenAI key, or the Ollama it bundles — generates every other secret itself, and starts
+the full stack. Choose Ollama and there is no key to find and no model to pull by hand:
+the stack ships an Ollama container and a one-shot job that downloads the model before
+anything that would ask for one starts. Open `http://localhost:3000` when it finishes. If
+the stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
 > **Which code you get.** `v0.1.2`, the current release. Both halves of the install come
@@ -132,7 +135,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 | **Durable execution** | Stages run as Temporal workflows, so a multi-hour sync survives a restart, a redeploy, or a crashed worker. |
 | **You can answer "why did it do that?"** | Every run emits domain events carrying stage state, row counts and a trace id, and the UI shows them stage by stage. |
 | **A SQL and NL query surface** | The [Data Explorer](#the-data-explorer) queries the systems you connected — no second BI tool to stand up first. |
-| **Your infrastructure, your keys** | One Docker command or one Helm chart. Credentials are encrypted at rest with a key you hold; point the LLM at OpenAI or at a local [Ollama](docs/deployment/ollama.md). |
+| **Your infrastructure, your keys** | One Docker command or one Helm chart. Credentials are encrypted at rest with a key you hold; point the LLM at OpenAI or at the [Ollama](docs/deployment/ollama.md) the installer bundles. |
 
 ## Connectors
 
@@ -198,8 +201,10 @@ data-flow diagrams.
 ## Requirements
 
 - Docker 24+ and Docker Compose v2 — or, for the Helm path, Kubernetes 1.25+ and Helm 3.8+
-- 8 GB RAM minimum (16 GB recommended)
-- An OpenAI API key (or a self-hosted Ollama instance — see [docs/deployment/ollama.md](docs/deployment/ollama.md))
+- 8 GB RAM minimum, 16 GB recommended — 12 GB if you let the installer bundle an LLM,
+  which it checks and warns about before starting anything
+- No API key required. Bring an OpenAI key if you have one, or choose the bundled
+  [Ollama](docs/deployment/ollama.md) and the installer downloads a model for you
 
 ## Documentation
 

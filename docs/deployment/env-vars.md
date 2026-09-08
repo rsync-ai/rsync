@@ -221,7 +221,7 @@ All of these are optional; unset means "inherit".
 | `EXPLORER_SQL_PROVIDER` | inherits the Explorer provider | Provider for NL→SQL only |
 | `EXPLORER_SQL_ALLOW_ONLINE` | `not EXPLORER_OFFLINE_ONLY` | Permits NL→SQL to reach a cloud provider while the rest of the Explorer is offline |
 | `EXPLORER_SQL_OPENAI_MODEL` | prompt-registry model | NL→SQL model, applied only when the SQL provider resolves to `openai` |
-| `EXPLORER_SQL_FALLBACK_MODELS` | `qwen2.5:7b,llama3:latest,codellama:7b-instruct` | Retry chain when SQL generation fails |
+| `EXPLORER_SQL_FALLBACK_MODELS` | `qwen2.5:7b,llama3:latest,codellama:7b-instruct` | Retry chain when SQL generation fails. Names equal to the primary model are dropped, so on the bundled Ollama — which pins this to the one model it pulled — the chain is empty and the error is raised immediately instead of after three requests for weights nobody downloaded. |
 | `RANK_TABLES_LLM_PROVIDER` | inherits `EXPLORER_LLM_PROVIDER`, then `LLM_PROVIDER` | Provider for `/agents/rank-tables` (table recommendations during pipeline setup) only |
 | `RANK_TABLES_MODEL` | `llama3:latest` offline, `gpt-4o-mini` on OpenAI | Model for `/agents/rank-tables`. Deliberately does **not** follow `LLM_MODEL` — it is a bulk metadata task pinned to a cheap model. |
 
@@ -325,7 +325,12 @@ REDIS_PASSWORD=<openssl rand -base64 24>
 # Option A: OpenAI (easiest for demo)
 OPENAI_API_KEY=sk-...
 
-# Option B: Ollama on same VM
+# Option B: the bundled Ollama — no key, no manual pull. Add
+#   -f docker-compose.ollama.yml
+# to the compose command; the overlay sets both address variables and the model.
+# LLM_PROVIDER=ollama
+#
+# Option C: an Ollama you already run on this VM
 # OLLAMA_BASE_URL=http://host-gateway:11434
 # EXPLORER_OFFLINE_ONLY=true
 #   verify: docker logs rsync-llm-service 2>&1 \

@@ -1,15 +1,47 @@
-# Optional: bundle a local Ollama so the stack runs FULLY OFFLINE (no OpenAI key,
-# no host Ollama). Layer it on top of the quickstart:
+# ─────────────────────────────────────────────────────────────────────────────
+# Optional: bundle a local Ollama so the stack runs FULLY OFFLINE — no OpenAI
+# key, no Ollama on the host. Layer it on top of the quickstart:
 #
 #     docker compose -f docker-compose.quickstart.yml -f docker-compose.ollama.yml up -d
-#     docker exec rsync-ollama ollama pull qwen2.5:7b      # pull the model once
 #
-# Set LLM_PROVIDER=ollama in .env (install.sh option 2 does this). This overlay just
-# points the LLM services at the bundled ollama container instead of host.docker.internal;
-# the `environment:` maps merge with the base, overriding only OLLAMA_URL.
+# install.sh adds this overlay for you when you pick the internal LLM, and the
+# status / logs / retry commands it prints at the end of a run carry the same
+# `-f` set, because they are built from the same array. Combine freely with the
+# byo-postgres and byo-kafka overlays; all three are independent.
 #
-# Without this overlay, choosing Ollama in install.sh uses an Ollama running on the HOST
-# (http://host.docker.internal:11434).
+# Set LLM_PROVIDER=ollama in .env. Without this overlay that setting points the
+# LLM tier at an Ollama running on the HOST (http://host.docker.internal:11434),
+# which is the right answer when you already run one and the wrong one when you
+# do not — nothing starts an Ollama on your behalf. This file starts one.
+#
+# ── The model is pulled for you ──────────────────────────────────────────────
+# `ollama-pull` below downloads the model once, into a named volume, before any
+# service that would ask for it starts. The first `up` therefore BLOCKS for as
+# long as that download takes — several minutes on a home connection, and about
+# 4.7 GB on disk for the default qwen2.5:7b. Watch it with:
+#
+#     docker logs -f rsync-ollama-pull
+#
+# Later `up`s are a no-op: the volume survives `down`, and the pull step exits
+# immediately when the model is already there. `docker compose down -v` deletes
+# the volume and the next `up` downloads again.
+#
+# ── Memory ───────────────────────────────────────────────────────────────────
+# A 7B model at 4-bit wants ~5 GB resident on top of everything else the stack
+# runs, so plan for 12 GB of RAM. install.sh checks this before it starts the
+# stack; a hand-run `docker compose up` does not, and the failure mode is the
+# model loading, the host swapping, and inference taking minutes per token.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The model name, resolved ONCE and referenced everywhere below.
+#
+# The precedence is not a house choice — it mirrors get_default_model() in
+# llm-service/src/utils/openai_client.py:120-138, which is the function the
+# running code calls to decide what to ask Ollama for: LLM_MODEL first, then
+# OLLAMA_MODEL, then qwen2.5:7b. Pulling a model by any other rule pulls a model
+# the stack will not request, and the operator gets a 4.7 GB download followed
+# by `model not found` on the first prompt.
+x-ollama-model: &ollama-model ${LLM_MODEL:-${OLLAMA_MODEL:-qwen2.5:7b}}
 
 services:
   ollama:
@@ -18,8 +50,27 @@ services:
     image: ollama/ollama:0.33.2
     container_name: rsync-ollama
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    # Deliberately NO mem_limit. Every other service here gets one because its
+    # working set is bounded and a leak should be capped; this one's working set
+    # IS the model, and a cap below it does not slow inference down, it gets the
+    # container OOM-killed mid-answer. Size the HOST instead — see the note above.
     volumes:
       - ollama_models:/root/.ollama
+    healthcheck:
+      # `ollama list` is a round trip to the server's own API, so it goes green
+      # only once the HTTP listener is actually accepting — which is what the
+      # pull step below is waiting for. A port check would pass earlier and
+      # hand the pull a connection the server is not ready to serve.
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
     # For GPU acceleration on a CUDA host, uncomment:
     # deploy:
     #   resources:
@@ -29,20 +80,183 @@ services:
     #           count: all
     #           capabilities: [gpu]
 
+  # ─── MODEL BOOTSTRAP ────────────────────────────────────────────────────────
+  #
+  # Until this service existed, starting the bundled Ollama gave you a server
+  # with no models in it, and the only thing telling you to fix that was a line
+  # in this file's own header:
+  #
+  #     docker exec rsync-ollama ollama pull qwen2.5:7b
+  #
+  # Skipping it does not fail loudly. Ollama answers the request and returns
+  # `model "qwen2.5:7b" not found, try pulling it first`; the Python tier
+  # surfaces that as a failed generation, and the stack around it stays green —
+  # every container `running`, `/ready` 200, nothing to point at. The whole
+  # offline path was one undocumented-by-anything-executable step away from
+  # working.
+  ollama-pull:
+    image: ollama/ollama:0.33.2
+    container_name: rsync-ollama-pull
+    restart: "no"
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    # Run-once job, and a thin one: it holds no model bytes at all. Both
+    # commands below are HTTP calls to the `ollama` container, which does the
+    # downloading into its own volume — which is also why this service mounts
+    # nothing. A second writer on ollama_models would race the server.
+    mem_limit: 512m
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      # The CLI is a client. Without this it looks for a server on localhost
+      # inside its own container, finds nothing, and reports a connection error
+      # that reads like the server is down when it is up and healthy next door.
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: *ollama-model
+    entrypoint: ["/bin/sh", "-c"]
+    # Single-element list, not a bare block scalar: Compose splits a string
+    # command into argv, which would leave `sh -c` running only the first word.
+    # `docker compose config` must show ONE item.
+    command:
+      - |
+        set -u;
+        echo "model: $$OLLAMA_MODEL";
+        if ollama show "$$OLLAMA_MODEL" >/dev/null 2>&1; then
+          echo "already on the server; nothing to download";
+          exit 0;
+        fi;
+        echo "downloading $$OLLAMA_MODEL -- this is a few GB and only happens once";
+        # The error is captured rather than discarded because the failures that
+        # land here read identically from outside: a model name with a typo, a
+        # registry that is down, and a disk with no room all just end this loop.
+        # The operator needs Ollama's own words to tell them apart.
+        ERR="";
+        n=0;
+        until ERR="$$(ollama pull "$$OLLAMA_MODEL" 2>&1)"; do
+          n=$$((n + 1));
+          if [ "$$n" -ge 5 ]; then
+            echo "FATAL: could not pull \"$$OLLAMA_MODEL\" after 5 attempts." >&2;
+            echo "  Last error from ollama: $$ERR" >&2;
+            echo "  Checked in this order:" >&2;
+            echo "    * the name is a real tag at https://ollama.com/library" >&2;
+            echo "      (LLM_MODEL in .env, or OLLAMA_MODEL if LLM_MODEL is unset)" >&2;
+            echo "    * this host can reach registry.ollama.ai over HTTPS" >&2;
+            echo "    * the docker volume has room for the model (several GB)" >&2;
+            echo "  Nothing downstream starts until this succeeds, by design: a" >&2;
+            echo "  server with no model answers every prompt with 'model not found'." >&2;
+            exit 1;
+          fi;
+          echo "pull attempt $$n/5 failed, retrying in 10s: $$ERR" >&2;
+          sleep 10;
+        done;
+        echo "$$OLLAMA_MODEL is ready";
+
   llm-service:
     environment:
       OLLAMA_URL: http://ollama:11434
+      # OLLAMA_BASE_URL as well, not OLLAMA_URL alone. _ollama_base_url in
+      # llm-service/src/utils/openai_client.py:70 reads BASE_URL first and only
+      # falls back to URL when BASE_URL is unset or empty -- and
+      # docker-compose.yml:1583 hard-codes
+      # OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 on tool-generator,
+      # a line docker-compose.prod.yml:789 repeats. With only OLLAMA_URL set
+      # here, that service kept dialling the host on both of those bases while
+      # this overlay's whole promise is that it does not have to. Rendered
+      # `docker compose -f docker-compose.yml -f docker-compose.ollama.yml config`
+      # and read the key back to confirm. The trailing /v1 is what the helper
+      # appends anyway; writing it keeps the rendered value byte-identical in
+      # shape to the ones the base files already carry.
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      # Pinned, and the quickstart is why. Its own default for this key is
+      # `${LLM_MODEL:-gpt-4o}`, so a hand-run
+      # `docker compose -f docker-compose.quickstart.yml -f docker-compose.ollama.yml up -d`
+      # with nothing set hands this container LLM_MODEL=gpt-4o while ollama-pull
+      # downloads qwen2.5:7b -- and get_default_model returns LLM_MODEL before it
+      # ever looks at OLLAMA_MODEL, so the main chat path asks the bundled Ollama
+      # for an OpenAI catalog name. Verified by rendering the two files together.
+      # install.sh happens to hide this by writing LLM_MODEL into the .env; the
+      # hand-run command in this file's header does not, and it is supported.
+      LLM_MODEL: *ollama-model
+      # Not redundant with LLM_MODEL above, and not decoration. FOUR functions in
+      # llm-service/src/utils/openai_client.py pick a model name for the Ollama
+      # provider, and left alone they pick THREE different ones — while
+      # ollama-pull downloads exactly one:
+      #
+      #   get_default_model            :120-138  LLM_MODEL, OLLAMA_MODEL, qwen2.5:7b
+      #   explorer_default_model       :164-195  OLLAMA_MODEL, llama3:latest
+      #   explorer_default_sql_model   :198-207  OLLAMA_MODEL, sqlcoder:latest
+      #   rank_tables_default_model    :210-233  RANK_TABLES_MODEL, llama3:latest
+      #
+      # So without these two lines the main chat path works on the pulled model
+      # while the Data Explorer and the table-ranking step ask Ollama for
+      # `llama3:latest` and `sqlcoder:latest`, which are not in the volume and
+      # are not going to be. The operator sees a working /chat beside a Data
+      # Explorer that fails — the exact split-brain this overlay exists to end.
+      OLLAMA_MODEL: *ollama-model
+      # rank-tables is the one that reads its own variable rather than
+      # OLLAMA_MODEL, deliberately: on the cloud providers it is pinned to a
+      # cheap model so a stack-wide upgrade cannot silently multiply its bill.
+      # Offline there is only one model, so point it at that one.
+      RANK_TABLES_MODEL: *ollama-model
+      # A fifth model name, and the only one that is a LIST. When the Explorer's
+      # NL->SQL step returns something that is not a SELECT, it retries against
+      # each name in EXPLORER_SQL_FALLBACK_MODELS in turn
+      # (llm-service/src/gateway/main.py:2756-2782), and its built-in default is
+      # the literal `qwen2.5:7b,llama3:latest,codellama:7b-instruct` -- names
+      # from the era when this file pulled three models. ollama-pull downloads
+      # one, so on a default install two of those three are guaranteed 404s
+      # against the bundled server, spent inside the Explorer's request budget
+      # before the same error is raised anyway; set LLM_MODEL to anything else
+      # and all three are wrong. Pinning it to the pulled model makes the list
+      # collapse to empty -- the loop filters out any name equal to the primary
+      # -- which is the honest answer on a one-model install: there is no other
+      # model to fall back to, so fail immediately instead of slowly.
+      EXPLORER_SQL_FALLBACK_MODELS: *ollama-model
     depends_on:
-      ollama:
-        condition: service_started
+      # service_completed_successfully, and deliberately WITHOUT `required:
+      # false`. That flag reads like the house style in the byo-* overlays, and
+      # here it would quietly undo this whole file: measured on Compose 2.x, a
+      # FAILED completion dependency marked `required: false` degrades to the
+      # warning `optional dependency "…" didn't complete successfully` and the
+      # dependent starts anyway with `up` still exiting 0 — which is exactly the
+      # start-on-an-empty-Ollama this service exists to prevent. The flag is for
+      # a service that may be absent from the project; ollama-pull is defined
+      # right here and never is.
+      ollama-pull:
+        condition: service_completed_successfully
 
   tool-generator:
     environment:
       OLLAMA_URL: http://ollama:11434
+      # This is the service the base files pin OLLAMA_BASE_URL on, so without
+      # the line below the overlay's OLLAMA_URL never wins here. See llm-service.
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      # Both keys, for the reason spelled out under llm-service: whichever of the
+      # two a service happens to read, it reads the model that is on disk.
+      LLM_MODEL: *ollama-model
+      OLLAMA_MODEL: *ollama-model
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
 
   planner:
     environment:
       OLLAMA_URL: http://ollama:11434
+      # No base file pins OLLAMA_BASE_URL on planner today. Set anyway, so the
+      # three extended services resolve the same way and a later base-file edit
+      # cannot strand this one the way it stranded tool-generator.
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+      # Threads the quickstart's `${LLM_MODEL:-gpt-4o}` default too, so it needs
+      # the same pin llm-service does.
+      LLM_MODEL: *ollama-model
+      OLLAMA_MODEL: *ollama-model
+    depends_on:
+      ollama-pull:
+        condition: service_completed_successfully
 
 volumes:
   ollama_models:

@@ -59,7 +59,35 @@ COMPOSE_URL="${RAW_BASE}/${COMPOSE_FILE}"
 # thing the curl-pipe install deliberately avoids.
 BYO_PG_FILE="docker-compose.byo-postgres.yml"
 BYO_KAFKA_FILE="docker-compose.byo-kafka.yml"
+# The bundled-LLM overlay. Same deal as the two above -- downloaded
+# unconditionally, layered only when the .env asks for it -- except that it ADDS
+# services rather than parking any: an Ollama server, and a run-once job that
+# pulls the model into it before anything that would ask for one starts.
+OLLAMA_FILE="docker-compose.ollama.yml"
+# The one file this script does not take from RSYNC_REF, and the reason is
+# specific rather than convenient. At v0.1.2 this overlay is a stub that starts
+# an empty Ollama and leaves `docker exec rsync-ollama ollama pull` to the
+# operator -- the manual step the bundle exists to remove -- so taking it from
+# the pinned ref would ship the very defect the pin is meant to protect against.
+# The other way to fix that is to make v0.1.2 mean two different things.
+#
+# It is safe for this file and would not be for the quickstart, because of what
+# this file contains: ollama/ollama images only -- no ghcr.io/rsync-ai image and
+# no ${RSYNC_VERSION} -- so it has no half that can drift against the images
+# RSYNC_VERSION pulls. Everything else in it is `environment` and `depends_on`
+# on three services the pinned quickstart already defines, and
+# llm-service/tests/test_the_internal_llm_needs_no_manual_step.py fails the
+# build if either of those stops holding. The residual is worth stating rather
+# than hiding: an overlay that one day names a service the PINNED quickstart
+# lacks would break a pinned install, and the answer to that is a new tag, not
+# a second exception.
+OLLAMA_REF="${RSYNC_OLLAMA_REF:-main}"
+OLLAMA_RAW_BASE="https://raw.githubusercontent.com/${RSYNC_REPO}/${OLLAMA_REF}"
 COMPOSE_ARGS=()
+# Set by build_compose_args when the overlay above goes on, and read by
+# start_stack, which behaves differently on that path: the first `up` blocks for
+# the length of a multi-gigabyte download.
+OLLAMA_BUNDLED=0
 # Which optional compose profiles this install activates. `cdc` is in the
 # default because the change-data-capture services are not an add-on: pick a
 # streaming sync in the UI without them and the orchestrator's pre-flight polls
@@ -93,6 +121,14 @@ MIN_RAM_GB=$MIN_RAM_GB_BATCH
 case " ${RSYNC_PROFILES//,/ } " in
   *" cdc "*) MIN_RAM_GB=$MIN_RAM_GB_CDC ;;
 esac
+# What the bundled LLM needs, and not a third opinion on the two floors above: a
+# 7B model at 4-bit is ~5GB resident ON TOP of them, and it stays resident for
+# as long as the container runs. Checked separately, in build_compose_args,
+# because nothing knows whether the LLM is bundled until the .env exists.
+MIN_RAM_GB_WITH_LLM=12
+# Written by check_ram so that later check can reuse the reading. 0 means "could
+# not read this platform", never "no RAM" -- see check_ram's three outcomes.
+DETECTED_RAM_GB=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -257,6 +293,10 @@ check_ram() {
   elif [[ "$OSTYPE" == "darwin"* ]]; then
     ram_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
   fi
+  # Stashed for build_compose_args, which re-checks this same reading against a
+  # higher floor once it knows whether an LLM is being bundled. Reading the
+  # machine twice would be harmless; disagreeing with itself would not.
+  DETECTED_RAM_GB=$ram_gb
   # Three outcomes, not two. `ram_gb` stays at its 0 initialiser on any platform
   # neither branch above matches (a BSD, a busybox container, WSL reporting an
   # unexpected $OSTYPE), and 0 is excluded from the "too small" test by the
@@ -322,7 +362,7 @@ prompt_env() {
   # LLM provider: OpenAI (cloud) or Ollama (local, fully offline — no API key)
   echo "  LLM provider:"
   echo "    1) OpenAI  — cloud, needs an API key (best quality)"
-  echo "    2) Ollama  — local, fully offline, no key (needs Ollama running with a model pulled)"
+  echo "    2) Ollama  — local, fully offline, no key (one is started for you, model included)"
   # Without a terminal, an OPENAI_API_KEY in the environment is a clear enough
   # statement of intent to pick provider 1; with nothing set, the offline
   # provider is the only one that can work unattended.
@@ -342,10 +382,26 @@ prompt_env() {
   if [[ "${_llm_choice:-1}" == "2" ]]; then
     LLM_PROVIDER="ollama"
     LLM_MODEL="${LLM_MODEL:-qwen2.5:7b}"
-    OLLAMA_URL="${OLLAMA_URL:-http://host.docker.internal:11434}"
+    # The bundled service, not the host. Until docker-compose.ollama.yml grew a
+    # pull job this defaulted to host.docker.internal, which is the right answer
+    # only when the operator already runs an Ollama -- and nothing here started
+    # one, so the common case was a stack that came up green and answered every
+    # prompt with a connection error. An OLLAMA_URL already in the environment
+    # still wins, which is how you keep pointing at a host or a remote Ollama;
+    # build_compose_args reads this value back out of the .env and layers the
+    # overlay only when it names the bundle.
+    OLLAMA_URL="${OLLAMA_URL:-http://ollama:11434}"
     OPENAI_API_KEY=""
     info "Using local Ollama at ${OLLAMA_URL} (model ${LLM_MODEL})."
-    warn "Ensure Ollama is running and the model is pulled: ollama pull ${LLM_MODEL}"
+    # Conditional, because it is only true of an Ollama this script does not
+    # start. On the bundled path the overlay's ollama-pull job downloads the
+    # model before any service that would ask for one starts, so printing the
+    # manual step there tells the operator to do work that is already done.
+    if [[ "$OLLAMA_URL" == *"//ollama:"* ]]; then
+      info "An Ollama is bundled with the stack; its model is pulled on first start."
+    else
+      warn "Ensure Ollama is running and the model is pulled: ollama pull ${LLM_MODEL}"
+    fi
     # host.docker.internal is free on Docker Desktop and absent on Linux Docker.
     # The compose file now maps it to host-gateway, so the name resolves -- but
     # host-gateway is the bridge address, and Ollama listens on 127.0.0.1 by
@@ -721,7 +777,8 @@ download_compose() {
   fetch "$COMPOSE_URL"                  "${INSTALL_DIR}/${COMPOSE_FILE}"
   fetch "${RAW_BASE}/${BYO_PG_FILE}"    "${INSTALL_DIR}/${BYO_PG_FILE}"
   fetch "${RAW_BASE}/${BYO_KAFKA_FILE}" "${INSTALL_DIR}/${BYO_KAFKA_FILE}"
-  info "compose files downloaded (quickstart + both bring-your-own overlays)"
+  fetch "${OLLAMA_RAW_BASE}/${OLLAMA_FILE}" "${INSTALL_DIR}/${OLLAMA_FILE}"
+  info "compose files downloaded (quickstart + both bring-your-own overlays + bundled LLM)"
 }
 
 # Which -f files this install actually runs with. Keyed off the .env on disk
@@ -742,7 +799,7 @@ build_compose_args() {
   for profile in ${RSYNC_PROFILES//,/ }; do
     COMPOSE_ARGS+=( --profile "$profile" )
   done
-  local envf="${INSTALL_DIR}/${ENV_FILE}" pg="" kb=""
+  local envf="${INSTALL_DIR}/${ENV_FILE}" pg="" kb="" llm="" ourl=""
   if [[ -f "$envf" ]]; then
     # `|| true` is load-bearing, not defensive noise: this script runs under
     # `set -o pipefail`, so a grep that matches nothing fails the whole pipeline
@@ -750,8 +807,12 @@ build_compose_args() {
     # without this EVERY standard install dies here.
     pg=$(grep -E '^[[:space:]]*POSTGRES_HOST=' "$envf" | tail -1 | cut -d= -f2- || true)
     kb=$(grep -E '^[[:space:]]*KAFKA_BROKERS=' "$envf" | tail -1 | cut -d= -f2- || true)
+    llm=$(grep -E '^[[:space:]]*LLM_PROVIDER=' "$envf" | tail -1 | cut -d= -f2- || true)
+    ourl=$(grep -E '^[[:space:]]*OLLAMA_URL=' "$envf" | tail -1 | cut -d= -f2- || true)
     pg="${pg//\"/}"; pg="${pg//\'/}"
     kb="${kb//\"/}"; kb="${kb//\'/}"
+    llm="${llm//\"/}"; llm="${llm//\'/}"
+    ourl="${ourl//\"/}"; ourl="${ourl//\'/}"
   fi
   # `postgres` and `kafka:29092` are the in-compose defaults -- naming them
   # explicitly still means "use the bundled one", not "I have my own".
@@ -762,6 +823,32 @@ build_compose_args() {
   if [[ -n "$kb" && "$kb" != "kafka:29092" ]]; then
     COMPOSE_ARGS+=( -f "${INSTALL_DIR}/${BYO_KAFKA_FILE}" )
     info "External Kafka configured (${kb}) — bundled broker disabled."
+  fi
+  # The bundled LLM. Two conditions, and the second is the load-bearing one:
+  # LLM_PROVIDER=ollama says the LLM tier speaks Ollama, it does not say WHICH
+  # Ollama. Every .env written before this overlay grew a pull job carries
+  # OLLAMA_URL=http://host.docker.internal:11434 -- an Ollama on the operator's
+  # own machine. Layering the overlay on one of those would start a second,
+  # empty server that nothing talks to, download several GB into it, and leave
+  # the operator's own Ollama serving exactly as before. So it goes on only when
+  # the URL names the bundled service, or is blank -- which write_env never
+  # writes, but a hand-edited file can.
+  if [[ "$llm" == "ollama" ]] && [[ -z "$ourl" || "$ourl" == *"//ollama:"* ]]; then
+    COMPOSE_ARGS+=( -f "${INSTALL_DIR}/${OLLAMA_FILE}" )
+    OLLAMA_BUNDLED=1
+    info "Internal LLM configured — bundling an Ollama and pulling its model."
+    # Same three outcomes as check_ram, against the higher floor: a reading we
+    # could not take must not certify the machine.
+    if (( DETECTED_RAM_GB == 0 )); then
+      warn "RAM unread on this platform; the bundled model wants ${MIN_RAM_GB_WITH_LLM}GB total."
+    elif (( DETECTED_RAM_GB < MIN_RAM_GB_WITH_LLM )); then
+      warn "Only ${DETECTED_RAM_GB}GB RAM, and the bundled LLM wants ${MIN_RAM_GB_WITH_LLM}GB total"
+      warn "(the model is resident on top of the stack). Expect swapping and slow answers."
+      echo "  For a cloud model instead: set LLM_PROVIDER=openai and OPENAI_API_KEY in"
+      echo "  ${envf}, then re-run this installer."
+    fi
+  elif [[ "$llm" == "ollama" ]]; then
+    info "External Ollama configured (${ourl}) — no LLM container bundled."
   fi
   COMPOSE_CMD="docker compose $(printf '%s ' "${COMPOSE_ARGS[@]}")"
 }
@@ -775,6 +862,15 @@ pull_images() {
 
 start_stack() {
   section "Starting rsync.ai"
+  # `up -d` normally returns in seconds. On the bundled-LLM path it BLOCKS until
+  # the model is on disk, because the three Python services wait on ollama-pull
+  # completing successfully -- deliberately so, since an Ollama with no model
+  # answers every prompt with `model not found` while every container around it
+  # reads healthy. Say that before the terminal goes quiet for several minutes.
+  if (( OLLAMA_BUNDLED )); then
+    warn "First start downloads the LLM into a docker volume — several GB, once."
+    echo "  This blocks until it finishes. Watch it: docker logs -f rsync-ollama-pull"
+  fi
   docker compose \
     "${COMPOSE_ARGS[@]}" \
     --env-file "${INSTALL_DIR}/${ENV_FILE}" \
@@ -1017,6 +1113,15 @@ main() {
   # the quickstart file and neither overlay. Fetch whichever is missing.
   [[ -f "${INSTALL_DIR}/${BYO_PG_FILE}" ]]    || fetch "${RAW_BASE}/${BYO_PG_FILE}"    "${INSTALL_DIR}/${BYO_PG_FILE}"
   [[ -f "${INSTALL_DIR}/${BYO_KAFKA_FILE}" ]] || fetch "${RAW_BASE}/${BYO_KAFKA_FILE}" "${INSTALL_DIR}/${BYO_KAFKA_FILE}"
+  # Not merely "missing", unlike the two above. An install dir from a v0.1.2 run
+  # holds the overlay that shipped in that tag, which starts an Ollama and
+  # leaves the model pull to the operator; `[[ -f ]]` reads that as done, so the
+  # re-run repairs nothing and the operator is back where they started. Key the
+  # guard on the thing that was absent instead of on the filename.
+  if [[ ! -f "${INSTALL_DIR}/${OLLAMA_FILE}" ]] \
+     || ! grep -qE '^[[:space:]]*ollama-pull:' "${INSTALL_DIR}/${OLLAMA_FILE}"; then
+    fetch "${OLLAMA_RAW_BASE}/${OLLAMA_FILE}" "${INSTALL_DIR}/${OLLAMA_FILE}"
+  fi
 
   # Record the profile set in the .env, so a compose command typed by hand --
   # without the --profile flags this script passes -- starts the same services
