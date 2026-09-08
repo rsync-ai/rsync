@@ -219,6 +219,23 @@ def test_ollama_default_model_is_a_local_model(monkeypatch):
     assert explorer_default_model("ollama") == "llama3:latest"
 
 
+def test_ollama_default_model_follows_the_model_that_was_pulled(monkeypatch):
+    """The fallback above is a guess; OLLAMA_MODEL is the operator saying which.
+
+    A self-hosted install downloads exactly one model, and the bundled overlay
+    announces it in OLLAMA_MODEL -- which explorer_default_sql_model already
+    read and this function did not. So the Explorer chat was the one Ollama path
+    no environment variable could point at the model on disk, and it asked for a
+    llama3:latest nobody had pulled while /chat worked.
+    """
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    assert explorer_default_model("ollama") == "qwen2.5:7b"
+    # Still a local name when the cloud override is also set: LLM_MODEL is what
+    # the hosted providers read, and letting it win here is the leak above.
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o")
+    assert explorer_default_model("ollama") == "qwen2.5:7b"
+
+
 def test_ollama_sql_model_prefers_a_sql_specialist(monkeypatch):
     assert explorer_default_sql_model("ollama") == "sqlcoder:latest"
     monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")

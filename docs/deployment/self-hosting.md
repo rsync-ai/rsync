@@ -33,7 +33,7 @@ Deploy rsync-ai on your own infrastructure with production-grade security, TLS, 
 | RAM       | 8 GB    | 16+ GB      |
 | Disk      | 40 GB SSD | 100+ GB SSD |
 
-If running Ollama locally for the Explorer feature, add an additional 8 GB RAM.
+Add 8 GB RAM if you run an LLM locally — the bundled Ollama overlay or your own server.
 
 ### Software
 
@@ -327,27 +327,48 @@ LLM_PROVIDER=openai
 LLM_MODEL=gpt-4o-mini
 ```
 
-### Option B: Ollama (Local / Air-Gapped)
+### Option B: Ollama, bundled with the stack (no API key, no manual pull)
 
-For environments without internet access or to avoid API costs.
+For environments without internet access, or to avoid API costs. Nothing is installed on
+the host: `docker-compose.ollama.yml` adds an Ollama container and a one-shot job that
+downloads the model before any service that would ask for one starts.
 
-1. **Install Ollama** on the host machine: [ollama.com/download](https://ollama.com/download)
-
-2. **Pull required models:**
+Add the overlay to whichever compose command you already run — it layers onto the
+evaluation stack and the production pair alike:
 
 ```bash
-ollama pull llama3:latest     # General-purpose (used by planner/executor)
-ollama pull sqlcoder:latest   # SQL generation (used by Explorer)
-ollama pull mistral:7b        # Code generation (used by tool-generator)
+# evaluation
+docker compose -f docker-compose.yml -f docker-compose.ollama.yml up -d
+
+# production
+docker compose -f docker-compose.yml -f docker-compose.prod.yml -f docker-compose.ollama.yml \
+  --env-file .env.prod up -d
 ```
 
-3. **Configure** `llm-service/.env`:
+Then set the provider in `llm-service/.env`:
 
 ```env
 LLM_PROVIDER=ollama
-OLLAMA_URL=http://host.docker.internal:11434
-LLM_MODEL=llama3:latest
 ```
+
+That line is the only one that is yours to write. The overlay sets both address
+variables — `OLLAMA_URL` and the `OLLAMA_BASE_URL` the client reads first — on every
+service it extends, and a value in a compose `environment:` block beats one loaded from
+`env_file:`, so an address written here would be ignored while the overlay is in play.
+
+Leave `LLM_MODEL` unset for the default `qwen2.5:7b`, or set it to any model name Ollama
+can pull — the download job reads the same value the services do, so it cannot fetch one
+model and serve another. Budget several GB of disk and several minutes for the first
+start; the weights live in a named volume, so restarts reuse them.
+
+`install.sh` does all of this for you if you choose provider **2) Ollama** at the prompt.
+Sizing, GPU, timeouts and the external-server variants are in
+[Ollama deployment](ollama.md).
+
+**Pointing at an Ollama you already run** instead — on the host or elsewhere on the
+network — means giving `OLLAMA_URL` that address and pulling the models yourself. Do not
+add the overlay in that case; see [Ollama deployment](ollama.md) for which models each
+part of the stack asks for.
 
 ### Explorer Feature
 
@@ -1208,7 +1229,13 @@ The Explorer uses `LLM_PROVIDER` from `llm-service/.env`. Check:
    docker compose logs rsync-ai-llm-service | grep -i "azure\|deployment\|error"
    ```
 
-2. **Ollama (air-gapped)**: If `EXPLORER_OFFLINE_ONLY=true`, verify Ollama is running:
+2. **Ollama (air-gapped)**: If `EXPLORER_OFFLINE_ONLY=true`, verify the server is up and the
+   model is actually on it. With the bundled overlay:
+   ```bash
+   docker exec rsync-ollama ollama list
+   docker logs rsync-ollama-pull        # empty list ⇒ the one-shot pull job failed
+   ```
+   Pointing at your own Ollama instead:
    ```bash
    curl http://localhost:11434/api/tags
    ollama list

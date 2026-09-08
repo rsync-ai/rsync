@@ -87,6 +87,16 @@ GUARDS = [
     # were added to the `llm` filter in the same change, because a PR deleting the
     # adapter's dial retry touched nothing this job was gated on.
     "test_chart_waits_for_the_dependency_that_is_fatal_to_miss.py",
+    # Enrolled 2026-09-08 with the bundled-Ollama install. Its subjects are
+    # install.sh, docker-compose.ollama.yml and docker-compose.quickstart.yml,
+    # all three already covered -- by `install.sh` and by the `docker-compose*.yml`
+    # glob. Nothing in ci.yml had to change for it; it is listed for the reason
+    # every entry above gives, and it is the reason that made this pass: the
+    # guard was written, ran green, and a `--collect-only | grep` for its name
+    # returned NOTHING, because GUARDS is a hand-maintained literal and an
+    # absent guard produces zero cases -- indistinguishable in the log from a
+    # guard whose every subject is covered.
+    "test_the_internal_llm_needs_no_manual_step.py",
 ]
 
 

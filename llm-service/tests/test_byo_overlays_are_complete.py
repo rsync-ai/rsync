@@ -232,6 +232,11 @@ def test_installer_overlay_selection_survives_a_default_env(tmp_path):
     every standard install -- while the BYO paths this function exists for are
     the only ones that survive. Exactly inverted from what a smoke test would
     catch.
+
+    The bundled-LLM overlay is selected by the same function and is checked here
+    for the same reason, plus one of its own: unlike the two BYO overlays it is
+    layered on a POSITIVE condition, so getting it wrong starts an extra Ollama
+    and downloads several GB into it rather than merely leaving a service out.
     """
     body = []
     with open(INSTALL_SH) as fh:
@@ -252,7 +257,15 @@ def test_installer_overlay_selection_survives_a_default_env(tmp_path):
         'COMPOSE_FILE="docker-compose.quickstart.yml"\n'
         'BYO_PG_FILE="docker-compose.byo-postgres.yml"\n'
         'BYO_KAFKA_FILE="docker-compose.byo-kafka.yml"\n'
-        "COMPOSE_ARGS=(); COMPOSE_CMD=\"\"\ninfo(){ :; }\n"
+        + _install_sh_assignment("OLLAMA_FILE")
+        # The bundled-LLM branch reads both of these and runs under `set -u`.
+        # DETECTED_RAM_GB is pinned at the floor rather than read off this
+        # machine so the cases assert overlay SELECTION and never turn red on a
+        # small CI box -- the low-RAM warning is a warning, not a decision.
+        + f"MIN_RAM_GB_WITH_LLM={_install_sh_int('MIN_RAM_GB_WITH_LLM')}\n"
+        + f"DETECTED_RAM_GB={_install_sh_int('MIN_RAM_GB_WITH_LLM')}\n"
+        + "OLLAMA_BUNDLED=0\n"
+        + "COMPOSE_ARGS=(); COMPOSE_CMD=\"\"\ninfo(){ :; }\nwarn(){ :; }\n"
         # build_compose_args reads RSYNC_PROFILES, and this harness runs under
         # `set -u`, where an unset variable inside a pattern substitution aborts
         # on bash 5 while bash 3.2 quietly expands it to nothing. Lift the real
@@ -260,26 +273,59 @@ def test_installer_overlay_selection_survives_a_default_env(tmp_path):
         # installer's own default rather than an accident of the host's bash.
         + _install_sh_assignment("RSYNC_PROFILES")
         + "".join(body)
-        + '\nbuild_compose_args\necho "${COMPOSE_ARGS[*]}"\n'
+        + '\nbuild_compose_args\necho "${COMPOSE_ARGS[*]}"\necho "BUNDLED=${OLLAMA_BUNDLED}"\n'
     )
 
+    all_overlays = (
+        "docker-compose.byo-postgres.yml",
+        "docker-compose.byo-kafka.yml",
+        "docker-compose.ollama.yml",
+    )
     for label, env_body, expect in (
         ("default (neither key)", "POSTGRES_USER=rsync\n", []),
         ("explicit bundled", "POSTGRES_HOST=postgres\nKAFKA_BROKERS=kafka:29092\n", []),
         ("external postgres", "POSTGRES_HOST=db.example.com\n", ["docker-compose.byo-postgres.yml"]),
         ("external kafka", "KAFKA_BROKERS=b-1.example.com:9096\n", ["docker-compose.byo-kafka.yml"]),
         ("empty value", "POSTGRES_HOST=\n", []),
+        # What install.sh's own option 2 writes today.
+        (
+            "internal llm",
+            "LLM_PROVIDER=ollama\nOLLAMA_URL=http://ollama:11434\n",
+            ["docker-compose.ollama.yml"],
+        ),
+        # What every .env written before the overlay grew a pull job carries.
+        # Layering here would start a second, empty Ollama beside the
+        # operator's own and download several GB into it.
+        (
+            "host ollama",
+            "LLM_PROVIDER=ollama\nOLLAMA_URL=http://host.docker.internal:11434\n",
+            [],
+        ),
+        ("remote ollama", "LLM_PROVIDER=ollama\nOLLAMA_URL=http://203.0.113.10:11434\n", []),
+        # A hand-edited .env can leave the URL off entirely; the in-code default
+        # is the bundled service, so this is a bundled install.
+        ("llm provider, no url", "LLM_PROVIDER=ollama\n", ["docker-compose.ollama.yml"]),
+        ("openai", "LLM_PROVIDER=openai\nOLLAMA_URL=http://ollama:11434\n", []),
+        # The substring must not match a host that merely ends in the same
+        # characters -- `//ollama:` is the whole word, with its scheme separator.
+        ("lookalike host", "LLM_PROVIDER=ollama\nOLLAMA_URL=http://myollama:11434\n", []),
     ):
         (tmp_path / ".env").write_text(env_body)
         out = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
         assert out.returncode == 0, f"[{label}] build_compose_args exited {out.returncode}: {out.stderr}"
         got = out.stdout.split()
         assert "docker-compose.quickstart.yml" in " ".join(got), f"[{label}] base file dropped: {got}"
-        for overlay in ("docker-compose.byo-postgres.yml", "docker-compose.byo-kafka.yml"):
+        for overlay in all_overlays:
             layered = any(overlay in g for g in got)
             assert layered == (overlay in expect), (
                 f"[{label}] expected {overlay} layered={overlay in expect}, got {layered}: {got}"
             )
+        # start_stack prints the multi-gigabyte-download warning off this flag,
+        # so it has to track the -f list rather than merely correlate with it.
+        expect_bundled = "docker-compose.ollama.yml" in expect
+        assert f"BUNDLED={1 if expect_bundled else 0}" in got, (
+            f"[{label}] OLLAMA_BUNDLED disagrees with the overlay list: {got}"
+        )
 
 
 # The compose profiles the installer is expected NOT to activate, each with the

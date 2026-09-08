@@ -453,27 +453,30 @@ All providers are built by one factory —
 provider-specific code anywhere else. Four providers: `openai` · `azure` · `groq` · `ollama`,
 selected by `LLM_PROVIDER`.
 
-Resolution when `LLM_PROVIDER` is unset (`resolve_provider`, `:77-115`): Azure endpoint → `azure`,
+Resolution when `LLM_PROVIDER` is unset (`resolve_provider`, `:79-117`): Azure endpoint → `azure`,
 else `OPENAI_API_KEY` → `openai`, else `ollama`. `LLM_PROVIDER=openai` with no key **fails closed
-to `ollama`** (`:101-103`), and Groq is never auto-selected — it requires an explicit opt-in so a
+to `ollama`** (`:103-105`), and Groq is never auto-selected — it requires an explicit opt-in so a
 stray `GROQ_API_KEY` cannot silently route prompts to an undisclosed external LLM
-(`:98-99`, `:113-115`).
+(`:100-101`, `:115-117`).
 
 ### Model selection
 
-One rule, two levels (`get_default_model`, `:118-136`):
+One rule, two levels (`get_default_model`, `:120-138`):
 
 1. `LLM_MODEL` — overrides everything, for every provider. On Azure this is a **deployment name**.
 2. Otherwise the provider default: `gpt-4o-mini` (openai/azure), `llama-3.3-70b-versatile` (groq),
    `OLLAMA_MODEL` or `qwen2.5:7b` (ollama).
 
-Individual agents may override: `RSYNC_TOOL_GENERATOR_MODEL`, `RANK_TABLES_MODEL`, and the
-`EXPLORER_*_MODEL` family.
+Individual agents may override: `RANK_TABLES_MODEL` and the `EXPLORER_*_MODEL` family
+(`EXPLORER_TABLE_LINK_MODEL`, `EXPLORER_COLUMN_LINK_MODEL`, `EXPLORER_NEXT_STEPS_MODEL`,
+`EXPLORER_QUERY_SPEC_MODEL`, `EXPLORER_SQL_MODEL`, `EXPLORER_SQL_MODEL_MYSQL`,
+`EXPLORER_SQL_OPENAI_MODEL`, `EXPLORER_SQL_FALLBACK_MODELS`). tool-generator has no model
+variable of its own — it reads `LLM_MODEL` like every other agent.
 
 Two deliberate exceptions to "`LLM_MODEL` overrides everything", both in
 [openai_client.py](../../llm-service/src/utils/openai_client.py): the Explorer resolves through
-`explorer_default_model` (`:162`) / `explorer_default_sql_model` (`:185`), and `/agents/rank-tables`
-through `rank_tables_default_model` (`:197`) — which ignores `LLM_MODEL` on OpenAI on purpose, so a
+`explorer_default_model` (`:164`) / `explorer_default_sql_model` (`:198`), and `/agents/rank-tables`
+through `rank_tables_default_model` (`:210`) — which ignores `LLM_MODEL` on OpenAI on purpose, so a
 stack-wide upgrade to `gpt-4o` doesn't silently multiply the cost of a bulk metadata task. Set
 `RANK_TABLES_MODEL` to move it.
 
@@ -484,8 +487,9 @@ OPENAI_API_KEY=sk-xxx
 LLM_MODEL=gpt-4o-mini       # Azure: the deployment name
 ```
 
-> There is no `OPENAI_MODEL_PLANNING` or `OPENAI_MODEL_INTENT` variable — earlier revisions of this
-> doc invented both. Per-agent model selection uses the override names listed above.
+> There is no `OPENAI_MODEL_PLANNING`, `OPENAI_MODEL_INTENT` or `RSYNC_TOOL_GENERATOR_MODEL`
+> variable — earlier revisions of this doc invented all three. Per-agent model selection uses the
+> override names listed above, every one of which is read somewhere under `llm-service/src`.
 
 ### Ollama (Offline)
 
@@ -493,7 +497,10 @@ Used by the Explorer when `EXPLORER_OFFLINE_ONLY=true` (default **`false`**), an
 when `LLM_PROVIDER=ollama`.
 
 Offline defaults: `llama3:latest` (table/column linking), `sqlcoder:latest` (NL→SQL),
-`qwen2.5:7b` (general agents).
+`qwen2.5:7b` (general agents). These are the defaults the *code* falls back to, and they assume
+someone pulled three models. The bundled overlay `docker-compose.ollama.yml` pulls one and pins
+every one of those names to it, so nothing on that path asks for weights the volume does not
+hold.
 
 **Benefits**: no API costs · data privacy (on-premise) · works without internet.
 
@@ -507,6 +514,12 @@ LLM_PROVIDER=ollama
 OLLAMA_BASE_URL=http://ollama:11434   # /v1 is appended automatically
 OLLAMA_MODEL=qwen2.5:7b
 ```
+
+Add `-f docker-compose.ollama.yml` to the stack, or let `install.sh` do it, and only the first
+line above stays yours: the overlay starts an Ollama, downloads the model before any service that
+wants one boots, and sets the address and the model itself. It sets `OLLAMA_BASE_URL` and not just
+`OLLAMA_URL` on purpose — `docker-compose.yml` and `docker-compose.prod.yml` each hard-code
+`OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` on tool-generator, and that key wins.
 
 Full sizing and deployment options → [docs/deployment/ollama.md](../deployment/ollama.md).
 
@@ -618,10 +631,13 @@ curl http://localhost:5012/health
 # Enable debug logging
 export LOG_LEVEL=DEBUG
 
-# Check Ollama model
-ollama list
-ollama pull llama3
+# Check the model is actually on the server (bundled overlay)
+docker exec rsync-ollama ollama list
 ```
+
+If the list is empty the one-shot `ollama-pull` job failed; read its log with
+`docker logs rsync-ollama-pull`. Pointing at your own Ollama instead? Run `ollama list` against
+that host and pull the three models the offline defaults above name.
 
 ---
 

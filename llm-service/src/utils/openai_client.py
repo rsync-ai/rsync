@@ -169,6 +169,8 @@ def explorer_default_model(provider: str) -> str:
     *deployment* name, so a hardcoded "gpt-4o-mini" returns 404
     DeploymentNotFound unless a deployment happens to carry that name — the
     rest of the stack already runs on LLM_MODEL, so Explorer must too.
+
+    Offline, OLLAMA_MODEL wins instead: see the return below.
     """
     if provider in ("openai", "azure"):
         override = (os.getenv("LLM_MODEL") or "").strip()
@@ -181,7 +183,16 @@ def explorer_default_model(provider: str) -> str:
         return "gpt-4o-mini"
     if provider == "groq":
         return "llama-3.3-70b-versatile"
-    return "llama3:latest"
+    # Ollama, and the only branch here with no hosted catalog behind it: the name
+    # has to be a model the server has actually pulled, or the request comes back
+    # `model "..." not found, try pulling it first`. OLLAMA_MODEL is the name the
+    # bundled overlay downloads (docker-compose.ollama.yml) and the sibling
+    # explorer_default_sql_model below already reads, so an offline install that
+    # pulled one model now gets that model here too. Without this the Explorer
+    # chat was the one Ollama path that could not be pointed at the model on
+    # disk by any environment variable, and it asked for a llama3:latest nothing
+    # had downloaded — beside a /chat that worked.
+    return (os.getenv("OLLAMA_MODEL") or "llama3:latest").strip()
 
 
 def explorer_default_sql_model(provider: str) -> str:
