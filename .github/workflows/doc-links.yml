@@ -204,4 +204,5 @@ jobs:
             tests/test_changelog_versions_name_real_tags.py \
             tests/test_documented_shell_blocks_parse.py \
             tests/test_readme_connector_claims_match_the_catalogue.py \
-            tests/test_docs_do_not_call_built_connectors_unbuilt.py
+            tests/test_docs_do_not_call_built_connectors_unbuilt.py \
+            tests/test_no_bundled_observability_vendor.py

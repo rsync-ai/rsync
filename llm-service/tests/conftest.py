@@ -13,7 +13,7 @@ Nothing else belongs in this file. ``collect_ignore`` governs only paths pytest
 discovers for itself; a module named as a command-line ARGUMENT is collected
 regardless, and so is one that ``pytest_ignore_collect`` returns True for --
 measured both ways, see ``_cut_collection.py``. ``ci.yml`` passes directories so
-this mechanism reaches it, but ``doc-links.yml`` names its twelve doc guards as
+this mechanism reaches it, but ``doc-links.yml`` names its doc guards as
 files and this mechanism reaches none of them. A guard whose SUBJECT the cut
 removes calls ``skip_if_cut`` in its own module instead; that works under both
 invocation styles. This file previously carried a ``CAPABILITIES.md`` entry that

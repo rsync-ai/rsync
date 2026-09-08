@@ -59,7 +59,7 @@ service's own operational plumbing.
 | Absent | Why | Decided at |
 |---|---|---|
 | **Connector *generation*** (build a new connector from an OpenAPI/GraphQL spec) | the generator package is stripped from the image | `llm-service/oss-strip-list.txt` |
-| Monitoring UI (overview, infra) | needs an observability backend, and this repo ships none | `features.go:30-36` — default `false`; traces default on in dev |
+| Monitoring UI (overview, infra, traces) | needs an observability backend, and this repo ships none | `features.go:30-36` — overview and infra default `false`; traces defaults to `isDevelopment()`, which quickstart makes false by pinning `ENVIRONMENT=production` |
 | OpenTelemetry export | no `otel-collector` container in quickstart | `docker-compose.quickstart.yml` |
 | Log shipping (`fluent-bit`), Avro `schema-registry`, Temporal web UI + admin tools, MinIO lifecycle init, Docker socket proxy, connector FS init | hosted-only plumbing | 8 services quickstart omits, `otel-collector` included |
 | Internal connectors as pipeline endpoints (MinIO, Debezium, Kafka sink) | blocked by default in **both** editions; the hosted compose opts in with `RSYNC_ALLOW_INTERNAL_CONNECTORS=true` | `connections.go:56-60` |
