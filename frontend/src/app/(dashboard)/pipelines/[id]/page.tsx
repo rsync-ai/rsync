@@ -14,7 +14,6 @@ import { PipelineScheduleCreateDialogLauncher } from "@/components/pipeline/Pipe
 import { PipelineHeaderOverflowMenu } from "@/components/pipeline/PipelineHeaderOverflowMenu"
 import { PipelineCreateScheduleButton } from "@/components/pipeline/PipelineCreateScheduleButton"
 import { PipelineDetailTabsClient } from "@/components/pipeline/PipelineDetailTabsClient"
-import { SigNozButton } from "@/components/pipeline/SigNozButton"
 import { API_ENDPOINTS, API_GATEWAY_URL_INTERNAL } from "@/lib/config/api"
 import { cookies } from "next/headers"
 import { activeWorkspaceCookieHeader } from "@/lib/workspace/server-workspace"
@@ -186,7 +185,6 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
           {pipeline.type !== "cdc" && (
             <PipelineCreateScheduleButton pipelineId={pipeline.id} />
           )}
-          <SigNozButton pipelineId={pipeline.id} />
           <PipelineHeaderOverflowMenu
             pipelineId={pipeline.id}
             pipelineName={pipeline.name}

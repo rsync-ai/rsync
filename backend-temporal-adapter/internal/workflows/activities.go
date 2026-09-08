@@ -87,7 +87,7 @@ func StateUpdateActivity(ctx context.Context, update StateUpdateInput) error {
 
 // emitDomainEventActivity emits a domain event to Kafka
 func emitDomainEventActivity(ctx context.Context, event map[string]interface{}) error {
-	// Ensure every domain event carries a stable trace_id for correlation (SigNoz).
+	// Ensure every domain event carries a stable trace_id for correlation.
 	// We don't assume OTEL is configured in this binary yet, so we fall back to execution_id.
 	if event != nil {
 		if _, ok := event["trace_id"]; !ok {

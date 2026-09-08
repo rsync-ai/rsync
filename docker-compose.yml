@@ -72,9 +72,10 @@ services:
   # INFRASTRUCTURE
   # ============================================
   
-  # NOTE: SigNoz runs separately using official docker-compose
-  # See: https://signoz.io/docs/install/docker/
-  # Our services send traces to: http://localhost:4317 (OTel Collector)
+  # NOTE: this bundle ships an OTel Collector but no telemetry backend.
+  # Services export to otel-collector:4317; the collector forwards to whatever
+  # OTLP endpoint OTLP_BACKEND_ENDPOINT names. Leave it at the default and
+  # nothing is stored — the supported story here is `docker compose logs`.
 
   # Read-only Docker socket proxy. Lets api-gateway surface LIVE MCP container
   # status (docker_status=running, port) without mounting the raw socket or
@@ -900,7 +901,7 @@ services:
       - rsync-ai-mcp
     restart: unless-stopped
     # Ship the sink worker's (now structured-JSON) stdout/stderr to fluent-bit so
-    # the destination-write leg is visible + trace-correlated in SigNoz. Without
+    # the destination-write leg is visible + trace-correlated downstream. Without
     # this driver the sink is the one data-plane stage absent from the flow view. F-Obs-2.
     logging:
       driver: json-file
@@ -1145,7 +1146,7 @@ services:
       # Scheduler is deprecated (schedules are managed via API Gateway + Temporal).
       # Disable to avoid legacy DB queries against removed columns.
       ENABLE_SCHEDULER: "false"
-      # OpenTelemetry Configuration (points to external SigNoz)
+      # OpenTelemetry Configuration (exports to the bundled OTel Collector)
       OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
       OTEL_SERVICE_NAME: "orchestrator"
       OTEL_ENABLED: "true"
@@ -1301,23 +1302,16 @@ services:
       RESEND_API_KEY: "${RESEND_API_KEY:-}"
       RESEND_FROM_ADDR: "${RESEND_FROM_ADDR:-}"
       APP_BASE_URL: "${APP_BASE_URL:-http://localhost:3000}"
-      # OpenTelemetry Configuration (points to external SigNoz)
+      # OpenTelemetry Configuration (exports to the bundled OTel Collector)
       OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
       OTEL_SERVICE_NAME: "api-gateway"
       OTEL_ENABLED: "true"
       OTEL_TRACES_EXPORTER: "otlp"
       OTEL_METRICS_EXPORTER: "otlp"
-      # SigNoz log-enrichment read path (Phase 3b diagnose reads stalled-stage log lines
-      # from SigNoz's ClickHouse — signoz_logs.go). Empty ⇒ co-located default
-      # host.docker.internal:8123. Set to the SigNoz VM's ClickHouse HTTP URL
-      # (e.g. http://10.0.0.20:8123) when observability runs on a dedicated box.
-      SIGNOZ_CLICKHOUSE_HTTP_URL: "${SIGNOZ_CLICKHOUSE_HTTP_URL:-}"
       # Monitoring UI feature flags (V1)
       FEATURE_MONITORING_OVERVIEW: "true"
       FEATURE_MONITORING_INFRA: "true"
       FEATURE_MONITORING_TRACES: "true"
-      FEATURE_SIGNOZ_DEEPLINKS: "true"
-      SIGNOZ_UI_URL: "http://localhost:3301"
       # JIT Integration: Path to generated tools
       TOOLS_PATH: "/app/shared/mcp-connectors"
     depends_on:
@@ -1417,7 +1411,7 @@ services:
       # password supplied". Mirrors the api-gateway/orchestrator default; staging &
       # prod override DATABASE_URL via .env to point at Azure PostgreSQL.
       DATABASE_URL: ${DATABASE_URL:-postgres://user:password@postgres:5432/pipeline_db?sslmode=disable}
-      # OpenTelemetry Configuration (points to external SigNoz)
+      # OpenTelemetry Configuration (exports to the bundled OTel Collector)
       OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       OTEL_SERVICE_NAME: llm-service
       OTEL_ENABLED: "true"
@@ -1596,7 +1590,7 @@ services:
       # workaround is obsolete now that kafka-mcp-sink bridges into rsync-ai-mcp
       # (see its networks: block above).
       - DOCKER_NETWORK=${STACK_PREFIX:-rsync-ai}-mcp
-      # OpenTelemetry Configuration (points to external SigNoz)
+      # OpenTelemetry Configuration (exports to the bundled OTel Collector)
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=tool-generator
       - OTEL_ENABLED=true
@@ -1689,7 +1683,7 @@ services:
       KAFKA_USE_AVRO: "false"
       SCHEMA_REGISTRY_URL: "http://schema-registry:8080"
       AVRO_AUTO_REGISTER_SCHEMAS: "false"
-      # OpenTelemetry Configuration (points to external SigNoz)
+      # OpenTelemetry Configuration (exports to the bundled OTel Collector)
       OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
       OTEL_SERVICE_NAME: "planner"
       OTEL_ENABLED: "true"
@@ -1758,8 +1752,6 @@ services:
       - NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW=true
       - NEXT_PUBLIC_FEATURE_MONITORING_INFRA=true
       - NEXT_PUBLIC_FEATURE_MONITORING_TRACES=true
-      - NEXT_PUBLIC_FEATURE_SIGNOZ_DEEPLINKS=true
-      - NEXT_PUBLIC_SIGNOZ_UI_URL=http://localhost:3301
     depends_on:
       - api-gateway
       - fluent-bit
@@ -1804,10 +1796,10 @@ services:
   #
   # Trade-off, recorded rather than hidden: the fluentd driver carried a clean
   # `tag: <service>`, and the tail path tags by container-log PATH instead, so a
-  # deployment that does run SigNoz gets a less readable service label. Bounded
-  # disk on an unattended self-host box is the requirement that wins; SigNoz is
-  # not deployed on prod (measured: zero containers), so nothing is losing a
-  # label it was using.
+  # deployment that does forward to a backend gets a less readable service
+  # label. Bounded disk on an unattended self-host box is the requirement that
+  # wins, and no telemetry backend ships with this bundle, so nothing is losing
+  # a label it was using.
   fluent-bit:
     image: fluent/fluent-bit:2.2
     container_name: rsync-ai-fluent-bit
@@ -1835,11 +1827,11 @@ services:
     restart: unless-stopped
 
   # OpenTelemetry Collector for trace-log correlation
-  # Receives logs from fluent-bit and maps trace context for SigNoz
+  # Receives logs from fluent-bit and maps trace context for an OTLP backend
   otel-collector:
     # 0.111.0: OTTL `set(trace_id.string, ...)` reliably promotes parsed log
     # attributes into the typed LogRecord trace_id/span_id fields (no-op in 0.92).
-    # Required for SigNoz trace↔log correlation. F-Obs-2.
+    # Required for trace↔log correlation downstream. F-Obs-2.
     image: otel/opentelemetry-collector-contrib:0.111.0
     container_name: rsync-ai-otel-collector
     logging:
@@ -1849,16 +1841,17 @@ services:
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     command: ["--config=/etc/otel-collector-config.yaml"]
     environment:
-      # Where this collector ships all telemetry (logs/traces/metrics). Default =
-      # co-located SigNoz on the host (host.docker.internal:4317). Set SIGNOZ_OTLP_ENDPOINT
-      # in the root .env to a dedicated SigNoz host's OTLP endpoint (e.g. 10.0.0.20:4317)
-      # to run observability off-box. The collector config reads ${env:SIGNOZ_OTLP_ENDPOINT};
-      # this compose default guarantees it's never empty. OSS/dev keep the co-located default.
-      - SIGNOZ_OTLP_ENDPOINT=${SIGNOZ_OTLP_ENDPOINT:-host.docker.internal:4317}
+      # Where this collector ships all telemetry (logs/traces/metrics). No
+      # telemetry backend ships with this repo — point OTLP_BACKEND_ENDPOINT at
+      # one you run yourself (e.g. 10.0.0.20:4317) in the root .env. The
+      # collector config reads ${env:OTLP_BACKEND_ENDPOINT}; this compose default
+      # guarantees it is never empty, and with nothing listening on the host the
+      # exports simply fail and are dropped.
+      - OTLP_BACKEND_ENDPOINT=${OTLP_BACKEND_ENDPOINT:-host.docker.internal:4317}
     volumes:
       - ./deploy/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
     ports:
-      - "${RSYNC_HP_OTEL_GRPC:-14317}:4317"  # OTLP gRPC receiver (avoid conflict with SigNoz)
+      - "${RSYNC_HP_OTEL_GRPC:-14317}:4317"  # OTLP gRPC receiver (host-port shifted to avoid a collision)
       - "${RSYNC_HP_OTEL_HTTP:-14318}:4318"  # OTLP HTTP receiver  
       - "${RSYNC_HP_OTEL_FLUENTFWD:-8006}:8006"   # Fluentforward receiver
       - "${RSYNC_HP_OTEL_HEALTH:-13133}:13133" # Health check

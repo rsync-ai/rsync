@@ -179,8 +179,8 @@ func findMostRelevantPipeline(database *sql.DB, workspaceID string) (pipelineID,
 
 // buildDiagnosisResponse runs the RICH diagnosis for a pipeline: it gathers the
 // same evidence the on-call POST /pipelines/:id/diagnose endpoint uses (progress
-// + blocking reason, dependency health, latest execution error, sink write
-// errors, SigNoz logs, deterministic flow), asks llm-service for a root-cause
+// + blocking reason, dependency health, latest execution error, deterministic
+// flow), asks llm-service for a root-cause
 // hypothesis, AND runs the deterministic rule diagnoser as a fast, always-
 // available fallback. Works for failed AND live (running/stuck) pipelines.
 //
@@ -215,13 +215,6 @@ func (h *ChatHandler) buildDiagnosisResponse(
 			Timestamp: now,
 		}
 	}
-	if flow, ok := evidence["flow"].(map[string]interface{}); ok {
-		enrichFlowWithSigNozLogs(ctx, flow)
-	}
-	// Surface the real sink write error (missing PK / ON CONFLICT, etc.) when
-	// rows were read but none landed.
-	enrichEvidenceWithSinkErrors(ctx, pipelineID, evidence)
-
 	if pipelineName == "" {
 		pipelineName = evidenceStr(evidence, "pipeline", "name")
 	}

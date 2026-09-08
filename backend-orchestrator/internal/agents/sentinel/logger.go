@@ -21,7 +21,7 @@ type AuditLogger struct {
 	db           *sql.DB
 	config       *SentinelConfig
 
-	// Metrics for SigNoz
+	// OTLP metrics
 	meter              metric.Meter
 	issuesDetected     metric.Int64Counter
 	issuesResolved     metric.Int64Counter
@@ -65,8 +65,8 @@ func NewAuditLogger(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelCon
 		config:       config,
 	}
 
-	// Initialize OpenTelemetry metrics for SigNoz
-	if config.EnableSigNozExport {
+	// Initialize OpenTelemetry metrics
+	if config.EnableMetricsExport {
 		logger.initializeMetrics()
 	}
 
@@ -126,11 +126,11 @@ func (l *AuditLogger) initializeMetrics() {
 		log.WithError(err).Error("Failed to create consumer_lag metric")
 	}
 
-	log.Info("✅ Initialized SigNoz metrics for Sentinel")
+	log.Info("✅ Initialized OTLP metrics for Sentinel")
 }
 
 // RecordConsumerLag emits the current Kafka consumer lag for a (topic, group)
-// pair. Safe to call when SigNoz export is disabled — becomes a no-op.
+// pair. Safe to call when metrics export is disabled — becomes a no-op.
 //
 // Lag is the number of records produced to a partition that the consumer
 // group hasn't acknowledged yet. Sustained non-zero lag indicates a slow or
@@ -154,8 +154,8 @@ func (l *AuditLogger) RecordConsumerLag(ctx context.Context, topic, group string
 func (l *AuditLogger) Start(ctx context.Context) error {
 	l.ctx, l.cancel = context.WithCancel(ctx)
 
-	// Start metric export loop if SigNoz is enabled
-	if l.config.EnableSigNozExport {
+	// Start metric export loop if metrics export is enabled
+	if l.config.EnableMetricsExport {
 		go l.exportMetricsLoop()
 	}
 
@@ -219,7 +219,7 @@ const (
 	healingOutcomeFailure healingOutcome = "failure"
 )
 
-// classifyHealingResult is the single decision the audit level AND the SigNoz counters
+// classifyHealingResult is the single decision the audit level AND the OTLP counters
 // both key off, so the two cannot drift into disagreeing about what a skip is.
 func classifyHealingResult(result *HealingResult) healingOutcome {
 	switch {
@@ -243,7 +243,7 @@ func (l *AuditLogger) LogHealingResult(ctx context.Context, result *HealingResul
 	// This is the layer where "a skip is neither a success nor a failure" is actually
 	// kept or broken. Branching on !Success alone filed a DECLINED action at level
 	// "error" with the raw error text as the message — an on-call engineer reading the
-	// logs or SigNoz saw a repair that failed, for a repair that was never attempted.
+	// logs or metrics saw a repair that failed, for a repair that was never attempted.
 	// A skip is a warning: something is unhealthy and the healer has no path for it.
 	outcome := classifyHealingResult(result)
 
@@ -280,7 +280,7 @@ func (l *AuditLogger) LogHealingResult(ctx context.Context, result *HealingResul
 
 	// Record metrics. A skip increments NEITHER counter: sentinel.healing.success would
 	// count a repair that never happened, and sentinel.healing.failures would invent a
-	// failure out of an action the healer declined to attempt. Both make the SigNoz
+	// failure out of an action the healer declined to attempt. Both make the exported
 	// healing rate a fiction for any component with no restart path.
 	switch outcome {
 	case healingOutcomeSkipped:
@@ -441,7 +441,7 @@ func (l *AuditLogger) redactSensitiveData(data map[string]interface{}) map[strin
 	return redacted
 }
 
-// exportMetricsLoop periodically exports metrics to SigNoz
+// exportMetricsLoop periodically exports metrics over OTLP
 func (l *AuditLogger) exportMetricsLoop() {
 	ticker := time.NewTicker(l.config.MetricExportInterval)
 	defer ticker.Stop()
@@ -453,7 +453,7 @@ func (l *AuditLogger) exportMetricsLoop() {
 		case <-ticker.C:
 			// Metrics are automatically exported by the OpenTelemetry SDK
 			// This loop can be used for custom metric calculations if needed
-			log.Debug("📊 Metrics exported to SigNoz")
+			log.Debug("📊 Metrics exported")
 		}
 	}
 }

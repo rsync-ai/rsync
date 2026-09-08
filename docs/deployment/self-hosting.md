@@ -914,101 +914,68 @@ Notes:
 
 ## Monitoring (Optional)
 
-rsync-ai ships with OpenTelemetry instrumentation. For full observability, deploy [SigNoz](https://signoz.io/):
+rsync-ai ships OpenTelemetry instrumentation and an OTel Collector, but **no
+observability backend**. Out of the box, observability on a self-hosted stack is
+`docker compose logs`. If you want traces and metrics stored and searchable,
+bring your own OTLP-compatible backend and point the collector at it.
 
-### SigNoz Setup
+### Reading the logs
 
-> **Use the in-repo vendored config, NOT a vanilla upstream clone.** rsync-ai ships a
-> customized SigNoz stack under [`deploy/signoz/`](../../deploy/signoz/) with deviations the
-> platform depends on: UI on **3301** (host 8080 is Traefik's), ClickHouse HTTP exposed on
-> **8123** (api-gateway diagnose log-enrichment), and a **ClickHouse memory bound**. A
-> plain `git clone` of upstream SigNoz has none of these and will OOM its ClickHouse under
-> load (exit 137).
+Every service logs structured JSON to stdout (`LOG_FORMAT=json` in
+`docker-compose.prod.yml`), so the container logs are the primary diagnostic
+surface:
 
-SigNoz runs as a separate Docker Compose stack (project name `signoz`). Launch it with the
-guarded helper, which always runs from the main checkout so ClickHouse's bind-mounts stay
-stable (never launch it from a `.claude/worktrees/` path — a pruned worktree leaves dangling
-mounts that block ClickHouse from restarting after an OOM):
-
-```bash
-# From the rsync-ai repo root on the prod VM:
-scripts/signoz-up.sh                       # up -d (UI: http://<server-ip>:3301)
-scripts/signoz-up.sh status                # ps + ClickHouse ingest-lag check
-```
-
-Equivalent raw command (the script just resolves the main root and runs this):
-
-```bash
-docker compose -p signoz -f deploy/signoz/docker/docker-compose.yaml up -d
-```
-
-**Size ClickHouse to the VM.** The compose defaults to `mem_limit: 3g` (tuned for the
-staging Docker VM). On a larger prod VM, set it to ~40% of host RAM and keep the
-`max_server_memory_usage_to_ram_ratio=0.7` in
-[`deploy/signoz/common/clickhouse/config.xml`](../../deploy/signoz/common/clickhouse/config.xml):
-
-```bash
-CLICKHOUSE_MEM_LIMIT=8g scripts/signoz-up.sh    # e.g. on a ~20 GB VM
-```
-
-ClickHouse is `restart: unless-stopped`, so once launched from a stable path it self-heals
-after a crash. rsync-ai services are pre-configured to send traces and logs to the OTel
-Collector, which forwards to SigNoz.
-
-### SigNoz on a Linux prod VM — two mandatory first-time steps
-
-SigNoz was validated on the staging Mac (Docker Desktop). On a **native Linux prod VM**
-two things that "just work" on the Mac must be done explicitly the first time you bring
-SigNoz up. Skip either and **nothing ingests** — the UI stays empty with no obvious error.
-
-**1. Create the organization (first-run UI setup).** SigNoz's otel-collector fetches its
-pipeline config from the SigNoz server over OpAMP, and the server refuses to register the
-collector until an org exists. Symptom in `docker logs signoz`:
-`cannot create agent without orgId` (every 30s); the collector never starts its `4317`
-receiver, so `docker logs signoz-otel-collector` has **no** `Starting GRPC server ... 4317`
-line. Fix: tunnel to the UI and create the admin account.
-```bash
-# from your laptop (the UI must NOT be publicly exposed):
-ssh -L 3301:localhost:3301 <user>@<prod-vm>
-# then open http://localhost:3301 and create the admin email/password (creates the org)
-```
-
-**2. Wire the rsync-ai collector to SigNoz over the shared network.** On Linux the default
-`host.docker.internal:4317` exporter endpoint is refused (see the macOS-vs-Linux callout in
-[deploy/signoz/README.md](../../deploy/signoz/README.md)). Put the rsync-ai collector on
-`signoz-net` and target SigNoz's collector by container name:
 ```bash
 P="-f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod"
-# attach the app collector to SigNoz's network
-docker network connect signoz-net rsync-ai-otel-collector
-# point the exporter at the container name instead of host.docker.internal
-sed -i 's#host.docker.internal:4317#signoz-otel-collector:4317#' deploy/otel-collector-config.yaml
-docker compose $P restart otel-collector
+
+docker compose $P logs -f api-gateway              # follow one service
+docker compose $P logs --since 15m --tail 200      # recent activity, all services
+docker compose $P ps                               # what is up, and health state
 ```
 
-> **⚠️ The `docker network connect` is EPHEMERAL.** A future `docker compose up` (i.e. your
-> next core deploy, step 4 above) recreates `rsync-ai-otel-collector` and silently drops the
-> `signoz-net` attachment — breaking ingestion again. Until this is folded into compose
-> (declare `signoz-net` as an external network on the `otel-collector` service and set the
-> endpoint to `signoz-otel-collector:4317` in `deploy/otel-collector-config.yaml`), you must
-> **re-run the two commands above after every core redeploy**. The `sed` edit to
-> `deploy/otel-collector-config.yaml` also makes `git status` dirty — commit it or keep it as
-> a tracked deviation; do not leave it as an unexplained local change.
+Each line is a JSON object carrying `level`, `message`, `service`, `trace_id` and
+`span_id`, so `jq` filters work directly:
 
-### Verify Traces
+```bash
+# errors only, across the whole stack, in the last hour
+docker compose $P logs --no-log-prefix --since 1h \
+  | jq -rc 'select(.level=="error") | [.service, .message] | @tsv'
 
-0. Confirm the two steps above are done: `docker logs signoz-otel-collector --tail=20 | grep 4317`
-   should show `Starting GRPC server ... [::]:4317`, and `docker logs rsync-ai-otel-collector
-   --since 2m | grep refused` should be empty.
-1. Open SigNoz at `http://localhost:3301` (over the SSH tunnel)
-2. Go to **Services** — you should see `api-gateway`, `orchestrator`, `temporal-adapter`, etc.
-3. Go to **Logs** — verify structured JSON logs are flowing
-4. Sanity-check ingest freshness from the host (should be a few seconds; a value in the
-   billions means ZERO rows — i.e. nothing has ingested yet, re-check the two steps above):
-   ```bash
-   curl -s http://localhost:8123/ --data \
-     "SELECT dateDiff('second', toDateTime(max(timestamp)/1e9), now()) AS lag_s FROM signoz_logs.logs_v2"
-   ```
+# every log line belonging to one request, once you have its trace_id
+docker compose $P logs --no-log-prefix --since 1h \
+  | jq -rc 'select(.trace_id=="<trace-id>")'
+```
+
+Log volume is bounded — every service uses the `json-file` driver with
+`max-size` (default `10m`) and `max-file` (default `3`), tunable via
+`RSYNC_LOG_MAX_SIZE` and `RSYNC_LOG_MAX_FILE`. That caps worst-case disk at
+roughly `max-size × max-file` per container, so an unattended box cannot fill
+its disk with logs.
+
+### Attaching your own OTLP backend
+
+The stack already runs an OTel Collector that receives traces and metrics over
+OTLP, receives logs from fluent-bit, correlates them, and forwards everything to
+a single OTLP endpoint. That endpoint is `OTLP_BACKEND_ENDPOINT`, and nothing
+listens on its default, so exports fail and are dropped until you set it:
+
+```bash
+# in .env.prod — your backend's OTLP gRPC endpoint
+OTLP_BACKEND_ENDPOINT=10.0.0.20:4317
+```
+
+```bash
+docker compose $P up -d otel-collector
+```
+
+If your backend runs as a container on the same host rather than on a separate
+box, attach the collector to that backend's network and target it by container
+name instead of an address — a `docker compose up` recreates the collector and
+drops any `docker network connect` made by hand, so declare the network in
+compose rather than attaching it manually.
+
+The collector's pipelines, processors and the exact trace↔log correlation
+behaviour are documented in [deploy/TELEMETRY.md](../../deploy/TELEMETRY.md).
 
 ---
 

@@ -12,7 +12,7 @@
 //
 // NO labels include free-form user input (pipeline_id, run_id, workflow
 // run id, connection_id). Those would explode series memory. Per-run
-// drill-down lives in traces/logs in SigNoz, correlated by trace id.
+// drill-down lives in the traces/logs themselves, correlated by trace id.
 //
 // F-Obs-2 (Obs-TemporalAdapter).
 package metrics

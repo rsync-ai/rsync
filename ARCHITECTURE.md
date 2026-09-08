@@ -43,7 +43,7 @@ User → Frontend (Next.js)
      → Kafka Connect + Debezium    CDC streaming infrastructure
 Data: Postgres (system of record + event store) · Redis (ephemeral/cache) · MinIO (claim-check staging)
 AI:   Planner (Python) · LLM Service / Tool Generator (Python) · Context7 MCP
-Obs:  OpenTelemetry → SigNoz, trace_id carried end-to-end
+Obs:  OpenTelemetry → OTLP collector → your backend, trace_id carried end-to-end
 ```
 
 Full Mermaid diagram + the draft-first sequence diagram: [`docs/architecture/overview.md`](docs/architecture/overview.md).
@@ -64,7 +64,7 @@ Full Mermaid diagram + the draft-first sequence diagram: [`docs/architecture/ove
 | **System of record** | **PostgreSQL** | Pipelines, executions, ownership, and the `pipeline_run_events` event store. One relational store for state + replay; managed (Azure Flexible Server) in production for backups/PITR with no DBA. |
 | **Ephemeral state** | **Redis** | Fast coordination, caching, short-lived state. |
 | **Large-payload staging** | **MinIO (S3-compatible)** | Claim-check pattern — batch chunks land in object storage and Kafka carries a reference, keeping the bus lean. |
-| **Observability** | **OpenTelemetry → SigNoz** | `trace_id` propagated through every event and service boundary for end-to-end correlation (UI → logs → traces). |
+| **Observability** | **OpenTelemetry (OTLP)** | `trace_id` propagated through every event and service boundary for end-to-end correlation (UI → logs → traces). Vendor-neutral by design: the bundled collector forwards to whichever OTLP backend you point it at, and no backend ships with this repo — see [`deploy/TELEMETRY.md`](deploy/TELEMETRY.md). |
 | **Reverse proxy / TLS** | **Traefik** | Single public entrypoint, automatic Let's Encrypt certs (DNS challenge via Cloudflare), routes `/api`→gateway, `/ws`→websocket, everything else→frontend. |
 
 ---

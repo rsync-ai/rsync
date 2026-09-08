@@ -3,8 +3,7 @@
 import { useEffect, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Badge } from "@/components/ui/badge"
-import { Button } from "@/components/ui/button"
-import { ExternalLink, AlertTriangle, CheckCircle2, XCircle, TrendingUp } from "lucide-react"
+import { AlertTriangle, CheckCircle2, XCircle, TrendingUp } from "lucide-react"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
 
@@ -49,11 +48,6 @@ type MonitoringOverview = {
   }
   infrastructure_error?: string
   correlations?: Correlation[]
-  links: {
-    signoz_trace?: string
-    signoz_metrics?: string
-    signoz_dashboard?: string
-  }
 }
 
 type Correlation = {
@@ -237,38 +231,6 @@ export function MonitoringOverviewTab({ pipelineId }: { pipelineId: string }) {
         </Card>
 
       </div>
-
-      {/* SigNoz deep links */}
-      {(overview.links.signoz_trace || overview.links.signoz_dashboard) && (
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm font-medium">Deep Dive</CardTitle>
-            <CardDescription className="text-xs">
-              Explore detailed traces in SigNoz
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <div className="flex flex-wrap gap-2">
-              {overview.links.signoz_trace && (
-                <Button variant="outline" size="sm" asChild>
-                  <a href={overview.links.signoz_trace} target="_blank" rel="noopener noreferrer">
-                    <ExternalLink className="h-3 w-3 mr-2" />
-                    View Trace
-                  </a>
-                </Button>
-              )}
-              {overview.links.signoz_dashboard && (
-                <Button variant="outline" size="sm" asChild>
-                  <a href={overview.links.signoz_dashboard} target="_blank" rel="noopener noreferrer">
-                    <ExternalLink className="h-3 w-3 mr-2" />
-                    SigNoz Dashboard
-                  </a>
-                </Button>
-              )}
-            </div>
-          </CardContent>
-        </Card>
-      )}
     </div>
   )
 }

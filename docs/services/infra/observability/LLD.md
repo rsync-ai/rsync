@@ -18,11 +18,11 @@ OTel Collector:
 1) services log JSON
 2) docker logging driver sends logs to Fluent Bit (fluentd)
 3) Fluent Bit forwards to OTel Collector
-4) OTel Collector exports to backend (SigNoz) and keeps trace context
+4) OTel Collector exports to the configured OTLP backend and keeps trace context
 
 ### Metrics Pipeline
 Source: `deploy/otel-collector-config.yaml` (a `prometheus` receiver feeding the
-existing `otlp/signoz` metrics pipeline — `receivers: [otlp, prometheus]`).
+existing `otlp/backend` metrics pipeline — `receivers: [otlp, prometheus]`).
 
 Six scrape jobs (15s), all on the internal docker network — no host exposure needed:
 
@@ -36,7 +36,8 @@ Six scrape jobs (15s), all on the internal docker network — no host exposure n
 | `rsync-llm-planner` | `planner:5011` | `/prometheus` | #102 |
 
 Flow: each service exposes a pull-only Prometheus endpoint → OTel Collector
-`prometheus` receiver scrapes it → forwarded over OTLP to SigNoz. Counters only
+`prometheus` receiver scrapes it → forwarded over OTLP to the configured
+backend. Counters only
 emit a series after their first increment (e.g. `rsync_pipeline_runs_total`
 appears after the first pipeline run).
 
@@ -47,7 +48,8 @@ Implementation entry points:
 - Python: `llm-service/src/utils/metrics.py` (`prometheus_client` collectors +
   `instrument_openai_client` + `mount_metrics(app)` → `/prometheus`).
 
-Importable SigNoz assets (dashboard + threshold alerts) live in `deploy/signoz/`
-(see `deploy/signoz/README.md`).
+Dashboards and alert thresholds are backend-specific, and this repo ships no
+observability backend, so none are included. `deploy/TELEMETRY.md` covers
+attaching your own and what the metric names are.
 
 

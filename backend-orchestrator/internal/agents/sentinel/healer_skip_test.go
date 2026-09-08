@@ -271,7 +271,7 @@ func TestRestartConsumerStillHasNoMCPBranch(t *testing.T) {
 	}
 }
 
-// The metric half of the same claim. The SigNoz counters are OpenTelemetry instruments;
+// The metric half of the same claim. The counters are OpenTelemetry instruments;
 // asserting on the points they emit needs go.opentelemetry.io/otel/sdk/metric, which this
 // module does not require, so the branch is pinned where it is decided instead:
 // LogHealingResult reads `outcome := classifyHealingResult(result)` ONCE and switches on
@@ -283,7 +283,7 @@ func TestClassifyHealingResultSeparatesADeclineFromAFailure(t *testing.T) {
 		name    string
 		result  HealingResult
 		want    healingOutcome
-		counter string // the SigNoz counter this outcome increments, "" for none
+		counter string // the counter this outcome increments, "" for none
 	}{
 		{
 			name:    "declined: neither counter moves",

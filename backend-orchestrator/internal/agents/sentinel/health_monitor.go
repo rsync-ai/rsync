@@ -357,7 +357,7 @@ func (h *HealthMonitor) checkKafkaConsumerLag() {
 		// groups there's only one entry but iterating is cheap and robust.
 		topicLag := lag[topic]
 
-		// Always emit the OTel gauge — including zero lag — so SigNoz can
+		// Always emit the OTel gauge — including zero lag — so a backend can
 		// distinguish "consumer healthy at zero" from "consumer not reporting".
 		if h.logger != nil {
 			h.logger.RecordConsumerLag(ctx, topic, topicGroup, topicLag)

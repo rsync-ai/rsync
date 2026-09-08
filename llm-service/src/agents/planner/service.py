@@ -93,7 +93,7 @@ app = FastAPI(
 # Instrument FastAPI with OpenTelemetry
 instrument_fastapi(app)
 
-# Prometheus metrics endpoint (/prometheus) — scraped by OTEL Collector → SigNoz. F-Obs-2.
+# Prometheus metrics endpoint (/prometheus) — scraped by the OTEL Collector. F-Obs-2.
 from src.utils.metrics import mount_metrics  # noqa: E402
 mount_metrics(app)
 
@@ -146,7 +146,7 @@ async def safety_middleware(request: Request, call_next):
                     content={"error": "request_too_large", "message": "Request body exceeds limit"},
                 )
 
-        # Bind pipeline/execution ids so all logs for this request correlate by pipeline in SigNoz.
+        # Bind pipeline/execution ids so all logs for this request correlate by pipeline.
         pid, eid = ids_from_carrier(request.headers, body)
         ctx_tokens = bind_log_context(pid, eid) if (pid or eid) else None
 

@@ -182,7 +182,7 @@ func (b *KafkaBridge) processMessage(topic string, msg kafka.Message) {
 
 	// Determine trace ID for WebSocket events:
 	// - Prefer real W3C trace context when present (traceparent/tracestate).
-	// - Otherwise, use the explicit trace_id header (stable correlation id for SigNoz/logs).
+	// - Otherwise, use the explicit trace_id header (stable correlation id for traces/logs).
 	// - Finally, fall back to the new span's trace ID.
 	traceID := span.SpanContext().TraceID().String()
 	hasW3C := carrier["traceparent"] != "" || carrier["tracestate"] != ""

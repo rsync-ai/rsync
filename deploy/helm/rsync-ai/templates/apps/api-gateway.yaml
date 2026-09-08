@@ -155,8 +155,6 @@ spec:
             # Cloudflare in front lets a client spoof its own rate-limit key.
             - name: RSYNC_TRUST_CLOUDFLARE
               value: {{ .Values.apiGateway.trustCloudflare | quote }}
-            - name: SIGNOZ_LOGS_ENRICH
-              value: "false"
             - name: RSYNC_ADMIN_EMAILS
               value: {{ .Values.apiGateway.adminEmails | quote }}
             - name: FRONTEND_URL

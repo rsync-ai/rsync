@@ -232,24 +232,6 @@ maintenance. See [docs/architecture/kafka-topics.md](../docs/architecture/kafka-
 
 ---
 
-### 📡 setup_signoz.sh
-**Observability setup (optional)**
-
-```bash
-./scripts/setup_signoz.sh
-```
-
-**What it does:**
-- Installs SigNoz for observability
-- Sets up tracing
-- Configures metrics
-
-**When to use:**
-- Production deployments
-- Advanced monitoring needed
-
----
-
 ## 🎯 Common Workflows
 
 ### First Time Setup

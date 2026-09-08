@@ -10,8 +10,8 @@ the full export timeout each time. ``init_metrics`` in the telemetry agent had t
 identical shape with a reader that wakes every 10 seconds.
 
 Both are now gated on ``otel_enabled()``. The default is ENABLED, matching cloud,
-which runs SigNoz; only ``docker-compose.quickstart.yml`` turns it off, because
-that bundle ships no collector and its observability story is ``docker logs``.
+which runs a collector; only ``docker-compose.quickstart.yml`` turns it off,
+because that bundle ships none and its observability story is ``docker logs``.
 
 Every assertion here is two-sided on purpose: a gate that disables export
 unconditionally would fix the retry loop and silently break cloud tracing, and a

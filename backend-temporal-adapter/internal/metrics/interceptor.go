@@ -10,7 +10,7 @@
 // workflow.IsReplaying(ctx) is false — otherwise every replay would
 // double-count. We deliberately do NOT measure workflow duration here
 // (wall-clock in workflow code is non-deterministic); duration lives in
-// activity metrics and in SigNoz traces.
+// activity metrics and in traces.
 //
 // F-Obs-2 (Obs-TemporalAdapter).
 package metrics

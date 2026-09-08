@@ -219,7 +219,7 @@ func setupLogging(cfg *config.Config) {
 	// Add service field hook
 	log.AddHook(&ServiceFieldHook{ServiceName: cfg.Telemetry.ServiceName})
 
-	// Add trace context hook for log-trace correlation in SigNoz
+	// Add trace context hook for log-trace correlation downstream
 	log.AddHook(telemetry.NewTraceContextHook())
 
 	log.Info("✅ Logging initialized with TraceContext hook (log-trace correlation enabled)")

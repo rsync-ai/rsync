@@ -20,8 +20,8 @@ from src.utils.openai_client import env_bool
 # trace_id correlates a log to a single request span; pipeline_id/execution_id
 # correlate it to the *pipeline run* it belongs to. The Go data-plane services
 # already emit pipeline_id on their logs — these ContextVars let the Python
-# services (planner / tool-generator) do the same so SigNoz can filter every
-# service's logs by pipeline. Bound per-request by each service's HTTP middleware.
+# services (planner / tool-generator) do the same so a log backend can filter
+# every service's logs by pipeline. Bound per-request by each service's HTTP middleware.
 # =============================================================================
 _pipeline_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("pipeline_id", default="")
 _execution_id_var: contextvars.ContextVar[str] = contextvars.ContextVar("execution_id", default="")
@@ -83,7 +83,7 @@ from opentelemetry.instrumentation.requests import RequestsInstrumentor
 class TraceContextFilter(logging.Filter):
     """
     Logging filter that injects OpenTelemetry trace_id and span_id into log records.
-    This enables log-trace correlation in SigNoz.
+    This enables log-trace correlation in whatever backend receives them.
     """
     
     def filter(self, record):
@@ -109,7 +109,7 @@ class TraceContextFilter(logging.Filter):
 
 class JSONFormatter(logging.Formatter):
     """
-    JSON log formatter with trace context for SigNoz log ingestion.
+    JSON log formatter with trace context for structured log ingestion.
     Outputs logs in a structured JSON format that fluent-bit can parse.
     """
     
@@ -164,7 +164,7 @@ class JSONFormatter(logging.Formatter):
 
 def setup_logging(service_name: str, log_level: str = None):
     """
-    Setup logging with trace context injection for SigNoz correlation.
+    Setup logging with trace context injection for log-trace correlation.
     
     Args:
         service_name: Name of the service (e.g., "tool-generator", "planner")
@@ -230,11 +230,10 @@ def otel_enabled() -> bool:
     no connection, so it never raises, and the service logs the green
     "OpenTelemetry initialized" line while nothing is listening.
 
-    Cloud runs SigNoz, so the default is enabled -- the cloud behaviour, per the
-    OSS/cloud split rule in CLAUDE.md. Only docker-compose.quickstart.yml turns it
-    off, because that bundle ships no collector and its observability story is
-    ``docker logs``. This is the same shape as the SIGNOZ_LOGS_ENRICH flag that
-    file already sets.
+    Cloud runs a collector and a backend behind it, so the default is enabled --
+    the cloud behaviour, per the OSS/cloud split rule in CLAUDE.md. Only
+    docker-compose.quickstart.yml turns it off, because that bundle ships no
+    collector and its observability story is ``docker logs``.
     """
     return env_bool("OTEL_ENABLED", True)
 

@@ -32,7 +32,7 @@ import (
 
 // captureLogStderr runs fn with os.Stderr redirected to a pipe and returns the
 // raw text it wrote. Raw (not decoded) because the privacy assertion below has to
-// search the bytes that would reach SigNoz, not a field the decoder picked out.
+// search the bytes that would reach the log backend, not a field the decoder picked out.
 func captureLogStderr(t *testing.T, fn func()) string {
 	t.Helper()
 

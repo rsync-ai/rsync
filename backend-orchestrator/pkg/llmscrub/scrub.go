@@ -75,7 +75,7 @@ var (
 	// ("Duplicate entry 'x' for key 'y'"); identifiers occasionally caught here
 	// are an accepted loss (fail-closed). The trailing `(?:'|$)` also covers a
 	// literal left OPEN by upstream truncation: log pipelines cut the text before
-	// we scrub (e.g. SigNoz substring(body,1,2000)), so the closing quote may be
+	// we scrub (e.g. a backend's substring(body,1,2000)), so the closing quote may be
 	// gone.
 	//
 	// The leading `(^|[^A-Za-z0-9_])` is what makes this safe on prose. A SQL

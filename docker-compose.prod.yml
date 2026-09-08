@@ -500,8 +500,6 @@ services:
       - FEATURE_MONITORING_OVERVIEW=true
       - FEATURE_MONITORING_INFRA=true
       - FEATURE_MONITORING_TRACES=true
-      - FEATURE_SIGNOZ_DEEPLINKS=true
-      - SIGNOZ_UI_URL=${SIGNOZ_UI_URL:-http://localhost:3301}
       - TOOLS_PATH=/app/shared/mcp-connectors
       # Used by admin invitation creation to generate signup URLs.
       - FRONTEND_URL=${FRONTEND_URL:-https://${DOMAIN}}
@@ -864,8 +862,6 @@ services:
         NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW: "true"
         NEXT_PUBLIC_FEATURE_MONITORING_INFRA: "true"
         NEXT_PUBLIC_FEATURE_MONITORING_TRACES: "true"
-        NEXT_PUBLIC_FEATURE_SIGNOZ_DEEPLINKS: "true"
-        NEXT_PUBLIC_SIGNOZ_UI_URL: ${SIGNOZ_UI_URL:-}
         NEXT_PUBLIC_OTEL_ENDPOINT: ${NEXT_PUBLIC_OTEL_ENDPOINT:-}
         NEXT_PUBLIC_OTEL_SERVICE_NAME: "frontend"
     environment:
@@ -884,8 +880,6 @@ services:
       - NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW=true
       - NEXT_PUBLIC_FEATURE_MONITORING_INFRA=true
       - NEXT_PUBLIC_FEATURE_MONITORING_TRACES=true
-      - NEXT_PUBLIC_FEATURE_SIGNOZ_DEEPLINKS=true
-      - NEXT_PUBLIC_SIGNOZ_UI_URL=${SIGNOZ_UI_URL:-http://localhost:3301}
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.frontend.rule=Host(`${DOMAIN}`)"
