@@ -31,6 +31,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/rsync-ai/backend-orchestrator/pkg/llmjson"
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 	log "github.com/sirupsen/logrus"
 )
@@ -204,7 +205,7 @@ func (d *LLMDiagnoser) diagnoseLLM(signal Signal) (Diagnosis, error) {
 	}
 
 	var parsed llmDiagnosisResponse
-	if err := json.Unmarshal([]byte(llmResp.Choices[0].Message.Content), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(llmjson.ExtractObject(llmResp.Choices[0].Message.Content)), &parsed); err != nil {
 		return Diagnosis{}, fmt.Errorf("failed to parse LLM diagnosis: %w", err)
 	}
 

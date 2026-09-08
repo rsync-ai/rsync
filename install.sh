@@ -354,8 +354,8 @@ prompt_env() {
   if (( ! TTY_OK )); then
     warn "No terminal available — running non-interactively."
     echo "  Values come from the environment; anything unset takes its default."
-    echo "  Recognised: OPENAI_API_KEY, LLM_PROVIDER, LLM_MODEL, OLLAMA_URL,"
-    echo "              PUBLIC_HOST, ADMIN_EMAIL, RSYNC_VERSION"
+    echo "  Recognised: OPENAI_API_KEY, OPENAI_BASE_URL, LLM_PROVIDER, LLM_MODEL,"
+    echo "              OLLAMA_URL, PUBLIC_HOST, ADMIN_EMAIL, RSYNC_VERSION"
     echo ""
   fi
 
@@ -392,6 +392,9 @@ prompt_env() {
     # overlay only when it names the bundle.
     OLLAMA_URL="${OLLAMA_URL:-http://ollama:11434}"
     OPENAI_API_KEY=""
+    # Ollama is addressed by OLLAMA_URL; carrying an OpenAI-compatible base URL
+    # into an offline install would only be a live pointer at a cloud endpoint.
+    OPENAI_BASE_URL=""
     info "Using local Ollama at ${OLLAMA_URL} (model ${LLM_MODEL})."
     # Conditional, because it is only true of an Ollama this script does not
     # start. On the bundled path the overlay's ollama-pull job downloads the
@@ -422,6 +425,11 @@ prompt_env() {
     LLM_PROVIDER="openai"
     LLM_MODEL="${LLM_MODEL:-gpt-4o}"
     OLLAMA_URL="${OLLAMA_URL:-http://host.docker.internal:11434}"
+    # "openai" here names the wire protocol, not the vendor. Vertex AI, Azure,
+    # Groq, OpenRouter, Together and vLLM all serve it, and OPENAI_BASE_URL is
+    # what points at one of them. Carried through to the generated .env below;
+    # empty means api.openai.com, which is the client's own default.
+    OPENAI_BASE_URL="${OPENAI_BASE_URL:-}"
     if [[ -z "${OPENAI_API_KEY:-}" ]]; then
       if (( ! TTY_OK )); then
         error "OpenAI was selected but OPENAI_API_KEY is not set, and there is no"
@@ -435,19 +443,39 @@ prompt_env() {
       # the operator pressing Enter. An unbounded `while true` over that turns a
       # closed stdin into an infinite loop printing the same error forever, on the
       # one prompt most likely to be reached by a piped `curl | bash`.
+      # The sk- shape belongs to OpenAI and to nobody else. When OPENAI_BASE_URL
+      # points at another OpenAI-compatible endpoint the key is that vendor's
+      # (Groq's gsk_, an OpenRouter sk-or-, a Vertex OAuth token), so demanding
+      # sk- there would reject every key that could possibly work.
+      local key_prompt="  OpenAI API Key (sk-...): "
+      local require_sk=1
+      if [[ -n "${OPENAI_BASE_URL:-}" ]]; then
+        key_prompt="  API key for ${OPENAI_BASE_URL}: "
+        require_sk=0
+      fi
       local key_tries=0
       while true; do
-        ask OPENAI_API_KEY "  OpenAI API Key (sk-...): "
-        if [[ "$OPENAI_API_KEY" == sk-* ]]; then break; fi
+        ask OPENAI_API_KEY "$key_prompt"
+        local key_ok=0
+        if (( require_sk )); then
+          if [[ "$OPENAI_API_KEY" == sk-* ]]; then key_ok=1; fi
+        else
+          if [[ -n "$OPENAI_API_KEY" ]]; then key_ok=1; fi
+        fi
+        if (( key_ok )); then break; fi
         key_tries=$(( key_tries + 1 ))
         if (( key_tries >= 3 )); then
-          error "  No usable OpenAI key after 3 attempts."
+          error "  No usable API key after 3 attempts."
           echo "    Pass one non-interactively, or install with no key at all:" >&2
           echo "      curl -sSL <url> | OPENAI_API_KEY=sk-... bash" >&2
           echo "      curl -sSL <url> | LLM_PROVIDER=ollama bash   # fully offline" >&2
           exit 1
         fi
-        error "  Must start with 'sk-'. Get yours at https://platform.openai.com/api-keys"
+        if (( require_sk )); then
+          error "  Must start with 'sk-'. Get yours at https://platform.openai.com/api-keys"
+        else
+          error "  Empty key. Enter the key ${OPENAI_BASE_URL} expects."
+        fi
       done
     else
       info "OPENAI_API_KEY already set in environment"
@@ -591,6 +619,11 @@ RSYNC_ADMIN_EMAILS=${ADMIN_EMAIL}
 LLM_PROVIDER=${LLM_PROVIDER}
 LLM_MODEL=${LLM_MODEL}
 OLLAMA_URL=${OLLAMA_URL}
+# Any OpenAI-compatible endpoint: Vertex AI, Azure OpenAI, Groq, OpenRouter,
+# Together, a local vLLM. Empty = OpenAI's own api.openai.com. LLM_PROVIDER stays
+# "openai" for all of them — it names the wire protocol, not the vendor — and
+# LLM_MODEL must then be a name that endpoint's catalog actually has.
+OPENAI_BASE_URL=${OPENAI_BASE_URL}
 
 # ── Object Storage (internal MinIO) ───────────────────────────────────────────
 MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}

@@ -8,6 +8,11 @@ try:
 except Exception:  # pragma: no cover
     redis = None
 
+# env_bool, not a local copy: the naive form reads compose's empty ${VAR:-} as
+# False and silently flips every default-True flag. That bug was fixed once, in
+# openai_client; this module carried the unfixed copy.
+from src.utils.openai_client import env_bool as _env_bool
+
 logger = logging.getLogger("ratelimit")
 
 
@@ -19,11 +24,6 @@ def _env_int(name: str, default: int) -> int:
         return int(raw)
     except Exception:
         return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    v = (os.getenv(name, "true" if default else "false") or "").strip().lower()
-    return v in ("1", "true", "yes", "y", "on")
 
 
 def _default_redis_url() -> Optional[str]:
@@ -39,6 +39,23 @@ def _default_redis_url() -> Optional[str]:
     if password:
         return f"redis://:{password}@{host}:{port}/{db}"
     return f"redis://{host}:{port}/{db}"
+
+
+def _redis_target_for_logs() -> str:
+    """Where we are pointing, with no credential in it.
+
+    ``_default_redis_url`` embeds REDIS_PASSWORD, and the startup line used to
+    log that URL verbatim at INFO — putting the Redis password into container
+    logs, log shipping, and any bug report that pastes them.
+    """
+    url = (os.getenv("REDIS_URL") or "").strip()
+    if url:
+        # A caller-supplied URL may carry user:pass@; keep only what follows.
+        return url.rsplit("@", 1)[-1] if "@" in url else url
+    host = (os.getenv("REDIS_HOST") or "").strip() or "redis"
+    port = (os.getenv("REDIS_PORT") or "").strip() or "6379"
+    db = (os.getenv("REDIS_DB") or "").strip() or "0"
+    return f"{host}:{port}/{db}"
 
 
 class FixedWindowLimiter:
@@ -68,10 +85,32 @@ class InMemoryFixedWindowLimiter(FixedWindowLimiter):
 
 
 class RedisFixedWindowLimiter(FixedWindowLimiter):
+    """Shared-window limiter backed by Redis, degrading to in-memory on failure.
+
+    ``redis.from_url`` connects lazily, so an unreachable or password-protected
+    Redis raises nothing at construction — ``get_limiter`` logged
+    "Rate limiting enabled (Redis)" and the first real failure arrived at the
+    first request. This class used to re-raise it, and every call site wraps
+    ``hit`` in ``except Exception`` and fails *open*, so the outcome was: no rate
+    limiting at all, one warning line per request, and a startup log claiming
+    the opposite. That is the difference between "the limiter degraded" and
+    "the limiter is not running", and only the second one was true.
+
+    ``get_limiter`` already documents the intended behaviour — fall back to
+    in-memory when Redis is unavailable. It just could not happen at
+    construction time. It happens here instead, at the first point the failure
+    is observable, and the warning is logged once rather than per request.
+    """
+
     def __init__(self, client: "redis.Redis") -> None:
         self._redis = client
+        self._fallback = InMemoryFixedWindowLimiter()
+        self._degraded = False
 
     async def hit(self, key: str, limit: int, window_seconds: int) -> Tuple[bool, int]:
+        if self._degraded:
+            return await self._fallback.hit(key, limit, window_seconds)
+
         now = int(time.time())
         window_id = now // window_seconds
         # Keep key stable per window
@@ -89,9 +128,17 @@ class RedisFixedWindowLimiter(FixedWindowLimiter):
                 ttl = window_seconds
             allowed = int(count) <= int(limit)
             return allowed, int(ttl if ttl is not None else window_seconds)
-        except Exception as e:  # pragma: no cover
-            # Fail open to in-memory behavior at caller level
-            raise e
+        except Exception as e:
+            self._degraded = True
+            logger.warning(
+                "Redis rate limiter unreachable at %s (%s: %s); degrading to "
+                "in-memory limits for this process. Limits are now per-replica, "
+                "not shared — check REDIS_HOST/REDIS_PORT/REDIS_PASSWORD.",
+                _redis_target_for_logs(),
+                type(e).__name__,
+                e,
+            )
+            return await self._fallback.hit(key, limit, window_seconds)
 
 
 _limiter: Optional[FixedWindowLimiter] = None
@@ -113,7 +160,14 @@ def get_limiter() -> FixedWindowLimiter:
             url = _default_redis_url()
             client = redis.from_url(url, encoding="utf-8", decode_responses=True)
             _limiter = RedisFixedWindowLimiter(client)
-            logger.info(f"✅ Rate limiting enabled (Redis): {url}")
+            # from_url() opens no socket, so this line reports configuration, not
+            # reachability, and must not claim otherwise. The limiter says so
+            # itself (once) if the first request cannot reach the server. The
+            # target is logged without its password.
+            logger.info(
+                f"✅ Rate limiting configured (Redis): {_redis_target_for_logs()} "
+                f"(connection verified on first request)"
+            )
             return _limiter
         except Exception as e:  # pragma: no cover
             logger.warning(f"⚠️  Redis rate limiter unavailable, falling back to in-memory: {e}")

@@ -12,6 +12,8 @@ from typing import Optional, Dict, Any, Tuple
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
+from src.utils.openai_client import env_bool
+
 # =============================================================================
 # PIPELINE / EXECUTION LOG CONTEXT
 # -----------------------------------------------------------------------------
@@ -217,6 +219,26 @@ _tracer: Optional[trace.Tracer] = None
 _propagator = TraceContextTextMapPropagator()
 
 
+def otel_enabled() -> bool:
+    """Whether this process should export OTLP spans and metrics.
+
+    The exporter is a *network* client. With no collector listening, the
+    BatchSpanProcessor keeps a queue and retries every batch to
+    ``OTEL_EXPORTER_OTLP_ENDPOINT`` (default ``localhost:4317``) for the life of
+    the process, and each export blocks its worker for the full 10s timeout. The
+    try/except below is no protection: constructing an ``OTLPSpanExporter`` opens
+    no connection, so it never raises, and the service logs the green
+    "OpenTelemetry initialized" line while nothing is listening.
+
+    Cloud runs SigNoz, so the default is enabled -- the cloud behaviour, per the
+    OSS/cloud split rule in CLAUDE.md. Only docker-compose.quickstart.yml turns it
+    off, because that bundle ships no collector and its observability story is
+    ``docker logs``. This is the same shape as the SIGNOZ_LOGS_ENRICH flag that
+    file already sets.
+    """
+    return env_bool("OTEL_ENABLED", True)
+
+
 def init_tracer(service_name: str, service_version: str = "1.0.0") -> trace.Tracer:
     """
     Initialize OpenTelemetry tracer with OTLP exporter
@@ -243,17 +265,25 @@ def init_tracer(service_name: str, service_version: str = "1.0.0") -> trace.Trac
     # Create trace provider
     provider = TracerProvider(resource=resource)
     
-    # Create OTLP exporter
-    try:
-        exporter = OTLPSpanExporter(
-            endpoint=endpoint,
-            insecure=True,  # Use insecure for development
+    # Create OTLP exporter -- only when an operator says a collector exists.
+    # The provider is still installed either way, so every start_span() call site
+    # keeps working; it just has nothing attached to ship the spans anywhere.
+    if otel_enabled():
+        try:
+            exporter = OTLPSpanExporter(
+                endpoint=endpoint,
+                insecure=True,  # Use insecure for development
+            )
+            provider.add_span_processor(BatchSpanProcessor(exporter))
+            logger.info(f"✅ OpenTelemetry initialized for service: {service_name} (endpoint: {endpoint})")
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to connect to OTLP endpoint {endpoint}: {e}")
+            # Continue without exporter for local development
+    else:
+        logger.info(
+            f"OpenTelemetry export disabled for service: {service_name} "
+            f"(OTEL_ENABLED=false); spans are created but not exported"
         )
-        provider.add_span_processor(BatchSpanProcessor(exporter))
-        logger.info(f"✅ OpenTelemetry initialized for service: {service_name} (endpoint: {endpoint})")
-    except Exception as e:
-        logger.warning(f"⚠️ Failed to connect to OTLP endpoint {endpoint}: {e}")
-        # Continue without exporter for local development
     
     # Set global trace provider
     trace.set_tracer_provider(provider)

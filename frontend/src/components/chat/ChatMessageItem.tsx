@@ -3,6 +3,7 @@
 import { useState } from "react"
 import Link from "next/link"
 import { Button } from "@/components/ui/button"
+import { AssistantMarkdown } from "@/components/chat/AssistantMarkdown"
 import { PipelineConfirmationInline } from "@/components/chat/PipelineConfirmationInline"
 import { SyncModeChoiceInline } from "@/components/chat/SyncModeChoiceInline"
 import { DiagnosisCard, type DiagnosisData } from "@/components/chat/DiagnosisCard"
@@ -57,7 +58,15 @@ export function ChatMessageItem({ message: m, onRunPrompt, onSetInput, onSyncMod
       <div className="text-xs uppercase tracking-wide text-zinc-500">
         {m.role === "user" ? "You" : "Assistant"}
       </div>
-      <div className="text-zinc-900 dark:text-zinc-100 whitespace-pre-wrap">{m.content}</div>
+      {/* Assistant replies are authored as Markdown (see prompts/chat/*.md and the
+          hand-assembled `**bold**` replies in api-gateway chat_nl_pipeline.go), so
+          they get parsed. User messages stay verbatim: echoing someone's own text
+          back with markup applied is both wrong and an avoidable input surface. */}
+      {m.role === "assistant" ? (
+        <AssistantMarkdown content={m.content} />
+      ) : (
+        <div className="text-zinc-900 dark:text-zinc-100 whitespace-pre-wrap">{m.content}</div>
+      )}
 
       {/* Upgrade CTA: shown when the assistant reply signals a plan limit */}
       {planLimitHint && (
