@@ -21,6 +21,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rsync-ai/backend-orchestrator/pkg/llmjson"
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 	"github.com/rsync-ai/shared/crypto"
 	log "github.com/sirupsen/logrus"
@@ -1628,7 +1629,7 @@ func (h *ChatHandler) callHelpResponseLLM(ctx context.Context, userMessage strin
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: llmServiceTimeout()}
 	resp, err := client.Do(req)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to call help prompt: %w", err)
@@ -1651,7 +1652,7 @@ func (h *ChatHandler) callHelpResponseLLM(ctx context.Context, userMessage strin
 		Message     string   `json:"message"`
 		Suggestions []string `json:"suggestions"`
 	}
-	if err := json.Unmarshal([]byte(llmResponse.Content), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(llmjson.ExtractObject(llmResponse.Content)), &parsed); err != nil {
 		return "", nil, fmt.Errorf("failed to parse help prompt content: %w", err)
 	}
 
@@ -2371,7 +2372,7 @@ func (h *ChatHandler) callSlotFillingLLM(ctx context.Context, conv *chat.Convers
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: llmServiceTimeout()}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call slot-filling LLM: %w", err)
@@ -2391,7 +2392,7 @@ func (h *ChatHandler) callSlotFillingLLM(ctx context.Context, conv *chat.Convers
 	}
 
 	var result chat.SlotFillingResult
-	if err := json.Unmarshal([]byte(llmResponse.Content), &result); err != nil {
+	if err := json.Unmarshal([]byte(llmjson.ExtractObject(llmResponse.Content)), &result); err != nil {
 		return nil, fmt.Errorf("failed to parse slot-filling result: %w", err)
 	}
 
@@ -2501,6 +2502,20 @@ type Intent struct {
 	RequiresExecution bool
 }
 
+// llmServiceTimeout is the deadline every chat call to llm-service gets.
+//
+// This was a hard-coded 10s with no override. That is fine against a hosted API
+// but far too short for the quickstart bundle, where inference runs on CPU
+// Ollama and a first token can take 60-100s: every plain-English message came
+// back as the canned fallback with one warning line, while the regex fast path
+// kept answering canonical phrasings in 0s so smoke tests never noticed.
+//
+// The default stays 10s (the cloud behaviour). Only docker-compose.quickstart.yml
+// raises it, per the OSS/cloud split rule in CLAUDE.md.
+func llmServiceTimeout() time.Duration {
+	return getEnvDuration("LLM_SERVICE_TIMEOUT_SECONDS", 10)
+}
+
 // parseIntent calls the Intent agent to parse natural language
 func (h *ChatHandler) parseIntent(ctx context.Context, message string) (*Intent, error) {
 	// Call LLM service intent agent
@@ -2519,14 +2534,14 @@ func (h *ChatHandler) parseIntent(ctx context.Context, message string) (*Intent,
 
 	jsonBody, _ := json.Marshal(requestBody)
 
-	reqCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, llmServiceTimeout())
 	defer cancel()
 	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, fmt.Sprintf("%s/v1/completion", llmServiceURL), bytes.NewBuffer(jsonBody))
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 10 * time.Second}
+	client := &http.Client{Timeout: llmServiceTimeout()}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to call intent agent: %w", err)
@@ -2558,7 +2573,7 @@ func (h *ChatHandler) parseIntent(ctx context.Context, message string) (*Intent,
 			SyncMode    string   `json:"sync_mode"`
 		} `json:"parameters"`
 	}
-	if err := json.Unmarshal([]byte(llmResponse.Content), &parsed); err != nil {
+	if err := json.Unmarshal([]byte(llmjson.ExtractObject(llmResponse.Content)), &parsed); err != nil {
 		return nil, fmt.Errorf("failed to parse intent content: %w", err)
 	}
 

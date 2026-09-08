@@ -22,7 +22,7 @@ import uvicorn
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../..'))
 from src.utils.telemetry import (
     init_tracer, instrument_fastapi, start_span,
-    get_current_trace_id, add_span_attributes, setup_logging
+    get_current_trace_id, add_span_attributes, setup_logging, otel_enabled
 )
 from opentelemetry import metrics
 from opentelemetry.sdk.metrics import MeterProvider
@@ -41,7 +41,18 @@ tracer = init_tracer("telemetry-agent", "1.0.0")
 
 # Initialize OpenTelemetry metrics
 def init_metrics():
-    """Initialize OpenTelemetry metrics with OTLP exporter"""
+    """Initialize OpenTelemetry metrics with OTLP exporter.
+
+    Gated on the same OTEL_ENABLED flag as tracing (src/utils/telemetry.py).
+    A PeriodicExportingMetricReader wakes every 10s forever and retries the whole
+    batch at the endpoint, so with no collector this is a permanent background
+    retry loop -- and, like the tracer, the try/except never fires because
+    constructing the exporter opens no connection.
+    """
+    if not otel_enabled():
+        logger.info("OpenTelemetry metrics disabled (OTEL_ENABLED=false); no metrics exported")
+        return
+
     endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317")
     
     resource = Resource.create({SERVICE_NAME: "telemetry-agent"})

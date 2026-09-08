@@ -603,6 +603,14 @@ services:
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     restart: unless-stopped
     mem_limit: 1536m
+    # The rate limiter degrades to per-process in-memory counters the first time
+    # it cannot reach Redis, and stays degraded for the life of the process. Wait
+    # for the server so that decision is never made against a Redis that was
+    # merely still booting. Same edge the orchestrator, adapter and gateway
+    # already declare.
+    depends_on:
+      redis:
+        condition: service_healthy
     # OLLAMA_URL below defaults to host.docker.internal, which Docker Desktop
     # (macOS/Windows) resolves for free and Linux Docker does NOT -- so without
     # this line the offline provider fails to resolve its own default on exactly
@@ -627,6 +635,15 @@ services:
       # Provider selection is by LLM_PROVIDER; the client falls back to Ollama when
       # no cloud key is present (see llm-service openai_client.py).
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # LLM_PROVIDER=openai means "speaks the OpenAI wire protocol", not "is
+      # OpenAI": Vertex AI, Azure, Groq, OpenRouter, Together and vLLM all serve
+      # that protocol, and OPENAI_BASE_URL is the only var that points the client
+      # at one of them. There is no env_file on this service, so without this line
+      # an operator who sets OPENAI_BASE_URL in .env watches it be silently
+      # ignored and the stack keeps talking to api.openai.com — the one endpoint
+      # their key is not for. docker-compose.prod.yml:585 already passes it, which
+      # is what makes the omission here an oversight rather than a policy.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
@@ -665,6 +682,26 @@ services:
       # true, so leaving it unset points the producer at a host that does not exist here.
       KAFKA_USE_AVRO: "false"
       USE_MOCK_LLM: "false"
+      # The gateway's rate limiter (src/utils/ratelimit.py get_limiter) builds its
+      # Redis URL from these four. With none of them delivered it still resolved
+      # the host "redis" by luck of the default, then failed AUTH against a server
+      # this file always starts with requirepass — so every limited route ran on a
+      # per-replica in-memory counter while the logs said Redis. Names and values
+      # match the orchestrator block below; REDIS_PASSWORD is the same one the
+      # redis service is started with.
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # This bundle ships no OTLP collector, same as SIGNOZ_LOGS_ENRICH further
+      # down. The gRPC exporter connects lazily, so an absent collector is not a
+      # startup error: the BatchSpanProcessor just queues and retries every batch
+      # at localhost:4317 for the life of the process, blocking a worker for the
+      # full export timeout each time. The code default is true (cloud runs
+      # SigNoz); only this file turns it off, per the OSS/cloud split rule in
+      # CLAUDE.md. Spans are still created, they are simply not shipped —
+      # observability here is `docker logs`.
+      OTEL_ENABLED: "false"
       LOG_FORMAT: json
       LOG_LEVEL: info
       ENVIRONMENT: production
@@ -815,6 +852,9 @@ services:
     depends_on:
       llm-service:
         condition: service_healthy
+      # Same sticky-degrade reason as llm-service above.
+      redis:
+        condition: service_healthy
     # Same reason as llm-service: OLLAMA_URL below defaults to a name Linux
     # Docker does not resolve on its own.
     extra_hosts:
@@ -825,6 +865,10 @@ services:
       <<: *kafka-security
       PORT: 5011
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Same OpenAI-compatible-endpoint story as llm-service above: without this
+      # the planner talks to api.openai.com no matter what the operator set, so a
+      # stack pointed at Vertex/Azure/vLLM would answer chat and fail planning.
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_MODEL: ${LLM_MODEL:-gpt-4o}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
@@ -845,6 +889,14 @@ services:
       KAFKA_USE_AVRO: "false"
       ENABLE_KAFKA_CONSUMER: "false"
       CONNECTORS_DIR: /app/shared/mcp-connectors
+      # src/agents/planner/service.py imports the same get_limiter as the gateway,
+      # so it needs the same four vars or its limits are per-replica too.
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_DB: 0
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # No collector in this bundle — see the llm-service block above.
+      OTEL_ENABLED: "false"
       LOG_FORMAT: json
       LOG_LEVEL: info
       ENVIRONMENT: production
@@ -937,6 +989,10 @@ services:
       EXECUTOR_TABLE_CONCURRENCY: ${EXECUTOR_TABLE_CONCURRENCY:-}
       EXECUTOR_TABLE_BATCH_ROWS: ${EXECUTOR_TABLE_BATCH_ROWS:-}
       DOCKER_NETWORK: rsync-ai-mcp
+      # No collector in this bundle — same reason as SIGNOZ_LOGS_ENRICH below.
+      # internal/config/config.go:231 defaults this to true for cloud; the OSS
+      # compose is the only place it is turned off.
+      OTEL_ENABLED: "false"
       LOG_FORMAT: json
       LOG_LEVEL: info
       ENVIRONMENT: production
@@ -1061,6 +1117,17 @@ services:
       ORCHESTRATOR_URL: http://orchestrator:8080
       AGENT_ORCHESTRATOR_URL: http://orchestrator:8080
       TOOL_GENERATOR_URL: http://tool-generator:5010
+      # Deadline for every chat call to llm-service (llmServiceTimeout() in
+      # internal/handlers/chat_nl_pipeline.go). The code default is 10s — right
+      # for a hosted API, hopeless for this bundle, which runs inference on CPU
+      # Ollama where a first token takes 60-100s. At 10s every plain-English
+      # message returned the canned fallback while the regex fast path kept
+      # answering canonical phrasings instantly, so the stack looked healthy.
+      #
+      # 90 and not more: cmd/server/main.go:1244 caps the whole response at a
+      # 120s WriteTimeout, so a longer upstream deadline would just move the cut
+      # to a worse place. Raise both together if you ever need more.
+      LLM_SERVICE_TIMEOUT_SECONDS: ${LLM_SERVICE_TIMEOUT_SECONDS:-90}
       JWT_SECRET: ${JWT_SECRET}
       REDIS_ADDRESS: redis:6379
       # Same requirepass as the adapter above. api-gateway fails SOFTER -- it
@@ -1099,6 +1166,13 @@ services:
       # not even resolve under Linux Docker. The path is fail-soft, so the only
       # symptom is every diagnose call paying a pointless connect timeout first.
       SIGNOZ_LOGS_ENRICH: "false"
+      # Second half of the same fact: no SigNoz here also means no OTLP collector
+      # to export spans to. LoadTelemetryConfig defaults this to true (cloud runs
+      # one), and until now InitTracerWithConfig ignored the flag entirely, so
+      # every self-host retried gRPC exports at localhost:4317 forever. Only this
+      # file turns it off, per the OSS/cloud split rule in CLAUDE.md; the tracer
+      # falls back to a no-op provider, so instrumented paths keep working.
+      OTEL_ENABLED: "false"
       RSYNC_ADMIN_EMAILS: ${RSYNC_ADMIN_EMAILS:-}
       OAUTH_CALLBACK_URL: ${OAUTH_CALLBACK_URL:-}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}

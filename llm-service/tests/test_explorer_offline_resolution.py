@@ -388,11 +388,73 @@ def test_rank_tables_offline_model_is_a_model_ollama_can_have(monkeypatch):
     assert rank_tables_default_model("ollama") == "llama3:latest"
 
 
+def test_rank_tables_offline_follows_the_model_the_deployment_pulled(monkeypatch):
+    # "llama3:latest" was the same bet as "gpt-4o-mini", made on a different
+    # name: a literal nothing guarantees is in the volume. OLLAMA_MODEL is an
+    # Ollama-side name by construction, so following it cannot reintroduce the
+    # cloud-name leak that refusing LLM_MODEL exists to prevent. The sibling
+    # explorer resolvers already read it; this one was the straggler.
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    assert rank_tables_default_model("ollama") == "qwen2.5:7b"
+
+
+def test_rank_tables_offline_still_refuses_a_cloud_model_name(monkeypatch):
+    # The guarantee OLLAMA_MODEL must not weaken: LLM_MODEL is the cloud knob,
+    # and an OpenAI catalog name is never something Ollama can serve.
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o")
+    assert rank_tables_default_model("ollama") != "gpt-4o"
+
+
+def test_rank_tables_override_still_beats_ollama_model(monkeypatch):
+    # RANK_TABLES_MODEL exists to pin the bulk metadata path to something
+    # cheaper; a stack-wide OLLAMA_MODEL must not silently override the operator.
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    monkeypatch.setenv("RANK_TABLES_MODEL", "llama3.2:1b")
+    assert rank_tables_default_model("ollama") == "llama3.2:1b"
+
+
 def test_rank_tables_stays_cheap_on_openai(monkeypatch):
     # Ranking is a bulk metadata task pinned to a cheap model on purpose; it must
     # NOT follow a stack-wide LLM_MODEL upgrade and multiply its own cost.
     monkeypatch.setenv("LLM_MODEL", "gpt-4o")
     assert rank_tables_default_model("openai") == "gpt-4o-mini"
+
+
+def test_rank_tables_cheap_pin_does_not_survive_a_foreign_catalog(monkeypatch):
+    # "openai" is a wire protocol, not a vendor. OPENAI_BASE_URL points it at any
+    # OpenAI-compatible endpoint, and there "gpt-4o-mini" is not a cheap model —
+    # it is a name the catalog has never heard of, so every rank-tables request
+    # answers HTTP 400 while the rest of the stack works, because everything else
+    # resolves through LLM_MODEL. Observed against Vertex AI's OpenAI surface.
+    monkeypatch.setenv(
+        "OPENAI_BASE_URL",
+        "https://europe-west4-aiplatform.googleapis.com/v1/projects/p/locations/l/endpoints/openapi",
+    )
+    monkeypatch.setenv("LLM_MODEL", "google/gemini-2.5-flash")
+    assert rank_tables_default_model("openai") == "google/gemini-2.5-flash"
+
+
+def test_rank_tables_cheap_pin_holds_when_the_base_url_is_openais_own(monkeypatch):
+    # The other side: an explicitly-set OpenAI base URL is still OpenAI, so the
+    # cost decision above stands. A gate that keyed on "is OPENAI_BASE_URL set"
+    # rather than on where it points would break this.
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o")
+    assert rank_tables_default_model("openai") == "gpt-4o-mini"
+
+
+def test_rank_tables_foreign_catalog_without_llm_model_keeps_the_old_literal(monkeypatch):
+    # Nothing to inherit means nothing to change: no LLM_MODEL, no new behaviour.
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    assert rank_tables_default_model("openai") == "gpt-4o-mini"
+
+
+def test_rank_tables_explicit_model_still_beats_a_foreign_catalog(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://openrouter.ai/api/v1")
+    monkeypatch.setenv("LLM_MODEL", "google/gemini-2.5-flash")
+    monkeypatch.setenv("RANK_TABLES_MODEL", "meta-llama/llama-3.1-8b-instruct")
+    assert rank_tables_default_model("openai") == "meta-llama/llama-3.1-8b-instruct"
 
 
 def test_rank_tables_azure_uses_a_deployment_name(monkeypatch):

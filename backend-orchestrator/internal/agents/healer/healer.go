@@ -23,6 +23,7 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
 	appmetrics "github.com/rsync-ai/backend-orchestrator/internal/metrics"
 	"github.com/rsync-ai/backend-orchestrator/pkg/diagnose"
+	"github.com/rsync-ai/backend-orchestrator/pkg/llmjson"
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 )
 
@@ -390,37 +391,11 @@ func actionOutcome(action string) string {
 	return "escalated"
 }
 
-// extractJSONObject pulls a JSON object out of an LLM response that may be
-// wrapped in a markdown code fence (```json … ```) or padded with prose.
-// Models frequently fence their output even when asked for bare JSON; feeding
-// that raw to json.Unmarshal fails with "invalid character '`'" and silently
-// drops us to the rule-based fallback. Callers pass the result to
-// json.Unmarshal; if no object is found the trimmed input is returned so the
-// caller still surfaces a real parse error.
-func extractJSONObject(s string) string {
-	s = strings.TrimSpace(s)
-	// Strip a leading ``` / ```json fence and its matching trailing ```.
-	if strings.HasPrefix(s, "```") {
-		if nl := strings.IndexByte(s, '\n'); nl != -1 {
-			s = s[nl+1:] // drop the opening fence line (``` or ```json)
-		} else {
-			s = strings.TrimPrefix(s, "```")
-		}
-		if idx := strings.LastIndex(s, "```"); idx != -1 {
-			s = s[:idx] // drop the closing fence
-		}
-		s = strings.TrimSpace(s)
-	}
-	// If prose still surrounds the object, slice from the first { to the last }.
-	if !strings.HasPrefix(s, "{") || !strings.HasSuffix(s, "}") {
-		if start := strings.IndexByte(s, '{'); start != -1 {
-			if end := strings.LastIndexByte(s, '}'); end > start {
-				s = s[start : end+1]
-			}
-		}
-	}
-	return strings.TrimSpace(s)
-}
+// extractJSONObject delegates to the shared llmjson helper. The implementation
+// moved to pkg/llmjson so api-gateway's chat pipeline strips fences the same way
+// — a second copy is how one caller keeps the old behaviour. Kept as a local
+// name so the existing guards in healer_llm_parse_test.go still exercise it.
+func extractJSONObject(s string) string { return llmjson.ExtractObject(s) }
 
 func (a *Agent) analyzeWithLLM(ctx context.Context, event *SchemaChangeEvent) (*LLMAnalysisResponse, error) {
 	prompt := buildAnalysisPrompt(event)

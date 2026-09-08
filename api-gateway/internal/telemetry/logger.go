@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -151,9 +152,23 @@ func LoadTelemetryConfig(serviceName string) TelemetryConfig {
 		OTLPEndpoint:   getEnvWithDefault("OTEL_EXPORTER_OTLP_ENDPOINT", "localhost:4317"),
 		ServiceName:    getEnvWithDefault("OTEL_SERVICE_NAME", serviceName),
 		ServiceVersion: getEnvWithDefault("OTEL_SERVICE_VERSION", "1.0.0"),
-		Enabled:        getEnvWithDefault("OTEL_ENABLED", "true") == "true",
+		Enabled:        parseBoolWithDefault(os.Getenv("OTEL_ENABLED"), true),
 		SamplingRate:   1.0, // Default to 100% sampling
-		Insecure:       getEnvWithDefault("OTEL_INSECURE", "true") == "true",
+		Insecure:       parseBoolWithDefault(os.Getenv("OTEL_INSECURE"), true),
+	}
+}
+
+// parseBoolWithDefault reads an operator-supplied boolean. Unset OR empty keeps
+// the default: compose renders an unset ${VAR:-} as the empty string, and an
+// empty string must never be the value that flips a default off.
+func parseBoolWithDefault(raw string, defaultValue bool) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	case "0", "false", "no", "off":
+		return false
+	default:
+		return defaultValue
 	}
 }
 
@@ -164,8 +179,25 @@ func getEnvWithDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
-// InitTracerWithConfig initializes OpenTelemetry with typed config
+// InitTracerWithConfig initializes OpenTelemetry with typed config.
+//
+// cfg.Enabled used to be loaded from OTEL_ENABLED and then dropped on the floor
+// here, so the flag was decorative: every deployment exported spans whether or
+// not a collector existed. The default endpoint is localhost:4317 (the sidecar
+// pattern) and the gRPC exporter connects lazily, so a bundle that ships no
+// collector never errors at startup — it just retries the export forever, once
+// per batch, filling the log. Honour the flag; the default stays true, so cloud
+// (which does run a sidecar) is unaffected, and only docker-compose.quickstart.yml
+// turns it off. Per the OSS/cloud split rule in CLAUDE.md.
+//
+// Disabling leaves no global TracerProvider registered. That is safe: the HTTP
+// middleware takes its tracer from otel.Tracer(), which returns a no-op tracer
+// when no provider is set, so instrumented code paths keep working untraced.
 func InitTracerWithConfig(cfg TelemetryConfig) (func(context.Context) error, error) {
+	if !cfg.Enabled {
+		log.Infof("OpenTelemetry tracing disabled for %s (OTEL_ENABLED=false); no spans exported", cfg.ServiceName)
+		return func(context.Context) error { return nil }, nil
+	}
 	return InitTracerWithConfigOptions(cfg.OTLPEndpoint, cfg.ServiceName, cfg.ServiceVersion, cfg.SamplingRate, cfg.Insecure)
 }
 

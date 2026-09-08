@@ -207,6 +207,21 @@ def explorer_default_sql_model(provider: str) -> str:
     return explorer_default_model(provider)
 
 
+def _openai_base_url_is_custom() -> bool:
+    """True when OPENAI_BASE_URL points somewhere other than OpenAI's own API.
+
+    An OpenAI-compatible endpoint accepts the same requests but serves a
+    different model catalog, so an OpenAI catalog name is not a cheap default
+    there — it is a 400. Only used to decide whether a hardcoded catalog literal
+    is still meaningful; the client wiring reads the variable directly.
+    """
+    base = (os.getenv("OPENAI_BASE_URL") or "").strip()
+    if not base:
+        return False
+    host = (urlparse(base).hostname or "").lower()
+    return bool(host) and host != "api.openai.com" and not host.endswith(".api.openai.com")
+
+
 def rank_tables_default_model(provider: str) -> str:
     """
     Default model for the /agents/rank-tables endpoint.
@@ -217,19 +232,36 @@ def rank_tables_default_model(provider: str) -> str:
 
     It does need a real local model offline, though. The old copy returned the
     literal "gpt-4o-mini" for every non-Azure provider, so pointing this
-    endpoint at Ollama asked Ollama for a model it has never pulled.
+    endpoint at Ollama asked Ollama for a model it has never pulled — and
+    "llama3:latest" was the same bet on a different name, which is why the
+    offline branch now follows OLLAMA_MODEL down to the model the deployment
+    was actually given. RANK_TABLES_MODEL still beats both.
+
+    The cheap pin is scoped to OpenAI's *own* catalog, which is the only place
+    the cost argument holds. ``provider == "openai"`` really means "speaks the
+    OpenAI wire protocol", and OPENAI_BASE_URL points that protocol at anything
+    OpenAI-compatible — Vertex AI, OpenRouter, LiteLLM, a local gateway. On
+    those, "gpt-4o-mini" is not a cheap model, it is a name the catalog has
+    never heard of, and the endpoint answers HTTP 400 for every request while
+    the rest of the stack works, because everything else resolves through
+    LLM_MODEL. So when the base URL is not OpenAI's, follow LLM_MODEL like every
+    other resolver; RANK_TABLES_MODEL still overrides both.
     """
     explicit = (os.getenv("RANK_TABLES_MODEL") or "").strip()
     if explicit:
         return explicit
     if provider == "ollama":
-        return "llama3:latest"
+        return (os.getenv("OLLAMA_MODEL") or "llama3:latest").strip()
     if provider == "groq":
         return "llama-3.3-70b-versatile"
     if provider == "azure":
         # On Azure the model argument is a *deployment* name; falling through to
         # an OpenAI catalog name is a 404 DeploymentNotFound.
         return (os.getenv("AZURE_OPENAI_DEPLOYMENT") or os.getenv("LLM_MODEL") or "gpt-4o-mini").strip()
+    if _openai_base_url_is_custom():
+        override = (os.getenv("LLM_MODEL") or "").strip()
+        if override:
+            return override
     return "gpt-4o-mini"
 
 
