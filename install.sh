@@ -6,6 +6,11 @@ set -euo pipefail
 # Usage:
 #   curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
 #
+# Every RSYNC_* setting below goes on the `bash` side of the pipe:
+#   curl -sSL .../install.sh | RSYNC_PROFILES= bash
+# Written before `curl` it is exported to `curl`, which never reads it, and this
+# script runs with the default -- no error, just a setting silently ignored.
+#
 # Copyright (c) 2025 Infini Data Solution (Rahul Kumar Vishnoi)
 # Licensed under the Elastic License 2.0 — https://rsync.ai/license
 # ─────────────────────────────────────────────────────────────────────────────
@@ -55,9 +60,39 @@ COMPOSE_URL="${RAW_BASE}/${COMPOSE_FILE}"
 BYO_PG_FILE="docker-compose.byo-postgres.yml"
 BYO_KAFKA_FILE="docker-compose.byo-kafka.yml"
 COMPOSE_ARGS=()
+# Which optional compose profiles this install activates. `cdc` is in the
+# default because the change-data-capture services are not an add-on: pick a
+# streaming sync in the UI without them and the orchestrator's pre-flight polls
+# three absent containers for two minutes and then fails the run with
+# "kafka-connect is not reachable" -- a message about a container that was never
+# started, on a stack whose install reported success. The profile existed in
+# docker-compose.quickstart.yml and nothing in this script ever activated it, so
+# every install shipped that failure.
+#
+# `-` and not `:-` on purpose: RSYNC_PROFILES= (explicitly empty) is the
+# opt-out, and it has to be distinguishable from unset.
+RSYNC_PROFILES="${RSYNC_PROFILES-cdc}"
 ENV_FILE=".env"
 INSTALL_DIR="${RSYNC_INSTALL_DIR:-$HOME/rsync-ai}"
-MIN_RAM_GB=6
+# The floor tracks what the install actually starts. 6 sized the 18 unprofiled
+# services this file has always started. The cdc profile adds three more
+# containers -- one of them a JVM -- whose mem_limit lines in
+# docker-compose.quickstart.yml come to 2816MB on top of that, so the default
+# set needs 8.
+#
+# Two floors and not one because RSYNC_PROFILES= starts exactly the 18 services
+# 6 was sizing. Warning that operator about a JVM they excluded would be the
+# same defect this change fixes: a message about a container that was never
+# started.
+MIN_RAM_GB_BATCH=6
+MIN_RAM_GB_CDC=8
+MIN_RAM_GB=$MIN_RAM_GB_BATCH
+# Padded with spaces so the match is on a whole word: `nocdc` must not select
+# the cdc floor. Commas become spaces first -- RSYNC_PROFILES takes either
+# separator, and build_compose_args splits it the same way.
+case " ${RSYNC_PROFILES//,/ } " in
+  *" cdc "*) MIN_RAM_GB=$MIN_RAM_GB_CDC ;;
+esac
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -550,12 +585,28 @@ EOF
 # later than startup -- at whichever message the two versions read differently.
 
 # ── Optional profiles ─────────────────────────────────────────────────────────
-# Both are off by default; neither is needed to move data with the connectors
-# that ship in the box.
-#   cdc       change-data-capture (Kafka Connect + Debezium + the sink worker)
-#   generate  connector generation against live API docs
+# RSYNC_PROFILES holds the set this install activates; it defaults to `cdc`.
 #
-#   COMPOSE_PROFILES=cdc
+#   cdc       change-data-capture (Kafka Connect + Debezium + the sink worker).
+#             ON by default. Absent, a streaming pipeline does not degrade --
+#             the orchestrator's infra pre-flight requires all three services
+#             together and fails the run once they do not answer.
+#   generate  connector generation against live API docs. OFF by default, and it
+#             is the other case: the generator probes context7-mcp with a 3s
+#             timeout and carries on without it, so its absence costs a
+#             documentation lookup, not a run.
+#
+# Turn CDC off on a machine that will only ever run batch syncs:
+#
+#   curl -sSL .../install.sh | RSYNC_PROFILES= bash
+#
+# Or run both:
+#
+#   curl -sSL .../install.sh | RSYNC_PROFILES=cdc,generate bash
+#
+# The resolved set is also written to the generated .env as COMPOSE_PROFILES, so
+# a compose command typed by hand in the install directory starts the same
+# services this script did.
 
 # ── Bring-your-own Kafka (optional) ───────────────────────────────────────────
 # Unset, the stack runs the Kafka broker defined in this compose file, over
@@ -577,7 +628,9 @@ EOF
 # The cdc profile adds a JVM (Kafka Connect) that reads the same credentials in
 # JAAS form. It is not derivable from the two lines above: the password crosses
 # two grammars on its way in, so escaping it once corrupts it in exactly the way
-# not escaping it does. Set it explicitly when running --profile cdc:
+# not escaping it does. cdc is in the default profile set, so an external broker
+# needs this line set even if you never asked for CDC -- or RSYNC_PROFILES=
+# to leave the JVM out entirely:
 #
 #   KAFKA_SASL_JAAS_CONFIG=org.apache.kafka.common.security.scram.ScramLoginModule required username="user" password="pass";
 #
@@ -679,6 +732,16 @@ download_compose() {
 # depends_on, without which Compose refuses the whole project.
 build_compose_args() {
   COMPOSE_ARGS=( -f "${INSTALL_DIR}/${COMPOSE_FILE}" )
+  # Unquoted on purpose -- this is the word split that turns "cdc,generate" into
+  # two flags. An empty RSYNC_PROFILES yields zero iterations, which is the
+  # opt-out. Flags rather than an exported COMPOSE_PROFILES because an exported
+  # variable dies with this process, while these flags reach the operator: the
+  # status / logs / retry commands printed at the end of a run are built from
+  # COMPOSE_CMD, and COMPOSE_CMD is built from this array.
+  local profile
+  for profile in ${RSYNC_PROFILES//,/ }; do
+    COMPOSE_ARGS+=( --profile "$profile" )
+  done
   local envf="${INSTALL_DIR}/${ENV_FILE}" pg="" kb=""
   if [[ -f "$envf" ]]; then
     # `|| true` is load-bearing, not defensive noise: this script runs under
@@ -954,6 +1017,21 @@ main() {
   # the quickstart file and neither overlay. Fetch whichever is missing.
   [[ -f "${INSTALL_DIR}/${BYO_PG_FILE}" ]]    || fetch "${RAW_BASE}/${BYO_PG_FILE}"    "${INSTALL_DIR}/${BYO_PG_FILE}"
   [[ -f "${INSTALL_DIR}/${BYO_KAFKA_FILE}" ]] || fetch "${RAW_BASE}/${BYO_KAFKA_FILE}" "${INSTALL_DIR}/${BYO_KAFKA_FILE}"
+
+  # Record the profile set in the .env, so a compose command typed by hand --
+  # without the --profile flags this script passes -- starts the same services
+  # the install did. Compose reads .env from the project directory, which for an
+  # absolute -f path is the directory holding the compose file, i.e. this one.
+  #
+  # Appended once and never rewritten, the way INTERNAL_SERVICE_SECRET above is,
+  # so an operator who edits the line keeps their edit. The consequence is worth
+  # stating rather than hiding: opting out on a RE-RUN (RSYNC_PROFILES=) leaves
+  # an earlier `cdc` in the .env, so this run's own compose commands drop the CDC
+  # services while a later bare `docker compose up -d` in that directory would
+  # still start them. Delete the line to reset it.
+  if ! grep -q '^COMPOSE_PROFILES=' "${INSTALL_DIR}/${ENV_FILE}"; then
+    echo "COMPOSE_PROFILES=${RSYNC_PROFILES}" >> "${INSTALL_DIR}/${ENV_FILE}"
+  fi
 
   build_compose_args
 

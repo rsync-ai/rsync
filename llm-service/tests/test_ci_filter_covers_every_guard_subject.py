@@ -71,6 +71,15 @@ GUARDS = [
     # directly above: scripts/flip/apply-ci-split.py plus the ci.yml it
     # rewrites, covered by `scripts/flip/**` and `.github/workflows/**`.
     "test_flip_drops_a_changes_output_no_job_reads.py",
+    # Enrolled 2026-09-08 with the CDC-profile fix. Its subjects are install.sh,
+    # docker-compose.quickstart.yml, deploy/helm/rsync-ai/values.yaml and
+    # backend-orchestrator/internal/workers/infra_preflight.go. The first three
+    # were already covered; the Go file was not, and it is the one that says why
+    # a missing CDC plane fails a run instead of degrading -- so the filter
+    # gained it in the same change. Listed here for the reason the entries above
+    # give: GUARDS is a hand-maintained literal, and being absent from it looks
+    # exactly like being covered.
+    "test_both_install_paths_start_the_cdc_plane.py",
     # Enrolled 2026-09-06. Subjects are the chart helper, plus
     # backend-temporal-adapter/cmd/adapter/main.go and api-gateway/cmd/server/main.go
     # -- the two Go files that say why one component waits for Temporal and the other

@@ -685,8 +685,15 @@ connectors:
   # because debezium writes source-DB credentials to a directory kafka-connect
   # reads through FileConfigProvider. Sharing an emptyDir in one pod keeps those
   # credentials off the Kafka config topic without needing a RWX volume.
+  #
+  # On by default, because "all three or none" has no third branch that degrades:
+  # a streaming pipeline on a release without them does not fall back to batch,
+  # it polls three absent Services for two minutes and fails the run. The install
+  # that left them out reported success, so the first evidence anything is
+  # missing is a failed pipeline. Set false on a cluster that will only ever run
+  # batch syncs — it frees a JVM and two Deployments.
   cdc:
-    enabled: false
+    enabled: true
     kafkaConnect:
       image: { repository: kafka-connect, tag: "" }
       groupId: rsync-connect-cluster

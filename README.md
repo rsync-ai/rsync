@@ -60,10 +60,21 @@ success banner over a dead stack.
 > commit. Every image the default compose starts is published at that tag and pullable
 > anonymously — a test pins that, so a release cannot ship half-built.
 >
-> Pass `RSYNC_REF=main` to track the branch instead. That install is not reproducible:
-> the compose file comes from the branch tip and changes with every commit, while `main`
-> images track the last publish rather than the newest commit, so the two halves move at
-> different rates.
+> **What it starts.** Everything needed for both sync modes, change data capture
+> included — Kafka Connect, Debezium and the sink worker come up with the rest. They
+> are not an add-on: pick a streaming sync without them and the run fails a pre-flight
+> two minutes in rather than falling back to batch. On a machine that will only ever
+> run batch syncs, `curl -sSL … | RSYNC_PROFILES= bash` leaves the JVM out and drops
+> the memory floor back to 6 GB.
+>
+> **Settings go on the `bash` side of the pipe.** A `VAR=x` written before `curl` sets
+> it for `curl`, which never reads it, and the installer runs with the default — no
+> error, just the setting silently ignored. That is true of every variable here.
+>
+> Pass `RSYNC_REF=main` (as `curl -sSL … | RSYNC_REF=main bash`) to track the branch
+> instead. That install is not reproducible: the compose file comes from the branch tip
+> and changes with every commit, while `main` images track the last publish rather than
+> the newest commit, so the two halves move at different rates.
 
 ### Kubernetes
 

@@ -401,3 +401,95 @@ def test_a_documented_helm_test_is_backed_by_a_real_test_hook():
         "`helm.sh/hook: test` annotation -- `helm test` would print "
         "'TEST SUITE: None' and exit 0, which reads as a pass"
     )
+
+
+# ---------------------------------------------------------------------------
+# The Docker half of the same class. A command a reader copies out of a doc has
+# to do what the doc says it does -- but this one fails more quietly than a
+# missing --set, because it does not fail at all.
+
+_INSTALL_PIPE = re.compile(
+    r"((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)"   # assignments before curl
+    r"curl\b[^\n`]*?\|\s*"                    # the fetch, up to the pipe
+    r"((?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*)"   # assignments before the shell
+    r"(?:ba)?sh\b"
+)
+_RSYNC_ASSIGNMENT = re.compile(r"\bRSYNC_[A-Z0-9_]*=")
+
+
+def _documented_install_pipes():
+    """(doc, line, pre_curl, pre_shell, whole) for every curl-pipe install of ours.
+
+    A backtick ends the match, so an inline `curl … | bash` in prose is captured
+    without swallowing the rest of the sentence. That matters: the broken form
+    this guards against was written in prose, not in a fence.
+
+    Ours means the match names this repo's raw URL or carries an RSYNC_ setting.
+    Third-party installers (ollama.com, get.docker.com) are documented here too
+    and are not this repo's to hold to a convention. The predicate repairs itself
+    for the case that matters -- put an RSYNC_ assignment on a pipe and it is in
+    scope by that alone, however the URL was abbreviated.
+
+    Shell is in the corpus alongside markdown because install.sh documents its
+    own settings in a comment block, and a first pass of this guard read only
+    markdown -- which left the one file whose behaviour is at stake outside the
+    detector, while it carried two copies of the broken form. A guard whose
+    corpus excludes the subject it is about is the defect it was written for.
+    """
+    names = subprocess.run(
+        ["git", "-C", REPO_ROOT, "ls-files", "-z", "--", "*.md", "*.sh"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split("\0")
+    names = [n for n in names if n]
+    assert len(names) > 20 and "install.sh" in names, (
+        f"git ls-files found {len(names)} files and "
+        f"{'did' if 'install.sh' in names else 'did NOT'} find install.sh; this "
+        "sweep would be near-vacuous -- wrong cwd, or the repo is not checked out"
+    )
+    out = []
+    for rel in names:
+        with open(os.path.join(REPO_ROOT, rel), encoding="utf-8") as fh:
+            text = fh.read()
+        for m in _INSTALL_PIPE.finditer(text):
+            whole = m.group(0)
+            if "rsync-ai/rsync" not in whole and not _RSYNC_ASSIGNMENT.search(whole):
+                continue
+            line = text[: m.start()].count("\n") + 1
+            out.append((rel, line, m.group(1), m.group(2), whole))
+    return out
+
+
+def test_a_documented_setting_is_passed_where_the_installer_can_read_it():
+    """`VAR=x curl … | bash` sets VAR for curl. The installer never sees it.
+
+    No error and no warning: the pipe runs, the install reports success, and the
+    setting the reader asked for was silently the default. That is worse than a
+    command that fails, and this repo shipped it -- the CDC opt-out was first
+    documented in exactly that form, on the one path that turns the JVM off.
+    """
+    pipes = _documented_install_pipes()
+    docs = {rel for rel, *_ in pipes}
+    quickstart = os.path.join("docs", "getting-started", "quickstart.md")
+    assert {"README.md", quickstart, "install.sh"} <= docs, (
+        f"the documented install command is not in the work list: {sorted(docs)}. "
+        "A rewritten URL or a renamed fence makes every assertion below vacuous"
+    )
+    # Positive control. "No assignment on the curl side" is trivially true of a
+    # corpus that documents no settings at all, so require one on the right side.
+    assert any(_RSYNC_ASSIGNMENT.search(post) for _, _, _, post, _ in pipes), (
+        "no documented install pipe passes an RSYNC_ setting at all, so this test "
+        "would pass over a corpus that never exercises the thing it checks"
+    )
+    bad = [
+        f"{rel}:{line}  {whole.strip()}"
+        for rel, line, pre, _post, whole in pipes
+        if _RSYNC_ASSIGNMENT.search(pre)
+    ]
+    assert not bad, (
+        "these documented commands set an RSYNC_ variable for `curl`, which never "
+        "reads it, so the installer runs with the default and says nothing about "
+        "it. Move the assignment right of the pipe (`curl … | RSYNC_X=y bash`):\n  "
+        + "\n  ".join(bad)
+    )
