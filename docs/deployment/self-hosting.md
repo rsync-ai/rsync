@@ -526,8 +526,9 @@ services:
     volumes: *kafka-certs
   llm-service:
     volumes: *kafka-certs
-  # The three below belong to the `cdc` profile — a default `up` renders without
-  # them, and naming a service that is not in the active profile is harmless.
+  # The three below belong to the `cdc` profile. The installer activates it, so a
+  # default install runs them; a compose command you type yourself carries no
+  # profile flag, which is what the `--profile cdc` below is for.
   debezium-mcp:
     volumes: *kafka-certs
   kafka-mcp-sink-mcp:
@@ -540,8 +541,12 @@ services:
 ```bash
 docker compose -f docker-compose.quickstart.yml \
                -f docker-compose.byo-kafka.yml \
-               -f docker-compose.kafka-certs.yml up -d
+               -f docker-compose.kafka-certs.yml --profile cdc up -d
 ```
+
+> The installer writes `COMPOSE_PROFILES` into the `.env` beside the compose file, so
+> a command run from the install directory picks the profile up from there and the flag
+> is redundant. Spell it out when you are working somewhere else.
 
 Confirm the mount reached every service before you restart anything —
 `config` is read-only and needs no daemon-side changes:

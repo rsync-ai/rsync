@@ -72,7 +72,7 @@ connector-deployer's job. Declare every connector your pipelines use under
 | App | api-gateway, orchestrator, temporal-adapter, frontend | on |
 | Infra (in-chart) | postgres, redis, kafka (KRaft), minio, temporal | on |
 | Connector plane | minio-mcp | on |
-| CDC plane | kafka-connect + debezium-mcp (one pod), kafka-mcp-sink | `connectors.cdc.enabled` |
+| CDC plane | kafka-connect + debezium-mcp (one pod), kafka-mcp-sink | on (`connectors.cdc.enabled`) |
 | Connectors | whatever is in `connectors.fleet` | empty |
 | Generation | llm-service, tool-generator, planner | on (`generation.enabled`) |
 | Cluster plumbing | Ingress, NetworkPolicy, PodDisruptionBudget | off |

@@ -89,7 +89,14 @@ FLEET=(mcp-postgresql)
 # needs before any pod can start. Named separately from FLEET because FLEET
 # mirrors the `connectors.fleet` values key and sample-data is a different key
 # (connectors.sampleData) that is on by default.
-DEFAULTSET=(api-gateway orchestrator temporal-adapter frontend connector-seed mcp-minio mcp-sample-data llm-service-oss connector-lifecycle)
+#
+# The last three arrived when connectors.cdc.enabled flipped to true. They are
+# the same three names KAFKA_PATH already carries, and the overlap is not a
+# duplicate: KAFKA_PATH is "what a Kafka-security test can be wrong about",
+# this is "what a cluster cannot start without". A default install that omits
+# them does not fall back to batch -- the orchestrator's infra pre-flight
+# requires all three together and fails the first streaming pipeline.
+DEFAULTSET=(api-gateway orchestrator temporal-adapter frontend connector-seed mcp-minio mcp-sample-data llm-service-oss connector-lifecycle kafka-connect mcp-debezium mcp-kafka-sink)
 
 case "${1:-}" in
   ""    ) WANT=("${KAFKA_PATH[@]}") ;;

@@ -260,6 +260,17 @@ jobs:
               # its exemption -- would otherwise touch nothing this filter matches.
               - 'backend-temporal-adapter/cmd/adapter/main.go'
               - 'api-gateway/cmd/server/main.go'
+              # A ninth time, same shape.
+              # test_both_install_paths_start_the_cdc_plane.py holds the docker
+              # and kubernetes installs to one promise: a default install can
+              # run the sync modes the UI offers. The reason there is no
+              # degraded path lives in this Go file -- the pre-flight builds its
+              # required-service list from sync_mode and demands all three CDC
+              # services together. Rename one there and the guard's premise is
+              # stale, which is precisely when it must run; every other subject
+              # it reads is already matched, so without this path that PR would
+              # skip the job.
+              - 'backend-orchestrator/internal/workers/infra_preflight.go'
             e2e:
               - 'e2e/_support/**'
               - '.github/workflows/ci.yml'
