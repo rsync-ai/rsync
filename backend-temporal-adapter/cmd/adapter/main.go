@@ -120,10 +120,10 @@ func requireRealEncryptionKey() {
 }
 
 func main() {
-	// Structured JSON logging + trace-context hook (log-trace correlation in SigNoz)
+	// Structured JSON logging + trace-context hook (log-trace correlation)
 	telemetry.InitLogging("temporal-adapter")
 
-	// OTel tracer → OTEL Collector → SigNoz
+	// OTel tracer → OTel Collector → your OTLP backend
 	shutdownTracer, err := telemetry.InitTracer("temporal-adapter")
 	if err != nil {
 		log.Warnf("OTel tracer init failed (non-fatal): %v", err)
@@ -140,7 +140,7 @@ func main() {
 	log.Info("🚀 Starting Temporal Adapter Service...")
 
 	// Prometheus /metrics endpoint (scraped by the OTEL Collector's
-	// `rsync-temporal-adapter` job → SigNoz). Internal-only port 8082;
+	// `rsync-temporal-adapter` job → the OTLP backend). Internal-only port 8082;
 	// no host mapping. F-Obs-2.
 	metricsAddr := getEnv("METRICS_ADDR", ":8082")
 	go func() {

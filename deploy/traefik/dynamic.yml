@@ -64,7 +64,6 @@ http:
   # docker labels (see docker-compose.prod.yml); this file carries only TLS
   # options and the reusable middlewares above.
   #
-  # If you run SigNoz off-box and want Traefik to proxy its UI, add a router and
-  # service here for YOUR hostname and YOUR SigNoz address — do not expect a
-  # default. If you run SigNoz as a container instead, deploy/signoz/docker/
-  # already carries the labels; set SIGNOZ_DOMAIN and SIGNOZ_TRAEFIK_ENABLE=true.
+  # If you run your own telemetry backend and want Traefik to proxy its UI, add a
+  # router and service here for YOUR hostname and YOUR backend address — this repo
+  # ships no observability backend, so there is no default to inherit.

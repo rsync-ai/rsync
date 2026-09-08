@@ -3,7 +3,8 @@ import { isLeakedLocalhostUrl } from "@/lib/config/api"
 
 // Regression guard for the localhost-leak hardening (see @/lib/config/api).
 // isLeakedLocalhostUrl() is the primitive used to HIDE links to separate hosts
-// (SigNoz, a connector's Docker health port, Superset) that can't be same-origin
+// (an observability backend, a connector's Docker health port, Superset) that
+// can't be same-origin
 // rebased, so a mis-baked localhost value never becomes a dead link in prod.
 
 const realLocation = window.location

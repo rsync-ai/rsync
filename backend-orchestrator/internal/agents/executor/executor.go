@@ -303,7 +303,7 @@ func resolveDestinationNamespace(ctx context.Context, db *sql.DB, task ExecutorT
 		resolved, source = dbVal, "pipelines.config"
 	}
 
-	// Observability: every namespace decision is traceable in SigNoz. This is
+	// Observability: every namespace decision is traceable in the logs. This is
 	// the single point that determines where reload DROP + ownership land.
 	log.WithFields(log.Fields{
 		"pipeline_id": task.PipelineID,
@@ -1044,7 +1044,7 @@ func (a *Agent) handleMessage(message *sarama.ConsumerMessage) error {
 		log.Infof("✅ Task %s completed successfully", task.TaskID)
 	} else {
 		// Scrub row values / PII from the connector/DB error before it hits the
-		// log stream (ships to SigNoz). Raw driver errors embed offending row
+		// log stream (ships to the telemetry backend). Raw driver errors embed offending row
 		// data (e.g. "Duplicate entry 'jane@acme.com'", "Failing row contains …").
 		log.Errorf("❌ Task %s failed: %s", task.TaskID, llmscrub.Scrub(response.Error))
 	}
@@ -5347,7 +5347,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 				}
 			case landed < dispatchedRows:
 				// Benign undercount only reaches here now (tier 3: received>=dispatched,
-				// upsert/dedup merged, or version-skew received==0). Surface for SigNoz but
+				// upsert/dedup merged, or version-skew received==0). Surface in the logs but
 				// do NOT fail — real receipt shortfalls were caught as UnverifiedCompletion.
 				log.Warnf("⚠️ Landed-row reconciliation: dispatched %d but ack ledger shows %d landed (execution %s); received=%d (benign upsert/dedup or ledger skew)", dispatchedRows, landed, executionID, received)
 			}

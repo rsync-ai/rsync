@@ -13,10 +13,6 @@ export interface FeatureFlags {
   monitoringOverview: boolean
   monitoringInfra: boolean
   monitoringTraces: boolean
-  sigNozDeepLinks: boolean
-  
-  // SigNoz availability
-  sigNozAvailable: boolean
 }
 
 /**
@@ -35,12 +31,6 @@ export const DEFAULT_FEATURES: FeatureFlags = {
     process.env.NEXT_PUBLIC_FEATURE_MONITORING_TRACES,
     process.env.NODE_ENV === 'development'
   ),
-  
-  // SigNoz deep links - defaults to ON
-  sigNozDeepLinks: parseBool(process.env.NEXT_PUBLIC_FEATURE_SIGNOZ_DEEPLINKS, true),
-  
-  // SigNoz availability
-  sigNozAvailable: Boolean(process.env.NEXT_PUBLIC_SIGNOZ_UI_URL),
 }
 
 /**
@@ -169,8 +159,6 @@ export async function fetchFeatureFlags(apiUrl: string): Promise<void> {
         monitoringOverview: data.monitoring_overview ?? DEFAULT_FEATURES.monitoringOverview,
         monitoringInfra: data.monitoring_infra ?? DEFAULT_FEATURES.monitoringInfra,
         monitoringTraces: data.monitoring_traces ?? DEFAULT_FEATURES.monitoringTraces,
-        sigNozDeepLinks: data.signoz_deeplinks ?? DEFAULT_FEATURES.sigNozDeepLinks,
-        sigNozAvailable: data.signoz_available ?? DEFAULT_FEATURES.sigNozAvailable,
       })
     }
   } catch (error) {

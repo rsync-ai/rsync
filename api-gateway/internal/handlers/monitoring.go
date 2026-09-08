@@ -34,7 +34,6 @@ type MonitoringOverview struct {
 	Infrastructure      *InfrastructureSummary `json:"infrastructure,omitempty"`
 	InfrastructureError string                 `json:"infrastructure_error,omitempty"`
 	Correlations        []Correlation          `json:"correlations,omitempty"`
-	Links               MonitoringLinks        `json:"links"`
 }
 
 // TimeRange represents the query time window
@@ -123,13 +122,6 @@ type Correlation struct {
 	Method        string         `json:"method"` // trace_id_match, time_window_semantic
 }
 
-// MonitoringLinks provides deep-links to external tools
-type MonitoringLinks struct {
-	SigNozTrace     string `json:"signoz_trace,omitempty"`
-	SigNozMetrics   string `json:"signoz_metrics,omitempty"`
-	SigNozDashboard string `json:"signoz_dashboard,omitempty"`
-}
-
 // PaginatedIssuesResponse wraps paginated Sentinel issues
 type PaginatedIssuesResponse struct {
 	Issues     []SentinelIssue `json:"issues"`
@@ -185,7 +177,6 @@ func GetPipelineMonitoringOverview(c *gin.Context) {
 	overview := MonitoringOverview{
 		PipelineID: pipelineID,
 		TimeRange:  timeRange,
-		Links:      generateMonitoringLinks(features, pipelineID, ""),
 	}
 
 	// Fetch agent reasoning summary (graceful degradation)
@@ -865,21 +856,4 @@ func computeCorrelations(decisions []AgentDecision, issues []SentinelIssue) []Co
 	}
 
 	return correlations
-}
-
-func generateMonitoringLinks(features *config.FeatureFlags, pipelineID, traceID string) MonitoringLinks {
-	links := MonitoringLinks{}
-
-	if features == nil || !features.SigNozDeepLinks {
-		return links
-	}
-
-	if traceID != "" {
-		links.SigNozTrace = features.GetSigNozTraceURL(traceID)
-	}
-
-	links.SigNozMetrics = features.GetSigNozMetricsURL("/dashboard")
-	links.SigNozDashboard = features.GetSigNozMetricsURL("/")
-
-	return links
 }

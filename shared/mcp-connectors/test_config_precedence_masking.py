@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Guard: _enforce_config_precedence must not log api_key/token VALUES.
 
-Connector stdout ships to SigNoz, so a cleartext credential in the override
+Connector stdout ships to the log backend, so a cleartext credential in the override
 warning would be persisted. This mirrors the Go twin's security.IsSensitiveKey
 guard in backend-orchestrator/internal/mcp/client.go. Non-secret keys (host,
 user, port, database) still log their values for debuggability.

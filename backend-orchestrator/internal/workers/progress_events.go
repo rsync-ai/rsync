@@ -157,7 +157,7 @@ func normalizeProgressEvent(ctx context.Context, event *ProgressEvent) error {
 		return fmt.Errorf("event_type is required")
 	}
 
-	// Ensure trace_id is present for end-to-end correlation (SigNoz).
+	// Ensure trace_id is present for end-to-end correlation.
 	// Prefer the active OTel trace from context; fall back to execution_id; then pipeline_id.
 	if event.TraceID == "" {
 		if tid := telemetry.TraceIDFromContext(ctx); tid != "" {

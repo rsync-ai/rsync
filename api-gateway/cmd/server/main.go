@@ -602,7 +602,7 @@ func main() {
 	// auth-failure (401/403) and pipeline-run-trigger counters. Installed
 	// right after tracing so it observes the final status of every handler.
 	// Exposed on /metrics (below) and scraped by the otel-collector's
-	// prometheus receiver → SigNoz. F-Obs-2.
+	// prometheus receiver → the OTLP backend. F-Obs-2.
 	r.Use(metrics.HTTPMetricsMiddleware())
 
 	// Prometheus /metrics — Go runtime + process metrics out of the box.

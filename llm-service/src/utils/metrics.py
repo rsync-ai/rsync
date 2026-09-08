@@ -1,8 +1,8 @@
 """Application-level Prometheus metrics for llm-service.
 
-SigNoz-native observability (F-Obs-2, Obs-LLMService): each FastAPI app
+OTLP-native observability (F-Obs-2, Obs-LLMService): each FastAPI app
 mounts a pull-only ``/prometheus`` ASGI endpoint that the OTEL Collector's
-``rsync-llm-*`` scrape jobs read and forward to SigNoz. No separate
+``rsync-llm-*`` scrape jobs read and forward over OTLP. No separate
 Prometheus/Grafana stack.
 
 Why ``/prometheus`` and not ``/metrics``: gateway/service.py already serve
@@ -17,7 +17,7 @@ Cardinality is bounded by design:
   - ``kind``     = prompt | completion (token direction).
 
 NO free-form labels (prompt text, user id, request id). Per-call drill-down
-lives in traces/logs in SigNoz, correlated by trace id.
+lives in the traces and logs, correlated by trace id.
 
 Double-counting note: only DIRECT provider calls are recorded here — the
 gateway's OpenAI clients and tool-generator's BaseAgent. The planner and

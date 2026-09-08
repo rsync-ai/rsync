@@ -118,7 +118,7 @@ func TracingMiddleware(serviceName string) gin.HandlerFunc {
 				attribute.String("http.method", c.Request.Method),
 				// Redact sensitive query params (e.g. ?token= on WebSocket upgrade)
 				// before recording the URL in traces — session tokens in OTel spans
-				// would be visible to anyone with SigNoz read access.
+				// would be visible to anyone with read access to the logs.
 				attribute.String("http.url", redactSensitiveQueryParams(c.Request.URL)),
 				attribute.String("http.route", c.FullPath()),
 				attribute.String("http.host", c.Request.Host),

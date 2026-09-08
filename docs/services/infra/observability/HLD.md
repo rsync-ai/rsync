@@ -5,12 +5,16 @@ rsync-ai uses a lightweight observability stack to enable:
 - structured JSON logging for all services
 - trace-log correlation via OpenTelemetry
 - **domain metrics** (RED-style + business counters) scraped from each service
-- forwarding to SigNoz (run separately) as the single backend for logs, traces, **and metrics**
+- forwarding over OTLP to one backend of your choosing for logs, traces, **and metrics**
 
-SigNoz is the single observability backend. A parallel Prometheus + Grafana +
+One OTLP backend receives everything. A parallel Prometheus + Grafana +
 Alertmanager stack was deliberately rejected — a second pane of glass breaks
 trace↔metric correlation. Services expose pull-only Prometheus endpoints; the
 OTel Collector scrapes them and forwards over OTLP. No extra containers.
+
+No observability backend ships with this repo. The bundled collector is the
+seam: point `OTLP_BACKEND_ENDPOINT` at whatever you run. Details and the
+backend-free story (`docker compose logs`) are in `deploy/TELEMETRY.md`.
 
 ### Components
 - **Fluent Bit**
@@ -19,7 +23,7 @@ OTel Collector scrapes them and forwards over OTLP. No extra containers.
 - **OpenTelemetry Collector**
   - receives logs and traces (OTLP)
   - **`prometheus` receiver** scrapes each service's metrics endpoint (15s)
-  - exports logs, traces, and metrics to SigNoz / OTLP backends
+  - exports logs, traces, and metrics to the configured OTLP backend
 - **Per-service metrics endpoints** (pull-only, no backend of their own):
   - Go services use `promauto` collectors + `promhttp` at `/metrics`
   - Python (llm-service) uses `prometheus_client` mounted at `/prometheus`

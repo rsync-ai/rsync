@@ -153,8 +153,8 @@ export function PipelineDetailTabsClient(props: {
           <CDCLagAlertsPanel pipelineId={pipelineId} />
         )}
         <MonitorTab pipelineId={pipelineId} />
-        {/* Rich monitoring (Agent Reasoning / Data Plane / SigNoz) — moved here
-            from the Overview tab to remove the duplicate monitoring surface. */}
+        {/* Rich monitoring (Overview / Trace event history) — moved here from
+            the Overview tab to remove the duplicate monitoring surface. */}
         <PipelineMonitoringPanelNoSSR pipelineId={pipelineId} variant="monitoring" />
       </TabsContent>
       </Tabs>

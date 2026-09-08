@@ -198,7 +198,7 @@ func CheckActiveRunActivity(ctx context.Context, pipelineID string) (bool, error
 	// therefore keeps skipping, and this skip is the ONLY trace the scheduled run
 	// leaves anywhere (the wrapper returns nil before any execution row is
 	// created). Log a park at WARN, with how long it has lasted, so a bricked
-	// schedule is greppable in SigNoz instead of looking like a healthy no-op.
+	// schedule is greppable in the logs instead of looking like a healthy no-op.
 	// The user-facing counterpart is `blocked_reason` on the schedules API.
 	isActive := status == "processing" || status == "waiting_for_user"
 	if status == "waiting_for_user" {

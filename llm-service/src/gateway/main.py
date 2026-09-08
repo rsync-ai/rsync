@@ -638,7 +638,7 @@ app = FastAPI(title="LLM Gateway")
 # Instrument FastAPI with OpenTelemetry
 instrument_fastapi(app)
 
-# Prometheus metrics endpoint (/prometheus) — scraped by OTEL Collector → SigNoz. F-Obs-2.
+# Prometheus metrics endpoint (/prometheus) — scraped by the OTEL Collector. F-Obs-2.
 from src.utils.metrics import mount_metrics
 mount_metrics(app)
 

@@ -693,14 +693,13 @@ services:
       REDIS_PORT: 6379
       REDIS_DB: 0
       REDIS_PASSWORD: ${REDIS_PASSWORD}
-      # This bundle ships no OTLP collector, same as SIGNOZ_LOGS_ENRICH further
-      # down. The gRPC exporter connects lazily, so an absent collector is not a
-      # startup error: the BatchSpanProcessor just queues and retries every batch
-      # at localhost:4317 for the life of the process, blocking a worker for the
-      # full export timeout each time. The code default is true (cloud runs
-      # SigNoz); only this file turns it off, per the OSS/cloud split rule in
-      # CLAUDE.md. Spans are still created, they are simply not shipped —
-      # observability here is `docker logs`.
+      # This bundle ships no OTLP collector. The gRPC exporter connects lazily,
+      # so an absent collector is not a startup error: the BatchSpanProcessor just
+      # queues and retries every batch at localhost:4317 for the life of the
+      # process, blocking a worker for the full export timeout each time. The code
+      # default is true (cloud exports to a collector); only this file turns it
+      # off, per the OSS/cloud split rule in CLAUDE.md. Spans are still created,
+      # they are simply not shipped — observability here is `docker logs`.
       OTEL_ENABLED: "false"
       LOG_FORMAT: json
       LOG_LEVEL: info
@@ -989,7 +988,7 @@ services:
       EXECUTOR_TABLE_CONCURRENCY: ${EXECUTOR_TABLE_CONCURRENCY:-}
       EXECUTOR_TABLE_BATCH_ROWS: ${EXECUTOR_TABLE_BATCH_ROWS:-}
       DOCKER_NETWORK: rsync-ai-mcp
-      # No collector in this bundle — same reason as SIGNOZ_LOGS_ENRICH below.
+      # No collector in this bundle — same reason as the llm-service block above.
       # internal/config/config.go:231 defaults this to true for cloud; the OSS
       # compose is the only place it is turned off.
       OTEL_ENABLED: "false"
@@ -1159,19 +1158,13 @@ services:
       # attacker-controllable. Disable Cloudflare client-IP trust here; cloud
       # leaves this unset => enabled. See trustCloudflareClientIP() in api-gateway.
       RSYNC_TRUST_CLOUDFLARE: "false"
-      # Diagnose enriches its evidence with log lines from self-hosted SigNoz.
-      # This stack ships no SigNoz, and signozLogsHTTPURL()
-      # (api-gateway/internal/handlers/signoz_logs.go) defaults to
-      # http://host.docker.internal:8123 when nothing is set — a name that does
-      # not even resolve under Linux Docker. The path is fail-soft, so the only
-      # symptom is every diagnose call paying a pointless connect timeout first.
-      SIGNOZ_LOGS_ENRICH: "false"
-      # Second half of the same fact: no SigNoz here also means no OTLP collector
-      # to export spans to. LoadTelemetryConfig defaults this to true (cloud runs
-      # one), and until now InitTracerWithConfig ignored the flag entirely, so
-      # every self-host retried gRPC exports at localhost:4317 forever. Only this
-      # file turns it off, per the OSS/cloud split rule in CLAUDE.md; the tracer
-      # falls back to a no-op provider, so instrumented paths keep working.
+      # This bundle ships no OTLP collector to export spans to.
+      # LoadTelemetryConfig defaults this to true (cloud runs one), and until now
+      # InitTracerWithConfig ignored the flag entirely, so every self-host retried
+      # gRPC exports at localhost:4317 forever. Only this file turns it off, per
+      # the OSS/cloud split rule in CLAUDE.md; the tracer falls back to a no-op
+      # provider, so instrumented paths keep working. Observability in this
+      # bundle is `docker compose logs`.
       OTEL_ENABLED: "false"
       RSYNC_ADMIN_EMAILS: ${RSYNC_ADMIN_EMAILS:-}
       OAUTH_CALLBACK_URL: ${OAUTH_CALLBACK_URL:-}

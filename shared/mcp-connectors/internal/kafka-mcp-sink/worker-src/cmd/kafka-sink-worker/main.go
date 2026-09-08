@@ -51,7 +51,7 @@ func loadStr(v *atomic.Value) string {
 // carrying free-form text is the leak path (destination drivers embed offending
 // row values in their error strings), and new fields are far more often error
 // text than new coordinates. A structural field left off this list gets its
-// digits masked, which is ugly in SigNoz; a value field wrongly exempted ships
+// digits masked, which is ugly in a log viewer; a value field wrongly exempted ships
 // customer data. Only the first failure mode is acceptable.
 //
 // Counts (rows_written, raw_count, …) MUST be listed: reScrubLongDigits masks
@@ -115,7 +115,7 @@ func scrubLogValue(key string, v any) any {
 // nothing: logf and logMsgEvent scrubbed their message text on the way in, but
 // every logEvent caller that passed an error through a FIELD ("error",
 // err.Error()) shipped the raw driver error — row values and all — straight to
-// SigNoz, violating the metadata-only privacy rule. Scrubbing here covers the
+// the log backend, violating the metadata-only privacy rule. Scrubbing here covers the
 // message and every field on every path, including direct logEvent callers.
 func logEvent(level, msg string, fields ...any) {
 	rec := map[string]any{
@@ -155,7 +155,7 @@ func logf(level, format string, a ...any) {
 // nil (e.g. before parse or in low-level read paths); when nil or empty, trace_id
 // and table are pulled from the Kafka message headers so the line is still
 // correlatable. The field is named exactly "trace_id" so the otel-collector
-// promotes it to SigNoz's typed trace field (enabling trace↔log correlation).
+// promotes it to the typed OTLP trace field (enabling trace↔log correlation).
 func logMsgEvent(level string, sm *SinkMessage, msg kafka.Message, text string, fields ...any) {
 	traceID, table := "", ""
 	if sm != nil {
@@ -183,7 +183,7 @@ func logMsgEvent(level string, sm *SinkMessage, msg kafka.Message, text string, 
 //
 // Why a fingerprint and not the key itself: the PK is customer ROW DATA — an
 // email primary key is PII — and logSafeFields exists precisely to stop values
-// reaching SigNoz. A fingerprint still answers the only forensic question a
+// reaching the log backend. A fingerprint still answers the only forensic question a
 // wrong-row delete poses: take the row that vanished, hash its key, and grep the
 // logs for the match. Logging the value would answer the same question by
 // shipping the data, which the metadata-only privacy rule forbids.
@@ -7465,7 +7465,7 @@ func callDestinationTool(ctx context.Context, httpClient *http.Client, cfg *Work
 			continue
 		}
 		// DIAG: destination tool call succeeded — log tool + any returned row/table info
-		// so a "completed but 0 rows" run is fully traceable in SigNoz.
+		// so a "completed but 0 rows" run is fully traceable in the logs.
 		logEvent("info", "destination tool call ok", "tool", toolName, "host", host,
 			"table", toString(res["table"]), "rows_written", toString(res["rows_written"]),
 			"rows", toString(res["rows"]), "imported", toString(res["imported"]))
@@ -8440,7 +8440,7 @@ func sendToDLQ(ctx context.Context, w *kafka.Writer, msg kafka.Message, err erro
 			// Always log every DLQ routing so a bad record is never silently
 			// shed. A DLQ routing is a recoverable bad-record event → warn.
 			// trace_id/table come from the source message headers so the line
-			// is correlatable in SigNoz even though sm is not in scope here.
+			// is correlatable in the logs even though sm is not in scope here.
 			logEvent("warn", "message routed to DLQ",
 				"trace_id", strings.TrimSpace(string(headerValue(msg.Headers, "trace_id"))),
 				"table", strings.TrimSpace(string(headerValue(msg.Headers, "table"))),

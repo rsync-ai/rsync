@@ -483,7 +483,7 @@ import logging  # noqa: E402
 import re  # noqa: E402
 # -----------------------------------------------------------------------------
 # Privacy contract: connector logs must not leak customer row values,
-# credentials, or PII to the log backend (SigNoz). DB drivers embed failing-row
+# credentials, or PII to the log backend. DB drivers embed failing-row
 # values in error text — e.g. Postgres "Key (email)=(a@b.com)" or "Failing row
 # contains (...)" — which base_connector logs verbatim at the Query/Import leak
 # sites. This scrubber redacts those before the record is emitted.
@@ -1886,7 +1886,7 @@ class BaseMCPConnector(ABC):
                 if key in params and str(params[key]) != str(val):
                     _kl = str(key).lower()
                     if any(_s in _kl for _s in ("password", "passwd", "secret", "token", "credential", "api_key", "apikey", "access_key", "private_key")):
-                        # SECURITY: never log credential values here — connector stdout ships to SigNoz.
+                        # SECURITY: never log credential values here — connector stdout is shipped to the log backend.
                         # Mirrors the Go twin's security.IsSensitiveKey guard (backend-orchestrator/internal/mcp/client.go).
                         self.log(f"⚠️  Enforcing config for '{key}': overriding plan value with connection config (sensitive value masked)")
                     else:

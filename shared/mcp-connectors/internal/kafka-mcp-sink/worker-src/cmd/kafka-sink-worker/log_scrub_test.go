@@ -41,7 +41,7 @@ func captureLogEvent(t *testing.T, fn func()) map[string]any {
 // The leak this closes, observed live on prod 2026-07-31: a destination driver
 // error carrying the offending ROW VALUES was passed through a logEvent FIELD.
 // logf/logMsgEvent scrubbed their message text, but nothing scrubbed fields, so
-// the raw values shipped to SigNoz — a metadata-only privacy rule violation.
+// the raw values shipped to the log backend — a metadata-only privacy rule violation.
 func TestLogEventScrubsErrorField(t *testing.T) {
 	pgErr := `ERROR: duplicate key value violates unique constraint "customers_email_key" ` +
 		`(SQLSTATE 23505) DETAIL: Key (email)=(alice@example.com) already exists. ` +

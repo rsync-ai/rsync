@@ -122,7 +122,8 @@ export const LLM_SERVICE_URL = rebaseLeakedLocalhost(
 // True when `url` points at a loopback host while the current page is on a real
 // (non-localhost) origin — i.e. a build-time-baked localhost value that would be
 // a dead/incorrect link if shown to the browser. Use this to HIDE links to
-// SEPARATE hosts (SigNoz, a connector's Docker health port, Superset, …) that
+// SEPARATE hosts (an observability backend, a connector's Docker health port,
+// Superset, …) that
 // legitimately cannot be same-origin rebased. Returns false on the server and on
 // a localhost page origin, so SSR output and local dev are unaffected.
 export function isLeakedLocalhostUrl(url: string | null | undefined): boolean {

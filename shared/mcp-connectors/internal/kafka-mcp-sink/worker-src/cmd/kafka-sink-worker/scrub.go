@@ -13,7 +13,7 @@ package main
 // their error text (Postgres "DETAIL: Key (email)=(alice@example.com)…",
 // "Failing row contains (…)"; MySQL "Duplicate entry 'jane@acme.com'…"), and
 // the sink logs those errors verbatim on DLQ-routing / flush failures. Those
-// lines ship to SigNoz, so they must be scrubbed first.
+// lines ship to the log backend, so they must be scrubbed first.
 //
 // The lockstep is enforced, not just asserted: scrub_golden_parity_test.go pins
 // scrubLog to shared/scrubber_golden.json, the same fixture the orchestrator and

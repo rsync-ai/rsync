@@ -67,17 +67,6 @@ func DiagnosePipeline(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Phase 3b: pull the verbatim SigNoz log lines for the stalled/failed stage
-	// (fail-soft — attaches nothing if SigNoz is unavailable).
-	if flow, ok := evidence["flow"].(map[string]interface{}); ok {
-		enrichFlowWithSigNozLogs(ctx, flow)
-	}
-
-	// When inserted_rows == 0, pull sink write errors by pipeline_id so the LLM
-	// sees the actual error text (e.g. missing PK / ON CONFLICT constraint) and
-	// can give an actionable diagnosis instead of a generic "silent drop" report.
-	enrichEvidenceWithSinkErrors(ctx, pipelineID, evidence)
-
 	verdict, status, err := callDiagnoseLLM(ctx, pipelineID, evidence)
 	if err != nil {
 		// Even if the LLM call fails we still return the evidence — that's

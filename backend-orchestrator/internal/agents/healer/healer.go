@@ -1324,7 +1324,7 @@ func (a *Agent) recordHealingResult(ctx context.Context, result *HealingResult) 
 	}
 
 	// F-Obs-2: record the schema-change healing action by change type and
-	// resolved outcome so the SigNoz "Healer actions by outcome" panel and
+	// resolved outcome so a "Healer actions by outcome" dashboard panel and
 	// the escalation alert have data. Both labels are bounded enums.
 	appmetrics.HealerActionsTotal.
 		WithLabelValues(result.ChangeType, healingOutcome(result.Status)).

@@ -161,7 +161,7 @@ func InitTracer(serviceName string) (shutdown func(context.Context) error, err e
 		propagation.Baggage{},
 	))
 
-	log.WithField("endpoint", endpoint).Info("✅ OTel tracer initialised → SigNoz")
+	log.WithField("endpoint", endpoint).Info("✅ OTel tracer initialised")
 
 	return func(ctx context.Context) error {
 		return tp.Shutdown(ctx)

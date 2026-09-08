@@ -15,11 +15,11 @@ import (
 // but buries the single most useful triage fact: *which stage did the run reach,
 // and where did it stall?* This file folds the pipeline_run_events stream onto
 // the canonical stage sequence so that fact is computed deterministically (no LLM
-// guess, no SigNoz dependency) and surfaced as evidence.
+// guess, no telemetry-backend dependency) and surfaced as evidence.
 //
-// SigNoz log enrichment (pulling the actual error log lines for the stalled
-// stage via its trace_id) is a deliberate follow-up — this is the robust
-// structural backbone it will hang off.
+// The stall point's trace_id is carried through so an operator can pull the
+// matching log lines out of `docker compose logs` (or their own OTLP backend, if
+// they run one) — this is the structural backbone that correlation hangs off.
 
 // canonicalPipelineStages is the ordered backbone of a batch pipeline run, as
 // emitted by the Temporal workflow (nl_pipeline_v2_workflow.go emitStageEvent).
@@ -49,7 +49,7 @@ type stageState struct {
 	startedAt   *time.Time
 	finishedAt  *time.Time // completion or failure time
 	severity    string
-	traceID     string // OTel trace_id carried on the stage's events (for SigNoz log enrichment)
+	traceID     string // OTel trace_id carried on the stage's events (for log correlation)
 }
 
 // computePipelineFlow reads the pipeline_run_events stream for the given
@@ -199,7 +199,7 @@ func computePipelineFlow(database *sql.DB, pipelineID, executionID, syncMode str
 		stalled = firstIncomplete
 	}
 
-	// trace_id to hang SigNoz log enrichment off: prefer the stalled/failed stage's
+	// trace_id to hang log correlation off: prefer the stalled/failed stage's
 	// own trace, fall back to the run's most recent trace when the stall point never
 	// emitted one (e.g. a "not_reached" stage). Empty when no event carried a trace.
 	stalledTraceID := ""

@@ -10,7 +10,7 @@ import (
 // =============================================================================
 // This hook automatically injects trace_id and span_id into every log entry
 // when a valid trace context is available. This enables log-trace correlation
-// in observability backends like SigNoz.
+// in an OTLP observability backend.
 //
 // The sidecar OTEL Collector parses these fields from JSON logs and correlates
 // them with spans received via OTLP.

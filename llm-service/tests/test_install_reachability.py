@@ -78,9 +78,9 @@ def test_every_service_naming_the_host_alias_can_resolve_it(compose_file):
     unattended install with no `OPENAI_API_KEY`, and Ollama's default URL is this
     name, so the default path and the platform that breaks it are the same path.
 
-    Comments naming the alias are deliberately not matched: `api-gateway` explains
-    in prose why it disables the SigNoz enrichment that would otherwise dial this
-    name, and that service correctly needs no mapping.
+    Comments naming the alias are deliberately not matched: several services
+    explain in prose why they disable an integration that would otherwise dial
+    this name, and those services correctly need no mapping.
     """
     services = _services(compose_file)
     assert len(services) >= 10, (

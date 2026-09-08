@@ -27,7 +27,7 @@ func respondError(c *gin.Context, status int, code string, publicMessage string,
 
 	if err != nil {
 		// Scrub the error before logging — provider/DB error strings routinely
-		// carry DSNs, row values, tokens, and other secrets bound for SigNoz.
+		// carry DSNs, row values, tokens, and other secrets bound for the log backend.
 		log.WithField("error", llmscrub.Scrub(err.Error())).WithFields(log.Fields{
 			"status": status,
 			"code":   code,

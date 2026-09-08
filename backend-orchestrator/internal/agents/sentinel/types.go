@@ -180,9 +180,9 @@ type SentinelConfig struct {
 	// Stale component eviction — how long to keep a dead component in memory before removing it
 	StaleComponentTTL time.Duration
 
-	// SigNoz export
-	EnableSigNozExport   bool
-	SigNozEndpoint       string
+	// OTLP metrics export
+	EnableMetricsExport  bool
+	MetricsOTLPEndpoint  string
 	MetricExportInterval time.Duration
 }
 
@@ -204,8 +204,8 @@ func DefaultSentinelConfig() *SentinelConfig {
 		StaleComponentTTL:            10 * time.Minute,
 		AnomalyStdDevThreshold:       3.0,
 		AnomalyWindowSize:            100,
-		EnableSigNozExport:           true,
-		SigNozEndpoint:               "http://otel-collector:4318",
+		EnableMetricsExport:          true,
+		MetricsOTLPEndpoint:          "http://otel-collector:4318",
 		MetricExportInterval:         30 * time.Second,
 	}
 }

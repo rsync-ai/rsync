@@ -49,10 +49,6 @@ debug
 .cursor/
 
 # ─── Project-specific ignores ─────────────────────────────────────────────────
-# Anchored to repo root: ignores a locally-cloned SigNoz runtime at /signoz/,
-# but NOT deploy/signoz/ (our committed dashboard + alert + README assets).
-/signoz/
-!deploy/signoz/
 logs/
 # docs/ is tracked in git — remove this line if you want to untrack it
 # docs/

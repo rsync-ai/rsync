@@ -91,9 +91,9 @@ INSERT INTO sentinel_config (config_key, config_value, description) VALUES
 ('issue_cooldown_period', '"5m"', 'Minimum time between reporting the same issue'),
 ('anomaly_stddev_threshold', '3.0', 'Standard deviations for anomaly detection'),
 ('anomaly_window_size', '100', 'Number of data points to keep for anomaly detection'),
-('enable_signoz_export', 'true', 'Enable metrics export to SigNoz'),
-('signoz_endpoint', '"http://otel-collector:4318"', 'SigNoz OTLP endpoint'),
-('metric_export_interval', '"30s"', 'Interval for exporting metrics to SigNoz')
+('enable_metrics_export', 'true', 'Enable OpenTelemetry metrics export over OTLP'),
+('metrics_otlp_endpoint', '"http://otel-collector:4318"', 'OTLP endpoint for exported metrics'),
+('metric_export_interval', '"30s"', 'Interval for exporting metrics over OTLP')
 ON CONFLICT (config_key) DO NOTHING;
 
 -- Component Health Status: Current health state of all components

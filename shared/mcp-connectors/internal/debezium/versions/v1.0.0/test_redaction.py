@@ -2,7 +2,7 @@
 """Unit tests for credential redaction in the Debezium MCP connector.
 
 These guard the fix that stops the source DB password from riding up into the
-orchestrator's tool-result (and from there into logs / SigNoz). The raw config
+orchestrator's tool-result (and from there into the logs). The raw config
 still POSTs to Kafka Connect unchanged — only what the connector RETURNS to the
 caller is redacted.
 

@@ -46,8 +46,8 @@ pytest 9.1.1 (2026-09-04):
 
 and in the second run the innocent SIBLING did not execute either, because one
 collection error aborts the whole session with exit 2. ``ci.yml`` passes
-directories, so conftest covers it; ``doc-links.yml`` names all twelve doc guards
-as FILES, so conftest covers none of it. Measured on the materialised public tree
+directories, so conftest covers it; ``doc-links.yml`` names every doc guard
+as a FILE, so conftest covers none of it. Measured on the materialised public tree
 before this was fixed: two modules read a cut file at import time, pytest exited 2,
 and 0 of those 12 guards ran.
 

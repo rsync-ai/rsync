@@ -82,7 +82,7 @@ opentelemetry-exporter-otlp==1.25.0
 opentelemetry-instrumentation-fastapi==0.46b0
 opentelemetry-instrumentation-requests==0.46b0
 
-# Prometheus metrics (pull-only /prometheus endpoint, scraped by OTEL Collector → SigNoz). F-Obs-2.
+# Prometheus metrics (pull-only /prometheus endpoint, scraped by the OTEL Collector). F-Obs-2.
 prometheus-client>=0.26.0
 
 # SQL Parsing & Transpilation
