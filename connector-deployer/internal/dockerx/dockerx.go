@@ -44,8 +44,10 @@ type ErrorKind int
 const (
 	// KindInternal is an unexpected server-side failure (500).
 	KindInternal ErrorKind = iota
-	// KindProtectedMissing: a compose-managed connector container is absent and must
-	// be started by `docker compose up`, never spawned here (409).
+	// KindProtectedMissing: refusing to tear down a compose-managed connector
+	// container, which docker compose owns (409). Deploy no longer raises this —
+	// an ABSENT compose-managed container is built on demand (see Deploy step 1);
+	// only Undeploy does.
 	KindProtectedMissing
 	// KindBuildFailed: the BuildKit CLI build returned non-zero (500).
 	KindBuildFailed
@@ -168,7 +170,8 @@ func (d *Deployer) Undeploy(ctx context.Context, name string) error {
 // Deploy mirrors docker_builder.py::start_container EXACTLY:
 //
 //  1. Protected compose containers: running ⇒ reuse (skip); stopped ⇒ start (never
-//     rebuild — may serve a live CDC stream); missing ⇒ 409 "run docker compose up".
+//     rebuild — may serve a live CDC stream); missing ⇒ nothing to protect, so
+//     fall through to the JIT path (see the note at the branch).
 //  2. Reuse running: an existing running container of this name with recreate=false ⇒ reuse.
 //  3. Remove a stale/stopped container of that name if present.
 //  4. Ensure image: build via the BuildKit CLI if the derived image is absent (or recreate).
@@ -179,25 +182,46 @@ func (d *Deployer) Undeploy(ctx context.Context, name string) error {
 func (d *Deployer) Deploy(ctx context.Context, req spec.DeployRequest, dcfg spec.DeployerConfig, opts DeployOptions) (DeployResult, error) {
 	name := req.Name
 
-	// (1) Protected compose-managed connectors — NEVER rebuild/replace.
+	// (1) Protected compose-managed connectors — NEVER rebuild/replace an
+	// EXISTING one. The protection's subject is a live container: it may be
+	// serving a CDC stream, and its image name (rsync-ai-*-mcp) differs from the
+	// mcp-{id}:{version} scheme, so a remove+recreate would fail with
+	// ImageNotFound. Running ⇒ reuse; stopped ⇒ start, image untouched.
+	//
+	// A MISSING one is a different case and used to 409 here with "run: docker
+	// compose up -d <svc>". That answer is only correct on a stack that actually
+	// has such a service. composeManagedConnectors lists six connectors, but
+	// docker-compose.quickstart.yml — the whole self-host install — pre-starts
+	// only three of them: minio, debezium and kafka-mcp-sink. postgresql, mysql
+	// and aws-s3 are compose-managed solely under docker-compose.mcp.yml, which
+	// a self-host box never runs. So on every quickstart install those three
+	// were refused here AND started by nobody, which made them undeployable by
+	// construction, and the 409 named a `docker compose up -d postgresql` that
+	// resolves to "no such service".
+	//
+	// That is what broke the bundled zero-credential demo: demo.go pins
+	// postgresql as the destination half, so `POST /demo/seed` 502'd after the
+	// orchestrator's full 60s connector wait on a stack advertising the demo in
+	// its own onboarding UI.
+	//
+	// When the container is absent there is nothing to protect, so fall through
+	// to the ordinary JIT build+start path — the same path every other public
+	// connector already takes on a self-host box.
 	if d.isProtectedComposeContainer(name) {
 		snap, err := d.backend.Inspect(ctx, name)
 		if err != nil {
 			return DeployResult{}, newErr(KindDaemon, "inspect %s: %v", name, err)
 		}
-		if snap == nil {
-			svc := strings.TrimSuffix(strings.TrimPrefix(name, "rsync-ai-"), "-mcp")
-			return DeployResult{}, newErr(KindProtectedMissing,
-				"compose-managed container %s not found; run: docker compose up -d %s", name, svc)
+		if snap != nil {
+			if snap.Running {
+				return DeployResult{ContainerID: shortID(snap.ID), Built: false}, nil // reuse
+			}
+			// Stopped/paused — restart without touching the image (compose owns it).
+			if err := d.backend.Start(ctx, name); err != nil {
+				return DeployResult{}, newErr(KindInternal, "restart compose-managed %s: %v", name, err)
+			}
+			return DeployResult{ContainerID: shortID(snap.ID), Built: false}, nil
 		}
-		if snap.Running {
-			return DeployResult{ContainerID: shortID(snap.ID), Built: false}, nil // reuse
-		}
-		// Stopped/paused — restart without touching the image (compose owns it).
-		if err := d.backend.Start(ctx, name); err != nil {
-			return DeployResult{}, newErr(KindInternal, "restart compose-managed %s: %v", name, err)
-		}
-		return DeployResult{ContainerID: shortID(snap.ID), Built: false}, nil
 	}
 
 	// (2)/(3) Reuse a running container; else remove a stale one before (re)create.

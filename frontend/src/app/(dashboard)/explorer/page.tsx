@@ -607,13 +607,21 @@ export default function ExplorerPage() {
       setSchemaCachedAt(null)
       setTables([])
       // Use Explorer schema-index (cached + includes types + FK relationships).
-      // NOTE: fetch directly to /api/v1/ — the /api/explorer/* Next.js proxy routes are
-      // intercepted by Traefik before reaching Next.js, so we call the api-gateway directly.
+      //
+      // Through authFetch, like the four other api-gateway calls in this file.
+      // The /api/explorer/* Next.js proxy routes are intercepted by Traefik
+      // before reaching Next.js, so this must address the api-gateway itself —
+      // and a bare relative URL does not do that. It resolves against the page
+      // origin, which is the frontend, so on any deployment where the two are
+      // separate origins the schema load 404'd at Next.js and the Explorer
+      // showed a schema error for a perfectly healthy connection. authFetch
+      // resolves the base through @/lib/config/api and carries the session and
+      // workspace headers the endpoint needs.
       const params = new URLSearchParams()
       if (opts?.force) params.set("refresh", "true")
       if (allDatabases) params.set("scope", "server")
       const qs = params.toString()
-      const res = await fetch(
+      const res = await authFetch(
         `/api/v1/explorer/connections/${selectedConnection}/schema-index${qs ? `?${qs}` : ""}`
       )
       if (!res.ok) {

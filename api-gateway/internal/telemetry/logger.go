@@ -203,6 +203,10 @@ func InitTracerWithConfig(cfg TelemetryConfig) (func(context.Context) error, err
 
 // InitTracerWithConfigOptions initializes OpenTelemetry with explicit parameters
 func InitTracerWithConfigOptions(endpoint, serviceName, version string, samplingRate float64, insecure bool) (func(context.Context) error, error) {
+	// Before the exporter exists, not after: the SDK's default error handler is
+	// on duty until this is called, and it is the one that floods the log.
+	installCollapsingErrorHandler()
+
 	ctx := context.Background()
 
 	// Build exporter options

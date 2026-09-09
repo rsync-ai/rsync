@@ -10,6 +10,7 @@ import Link from "next/link"
 import { Card, CardContent } from "@/components/ui/card"
 import { GitBranch, History, Database, ArrowRightLeft, RefreshCw, LucideIcon } from "lucide-react"
 import { onPipelineRefresh } from "@/lib/events/pipelineRefresh"
+import { readStatOrUnknown } from "@/lib/api/read-stat"
 
 const ICON_MAP: Record<string, LucideIcon> = {
   GitBranch,
@@ -86,45 +87,53 @@ export function DashboardStatsRefresher({
 
     ;(async () => {
       try {
-        const [pipelinesRes, srcRes, dstRes, execRes] = await Promise.allSettled([
-          fetch("/api/v1/pipelines", { credentials: "include" }).then((r) => r.ok ? r.json() : null),
-          fetch("/api/v1/connections?type=source", { credentials: "include" }).then((r) => r.ok ? r.json() : null),
-          fetch("/api/v1/connections?type=destination", { credentials: "include" }).then((r) => r.ok ? r.json() : null),
-          fetch("/api/v1/executions", { credentials: "include" }).then((r) => r.ok ? r.json() : null),
+        // Through readStatOrUnknown, so these reach the api-gateway rather than
+        // the frontend's own origin, and so a failed read stays distinguishable
+        // from a real zero. A relative fetch here 404'd on every deployment
+        // where the frontend and the gateway are separate origins.
+        const [pipelines, src, dst, exec] = await Promise.all([
+          readStatOrUnknown<any>("/api/v1/pipelines"),
+          readStatOrUnknown<any>("/api/v1/connections?type=source"),
+          readStatOrUnknown<any>("/api/v1/connections?type=destination"),
+          readStatOrUnknown<any>("/api/v1/executions"),
         ])
 
         if (cancelled) return
 
-        const pipelines = pipelinesRes.status === "fulfilled" ? pipelinesRes.value : null
-        const src = srcRes.status === "fulfilled" ? srcRes.value : null
-        const dst = dstRes.status === "fulfilled" ? dstRes.value : null
-        const exec = execRes.status === "fulfilled" ? execRes.value : null
-
-        const pTotal = pipelines?.total ?? (pipelines?.pipelines?.length ?? 0)
-        const pRunning = (pipelines?.pipelines ?? []).filter((p: any) => p.status === "running").length
-        const srcTotal = src?.total ?? (src?.connections?.length ?? 0)
-        const dstTotal = dst?.total ?? (dst?.connections?.length ?? 0)
-        const eTotal = exec?.total ?? (exec?.executions?.length ?? 0)
-        const eSuccess = exec?.stats?.success ?? (exec?.executions ?? []).filter((e: any) => e.status === "success" || e.status === "completed").length
-
         setCards((prev) =>
           prev.map((card) => {
+            // An unreadable stat leaves its card exactly as the server rendered
+            // it. Writing a zero here is what made a 404 look like an empty
+            // workspace.
             switch (card.title) {
-              case "Pipelines":
-                return { ...card, value: pTotal, subtitle: `${pRunning} running` }
-              case "Executions":
-                return { ...card, value: eTotal, subtitle: `${eSuccess} successful` }
+              case "Pipelines": {
+                if (!pipelines) return card
+                const total = pipelines.total ?? (pipelines.pipelines?.length ?? 0)
+                const running = (pipelines.pipelines ?? []).filter((p: any) => p.status === "running").length
+                return { ...card, value: total, subtitle: `${running} running` }
+              }
+              case "Executions": {
+                if (!exec) return card
+                const total = exec.total ?? (exec.executions?.length ?? 0)
+                const success =
+                  exec.stats?.success ??
+                  (exec.executions ?? []).filter((e: any) => e.status === "success" || e.status === "completed").length
+                return { ...card, value: total, subtitle: `${success} successful` }
+              }
               case "Sources":
-                return { ...card, value: srcTotal }
+                if (!src) return card
+                return { ...card, value: src.total ?? (src.connections?.length ?? 0) }
               case "Destinations":
-                return { ...card, value: dstTotal }
+                if (!dst) return card
+                return { ...card, value: dst.total ?? (dst.connections?.length ?? 0) }
               default:
                 return card
             }
           })
         )
       } catch {
-        // Silently ignore — keep SSR values
+        // readStatOrUnknown already absorbs per-request failures, so reaching
+        // here means something in the mapping threw. Keep the rendered values.
       } finally {
         if (!cancelled) setRefreshing(false)
       }

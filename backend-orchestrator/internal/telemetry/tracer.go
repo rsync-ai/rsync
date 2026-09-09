@@ -32,6 +32,10 @@ type TelemetryConfig struct {
 
 // InitTracerWithConfig initializes OpenTelemetry with typed config
 func InitTracerWithConfig(cfg TelemetryConfig) (func(context.Context) error, error) {
+	// Before the exporter exists, not after: the SDK's default error handler is
+	// on duty until this is called, and it is the one that floods the log.
+	installCollapsingErrorHandler()
+
 	ctx := context.Background()
 
 	// Build exporter options

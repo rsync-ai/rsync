@@ -112,6 +112,10 @@ func InitTracer(serviceName string) (shutdown func(context.Context) error, err e
 		return noop, nil
 	}
 
+	// Before the exporter exists, not after: the SDK's default error handler is
+	// on duty until this is called, and it is the one that floods the log.
+	installCollapsingErrorHandler()
+
 	ctx := context.Background()
 
 	// WithBlock() makes the dial wait for a ready connection, which is what lets a
