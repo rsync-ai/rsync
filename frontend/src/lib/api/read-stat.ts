@@ -42,12 +42,21 @@ export async function readStatOrUnknown<T = unknown>(path: string): Promise<T | 
     if (!res.ok) {
       // Loud enough to find in a browser console, quiet enough not to be a toast:
       // the user's view is unchanged, so this is diagnostic, not an interruption.
-      console.warn(`[stats] ${path} → HTTP ${res.status}; leaving the current value unchanged`)
+      //
+      // Constant message, variables as separate arguments. A console message is a
+      // format string: a `%s` arriving inside `path` would consume the argument
+      // after it, which in the catch below is the error itself. With nothing
+      // interpolated into the message there is nothing for it to consume, and the
+      // error stays an inspectable object rather than being flattened into text.
+      console.warn("[stats] read returned a non-2xx status; leaving the current value unchanged", {
+        path,
+        status: res.status,
+      })
       return undefined
     }
     return (await res.json()) as T
   } catch (err) {
-    console.warn(`[stats] ${path} could not be read; leaving the current value unchanged`, err)
+    console.warn("[stats] read could not complete; leaving the current value unchanged", { path }, err)
     return undefined
   }
 }
