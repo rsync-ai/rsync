@@ -97,6 +97,14 @@ GUARDS = [
     # absent guard produces zero cases -- indistinguishable in the log from a
     # guard whose every subject is covered.
     "test_the_internal_llm_needs_no_manual_step.py",
+    # Enrolled 2026-09-09 with the OTel export-error fix. Its subjects are the
+    # three internal/telemetry packages in backend-orchestrator, api-gateway and
+    # backend-temporal-adapter -- none of which any pattern in the `llm` filter
+    # matched, so the filter gained all three in the same change. This guard is
+    # the case that most needs the enrolment: it exists to catch drift between
+    # three byte-identical copies, and a PR editing exactly one copy is both the
+    # bug it hunts and the change that would have skipped the job.
+    "test_otel_export_errors_are_collapsed.py",
 ]
 
 

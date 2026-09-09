@@ -285,6 +285,18 @@ jobs:
               # it reads is already matched, so without this path that PR would
               # skip the job.
               - 'backend-orchestrator/internal/workers/infra_preflight.go'
+              # A tenth time, same shape, and this one spans three Go modules.
+              # test_otel_export_errors_are_collapsed.py asserts that every Go
+              # service building an OTLP exporter installs the rate-limiting
+              # error handler, and that the three byte-identical copies of that
+              # handler do not drift. They are separate modules with no shared
+              # telemetry package, so the copies stay in lockstep by that guard
+              # and nothing else -- and without these paths a PR editing one
+              # copy alone would run neither the guard nor anything else that
+              # could notice.
+              - 'backend-orchestrator/internal/telemetry/**'
+              - 'api-gateway/internal/telemetry/**'
+              - 'backend-temporal-adapter/internal/telemetry/**'
             e2e:
               - 'e2e/_support/**'
               - '.github/workflows/ci.yml'
