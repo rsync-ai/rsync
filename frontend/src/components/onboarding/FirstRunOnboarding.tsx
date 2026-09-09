@@ -14,6 +14,7 @@ import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { Card } from "@/components/ui/card"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { readStatOrUnknown } from "@/lib/api/read-stat"
 import { Check, Database, ArrowRightLeft, Sparkles, Search, Wand2, Loader2, LucideIcon } from "lucide-react"
 
 export interface OnboardingCounts {
@@ -50,31 +51,35 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
 
   const fetchCounts = useCallback(async (): Promise<OnboardingCounts | null> => {
     try {
-      const [pipesR, srcR, dstR, usageR] = await Promise.allSettled([
-        fetch("/api/v1/pipelines", { credentials: "include" }).then((r) => (r.ok ? r.json() : null)),
-        fetch("/api/v1/connections?type=source", { credentials: "include" }).then((r) => (r.ok ? r.json() : null)),
-        fetch("/api/v1/connections?type=destination", { credentials: "include" }).then((r) => (r.ok ? r.json() : null)),
-        fetch("/api/v1/usage", { credentials: "include" }).then((r) => (r.ok ? r.json() : null)),
+      // Through readStatOrUnknown for the same two reasons as the dashboard
+      // cards: a relative fetch goes to the frontend's own origin instead of the
+      // api-gateway, and a swallowed 404 became a zero. A zero here un-ticks
+      // steps the user has already completed and re-shows onboarding to an
+      // activated workspace, which is precisely what this component's header
+      // comment says must never happen.
+      const [p, s, d, u] = await Promise.all([
+        readStatOrUnknown<any>("/api/v1/pipelines"),
+        readStatOrUnknown<any>("/api/v1/connections?type=source"),
+        readStatOrUnknown<any>("/api/v1/connections?type=destination"),
+        readStatOrUnknown<any>("/api/v1/usage"),
       ])
-      const val = (r: PromiseSettledResult<any>) => (r.status === "fulfilled" ? r.value : null)
-      const p = val(pipesR)
-      const s = val(srcR)
-      const d = val(dstR)
-      const u = val(usageR)
+      // If nothing could be read, say so rather than reporting an empty
+      // workspace — the caller keeps the server-rendered counts.
+      if (!p && !s && !d && !u) return null
       return {
-        pipelineCount: p?.total ?? p?.pipelines?.length ?? 0,
-        sourceCount: s?.total ?? s?.connections?.length ?? 0,
-        destinationCount: d?.total ?? d?.connections?.length ?? 0,
+        pipelineCount: p ? (p.total ?? p.pipelines?.length ?? 0) : initial.pipelineCount,
+        sourceCount: s ? (s.total ?? s.connections?.length ?? 0) : initial.sourceCount,
+        destinationCount: d ? (d.total ?? d.connections?.length ?? 0) : initial.destinationCount,
         // Step 4 = "ask a question of your data". queries_used is the NL→SQL
         // query count (usage.go), which fires for CDC pipelines too — unlike a
         // "successful execution", which CDC/streaming syncs never record.
-        queryCount: u?.queries_used ?? 0,
+        queryCount: u ? (u.queries_used ?? 0) : initial.queryCount,
       }
     } catch {
       /* keep SSR values on failure */
       return null
     }
-  }, [])
+  }, [initial])
 
   useEffect(() => {
     let cancelled = false

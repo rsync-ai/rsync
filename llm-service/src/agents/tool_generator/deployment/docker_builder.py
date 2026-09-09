@@ -633,13 +633,27 @@ class DockerBuilder:
         # pre-started by docker-compose. We must NEVER tear down the container for the
         # connector's CURRENT (compose-managed) version: it may be actively serving a CDC
         # stream, and its image name (rsync-ai-*-mcp) differs from the mcp-{id}:{version}
-        # scheme so a remove+recreate would fail with ImageNotFound. If that container is
-        # down, surface it (fail loud) rather than silently spawning a replacement.
+        # scheme so a remove+recreate would fail with ImageNotFound.
         #
         # OLDER pinned versions of these connectors are NOT compose-managed (compose only
         # runs current_version), so they fall through to the JIT build+start path below —
         # this is what lets a pipeline pinned to an old version get its container built on
         # demand.
+        #
+        # A MISSING container also falls through, and used to fail loud instead with
+        # "run: docker compose up -d {svc}". That instruction is only executable on a
+        # stack that has such a service. _COMPOSE_MANAGED_CONNECTORS lists six, but
+        # docker-compose.quickstart.yml — the entire self-host install — pre-starts only
+        # minio, debezium and kafka-mcp-sink; postgresql, mysql and aws-s3 are
+        # compose-managed solely under docker-compose.mcp.yml, which a self-host box never
+        # runs. So on a quickstart install those three were refused here and started by
+        # nobody: undeployable by construction, behind an error naming a service that does
+        # not exist. It is what broke the bundled zero-credential demo, whose destination
+        # half is pinned to postgresql (api-gateway/internal/handlers/demo.go).
+        #
+        # There is nothing to protect when the container is absent, so build it.
+        # Mirrors connector-deployer/internal/dockerx/dockerx.go Deploy() step (1); the
+        # two must stay in lockstep.
         if self._is_protected_compose_container(container_name):
             try:
                 existing = self.client.containers.get(container_name)
@@ -651,10 +665,9 @@ class DockerBuilder:
                 existing.start()
                 return True, existing.id
             except NotFound:
-                svc = container_name.removeprefix("rsync-ai-").removesuffix("-mcp")
-                return False, (
-                    f"Compose-managed container {container_name} not found; "
-                    f"run: docker compose up -d {svc}"
+                logger.info(
+                    f"{container_name} is compose-managed but absent — no compose service on this "
+                    f"stack starts it, so building it on demand"
                 )
             except Exception as e:
                 return False, f"Failed to restart compose-managed container {container_name}: {e}"

@@ -177,20 +177,50 @@ func TestDeploy_ReuseRunning(t *testing.T) {
 	}
 }
 
-// A protected compose-managed connector that is MISSING must 409 (never spawned here).
-func TestDeploy_ProtectedComposeMissing_409(t *testing.T) {
+// A protected compose-managed connector that is MISSING is built on demand.
+//
+// This test used to assert the opposite — a 409 KindProtectedMissing carrying
+// "run: docker compose up -d <svc>". The instruction was unexecutable on the
+// stack that needed it most. composeManagedConnectors lists six connectors, but
+// only docker-compose.mcp.yml (dev/cloud) actually pre-starts all six;
+// docker-compose.quickstart.yml — the whole self-host install — pre-starts just
+// minio, debezium and kafka-mcp-sink. So on a self-host box postgresql, mysql
+// and aws-s3 were refused here AND started by nobody: undeployable by
+// construction, behind an error naming a compose service that does not exist.
+// The bundled zero-credential demo pins postgresql as its destination
+// (api-gateway/internal/handlers/demo.go), so POST /demo/seed 502'd after the
+// orchestrator's full 60 s connector wait on a stack whose own onboarding card
+// advertises the demo.
+//
+// The protection's real subject is an EXISTING container that compose owns and
+// that may be serving live CDC — never rebuild or replace that. An absent
+// container has nothing to protect, so it takes the ordinary JIT path.
+// TestDeploy_ProtectedComposeRunning_Reuse and
+// TestDeploy_ProtectedComposeStopped_Restart below hold that line.
+func TestDeploy_ProtectedComposeMissing_BuildsOnDemand(t *testing.T) {
 	tools := writeToolsWithLatest(t, "postgresql", "v1.0.0")
-	fb := &fakeBackend{snap: nil} // not found
+	fb := &fakeBackend{snap: nil, imageExists: false, createID: "pgbuilt12345678"} // not found
 	d := NewDeployer(fb, tools)
 
 	req := validReq()
 	req.Name = "rsync-ai-postgresql-v1-0-0-mcp" // current version → protected
-	_, err := d.Deploy(context.Background(), req, testDcfg, baseOpts())
-	if err == nil || KindOf(err) != KindProtectedMissing {
-		t.Fatalf("want KindProtectedMissing, got %v (%v)", KindOf(err), err)
+	res, err := d.Deploy(context.Background(), req, testDcfg, baseOpts())
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
 	}
-	if fb.buildCalled || fb.createCalled {
-		t.Error("must not build/create a compose-managed connector")
+	if !fb.buildCalled || !fb.createCalled {
+		t.Errorf("an absent compose-managed container must be built and created; build=%v create=%v",
+			fb.buildCalled, fb.createCalled)
+	}
+	if !res.Built {
+		t.Error("Built should be true when the image had to be built")
+	}
+	if res.ContainerID != "pgbuilt12345" {
+		t.Errorf("short id = %q, want pgbuilt12345", res.ContainerID)
+	}
+	// Whatever path it took, the HostConfig still has to pass the safety gate.
+	if verr := spec.ValidateHostConfigSafe(fb.createdHC, testDcfg); verr != nil {
+		t.Errorf("HostConfig passed to Create was not safe: %v", verr)
 	}
 }
 

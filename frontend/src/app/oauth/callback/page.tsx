@@ -4,6 +4,7 @@ import { Suspense, useEffect, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { Loader2, CheckCircle2, XCircle } from 'lucide-react';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
+import { authFetch } from '@/lib/api/auth-fetch';
 
 type CallbackStatus = 'processing' | 'success' | 'error';
 
@@ -52,12 +53,17 @@ function OAuthCallbackInner() {
       // Exchange code for token via our backend
       setMessage(`Exchanging code with ${provider}...`);
 
-      const response = await fetch(`/api/v1/oauth/callback/${provider}?code=${code}&state=${state}`, {
-        method: 'GET',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
+      // authFetch, not a bare relative fetch: a relative URL resolves against
+      // the frontend's own origin, so on any deployment where the frontend and
+      // the api-gateway are separate origins — every self-host install that is
+      // not behind a single reverse proxy — this exchange 404'd at the frontend
+      // and the user saw "Failed to exchange authorization code" for a code that
+      // was perfectly good. authFetch resolves the base through @/lib/config/api
+      // and carries the session cookie the exchange needs.
+      const response = await authFetch(
+        `/api/v1/oauth/callback/${provider}?code=${code}&state=${state}`,
+        { method: 'GET' },
+      );
 
       if (!response.ok) {
         const errorData = await response.json();

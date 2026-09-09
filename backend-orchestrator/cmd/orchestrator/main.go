@@ -31,6 +31,7 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/assessor"
 	"github.com/rsync-ai/backend-orchestrator/internal/config"
 	"github.com/rsync-ai/backend-orchestrator/internal/connections"
+	"github.com/rsync-ai/backend-orchestrator/internal/connectorpaths"
 	"github.com/rsync-ai/backend-orchestrator/internal/handlers"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
@@ -493,8 +494,28 @@ func main() {
 		}
 	}
 
-	// Initialize agents using config
-	toolsDir := cfg.MCP.ToolsDir
+	// Initialize agents using config.
+	//
+	// The connector tree is resolved by connectorpaths.ToolsDir(), the single
+	// shared resolver the sentinel's health monitor and the connector registry
+	// already call. This was the last reader that carried its own answer, and
+	// its answer was wrong everywhere the images actually run: the viper default
+	// is `../../shared/mcp-connectors`, a path relative to a repo checkout, and
+	// NewServerManager takes filepath.Abs of it. Under the image's WORKDIR /app
+	// that cleans to `/shared/mcp-connectors` — while every compose file mounts
+	// the catalog at /app/shared/mcp-connectors. The orchestrator therefore
+	// logged a tools dir no image creates and failed every connector lookup with
+	// "failed to locate connector ... in tools dir /shared/mcp-connectors".
+	//
+	// The config value stays as the fallback so a developer running from
+	// backend-orchestrator/cmd/orchestrator (where none of the resolver's
+	// candidate paths exist) keeps the behaviour they have today, and so an
+	// explicit TOOLS_DIR still wins — the resolver reads that env var first.
+	toolsDir := connectorpaths.ToolsDir()
+	if toolsDir == "" {
+		toolsDir = cfg.MCP.ToolsDir
+	}
+	log.WithField("tools_dir", toolsDir).Info("📁 Connector tools directory resolved")
 
 	// Initialize AgentManager for Sentinel to restart agents
 	agentManager := sentinel.NewAgentManager()

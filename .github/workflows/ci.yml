@@ -76,6 +76,20 @@ jobs:
               - 'backend-temporal-adapter/**'
               - 'connector-deployer/**'
               - 'shared/go/**'
+              # The compose files are here because connector-deployer's
+              # quickstart_deployability_test.go PARSES them: it derives which
+              # connectors the self-host stack actually pre-starts and asserts
+              # that everything composeManagedConnectors refuses to build is
+              # started by somebody. Without these paths the guard would be dead
+              # on half its subject -- deleting a connector service from
+              # docker-compose.quickstart.yml is exactly the change that
+              # re-opens the bug (postgresql refused by the deployer AND started
+              # by nobody, which 502'd the bundled demo), and it touches no Go
+              # file, so this job would report `skipping` and look identical to
+              # a pass. Same failure mode as the Helm paths on the `llm` filter
+              # below.
+              - 'docker-compose.quickstart.yml'
+              - 'docker-compose.mcp.yml'
               - '.github/workflows/ci.yml'
             go-shared:
               - 'shared/go/**'
