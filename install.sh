@@ -101,7 +101,29 @@ OLLAMA_BUNDLED=0
 # opt-out, and it has to be distinguishable from unset.
 RSYNC_PROFILES="${RSYNC_PROFILES-cdc}"
 ENV_FILE=".env"
-INSTALL_DIR="${RSYNC_INSTALL_DIR:-$HOME/rsync-ai}"
+# HOME is absent from exactly the environments setup_tty() exists to serve. A GCE
+# or cloud-init startup script, a systemd unit, a `docker run` without -e HOME and
+# most CI steps all run with it unset, and `set -u` (line 2) makes reading it there
+# a fatal error -- here, at the top level, before the banner, before check_docker,
+# and long before the no-terminal branch in prompt_env() that documents this exact
+# caller. So the one install path that cannot answer a prompt also could not start,
+# and the failure is `install.sh: line 104: HOME: unbound variable` with nothing
+# else printed. Every clean-room verification of this script ran over an
+# interactive ssh session, where HOME is always set, so none of them could see it.
+#
+# The passwd database knows this uid's home whether or not the environment does.
+# `2>/dev/null` because getent is a glibc tool and does not exist on macOS, where
+# HOME is set anyway; PWD is the last resort, for a uid with no passwd entry at
+# all (`docker run -u 1234`), and bash always sets it.
+#
+# The `|| true` is the same trap this file already documents at generate_secret:
+# under `set -o pipefail` a missing getent fails the whole pipeline, and under
+# `set -e` a failing command substitution takes the assignment -- and the script
+# -- down with it. Without it the fix merely moves the silent death two lines
+# later on any host that has no getent, which is every Mac.
+_home="${HOME:-}"
+[[ -n "$_home" ]] || _home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
+INSTALL_DIR="${RSYNC_INSTALL_DIR:-${_home:-$PWD}/rsync-ai}"
 # The floor tracks what the install actually starts. 6 sized the 18 unprofiled
 # services this file has always started. The cdc profile adds three more
 # containers -- one of them a JVM -- whose mem_limit lines in
