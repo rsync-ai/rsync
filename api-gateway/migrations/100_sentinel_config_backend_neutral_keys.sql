@@ -19,31 +19,50 @@
 --
 -- Idempotent: each statement is a no-op once applied, and the DELETEs guard
 -- against a partially-seeded table where both the old and the new key exist.
+--
+-- GUARDED BY to_regclass, and this is not defensive dressing -- it is the only
+-- reason the file can be applied at all. `013_cleanup_unused_tables.sql` runs
+-- `DROP TABLE IF EXISTS sentinel_config CASCADE` and nothing recreates it, so
+-- the table is ABSENT on every schema this migration ever meets: a fresh install
+-- creates it at 011 and drops it 2 files later, and an upgrade arrives with 013
+-- long since applied. Unguarded, the DELETE below raises
+-- `relation "sentinel_config" does not exist` (SQLSTATE 42P01); migrate.go
+-- returns on the first failure, so migration 100 halts the whole sequence, the
+-- schema never reaches ready, and /ready answers 503 schema_not_migrated
+-- forever. Measured against postgres:16 by replaying all 105 files in the
+-- runner's order: 104 applied, this one failed. Same shape and same cause as the
+-- to_regclass guards in 077 and 078, which cover the other tables 013 dropped.
+--
+-- The runner auto-wraps this file in one transaction; do NOT add a literal
+-- "BEGIN;" (it trips migrate.go's self-managed-txn detection).
 
-BEGIN;
+DO $$
+BEGIN
+    IF to_regclass('public.sentinel_config') IS NOT NULL THEN
 
--- Drop any new-name row that already exists, so the rename below cannot collide
--- with the config_key primary key on a re-run.
-DELETE FROM sentinel_config
- WHERE config_key = 'enable_metrics_export'
-   AND EXISTS (SELECT 1 FROM sentinel_config WHERE config_key = 'enable_signoz_export');
+        -- Drop any new-name row that already exists, so the rename below cannot
+        -- collide with the config_key primary key on a re-run.
+        DELETE FROM sentinel_config
+         WHERE config_key = 'enable_metrics_export'
+           AND EXISTS (SELECT 1 FROM sentinel_config WHERE config_key = 'enable_signoz_export');
 
-DELETE FROM sentinel_config
- WHERE config_key = 'metrics_otlp_endpoint'
-   AND EXISTS (SELECT 1 FROM sentinel_config WHERE config_key = 'signoz_endpoint');
+        DELETE FROM sentinel_config
+         WHERE config_key = 'metrics_otlp_endpoint'
+           AND EXISTS (SELECT 1 FROM sentinel_config WHERE config_key = 'signoz_endpoint');
 
-UPDATE sentinel_config
-   SET config_key  = 'enable_metrics_export',
-       description = 'Enable OpenTelemetry metrics export over OTLP'
- WHERE config_key = 'enable_signoz_export';
+        UPDATE sentinel_config
+           SET config_key  = 'enable_metrics_export',
+               description = 'Enable OpenTelemetry metrics export over OTLP'
+         WHERE config_key = 'enable_signoz_export';
 
-UPDATE sentinel_config
-   SET config_key  = 'metrics_otlp_endpoint',
-       description = 'OTLP endpoint for exported metrics'
- WHERE config_key = 'signoz_endpoint';
+        UPDATE sentinel_config
+           SET config_key  = 'metrics_otlp_endpoint',
+               description = 'OTLP endpoint for exported metrics'
+         WHERE config_key = 'signoz_endpoint';
 
-UPDATE sentinel_config
-   SET description = 'Interval for exporting metrics over OTLP'
- WHERE config_key = 'metric_export_interval';
+        UPDATE sentinel_config
+           SET description = 'Interval for exporting metrics over OTLP'
+         WHERE config_key = 'metric_export_interval';
 
-COMMIT;
+    END IF;
+END $$;
