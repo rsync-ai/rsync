@@ -662,6 +662,12 @@ GOOGLE_CLIENT_SECRET=
 # the images match the compose file this .env sits next to; written out rather
 # than left empty so the pairing survives re-running compose by hand later.
 RSYNC_VERSION=${RSYNC_VERSION}
+# The ref the line above was derived from, recorded so a LATER run can tell an
+# upgrade from an ordinary re-run. Same ref, and that run touches nothing here;
+# a different one, and it re-downloads the compose files and rewrites the
+# version above to match. Delete this line and the next run treats the install
+# as unrecorded and refreshes both halves once.
+RSYNC_INSTALLED_REF=${RSYNC_REF}
 EOF
 
   # A SECOND heredoc, and quoted: <<'EOF'. Everything above needs interpolation
@@ -1120,6 +1126,29 @@ env_value() {
   printf '%s' "$line"
 }
 
+# The write half of env_value, and it exists for the same reason: this file is
+# read and edited, never sourced. Replaces the key in place rather than
+# appending a second line that would win by being later -- the .env is a
+# document an operator reads, and two RSYNC_VERSION lines with different values,
+# only one of them live, is precisely the confusion the notes at the end of that
+# file exist to prevent. Duplicates already present collapse to the one line.
+set_env_value() {
+  local key="$1" value="$2" file="${INSTALL_DIR}/${ENV_FILE}" tmp
+  tmp="$(mktemp "${file}.XXXXXX")"
+  # Before a byte is written, not after: this file carries generated secrets and
+  # the temp copy is about to BECOME it. Same directory, so the mv is atomic and
+  # a crash mid-write cannot leave a half-written .env behind.
+  chmod 600 "$tmp"
+  # awk -v, not sed: a ref may contain a slash (release/1.0) and a value an
+  # ampersand, both live in a sed replacement and both inert in an awk variable.
+  awk -v k="$key" -v v="$value" '
+    $0 ~ "^[[:space:]]*" k "=" { if (!seen) { print k "=" v; seen = 1 } ; next }
+    { print }
+    END { if (!seen) print k "=" v }
+  ' "$file" > "$tmp"
+  mv "$tmp" "$file"
+}
+
 main() {
   setup_tty
   banner
@@ -1151,6 +1180,50 @@ main() {
       backfilled_secret=$(generate_secret)
       echo "INTERNAL_SERVICE_SECRET=${backfilled_secret}" >> "${INSTALL_DIR}/${ENV_FILE}"
       warn "Backfilled a missing INTERNAL_SERVICE_SECRET into the existing .env."
+    fi
+
+    # An upgrade is the only reason to re-run this script, and until this block
+    # existed a re-run could not perform one. BOTH halves of an install stayed
+    # pinned to the first run's ref, by two separate mechanisms that each look
+    # correct alone: the compose file is refreshed only when MISSING (the
+    # `[[ -f ]] ||` line below, which repairs a deleted file and was never a
+    # version check), and RSYNC_VERSION is written by write_env, which this
+    # branch skips. So `RSYNC_REF=main` over a v0.1.2 install re-read the v0.1.2
+    # compose file, re-pulled the 0.1.2 images it already had, recreated
+    # nothing, and printed the success banner -- an upgrade that upgraded
+    # nothing and said it worked, which is worse than one that fails.
+    #
+    # Keyed on the ref recorded in the .env rather than on the files' contents.
+    # It is the one fact that says which code this directory is meant to be
+    # running, and comparing it costs nothing in the ordinary case -- same ref,
+    # touch nothing -- which is the case where overwriting a hand-edited compose
+    # file would be the damage.
+    #
+    # An install written before that record existed has none, so it reads empty
+    # and every ref differs from it. That is the intended reading, not a corner
+    # case: those are exactly the installs stuck at their first ref, and one
+    # re-run adopts the requested ref and records it for next time.
+    local recorded_ref
+    recorded_ref="$(env_value RSYNC_INSTALLED_REF)"
+    if [[ "$recorded_ref" != "$RSYNC_REF" ]]; then
+      if [[ -n "$recorded_ref" ]]; then
+        info "Installed at ref ${recorded_ref}, ${RSYNC_REF} requested -- refreshing compose files and image tag."
+      else
+        info "This install predates ref tracking -- adopting ${RSYNC_REF} and refreshing compose files and image tag."
+      fi
+      # The compose file is the only artifact here an operator may have edited
+      # by hand, and this is the one path that overwrites it. Keep the outgoing
+      # copy so the edit is recoverable rather than merely lost.
+      if [[ -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
+        cp "${INSTALL_DIR}/${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}.previous"
+      fi
+      download_compose
+      # Both halves, together, or this fixes half the bug: the compose file
+      # names ${RSYNC_VERSION} for every image it starts, and compose reads that
+      # from the .env on disk -- never from this script's environment, which is
+      # why deriving it correctly at the top was not enough on this path.
+      set_env_value RSYNC_VERSION "${RSYNC_VERSION}"
+      set_env_value RSYNC_INSTALLED_REF "${RSYNC_REF}"
     fi
   else
     prompt_env
