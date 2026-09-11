@@ -13,6 +13,12 @@ export interface FeatureFlags {
   monitoringOverview: boolean
   monitoringInfra: boolean
   monitoringTraces: boolean
+
+  // Plan / usage panel. A BILLING surface: it reports the plan, the pipeline
+  // and query limits, trial expiry and metered transfer GB. Defaults to the
+  // cloud behaviour and is turned off by the API for a deployment that does
+  // not enforce plan quotas -- see api-gateway/internal/config/features.go.
+  usagePanel: boolean
 }
 
 /**
@@ -31,6 +37,13 @@ export const DEFAULT_FEATURES: FeatureFlags = {
     process.env.NEXT_PUBLIC_FEATURE_MONITORING_TRACES,
     process.env.NODE_ENV === 'development'
   ),
+
+  // Usage panel - defaults to ON, the cloud behaviour. NEXT_PUBLIC_* is
+  // inlined at BUILD time and every deployment pulls the same prebuilt
+  // frontend image, so this build-time value can never be what turns the
+  // panel off on a self-host; /api/v1/features does that at runtime. The
+  // variable exists for a deployment that builds its own image.
+  usagePanel: parseBool(process.env.NEXT_PUBLIC_FEATURE_USAGE_PANEL, true),
 }
 
 /**
@@ -62,6 +75,11 @@ function parseBool(value: string | undefined, defaultValue: boolean): boolean {
 class FeatureFlagsManager {
   private flags: FeatureFlags = { ...DEFAULT_FEATURES }
   private listeners: Array<(flags: FeatureFlags) => void> = []
+  // Whether the runtime answer from /api/v1/features has arrived yet (or
+  // failed for good). Until it has, the build-time defaults are a guess, and
+  // a surface that must not appear on the wrong deployment has to wait rather
+  // than render the guess and retract it a frame later.
+  private resolved = false
 
   /**
    * Get current feature flags
@@ -84,6 +102,7 @@ class FeatureFlagsManager {
    */
   resetFlags(): void {
     this.flags = { ...DEFAULT_FEATURES }
+    this.resolved = false
     this.notifyListeners()
   }
 
@@ -97,6 +116,24 @@ class FeatureFlagsManager {
     return () => {
       this.listeners = this.listeners.filter(l => l !== listener)
     }
+  }
+
+  /**
+   * Record that the runtime flag fetch has finished, successfully or not.
+   * A failed fetch still resolves: the build-time defaults are then the final
+   * answer, and leaving it unresolved would hide a cloud surface forever.
+   */
+  markResolved(): void {
+    if (this.resolved) return
+    this.resolved = true
+    this.notifyListeners()
+  }
+
+  /**
+   * Whether the runtime flag fetch has finished.
+   */
+  isResolved(): boolean {
+    return this.resolved
   }
 
   private notifyListeners(): void {
@@ -159,11 +196,48 @@ export async function fetchFeatureFlags(apiUrl: string): Promise<void> {
         monitoringOverview: data.monitoring_overview ?? DEFAULT_FEATURES.monitoringOverview,
         monitoringInfra: data.monitoring_infra ?? DEFAULT_FEATURES.monitoringInfra,
         monitoringTraces: data.monitoring_traces ?? DEFAULT_FEATURES.monitoringTraces,
+        usagePanel: data.usage_panel ?? DEFAULT_FEATURES.usagePanel,
       })
     }
   } catch (error) {
     console.warn('Failed to fetch feature flags from API, using defaults:', error)
+  } finally {
+    // Both branches above are final answers: a non-ok response and a network
+    // failure both mean the build-time defaults are what this page gets.
+    featureFlagsManager.markResolved()
   }
+}
+
+/**
+ * Resolution state of the usage panel.
+ *
+ * 'loading' until the runtime flags arrive. Callers must treat it as NOT
+ * visible: the panel reports plan limits, and a deployment that enforces none
+ * would otherwise flash a plan meter full of numbers that mean nothing before
+ * withdrawing it.
+ */
+export type UsagePanelState = 'loading' | 'on' | 'off'
+
+/**
+ * React hook for the usage panel's visibility.
+ * Usage: const state = useUsagePanelState()
+ */
+export function useUsagePanelState(): UsagePanelState {
+  const [state, setState] = React.useState<UsagePanelState>('loading')
+
+  React.useEffect(() => {
+    const read = () => {
+      if (!featureFlagsManager.isResolved()) {
+        setState('loading')
+        return
+      }
+      setState(featureFlagsManager.getFlags().usagePanel ? 'on' : 'off')
+    }
+    read()
+    return featureFlagsManager.subscribe(read)
+  }, [])
+
+  return state
 }
 
 /**

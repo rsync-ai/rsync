@@ -1,12 +1,10 @@
 package handlers
 
 import (
+	"api-gateway/internal/config"
 	"context"
 	"database/sql"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -60,26 +58,17 @@ type planQuota struct {
 var unlimitedQuota = planQuota{plan: "pro", effectiveLimit: -1, canRun: true}
 
 // billingEnforced reports whether plan/quota entitlements should be enforced.
+// The implementation lives in config.BillingEnforced so that the usage-panel
+// feature flag can share it: config must not import handlers (handlers already
+// imports config), and a second copy of the parser would be free to drift from
+// this one — the UI would then show a plan panel a self-host is not enforcing.
 //
-// It defaults to ENFORCED so cloud (app.rsync.ai) — which never sets the var —
-// keeps its trial/plan gating unchanged. Self-host / OSS installs have no Stripe
-// and no cloud plans, so a fresh install must NOT be trial-gated: the OSS compose
-// (docker-compose.quickstart.yml) sets RSYNC_BILLING_ENFORCED=false to disable it.
-//
-// Parsing fails toward enforcement: an unset or unparseable value ⇒ true, so only
-// an explicit false ("false"/"0"/"f") ever turns billing off. This is a billing
-// feature-flag, not a product-edition gate — there is deliberately no runtime
-// edition switch elsewhere (the OSS/cloud split is enforced by which artifact ships).
+// Polarity is unchanged: unset or unparseable ⇒ enforced, so cloud, which never
+// sets the variable, keeps its trial/plan gating and only an explicit false
+// ("false"/"0"/"f") turns billing off. See config.BillingEnforced for the full
+// rationale and for which deployment artifacts set it.
 func billingEnforced() bool {
-	v := strings.TrimSpace(os.Getenv("RSYNC_BILLING_ENFORCED"))
-	if v == "" {
-		return true
-	}
-	enforced, err := strconv.ParseBool(v)
-	if err != nil {
-		return true
-	}
-	return enforced
+	return config.BillingEnforced()
 }
 
 // resolvePlanQuota loads the workspace's plan, cascades through any expiries

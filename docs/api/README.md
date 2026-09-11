@@ -76,7 +76,12 @@ session auth → email-verified gate → CSRF → rate limiting
 
 ### Feature flags
 
-- `GET /api/v1/features` (public within the group)
+- `GET /api/v1/features` (public within the group) — returns the runtime flag set:
+  `monitoring_overview`, `monitoring_infra`, `monitoring_traces`, `usage_panel`. The
+  frontend fetches this on mount because `NEXT_PUBLIC_*` is inlined at build time and every
+  deployment runs the same image, so this endpoint is the only way a flag can differ per
+  deployment. `usage_panel` gates the plan/quota UI and defaults to whatever
+  `RSYNC_BILLING_ENFORCED` resolves to.
 
 ### Chat (agentic pipeline flow)
 

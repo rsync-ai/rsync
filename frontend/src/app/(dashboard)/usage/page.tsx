@@ -19,6 +19,7 @@ import { LoadingState } from "@/components/admin/AdminStates"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { captureWorkspace, onActiveWorkspaceChange } from "@/lib/workspace/active-workspace"
 import type { WorkspaceUsage } from "@/lib/api/usage"
+import { UsagePanelGate } from "@/components/usage/UsagePanelGate"
 
 const nf = new Intl.NumberFormat()
 const fmt = (n: number) => nf.format(n)
@@ -72,7 +73,18 @@ function usageStatusLabel(s: string): string {
   return s ? s.charAt(0).toUpperCase() + s.slice(1) : "—"
 }
 
+// The gate wraps the page rather than living inside it, so a deployment with
+// the panel off never mounts the content and never fires its /api/v1/usage
+// request. Hiding the sidebar entry alone would still leave this URL typeable.
 export default function UsagePage() {
+  return (
+    <UsagePanelGate>
+      <UsagePageContent />
+    </UsagePanelGate>
+  )
+}
+
+function UsagePageContent() {
   const [data, setData] = useState<WorkspaceUsage | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)

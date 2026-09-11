@@ -27,6 +27,7 @@ import {
   X,
 } from "lucide-react"
 import { RsyncLogo } from "@/components/icons/RsyncLogo"
+import { useUsagePanelState } from "@/config/features"
 
 const navigation = [
   {
@@ -93,6 +94,7 @@ export function Sidebar({ role }: SidebarProps) {
   const mobileOpen = useUIStore((state) => state.sidebarOpen)
   const setSidebarOpen = useUIStore((state) => state.setSidebarOpen)
   const toggleSidebarCollapsed = useUIStore((state) => state.toggleSidebarCollapsed)
+  const usagePanel = useUsagePanelState()
 
   const isActiveLink = (href: string, exact = false) => {
     if (href === "/") return pathname === "/" || pathname === "/dashboard"
@@ -118,6 +120,13 @@ export function Sidebar({ role }: SidebarProps) {
             )}
             <div className="space-y-1">
               {section.items.map((item) => {
+                // The Usage entry opens the plan/quota panel: plan, pipeline and
+                // query limits, trial expiry, metered transfer GB. A deployment
+                // that does not enforce plans has none of those, so the entry is
+                // withheld until the runtime flags say otherwise -- 'loading' is
+                // deliberately not visible, or a self-host would flash it.
+                if (item.href === "/usage" && usagePanel !== "on") return null
+
                 const isActive = isActiveLink(item.href, "exact" in item && item.exact)
                 const Icon = item.icon
                 const isHighlighted = 'highlight' in item && item.highlight
