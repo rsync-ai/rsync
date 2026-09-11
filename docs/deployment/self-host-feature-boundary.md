@@ -11,7 +11,7 @@ adapter and frontend images. The boundary is drawn in three places only:
 |---|---|---|
 | Which compose file you run | `docker-compose.quickstart.yml` (22 services) vs `docker-compose.yml` (27) | which containers exist |
 | Which image artifact ships | `llm-service/oss-strip-list.txt` (20 entries) | which Python packages are inside the image |
-| Feature flags, defaulting to the hosted behavior | `api-gateway/internal/config/features.go`, `plan_quota.go:73` | runtime behavior |
+| Feature flags, defaulting to the hosted behavior | `api-gateway/internal/config/features.go`, `plan_quota.go:70` | runtime behavior |
 
 There is no `if edition == …` branch anywhere. `RSYNC_EDITION` is cosmetic and has zero
 functional reads.
@@ -59,11 +59,12 @@ service's own operational plumbing.
 | Absent | Why | Decided at |
 |---|---|---|
 | **Connector *generation*** (build a new connector from an OpenAPI/GraphQL spec) | the generator package is stripped from the image | `llm-service/oss-strip-list.txt` |
-| Monitoring UI (overview, infra, traces) | needs an observability backend, and this repo ships none | `features.go:30-36` — overview and infra default `false`; traces defaults to `isDevelopment()`, which quickstart makes false by pinning `ENVIRONMENT=production` |
+| Monitoring UI (overview, infra, traces) | needs an observability backend, and this repo ships none | `features.go:35-42` — overview and infra default `false`; traces defaults to `isDevelopment()`, which quickstart makes false by pinning `ENVIRONMENT=production` |
 | OpenTelemetry export | no `otel-collector` container in quickstart | `docker-compose.quickstart.yml` |
 | Log shipping (`fluent-bit`), Avro `schema-registry`, Temporal web UI + admin tools, MinIO lifecycle init, Docker socket proxy, connector FS init | hosted-only plumbing | 8 services quickstart omits, `otel-collector` included |
 | Internal connectors as pipeline endpoints (MinIO, Debezium, Kafka sink) | blocked by default in **both** editions; the hosted compose opts in with `RSYNC_ALLOW_INTERNAL_CONNECTORS=true` | `connections.go:56-60` |
 | Billing and plan quotas | `RSYNC_BILLING_ENFORCED=false` | `docker-compose.quickstart.yml:1081` |
+| The Usage panel (`/usage`, `/admin/usage`) | it reports plan, quota and trial numbers that a deployment enforcing no plans does not have; the flag defaults to whatever billing does, so it switches itself off | `features.go` → `resolveUsagePanel()`; set `FEATURE_USAGE_PANEL=true` to show it anyway |
 
 ### Connector generation: what exactly is missing
 
@@ -98,12 +99,24 @@ self-hosted means writing it by hand: see the
 
 1. `RSYNC_BILLING_ENFORCED=false` in `docker-compose.quickstart.yml:1081` →
    `billingEnforced()` returns false → `resolvePlanQuota` returns `unlimitedQuota`
-   (`billingEnforced()` at `plan_quota.go:73`, the early return at `:95`).
+   (`billingEnforced()` at `plan_quota.go:70`, the early return at `:84`).
 2. Even with billing on, `loadPlans` reads the `plans` table; when it is empty the code
-   returns `unlimitedQuota` (`plan_quota.go:105-106`).
+   returns `unlimitedQuota` (`plan_quota.go:94-95`).
 
 The flag **fails closed to the hosted behavior**: unset or unparseable → enforced. Never
 set it `false` in `docker-compose.yml` or `docker-compose.prod.yml`.
+
+**The UI follows the flag.** Because nothing is enforced, the Usage panel would report a plan
+you do not have, so it is withheld: the `Usage` entry disappears from the sidebar and from the
+admin nav, and `/usage` and `/admin/usage` say so instead of rendering. That is the
+`FEATURE_USAGE_PANEL` flag, whose default is *derived* from `RSYNC_BILLING_ENFORCED` rather than
+set separately — so the quickstart compose and the Helm chart get it for free, and the display
+can never disagree with the enforcement. Set `FEATURE_USAGE_PANEL=true` on the api-gateway to
+show the page anyway; the numbers it reports are real, they are just not limits.
+
+Metering is unaffected either way: transfer bytes and NL-query counts are still recorded, and
+the dashboard's query-count tile still shows them, because `/api/v1/usage` is not gated — only
+the plan/quota page is.
 
 For reference, these are the hosted plan rows — they live in migrations, not in Go:
 

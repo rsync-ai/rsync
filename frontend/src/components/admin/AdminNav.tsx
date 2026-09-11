@@ -2,6 +2,7 @@
 
 import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
+import { useUsagePanelState } from "@/config/features"
 import {
   LayoutDashboard,
   Users,
@@ -33,10 +34,16 @@ const items = [
 export function AdminNav() {
   const pathname = usePathname()
   const router = useRouter()
+  const usagePanel = useUsagePanelState()
 
   return (
     <div className="flex flex-wrap gap-2">
       {items.map((it) => {
+        // Same gate as the workspace sidebar's Usage entry: this is the
+        // cross-workspace view of the SAME billing numbers, so it follows the
+        // same flag. 'loading' is not visible -- see useUsagePanelState.
+        if (it.href === "/admin/usage" && usagePanel !== "on") return null
+
         const active =
           it.href === "/admin"
             ? pathname === "/admin"

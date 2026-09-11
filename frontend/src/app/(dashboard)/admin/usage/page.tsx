@@ -17,6 +17,7 @@ import {
 import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
 import { authFetch } from "@/lib/api/auth-fetch"
 import type { AdminUsageResponse } from "@/lib/api/usage"
+import { UsagePanelGate } from "@/components/usage/UsagePanelGate"
 
 const nf = new Intl.NumberFormat()
 const fmt = (n: number) => nf.format(n)
@@ -30,7 +31,18 @@ function fmtDate(iso?: string | null): string {
 
 type Tab = "workspaces" | "users"
 
+// Same gate as the workspace page. AdminNav is handed to the gate so an admin
+// who typed this URL on a deployment with the panel off still gets the rest of
+// the admin section to navigate to.
 export default function AdminUsagePage() {
+  return (
+    <UsagePanelGate nav={<AdminNav />}>
+      <AdminUsagePageContent />
+    </UsagePanelGate>
+  )
+}
+
+function AdminUsagePageContent() {
   const [data, setData] = useState<AdminUsageResponse | null>(null)
   const [loading, setLoading] = useState(true)
   const [status, setStatus] = useState<number | null>(null)
