@@ -18,7 +18,11 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Loader2, Eye, EyeOff, CheckCircle2, AlertCircle, Zap, Clock, Info, Database, Radio, Container, Play, ShieldCheck } from "lucide-react"
-import { MCPConnector, ConfigProperty, splitMethodCredentialKeys } from "@/lib/types/mcp-connector"
+import {
+  ConfigProperty,
+  MCPConnector,
+  missingRequiredCredentials,
+} from "@/lib/types/mcp-connector"
 import { testMCPConnection } from "@/lib/api/mcp-connectors"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
@@ -426,8 +430,9 @@ export function GenericConnectorForm({
   // - fallback   → the synthesized field(s) must be filled
   // - oauth path → a completed authorization is required (fixes the old bypass
   //                where oauth_provider + auth_type!=oauth skipped this gate)
-  // - picker     → (create only) the chosen method's credential must be filled,
-  //                and an oauth2 method with no resolvable provider is unusable.
+  // - picker     → (create only) the chosen method's credential fields that the
+  //                schema marks `required` must be filled, and an oauth2 method
+  //                with no resolvable provider is unusable.
   //                Edit mode relies on handleSave's own validation since stored
   //                credentials aren't re-sent to the form.
   const authIncomplete = (() => {
@@ -446,17 +451,19 @@ export function GenericConnectorForm({
       return true
     }
     if (authUI.kind === "picker" && !isEditing) {
-      // Reachable only for a NON-oauth method (oauth2 was handled above), so
-      // require the chosen method's credential. Edit mode is skipped because
-      // stored credentials aren't re-sent to the form.
+      // Reachable only for a NON-oauth method (oauth2 was handled above). Edit
+      // mode is skipped because stored credentials aren't re-sent to the form.
       const active =
         supportedAuthMethods.find((m) => m.method === authMethod) || supportedAuthMethods[0]
       if (!active) return false
-      // Require EVERY distinct credential field the picker renders — not just the
-      // first key. (aws-s3 api_key has two distinct secrets; the old slice(0,1)
-      // let Save/Test pass with secret_access_key empty → a broken connection.)
-      const { fields } = splitMethodCredentialKeys(active, schemaKeys)
-      return fields.some((k) => !String(authValues[k] ?? "").trim())
+      // Gate on the connector's OWN contract — the credential fields its
+      // configuration_schema marks `required`, which is exactly what the
+      // orchestrator's pre-start gate checks. See missingRequiredCredentials in
+      // lib/types/mcp-connector.ts for why the form agrees with the server here
+      // instead of requiring every field the method happens to name.
+      return (
+        missingRequiredCredentials(active, schemaKeys, requiredFields, authValues).length > 0
+      )
     }
     return false
   })()

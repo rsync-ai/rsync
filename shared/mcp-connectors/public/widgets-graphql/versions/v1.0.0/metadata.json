@@ -26,6 +26,7 @@
   "header_config_keys": [],
   "base_url": "https://api.widgets.test/graphql",
   "auth_type": "bearer",  "supported_auth_methods": [    {
+      "credentials_optional": true,
       "method": "bearer",
       "header_name": "Authorization",
       "header_prefix": "Bearer",

@@ -76,6 +76,17 @@ export interface SupportedAuthMethod {
   // gap fix, Phase B). The picker prefers this over connector.oauth_provider so
   // a multi-auth connector routes oauth2 to Connect instead of a paste-token.
   oauth_provider?: string
+  // This method has a working path with NONE of its `config_keys` supplied —
+  // mongodb against an unauthenticated deployment, gcs/bigquery via Application
+  // Default Credentials, azure-blob anonymous/emulator. It is the connector's
+  // explicit answer to "why does your configuration_schema.required name no
+  // credential?", and `llm-service/tests/test_connector_auth_contract.py`
+  // rejects any non-oauth method that answers neither way. Absent/false — the
+  // default — means the connector is expected to mark a credential required.
+  //
+  // The Save/Test gate reads `required`, not this flag; this is the metadata
+  // contract the gate's honesty rests on.
+  credentials_optional?: boolean
 }
 
 /**
@@ -123,6 +134,48 @@ export function splitMethodCredentialKeys(
   // No schema-backed key → classic single-credential method defined only via
   // config_keys: the first key is the field, the rest are accepted aliases for it.
   return { fields: keys.slice(0, 1), aliases: keys.slice(1) }
+}
+
+/**
+ * Which of a method's credential fields the connection form must refuse to save
+ * blank — the Save/Test gate, as a pure function of the connector's metadata.
+ *
+ * The rule is "whatever the SERVER requires, and nothing more". The orchestrator
+ * refuses to start a connector whose config omits a `required_config` key
+ * (backend-orchestrator/internal/mcp/server_manager.go, missingRequiredConfig),
+ * and `required_config` mirrors `configuration_schema.required`. So the form
+ * gates on exactly that set, intersected with the credential fields the chosen
+ * method actually renders.
+ *
+ * The form deliberately does NOT gate on "every field the method names". Doing
+ * that made every connector with a legitimate no-credential path unconfigurable
+ * in the UI — mongodb against an unauthenticated deployment, gcs/bigquery via
+ * Application Default Credentials, azure-blob anonymous/emulator, clickhouse
+ * with a password-less user — because their Save button could never enable.
+ * aws-s3 is unaffected: it marks BOTH of its secrets `required`, which is what
+ * still blocks a connection with an empty secret_access_key.
+ *
+ * Whether a given COMBINATION of supplied credentials actually authenticates is
+ * the connector's own business, answered by validate_config / test_connection
+ * with a specific message (snowflake: "provide 'password' or
+ * 'private_key_file'"). The form does not re-implement per-vendor auth rules.
+ *
+ * A method that requires nothing here is claiming a working credential-less
+ * path; `credentials_optional: true` is where it says so, and
+ * llm-service/tests/test_connector_auth_contract.py rejects metadata that makes
+ * the claim by omission.
+ */
+export function missingRequiredCredentials(
+  method: Pick<SupportedAuthMethod, "method" | "config_keys">,
+  schemaKeys: Set<string>,
+  requiredFields: string[],
+  values: Record<string, unknown>,
+): string[] {
+  const { fields } = splitMethodCredentialKeys(method, schemaKeys)
+  const required = new Set(requiredFields.map((k) => k.toLowerCase()))
+  return fields.filter(
+    (k) => required.has(k.toLowerCase()) && !String(values[k] ?? "").trim(),
+  )
 }
 
 // Full MCP Connector metadata (from API)

@@ -177,3 +177,176 @@ def test_oauth2_methods_resolve_a_registered_provider(
                 f"({sorted(_REGISTERED_PROVIDERS)}). The OAuth Connect flow would "
                 f"fail at runtime. Register the provider or fix the id."
             )
+
+
+# ---------------------------------------------------------------------------
+# The connection form's Save/Test gate agrees with the SERVER's gate, and both
+# read ``config_schema.required``. That only protects anyone if `required` is
+# honest, so this section makes a dishonest one un-mergeable.
+#
+# Server gate:  backend-orchestrator/internal/mcp/server_manager.go
+#               missingRequiredConfig() — key presence over `required_config`,
+#               honouring `config_aliases`.
+# Form gate:    frontend/src/components/connectors/GenericConnectorForm.tsx
+#               authIncomplete() — the chosen method's credential fields that
+#               `configuration_schema.required` names must be non-blank.
+#
+# Consequence: a connector whose selected auth method has NO credential field in
+# `required` can be saved with every credential blank. For mongodb (an
+# unauthenticated deployment), gcs/bigquery (Application Default Credentials)
+# and azure-blob (anonymous / emulator) that is correct and intended. For a
+# vendor that always needs a secret it is a broken connection the user only
+# discovers at run time — which is exactly what stripe shipped: a bearer method
+# naming four credential keys and a `required` list of [].
+#
+# The two cases are indistinguishable from the data, so the honest one has to
+# say so: ``"credentials_optional": true`` on the auth method. Default false
+# means a new or generated connector fails this gate until someone decides which
+# case it is.
+
+
+def _split_method_credential_keys(
+    method: dict, schema_keys: set[str]
+) -> list[str]:
+    """The credential fields the connection form renders for ``method``.
+
+    A line-for-line mirror of ``splitMethodCredentialKeys`` in
+    frontend/src/lib/types/mcp-connector.ts (it returns {fields, aliases}; only
+    ``fields`` — the gated set — matters here). Keep the two in lockstep: this
+    gate is only meaningful while it models the field set the form actually
+    gates on.
+    """
+    keys = [k for k in (method.get("config_keys") or []) if isinstance(k, str)]
+    kind = method.get("method")
+    if kind in ("oauth2", "oauth"):
+        return []
+    if kind == "basic":
+        return list(keys)
+    distinct = [k for k in keys if k.lower() in schema_keys]
+    if distinct:
+        return distinct
+    return keys[:1]
+
+
+def _ungated_auth_methods(meta: dict) -> list[str]:
+    """Auth methods that gate on nothing and do not admit it.
+
+    Returns one human-readable complaint per offending method; empty means the
+    connector's declared contract is honest either way.
+    """
+    schema = meta.get("config_schema") or meta.get("configuration_schema") or {}
+    schema_keys = {k.lower() for k in (schema.get("properties") or {})}
+    required = {k.lower() for k in (schema.get("required") or [])}
+    # An alias of a required field satisfies the server gate, so it satisfies
+    # this one: missingRequiredConfig() accepts `config[alias]` for `required`.
+    for req, alias_list in (meta.get("config_aliases") or {}).items():
+        if req.lower() in required:
+            required.update(a.lower() for a in alias_list if isinstance(a, str))
+
+    complaints: list[str] = []
+    for i, method in enumerate(meta.get("supported_auth_methods") or []):
+        if not isinstance(method, dict) or method.get("method") in ("oauth2", "oauth"):
+            continue
+        fields = _split_method_credential_keys(method, schema_keys)
+        if any(f.lower() in required for f in fields):
+            continue
+        if method.get("credentials_optional") is True:
+            continue
+        complaints.append(
+            f"supported_auth_methods[{i}] (method={method.get('method')!r}, "
+            f"config_keys={method.get('config_keys')!r}): none of its credential "
+            f"fields {fields} appears in config_schema.required, and it does not "
+            f'declare "credentials_optional": true. A connection saves with every '
+            f"credential blank and fails at run time. Either add the field the "
+            f"vendor actually needs to `required` (+ `config_aliases` for the "
+            f"other spellings), or declare credentials_optional if this method "
+            f"genuinely works with no credential."
+        )
+    return complaints
+
+
+def _count_gated_methods() -> int:
+    """How many non-oauth methods the gate below actually examines."""
+    n = 0
+    for _, meta_path in _CONNECTORS:
+        meta = json.loads(meta_path.read_text())
+        for method in meta.get("supported_auth_methods") or []:
+            if isinstance(method, dict) and method.get("method") not in ("oauth2", "oauth"):
+                n += 1
+    return n
+
+
+def test_the_ungated_auth_check_has_a_real_corpus_to_check():
+    """An empty corpus would make every assertion below pass vacuously."""
+    n = _count_gated_methods()
+    assert n >= 10, (
+        f"only {n} non-oauth auth methods discovered across {len(_CONNECTORS)} "
+        f"connectors — the ungated-auth gate would be near-vacuous"
+    )
+
+
+def test_the_ungated_auth_check_rejects_a_dishonest_contract():
+    """Control: the checker must FAIL the shape it exists to catch.
+
+    Without this, a refactor that makes ``_ungated_auth_methods`` always return
+    [] would turn the whole gate green while catching nothing.
+    """
+    dishonest = {
+        "supported_auth_methods": [
+            {
+                "method": "bearer",
+                "config_keys": ["access_token", "token", "secret_key"],
+            }
+        ],
+        "config_schema": {
+            "properties": {"base_url": {}, "access_token": {}},
+            "required": [],
+        },
+    }
+    assert _ungated_auth_methods(dishonest), (
+        "the checker accepted a bearer method whose credential is in neither "
+        "`required` nor `credentials_optional` — it is not checking anything"
+    )
+
+    # …and must accept both honest shapes, so it is not merely always-failing.
+    by_required = json.loads(json.dumps(dishonest))
+    by_required["config_schema"]["required"] = ["access_token"]
+    assert _ungated_auth_methods(by_required) == []
+
+    by_alias = json.loads(json.dumps(dishonest))
+    by_alias["config_schema"]["required"] = ["secret_key"]
+    by_alias["config_aliases"] = {"secret_key": ["access_token"]}
+    assert _ungated_auth_methods(by_alias) == []
+
+    by_marker = json.loads(json.dumps(dishonest))
+    by_marker["supported_auth_methods"][0]["credentials_optional"] = True
+    assert _ungated_auth_methods(by_marker) == []
+
+
+@pytest.mark.parametrize("connector_id,meta_path", _CONNECTORS, ids=_IDS)
+def test_every_auth_method_gates_on_something_or_says_it_does_not(
+    connector_id: str, meta_path: Path
+):
+    """HARD GATE: a credential field in `required`, or `credentials_optional: true`.
+
+    Applies to every connector on disk, including ones the generator writes —
+    a generated connector lands here as a checked-in metadata.json like any
+    other, so this is the gate future connectors have to pass too.
+    """
+    complaints = _ungated_auth_methods(json.loads(meta_path.read_text()))
+    assert not complaints, f"{connector_id}:\n  " + "\n  ".join(complaints)
+
+
+@pytest.mark.parametrize("connector_id,meta_path", _CONNECTORS, ids=_IDS)
+def test_credentials_optional_is_a_boolean_when_present(
+    connector_id: str, meta_path: Path
+):
+    """A string "false" is truthy in JS and would silently disarm the form gate."""
+    meta = json.loads(meta_path.read_text())
+    for i, method in enumerate(meta.get("supported_auth_methods") or []):
+        if not isinstance(method, dict) or "credentials_optional" not in method:
+            continue
+        assert isinstance(method["credentials_optional"], bool), (
+            f"{connector_id}.supported_auth_methods[{i}]: credentials_optional="
+            f"{method['credentials_optional']!r} must be a JSON boolean"
+        )

@@ -37,6 +37,7 @@
   "auth_type": "api_key",
   "supported_auth_methods": [
     {
+      "credentials_optional": true,
       "method": "api_key",
       "header_name": "",
       "header_prefix": "",
@@ -46,6 +47,7 @@
       "description": "Azure Blob connection string (starts with DefaultEndpointsProtocol=). Recommended single-field auth. Leave empty to use account_name + account_key / SAS, or a custom endpoint."
     },
     {
+      "credentials_optional": true,
       "method": "api_key",
       "header_name": "",
       "header_prefix": "",
@@ -56,6 +58,7 @@
       "description": "Azure Storage account name + account key (shared key auth)."
     },
     {
+      "credentials_optional": true,
       "method": "api_key",
       "header_name": "",
       "header_prefix": "",
