@@ -63,7 +63,7 @@ service's own operational plumbing.
 | OpenTelemetry export | no `otel-collector` container in quickstart | `docker-compose.quickstart.yml` |
 | Log shipping (`fluent-bit`), Avro `schema-registry`, Temporal web UI + admin tools, MinIO lifecycle init, Docker socket proxy, connector FS init | hosted-only plumbing | 8 services quickstart omits, `otel-collector` included |
 | Internal connectors as pipeline endpoints (MinIO, Debezium, Kafka sink) | blocked by default in **both** editions; the hosted compose opts in with `RSYNC_ALLOW_INTERNAL_CONNECTORS=true` | `connections.go:56-60` |
-| Billing and plan quotas | `RSYNC_BILLING_ENFORCED=false` | `docker-compose.quickstart.yml:1081` |
+| Billing and plan quotas | `RSYNC_BILLING_ENFORCED=false` | `docker-compose.quickstart.yml:1147` |
 | The Usage panel (`/usage`, `/admin/usage`) | it reports plan, quota and trial numbers that a deployment enforcing no plans does not have; the flag defaults to whatever billing does, so it switches itself off | `features.go` → `resolveUsagePanel()`; set `FEATURE_USAGE_PANEL=true` to show it anyway |
 
 ### Connector generation: what exactly is missing
@@ -97,7 +97,7 @@ self-hosted means writing it by hand: see the
 
 **Self-hosted, every quota is off.** Two independent reasons, either sufficient:
 
-1. `RSYNC_BILLING_ENFORCED=false` in `docker-compose.quickstart.yml:1081` →
+1. `RSYNC_BILLING_ENFORCED=false` in `docker-compose.quickstart.yml:1147` →
    `billingEnforced()` returns false → `resolvePlanQuota` returns `unlimitedQuota`
    (`billingEnforced()` at `plan_quota.go:70`, the early return at `:84`).
 2. Even with billing on, `loadPlans` reads the `plans` table; when it is empty the code
