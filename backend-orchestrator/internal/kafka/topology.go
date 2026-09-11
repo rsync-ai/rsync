@@ -394,7 +394,7 @@ func (tm *TopologyManager) EnsureAgentControlTopics(ctx context.Context, partiti
 	// must therefore match, verbatim:
 	//
 	//	pipeline.domain.events    scripts/kafka-init-new-topics.sh:185  retention -1
-	//	                          docker-compose.quickstart.yml:140     --partitions 3
+	//	                          docker-compose.quickstart.yml:489     --partitions 3
 	//	pipeline.agent.telemetry  scripts/kafka-init-new-topics.sh:189  retention 7d
 	//	                          scripts/kafka-init-new-topics.sh:150  --partitions $PARTITIONS (3)
 	//

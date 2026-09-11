@@ -1006,7 +1006,7 @@ services:
     deploy:
       # SCALING:
       #   Each agent topic (agent.control.commands.<type>) is created with
-      #   3 partitions (see docker-compose.quickstart.yml:98 and the topic
+      #   3 partitions (see docker-compose.quickstart.yml:486 and the topic
       #   provisioner). Multiple orchestrator replicas in the same consumer
       #   group safely split partitions, so this service scales horizontally
       #   up to 3 replicas with no code changes.
