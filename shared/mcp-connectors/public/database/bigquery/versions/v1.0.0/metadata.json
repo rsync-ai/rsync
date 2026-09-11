@@ -22,6 +22,7 @@
   "auth_type": "api_key",
   "supported_auth_methods": [
     {
+      "credentials_optional": true,
       "method": "api_key",
       "header_name": "",
       "header_prefix": "",

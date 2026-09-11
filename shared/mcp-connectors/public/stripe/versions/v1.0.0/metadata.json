@@ -30,11 +30,13 @@
       "header_name": "Authorization",
       "header_prefix": "Bearer ",
       "config_keys": ["access_token", "token", "secret_key", "api_key"],      "description": "Stripe secret key used as HTTP Basic auth password (Bearer in header)"    }  ],  "required_config": [
-  ],
-  "config_aliases": {},
-  "optional_config": [
-    "base_url",
     "access_token"
+  ],
+  "config_aliases": {
+    "access_token": ["token", "secret_key", "api_key"]
+  },
+  "optional_config": [
+    "base_url"
   ],
   "configuration_schema": {
     "type": "object",
@@ -49,6 +51,7 @@
         "secret": true      }
     },
     "required": [
+      "access_token"
     ]
   },
   "config_schema": {
@@ -64,6 +67,7 @@
         "secret": true      }
     },
     "required": [
+      "access_token"
     ]
   },
   "capabilities": {

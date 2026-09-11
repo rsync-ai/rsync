@@ -52,6 +52,7 @@
   "auth_type": "basic",
   "supported_auth_methods": [
     {
+      "credentials_optional": true,
       "method": "basic",
       "header_name": "",
       "header_prefix": "",
