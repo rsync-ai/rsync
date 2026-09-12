@@ -494,7 +494,16 @@ services:
   minio:
     # Pinned: this is the one-command install. An unpinned tag means two operators running
     # the same install command on different days get different object stores.
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # quay.io, not Docker Hub. MinIO revoked anonymous pulls on docker.io/minio/*
+    # on 2026-09-12 -- every tag, server and `mc` client alike, 401 to an
+    # unauthenticated client. This file is the one-command install: `docker
+    # compose pull` died here before a single container started, and the error
+    # Docker reports for a walled repository is "repository does not exist or may
+    # require 'docker login'", which reads like a typo rather than a vendor
+    # policy change. quay.io/minio carries the same RELEASE tags and this one's
+    # manifest digest is byte-identical (sha256:14cea493...) to what Docker Hub
+    # served, so the source moved and the bits did not.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: rsync-minio
     logging:
       driver: json-file

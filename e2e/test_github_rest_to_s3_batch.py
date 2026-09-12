@@ -134,7 +134,7 @@ pytestmark = pytest.mark.skipif(_skip_reason() is not None, reason=_skip_reason(
 
 
 # --------------------------------------------------------------------------- #
-# MinIO helpers (disposable minio/mc container on the MCP network)
+# MinIO helpers (disposable quay.io/minio/mc container on the MCP network)
 # --------------------------------------------------------------------------- #
 
 
@@ -144,7 +144,7 @@ def _mc(cmd: str) -> str:
             f">/dev/null 2>&1; {cmd}")
     return subprocess.check_output(
         ["docker", "run", "--rm", "--network", MCP_NET,
-         "--entrypoint", "sh", "minio/mc:latest", "-c", full],
+         "--entrypoint", "sh", "quay.io/minio/mc:latest", "-c", full],
         text=True, stderr=subprocess.DEVNULL,
     )
 
@@ -274,7 +274,7 @@ def dest_minio():
         subprocess.check_call(
             ["docker", "run", "-d", "--name", DEST_MINIO, "--network", MCP_NET,
              "-e", f"MINIO_ROOT_USER={MINIO_USER}", "-e", f"MINIO_ROOT_PASSWORD={MINIO_PASS}",
-             "minio/minio:latest", "server", "/data"],
+             "quay.io/minio/minio:latest", "server", "/data"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # create the bucket (retry until MinIO is ready)
     ready = False

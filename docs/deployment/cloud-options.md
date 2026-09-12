@@ -60,7 +60,7 @@ not one. What is true, and what is not:
 
 | | Multi-arch `linux/arm64`? |
 |---|---|
-| `postgres:16-alpine`, `redis:7-alpine`, `confluentinc/cp-kafka:7.6.1`, `temporalio/auto-setup`, `minio/minio` | yes — the third-party dependencies are fine |
+| `postgres:16-alpine`, `redis:7-alpine`, `confluentinc/cp-kafka:7.6.1`, `temporalio/auto-setup`, `quay.io/minio/minio` | yes — the third-party dependencies are fine |
 | `ghcr.io/rsync-ai/*` (api-gateway, orchestrator, frontend, llm-service-oss, temporal-adapter, and the connector images) | **no** — `linux/amd64` only |
 
 The failure is not a clean one. `docker compose pull` reports
