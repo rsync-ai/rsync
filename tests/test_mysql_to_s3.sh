@@ -87,7 +87,7 @@ get_first_network() {
 mc() {
   local network="$1"
   shift
-  docker run --rm --network "$network" minio/mc:latest "$@"
+  docker run --rm --network "$network" quay.io/minio/mc:latest "$@"
 }
 
 require_cmd() {
@@ -393,7 +393,7 @@ echo ""
 echo "Listing objects in bucket..."
 PREFIX="batch-test/${RUN_TS}/"
 objects="$(
-  docker run --rm --network "$MINIO_NET" --entrypoint /bin/sh minio/mc:latest -lc \
+  docker run --rm --network "$MINIO_NET" --entrypoint /bin/sh quay.io/minio/mc:latest -lc \
     "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 && mc ls --recursive local/pipeline-data/${PREFIX}" \
     2>/dev/null || true
 )"
@@ -401,7 +401,7 @@ objects="$(
 # If nothing found under the expected prefix, fall back to listing the whole bucket.
 if [ -z "$objects" ]; then
   objects="$(
-    docker run --rm --network "$MINIO_NET" --entrypoint /bin/sh minio/mc:latest -lc \
+    docker run --rm --network "$MINIO_NET" --entrypoint /bin/sh quay.io/minio/mc:latest -lc \
       "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 && mc ls --recursive local/pipeline-data" \
       2>/dev/null || true
   )"
@@ -418,14 +418,14 @@ if [ -n "$objects" ]; then
 
   echo ""
   echo "Sample data (first 5 lines):"
-  docker run --rm --network "$MINIO_NET" --entrypoint /bin/sh minio/mc:latest -lc \
+  docker run --rm --network "$MINIO_NET" --entrypoint /bin/sh quay.io/minio/mc:latest -lc \
     "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 && mc cat \"local/pipeline-data/${sample_key}\" | head -5" \
     2>/dev/null | sed 's/^/     /' || true
 else
   echo "  ⚠️  No objects found in bucket (pipeline may have written to a different prefix)"
   echo ""
   echo "  Buckets:"
-  docker run --rm --network "$MINIO_NET" --entrypoint /bin/sh minio/mc:latest -lc \
+  docker run --rm --network "$MINIO_NET" --entrypoint /bin/sh quay.io/minio/mc:latest -lc \
     "mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null 2>&1 && mc ls local/" \
     2>/dev/null | sed 's/^/     /' || true
 fi

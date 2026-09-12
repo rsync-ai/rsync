@@ -307,6 +307,21 @@ jobs:
               - 'backend-orchestrator/internal/telemetry/**'
               - 'api-gateway/internal/telemetry/**'
               - 'backend-temporal-adapter/internal/telemetry/**'
+              # An eleventh time, same shape, and the subjects are whole test
+              # trees rather than single files.
+              # test_shipped_images_are_anonymously_pullable.py sweeps every
+              # tracked file for an image behind a registry auth wall -- the
+              # defect that killed a `curl | bash` install outright when MinIO
+              # withdrew anonymous pulls from docker.io/minio/*. Most of its
+              # subjects are compose files and the chart, already matched above,
+              # but five are shell and Python scripts under these two trees that
+              # `docker run` the `mc` client directly, and neither tree matched
+              # any pattern here: the `e2e:` filter below is scoped to
+              # e2e/_support/** and gates a different job. So a PR reverting one
+              # of those lines to the Docker Hub name would have skipped
+              # llm-service-unit and reported green.
+              - 'e2e/**'
+              - 'tests/**'
             e2e:
               - 'e2e/_support/**'
               - '.github/workflows/ci.yml'

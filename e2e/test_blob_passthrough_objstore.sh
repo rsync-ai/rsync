@@ -85,7 +85,7 @@ log "▶ starting throwaway MinIO '${BS}' (source+dest+claim-check)…"
 docker rm -f "${BS}" >/dev/null 2>&1 || true
 docker run -d --name "${BS}" --network "${MCP_NET}" \
   -e MINIO_ROOT_USER="${BS_KEY}" -e MINIO_ROOT_PASSWORD="${BS_SECRET}" \
-  minio/minio:latest server /data >/dev/null || die "failed to start MinIO ${BS}"
+  quay.io/minio/minio:latest server /data >/dev/null || die "failed to start MinIO ${BS}"
 
 log "▶ starting throwaway Azurite '${AZ}' (cross-provider dest)…"
 docker rm -f "${AZ}" >/dev/null 2>&1 || true

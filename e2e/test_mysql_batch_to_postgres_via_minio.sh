@@ -189,10 +189,10 @@ minio_ls_prefix() {
   local mc_cfg="${ROOT_DIR}/.tmp/mc"
   mkdir -p "${mc_cfg}"
 
-  docker run --rm --network "${NETWORK}" -v "${mc_cfg}:/mc" minio/mc:latest --config-dir /mc \
+  docker run --rm --network "${NETWORK}" -v "${mc_cfg}:/mc" quay.io/minio/mc:latest --config-dir /mc \
     alias set rsync "${MINIO_ENDPOINT_URL}" "${MINIO_ACCESS_KEY_ID}" "${MINIO_SECRET_ACCESS_KEY}" >/dev/null 2>&1 || true
 
-  docker run --rm --network "${NETWORK}" -v "${mc_cfg}:/mc" minio/mc:latest --config-dir /mc \
+  docker run --rm --network "${NETWORK}" -v "${mc_cfg}:/mc" quay.io/minio/mc:latest --config-dir /mc \
     ls --recursive "rsync/${MINIO_BUCKET}/${prefix}" 2>/dev/null || true
 }
 

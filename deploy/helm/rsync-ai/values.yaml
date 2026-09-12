@@ -403,11 +403,14 @@ objectStorage:
     # Pinned, per this file's own rule at the `tag:` key above: an unpinned tag
     # silently changes what a re-pulled pod runs. Digest-identical to `latest`
     # at the time of pinning, so this froze the image rather than changing it.
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # quay.io, not Docker Hub: docker.io/minio/* stopped serving anonymous pulls
+    # (2026-09-12), so a cluster with no registry credentials could not pull it.
+    # Same release tags, byte-identical manifest digest.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     # The `mc` client, used once per install/upgrade to create the bucket and
     # apply the lifecycle rule above.
     # Pinned for the same reason as the server image above.
-    mcImage: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    mcImage: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     persistence:
       size: 50Gi
       # Overrides global.storageClass for this volume only. Empty = inherit it.

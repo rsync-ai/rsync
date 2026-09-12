@@ -73,7 +73,7 @@ resolve_sink() {
 
 # mc helper: runs mc commands against the external MinIO.
 mc() {
-  docker run --rm --network "${MCP_NET}" --entrypoint sh minio/mc:latest -c \
+  docker run --rm --network "${MCP_NET}" --entrypoint sh quay.io/minio/mc:latest -c \
     "mc alias set d http://${DEST_MINIO}:9000 ${MINIO_USER} ${MINIO_PASS} >/dev/null 2>&1; $1"
 }
 
@@ -116,7 +116,7 @@ setup_minio() {
     docker rm -f "${DEST_MINIO}" >/dev/null 2>&1 || true
     docker run -d --name "${DEST_MINIO}" --network "${MCP_NET}" \
       -e "MINIO_ROOT_USER=${MINIO_USER}" -e "MINIO_ROOT_PASSWORD=${MINIO_PASS}" \
-      minio/minio:latest server /data >/dev/null
+      quay.io/minio/minio:latest server /data >/dev/null
   fi
   local ok=""
   for _ in $(seq 1 30); do

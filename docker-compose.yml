@@ -720,7 +720,9 @@ services:
   minio:
     # Pinned: an unpinned object store silently changes under a re-pull, and this one
     # holds staged pipeline data. Digest-identical to `latest` at the time of pinning.
-    image: minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # quay.io, not Docker Hub: docker.io/minio/* stopped serving anonymous pulls
+    # (2026-09-12). Same release tag, byte-identical manifest digest.
+    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
     container_name: rsync-ai-minio
     logging:
       driver: json-file
@@ -755,7 +757,9 @@ services:
   # SHORTER than retention and opened a loss window — default raised to 7 days.
   minio-lifecycle-init:
     # Pinned for the same reason as the minio server above; mc writes the lifecycle rule.
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    # quay.io, not Docker Hub, for the same reason as the server image above:
+    # docker.io/minio/* no longer serves anonymous pulls.
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     container_name: rsync-ai-minio-lifecycle-init
     logging:
       driver: json-file
