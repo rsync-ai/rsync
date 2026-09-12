@@ -245,7 +245,7 @@ jobs:
       - name: Upload SARIF to code-scanning
         id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           sarif_file: gosec-${{ matrix.module }}.sarif
           category: gosec-${{ matrix.module }}
@@ -344,7 +344,7 @@ jobs:
       - name: Upload SARIF to code-scanning
         id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
@@ -436,7 +436,7 @@ jobs:
       - name: Upload SARIF to code-scanning
         id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
-        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4
+        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           sarif_file: trivy.sarif
           category: trivy
