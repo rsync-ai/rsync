@@ -297,7 +297,7 @@ func FetchPipelineRunContextActivity(ctx context.Context, pipelineID, executionI
 		return NLPipelineWorkflowV2Input{}, fmt.Errorf("database type assertion failed")
 	}
 
-	var nlRequest, userID, sourceConnID, destConnID string
+	var nlRequest, userID, workspaceID, sourceConnID, destConnID string
 	var sourceConnIDNull, destConnIDNull sql.NullString
 	var defaultRunMode, dataset, pipelineName sql.NullString
 	var configJSON, srcSnapshotJSON, destSnapshotJSON []byte
@@ -315,6 +315,7 @@ func FetchPipelineRunContextActivity(ctx context.Context, pipelineID, executionI
 			COALESCE(natural_language_request, description, name) as nl_request,
 			name,
 			created_by,
+			workspace_id,
 			source_connection_id,
 			destination_connection_id,
 			default_run_mode,
@@ -328,6 +329,7 @@ func FetchPipelineRunContextActivity(ctx context.Context, pipelineID, executionI
 		&nlRequest,
 		&pipelineName,
 		&userID,
+		&workspaceID,
 		&sourceConnIDNull,
 		&destConnIDNull,
 		&defaultRunMode,
@@ -349,9 +351,13 @@ func FetchPipelineRunContextActivity(ctx context.Context, pipelineID, executionI
 	}
 
 	input := NLPipelineWorkflowV2Input{
-		PipelineID:              pipelineID,
-		ExecutionID:             executionID,
-		UserID:                  userID,
+		PipelineID:  pipelineID,
+		ExecutionID: executionID,
+		UserID:      userID,
+		// A scheduled run has no HTTP request to carry the caller's active
+		// workspace, so it comes off the pipeline row itself — the same tenant the
+		// manual /run path scopes by.
+		WorkspaceID:             workspaceID,
 		Message:                 nlRequest,
 		SourceConnectionID:      sourceConnID,
 		DestinationConnectionID: destConnID,

@@ -3142,10 +3142,13 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 		runModeVal := resolveRunMode(c.Query("run_mode"), runReq.RunMode, defaultRunMode)
 
 		workflowInput := map[string]interface{}{
-			"pipeline_id":               id,
-			"execution_id":              execID,
-			"message":                   requestText, // V2: Just the message, workflow handles rest
-			"user_id":                   userID,
+			"pipeline_id":  id,
+			"execution_id": execID,
+			"message":      requestText, // V2: Just the message, workflow handles rest
+			"user_id":      userID,
+			// Tenant scope for the orchestrator's workspace resolver — the same
+			// workspace this handler already scoped the pipeline SELECT by.
+			"workspace_id":              wsID,
 			"source_connection_id":      sourceConnIDVal,
 			"destination_connection_id": destConnIDVal,
 			// Dataset namespace for cloud storage paths

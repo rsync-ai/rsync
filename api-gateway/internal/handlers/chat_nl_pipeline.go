@@ -3287,10 +3287,14 @@ func (h *ChatHandler) createAndRunPipeline(
 
 		// V2: Minimal input - workflow handles everything
 		workflowInput := map[string]interface{}{
-			"pipeline_id":               pipelineID,
-			"execution_id":              execID,
-			"message":                   request, // Raw user message - workflow parses intent
-			"user_id":                   userID,
+			"pipeline_id":  pipelineID,
+			"execution_id": execID,
+			"message":      request, // Raw user message - workflow parses intent
+			"user_id":      userID,
+			// Tenant scope for the orchestrator's workspace resolver. It must be the
+			// workspace id, not the user id: a user can belong to several workspaces,
+			// and the resolver's connection queries filter on connections.workspace_id.
+			"workspace_id":              workspaceID,
 			"source_connection_id":      sourceConnectionID,
 			"destination_connection_id": destinationConnectionID,
 			// Distributed tracing context (so Temporal activities + Kafka can join the same trace).

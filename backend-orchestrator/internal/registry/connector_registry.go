@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +36,11 @@ type ConnectorCapabilities struct {
 	// into a pre-flight UI signal (why a given source→dest pair is/ isn't allowed).
 	// Defaults to ["structured"] for any connector that doesn't declare it.
 	SupportedModalities []string `json:"supported_modalities"`
+	// Aliases are the other names this connector answers to, declared by the
+	// connector itself in its metadata.json (e.g. gcs also answers to
+	// "google-cloud-storage"). Callers never read this directly — the registry
+	// folds it into a normalized alias index that GetCapabilities consults.
+	Aliases []string `json:"aliases,omitempty"`
 	// Internal connectors (like MinIO) are not visible to users in UI
 	// They are used for system-internal operations (staging, buffering)
 	Internal bool `json:"internal,omitempty"`
@@ -65,9 +71,12 @@ type ConnectorRegistry struct {
 	dbDisabledWhy string
 	cache         map[string]*ConnectorCapabilities
 	categoryCache map[string]*CategoryDefaults
-	mu            sync.RWMutex
-	cacheExpiry   time.Time
-	cacheTTL      time.Duration
+	// aliasIndex maps a normalized alias to the connector_type that declared it.
+	// Derived from r.cache; rebuilt in the same critical section that publishes it.
+	aliasIndex  map[string]string
+	mu          sync.RWMutex
+	cacheExpiry time.Time
+	cacheTTL    time.Duration
 }
 
 // NewConnectorRegistry creates a new connector registry
@@ -76,6 +85,7 @@ func NewConnectorRegistry(db *sql.DB) *ConnectorRegistry {
 		db:            db,
 		cache:         make(map[string]*ConnectorCapabilities),
 		categoryCache: make(map[string]*CategoryDefaults),
+		aliasIndex:    make(map[string]string),
 		cacheTTL:      5 * time.Minute, // Cache for 5 minutes
 	}
 
@@ -90,6 +100,17 @@ func (r *ConnectorRegistry) RefreshCache() error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
+	// Every loader below publishes by replacing or refilling r.cache, and there are
+	// five paths out of the load (DB, two DB-unavailable fallbacks, the filesystem
+	// loader, the hardcoded defaults). The alias index is derived from r.cache, so
+	// rebuild it on the way out — one call, every path, still inside the write lock.
+	defer r.rebuildAliasIndexLocked()
+
+	return r.refreshCacheLocked()
+}
+
+// refreshCacheLocked performs the load. The caller must hold r.mu for writing.
+func (r *ConnectorRegistry) refreshCacheLocked() error {
 	if r.db == nil || r.dbDisabled {
 		if r.dbDisabled {
 			log.Warnf("⚠️  ConnectorRegistry: DB capability registry disabled (%s); loading MCP connector metadata from filesystem", r.dbDisabledWhy)
@@ -265,6 +286,7 @@ func (r *ConnectorRegistry) loadFromFilesystem() error {
 		ConnectorType       string                 `json:"connector_type"`
 		DisplayName         string                 `json:"display_name"`
 		Category            string                 `json:"category"`
+		Aliases             []string               `json:"aliases"`
 		Internal            bool                   `json:"internal,omitempty"`
 		Capabilities        interface{}            `json:"capabilities"`
 		ConfigSchema        map[string]interface{} `json:"config_schema"`
@@ -357,6 +379,7 @@ func (r *ConnectorRegistry) loadFromFilesystem() error {
 			Terminology:         extractTerminologyFromCapabilities(tm.Capabilities),
 			Operations:          extractOperationsFromCapabilities(tm.Capabilities),
 			SupportedModalities: extractModalitiesFromCapabilities(tm.Capabilities),
+			Aliases:             tm.Aliases,
 			Internal:            tm.Internal,
 		}
 
@@ -659,10 +682,22 @@ func (r *ConnectorRegistry) GetCapabilities(connectorType string) *ConnectorCapa
 		return caps
 	}
 
+	q := normalizeConnectorKey(connectorType)
+
+	// Declared-alias lookup. Every connector lists the other names it answers to in
+	// its own metadata.json, and the index is built from those arrays — so a name
+	// like "google-cloud-storage" resolves to the gcs connector without any table
+	// here, and a connector generated tomorrow is resolvable by every name it
+	// declares the moment its metadata lands on disk.
+	if connType, ok := r.aliasIndex[q]; ok {
+		if caps, ok := r.cache[connType]; ok {
+			return caps
+		}
+	}
+
 	// Vendor-prefix alias fallback. Normalise both sides so users typing
 	// "Shopify" or "shopify_admin_graphql" still match the canonical
 	// "shopify-admin-graphql" key.
-	q := normalizeConnectorKey(connectorType)
 	if len(q) >= 4 {
 		for key, caps := range r.cache {
 			normKey := normalizeConnectorKey(key)
@@ -680,6 +715,66 @@ func (r *ConnectorRegistry) GetCapabilities(connectorType string) *ConnectorCapa
 	return nil
 }
 
+// rebuildAliasIndexLocked rebuilds the normalized alias -> connector_type index from
+// whatever is currently in r.cache. The caller must hold r.mu for writing.
+//
+// Rules, in order:
+//   - a real connector_type always wins; an alias may never shadow one
+//   - version-shaped aliases ("1.0.0", "v100") are skipped — they are metadata noise
+//     that no caller resolves a connector by
+//   - when two connectors claim the same alias, the first in sorted connector_type
+//     order keeps it and the other is logged, so the outcome does not depend on Go's
+//     randomized map iteration
+func (r *ConnectorRegistry) rebuildAliasIndexLocked() {
+	index := make(map[string]string, len(r.cache))
+
+	types := make([]string, 0, len(r.cache))
+	canonical := make(map[string]bool, len(r.cache))
+	for connType := range r.cache {
+		types = append(types, connType)
+		canonical[normalizeConnectorKey(connType)] = true
+	}
+	sort.Strings(types)
+
+	for _, connType := range types {
+		caps := r.cache[connType]
+		if caps == nil {
+			continue
+		}
+		for _, alias := range caps.Aliases {
+			key := normalizeConnectorKey(alias)
+			if key == "" || canonical[key] || isVersionShaped(key) {
+				continue
+			}
+			if owner, taken := index[key]; taken {
+				if owner != connType {
+					log.Warnf("⚠️  ConnectorRegistry: alias '%s' is claimed by both '%s' and '%s'; keeping '%s'", key, owner, connType, owner)
+				}
+				continue
+			}
+			index[key] = connType
+		}
+	}
+
+	r.aliasIndex = index
+}
+
+// isVersionShaped reports whether a string looks like a version ("1.0.0", "v100")
+// rather than a name. kafka-mcp-sink lists two of these in its aliases array; they
+// must not become resolvable connector names.
+func isVersionShaped(s string) bool {
+	s = strings.TrimPrefix(s, "v")
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if (c < '0' || c > '9') && c != '.' {
+			return false
+		}
+	}
+	return strings.ContainsAny(s, "0123456789")
+}
+
 func normalizeConnectorKey(s string) string {
 	s = strings.ToLower(strings.TrimSpace(s))
 	s = strings.ReplaceAll(s, "_", "-")
@@ -695,8 +790,9 @@ func normalizeConnectorKey(s string) string {
 //
 // Matching strategy (in order):
 // 1) Exact match on connector_type (normalized)
-// 2) Substring match on connector_type
-// 3) Substring match on display_name
+// 2) Exact match on a declared alias
+// 3) Substring match on connector_type
+// 4) Substring match on display_name
 func (r *ConnectorRegistry) FindConnector(query string) (*ConnectorCapabilities, bool) {
 	q := normalizeConnectorKey(query)
 	if q == "" {
@@ -713,14 +809,21 @@ func (r *ConnectorRegistry) FindConnector(query string) (*ConnectorCapabilities,
 		}
 	}
 
-	// 2) substring match on connector_type
+	// 2) declared alias — an explicit name beats any substring guess below
+	if connType, ok := r.aliasIndex[q]; ok {
+		if caps, ok := r.cache[connType]; ok {
+			return caps, true
+		}
+	}
+
+	// 3) substring match on connector_type
 	for _, caps := range r.cache {
 		if strings.Contains(normalizeConnectorKey(caps.ConnectorType), q) {
 			return caps, true
 		}
 	}
 
-	// 3) substring match on display name
+	// 4) substring match on display name
 	for _, caps := range r.cache {
 		if strings.Contains(normalizeConnectorKey(caps.DisplayName), q) {
 			return caps, true

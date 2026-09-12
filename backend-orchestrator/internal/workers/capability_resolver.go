@@ -387,8 +387,16 @@ func (w *CapabilityResolverWorker) ProcessTask(ctx context.Context, assignment T
 		workspaceID = getStringFromMap(assignment.Context, "workspace_id")
 	}
 	if workspaceID == "" {
-		// Try to get from user_id (for backward compatibility)
-		workspaceID = assignment.UserID
+		// Fallback for tasks built before workspace_id was threaded onto the
+		// connector-resolver payload. The workspace comes off the pipeline row
+		// (pipelines.workspace_id, NOT NULL since migration 069).
+		//
+		// This used to fall back to assignment.UserID. users.id and workspaces.id are
+		// different UUID spaces, so every workspace-scoped connection query below
+		// matched zero rows and the run ended blocked on HITL — and deriving a
+		// workspace from a user id is wrong anyway, since a user can belong to
+		// several workspaces.
+		workspaceID = w.workspaceIDForPipeline(ctx, assignment.PipelineID)
 	}
 
 	if workspaceID != "" && w.workspaceResolver != nil {
@@ -910,4 +918,23 @@ func (w *CapabilityResolverWorker) getCapabilitiesSummary(connectorType string) 
 		"supports_destination": caps.SupportsDestination,
 		"operations":           len(caps.Operations),
 	}
+}
+
+// workspaceIDForPipeline reads the tenant a pipeline belongs to.
+//
+// Returns "" when the handle or the row is missing, which makes the caller skip
+// workspace resolution altogether. That is the safe outcome: resolving against the
+// wrong tenant would silently select another workspace's connections.
+func (w *CapabilityResolverWorker) workspaceIDForPipeline(ctx context.Context, pipelineID string) string {
+	if w.db == nil || pipelineID == "" {
+		return ""
+	}
+	var workspaceID sql.NullString
+	err := w.db.QueryRowContext(ctx, `SELECT workspace_id FROM pipelines WHERE id = $1`, pipelineID).Scan(&workspaceID)
+	if err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).
+			Warn("⚠️  Could not read workspace_id for pipeline; skipping workspace resolution")
+		return ""
+	}
+	return workspaceID.String
 }

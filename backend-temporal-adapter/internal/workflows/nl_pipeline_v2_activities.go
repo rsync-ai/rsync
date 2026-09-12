@@ -194,22 +194,7 @@ func ConnectorResolverActivityV2(ctx context.Context, input NLPipelineWorkflowV2
 
 	logger.Info("🔌 ConnectorResolverActivityV2 starting", "correlation_id", correlationID)
 
-	// Build task for connector resolver
-	task := map[string]interface{}{
-		"pipeline_id":               input.PipelineID,
-		"execution_id":              input.ExecutionID,
-		"user_id":                   input.UserID,
-		"type":                      "connector_resolver",
-		"trace_id":                  traceID,
-		"traceparent":               traceparent,
-		"tracestate":                tracestate,
-		"user_request":              input.Message,
-		"source_connection_id":      state.SourceConnectionID,
-		"destination_connection_id": state.DestinationConnectionID,
-		"batch_size":                input.BatchSize,
-		"parsed_intent":             state.CachedIntent, // orchestrator CapabilityResolverWorker expects this in Context
-		"intent":                    state.CachedIntent, // legacy alias (kept for debugging)
-	}
+	task := buildConnectorResolverTaskMap(input, state, traceID, traceparent, tracestate)
 
 	// Write request to correlation store
 	req := correlation.Request{
@@ -1682,4 +1667,35 @@ func CleanupPartialDataActivityV2(ctx context.Context, pipelineID, executionID, 
 
 	logger.Info("CleanupPartialDataActivityV2: cleanup initiated", "pipeline_id", pipelineID, "execution_id", executionID)
 	return nil
+}
+
+// buildConnectorResolverTaskMap builds the connector-resolver task payload from the
+// workflow input + cached state. PURE / DETERMINISTIC: it copies fields only — no
+// time, no randomness, no I/O — mirroring buildExecutorTaskMap so the payload is
+// testable without a Temporal environment or a Redis correlation store.
+//
+// The task map is the transport: the orchestrator reads it verbatim as
+// correlation.Request.Task → PendingRequest.Payload → both Task.Payload and
+// Task.Context → assignment. A key absent here is absent at the resolver.
+func buildConnectorResolverTaskMap(input NLPipelineWorkflowV2Input, state *WorkflowState, traceID, traceparent, tracestate string) map[string]interface{} {
+	return map[string]interface{}{
+		"pipeline_id":  input.PipelineID,
+		"execution_id": input.ExecutionID,
+		"user_id":      input.UserID,
+		// workspace_id scopes the orchestrator's workspace resolver. Its absence is
+		// what made every chat-built pipeline fall back to the caller's user id — a
+		// different UUID space, so the workspace-scoped connection queries matched
+		// nothing and the run ended blocked on HITL.
+		"workspace_id":              input.WorkspaceID,
+		"type":                      "connector_resolver",
+		"trace_id":                  traceID,
+		"traceparent":               traceparent,
+		"tracestate":                tracestate,
+		"user_request":              input.Message,
+		"source_connection_id":      state.SourceConnectionID,
+		"destination_connection_id": state.DestinationConnectionID,
+		"batch_size":                input.BatchSize,
+		"parsed_intent":             state.CachedIntent, // orchestrator CapabilityResolverWorker expects this in Context
+		"intent":                    state.CachedIntent, // legacy alias (kept for debugging)
+	}
 }
