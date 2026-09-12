@@ -1,26 +1,16 @@
 module api-gateway
 
-go 1.25.7
-
-// Pin the patched toolchain so CI/local builds analyze against the fixed
-// stdlib. go1.25.13 clears the six reachable stdlib CVEs go1.25.12 carries --
-// GO-2026-6218 (net/url), GO-2026-6091 (html/template), GO-2026-6090
-// (crypto/tls), GO-2026-6089 + GO-2026-5026 (net/http), GO-2026-5972
-// (encoding/asn1) -- on top of the crypto/tls, crypto/x509, net and
-// html/template CVEs earlier patches fixed. The golang:1.25-alpine Docker base
-// already floats to this patch; this makes the guarantee explicit for
-// `go test` / govulncheck outside the container.
-toolchain go1.25.13
+go 1.26.0
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
 	github.com/IBM/sarama v1.60.2
 	github.com/gin-gonic/gin v1.12.0
-	github.com/go-playground/validator/v10 v10.30.3
+	github.com/go-playground/validator/v10 v10.30.4
 	github.com/go-sql-driver/mysql v1.10.1
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.3
-	github.com/jackc/pgx/v5 v5.10.0
+	github.com/jackc/pgx/v5 v5.11.0
 	github.com/linkedin/goavro/v2 v2.15.0
 	github.com/microsoft/go-mssqldb v1.11.0
 	github.com/prometheus/client_golang v1.24.1
@@ -40,7 +30,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.46.0
 	go.temporal.io/api v1.63.5
 	go.temporal.io/sdk v1.48.0
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.57.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
@@ -89,7 +79,7 @@ require (
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/eapache/go-resiliency v1.7.0 // indirect
 	github.com/facebookgo/clock v0.0.0-20150410010913-600d898af40a // indirect
-	github.com/gabriel-vasile/mimetype v1.4.13 // indirect
+	github.com/gabriel-vasile/mimetype v1.4.15 // indirect
 	github.com/gin-contrib/sse v1.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
 	github.com/go-logr/stdr v1.2.2 // indirect
@@ -113,7 +103,7 @@ require (
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/klauspost/compress v1.19.2 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
-	github.com/leodido/go-urn v1.4.0 // indirect
+	github.com/leodido/go-urn v1.5.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/modern-go/concurrent v0.0.0-20180306012644-bacd9c7ef1dd // indirect
 	github.com/modern-go/reflect2 v1.0.2 // indirect
@@ -146,9 +136,9 @@ require (
 	go.uber.org/atomic v1.11.0 // indirect
 	golang.org/x/arch v0.22.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect

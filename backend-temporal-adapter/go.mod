@@ -1,16 +1,6 @@
 module github.com/rsync-ai/backend-temporal-adapter
 
-go 1.25.7
-
-// Pin the patched toolchain so CI/local builds analyze against the fixed
-// stdlib. go1.25.13 clears the six reachable stdlib CVEs go1.25.12 carries --
-// GO-2026-6218 (net/url), GO-2026-6091 (html/template), GO-2026-6090
-// (crypto/tls), GO-2026-6089 + GO-2026-5026 (net/http), GO-2026-5972
-// (encoding/asn1) -- on top of the crypto/tls, crypto/x509, net and
-// html/template CVEs earlier patches fixed. The golang:1.25-alpine Docker base
-// already floats to this patch; this makes the guarantee explicit for
-// `go test` / govulncheck outside the container.
-toolchain go1.25.13
+go 1.26.0
 
 require (
 	github.com/IBM/sarama v1.60.2
@@ -31,7 +21,7 @@ require (
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/pgx/v5 v5.10.0 // indirect
+	github.com/jackc/pgx/v5 v5.11.0 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 )
@@ -91,11 +81,11 @@ require (
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.46.0 // indirect
 	go.opentelemetry.io/otel/metric v1.46.0 // indirect
 	go.opentelemetry.io/proto/otlp v1.11.0 // indirect
-	golang.org/x/crypto v0.55.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
-	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/sys v0.48.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
 	golang.org/x/time v0.3.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260819154853-08b0e4226688 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260819154853-08b0e4226688 // indirect
