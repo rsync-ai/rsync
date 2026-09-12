@@ -90,6 +90,16 @@ jobs:
               # below.
               - 'docker-compose.quickstart.yml'
               - 'docker-compose.mcp.yml'
+              # Connector metadata is here for the same reason: the orchestrator's
+              # registry tests (backend-orchestrator/internal/registry) load the real
+              # connector tree and assert that every alias a connector declares
+              # resolves back to that connector. Editing a metadata.json `aliases`
+              # array is exactly the change that breaks name resolution -- the chat
+              # path could not reach the gcs connector by its catalog name for
+              # months -- and it touches no Go file, so without this path the guard
+              # is dead on its own subject and the job reports `skipping`, which
+              # looks identical to a pass.
+              - 'shared/mcp-connectors/**'
               - '.github/workflows/ci.yml'
             go-shared:
               - 'shared/go/**'

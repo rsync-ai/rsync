@@ -139,6 +139,15 @@ type NLPipelineWorkflowV2Input struct {
 	UserID      string `json:"user_id"`
 	Message     string `json:"message"` // Raw user message - workflow parses intent
 
+	// WorkspaceID is the tenant the pipeline belongs to (pipelines.workspace_id,
+	// NOT NULL since migration 069). The orchestrator's workspace resolver scopes
+	// its connection lookups by workspace, and before this field existed it was
+	// handed the caller's user id instead — a different UUID space, so every
+	// lookup returned zero rows and the run ended blocked. Temporal's default JSON
+	// converter drops keys with no matching field, so a start site that sends
+	// "workspace_id" without this declaration is a silent no-op.
+	WorkspaceID string `json:"workspace_id,omitempty"`
+
 	// Optional execution context for stable storage paths + run-mode semantics.
 	// These are provided by the API Gateway on /pipelines/:id/run.
 	PipelineName string `json:"pipeline_name,omitempty"`
@@ -561,6 +570,7 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 					PipelineID:  input.PipelineID,
 					ExecutionID: input.ExecutionID,
 					UserID:      input.UserID,
+					WorkspaceID: input.WorkspaceID,
 					Message:     intentUpdate.NewMessage,
 					// Preserve connection IDs across intent updates
 					SourceConnectionID:      input.SourceConnectionID,
