@@ -134,6 +134,27 @@ invalid on restart.
 {{- fail "secrets.postgresPassword is required when postgresql.enabled=true (or set secrets.existingSecret)." }}
 {{- end }}
 {{/*
+The same key on the OTHER path, which had no guard at all until now -- and which
+is the only path where the password is not something this chart generated.
+
+With postgresql.enabled=true an empty password is caught above and the value is
+the chart's own to begin with. With enabled=false it is the password of a role
+on a server nobody here owns, and an empty one rendered a valid install: every
+service got POSTGRES_PASSWORD="" and the failure arrived later as an
+authentication error naming no key, on a stack that had already reported
+success. db-init now hits it first, which moves the symptom earlier but not to
+render time -- this does that.
+
+Guarded on external.iamAuth so the one configuration where an empty password IS
+correct can say so. RDS IAM, Cloud SQL IAM and Azure AD authentication all mint
+a short-lived token outside this chart; nothing here can check that a proxy is
+actually running, so the flag records the operator's intent rather than
+verifying it.
+*/}}
+{{- if and (not .Values.postgresql.enabled) (not .Values.postgresql.external.iamAuth) (not .Values.secrets.postgresPassword) }}
+{{- fail "secrets.postgresPassword is required when postgresql.enabled=false (or set secrets.existingSecret).\n\nThis is the password of the role named in postgresql.username on the server at\npostgresql.external.host. Nothing in this chart creates that role, so nothing\nhere can generate its password either.\n\nRendered empty, the install succeeds: every service starts with an empty\ncredential and the first thing you see is an authentication error that names\nneither this key nor that role.\n\nIf you are using IAM database authentication (RDS IAM, Cloud SQL IAM, Azure AD),\nan empty password is correct -- set postgresql.external.iamAuth=true to say so." }}
+{{- end }}
+{{/*
 Three secrets are read two incompatible ways each; the reasoning, the alphabet
 and the message live in one place, rsync-ai.assertDeliverableSecret
 (_helpers.tpl), so the three cannot drift apart.
@@ -318,4 +339,38 @@ cannot build it from a Secret it does not own and cannot read.
 {{- if and $usesTLS $tls.existingSecret $tls.clientCertKey (not $tls.clientPemKey) .Values.connectors.cdc.enabled }}
 {{- fail "kafka.external.tls.existingSecret declares a client keypair but no clientPemKey, and the CDC plane is enabled.\n\nKafka Connect cannot load a certificate and a key as two PEM files -- its\nkeystore is a single file containing both. Add that combined file to your\nSecret and name it in kafka.external.tls.clientPemKey:\n\n  cat client.crt client.key > client.pem\n\nWithout it the Connect worker presents no certificate and every task fails the\nhandshake while the worker itself reports RUNNING." }}
 {{- end }}
+{{- end }}
+
+{{/*
+─── Generation tier: an Ollama the pods can actually reach ──────────────────────
+
+Appended after the `kafka.enabled=false` block that closes on the line above, and
+that placement is the point: this guard applies to every install, not only to
+BYO-Kafka ones. A guard nested inside an unrelated `if` is a guard that does not
+run for most operators.
+
+There is deliberately NO matching guard for "provider=openai and no API key",
+and it is worth saying why, because it looks like the obvious companion to this
+one. Two reasons, both measured. The chart's documented install command
+(README.md:6-16) carries no key, so such a guard would make the first code block
+a reader runs exit 1 -- and this file's rule is to fix the documentation, never
+relax the check, which would mean putting a key in the chart's front door for a
+tier that is optional. And the failure it would catch is not silent: the provider
+answers 401 and the error names authentication, unlike the case below.
+*/}}
+{{/*
+An Ollama provider with no Ollama.
+
+There is no safe default to fall back on here. With neither knob set the Python
+client resolves its base URL to http://host.docker.internal:11434
+(llm-service/src/utils/openai_client.py:67-76) -- a Docker Desktop name that
+exists on a laptop and resolves nowhere inside a pod. So the failure is not "the
+operator forgot an address", it is "the code has an address that cannot work
+here": the pods start, pass their probes (/health is an HTTP check, not a model
+call), and every prompt dies on a DNS error naming a host nobody configured.
+/chat is the product's only pipeline-creation path, so the platform comes up
+healthy and cannot be used.
+*/}}
+{{- if and .Values.generation.enabled (eq .Values.generation.llm.provider "ollama") (not .Values.ollama.enabled) (not .Values.generation.llm.ollamaUrl) }}
+{{- fail "generation.llm.provider is \"ollama\" but nothing tells the chart where Ollama is.\n\nollama.enabled is false and generation.llm.ollamaUrl is empty, so the generation\npods fall back to the client's own default, http://host.docker.internal:11434 --\na Docker Desktop hostname that does not resolve inside a Kubernetes pod. The\npods start, pass their probes, and fail every prompt with a DNS error.\n\nPick one:\n\n  * run one here:  --set ollama.enabled=true\n                   Adds a StatefulSet plus a post-install hook that downloads\n                   ollama.model (~4.7 GB by default). Install it with\n                   `--wait --timeout 30m`: the default 5m timeout is shorter\n                   than the download.\n  * point at one:  --set generation.llm.ollamaUrl=http://my-ollama:11434\n                   Must already serve the model in generation.llm.model." }}
 {{- end }}

@@ -105,6 +105,24 @@ spec:
             {{- if .Values.generation.enabled }}
             - name: TOOL_GENERATOR_URL
               value: "http://{{ $fullname }}-tool-generator:5010"
+            # Same defect class as KAFKA_CONNECT_URL in orchestrator.yaml, one
+            # tier over. EIGHT call sites in this service read LLM_SERVICE_URL
+            # (chat_nl_pipeline.go x3, explorer.go x4, connections.go,
+            # diagnose.go, suggestions.go) and every one of them falls back to
+            # the bare compose service name "llm-service". On Kubernetes the
+            # Service is {{ $fullname }}-llm-service, so leaving this unset
+            # pointed chat, the Data Explorer, diagnose and suggestions at a
+            # host that does not resolve -- and each of those paths degrades
+            # quietly rather than failing the pod, so nothing turns red.
+            - name: LLM_SERVICE_URL
+              value: "http://{{ $fullname }}-llm-service:5000"
+            # llmServiceTimeout() (chat_nl_pipeline.go) falls back to 10s when
+            # this is empty, and a 10s deadline against CPU inference is what
+            # made every plain-English chat message return a canned reply with
+            # HTTP 200. docker-compose.quickstart.yml ships 90; match it, and
+            # let operators on slower hardware raise it.
+            - name: LLM_SERVICE_TIMEOUT_SECONDS
+              value: {{ .Values.generation.llmServiceTimeoutSeconds | default 90 | quote }}
             {{- end }}
             # CSRF double-submit. Never turn this off: the session cookie is
             # httpOnly and same-site, so without the header check every

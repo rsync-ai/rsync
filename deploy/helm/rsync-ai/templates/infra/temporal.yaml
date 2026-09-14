@@ -100,9 +100,32 @@ spec:
                 secretKeyRef:
                   name: {{ include "rsync-ai.secretName" . }}
                   key: POSTGRES_PASSWORD
+            {{/*
+              auto-setup's own defaults, set explicitly. They are named in one
+              other place -- templates/jobs/db-init.yaml, which has to CREATE
+              these two on an external database -- and a name the creator and
+              the consumer each hardcode separately is a name that can drift.
+              Both now read temporal.database / temporal.visibilityDatabase.
+            */}}
+            - name: DBNAME
+              value: {{ .Values.temporal.database | quote }}
+            - name: VISIBILITY_DBNAME
+              value: {{ .Values.temporal.visibilityDatabase | quote }}
 {{- if not .Values.postgresql.enabled }}
-            # External database: `temporal` and `temporal_visibility` must already
-            # exist, created by you (see the chart README, external PostgreSQL).
+            # External database: DBNAME and VISIBILITY_DBNAME must already
+            # exist before this pod starts.
+{{- if include "rsync-ai.dbInit.enabled" . }}
+            # templates/jobs/db-init.yaml creates them in a pre-install/
+            # pre-upgrade hook, which is why that hook runs before this
+            # Deployment rather than beside it.
+{{- else }}
+            # This install has db-init OFF (postgresql.dbInit.enabled=false, or
+            # external.iamAuth=true, which leaves it no password to connect
+            # with), so NOTHING here creates them. They are yours to create --
+            # see deploy/helm/rsync-ai/README.md -- and until they exist this
+            # pod fails its schema step with `database "temporal" does not
+            # exist`.
+{{- end }}
             # auto-setup's create step is guarded only by the name test
             # `${DBNAME} != ${POSTGRES_USER}`, never on whether the database is
             # there, so it runs against every external instance and exits 1 with

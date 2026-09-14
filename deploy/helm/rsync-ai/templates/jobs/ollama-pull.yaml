@@ -1,0 +1,149 @@
+{{- if .Values.ollama.enabled }}
+{{/*
+Model bootstrap for the in-chart Ollama. Without it, `ollama.enabled=true` gives
+you a server with no model in it: every pod Running, every probe green, and every
+prompt answered `model "qwen2.5:7b" not found, try pulling it first`. That is the
+same silent-success shape as the manual CREATE DATABASE this release removed from
+the Postgres paths — a stack that comes up healthy and does not work.
+
+Runs the same steps as docker-compose.ollama.yml's `ollama-pull` service, and the
+two are hand-kept in step rather than sharing a script: install.sh downloads
+compose files with no repo checkout, and this chart is pulled as an OCI artifact,
+so there is no shared file on either host to call. Same reason kafka-init's shell
+is inline.
+
+── Why a hook, and what a hook cannot do ────────────────────────────────────────
+Compose gates the consumers on this finishing, with
+`depends_on: {ollama-pull: {condition: service_completed_successfully}}`. There is
+no exact Kubernetes analogue here, and the two obvious constructions are both
+worse than admitting that:
+
+  * A wait-for-model initContainer on the generation Deployments DEADLOCKS under
+    `helm install --wait`. Helm waits for the main resources to become Ready
+    BEFORE it runs post-install hooks, so those pods would sit in Init waiting for
+    a model whose pull has not been allowed to start.
+  * A plain (non-hook) Job is created in the same wave as the Deployments and so
+    avoids that deadlock, but a Job's spec is largely immutable, so the next
+    `helm upgrade` fails with "field is immutable". That is exactly why kafka-init
+    is a hook carrying before-hook-creation.
+
+So: a hook, and the honest operator-facing statement is that
+`helm install --wait --timeout 30m` is the analogue of compose's blocking first
+`up` — it does not return until post-install hooks complete. The default 5m
+timeout is SHORTER than a 4.7 GB download, which is why the README names 30m.
+Without --wait there is a bounded window, as long as the download, in which a
+prompt returns "model not found" and then starts working on its own.
+
+Weight 5, not kafka-init's 0: hooks run in weight order and Helm waits for each
+before starting the next, so a multi-minute download must not sit in front of
+quick topic creation.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-ollama-pull
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama-pull
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  {{/*
+    Low on purpose. The script below already retries the pull five times with
+    sleeps, so a Job-level restart is the second line of defence, not the first;
+    a high backoffLimit here would multiply into a very long stall on a genuinely
+    wrong model name.
+  */}}
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ollama-pull
+    spec:
+      restartPolicy: OnFailure
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: ollama-pull
+          image: {{ .Values.ollama.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          {{/*
+            No volume and no HOME, deliberately. This container is a CLIENT: both
+            commands below are HTTP calls to the server pod, which downloads into
+            its own PVC. A second writer on that volume would race the server, and
+            HOME only matters to `ollama serve` — initializeKeypair is reachable
+            only from the serve path (cmd/cmd.go:2015), and the signing key it
+            writes is used only on a registry 401 (server/images.go:1309-1330),
+            which a public model pull does not produce.
+          */}}
+          env:
+            - name: OLLAMA_HOST
+              value: {{ printf "http://%s-ollama:11434" (include "rsync-ai.fullname" .) | quote }}
+            - name: OLLAMA_MODEL
+              value: {{ include "rsync-ai.ollama.model" . | quote }}
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -u
+              echo "model: $OLLAMA_MODEL"
+              echo "server: $OLLAMA_HOST"
+
+              # Without --wait, Helm fires post-install hooks as soon as the main
+              # resources are CREATED, not once they are Ready, so this can start
+              # while the server pod is still pulling its image. Compose gets this
+              # for free from `condition: service_healthy`; here it is explicit.
+              w=0
+              until ollama list >/dev/null 2>&1; do
+                w=$((w + 1))
+                if [ "$w" -ge 60 ]; then
+                  echo "FATAL: $OLLAMA_HOST did not answer after 5 minutes." >&2
+                  echo "  Check the ollama pod: kubectl get pods -l app.kubernetes.io/component=ollama" >&2
+                  exit 1
+                fi
+                echo "waiting for the ollama server ($w/60)"
+                sleep 5
+              done
+
+              if ollama show "$OLLAMA_MODEL" >/dev/null 2>&1; then
+                echo "already on the server; nothing to download"
+                exit 0
+              fi
+
+              echo "downloading $OLLAMA_MODEL -- this is a few GB and only happens once"
+              # The error is captured rather than discarded because the failures
+              # that land here read identically from outside: a model name with a
+              # typo, a registry that is down, and a volume with no room all just
+              # end this loop. The operator needs Ollama's own words to tell them
+              # apart.
+              ERR=""
+              n=0
+              until ERR="$(ollama pull "$OLLAMA_MODEL" 2>&1)"; do
+                n=$((n + 1))
+                if [ "$n" -ge 5 ]; then
+                  echo "FATAL: could not pull \"$OLLAMA_MODEL\" after 5 attempts." >&2
+                  echo "  Last error from ollama: $ERR" >&2
+                  echo "  Checked in this order:" >&2
+                  echo "    * the name is a real tag at https://ollama.com/library" >&2
+                  echo "      (ollama.model in values.yaml)" >&2
+                  echo "    * this cluster can reach registry.ollama.ai over HTTPS" >&2
+                  echo "    * ollama.persistence.size has room for the model (several GB)" >&2
+                  echo "  Until this succeeds the generation tier answers every" >&2
+                  echo "  prompt with 'model not found'." >&2
+                  exit 1
+                fi
+                echo "pull attempt $n/5 failed, retrying in 10s: $ERR" >&2
+                sleep 10
+              done
+              echo "$OLLAMA_MODEL is ready"
+{{- end }}

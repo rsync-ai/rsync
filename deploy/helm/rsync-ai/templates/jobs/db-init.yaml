@@ -1,0 +1,276 @@
+{{/*
+Database bootstrapper for an EXTERNAL PostgreSQL.
+
+Nothing else in this chart creates a database. On the bundled path two upstream
+images do it as a side effect -- the postgres image runs initdb with
+POSTGRES_DB, and temporalio/auto-setup creates its own two -- so the gap is
+invisible until postgresql.enabled=false, which is every production install.
+
+What was left to the operator was four CREATE statements and two extensions,
+documented in prose in four separate files. Miss any one of them and the install
+still succeeds:
+
+  pipeline_db missing   api-gateway logs ONE warning and keeps answering /health
+                        200 (cmd/server/main.go:306). Its migration step lives
+                        in the else-branch, so nothing migrates and nothing
+                        exits. Only /ready knows, and the pod simply stays 0/1.
+  temporal missing      auto-setup runs with SKIP_DB_CREATE=true on this path
+                        (see infra/temporal.yaml) so its schema step exits 1 and
+                        the pod CrashLoopBackOffs -- the one loud case.
+  uuid-ossp missing     001_init_schema.sql:5 is the FIRST migration and calls
+                        uuid_generate_v4(). migrate.go:127 stops at the first
+                        failing file, so a missing extension means NO table is
+                        created, reported as one ERROR line in a pod that keeps
+                        running.
+  pg_trgm missing       020b_workspace_connection_refs.sql:12 builds
+                        gin_trgm_ops indexes. Same stop-at-first-failure path.
+
+The ROLE named in postgresql.username is deliberately NOT created here: this job
+authenticates AS that role, so it cannot be the thing that creates it. That one
+statement stays with the operator and is the only one left.
+
+Ordering. This is a pre-install/pre-upgrade hook, not post-install like
+kafka-init, because api-gateway's connect retry is bounded (DB_CONNECT_TIMEOUT,
+60s by default, db.go:118) and losing it is NOT self-correcting -- liveness is
+/health, which answers 200 forever, so the pod never restarts to try again. A
+post-install hook would be racing that timer on every install.
+
+That ordering is why the password arrives through a hook Secret of its own
+(below) rather than the release Secret: pre-install hooks run BEFORE the
+release's own resources are created, so the release Secret does not exist yet.
+With secrets.existingSecret set there is nothing to copy -- that Secret is
+managed outside this chart and already exists -- so the job reads it directly.
+*/}}
+{{- if include "rsync-ai.dbInit.enabled" . }}
+{{- if not .Values.secrets.existingSecret }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-db-init
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db-init
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    {{/*
+      Lower than the Job's weight so it is created first. Helm applies hooks in
+      weight order and waits for each, then runs the delete policies once the
+      whole phase is done -- so hook-succeeded here does not race the Job that
+      mounts it.
+    */}}
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+type: Opaque
+stringData:
+  POSTGRES_PASSWORD: {{ .Values.secrets.postgresPassword | quote }}
+---
+{{- end }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-db-init
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: db-init
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  {{/*
+    Matches kafka-init. The common failure here is a database that is reachable
+    but not yet accepting connections (a managed instance still starting, a
+    pooler warming up), and the in-container wait below is bounded at 60s.
+  */}}
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: db-init
+    spec:
+      restartPolicy: OnFailure
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: db-init
+          image: {{ .Values.postgresql.dbInit.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            - name: PGHOST
+              value: {{ include "rsync-ai.postgres.host" . | quote }}
+            - name: PGPORT
+              value: {{ include "rsync-ai.postgres.port" . | quote }}
+            - name: PGUSER
+              value: {{ .Values.postgresql.username | quote }}
+            {{/*
+              The database psql connects to in order to run CREATE DATABASE --
+              never the one being created. `postgres` exists on RDS, Cloud SQL
+              and Azure Flexible Server alike; a few hardened instances drop it,
+              which is what this key is for.
+            */}}
+            - name: PGDATABASE
+              value: {{ .Values.postgresql.external.maintenanceDatabase | quote }}
+            {{/*
+              libpq's own name for the same fact api-gateway carries in its
+              DATABASE_URL. Omitting it does not fail against a TLS-mandatory
+              server -- libpq defaults to `prefer`, so it would connect in
+              CLEARTEXT wherever the server allows it, and this job sends a
+              password.
+            */}}
+            - name: PGSSLMODE
+              value: {{ include "rsync-ai.postgres.sslmode" . | quote }}
+            {{- with .Values.postgresql.external.tls.caFile }}
+            - name: PGSSLROOTCERT
+              value: {{ . | quote }}
+            {{- end }}
+            - name: PGCONNECT_TIMEOUT
+              value: "10"
+            - name: PGPASSWORD
+              valueFrom:
+                secretKeyRef:
+                  {{- if .Values.secrets.existingSecret }}
+                  name: {{ .Values.secrets.existingSecret }}
+                  {{- else }}
+                  name: {{ include "rsync-ai.fullname" . }}-db-init
+                  {{- end }}
+                  key: POSTGRES_PASSWORD
+            - name: APP_DATABASE
+              value: {{ .Values.postgresql.database | quote }}
+            {{/*
+              Rendered only when this chart runs Temporal. Against Temporal
+              Cloud or a cluster someone else operates, these two databases are
+              not ours to create -- and on a shared instance, creating them
+              would be creating databases the operator never asked for.
+            */}}
+            {{- if .Values.temporal.enabled }}
+            - name: TEMPORAL_DATABASE
+              value: {{ .Values.temporal.database | quote }}
+            - name: TEMPORAL_VISIBILITY_DATABASE
+              value: {{ .Values.temporal.visibilityDatabase | quote }}
+            {{- end }}
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -u
+
+              # ── Wait ──────────────────────────────────────────────────────
+              # Same reasoning as rsync-ai.waitForDepsInitContainer, half the
+              # patience: 30 attempts at 2s. A managed
+              # instance that is provisioning answers the port before it accepts
+              # connections, and pods start unordered.
+              #
+              # ERR is captured rather than discarded because the two failures
+              # that land here read identically from outside -- a wrong password
+              # and an unreachable host both end this loop -- and the operator
+              # needs the server's own words to tell them apart.
+              ERR=""
+              n=0
+              until ERR="$(psql -w -Atc 'SELECT 1' 2>&1)"; do
+                n=$((n + 1))
+                if [ "$n" -ge 30 ]; then
+                  echo "FATAL: cannot connect to PostgreSQL at $PGHOST:$PGPORT as \"$PGUSER\" after 60s." >&2
+                  echo "       Last error from the server:" >&2
+                  echo "       $ERR" >&2
+                  echo "" >&2
+                  echo "       Checked in this order:" >&2
+                  echo "         * postgresql.external.host / .port reach the instance" >&2
+                  echo "         * the role \"$PGUSER\" exists and its password matches" >&2
+                  echo "           secrets.postgresPassword (this chart never creates the" >&2
+                  echo "           role it logs in as)" >&2
+                  echo "         * postgresql.external.maintenanceDatabase=\"$PGDATABASE\"" >&2
+                  echo "           exists and \"$PGUSER\" may connect to it" >&2
+                  echo "         * postgresql.external.sslMode=\"$PGSSLMODE\" matches what" >&2
+                  echo "           the server requires" >&2
+                  exit 1
+                fi
+                echo "Waiting for PostgreSQL at $PGHOST:$PGPORT (attempt $n/30): $ERR"
+                sleep 2
+              done
+              echo "Connected to $PGHOST:$PGPORT as \"$PGUSER\" (maintenance database \"$PGDATABASE\")"
+
+              # ── Databases ─────────────────────────────────────────────────
+              # CREATE DATABASE has no IF NOT EXISTS and cannot run inside a
+              # transaction, so idempotency is an existence check against
+              # pg_database rather than a swallowed error. Swallowing would be
+              # worse than it looks: "permission denied to create database" and
+              # "already exists" would then be the same outcome, and the first
+              # one has to be fatal.
+              #
+              # No OWNER clause. The creating role owns what it creates, and
+              # naming an owner we did not create is how this job would fail on
+              # a managed instance whose admin role is not postgresql.username.
+              mkdb() {
+                if [ "$(psql -w -Atc "SELECT 1 FROM pg_database WHERE datname = '$1'")" = "1" ]; then
+                  echo "  database \"$1\" already exists"
+                  return 0
+                fi
+                if ! OUT="$(psql -w -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$1\"" 2>&1)"; then
+                  # Two installs racing (an upgrade retried, a second release)
+                  # can both pass the existence check. The loser sees 42P04 and
+                  # has nothing to do.
+                  if [ "$(psql -w -Atc "SELECT 1 FROM pg_database WHERE datname = '$1'")" = "1" ]; then
+                    echo "  database \"$1\" was created concurrently"
+                    return 0
+                  fi
+                  echo "FATAL: could not create database \"$1\"." >&2
+                  echo "       $OUT" >&2
+                  echo "" >&2
+                  echo "       The role \"$PGUSER\" needs CREATEDB:" >&2
+                  echo "         ALTER ROLE \"$PGUSER\" CREATEDB;" >&2
+                  echo "       On a managed instance grant its admin role instead" >&2
+                  echo "       (RDS: rds_superuser; Azure: azure_pg_admin; Cloud SQL:" >&2
+                  echo "       cloudsqlsuperuser). Or create the databases yourself and" >&2
+                  echo "       set postgresql.dbInit.enabled=false." >&2
+                  exit 1
+                fi
+                echo "  database \"$1\" created"
+              }
+
+              mkdb "$APP_DATABASE"
+              if [ -n "${TEMPORAL_DATABASE:-}" ]; then
+                mkdb "$TEMPORAL_DATABASE"
+                mkdb "$TEMPORAL_VISIBILITY_DATABASE"
+              fi
+
+              # ── Extensions ────────────────────────────────────────────────
+              # In the APPLICATION database only. Temporal's two need none, and
+              # creating extensions in a database whose schema another product
+              # owns is not ours to do.
+              #
+              # Fatal, not best-effort. Both are trusted extensions on
+              # PostgreSQL 13+, so a database owner can create them without
+              # superuser -- but a managed instance can still refuse
+              # (Azure Flexible Server only permits what `azure.extensions`
+              # lists). Continuing past that failure hands the refusal to the
+              # migration runner instead, which stops at the FIRST failing file
+              # and logs one line while the process keeps running: the whole
+              # schema is then missing and nothing says why.
+              mkext() {
+                if ! OUT="$(psql -w -v ON_ERROR_STOP=1 -d "$APP_DATABASE" \
+                              -c "CREATE EXTENSION IF NOT EXISTS \"$1\"" 2>&1)"; then
+                  echo "FATAL: could not create extension \"$1\" in \"$APP_DATABASE\"." >&2
+                  echo "       $OUT" >&2
+                  echo "" >&2
+                  echo "       $2" >&2
+                  echo "" >&2
+                  echo "       Both are trusted extensions on PostgreSQL 13+, so the" >&2
+                  echo "       database owner may create them -- but a managed instance" >&2
+                  echo "       can still refuse. Azure Database for PostgreSQL needs the" >&2
+                  echo "       extension allowlisted in the server parameter" >&2
+                  echo "       azure.extensions before this succeeds." >&2
+                  exit 1
+                fi
+                echo "  extension \"$1\" ready"
+              }
+
+              mkext "uuid-ossp" "001_init_schema.sql calls uuid_generate_v4() and is the FIRST migration, so without it NO table is created."
+              mkext "pg_trgm"   "020b_workspace_connection_refs.sql builds gin_trgm_ops indexes."
+
+              echo "Database bootstrap complete"
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits: { memory: 256Mi }
+{{- end }}

@@ -164,6 +164,34 @@ postgresql:
   image: postgres:16-alpine
   database: pipeline_db
   username: rsync
+
+  # Creates the databases and extensions an EXTERNAL PostgreSQL needs, as a
+  # pre-install/pre-upgrade hook Job. Does nothing when enabled=true above --
+  # the postgres image's initdb and temporalio/auto-setup already cover that
+  # path, which is why the gap only ever appears in production.
+  #
+  # What it creates: `database` above, plus temporal.database and
+  # temporal.visibilityDatabase when temporal.enabled=true, plus the uuid-ossp
+  # and pg_trgm extensions inside `database`.
+  #
+  # What it does NOT create, and cannot: the ROLE in `username`. The job
+  # authenticates as that role, so that one statement stays with you:
+  #
+  #   CREATE ROLE rsync LOGIN PASSWORD '<secrets.postgresPassword>';
+  #   ALTER ROLE rsync CREATEDB;
+  #
+  # Set enabled=false if your database is provisioned by Terraform or a DBA and
+  # the role has no CREATEDB. Doing so restores the old contract: the four
+  # CREATE DATABASE statements and the two extensions become yours, and getting
+  # any of them wrong produces an install that comes up healthy and does not
+  # work -- see templates/jobs/db-init.yaml for what each one costs.
+  dbInit:
+    enabled: true
+    # Any image with psql. Pinned separately from postgresql.image because that
+    # one is the SERVER, which this path does not run at all -- and the client
+    # version wants to be >= the server's, not the other way round.
+    image: postgres:16-alpine
+
   persistence:
     size: 20Gi
     # Overrides global.storageClass for this volume only. Empty = inherit it.
@@ -176,6 +204,25 @@ postgresql:
   external:
     host: ""
     port: 5432
+    # The database db-init connects to in order to run CREATE DATABASE -- never
+    # one of the databases it creates. `postgres` exists on RDS, Cloud SQL and
+    # Azure Database alike; change it only for an instance that dropped it.
+    maintenanceDatabase: postgres
+    # IAM database authentication (RDS IAM, Cloud SQL IAM, Azure AD). The token
+    # is fetched by a sidecar or proxy you run yourself, so there is no password
+    # for this chart to hold -- and an empty secrets.postgresPassword is then
+    # correct rather than forgotten. Set this and the chart stops asking for one.
+    #
+    # It does not switch anything on: nothing in this chart mints tokens. It
+    # says only that the empty password is deliberate.
+    #
+    # It does switch one thing OFF. db-init above authenticates with that
+    # password, so under IAM auth it has no credential and could only fail --
+    # and it is a PRE-install hook, so its failure would abort the install
+    # before anything else existed. Setting this therefore takes db-init out of
+    # the render, and the CREATE DATABASE statements become yours again, exactly
+    # as with dbInit.enabled=false.
+    iamAuth: false
     # sslmode for every component that talks to this database -- api-gateway's
     # DATABASE_URL, orchestrator's DB_SSLMODE, temporal-adapter's
     # POSTGRES_SSLMODE, and (translated, see below) Temporal's own TLS switches.
@@ -434,6 +481,12 @@ temporal:
   # Set enabled=false to use Temporal Cloud or a separately-operated cluster.
   enabled: true
   image: temporalio/auto-setup:1.22.4
+  # auto-setup's own defaults, stated here rather than left implicit because
+  # db-init has to create these two on an external database and a second
+  # hardcoded copy of a name is how the two drift apart. Changing them changes
+  # both the databases db-init creates and the ones Temporal migrates into.
+  database: temporal
+  visibilityDatabase: temporal_visibility
   resources:
     requests: { cpu: 200m, memory: 512Mi }
     limits: { memory: 1Gi }
@@ -523,6 +576,54 @@ frontend:
   wsUrl: ""           # wss://api.example.com/ws → NEXT_PUBLIC_WS_URL
 
 # ─────────────────────────────────────────────────────────────────────────────
+# In-chart Ollama — the fully-offline LLM
+# ─────────────────────────────────────────────────────────────────────────────
+# Off by default: most installs bring an OpenAI key, and this component is the
+# single largest thing the chart can start (a 7B model is ~4.7 GB on disk and
+# wants ~5 GB resident). Turn it on and generation.llm.provider=ollama and the
+# deployment needs no outbound LLM call at all.
+#
+# The Kubernetes equivalent of layering docker-compose.ollama.yml. Enabling it
+# also enrols templates/jobs/ollama-pull.yaml, a post-install hook that downloads
+# `model` before the tier is asked for it — WITHOUT that step the server comes up
+# healthy and answers every prompt `model not found`.
+#
+# The first install therefore blocks for as long as that download: run it as
+# `helm install --wait --timeout 30m`, because Helm's default 5m timeout is
+# shorter than the pull. See templates/jobs/ollama-pull.yaml.
+#
+# Setting provider=ollama WITHOUT this expects an Ollama you already run, named
+# in generation.llm.ollamaUrl — and `model` below still applies to it, so name
+# something that server actually serves. Neither one set is a misconfiguration
+# the chart refuses at install time (templates/validate.yaml), because the
+# client's own default is host.docker.internal — a name no pod can resolve.
+ollama:
+  enabled: false
+  # Pinned: a model runtime that changes under a re-pull changes inference
+  # behaviour, not just the binary. Same tag as docker-compose.ollama.yml.
+  image: ollama/ollama:0.33.2
+  # Which model the Ollama path asks for — read whether or not `enabled` is
+  # true, the same way postgresql.database names the database on both the
+  # in-chart and the external path. With enabled=true the pull hook downloads
+  # it; with a BYO Ollama at generation.llm.ollamaUrl it is the name the pods
+  # send to that server, so set it to one that server serves. Either way it is
+  # what all four model-resolution call sites in openai_client.py are pointed
+  # at. One model, one name.
+  model: qwen2.5:7b
+  persistence:
+    # Headroom over the default model's ~4.7 GB, because a second model pulled by
+    # hand into this volume is a normal thing to do.
+    size: 20Gi
+    # Overrides global.storageClass for this volume only. Empty = inherit it.
+    storageClass: ""
+  resources:
+    requests: { cpu: "1", memory: 6Gi }
+    # Deliberately NO `limits` key. Every other component here caps memory
+    # because its working set is bounded; this one's working set IS the model,
+    # and a cap below it does not slow inference down, it gets the container
+    # OOM-killed mid-answer. Size the node instead.
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Generation tier
 # ─────────────────────────────────────────────────────────────────────────────
 # llm-service / tool-generator / planner are the Python tier. In the community
@@ -545,11 +646,21 @@ frontend:
 # disabling this never breaks an already-created pipeline.
 generation:
   enabled: true
+  # Deadline api-gateway puts on every llm-service call. The code falls back to
+  # 10s when unset, which is far below CPU inference latency -- at 10s the chat
+  # intent classifier times out and the reply comes back canned, with HTTP 200
+  # and one warning line. 90 matches docker-compose.quickstart.yml. Raise it on
+  # slower hardware; lower it only if you front this with a fast hosted model.
+  llmServiceTimeoutSeconds: 90
   # llm-service + planner. tool-generator runs a different image — see below.
   image: { repository: llm-service-oss, tag: "" }
   llm:
     provider: openai
+    # The OpenAI-path model, and only that. On the Ollama path ollama.model
+    # wins — see the rsync-ai.llm.model helper in templates/_helpers.tpl.
     model: gpt-4o
+    # Only read when ollama.enabled=false: an Ollama you already run.
+    # With ollama.enabled=true the chart's own Service address wins.
     ollamaUrl: ""
     # Air-gapped / on-prem: pins ONLY the Data Explorer to Ollama so schema
     # metadata never leaves the deployment.
