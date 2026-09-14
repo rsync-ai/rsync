@@ -1135,7 +1135,7 @@ services:
       # 90 and not more: cmd/server/main.go:1244 caps the whole response at a
       # 120s WriteTimeout, so a longer upstream deadline would just move the cut
       # to a worse place. Raise both together if you ever need more.
-      LLM_SERVICE_TIMEOUT_SECONDS: ${LLM_SERVICE_TIMEOUT_SECONDS:-90}
+      LLM_SERVICE_TIMEOUT_SECONDS: ${LLM_SERVICE_TIMEOUT_SECONDS:-240}
       JWT_SECRET: ${JWT_SECRET}
       REDIS_ADDRESS: redis:6379
       # Same requirepass as the adapter above. api-gateway fails SOFTER -- it

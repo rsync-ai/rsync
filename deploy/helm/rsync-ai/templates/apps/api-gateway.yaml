@@ -119,10 +119,13 @@ spec:
             # llmServiceTimeout() (chat_nl_pipeline.go) falls back to 10s when
             # this is empty, and a 10s deadline against CPU inference is what
             # made every plain-English chat message return a canned reply with
-            # HTTP 200. docker-compose.quickstart.yml ships 90; match it, and
-            # let operators on slower hardware raise it.
+            # HTTP 200. docker-compose.quickstart.yml ships 240; match it, and
+            # let operators on slower hardware raise it. It must also stay under
+            # the api-gateway's own 300s WriteTimeout (main.go), which caps the
+            # whole response: a deadline above that ceiling just moves the cut
+            # to a place with no error message.
             - name: LLM_SERVICE_TIMEOUT_SECONDS
-              value: {{ .Values.generation.llmServiceTimeoutSeconds | default 90 | quote }}
+              value: {{ .Values.generation.llmServiceTimeoutSeconds | default 240 | quote }}
             {{- end }}
             # CSRF double-submit. Never turn this off: the session cookie is
             # httpOnly and same-site, so without the header check every

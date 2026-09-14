@@ -250,9 +250,10 @@ func SetSavedQueryMaterialization(c *gin.Context) {
 
 // allowLongModelRun lifts this request's HTTP write deadline for the length of a rebuild.
 //
-// cmd/server/main.go sets WriteTimeout: 120s on the shared http.Server. That is a sane
-// bound for the API surface and three orders of magnitude too short for this one route,
-// where modelRunTimeout budgets 30 minutes. The deadline sits on the connection rather
+// cmd/server/main.go sets WriteTimeout: 300s on the shared http.Server. That is a sane
+// bound for the API surface -- it is sized to cover the chat path's CPU inference --
+// and still six times too short for this one route, where modelRunTimeout budgets 30
+// minutes. The deadline sits on the connection rather
 // than the handler, so when it expires mid-rebuild the handler keeps running to
 // completion while the response can no longer be written: the caller gets a bare EOF.
 //
