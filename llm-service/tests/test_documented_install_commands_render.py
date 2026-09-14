@@ -40,6 +40,21 @@ values-eks.yaml sets objectStorage.mode=s3, so the minio guard does not fire
 there at all. Enforcing a flat "all five keys" on those would be a false
 positive on the correct EKS documentation. The render layer covers them instead,
 on any machine that has helm.
+
+_install_blocks() was also narrower than the docs it claimed to cover: its
+filter matched only `deploy/helm/rsync-ai`, so README.md's published-chart
+block (`helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai ...`) was
+never collected, and every assertion in this file passed while that block --
+the one a reader can actually run without cloning the repo -- went unchecked.
+The OCI form also needed its own required-key source: apps/frontend.yaml
+enforces `frontend.apiUrl`/`frontend.publicUrl` through a `required` function,
+not a validate.yaml `fail`, so reading validate.yaml alone under-reported the
+required set by two keys precisely on the block that needs them. Both gaps are
+closed now (`_required_value_paths()` reads validate.yaml + frontend.yaml;
+`_install_blocks()` admits a `helm install rsync oci://.../charts/rsync-ai`
+line that also pins `--version`) and floored by
+test_the_published_chart_install_command_is_in_the_work_list, so neither can
+regress back into a silent zero.
 """
 
 import os
@@ -53,6 +68,7 @@ import yaml
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 CHART_DIR = os.path.join(REPO_ROOT, "deploy", "helm", "rsync-ai")
 VALIDATE = os.path.join(CHART_DIR, "templates", "validate.yaml")
+FRONTEND = os.path.join(CHART_DIR, "templates", "apps", "frontend.yaml")
 
 # Docs that hand a reader a runnable chart install. Tracked paths, repo-relative.
 DOC_FILES = [
@@ -75,19 +91,91 @@ def _required_value_paths():
     Every one of these fires under DEFAULT values: postgresql.enabled and
     objectStorage.mode=minio are both defaults, and secrets.existingSecret is
     empty by default, which is the branch the whole secrets block sits under.
+
+    Two files, not a walk of templates/**: frontend.apiUrl and
+    frontend.publicUrl are enforced by the `required` function in
+    apps/frontend.yaml, not by a `fail` in validate.yaml, so reading
+    validate.yaml alone made this set five keys where it should be seven. An
+    all-templates walk was tried and rejected -- it also captures `hosts.api`
+    and `hosts.app`, mis-parsed out of `ingress.hosts.app is required when
+    ingress.enabled` and conditional on `ingress.enabled: false`
+    (values.yaml default) -- two false positives measured against ground
+    truth before this was narrowed to the two files that actually gate on
+    default values.
     """
-    with open(VALIDATE) as fh:
-        return sorted(set(_REQUIRED.findall(fh.read())))
+    keys = set()
+    for path in (VALIDATE, FRONTEND):
+        with open(path) as fh:
+            keys |= set(_REQUIRED.findall(fh.read()))
+    return sorted(keys)
+
+
+def _dequote(block):
+    """Strip a `> ` blockquote marker shared by every line of the block.
+
+    README.md's OCI install lives inside a `> [!TIP]` admonition, so every
+    line of its ```bash fence carries a literal leading `> ` in the raw file
+    -- GitHub un-indents it for display and for the code block's own "copy"
+    button, but a raw read of the file (which is all `_FENCE` does) sees the
+    marker. Left in, every line fails the render layer's
+    `lstrip().startswith(("helm", "--", ...))` check and the whole block
+    reads as unparseable stray commands, even though it is the exact text a
+    reader would paste. Stripped here, once, so every downstream consumer --
+    the required-key regex, both render-layer checks -- sees the same text a
+    reader's clipboard would.
+
+    A no-op for the common case: only fires when EVERY non-blank line starts
+    with `>`, so a block that legitimately contains a `>` redirect or
+    comparison is left untouched.
+    """
+    lines = block.splitlines()
+    non_blank = [ln for ln in lines if ln.strip()]
+    if not non_blank or not all(ln.startswith(">") for ln in non_blank):
+        return block
+    out_lines = []
+    for ln in lines:
+        if ln.startswith("> "):
+            out_lines.append(ln[2:])
+        elif ln == ">":
+            out_lines.append("")
+        else:
+            out_lines.append(ln)
+    return "\n".join(out_lines)
 
 
 def _install_blocks():
-    """(doc, block_text) for every fenced shell block that installs this chart."""
+    """(doc, block_text) for every fenced shell block that installs this chart.
+
+    The OCI half of the filter is narrower than "the block mentions the
+    published chart" -- it was first written as a bare `"oci://ghcr.io/
+    rsync-ai/charts" in block` substring, and that also caught two blocks that
+    are not install commands: deploy/helm/rsync-ai/README.md's Ollama example
+    (`--set` flags meant to layer onto an existing install, no `--version`, no
+    secrets -- so it isn't renderable as a standalone command) and
+    kubernetes.md's `helm pull oci://... && helm install rsync ./rsync-ai`
+    two-liner, where the oci:// reference belongs to `helm pull`, not to the
+    `helm install` line the render layer executes. Both were false positives
+    that broke test_every_documented_install_block_renders when this was
+    widened the first time; measured against those two before landing. The fix
+    anchors on the literal "helm install rsync oci://.../charts/rsync-ai"
+    shape (chart ref immediately follows the release name, which is how every
+    real full-install block writes it) and additionally requires `--version`,
+    which only a complete install command pins.
+    """
     out = []
     for rel in DOC_FILES:
         with open(os.path.join(REPO_ROOT, rel)) as fh:
             text = fh.read()
-        for block in _FENCE.findall(text):
-            if "helm install" in block and "deploy/helm/rsync-ai" in block:
+        for raw_block in _FENCE.findall(text):
+            block = _dequote(raw_block)
+            if "helm install" not in block:
+                continue
+            is_local = "deploy/helm/rsync-ai" in block
+            is_oci_install = (
+                "helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai" in block
+                and "--version" in block
+            )
+            if is_local or is_oci_install:
                 out.append((rel, block))
     return out
 
@@ -131,6 +219,20 @@ def test_the_docs_still_contain_a_chart_install_command():
     assert len(_required_value_paths()) >= 5, (
         "validate.yaml stopped yielding required-key fail messages -- the "
         "derivation broke, so the checks below are vacuous"
+    )
+
+
+def test_the_published_chart_install_command_is_in_the_work_list():
+    """The OCI block is the one a reader can run without cloning, and it was
+    invisible here: the filter keyed on `deploy/helm/rsync-ai`, which that block
+    does not contain, so it was collected zero times while this file passed.
+    """
+    oci = [d for d, b in _install_blocks() if "oci://ghcr.io/rsync-ai/charts" in b]
+    assert oci, (
+        "no documented `helm install oci://...` block reached the work list. "
+        "Either the docs stopped advertising the published chart, or the filter "
+        "in _install_blocks() stopped matching it -- and an empty work list "
+        "passes every assertion in this file."
     )
 
 

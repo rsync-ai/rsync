@@ -117,11 +117,16 @@ per-provider value files ship for EKS, GKE and AKS. See the
 >   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
 >   --set secrets.postgresPassword="$(openssl rand -hex 24)" \
 >   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
->   --set secrets.minioSecretKey="$(openssl rand -base64 32)"
+>   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
+>   --set frontend.publicUrl=https://app.example.com \
+>   --set frontend.apiUrl=https://api.example.com
 > ```
 >
-> Both paths pull images at `.Chart.AppVersion` (**0.1.2**), and every image the chart
-> names is published at that tag.
+> The two `frontend.*` flags are not optional on either path — the chart refuses to
+> render without them, because the browser calls the API directly and NextAuth
+> builds its callback URLs from `publicUrl`. Point them at the hostnames your
+> ingress will serve. Both paths pull images at `.Chart.AppVersion` (**0.1.2**), and
+> every image the chart names is published at that tag.
 
 ---
 

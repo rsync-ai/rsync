@@ -651,7 +651,7 @@ generation:
   # intent classifier times out and the reply comes back canned, with HTTP 200
   # and one warning line. 90 matches docker-compose.quickstart.yml. Raise it on
   # slower hardware; lower it only if you front this with a fast hosted model.
-  llmServiceTimeoutSeconds: 90
+  llmServiceTimeoutSeconds: 240
   # llm-service + planner. tool-generator runs a different image — see below.
   image: { repository: llm-service-oss, tag: "" }
   llm:

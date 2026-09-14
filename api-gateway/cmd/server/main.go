@@ -1236,12 +1236,18 @@ func main() {
 
 	log.Infof("API Gateway starting on port %s", port)
 
+	// WriteTimeout caps the whole response, so it is also the ceiling on the chat
+	// deadline (LLM_SERVICE_TIMEOUT_SECONDS); a deadline above it just moves the
+	// cut to a place with no error message. 120s sat under the workload it had to
+	// cover: the bundled Ollama runs a 7B model on CPU, measured at 4.82 tok/s on
+	// 8 vCPU, so a single intent parse took 92s. install.sh gates on RAM only, so
+	// 2- and 4-vCPU hosts pass pre-flight and are several times slower again.
 	srv := &http.Server{
 		Addr:              ":" + port,
 		Handler:           r,
 		ReadHeaderTimeout: 10 * time.Second,  // prevent slowloris header attacks
 		ReadTimeout:       60 * time.Second,  // max time to read full request body
-		WriteTimeout:      120 * time.Second, // max time to write response (covers LLM streaming)
+		WriteTimeout:      300 * time.Second, // ceiling on the chat deadline -- see above
 		IdleTimeout:       120 * time.Second, // keepalive idle connection timeout
 	}
 
