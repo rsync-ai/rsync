@@ -143,6 +143,32 @@ promoting to a stricter one the operator did not ask for.
 {{- if eq (include "rsync-ai.postgres.tlsHostVerification" .) "true" -}}false{{- else -}}true{{- end -}}
 {{- end -}}
 
+{{/*
+Whether the chart creates the databases itself. Three conditions, and each one
+that fails means something different, so they are collected here rather than
+repeated at every reader (templates/jobs/db-init.yaml renders the hook;
+templates/infra/temporal.yaml tells the operator who created its two databases).
+
+  postgresql.enabled          in-chart Postgres already does it via the image's
+                              initdb and Temporal's own auto-setup -- there is
+                              nothing left for a hook to create.
+  postgresql.dbInit.enabled   the operator's opt-out, for a database whose
+                              creation is owned by their platform team.
+  external.iamAuth            db-init authenticates with a password out of a
+                              Secret. Under IAM database auth there IS no
+                              password -- the credential is a short-lived token
+                              minted by a sidecar or proxy the chart does not
+                              run -- so the hook could only fail, and it is a
+                              PRE-install hook, so its failure would abort the
+                              install before anything else was created.
+
+The last two leave the operator holding the CREATE DATABASE statements; that is
+what deploy/helm/rsync-ai/README.md still documents for exactly these paths.
+*/}}
+{{- define "rsync-ai.dbInit.enabled" -}}
+{{- if and (not .Values.postgresql.enabled) .Values.postgresql.dbInit.enabled (not .Values.postgresql.external.iamAuth) -}}true{{- end -}}
+{{- end -}}
+
 {{- define "rsync-ai.redis.host" -}}
 {{- if .Values.redis.enabled -}}
 {{- printf "%s-redis" (include "rsync-ai.fullname" .) -}}
@@ -157,6 +183,55 @@ promoting to a stricter one the operator did not ask for.
 
 {{- define "rsync-ai.redis.address" -}}
 {{- printf "%s:%s" (include "rsync-ai.redis.host" .) (include "rsync-ai.redis.port" .) -}}
+{{- end -}}
+
+{{/*
+Ollama: the URL, and the model name, resolved in ONE place for three call sites.
+
+Three orthogonal keys, and untangling them is why these are helpers and not a
+values lookup at the point of use:
+
+  * ollama.enabled decides WHO RUNS the server -- this chart, or the operator, at
+    the address in generation.llm.ollamaUrl. Disabled and unset renders the empty
+    string, which is falsy to `with`, so the BYO-nothing install emits no Ollama
+    env at all rather than an address that resolves nowhere.
+  * ollama.model is WHICH MODEL the Ollama path asks for, on BOTH sides of that
+    switch -- the same shape as postgresql.database and postgresql.username,
+    which name the database whoever hosts it. A BYO Ollama serving llama3.1 is
+    configured with `--set ollama.model=llama3.1:8b`; the in-chart pull hook
+    reads the identical key. Reading generation.llm.model here instead is the
+    bug this note exists to prevent: it renders OLLAMA_MODEL="gpt-4o" and asks a
+    BYO Ollama for a cloud model, which is the same `model not found` the pull
+    hook was written to eliminate.
+  * generation.llm.provider decides WHETHER the main client asks Ollama for
+    anything. It is legal, and useful, to run a bundled Ollama with
+    provider=openai: that pins ONLY the Data Explorer offline while chat stays on
+    the cloud model.
+
+rsync-ai.llm.model exists because generation.llm.model is an OpenAI key carrying
+an OpenAI default. get_default_model() reads LLM_MODEL FIRST
+(openai_client.py:118-135), so passing gpt-4o through on the Ollama path gives a
+404 on every chat beside a Data Explorer that works -- the same split the compose
+overlay's OLLAMA_MODEL line exists to close.
+*/}}
+{{- define "rsync-ai.ollama.url" -}}
+{{- if .Values.ollama.enabled -}}
+{{- printf "http://%s-ollama:11434" (include "rsync-ai.fullname" .) -}}
+{{- else -}}
+{{- .Values.generation.llm.ollamaUrl -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "rsync-ai.ollama.model" -}}
+{{- .Values.ollama.model -}}
+{{- end -}}
+
+{{- define "rsync-ai.llm.model" -}}
+{{- if eq .Values.generation.llm.provider "ollama" -}}
+{{- include "rsync-ai.ollama.model" . -}}
+{{- else -}}
+{{- .Values.generation.llm.model -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

@@ -86,16 +86,40 @@ spec:
             {{- if ne $svc.name "tool-generator" }}
             - name: LLM_PROVIDER
               value: {{ $root.Values.generation.llm.provider | quote }}
+            {{/*
+              Through the helper, not straight from generation.llm.model. On the
+              offline path that key still holds its gpt-4o default, and
+              get_default_model() reads LLM_MODEL FIRST (openai_client.py:118-135)
+              — so passing it through asks the bundled Ollama for a cloud model it
+              has never pulled, and every chat 404s beside a Data Explorer that
+              works. The helper substitutes ollama.model when the provider is
+              ollama and is a pass-through otherwise.
+            */}}
             - name: LLM_MODEL
-              value: {{ $root.Values.generation.llm.model | quote }}
-            {{- with $root.Values.generation.llm.ollamaUrl }}
+              value: {{ include "rsync-ai.llm.model" $root | quote }}
+            {{- with (include "rsync-ai.ollama.url" $root) }}
             # OLLAMA_BASE_URL wins over OLLAMA_URL in the client
             # (openai_client.py _ollama_base_url), so both are set to the same
             # value — setting only the losing one is a silent no-op.
+            #
+            # `with` rebinds the dot to this string, so every include below it
+            # takes $root explicitly. Empty means neither an in-chart Ollama nor a
+            # BYO url, and empty is falsy — the block renders nothing rather than
+            # an address that resolves nowhere.
             - name: OLLAMA_URL
               value: {{ . | quote }}
             - name: OLLAMA_BASE_URL
               value: {{ . | quote }}
+            {{/*
+              Not redundant with LLM_MODEL. FOUR call sites in openai_client.py
+              pick a model for Ollama and only get_default_model reads LLM_MODEL:
+              explorer_default_model and rank_tables_default_model fall back to
+              llama3:latest, explorer_default_sql_model to sqlcoder:latest. Setting
+              this collapses all four onto the one model the pull hook downloaded.
+              Same line, same reason, as docker-compose.ollama.yml's OLLAMA_MODEL.
+            */}}
+            - name: OLLAMA_MODEL
+              value: {{ include "rsync-ai.ollama.model" $root | quote }}
             {{- end }}
             # Soft, not required: a fully-offline Ollama install has no OpenAI
             # key and must still boot. Provider selection is by LLM_PROVIDER.

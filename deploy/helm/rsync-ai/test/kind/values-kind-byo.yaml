@@ -68,7 +68,7 @@ frontend:
     requests: { cpu: 50m, memory: 192Mi }
 
   # Required, not optional: templates/apps/frontend.yaml:68 and :72 wrap both in
-  # `required`, so without them a `helm template` against this file fails at
+  # `required`, so without them the reproduction command in JOURNAL.md fails at
   # RENDER -- before a pod is scheduled, and before any of the broker wiring this
   # harness exists to test is reached. They are not secrets, so they belong here
   # rather than in the uncommitted secrets file where every reader would have to

@@ -77,6 +77,22 @@ spec:
             {{- if .Values.generation.enabled }}
             - name: TOOL_GENERATOR_URL
               value: "http://{{ $fullname }}-tool-generator:5010"
+            # LLM_SERVICE_URL is a SHARED name with two consumers IN THIS
+            # SERVICE that disagree on what it points at, which is why the two
+            # values below are deliberately different addresses.
+            # internal/workers/intent.go reads the shared name with a fallback
+            # of http://planner:5011 and has no override of its own, so it is
+            # the consumer the shared name has to serve. pkg/diagnose/llm.go
+            # wants llm-service:5000 and reads RSYNC_LLM_DIAGNOSER_URL FIRST --
+            # the override its author added for exactly this collision (see the
+            # comment at pkg/diagnose/llm.go:92). Setting only the shared name
+            # would silently repoint the diagnoser at the planner; setting
+            # neither leaves both dialling bare compose names that do not
+            # resolve under a release prefix.
+            - name: LLM_SERVICE_URL
+              value: "http://{{ $fullname }}-planner:5011"
+            - name: RSYNC_LLM_DIAGNOSER_URL
+              value: "http://{{ $fullname }}-llm-service:5000"
             {{- end }}
             {{- if .Values.connectors.cdc.enabled }}
             # Every Kafka Connect caller in the orchestrator resolves this env
@@ -88,6 +104,32 @@ spec:
             # that does not resolve.
             - name: KAFKA_CONNECT_URL
               value: "http://{{ $fullname }}-kafka-connect:8083"
+            {{- end }}
+            # Three service-to-service URLs this deployment never set, each
+            # falling back to a bare compose name that does not resolve under a
+            # release prefix. The *_INTERNAL_URL names come FIRST in every
+            # consumer's chain, so they are the ones that have to be set:
+            #   API_GATEWAY_INTERNAL_URL -> heal/worker.go:139 (feeding
+            #     executors.go:148) and executor/namespace_lock.go:86
+            #   API_GATEWAY_URL          -> connections/manager.go:43, the OAuth
+            #     refresh client, which reads ONLY this name
+            #   ORCHESTRATOR_INTERNAL_URL -> heal/resnapshot.go:76
+            # frontend.yaml:56 already sets API_GATEWAY_INTERNAL_URL the same
+            # way -- this deployment was simply missed. All three call
+            # /api/v1/internal/... and authenticate with INTERNAL_SERVICE_SECRET,
+            # which rsync-ai.cryptoEnv (included above) already provides here.
+            - name: API_GATEWAY_INTERNAL_URL
+              value: "http://{{ $fullname }}-api-gateway:{{ .Values.apiGateway.service.port }}"
+            - name: API_GATEWAY_URL
+              value: "http://{{ $fullname }}-api-gateway:{{ .Values.apiGateway.service.port }}"
+            - name: ORCHESTRATOR_INTERNAL_URL
+              value: "http://{{ $fullname }}-orchestrator:{{ .Values.orchestrator.service.port }}"
+            {{- if .Values.generation.enabled }}
+            # workers/planner.go:48 reads PLANNER_URL directly -- a separate name
+            # from the LLM_SERVICE_URL above, and separately unset. Same Service,
+            # same port; setting one does not set the other.
+            - name: PLANNER_URL
+              value: "http://{{ $fullname }}-planner:5011"
             {{- end }}
             - name: CORRELATION_CLAIM_TTL
               value: {{ .Values.orchestrator.correlationClaimTtl | quote }}

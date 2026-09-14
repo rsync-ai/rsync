@@ -1,0 +1,151 @@
+{{- if .Values.ollama.enabled }}
+{{/*
+The in-chart LLM. Setting generation.llm.provider=ollama WITHOUT this points the
+generation tier at http://host.docker.internal:11434 — the client's own default
+(llm-service/src/utils/openai_client.py:67-76), a Docker Desktop name that does
+not resolve inside a pod. So "use Ollama" and "run an Ollama" are two separate
+decisions in this chart, exactly as they are in Compose, where the equivalent is
+layering docker-compose.ollama.yml.
+
+This is the Kubernetes half of that overlay. Kept in step with it by hand,
+because install.sh downloads compose files with no repo checkout and the chart
+is pulled as an OCI artifact — neither side can call a shared script.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-ollama
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  clusterIP: None
+  ports:
+    - port: 11434
+      targetPort: http
+      name: http
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-ollama
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: ollama
+spec:
+  serviceName: {{ include "rsync-ai.fullname" . }}-ollama
+  {{/*
+    Hard-coded, not a values key, and that is the point. Each replica of a
+    StatefulSet gets its OWN PVC, so each would start with an empty model
+    directory. The pull Job fills exactly one of them; the headless Service then
+    load-balances prompts across all of them, and every request that lands on a
+    replica the Job did not fill comes back `model "..." not found`. An operator
+    who set replicaCount: 3 for availability would have bought a 2-in-3 failure
+    rate that looks like an intermittent model bug.
+  */}}
+  replicas: 1
+  selector:
+    matchLabels:
+{{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: ollama
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: ollama
+      {{- with .Values.global.podAnnotations }}
+      annotations:
+{{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: ollama
+          image: {{ .Values.ollama.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          {{/*
+            HOME is the whole configuration, and it is load-bearing twice over.
+
+            `ollama serve` calls initializeKeypair() FIRST and returns its error
+            (cmd/cmd.go:2015-2016 at the pinned tag), and that function writes
+            $HOME/.ollama/id_ed25519 after os.MkdirAll — so a HOME the process
+            cannot write does not degrade the server, it stops it booting. The
+            image sets no HOME and no USER; under Docker the runtime supplies
+            /root, which is why the compose overlay mounts /root/.ollama. Here
+            global.podSecurityContext runs the pod as uid 1000, so there is no
+            such gift and / is not writable.
+
+            Models() reads OLLAMA_MODELS first, else $HOME/.ollama/models
+            (envconfig/config.go:113-124). Pointing HOME at the PVC therefore
+            places the keypair AND the models on it with one knob, which is why
+            OLLAMA_MODELS is deliberately not set: two knobs could disagree and
+            put the keypair back on the read-only root.
+
+            fsGroup: 1000 in global.podSecurityContext is what makes the mounted
+            volume writable by that uid. Removing it breaks the server at boot.
+          */}}
+          env:
+            - name: HOME
+              value: /home/ollama
+            # Set in the image already, restated because the Service's targetPort
+            # depends on it: a future image that drops it would leave the server
+            # on 127.0.0.1 and every in-cluster client on a refused connection.
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+          ports:
+            - name: http
+              containerPort: 11434
+          {{/*
+            `/` returns "Ollama is running" (server/routes.go:1877-1878), so an
+            httpGet probe is a real round trip to the serving listener without
+            the cost of exec'ing the CLI every few seconds. It is the same signal
+            the compose healthcheck buys with `ollama list`, which is what the
+            pull step waits on there.
+          */}}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 30
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 60
+            periodSeconds: 20
+            failureThreshold: 6
+          {{/*
+            Requests only. values.yaml deliberately ships no `limits` for this
+            component, and a memory limit is the one that matters: this
+            container's working set IS the model, a cap below it does not slow
+            inference down, it gets the container OOM-killed mid-answer. Size the
+            NODE instead. Same reasoning, same words, as the absent mem_limit in
+            docker-compose.ollama.yml.
+          */}}
+          resources:
+{{- toYaml .Values.ollama.resources | nindent 12 }}
+          volumeMounts:
+            - name: models
+              mountPath: /home/ollama
+  volumeClaimTemplates:
+    - metadata:
+        name: models
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{/*
+          Per-component first, global as the fallback — see the same block in
+          infra/redis.yaml. (KI-CHART-DEAD-PER-COMPONENT-STORAGECLASS.)
+        */}}
+        {{- with (default .Values.global.storageClass .Values.ollama.persistence.storageClass) }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.ollama.persistence.size | quote }}
+{{- end }}

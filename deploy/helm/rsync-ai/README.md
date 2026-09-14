@@ -75,6 +75,7 @@ connector-deployer's job. Declare every connector your pipelines use under
 | CDC plane | kafka-connect + debezium-mcp (one pod), kafka-mcp-sink | on (`connectors.cdc.enabled`) |
 | Connectors | whatever is in `connectors.fleet` | empty |
 | Generation | llm-service, tool-generator, planner | on (`generation.enabled`) |
+| Internal LLM | ollama + a model-pull hook Job | off (`ollama.enabled`) |
 | Cluster plumbing | Ingress, NetworkPolicy, PodDisruptionBudget | off |
 
 Two workloads are single-replica **by design**, not by omission:
@@ -141,27 +142,61 @@ api-gateway logs one warning on a failed connect, keeps answering `/health`, and
 stalls at `0/1`, because its readinessProbe is `/ready` and `/ready` answers
 `503 db_ping_failed`.
 
-**The role and the database must already exist.** The chart connects as
+**The role must already exist. The databases need not.** The chart connects as
 `postgresql.username` (default `rsync`) to `postgresql.database` (default
-`pipeline_db`); a freshly created managed instance has neither. The role needs
-DDL on that database — `api-gateway` and `orchestrator` each run their own
-migrations at startup.
-
-**Temporal needs two more databases, and nothing creates them for you.** With
-`postgresql.enabled: false` the chart sets `SKIP_DB_CREATE=true` on the Temporal
-pod, so create them on the same instance before installing:
+`pipeline_db`), and a freshly created managed instance has neither. A pre-install
+hook Job — `templates/jobs/db-init.yaml` — creates `pipeline_db`, `temporal` and
+`temporal_visibility`, and the `uuid-ossp` and `pg_trgm` extensions inside
+`pipeline_db`. It cannot create the role, because it authenticates *as* that
+role, so that one statement is still yours:
 
 ```sql
-CREATE DATABASE temporal OWNER rsync;
-CREATE DATABASE temporal_visibility OWNER rsync;
+CREATE ROLE rsync LOGIN PASSWORD '<the value in secrets.postgresPassword>';
 ```
 
-Skip this and the Temporal pod CrashLoopBackOffs — its image runs
-`auto-setup.sh && start-temporal.sh` under `set -e` — and with no workflow
-engine every pipeline hangs rather than failing. `SKIP_DB_CREATE` is set
-unconditionally rather than only where `CREATE DATABASE` is forbidden, because
-auto-setup's own create step is guarded only by the name test
-`${DBNAME} != ${POSTGRES_USER}` and never on whether the database is there.
+Give it `CREATEDB`. The hook issues its `CREATE DATABASE` statements as this
+role, and without the attribute it stops with `permission denied to create
+database` and prints the `ALTER ROLE` that fixes it. Being a *pre*-install hook,
+that failure aborts the install rather than leaving a half-started stack — which
+is the point of running before anything else, since api-gateway's own connect
+retry is bounded and never comes back once it lapses.
+
+`SKIP_DB_CREATE=true` is still set on the Temporal pod whenever
+`postgresql.enabled: false`, unconditionally rather than only where
+`CREATE DATABASE` is forbidden, because auto-setup's own create step is guarded
+only by the name test `${DBNAME} != ${POSTGRES_USER}` and never on whether the
+database is there. db-init is what fills the gap that leaves.
+
+**Two values switch the hook off, and then the statements are yours again.**
+
+| Value | Why there is no Job |
+|---|---|
+| `postgresql.dbInit.enabled: false` | your opt-out, for an instance whose databases belong to a platform team |
+| `postgresql.external.iamAuth: true` | the Job authenticates with a password from a Secret, and under IAM database authentication there is no password — only a short-lived token from a proxy this chart does not run |
+
+Both are read by the `rsync-ai.dbInit.enabled` helper in `templates/_helpers.tpl`
+and nowhere else, so `helm template … --set postgresql.dbInit.enabled=false |
+grep db-init` is the check. On either path, run this against the instance before
+installing:
+
+<!-- manual-step-ok: dbInit-disabled -->
+<!-- manual-step-ok: iam-auth -->
+```sql
+CREATE DATABASE pipeline_db OWNER rsync;
+CREATE DATABASE temporal OWNER rsync;
+CREATE DATABASE temporal_visibility OWNER rsync;
+\c pipeline_db
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
+```
+
+Only one of those five failures is loud. Miss `temporal` and the pod
+CrashLoopBackOffs, because its image runs `auto-setup.sh && start-temporal.sh`
+under `set -e` and `SKIP_DB_CREATE` stopped it creating its own. The rest are
+silent: a missing `pipeline_db` leaves api-gateway logging a single warning and
+answering `/health` with 200 forever while it sits at `0/1`, and a missing
+extension stops the migration runner at its first file, so no table is created
+at all in a pod that keeps running. `/ready` is the endpoint that knows.
 
 TLS is derived from `postgresql.external.sslMode` alone, including Temporal's
 own switches, which have no `sslmode` concept. The mapping table is in
@@ -206,6 +241,52 @@ cluster is authorized, read
 [docs/deployment/kafka-acls.md](../../../docs/deployment/kafka-acls.md) first; in
 particular, a grant of Read/Write with no `Create` cannot run a single pipeline, because
 each pipeline's data topic is named at runtime from the pipeline's own id.
+
+## Internal LLM
+
+`ollama.enabled=true` renders a single-replica Ollama StatefulSet with its own
+PVC, plus a post-install/post-upgrade hook Job that downloads `ollama.model`
+into it. That Job is the whole point of the switch: an Ollama server with no
+model in it starts healthy and answers every prompt with `model "…" not found,
+try pulling it first`, so the stack comes up green and nothing works.
+
+```bash
+helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
+  --set ollama.enabled=true \
+  --set generation.llm.provider=ollama \
+  --wait --timeout 30m
+```
+
+**Use `--wait --timeout 30m`.** It is the analogue of compose's blocking first
+`up`: Helm runs post-install hooks only after the main resources are Ready, and
+does not return until they finish. The default 5-minute timeout is shorter than
+a 4.7 GB download on most connections. Without `--wait` nothing breaks
+permanently — there is just a window, as long as the download, in which a prompt
+returns `model not found` and then starts working on its own.
+
+Three keys, and they are deliberately independent:
+
+| Key | Decides |
+|---|---|
+| `ollama.enabled` | **who runs** the server — this chart, or you, at `generation.llm.ollamaUrl` |
+| `ollama.model` | **which model** the Ollama path asks for, on *both* sides of `enabled` |
+| `generation.llm.provider` | **whether** the Python tier asks Ollama for anything |
+
+So `ollama.model` names the model the way `postgresql.database` names the
+database: with `enabled=true` the hook downloads it, and with an Ollama you
+already run it is the name the pods send to that server — set it to one that
+server actually serves. `generation.llm.model` is the OpenAI-path model and
+never reaches Ollama.
+
+Setting `generation.llm.provider=ollama` with neither `ollama.enabled` nor
+`generation.llm.ollamaUrl` is **refused at render time**. The client's own
+fallback is `http://host.docker.internal:11434`, a name no pod resolves, so the
+install would otherwise succeed and every generation call would fail on DNS.
+
+Sizing: the server requests 1 CPU and 6 Gi and carries **no memory limit** — its
+working set is the model, and a cap below it gets the container OOM-killed
+mid-answer rather than slowing it down. The PVC defaults to 20 Gi. Schedule it on
+a node that can hold the model resident.
 
 ## Cloud overlays
 

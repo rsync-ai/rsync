@@ -58,6 +58,15 @@ spec:
               value: {{ include "rsync-ai.temporal.address" . | quote }}
             - name: TEMPORAL_NAMESPACE
               value: {{ .Values.temporal.external.namespace | default "default" | quote }}
+            {{- if .Values.generation.enabled }}
+            # nl_pipeline_v2_activities.go calls the llm-service HITL
+            # interpreter and falls back to the bare compose name
+            # "llm-service" when this is empty -- a host that does not resolve
+            # under a Helm release prefix. Same defect as the LLM_SERVICE_URL
+            # entry in api-gateway.yaml.
+            - name: LLM_SERVICE_URL
+              value: "http://{{ $fullname }}-llm-service:5000"
+            {{- end }}
             # This service reads POSTGRES_* (not the DB_* the orchestrator uses).
             # The names are not interchangeable — it refuses to start when it
             # cannot resolve a DSN, which is the intended behaviour but reads as
@@ -87,6 +96,28 @@ spec:
                 secretKeyRef:
                   name: {{ include "rsync-ai.secretName" . }}
                   key: REDIS_PASSWORD
+                  optional: true
+            # Three workflows call the gateway's internal API and every one of
+            # them falls back to a bare compose name: scheduled_model_workflow.go
+            # :130, model_freshness_workflow.go:170, and
+            # nl_pipeline_v2_activities.go:777 -- whose fallback is
+            # api-gateway:5001, the HOST port mapping, unreachable from inside
+            # the cluster even by a correct hostname.
+            - name: API_GATEWAY_URL
+              value: "http://{{ $fullname }}-api-gateway:{{ .Values.apiGateway.service.port }}"
+            # Those same workflows send X-Internal-Secret from
+            # INTERNAL_SERVICE_SECRET (scheduled_model_workflow.go:123,
+            # model_freshness_workflow.go:162). docker-compose.yml gives this
+            # service both the URL and the secret; the chart gave it neither, so
+            # wiring only the URL would move the failure from "no such host" to
+            # "401". Declared inline rather than via rsync-ai.cryptoEnv because
+            # that helper also carries JWT_SECRET, which this service never reads
+            # (0 non-test call sites) -- same pattern as frontend.yaml:73.
+            - name: INTERNAL_SERVICE_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: INTERNAL_SERVICE_SECRET
                   optional: true
             - name: ENCRYPTION_KEY
               valueFrom:

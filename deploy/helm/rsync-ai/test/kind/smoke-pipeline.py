@@ -3,13 +3,14 @@
 
 WHY THIS EXISTS
 ---------------
-`kubectl get pods` is not evidence that this chart works: readiness proves each
-pod reached its own dependencies, not that the pods are wired to each other, and
-a wrong Service hostname is valid YAML. The only check
-that settles it is a pipeline run that moves an EXACTLY-KNOWN row count,
-asserted `== N` and never `> 0`. The rest of this harness installs the chart and
-stops there, so until this script existed the one criterion that can only be met
-by executing the product had no executor.
+JOURNAL.md's pass criterion is explicit that `kubectl get pods` is not evidence:
+readiness proves each pod reached its own dependencies, not that the pods are
+wired to each other, and a wrong Service hostname is valid YAML. The criterion
+demands a pipeline run that moves an EXACTLY-KNOWN row count asserted `== N`,
+never `> 0`. Until this script existed the JOURNAL's own
+"Reproducing" section documented only the INSTALL half -- there was no
+pipeline-creation or row-moving procedure anywhere in the harness, so the one
+criterion that can only be met by executing the product had no executor.
 
 WHY IT IS NOT AN e2e/ TEST
 --------------------------
@@ -42,7 +43,7 @@ USAGE
   python3 smoke-pipeline.py                 # seed, run, assert, leave artifacts
   python3 smoke-pipeline.py --cleanup       # drop both schemas afterwards
 
-Prerequisites: the chart is installed on kind and every pod is Ready,
+Prerequisites: the cluster is installed and Ready (see JOURNAL.md Reproducing),
 byo-postgres is running from postgres-up.sh, and the password file it wrote is
 on disk. Nothing here prints a credential.
 """
