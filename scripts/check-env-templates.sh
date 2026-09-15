@@ -185,6 +185,16 @@ check_pair "staging (scripts/staging-up.sh)"   .env.staging.example \
   docker-compose.yml docker-compose.prod.yml docker-compose.staging.yml
 check_pair "local dev (docs/getting-started/quickstart.md)" .env.example \
   docker-compose.yml
+# .env.example is also the template self-hosting.md's BYO-Kafka/BYO-Postgres
+# sections and oracle-cloud.md point a reader at when they run
+# docker-compose.quickstart.yml directly instead of through install.sh (which
+# generates its own .env — see check_installer below). Before this pairing
+# existed, docker-compose.yml's vacuous check above was the ONLY thing run
+# against .env.example, so a var required only by quickstart.yml (MinIO's
+# different name pair) could go missing from .env.example with this guard
+# still green.
+check_pair "local dev, quickstart path (docs/deployment/self-hosting.md, oracle-cloud.md)" .env.example \
+  docker-compose.quickstart.yml
 check_installer
 
 check_byo_kafka .env.prod.example

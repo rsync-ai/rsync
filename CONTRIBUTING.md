@@ -22,6 +22,22 @@ make dev
 
 This starts all services via Docker Compose. The frontend is at `http://localhost:3000` and the API gateway at `http://localhost:5001`.
 
+### Running `llm-service` tests
+
+`llm-service/tests/` must run against a virtualenv with the service's own dependencies
+installed — the host Python won't have them, and there's no supported way to install
+them globally.
+
+```bash
+cd llm-service
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install pytest pytest-asyncio
+.venv/bin/pytest tests/
+```
+
+Use `requirements-oss.txt` instead of `requirements.txt` if you're working on the OSS build.
+
 ## Services
 
 | Service | Language | Path |
