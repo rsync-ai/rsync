@@ -152,6 +152,38 @@ class BigQueryWarehouseAdapter:
             table.schema = new_fields
             client.update_table(table, ["schema"])
 
+    def _config_with_namespace(self, params: Dict[str, Any], config: Dict[str, Any],
+                               table: str) -> Dict[str, Any]:
+        """Return a config copy whose ``dataset_id`` is overridden by an explicit
+        ``namespace`` param when the table is bare.
+
+        BigQuery's namespace analog is the DATASET, not a schema — that is the only
+        difference from the snowflake/databricks/redshift helper of the same name.
+        The sink bares the table and forwards the pipeline's destination namespace
+        separately as ``namespace``/``db_or_schema`` (kafka-sink-worker
+        ``addNamespaceParam``, taken for every warehouse destination). Without this
+        the write paths resolved ``config["dataset_id"]`` unconditionally, so a
+        pipeline's ``destination_namespace`` was silently discarded and rows landed
+        in the connection's dataset — "loaded" but mis-routed, which no row count
+        can detect.
+
+        ``export`` deliberately does NOT use this: a destination namespace must
+        never retarget a source read.
+        """
+        ns = (params.get("namespace") or params.get("db_or_schema")
+              or params.get("destination_namespace") or "").strip()
+        # Empty and the literal "default" both mean "no real namespace" (the sink's
+        # isRealNamespace); they must leave the connection's dataset untouched.
+        if not ns or ns.lower() == "default":
+            return config
+        # Only a bare table takes the namespace; a dataset-qualified or fully
+        # qualified name already names its own dataset and must win.
+        if "." in str(table).strip("`"):
+            return config
+        qcfg = dict(config)
+        qcfg["dataset_id"] = ns
+        return qcfg
+
     def _qualify_table(self, config: Dict[str, Any], table: str) -> str:
         raw = (table or "").strip().strip("`")
         if not raw:
@@ -398,7 +430,7 @@ class BigQueryWarehouseAdapter:
             return {"success": True, "rows_inserted": 0, "message": "No data to import"}
 
         client = self._client(config)
-        fq = self._qualify_table(config, table)
+        fq = self._qualify_table(self._config_with_namespace(params, config, table), table)
         errors = client.insert_rows_json(fq, data)
         if errors:
             return {"success": False, "error": "BigQuery insert_rows_json failed", "details": errors}
@@ -500,7 +532,7 @@ class BigQueryWarehouseAdapter:
                     "fell_back": False, "message": "No data to load"}
 
         client = self._client(config)
-        fq = self._qualify_table(config, table)
+        fq = self._qualify_table(self._config_with_namespace(params, config, table), table)
 
         # Best-effort additive schema evolution; never fail the load for it.
         try:
@@ -563,7 +595,7 @@ class BigQueryWarehouseAdapter:
             return {"success": False, "error": "Missing primary key fields for merge (key_fields/primary_keys)"}
 
         client = self._client(config)
-        target_fq = self._qualify_table(config, table)
+        target_fq = self._qualify_table(self._config_with_namespace(params, config, table), table)
 
         # Ensure soft delete columns exist on target.
         try:
@@ -682,7 +714,19 @@ WHEN NOT MATCHED BY TARGET AND COALESCE(S.`_rsync_deleted`, FALSE) = FALSE THEN
         # MERGE. Best-effort — duplicates on replay are absorbed by the idempotent
         # MERGE above, so a failed offset write only costs reprocessing, never data.
         try:
-            self._write_cdc_offsets(client, project_id, dataset_id, params)
+            # The offsets table is per-CONNECTION control-plane state keyed by
+            # pipeline_id, so it deliberately stays in the CONNECTION's dataset even
+            # when destination_namespace routes the DATA elsewhere: the sink's seed
+            # call (callGetCDCOffsets) forwards no namespace, so an offsets table
+            # that followed the data could never be read back and the restart
+            # high-water seed would silently return empty. project_id/dataset_id
+            # here are derived from target_fq, which IS namespace-aware.
+            self._write_cdc_offsets(
+                client,
+                (config.get("project_id") or project_id or "").strip(),
+                (config.get("dataset_id") or dataset_id or "").strip(),
+                params,
+            )
         except Exception:
             pass
 

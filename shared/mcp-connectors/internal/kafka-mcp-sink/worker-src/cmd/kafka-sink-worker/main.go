@@ -5143,8 +5143,16 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 	// Document DB (MongoDB): skip ensure_table entirely — collections auto-create on
 	// first write and _id is always present, so there is nothing to reconcile.
 	if isDocumentDBConnector(destType) {
-		// The per-pipeline namespace has no Mongo schema analog (the database comes from
-		// the connection config), so it is not forwarded; the collection is the bare table.
+		// ensure_table is still skipped (collections auto-create; _id is always present),
+		// but the namespace IS forwarded: a Mongo database is the per-pipeline namespace
+		// analog exactly as a ClickHouse database is, and the connector resolves it in
+		// _target_database. Forwarding it here is what makes the three paths agree —
+		// the batch write (~8072) and the reload-cleanup drop (~4236) already forward
+		// sm.DBOrSchema unconditionally, so while this branch stayed silent a CDC
+		// pipeline with a locked destination_namespace wrote into the connection's
+		// database while its own drop targeted the namespace. targetTable was bared
+		// above for exactly this. No-op when the pipeline has no real namespace.
+		addNamespaceParam(params, destNamespace)
 	} else if !looksLikeObjectStorage && !isWarehouse {
 		rowsForDDL := []map[string]interface{}{}
 		if d, ok := params["data"].([]map[string]interface{}); ok && len(d) > 0 {

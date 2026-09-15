@@ -344,6 +344,82 @@ def test_delete_data_no_keys_is_noop():
     assert len(client["appdb"]["t"].docs()) == 1, "no data → nothing deleted"
 
 
+# ============ DESTINATION NAMESPACE (the sink's addNamespaceParam) ==========
+#
+# The sink forwards a pipeline's ``destination_namespace`` to every non-object-
+# storage destination as BOTH ``namespace`` and ``db_or_schema`` (kafka-sink-worker
+# ``addNamespaceParam``), having first stripped the ``<ns>.`` qualifier off the
+# table. For MongoDB the namespace analog is the DATABASE — exactly as it is for
+# ClickHouse. While this connector discarded it, CDC rows for a pipeline with a
+# locked ``destination_namespace`` landed in the CONNECTION's database instead:
+# "applied", right row counts, zero lag, wrong database.
+
+def test_namespace_param_routes_every_write_to_that_database():
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"t": []}})
+    ns = {"namespace": "postgres_test"}
+
+    assert s.import_data({**CFG, **ns, "table": "t",
+                          "data": [{"_id": 1, "v": "a"}]})["success"] is True
+    assert s.upsert_data({**CFG, **ns, "table": "t",
+                          "data": [{"_id": 2, "v": "b"}]})["success"] is True
+    assert s.delete_data({**CFG, **ns, "table": "t",
+                          "data": [{"_id": 1}]})["success"] is True
+
+    assert [d["_id"] for d in client["postgres_test"]["t"].docs()] == [2], \
+        client["postgres_test"]["t"].docs()
+    assert client["appdb"]["t"].docs() == [], \
+        "connection database must be untouched when a namespace is forwarded"
+
+
+def test_db_or_schema_alone_is_honoured_like_namespace():
+    """``addNamespaceParam`` sets BOTH keys to the same value, so either alone is
+    the whole contract — a connector must not depend on the other being present."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"t": []}})
+    out = s.import_data({**CFG, "db_or_schema": "ns2", "table": "t",
+                         "data": [{"_id": 1}]})
+    assert out["success"] is True, out
+    assert len(client["ns2"]["t"].docs()) == 1, client["ns2"]["t"].docs()
+    assert client["appdb"]["t"].docs() == [], client["appdb"]["t"].docs()
+
+
+def test_empty_and_default_namespace_fall_back_to_the_connection_database():
+    """Back-compat: the sink's ``isRealNamespace`` treats "" and the literal
+    "default" as "this pipeline has no namespace". Both must resolve identically,
+    or every historical single-namespace pipeline would re-route on upgrade."""
+    for ns in ("", "   ", "default", "DEFAULT"):
+        s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"t": []}})
+        out = s.import_data({**CFG, "namespace": ns, "table": "t",
+                             "data": [{"_id": 1}]})
+        assert out["success"] is True, (ns, out)
+        assert len(client["appdb"]["t"].docs()) == 1, (ns, client["appdb"]["t"].docs())
+        assert ns.strip() not in client._dbs or not client[ns.strip()]["t"].docs(), ns
+
+
+def test_drop_table_resolves_the_same_database_as_the_writes():
+    """The sink forwards the namespace on the reload-cleanup drop UNCONDITIONALLY
+    (``addNamespaceParam(dropArgs, sm.DBOrSchema)``). A drop that resolved the
+    connection database while the writes went to the namespace would "clean" the
+    wrong place and let reload mode accumulate duplicates forever."""
+    s, client = _mongo_fakes.make_connector(
+        mg, dbs={"appdb": {"t": [{"_id": 99}]}, "ns": {"t": [{"_id": 1}]}})
+    out = s.drop_table({**CFG, "namespace": "ns", "table": "t"})
+    assert out["success"] is True and out["dropped"] is True, out
+    assert "t" not in client["ns"].list_collection_names(), client["ns"].list_collection_names()
+    assert "t" in client["appdb"].list_collection_names(), \
+        "the connection database must not be dropped by a namespaced reload"
+
+
+def test_source_reads_ignore_a_destination_namespace():
+    """A DESTINATION namespace must never retarget a SOURCE read — the same
+    connector instance serves both roles, and ``export`` resolving it would make a
+    Mongo source silently read a different database."""
+    s, _ = _mongo_fakes.make_connector(
+        mg, dbs={"appdb": {"t": [{"_id": 1}, {"_id": 2}]}, "ns": {"t": []}})
+    out = s.export({**CFG, "namespace": "ns", "table": "t", "limit": 10})
+    assert out["success"] is True, out
+    assert out["row_count"] == 2 and len(out["data"]) == 2, out
+
+
 def test_drop_table_drops_collection_for_reload():
     s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"t": [{"_id": 1}], "keep": [{"_id": 9}]}})
     out = s.drop_table({**CFG, "table": "t"})
