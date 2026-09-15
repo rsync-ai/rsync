@@ -98,6 +98,7 @@ import {
 } from "@/components/explorer"
 import { groupTablesByDatabase } from "@/lib/explorer/schemaTree"
 import { handleExplorerRunShortcut } from "@/lib/explorer/runShortcut"
+import { DocumentExplorer } from "@/components/explorer/DocumentExplorer"
 import { isInternalExplorerTable } from "@/lib/explorer/internalTables"
 
 // Types
@@ -112,7 +113,7 @@ interface Connection {
   // dropdown filters on supports_explorer instead of a hardcoded connector allowlist,
   // so a new warehouse becomes explorable server-side with no frontend change.
   supports_explorer?: boolean
-  explorer_mode?: string // "sql" (document mode reserved for a future Document Explorer)
+  explorer_mode?: string // "sql" | "document" (MongoDB: DocumentExplorer instead of the SQL editor)
   sql_dialect?: string
 }
 
@@ -296,6 +297,8 @@ export default function ExplorerPage() {
   // Connection state
   const [connections, setConnections] = useState<Connection[]>([])
   const [selectedConnection, setSelectedConnection] = useState<string>("")
+  // Document connections (explorer_mode "document") browse one collection at a time.
+  const [documentCollection, setDocumentCollection] = useState<string>("")
   const [loadingConnections, setLoadingConnections] = useState(true)
 
   // Schema state
@@ -687,6 +690,7 @@ export default function ExplorerPage() {
   // MySQL-only, per-connection choice and shouldn't leak across connections.
   useEffect(() => {
     setAllDatabases(false)
+    setDocumentCollection("")
   }, [selectedConnection])
 
   // When the user focuses NL/SQL inputs, pause step updates and flush them on blur.
@@ -1572,6 +1576,8 @@ export default function ExplorerPage() {
   // lib/explorer/runShortcut so it can be tested, and so the deps type can withhold
   // executeQuery — see the defect write-up there.
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    // Document mode has no NL or SQL to run; DocumentExplorer handles its own shortcut.
+    if (connections.find((c) => c.id === selectedConnection)?.explorer_mode === "document") return
     handleExplorerRunShortcut(e, {
       hasNlInput: Boolean(nlInput.trim()),
       hasSql: Boolean(sqlQuery.trim()),
@@ -1723,7 +1729,8 @@ export default function ExplorerPage() {
   // key off this.
   const selectedConn = connections.find((c) => c.id === selectedConnection)
   const isMySQLConn = isMySQLFamily(selectedConn)
-  const namespaceLabel = isMySQLConn ? "databases" : "schemas"
+  const isDocumentConn = selectedConn?.explorer_mode === "document"
+  const namespaceLabel = isMySQLConn || isDocumentConn ? "databases" : "schemas"
   // Database/schema count for the panel header label. Counts the *visible*
   // tables (rsync-internal `_rsync_*` excluded) so the header total matches the
   // tree below it. The full tree (grouping, search, expand/collapse) lives in
@@ -1742,7 +1749,11 @@ export default function ExplorerPage() {
     <div className="space-y-6" onKeyDown={handleKeyDown}>
       <PageHeader
         heading="Data Explorer"
-        description="Query and explore your connected data sources using natural language or SQL"
+        description={
+          isDocumentConn
+            ? "Browse and filter the documents in your MongoDB collections"
+            : "Query and explore your connected data sources using natural language or SQL"
+        }
       />
 
       {/* Workspace: collapsible schema rail · full-width query editor + results.
@@ -1813,7 +1824,7 @@ export default function ExplorerPage() {
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     <Label className="text-xs capitalize">
-                      {databaseCount} {namespaceLabel} · {visibleTables.length} tables
+                      {databaseCount} {namespaceLabel} · {visibleTables.length} {isDocumentConn ? "collections" : "tables"}
                     </Label>
                     {schemaFromCache && visibleTables.length > 0 && (
                       <Badge
@@ -1887,12 +1898,23 @@ export default function ExplorerPage() {
                   tables={visibleTables}
                   selectedTables={selectedTables}
                   selectionKey={(t) => tableKeyFromMeta(t)}
-                  onToggleTable={toggleTableSelection}
-                  onInsertTable={insertIntoEditor}
-                  onInsertColumn={insertIntoEditor}
+                  // Document mode: no table picking for NL→SQL and no SQL editor to
+                  // insert into — clicking a collection opens it in the browser.
+                  onToggleTable={isDocumentConn ? undefined : toggleTableSelection}
+                  onInsertTable={
+                    isDocumentConn
+                      ? (qualified) => {
+                          const t = visibleTables.find((x) => tableKeyFromMeta(x) === qualified || x.name === qualified)
+                          if (t) setDocumentCollection(t.name)
+                        }
+                      : insertIntoEditor
+                  }
+                  onInsertColumn={isDocumentConn ? undefined : insertIntoEditor}
+                  itemLabel={isDocumentConn ? "collections" : "tables"}
+                  insertTitle={isDocumentConn ? "Open collection" : "Add to SQL"}
                   emptyHint={
                     selectedConnection
-                      ? "No tables found"
+                      ? isDocumentConn ? "No collections found" : "No tables found"
                       : "Select a connection to browse tables"
                   }
                   className="p-1.5"
@@ -1937,6 +1959,16 @@ export default function ExplorerPage() {
 
         {/* ── Center: NL → SQL → results ── */}
         <main className="w-full min-w-0 space-y-6 lg:flex-1">
+          {isDocumentConn ? (
+            <DocumentExplorer
+              connectionId={selectedConnection}
+              collections={visibleTables}
+              collection={documentCollection}
+              onCollectionChange={setDocumentCollection}
+              loadingCollections={loadingSchema}
+            />
+          ) : (
+          <>
           {/* Query Editor */}
           <Card>
             <CardHeader className="px-4 pt-4 pb-3">
@@ -2432,6 +2464,8 @@ export default function ExplorerPage() {
               )}
             </CardContent>
           </Card>
+          </>
+          )}
         </main>
       </div>
 

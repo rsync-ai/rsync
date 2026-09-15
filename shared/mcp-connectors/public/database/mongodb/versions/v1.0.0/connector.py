@@ -26,8 +26,10 @@ import sys
 import os
 import base64
 import ipaddress
+import json
 import logging
-from datetime import datetime, date
+import time
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, Any, List, Optional
 
 # Resolve the shared base_connector (see Dockerfile: it is copied to
@@ -95,6 +97,290 @@ def _infer_type(value: Any) -> str:
     if isinstance(value, (datetime, date)):
         return "timestamp"
     return "string"
+
+
+# --------------------------------------------------------------------------- #
+# Document browse (`find`): request validation                                #
+# --------------------------------------------------------------------------- #
+#
+# The Data Explorer's document mode sends a user-authored filter / projection /
+# sort to `find` through the gateway. The gateway enforces this same allowlist
+# before any network hop; it is enforced again here so the connector is safe when
+# called directly. The two lists must stay in lockstep.
+#
+# An allowlist, never a denylist: an operator MongoDB adds later stays rejected
+# until someone decides it is safe. Server-side JavaScript and arbitrary
+# expressions ($where, $function, $accumulator, $expr) are why this exists.
+FIND_QUERY_OPERATORS = frozenset({
+    "$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin",  # comparison
+    "$and", "$or", "$nor", "$not",                              # logical
+    "$exists", "$type", "$elemMatch", "$size", "$all",          # element / array
+    "$regex", "$options", "$mod",
+})
+# Top-level filter keys that are operators rather than field names.
+FIND_TOP_LEVEL_OPERATORS = frozenset({"$and", "$or", "$nor"})
+# Extended JSON wrappers a filter may use for BSON types plain JSON cannot express.
+# Each must be the only key of its object. Decoded by _decode_find_extjson, NOT
+# bson.json_util.loads, which would also decode $code (JavaScript), $binary,
+# $regularExpression and legacy {$regex, $options} pairs.
+FIND_EXTJSON_WRAPPERS = frozenset({"$oid", "$date", "$numberLong", "$numberDecimal"})
+
+FIND_DEFAULT_LIMIT = 50
+FIND_MAX_LIMIT = 500
+FIND_MAX_TIME_MS = 15000
+FIND_MAX_SKIP = 10000
+FIND_MAX_FILTER_DEPTH = 20
+FIND_MAX_FILTER_BYTES = 64 * 1024
+FIND_MAX_SORT_KEYS = 5
+FIND_MAX_PROJECTION_KEYS = 100
+FIND_MAX_COLLECTION_BYTES = 120
+FIND_MAX_CURSOR_CHARS = 4096
+FIND_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+
+_READ_PREFERENCES = {
+    "primary": "PRIMARY",
+    "primarypreferred": "PRIMARY_PREFERRED",
+    "secondary": "SECONDARY",
+    "secondarypreferred": "SECONDARY_PREFERRED",
+    "nearest": "NEAREST",
+}
+
+_EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+class FindRequestError(ValueError):
+    """A rejected `find` request.
+
+    `path` locates the problem (``filter.$or[1].$where``). Messages name paths and
+    operators, never a filter VALUE: values are user data and must not be echoed
+    into an error string that may be logged or shown elsewhere.
+    """
+
+    def __init__(self, code: str, message: str, path: str = ""):
+        super().__init__(message)
+        self.code = code
+        self.path = path
+
+
+def _find_path(parent: str, key: str) -> str:
+    return f"{parent}.{key[:64]}"
+
+
+def _validate_find_collection(raw: Any) -> str:
+    name = raw.strip() if isinstance(raw, str) else ""
+    if not name:
+        raise FindRequestError("invalid_collection", "Missing 'collection' parameter", "collection")
+    if len(name.encode("utf-8")) > FIND_MAX_COLLECTION_BYTES:
+        raise FindRequestError(
+            "invalid_collection", f"collection name exceeds {FIND_MAX_COLLECTION_BYTES} bytes", "collection")
+    if "$" in name or "\x00" in name:
+        raise FindRequestError("invalid_collection", "collection name must not contain '$' or NUL", "collection")
+    if name.startswith("system."):
+        raise FindRequestError("invalid_collection", "system collections cannot be browsed", "collection")
+    return name
+
+
+def _walk_find_filter(node: Any, path: str, depth: int) -> None:
+    if not isinstance(node, (dict, list)):
+        return
+    if depth > FIND_MAX_FILTER_DEPTH:
+        raise FindRequestError(
+            "filter_too_deep", f"filter nesting exceeds {FIND_MAX_FILTER_DEPTH} levels", path)
+    if isinstance(node, list):
+        for i, item in enumerate(node):
+            _walk_find_filter(item, f"{path}[{i}]", depth + 1)
+        return
+    wrapper = next((k for k in node if k in FIND_EXTJSON_WRAPPERS), None)
+    if wrapper is not None:
+        if len(node) != 1:
+            raise FindRequestError(
+                "invalid_filter", f"{wrapper} must be the only key in its object", _find_path(path, wrapper))
+        return  # the wrapped value's shape is checked when it is decoded
+    for key, value in node.items():
+        if not isinstance(key, str) or "\x00" in key:
+            raise FindRequestError("invalid_filter", "field names must be strings without NUL", path)
+        child = _find_path(path, key)
+        if key.startswith("$") and key not in FIND_QUERY_OPERATORS:
+            raise FindRequestError("operator_not_allowed", f"operator {key[:64]} is not allowed", child)
+        _walk_find_filter(value, child, depth + 1)
+
+
+def _decode_find_date(value: Any) -> datetime:
+    if isinstance(value, dict) and set(value) == {"$numberLong"} and isinstance(value["$numberLong"], str):
+        value = int(value["$numberLong"])
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _EPOCH + timedelta(milliseconds=value)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    raise ValueError("unsupported $date shape")
+
+
+def _decode_find_wrapper(key: str, value: Any, path: str) -> Any:
+    from bson import Decimal128, Int64, ObjectId
+    try:
+        if key == "$oid" and isinstance(value, str):
+            return ObjectId(value)
+        if key == "$numberLong" and isinstance(value, str):
+            number = int(value)
+            if -(2 ** 63) <= number < 2 ** 63:
+                return Int64(number)
+        if key == "$numberDecimal" and isinstance(value, str):
+            return Decimal128(value)
+        if key == "$date":
+            return _decode_find_date(value)
+    except Exception:  # InvalidId, ValueError, decimal.InvalidOperation, OverflowError
+        pass
+    raise FindRequestError("invalid_filter", f"malformed {key} value", path)
+
+
+def _decode_find_extjson(node: Any, path: str) -> Any:
+    if isinstance(node, list):
+        return [_decode_find_extjson(v, f"{path}[{i}]") for i, v in enumerate(node)]
+    if not isinstance(node, dict):
+        return node
+    if len(node) == 1:
+        key = next(iter(node))
+        if key in FIND_EXTJSON_WRAPPERS:
+            return _decode_find_wrapper(key, node[key], _find_path(path, key))
+    return {k: _decode_find_extjson(v, _find_path(path, k)) for k, v in node.items()}
+
+
+def _validate_find_filter(flt: Any) -> Dict[str, Any]:
+    """Check a filter against the allowlist and limits, then decode its Extended
+    JSON wrappers. Returns the filter ready for pymongo."""
+    if flt is None:
+        return {}
+    if not isinstance(flt, dict):
+        raise FindRequestError("invalid_filter", "filter must be a JSON object", "filter")
+    for key in flt:
+        if isinstance(key, str) and key.startswith("$") and key not in FIND_TOP_LEVEL_OPERATORS:
+            raise FindRequestError(
+                "operator_not_allowed", f"{key[:64]} is not allowed at the top level of a filter",
+                _find_path("filter", key))
+    # Depth first: the walk stops at the limit, so an absurdly nested filter never
+    # reaches json.dumps' own recursion limit.
+    _walk_find_filter(flt, "filter", 1)
+    try:
+        size = len(json.dumps(flt, separators=(",", ":")).encode("utf-8"))
+    except (TypeError, ValueError):
+        raise FindRequestError("invalid_filter", "filter must be plain JSON", "filter")
+    if size > FIND_MAX_FILTER_BYTES:
+        raise FindRequestError("filter_too_large", f"filter exceeds {FIND_MAX_FILTER_BYTES // 1024} KB", "filter")
+    return _decode_find_extjson(flt, "filter")
+
+
+def _validate_find_projection(projection: Any) -> Optional[Dict[str, int]]:
+    if projection is None or projection == {}:
+        return None
+    if not isinstance(projection, dict):
+        raise FindRequestError("invalid_projection", "projection must be a JSON object", "projection")
+    if len(projection) > FIND_MAX_PROJECTION_KEYS:
+        raise FindRequestError(
+            "invalid_projection", f"projection accepts at most {FIND_MAX_PROJECTION_KEYS} fields", "projection")
+    out: Dict[str, int] = {}
+    for key, value in projection.items():
+        path = _find_path("projection", str(key))
+        if not isinstance(key, str) or not key or "$" in key or "\x00" in key:
+            raise FindRequestError(
+                "invalid_projection", "projection field names must be non-empty and contain no '$'", path)
+        if isinstance(value, bool):
+            value = int(value)
+        if not isinstance(value, int) or value not in (0, 1):
+            raise FindRequestError("invalid_projection", "projection values must be 0 or 1", path)
+        out[key] = value
+    if len({v for k, v in out.items() if k != "_id"}) > 1:
+        raise FindRequestError(
+            "invalid_projection", "projection cannot mix inclusion and exclusion (except _id)", "projection")
+    return out
+
+
+def _validate_find_sort(sort: Any) -> List[tuple]:
+    """Return the sort as ordered (field, 1|-1) pairs.
+
+    Accepts an object or a list of [field, direction] pairs. The list form exists
+    for callers whose maps do not preserve key order (a Go map[string]any does not),
+    since sort order is the order of the keys.
+    """
+    if sort is None or sort == {} or sort == []:
+        return []
+    if isinstance(sort, dict):
+        items = list(sort.items())
+    elif isinstance(sort, list):
+        items = []
+        for i, pair in enumerate(sort):
+            if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+                raise FindRequestError("invalid_sort", "sort list entries must be [field, 1|-1] pairs", f"sort[{i}]")
+            items.append((pair[0], pair[1]))
+    else:
+        raise FindRequestError("invalid_sort", "sort must be an object or a list of [field, direction] pairs", "sort")
+    if len(items) > FIND_MAX_SORT_KEYS:
+        raise FindRequestError("invalid_sort", f"sort accepts at most {FIND_MAX_SORT_KEYS} keys", "sort")
+    out: List[tuple] = []
+    seen = set()
+    for key, direction in items:
+        path = _find_path("sort", str(key))
+        if not isinstance(key, str) or not key or "$" in key or "\x00" in key or key in seen:
+            raise FindRequestError(
+                "invalid_sort", "sort field names must be unique, non-empty and contain no '$'", path)
+        if isinstance(direction, bool) or not isinstance(direction, int) or direction not in (1, -1):
+            raise FindRequestError("invalid_sort", "sort direction must be 1 or -1", path)
+        seen.add(key)
+        out.append((key, direction))
+    return out
+
+
+def _find_int(value: Any, default: int, path: str) -> int:
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        raise FindRequestError(f"invalid_{path}", f"{path} must be an integer", path)
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        raise FindRequestError(f"invalid_{path}", f"{path} must be an integer", path)
+    if isinstance(value, float) and value != number:
+        raise FindRequestError(f"invalid_{path}", f"{path} must be an integer", path)
+    return number
+
+
+def _encode_find_cursor(last_id: Any) -> str:
+    """Opaque keyset cursor for the last _id returned. Canonical Extended JSON keeps
+    the _id's exact BSON type, so a 24-hex STRING _id resumes as a string and an
+    ObjectId as an ObjectId (export's str() cursor cannot tell them apart)."""
+    from bson import json_util
+    return json_util.dumps({"_id": last_id}, json_options=json_util.CANONICAL_JSON_OPTIONS)
+
+
+def _decode_find_cursor(cursor: Any) -> Any:
+    from bson import json_util
+    from bson.code import Code
+    if not isinstance(cursor, str) or len(cursor) > FIND_MAX_CURSOR_CHARS:
+        raise FindRequestError("invalid_cursor", "cursor is malformed", "cursor")
+    try:
+        doc = json_util.loads(cursor, json_options=json_util.CANONICAL_JSON_OPTIONS)
+    except Exception:
+        raise FindRequestError("invalid_cursor", "cursor is malformed", "cursor")
+    if not isinstance(doc, dict) or set(doc) != {"_id"} or isinstance(doc["_id"], Code):
+        raise FindRequestError("invalid_cursor", "cursor is malformed", "cursor")
+    return doc["_id"]
+
+
+def _find_read_preference(config: Dict[str, Any]):
+    name = config.get("read_preference") or config.get("readPreference")
+    if not name:
+        return None
+    attr = _READ_PREFERENCES.get(str(name).replace("_", "").replace("-", "").lower())
+    if attr is None:
+        raise FindRequestError(
+            "invalid_config",
+            "read_preference must be primary, primaryPreferred, secondary, secondaryPreferred or nearest",
+            "config.read_preference")
+    from pymongo import ReadPreference
+    return getattr(ReadPreference, attr)
 
 
 def _is_local_db_host(host: str) -> bool:
@@ -498,6 +784,9 @@ class MongodbMCPServer(BaseMCPConnector):
                  "description": "Return the primary key (_id) for a collection"},
                 {"name": "export", "method": "mongodb_export", "type": "source",
                  "description": "Export documents from a collection (_id keyset paging)"},
+                {"name": "find", "method": "mongodb_find", "type": "source",
+                 "description": "Read-only document browse for the Data Explorer (allowlisted filter, "
+                                "projection, sort, keyset/skip paging, Relaxed Extended JSON)"},
                 {"name": "import_data", "method": "mongodb_import_data", "type": "destination",
                  "description": "Insert documents into a collection (batch / CDC insert)"},
                 {"name": "upsert_data", "method": "mongodb_upsert_data", "type": "destination",
@@ -616,6 +905,170 @@ class MongodbMCPServer(BaseMCPConnector):
                     client.close()
                 except Exception:
                     pass
+
+    # ------------------------------------------------------------------ #
+    # Document browse (Data Explorer)                                     #
+    # ------------------------------------------------------------------ #
+    def find(self, params: Dict = None) -> Dict[str, Any]:
+        """Read-only document browse for the Data Explorer's document mode.
+
+        Runs one bounded find against a collection: allowlisted filter operators
+        (FIND_QUERY_OPERATORS), 0/1 projection, a sort of up to 5 keys, at most 500
+        documents, maxTimeMS on the server, and a 5 MB response budget. Documents
+        come back as Relaxed Extended JSON so BSON types survive ({"$oid": ...},
+        {"$date": ...}) and a copied value pastes straight back into a filter.
+
+        Paging: with no sort, or a sort on _id alone, paging is keyset on _id. Pass
+        back `next_cursor`; it is stable under concurrent writes. Any other sort
+        pages by skip: pass back `next_skip`, capped at FIND_MAX_SKIP.
+
+        Deliberately separate from `export`: pipelines depend on export's contract
+        (JSON-flattened rows, 10k batches, no filter), and nothing here changes it.
+        """
+        params = params or {}
+        started = time.monotonic()
+        try:
+            raw_config = params.get("config")
+            if isinstance(raw_config, str):
+                try:
+                    raw_config = json.loads(raw_config)
+                except ValueError:
+                    raise FindRequestError("invalid_config", "config is not valid JSON", "config")
+            config = self._get_config({"config": raw_config})
+            db_name = self._database_name(config)
+            if not db_name:
+                raise FindRequestError("invalid_config", "Missing 'database' in config", "config.database")
+            read_preference = _find_read_preference(config)
+
+            collection = _validate_find_collection(params.get("collection") or params.get("table"))
+            user_filter = _validate_find_filter(params.get("filter"))
+            projection = _validate_find_projection(params.get("projection"))
+            sort = _validate_find_sort(params.get("sort"))
+            limit = max(1, min(_find_int(params.get("limit"), FIND_DEFAULT_LIMIT, "limit"), FIND_MAX_LIMIT))
+            max_time_ms = max(1, min(_find_int(params.get("max_time_ms"), FIND_MAX_TIME_MS, "max_time_ms"),
+                                     FIND_MAX_TIME_MS))
+            skip = _find_int(params.get("skip"), 0, "skip")
+            if not 0 <= skip <= FIND_MAX_SKIP:
+                raise FindRequestError("invalid_skip", f"skip must be between 0 and {FIND_MAX_SKIP}", "skip")
+            cursor_raw = params.get("cursor")
+            has_cursor = cursor_raw not in (None, "")
+
+            keyset = not sort or (len(sort) == 1 and sort[0][0] == "_id")
+            if keyset:
+                if skip:
+                    raise FindRequestError(
+                        "invalid_skip", "skip applies only to a custom sort; page with cursor instead", "skip")
+                direction = sort[0][1] if sort else 1
+                query = user_filter
+                if has_cursor:
+                    bound = {"_id": {"$gt" if direction == 1 else "$lt": _decode_find_cursor(cursor_raw)}}
+                    query = {"$and": [user_filter, bound]} if user_filter else bound
+                sort_keys = [("_id", direction)]
+            else:
+                if has_cursor:
+                    raise FindRequestError(
+                        "invalid_cursor", "cursor applies only to the default _id sort; page with skip instead",
+                        "cursor")
+                query = user_filter
+                # _id tiebreaker: without a total order, skip pages can repeat or drop documents.
+                sort_keys = sort if any(k == "_id" for k, _ in sort) else sort + [("_id", 1)]
+
+            # Keyset paging needs every returned _id, so a projection hiding _id is
+            # widened for the query and _id is dropped from the output instead.
+            hide_id = bool(projection) and projection.get("_id") == 0
+            query_projection = projection
+            if keyset and hide_id:
+                query_projection = {k: v for k, v in projection.items() if k != "_id"} or None
+        except FindRequestError as e:
+            return {"success": False, "error": str(e), "error_code": e.code, "path": e.path}
+
+        from pymongo.errors import ConnectionFailure, ExecutionTimeout, OperationFailure
+        client = None
+        try:
+            client = self._get_client(config)
+            coll = client[db_name][collection]
+            if read_preference is not None:
+                coll = coll.with_options(read_preference=read_preference)
+            cursor = (coll.find(query, query_projection)
+                      .sort(sort_keys).skip(skip).limit(limit + 1).max_time_ms(max_time_ms))
+            raw_docs = list(cursor)
+        except ExecutionTimeout:
+            return {"success": False, "error_code": "query_timeout",
+                    "error": f"Query exceeded {max_time_ms} ms. Add a filter on an indexed field."}
+        except OperationFailure as e:
+            # The server's errmsg can quote filter values, so only the code name is surfaced.
+            code_name = (getattr(e, "details", None) or {}).get("codeName") or f"code {getattr(e, 'code', '?')}"
+            return {"success": False, "error_code": "query_failed", "mongo_code": getattr(e, "code", None),
+                    "error": f"MongoDB rejected the query ({code_name})"}
+        except ConnectionFailure as e:
+            return {"success": False, "error_code": "connection_failed", "error": f"{type(e).__name__}: {str(e)[:300]}"}
+        except Exception as e:
+            return {"success": False, "error_code": "query_failed", "error": f"find failed ({type(e).__name__})"}
+        finally:
+            self._close_client(client)
+
+        from bson import json_util
+        has_more = len(raw_docs) > limit
+        documents: List[Dict[str, Any]] = []
+        columns: List[str] = []
+        warnings: List[str] = []
+        used_bytes = 0
+        truncated_bytes = False
+        last_id = None
+        for position, doc in enumerate(raw_docs[:limit]):
+            doc_id = doc.get("_id")
+            if hide_id:
+                doc = {k: v for k, v in doc.items() if k != "_id"}
+            text = json_util.dumps(doc, json_options=json_util.RELAXED_JSON_OPTIONS)
+            size = len(text.encode("utf-8"))
+            if used_bytes + size > FIND_MAX_RESPONSE_BYTES:
+                if documents:
+                    truncated_bytes = has_more = True
+                    break
+                # One document larger than the whole budget: return only its _id so
+                # paging still advances, and say how to see the rest.
+                text = json_util.dumps({"_id": doc_id}, json_options=json_util.RELAXED_JSON_OPTIONS)
+                size = len(text.encode("utf-8"))
+                truncated_bytes = True
+                warnings.append(
+                    f"Document {position + 1} exceeds the {FIND_MAX_RESPONSE_BYTES // (1024 * 1024)} MB response "
+                    "budget; only its _id is shown. Use a projection to view selected fields.")
+            parsed = json.loads(text)
+            documents.append(parsed)
+            used_bytes += size
+            last_id = doc_id
+            for key in parsed:
+                if key not in columns:
+                    columns.append(key)
+        if "_id" in columns:
+            columns.remove("_id")
+            columns.insert(0, "_id")
+
+        next_cursor = None
+        next_skip = None
+        if has_more:
+            if keyset:
+                next_cursor = _encode_find_cursor(last_id) if last_id is not None else None
+            elif skip + len(documents) <= FIND_MAX_SKIP:
+                next_skip = skip + len(documents)
+            else:
+                warnings.append(
+                    f"Paging with a custom sort stops after {FIND_MAX_SKIP} documents; narrow the filter to see more.")
+
+        return {
+            "success": True,
+            "collection": collection,
+            "documents": documents,
+            "columns": columns,
+            "returned": len(documents),
+            "has_more": has_more,
+            "paging_mode": "keyset" if keyset else "skip",
+            "next_cursor": next_cursor,
+            "next_skip": next_skip,
+            "execution_time_ms": int((time.monotonic() - started) * 1000),
+            "truncated_bytes": truncated_bytes,
+            "warnings": warnings,
+        }
 
     # ------------------------------------------------------------------ #
     # Destination (write path)                                            #

@@ -1112,6 +1112,7 @@ func main() {
 		// ========================================================================
 		api.POST("/sql/generate", handlers.GenerateSQL)                                                  // NL → SQL
 		api.POST("/explorer/query", handlers.ExecuteExplorerQuery)                                       // Execute SQL: SELECT reads (all roles) + role-gated writes (admin=DML/DDL, owner=DROP/TRUNCATE)
+		api.POST("/explorer/documents/find", handlers.FindExplorerDocuments)                             // Document browse (MongoDB): allowlisted read-only find via the connector
 		api.POST("/explorer/connections/:id/tables/recommend", handlers.GetRecommendedTablesForExplorer) // Table recommendations
 		api.POST("/explorer/metabase/dashboard", handlers.CreateMetabaseDashboard)                       // Create Metabase dashboard from SQL
 

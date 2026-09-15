@@ -264,6 +264,65 @@
       ]
     },
     {
+      "name": "find",
+      "type": "source",
+      "description": "Read-only document browse for the Data Explorer: allowlisted filter operators, 0/1 projection, sort, keyset or skip paging, Relaxed Extended JSON results",
+      "method": "mongodb_find",
+      "parameters": [
+        {
+          "name": "collection",
+          "type": "string",
+          "required": true
+        },
+        {
+          "name": "filter",
+          "type": "object",
+          "required": false,
+          "default": {},
+          "description": "MongoDB query filter. Allowed operators: $eq $ne $gt $gte $lt $lte $in $nin $and $or $nor $not $exists $type $elemMatch $size $all $regex $options $mod, plus the Extended JSON wrappers $oid $date $numberLong $numberDecimal"
+        },
+        {
+          "name": "projection",
+          "type": "object",
+          "required": false,
+          "description": "Fields to include (1) or exclude (0); no mixing except _id"
+        },
+        {
+          "name": "sort",
+          "type": "object",
+          "required": false,
+          "description": "Up to 5 keys, each 1 or -1. Also accepts an ordered list of [field, direction] pairs"
+        },
+        {
+          "name": "limit",
+          "type": "integer",
+          "required": false,
+          "default": 50,
+          "description": "Documents per page, max 500"
+        },
+        {
+          "name": "cursor",
+          "type": "string",
+          "required": false,
+          "description": "Opaque next_cursor from the previous page (default _id sort only)"
+        },
+        {
+          "name": "skip",
+          "type": "integer",
+          "required": false,
+          "default": 0,
+          "description": "Documents to skip (custom sort only, max 10000)"
+        },
+        {
+          "name": "max_time_ms",
+          "type": "integer",
+          "required": false,
+          "default": 15000,
+          "description": "Server-side time limit in milliseconds, max 15000"
+        }
+      ]
+    },
+    {
       "name": "import_data",
       "type": "destination",
       "description": "Insert documents into a collection (batch / CDC insert). upsert_data and delete_data are advertised at runtime via get_capabilities for the CDC update/delete paths.",

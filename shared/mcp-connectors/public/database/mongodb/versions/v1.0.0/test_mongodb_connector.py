@@ -593,6 +593,339 @@ def test_env_database_reaches_the_driver():
         _restore_env(prior)
 
 
+# ===================== FIND: Data Explorer document browse ==================
+
+def _orders(n):
+    return [{"_id": ObjectId(f"{i:024x}"), "n": i, "status": "paid" if i % 2 else "open",
+             "customer": {"tier": "gold" if i % 3 == 0 else "std"},
+             "created": datetime(2026, 1, 1)} for i in range(1, n + 1)]
+
+
+def _find_server(docs):
+    return _mongo_fakes.make_connector(mg, dbs={"appdb": {"orders": docs}})
+
+
+def _find(s, **params):
+    return s.find({**CFG, "collection": "orders", **params})
+
+
+def _page_through(s, key, **params):
+    """Follow next_cursor / next_skip to the end; return (all docs, page count)."""
+    docs, pages, token = [], 0, {}
+    while True:
+        out = _find(s, **params, **token)
+        assert out["success"] is True, out
+        docs.extend(out["documents"])
+        pages += 1
+        assert pages < 50, "paging did not terminate"
+        if not out["has_more"]:
+            return docs, pages
+        token = {key: out["next_cursor" if key == "cursor" else "next_skip"]}
+        assert token[key] is not None, out
+
+
+def test_find_default_page_is_keyset_on_id_with_relaxed_extjson():
+    s, client = _find_server(_orders(3))
+    out = _find(s)
+    assert out["success"] is True, out
+    assert out["returned"] == 3 and out["has_more"] is False, out
+    assert out["paging_mode"] == "keyset" and out["next_cursor"] is None, out
+    doc = out["documents"][0]
+    # BSON types survive as Relaxed Extended JSON (paste-back-able into a filter)
+    assert doc["_id"] == {"$oid": f"{1:024x}"}, doc
+    assert doc["created"] == {"$date": "2026-01-01T00:00:00Z"}, doc
+    assert doc["n"] == 1 and doc["customer"] == {"tier": "std"}, doc
+    assert out["columns"][0] == "_id" and set(out["columns"]) == {"_id", "n", "status", "customer", "created"}, out
+    cur = client["appdb"]["orders"].last_cursor
+    assert cur.sorted_by == [("_id", 1)], cur.sorted_by
+    assert cur.limited == mg.FIND_DEFAULT_LIMIT + 1, "fetches limit+1 to detect has_more"
+    assert cur.max_time == mg.FIND_MAX_TIME_MS, cur.max_time
+    assert client.closed is True
+
+
+def test_find_keyset_pages_cover_every_document_once():
+    s, client = _find_server(_orders(7))
+    docs, pages = _page_through(s, "cursor", limit=3)
+    assert [d["n"] for d in docs] == list(range(1, 8)), docs
+    assert pages == 3, pages
+    q = client["appdb"]["orders"].find_calls[1]["query"]
+    assert set(q) == {"_id"} and isinstance(q["_id"]["$gt"], ObjectId), q
+
+
+def test_find_keyset_descending_combined_with_filter():
+    s, client = _find_server(_orders(9))
+    docs, _ = _page_through(s, "cursor", limit=2, sort={"_id": -1}, filter={"status": "paid"})
+    assert [d["n"] for d in docs] == [9, 7, 5, 3, 1], docs
+    q = client["appdb"]["orders"].find_calls[1]["query"]
+    assert q["$and"][0] == {"status": "paid"} and "$lt" in q["$and"][1]["_id"], q
+
+
+def test_find_cursor_keeps_a_string_id_a_string():
+    """export's str() cursor turns a 24-hex STRING _id into an ObjectId and skips
+    nothing but matches nothing; find's cursor carries the BSON type."""
+    hexes = [f"{i:024x}" for i in range(1, 4)]
+    s, client = _find_server([{"_id": h, "v": i} for i, h in enumerate(hexes)])
+    docs, _ = _page_through(s, "cursor", limit=1)
+    assert [d["_id"] for d in docs] == hexes, docs
+    q = client["appdb"]["orders"].find_calls[1]["query"]
+    assert type(q["_id"]["$gt"]) is str, q
+
+
+def test_find_rejects_cursor_tampering():
+    s, client = _find_server(_orders(2))
+    for bad in ("not json", '{"_id": {"$code": "function(){}"}}', '{"x": 1}', "[1]", "a" * 5000):
+        out = _find(s, cursor=bad)
+        assert out["success"] is False and out["error_code"] == "invalid_cursor", (bad, out)
+    assert client["appdb"]["orders"].find_calls == []
+
+
+def test_find_rejects_disallowed_operators_with_path_and_without_values():
+    cases = [
+        ({"$where": "sleep(1)"}, "filter.$where"),
+        ({"$or": [{"a": 1}, {"$where": "sleep(1)"}]}, "filter.$or[1].$where"),
+        ({"$expr": {"$gt": ["$a", "sleep(1)"]}}, "filter.$expr"),
+        ({"$not": {"a": "sleep(1)"}}, "filter.$not"),  # $not is field-level only
+        ({"$text": {"$search": "sleep(1)"}}, "filter.$text"),
+        ({"a": {"$function": {"body": "sleep(1)", "args": [], "lang": "js"}}}, "filter.a.$function"),
+        ({"a": {"$accumulator": {"init": "sleep(1)"}}}, "filter.a.$accumulator"),
+        ({"a": {"$elemMatch": {"b": {"$where": "sleep(1)"}}}}, "filter.a.$elemMatch.b.$where"),
+        ({"loc": {"$near": ["sleep(1)", 0]}}, "filter.loc.$near"),
+        ({"a": {"$code": "sleep(1)"}}, "filter.a.$code"),
+        ({"a": {"$binary": {"base64": "sleep(1)", "subType": "00"}}}, "filter.a.$binary"),
+    ]
+    s, client = _find_server(_orders(2))
+    for flt, path in cases:
+        out = _find(s, filter=flt)
+        assert out["success"] is False, (flt, out)
+        assert out["error_code"] == "operator_not_allowed", (flt, out)
+        assert out["path"] == path, (flt, out)
+        assert "sleep(1)" not in str(out), f"error echoed a filter value: {out}"
+    # rejected before any driver call
+    assert client["appdb"]["orders"].find_calls == []
+
+
+def test_find_accepts_allowlisted_operators():
+    s, _ = _find_server(_orders(6))
+    out = _find(s, filter={"$and": [{"n": {"$gte": 2}}, {"n": {"$lte": 5}}],
+                           "status": {"$in": ["paid"]}, "customer.tier": {"$exists": True},
+                           "n2": {"$not": {"$eq": 1}}})
+    assert out["success"] is True, out
+    assert [d["n"] for d in out["documents"]] == [3, 5], out
+    out = _find(s, filter={"status": {"$regex": "^OP", "$options": "i"}, "$nor": [{"n": 2}]})
+    assert [d["n"] for d in out["documents"]] == [4, 6], out
+
+
+def test_find_filter_depth_and_size_limits():
+    def nested(k):
+        f = {"x": 1}
+        for _ in range(k):
+            f = {"$and": [f]}
+        return f
+    s, _ = _find_server(_orders(1))
+    assert _find(s, filter=nested(9))["success"] is True       # depth 19
+    out = _find(s, filter=nested(10))                           # depth 21
+    assert out["error_code"] == "filter_too_deep", out
+    # far past json's recursion limit: must be refused, not crash
+    out = _find(s, filter=nested(3000))
+    assert out["error_code"] == "filter_too_deep", out
+    out = _find(s, filter={"s": "x" * (mg.FIND_MAX_FILTER_BYTES + 1)})
+    assert out["error_code"] == "filter_too_large", out
+
+
+def test_find_decodes_extended_json_wrappers():
+    from bson import Decimal128, Int64
+    from datetime import timezone
+    s, client = _find_server(_orders(1))
+    out = _find(s, filter={"_id": {"$oid": f"{1:024x}"},
+                           "created": {"$gte": {"$date": "2026-01-01T00:00:00Z"}},
+                           "at": {"$lt": {"$date": 1767225600000}},
+                           "big": {"$numberLong": "9007199254740993"},
+                           "price": {"$numberDecimal": "1.10"},
+                           "ids": {"$in": [{"$oid": f"{2:024x}"}]}})
+    assert out["success"] is True, out
+    q = client["appdb"]["orders"].find_calls[-1]["query"]
+    assert q["_id"] == ObjectId(f"{1:024x}"), q
+    assert q["created"]["$gte"] == datetime(2026, 1, 1, tzinfo=timezone.utc), q
+    assert q["at"]["$lt"] == datetime(2026, 1, 1, tzinfo=timezone.utc), q
+    assert isinstance(q["big"], Int64) and q["big"] == 9007199254740993, q
+    assert isinstance(q["price"], Decimal128) and str(q["price"]) == "1.10", q
+    assert q["ids"]["$in"] == [ObjectId(f"{2:024x}")], q
+    for flt, path in [({"_id": {"$oid": "nothex"}}, "filter._id.$oid"),
+                      ({"d": {"$date": "yesterday"}}, "filter.d.$date"),
+                      ({"n": {"$numberLong": 5}}, "filter.n.$numberLong")]:
+        out = _find(s, filter=flt)
+        assert out["error_code"] == "invalid_filter" and out["path"] == path, (flt, out)
+    out = _find(s, filter={"_id": {"$oid": f"{1:024x}", "n": 1}})
+    assert out["error_code"] == "invalid_filter", out
+
+
+def test_find_projection():
+    s, client = _find_server(_orders(3))
+    out = _find(s, projection={"status": 1})
+    assert out["columns"] == ["_id", "status"], out
+    # _id hidden: still keyset-pages (fetched for the cursor), stripped from output
+    out = _find(s, projection={"_id": 0, "status": 1}, limit=1)
+    assert out["documents"] == [{"status": "paid"}], out
+    assert out["next_cursor"] is not None, out
+    assert client["appdb"]["orders"].find_calls[-1]["projection"] == {"status": 1}
+    docs, _ = _page_through(s, "cursor", projection={"_id": 0, "n": 1}, limit=2)
+    assert docs == [{"n": 1}, {"n": 2}, {"n": 3}], docs
+    for bad in ({"a": 1, "b": 0}, {"a.$": 1}, {"a": {"$slice": 2}}, {"a": 2}, ["a"]):
+        out = _find(s, projection=bad)
+        assert out["error_code"] == "invalid_projection", (bad, out)
+
+
+def test_find_custom_sort_pages_by_skip_with_id_tiebreaker():
+    s, client = _find_server(_orders(5))
+    out = _find(s, sort={"n": -1}, limit=2)
+    assert out["paging_mode"] == "skip" and out["next_skip"] == 2 and out["next_cursor"] is None, out
+    assert client["appdb"]["orders"].last_cursor.sorted_by == [("n", -1), ("_id", 1)]
+    docs, pages = _page_through(s, "skip", sort={"n": -1}, limit=2)
+    assert [d["n"] for d in docs] == [5, 4, 3, 2, 1] and pages == 3, docs
+    # list form keeps key order (a Go map would not)
+    _find(s, sort=[["status", 1], ["n", -1]])
+    assert client["appdb"]["orders"].last_cursor.sorted_by == [("status", 1), ("n", -1), ("_id", 1)]
+
+
+def test_find_sort_and_paging_validation():
+    s, client = _find_server(_orders(2))
+    cases = [
+        ({"sort": {f"k{i}": 1 for i in range(6)}}, "invalid_sort"),
+        ({"sort": {"$natural": 1}}, "invalid_sort"),
+        ({"sort": {"n": 2}}, "invalid_sort"),
+        ({"sort": {"n": True}}, "invalid_sort"),
+        ({"sort": [["n", 1], ["n", -1]]}, "invalid_sort"),
+        ({"sort": "n"}, "invalid_sort"),
+        ({"sort": {"n": 1}, "cursor": '{"_id": 1}'}, "invalid_cursor"),
+        ({"skip": 5}, "invalid_skip"),
+        ({"sort": {"n": 1}, "skip": mg.FIND_MAX_SKIP + 1}, "invalid_skip"),
+        ({"sort": {"n": 1}, "skip": -1}, "invalid_skip"),
+        ({"limit": "abc"}, "invalid_limit"),
+        ({"limit": True}, "invalid_limit"),
+        ({"limit": 2.5}, "invalid_limit"),
+    ]
+    for params, code in cases:
+        out = _find(s, **params)
+        assert out["success"] is False and out["error_code"] == code, (params, out)
+    assert client["appdb"]["orders"].find_calls == []
+
+
+def test_find_limits_are_clamped():
+    s, client = _find_server(_orders(2))
+    _find(s, limit=100000, max_time_ms=10 ** 9)
+    cur = client["appdb"]["orders"].last_cursor
+    assert cur.limited == mg.FIND_MAX_LIMIT + 1 and cur.max_time == mg.FIND_MAX_TIME_MS, vars(cur)
+    _find(s, limit=0, max_time_ms=0)
+    cur = client["appdb"]["orders"].last_cursor
+    assert cur.limited == 2 and cur.max_time == 1, vars(cur)
+
+
+def test_find_skip_paging_stops_at_the_skip_cap():
+    prior = mg.FIND_MAX_SKIP
+    mg.FIND_MAX_SKIP = 5
+    try:
+        s, _ = _find_server(_orders(20))
+        out = _find(s, sort={"n": 1}, skip=4, limit=3)
+        assert out["has_more"] is True and out["next_skip"] is None, out
+        assert any("stops after 5" in w for w in out["warnings"]), out
+    finally:
+        mg.FIND_MAX_SKIP = prior
+
+
+def test_find_response_byte_budget_truncates_and_stays_pageable():
+    prior = mg.FIND_MAX_RESPONSE_BYTES
+    mg.FIND_MAX_RESPONSE_BYTES = 400
+    try:
+        docs = [{"_id": i, "pad": "x" * 100} for i in range(1, 8)]
+        s, _ = _find_server(docs)
+        out = _find(s, limit=10)
+        assert 0 < out["returned"] < 7 and out["truncated_bytes"] is True and out["has_more"] is True, out
+        got, _ = _page_through(s, "cursor", limit=10)
+        assert [d["_id"] for d in got] == list(range(1, 8)), got
+        # a single document bigger than the whole budget: _id stub + warning
+        s, _ = _find_server([{"_id": 1, "pad": "x" * 1000}, {"_id": 2, "pad": "y"}])
+        out = _find(s)
+        assert out["documents"] == [{"_id": 1}, {"_id": 2, "pad": "y"}], out
+        assert out["truncated_bytes"] is True and "projection" in out["warnings"][0], out
+    finally:
+        mg.FIND_MAX_RESPONSE_BYTES = prior
+
+
+def test_find_maps_server_errors_without_echoing_values():
+    from pymongo.errors import ConnectionFailure, ExecutionTimeout, OperationFailure
+    secret = "ssn-123-45-6789"
+    cases = [
+        (ExecutionTimeout(f"time limit {secret}", code=50, details={"codeName": "MaxTimeMSExpired"}),
+         "query_timeout", "indexed field"),
+        (OperationFailure(f"bad value {secret}", code=2, details={"codeName": "BadValue", "errmsg": secret}),
+         "query_failed", "BadValue"),
+        (RuntimeError(secret), "query_failed", "RuntimeError"),
+        (ConnectionFailure("no servers"), "connection_failed", "no servers"),
+    ]
+    for err, code, hint in cases:
+        s, client = _find_server(_orders(1))
+        client["appdb"]["orders"].find_error = err
+        out = _find(s, filter={"ssn": secret})
+        assert out["success"] is False and out["error_code"] == code, (err, out)
+        assert hint in out["error"], out
+        assert secret not in str(out), f"error echoed a value: {out}"
+        assert client.closed is True
+
+
+def test_find_honours_read_preference():
+    from pymongo import ReadPreference
+    s, client = _find_server(_orders(1))
+    _find(s)
+    assert client["appdb"]["orders"].options_calls == []
+    cfg = {"config": {**CFG["config"], "read_preference": "secondaryPreferred"}}
+    out = s.find({**cfg, "collection": "orders"})
+    assert out["success"] is True, out
+    assert client["appdb"]["orders"].options_calls == [{"read_preference": ReadPreference.SECONDARY_PREFERRED}]
+    cfg = {"config": {**CFG["config"], "read_preference": "fastest"}}
+    out = s.find({**cfg, "collection": "orders"})
+    assert out["error_code"] == "invalid_config", out
+
+
+def test_find_collection_validation_and_string_config():
+    import json
+    s, client = _find_server(_orders(2))
+    for bad in (None, "", "system.users", "a$b", "x" * 121, 5):
+        out = s.find({**CFG, "collection": bad})
+        assert out["error_code"] == "invalid_collection", (bad, out)
+    assert s.find({**CFG, "table": "orders"})["returned"] == 2
+    # the orchestrator's delegated path may send config as a JSON string
+    out = s.find({"config": json.dumps(CFG["config"]), "collection": "orders"})
+    assert out["success"] is True and out["returned"] == 2, out
+    assert s.find({"config": "{not json", "collection": "orders"})["error_code"] == "invalid_config"
+
+
+def test_find_never_writes():
+    s, client = _find_server(_orders(4))
+    _find(s)
+    _find(s, filter={"status": "paid"}, sort={"n": -1}, projection={"n": 1}, limit=1)
+    _page_through(s, "cursor", limit=1)
+    coll = client["appdb"]["orders"]
+    assert coll.insert_calls == [] and coll.bulk_ops == [] and coll.delete_calls == [] and coll.index_calls == []
+    assert len(coll.docs()) == 4
+
+
+def test_find_dispatches_as_mcp_tool_and_is_declared_in_lockstep():
+    import json
+    s, _ = _find_server(_orders(3))
+    out = s._handle_tool_call({"name": "mongodb_find", "arguments": {
+        **CFG, "collection": "orders", "filter": {"status": "paid"}, "sort": {"n": -1}, "limit": 1}})
+    assert out["success"] is True and out["documents"][0]["n"] == 3, out
+    assert s._resolves_to_handler("mongodb_find") is True
+    cap_ops = {o["name"]: o for o in s.get_capabilities({})["operations"]}
+    with open(os.path.join(_HERE, "metadata.json")) as fh:
+        meta_ops = {o["name"]: o for o in json.load(fh)["operations"]}
+    assert cap_ops["find"]["method"] == meta_ops["find"]["method"] == "mongodb_find"
+    # the operator list published in metadata is the one the code enforces
+    import re
+    desc = next(p for p in meta_ops["find"]["parameters"] if p["name"] == "filter")["description"]
+    assert set(re.findall(r"\$\w+", desc)) == set(mg.FIND_QUERY_OPERATORS | mg.FIND_EXTJSON_WRAPPERS), desc
+
+
 # ================================= runner ===================================
 
 def _run():

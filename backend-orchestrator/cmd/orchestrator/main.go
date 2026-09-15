@@ -1506,6 +1506,80 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			})
 		})
 
+		// Data Explorer document mode: a read-only `find` on a document store (MongoDB)
+		// through the connector's MCP find tool. The api-gateway validates the filter
+		// against the operator allowlist and loads the connection workspace-scoped; the
+		// connector enforces the allowlist again. S2S-gated by requirePrincipal.
+		api.POST("/agent/explorer-find", requirePrincipal(db), func(c *gin.Context) {
+			var req struct {
+				ConnectorType string                 `json:"connector_type" binding:"required"`
+				Config        map[string]interface{} `json:"config"`
+				ConnectionID  string                 `json:"connection_id,omitempty"`
+				Collection    string                 `json:"collection" binding:"required"`
+				// Raw so a 64-bit integer in a filter reaches the connector as written
+				// (a map[string]interface{} would round it through float64).
+				Filter     json.RawMessage `json:"filter,omitempty"`
+				Projection json.RawMessage `json:"projection,omitempty"`
+				Sort       json.RawMessage `json:"sort,omitempty"`
+				Limit         int                    `json:"limit,omitempty"`
+				Cursor        string                 `json:"cursor,omitempty"`
+				Skip          int                    `json:"skip,omitempty"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body", "error_code": "invalid_request", "details": err.Error()})
+				return
+			}
+
+			// SECURITY: never log the filter or projection — only shape metadata.
+			log.WithFields(log.Fields{
+				"connector_type":  req.ConnectorType,
+				"connection_id":   req.ConnectionID,
+				"config_keys":     len(req.Config),
+				"filter_bytes":     len(req.Filter),
+				"projection_bytes": len(req.Projection),
+				"sort_bytes":       len(req.Sort),
+				"limit":           req.Limit,
+				"has_cursor":      req.Cursor != "",
+				"skip":            req.Skip,
+			}).Info("📄 Agent: explorer_find (HTTP)")
+
+			spec := map[string]interface{}{"collection": req.Collection}
+			if len(req.Filter) > 0 {
+				spec["filter"] = req.Filter
+			}
+			if len(req.Projection) > 0 {
+				spec["projection"] = req.Projection
+			}
+			if len(req.Sort) > 0 {
+				spec["sort"] = req.Sort
+			}
+			if req.Limit > 0 {
+				spec["limit"] = req.Limit
+			}
+			if req.Cursor != "" {
+				spec["cursor"] = req.Cursor
+			}
+			if req.Skip > 0 {
+				spec["skip"] = req.Skip
+			}
+
+			result, err := executorAgent.ExplorerFind(c.Request.Context(), req.ConnectorType, req.Config, spec)
+			if err != nil {
+				code, path := "query_failed", ""
+				if fe, ok := err.(*executor.ExplorerFindError); ok {
+					code, path = fe.Code, fe.Path
+				}
+				c.JSON(explorerFindStatus(code), gin.H{
+					"error":      "explorer_find failed",
+					"error_code": code,
+					"path":       path,
+					"details":    err.Error(),
+				})
+				return
+			}
+			c.JSON(http.StatusOK, result)
+		})
+
 		// ============================================================================
 		// CDC CONTROL (Demo-grade)
 		// ============================================================================

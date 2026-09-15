@@ -128,6 +128,13 @@ func GenerateSQL(c *gin.Context) {
 					`SELECT connector_type FROM connections WHERE id = $1 AND workspace_id = $2`,
 					req.ConnectionID, wsID,
 				).Scan(&connectorType); err == nil {
+					if ResolveExplorerCapability(connectorType).QueryLanguage == langDocument {
+						c.JSON(http.StatusBadRequest, gin.H{
+							"error":      "SQL generation is not available for document connections",
+							"error_code": "document_connection",
+						})
+						return
+					}
 					if d := dialectFromConnectorType(connectorType); d != "" {
 						req.Dialect = d
 					}
@@ -526,7 +533,9 @@ func ExecuteExplorerQuery(c *gin.Context) {
 	// tool via the orchestrator). Unsupported connectors 400 here.
 	ct := strings.ToLower(connectorType)
 	ecap := ResolveExplorerCapability(connectorType)
-	if !ecap.Supported {
+	if !ecap.Supported || ecap.QueryLanguage != langSQL {
+		// A document connection (MongoDB) is Supported but browses through
+		// /explorer/documents/find — it must never reach the SQL executors below.
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": fmt.Sprintf("Unsupported connection type: %s", connectorType),
 			"hint":  "Explorer currently supports PostgreSQL/Redshift, MySQL, Databricks, SQL Server, and BigQuery",
@@ -2197,6 +2206,9 @@ func RefreshSchemaIndex(c *gin.Context) {
 // from a single connection (Superset/DBeaver-style). Postgres ignores this —
 // its namespaces are already schemas under one DB, all of which are returned.
 func buildSchemaIndex(ctx context.Context, connectionID, connectorType, configEncrypted string, allDatabases bool) (*cache.ExplorerSchemaIndex, error) {
+	if ResolveExplorerCapability(connectorType).QueryLanguage == langDocument {
+		return buildDocumentSchemaIndex(ctx, connectionID, connectorType, configEncrypted)
+	}
 	ct := strings.ToLower(connectorType)
 	isPostgres := strings.Contains(ct, "postgres") || strings.Contains(ct, "redshift")
 	isMySQL := strings.Contains(ct, "mysql") || strings.Contains(ct, "mariadb")
@@ -3614,7 +3626,7 @@ func ExportCSVHandler(c *gin.Context) {
 
 	ct := strings.ToLower(connectorType)
 	ecap := ResolveExplorerCapability(connectorType)
-	if !ecap.Supported {
+	if !ecap.Supported || ecap.QueryLanguage != langSQL {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Unsupported connection type for export"})
 		return
 	}
@@ -3785,7 +3797,7 @@ func ExportQueryHandler(c *gin.Context) {
 
 	ct := strings.ToLower(connectorType)
 	ecap := ResolveExplorerCapability(connectorType)
-	if !ecap.Supported {
+	if !ecap.Supported || ecap.QueryLanguage != langSQL {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error": fmt.Sprintf("Unsupported connection type for export: %s", connectorType),
 			"hint":  "Export currently supports PostgreSQL/Redshift, MySQL, Databricks, SQL Server, and BigQuery",

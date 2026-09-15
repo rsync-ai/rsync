@@ -23,6 +23,10 @@ export interface SchemaBrowserProps {
   onInsertTable?: (qualifiedName: string) => void
   /** Insert a bare column name into the SQL editor. */
   onInsertColumn?: (column: string) => void
+  /** Plural noun for the listed items (header, filter, no-match text). */
+  itemLabel?: string
+  /** Tooltip for the per-table insert button. */
+  insertTitle?: string
   className?: string
 }
 
@@ -50,6 +54,8 @@ export function SchemaBrowser({
   selectionKey,
   onInsertTable,
   onInsertColumn,
+  itemLabel = "tables",
+  insertTitle = "Add to SQL",
   className,
 }: SchemaBrowserProps) {
   const [selectedDb, setSelectedDb] = useState("")
@@ -127,7 +133,9 @@ export function SchemaBrowser({
 
       {/* Tables (N) header */}
       <div className="flex items-center justify-between px-0.5">
-        <span className="text-sm font-semibold">Tables ({activeTables.length})</span>
+        <span className="text-sm font-semibold">
+          {itemLabel.charAt(0).toUpperCase() + itemLabel.slice(1)} ({activeTables.length})
+        </span>
       </div>
 
       {/* Filter */}
@@ -137,7 +145,7 @@ export function SchemaBrowser({
           type="text"
           value={filter}
           onChange={(e) => setFilter(e.target.value)}
-          placeholder="Filter tables…"
+          placeholder={`Filter ${itemLabel}…`}
           className="w-full rounded-md border bg-background py-1.5 pl-8 pr-2 text-sm outline-none focus:ring-1 focus:ring-ring"
         />
       </div>
@@ -145,7 +153,7 @@ export function SchemaBrowser({
       {/* Table list (scrollable) */}
       {visibleTables.length === 0 ? (
         <p className="px-2 py-6 text-center text-sm text-muted-foreground">
-          No tables match “{filter}”.
+          No {itemLabel} match “{filter}”.
         </p>
       ) : (
         <ul className="max-h-[320px] space-y-0.5 overflow-y-auto">
@@ -188,7 +196,7 @@ export function SchemaBrowser({
                     <button
                       type="button"
                       aria-label={`Insert table ${table.name}`}
-                      title="Add to SQL"
+                      title={insertTitle}
                       onClick={() => onInsertTable(key)}
                       className="shrink-0 rounded p-0.5 text-muted-foreground opacity-0 hover:bg-muted hover:text-foreground group-hover:opacity-100"
                     >

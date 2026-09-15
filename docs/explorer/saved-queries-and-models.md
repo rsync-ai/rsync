@@ -473,7 +473,7 @@ Recording these so they are not re-litigated as oversights:
   measurement.
 - **Two triggers on one model** — one live schedule per query, to avoid a rebuild race.
 - **Second-person approval** — a workspace-policy question, not a hard-coded rule (§5).
-- **Document (MongoDB) browsing** — designed, deferred to a future Document Explorer.
+- **Document (MongoDB) browsing** — shipped as the Explorer's document browse mode ([document-browse-mode-plan.md](document-browse-mode-plan.md)); saving a document query is still a follow-up there.
 
 Open Data Explorer items — `DX-LimitDowngrade`, `DX-SqlGenResilience`,
 `DX-CornerCaseCoverage` — are tracked separately and are **not** part of
