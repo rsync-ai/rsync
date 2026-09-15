@@ -8,9 +8,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Separator } from "@/components/ui/separator"
-import { Switch } from "@/components/ui/switch"
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar"
-import { User, Bell, Palette, Save, Loader2, Lock, Eye, EyeOff } from "lucide-react"
+import { NotificationPreferencesCard } from "@/components/settings/NotificationPreferencesCard"
+import { User, Palette, Save, Loader2, Lock, Eye, EyeOff } from "lucide-react"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { toast } from "sonner"
@@ -26,9 +26,6 @@ export default function SettingsPage() {
   const [profileLoaded, setProfileLoaded] = useState(false)
   const [saving, setSaving] = useState(false)
 
-  const [notifPipelines, setNotifPipelines] = useState(true)
-  const [notifSystem, setNotifSystem] = useState(false)
-
   const [currentPassword, setCurrentPassword] = useState("")
   const [newPassword, setNewPassword] = useState("")
   const [confirmPassword, setConfirmPassword] = useState("")
@@ -36,6 +33,7 @@ export default function SettingsPage() {
   const [showNewPw, setShowNewPw] = useState(false)
   const [showConfirmPw, setShowConfirmPw] = useState(false)
   const [changingPassword, setChangingPassword] = useState(false)
+  const [isAdmin, setIsAdmin] = useState(false)
 
   useEffect(() => {
     setMounted(true)
@@ -46,9 +44,10 @@ export default function SettingsPage() {
           router.push(`/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`)
           return
         }
-        const data = await res.json() as { name?: string; email: string }
+        const data = await res.json() as { name?: string; email: string; role?: string }
         setName(data.name ?? "")
         setEmail(data.email)
+        setIsAdmin(data.role === "admin")
         setProfileLoaded(true)
       } catch {
         router.push(`/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`)
@@ -267,45 +266,8 @@ export default function SettingsPage() {
         </CardContent>
       </Card>
 
-      {/* Notifications */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Bell className="h-5 w-5 text-zinc-500" />
-            Notifications
-          </CardTitle>
-          <CardDescription>Configure how you receive notifications</CardDescription>
-        </CardHeader>
-        <CardContent>
-          <div className="space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="font-medium">Pipeline Executions</p>
-                <p className="text-sm text-zinc-500">Get notified when pipelines complete or fail</p>
-              </div>
-              {/* Radix renders a <button role="switch"> whose only child is the thumb —
-                  no text, no associated label, so the name must come from aria-label. */}
-              <Switch
-                aria-label="Pipeline execution notifications"
-                checked={notifPipelines}
-                onCheckedChange={setNotifPipelines}
-              />
-            </div>
-            <Separator />
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="font-medium">System Updates</p>
-                <p className="text-sm text-zinc-500">Important updates and maintenance notifications</p>
-              </div>
-              <Switch
-                aria-label="System update notifications"
-                checked={notifSystem}
-                onCheckedChange={setNotifSystem}
-              />
-            </div>
-          </div>
-        </CardContent>
-      </Card>
+      {/* Notifications — real email preferences (the old switches saved nothing) */}
+      <NotificationPreferencesCard email={profileLoaded ? email : undefined} isAdmin={isAdmin} />
 
       {/* Appearance */}
       <Card>

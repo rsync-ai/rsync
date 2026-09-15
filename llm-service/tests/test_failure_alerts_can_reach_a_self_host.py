@@ -6,7 +6,12 @@ reaches a human is decided purely by whether a handful of environment variables 
 values:
 
     slackEnabled = NOTIFIER_SLACK_WEBHOOK_URL != ""
-    emailEnabled = SMTP_HOST != "" && SMTP_FROM != ""      (notifier.go, both halves)
+    emailEnabled = SMTP_HOST != "" && SMTP_FROM != ""      (channels.go, both halves)
+
+Since migration 102 an admin can save Slack/SMTP in the UI, and a saved row replaces
+these variables entirely. Until someone does, the variables are still the whole
+configuration -- which is the state every fresh self-host starts in, so this guard's
+subject did not shrink.
 
 Neither branch logs an error when it is off, because "off" is a legitimate
 configuration. So a stack where the variables are simply not passed through to the
@@ -56,8 +61,8 @@ NOTIFIER_PKG = REPO / "api-gateway" / "internal" / "notifier"
 # census (test_ci_filter_covers_every_guard_subject.py) can see it: that census derives
 # a guard's subjects from string literals that resolve to real files, and a path built
 # segment-by-segment resolves to a directory it discards. This file is where the
-# slack/email gating lives, so it is a subject of this guard in its own right.
-NOTIFIER_GO = REPO / "api-gateway/internal/notifier/notifier.go"
+# env-var slack/email gating lives, so it is a subject of this guard in its own right.
+CHANNELS_GO = REPO / "api-gateway/internal/notifier/channels.go"
 
 # The service that runs the notifier consumer. Named here rather than derived because
 # the coupling is to a Go entrypoint (cmd/server/main.go), not to anything the compose
@@ -101,9 +106,18 @@ def _notifier_env_reads() -> frozenset[str]:
 
 
 @functools.lru_cache(maxsize=None)
-def _notifier_go() -> str:
-    assert NOTIFIER_GO.is_file(), f"{NOTIFIER_GO} is gone; the gating contract moved"
-    return NOTIFIER_GO.read_text()
+def _channels_go() -> str:
+    assert CHANNELS_GO.is_file(), f"{CHANNELS_GO} is gone; the gating contract moved"
+    return CHANNELS_GO.read_text()
+
+
+# EnvChannelConfig binds the two variables to locals, then gates on both.
+_EMAIL_GATE = re.compile(
+    r'host\s*:?=\s*strings\.TrimSpace\(os\.Getenv\("SMTP_HOST"\)\).*?'
+    r'from\s*:?=\s*strings\.TrimSpace\(os\.Getenv\("SMTP_FROM"\)\).*?'
+    r'Enabled:\s*host != "" && from != ""',
+    re.S,
+)
 
 
 def _ignore_unknown_tag(loader, suffix, node):
@@ -177,9 +191,8 @@ def test_the_derivation_found_the_real_notifier():
     # restated. SMTP_HOST alone leaves email off, and that omission is indis-
     # tinguishable from deliberately leaving email off -- which is exactly why both
     # halves have to survive into the operator-facing template below.
-    src = _notifier_go()
-    assert 'smtpHost != "" && n.smtpFrom != ""' in src.replace("n.smtpHost", "smtpHost"), (
-        "notifier.go no longer gates email on BOTH SMTP_HOST and SMTP_FROM. That "
+    assert _EMAIL_GATE.search(_channels_go()), (
+        "channels.go no longer gates email on BOTH SMTP_HOST and SMTP_FROM. That "
         "conjunction is the premise of test_install_sh_lets_the_operator_find_the_knob "
         "-- re-read the new gating before editing this assertion away."
     )
