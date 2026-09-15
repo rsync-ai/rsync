@@ -230,6 +230,31 @@ var catalog = map[string]Entry{
 		Severity:    severityCritical,
 	},
 
+	// ── Terminal run outcome ────────────────────────────────────────────────
+	// Raised by the temporal adapter's UpdatePipelineStatusActivity — the single
+	// authoritative terminal-write site, reached from a defer that fires on every
+	// workflow exit path. It is the only producer that sees a run END, as opposed
+	// to seeing one stage fail, so these two codes are what a team gets when a
+	// pipeline stops moving data. Do not add a completed/"all good" counterpart:
+	// a success alert on the same channel trains people to ignore these.
+	"PIPELINE_RUN_FAILED": {
+		Title: "{pipeline} stopped with an error",
+		// Deliberately does NOT promise the rest keeps running. This code is raised
+		// for the whole run, not one table, and the run is over.
+		Impact:      "This run didn't finish, so its data hasn't arrived. Open the pipeline to see where it stopped.",
+		ActionLabel: "Open pipeline",
+		Severity:    severityCritical,
+	},
+	"PIPELINE_RUN_STOPPED": {
+		Title: "{pipeline} was stopped before it finished",
+		// Usually someone cancelled it on purpose — so this is a warning, not a
+		// critical. It is still worth saying, because a stopped run and a run still
+		// working look identical from outside.
+		Impact:      "Whatever hadn't synced yet is still waiting. Re-run when you're ready.",
+		ActionLabel: "Open pipeline",
+		Severity:    severityWarning,
+	},
+
 	// ── Unclassified. These two are why the bell used to read
 	//    "LEGACY_UNCLASSIFIED": both are placeholders meaning "we couldn't
 	//    classify this", which is meaningless to a customer. The raw failure

@@ -2050,9 +2050,8 @@ func (b *cdcObjectBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkM
 			createdAt:    now,
 			lastAppendAt: now,
 		}
-		if strings.TrimSpace(batch.prefix) == "" {
-			batch.prefix = "test-aws-s3"
-		}
+		// No default prefix. A blank path_prefix means the bucket root — see
+		// tablePrefix. (This used to fall back to the literal "test-aws-s3".)
 		b.batches[key] = batch
 	}
 
@@ -2082,9 +2081,7 @@ func (b *cdcObjectBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkM
 				createdAt:    now,
 				lastAppendAt: now,
 			}
-			if strings.TrimSpace(batch.prefix) == "" {
-				batch.prefix = "test-aws-s3"
-			}
+			// No default prefix — see the sibling construction above.
 			b.batches[key] = batch
 		}
 	}
@@ -2940,7 +2937,14 @@ func fileExt(format, compression string) string {
 }
 
 func tablePrefix(prefix, dataset, dbOrSchema, table string) string {
-	parts := []string{strings.Trim(prefix, "/")}
+	parts := []string{}
+	// An empty prefix means "write at the bucket root" — it must NOT contribute a
+	// segment. Appending it unconditionally produced keys with a leading "/",
+	// which S3 and GCS accept but render as an unnamed top-level folder, and
+	// which no `list_blobs(prefix="<dataset>/…")` call then matches.
+	if p := strings.Trim(prefix, "/"); p != "" {
+		parts = append(parts, p)
+	}
 	if dataset != "" {
 		parts = append(parts, dataset)
 	}
@@ -3504,10 +3508,10 @@ func main() {
 					destCfg := cfg.DestinationConfig
 					bucket := firstStr(destCfg, "bucket", "bucket_name")
 					container := firstStr(destCfg, "container")
+					// An unset prefix means the bucket root — see tablePrefix. It must
+					// NOT acquire a default here, or objects land somewhere the user
+					// never configured and no reader looks.
 					prefix := firstStr(destCfg, "path_prefix", "prefix", "base_prefix", "key_prefix", "base_path", "path")
-					if prefix == "" {
-						prefix = "test-aws-s3"
-					}
 
 					tablePart := sm.Table
 					if idx := strings.LastIndex(tablePart, "."); idx >= 0 && idx+1 < len(tablePart) {
@@ -4143,10 +4147,10 @@ func main() {
 			if looksLikeObjectStorage {
 				bucket := firstStr(destCfg, "bucket", "bucket_name")
 				container := firstStr(destCfg, "container")
+				// An unset prefix means the bucket root — see tablePrefix. The
+				// delete_prefix issued below is derived from it, so a default here
+				// would also point the reload cleanup at the wrong subtree.
 				prefix := firstStr(destCfg, "path_prefix", "prefix", "base_prefix", "key_prefix", "base_path", "path")
-				if prefix == "" {
-					prefix = "test-aws-s3"
-				}
 				tablePart := sm.Table
 				if idx := strings.LastIndex(tablePart, "."); idx >= 0 && idx+1 < len(tablePart) {
 					tablePart = tablePart[idx+1:]
@@ -4895,10 +4899,10 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 		// Respect destination config format, defaulting to jsonl for CDC bronze.
 		bucket := firstStr(destCfg, "bucket", "bucket_name")
 		container := firstStr(destCfg, "container")
+		// An unset prefix means the bucket root — see tablePrefix. This is the CDC
+		// write path: a default here silently splits CDC deltas away from the batch
+		// backfill, and the merged view at the configured location is then incomplete.
 		prefix := firstStr(destCfg, "path_prefix", "prefix", "base_prefix", "key_prefix", "base_path", "path")
-		if prefix == "" {
-			prefix = "test-aws-s3"
-		}
 		format := firstStr(destCfg, "file_format", "format")
 		if format == "" {
 			format = "jsonl"
@@ -8045,10 +8049,8 @@ func writeToDestination(ctx context.Context, httpClient *http.Client, cfg *Worke
 	if looksLikeObjectStorage {
 		bucket := firstStr(destCfg, "bucket", "bucket_name")
 		container := firstStr(destCfg, "container")
+		// An unset prefix means the bucket root — see tablePrefix.
 		prefix := firstStr(destCfg, "path_prefix", "prefix", "base_prefix", "key_prefix", "base_path", "path")
-		if prefix == "" {
-			prefix = "test-aws-s3"
-		}
 		format := firstStr(destCfg, "file_format", "format")
 		if format == "" {
 			format = "csv"

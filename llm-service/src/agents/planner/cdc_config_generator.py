@@ -553,9 +553,11 @@ class CDCConfigGenerator:
                 "include.schema.changes": "true",
             }
             
-            # Get database-specific config
+            # Get database-specific config. `config` is passed through because some
+            # sources are not addressable as host:port at all — MongoDB Atlas is
+            # reachable only by the SRV URI the caller supplies.
             db_specific = self._get_database_specific_config(
-                source_type, host, port, user, password, db_name, table_list
+                source_type, host, port, user, password, db_name, table_list, config
             )
             
             # Debezium's schema-history client is a separate Kafka client inside
@@ -585,6 +587,68 @@ class CDCConfigGenerator:
             logger.error(f"Template-based generation failed: {e}")
             return CDCConfigResult(success=False, error=str(e))
     
+    # sslmode-ish values that mean "TLS on". Same set the debezium MCP connector
+    # accepts, so the advice this module gives matches what the connector will do.
+    _TLS_ON_VALUES = frozenset({
+        "require", "required", "true", "on", "prefer", "preferred",
+        "verify-ca", "verify_ca", "verify-full", "verify-identity", "verify_identity",
+    })
+
+    @classmethod
+    def _mongo_connection_string(
+        cls,
+        config: Dict[str, Any],
+        host: str,
+        port: Any,
+        user: Optional[str],
+        password: Optional[str],
+    ) -> str:
+        """Build Debezium's ``mongodb.connection.string``.
+
+        An explicit URI always wins. MongoDB Atlas is reachable only as
+        ``mongodb+srv://…`` — SRV resolves the seed list, so there is no single
+        host:port to synthesise — and the generator's ``host`` fallback is the
+        literal ``"localhost"``. Synthesising a URI anyway produced
+        ``mongodb://localhost:27017/?authSource=admin``: wrong scheme, no TLS,
+        wrong topology, and confidently presented as the config to use.
+
+        The synthesised branch is still correct for self-hosted MongoDB, and now
+        turns TLS on for an Atlas-looking host or an explicit sslmode, matching
+        the debezium MCP connector.
+        """
+        explicit = str(
+            config.get("connection_string")
+            or config.get("mongodb_connection_string")
+            or config.get("mongodb_uri")
+            or config.get("uri")
+            or ""
+        ).strip()
+        if explicit:
+            return explicit
+
+        creds = ""
+        if user:
+            creds = quote_plus(str(user))
+            if password:
+                creds += ":" + quote_plus(str(password))
+            creds += "@"
+
+        opts: List[str] = []
+        ssl_mode = str(
+            config.get("sslmode") or config.get("db_sslmode") or config.get("ssl") or ""
+        ).strip().lower()
+        if ssl_mode in cls._TLS_ON_VALUES or "mongodb.net" in str(host).lower():
+            opts.append("tls=true")
+        if user:
+            auth_source = config.get("auth_source") or config.get("authSource") or "admin"
+            opts.append("authSource=" + quote_plus(str(auth_source)))
+        replica_set = str(config.get("replica_set") or config.get("replicaSet") or "").strip()
+        if replica_set:
+            opts.append("replicaSet=" + quote_plus(replica_set))
+
+        query = ("?" + "&".join(opts)) if opts else ""
+        return f"mongodb://{creds}{host}:{port or 27017}/{query}"
+
     def _get_database_specific_config(
         self,
         source_type: str,
@@ -593,7 +657,8 @@ class CDCConfigGenerator:
         user: str,
         password: str,
         db_name: str,
-        table_list: str
+        table_list: str,
+        config: Optional[Dict[str, Any]] = None
     ) -> Dict[str, str]:
         """
         Get database-specific Debezium configuration.
@@ -646,11 +711,16 @@ class CDCConfigGenerator:
                 # on a modern image. topic.prefix (added by the SMT/base config)
                 # serves as the logical name. capture.mode=change_streams_update_full
                 # yields complete post-images so the sink's packed (_id + document)
-                # upsert stays correct. (This generator is advisory; the live config
-                # is built by the debezium MCP connector — keep them in lockstep.)
-                "mongodb.connection.string": (
-                    f"mongodb://{quote_plus(user)}:{quote_plus(password)}@{host}:{port}/?authSource=admin"
-                    if user else f"mongodb://{host}:{port}/"
+                # upsert stays correct.
+                #
+                # ADVISORY ONLY. The config that actually starts a connector is built
+                # by _build_connector_config in the debezium MCP connector
+                # (shared/mcp-connectors/internal/debezium/versions/v1.0.0/connector.py).
+                # _mongo_connection_string below mirrors that function; this branch is
+                # never the live path, so a divergence here is wrong advice, not an
+                # outage.
+                "mongodb.connection.string": self._mongo_connection_string(
+                    config or {}, host, port, user, password
                 ),
                 "capture.mode": "change_streams_update_full",
                 "database.include.list": db_name,

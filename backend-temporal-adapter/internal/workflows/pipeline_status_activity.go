@@ -104,6 +104,11 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 	// with reason 'silent_drop_detected'. Fail-soft: if the stats query
 	// errors or returns nothing, keep the original status — we'd rather
 	// miss a drop than spuriously fail a healthy run.
+	// Tracked rather than sniffed back out of errorMessage: the notification this
+	// run may raise says something materially different for a silent drop ("rows
+	// may be missing") than for an ordinary failure, and a string match on the
+	// reason prefix would break the moment the reason text is reworded.
+	silentDrop := false
 	if status == "completed" && executionID != "" {
 		if dropReason, ok := postflightSilentDropCheck(ctx, db, executionID); ok {
 			logger.Warn("🚨 Postflight silent-drop guard downgraded completed -> failed",
@@ -112,6 +117,7 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 				"reason", dropReason,
 			)
 			status = "failed"
+			silentDrop = true
 			if errorMessage == "" {
 				errorMessage = dropReason
 			} else {
@@ -222,6 +228,14 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 			return fmt.Errorf("failed to commit terminal status tx: %w", err)
 		}
 		tx = nil // disarm the deferred rollback
+
+		// Tell the team. This is the only site in the repo that sees every way a
+		// run can end terminally — see pipeline_failure_notification.go for why the
+		// executor's own failure sites are the wrong place — so it is where the
+		// Slack/email alert is raised. Deliberately after Commit and deliberately
+		// unable to fail: a broker outage must not turn a durably recorded failure
+		// into a retried activity.
+		emitTerminalRunNotification(pipelineID, executionID, status, errorMessage, silentDrop)
 
 		if pipelineRowsErr == nil && pipelineRows == 0 {
 			logger.Warn("No pipeline row updated (pipeline not found?)", "pipeline_id", pipelineID, "status", status)

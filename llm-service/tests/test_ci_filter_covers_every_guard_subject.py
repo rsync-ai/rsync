@@ -105,6 +105,17 @@ GUARDS = [
     # three byte-identical copies, and a PR editing exactly one copy is both the
     # bug it hunts and the change that would have skipped the job.
     "test_otel_export_errors_are_collapsed.py",
+    # Enrolled 2026-09-15 with the failure-alert delivery fix. Its subjects are
+    # docker-compose.quickstart.yml, install.sh and
+    # api-gateway/internal/notifier/notifier.go, all three already covered -- by
+    # `docker-compose*.yml`, `install.sh` and `api-gateway/**` respectively, so
+    # ci.yml needed no change. Enrolled for the reason every entry above gives,
+    # and the guard's subject makes the reason concrete: it exists because a
+    # variable the notifier reads and the compose file never passes produces
+    # persist-only alerting with no error at any layer, and a guard that never
+    # runs produces a green check with no error at any layer. Same shape, one
+    # level up.
+    "test_failure_alerts_can_reach_a_self_host.py",
 ]
 
 

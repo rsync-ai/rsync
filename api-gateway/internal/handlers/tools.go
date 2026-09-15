@@ -724,9 +724,18 @@ type MCPConnector struct {
 	QAMetadata          map[string]interface{} `json:"qa_metadata,omitempty"`
 	Capabilities        interface{}            `json:"capabilities"`         // Can be object or array
 	ConfigurationSchema map[string]interface{} `json:"configuration_schema"` // Return as configuration_schema in API
-	SupportsSource      bool                   `json:"supports_source"`
-	SupportsDestination bool                   `json:"supports_destination"`
-	SupportsCDC         bool                   `json:"supports_cdc"`
+	// ConfigAliases maps a canonical required field onto alternative keys that
+	// also satisfy it, mirroring the orchestrator's pre-start gate
+	// (backend-orchestrator/internal/mcp/server_manager.go, missingRequiredConfig).
+	// The connection form gates Save on configuration_schema.required, so without
+	// this on the wire the form is STRICTER than the server it is gating for:
+	// oracle by `dsn` and mongodb by an Atlas `connection_string` are both valid
+	// to the orchestrator but unsaveable in the UI, which demands a `host` the
+	// connector then ignores.
+	ConfigAliases       map[string][]string `json:"config_aliases,omitempty"`
+	SupportsSource      bool                `json:"supports_source"`
+	SupportsDestination bool                `json:"supports_destination"`
+	SupportsCDC         bool                `json:"supports_cdc"`
 	// SupportedVersions advertises which DB engine versions rsync supports,
 	// keyed by sync mode (e.g. {"batch": "...", "cdc": "..."}). Sourced from
 	// metadata.json `supported_versions`; surfaced read-only in the config modal.
@@ -1407,6 +1416,7 @@ type connectorMetadataDTO struct {
 	Internal             bool                     `json:"internal,omitempty"`
 	Capabilities         interface{}              `json:"capabilities"`
 	ConfigSchema         map[string]interface{}   `json:"config_schema"` // Read from config_schema
+	ConfigAliases        map[string][]string      `json:"config_aliases"`
 	SupportsSource       bool                     `json:"supports_source"`
 	SupportsDestination  bool                     `json:"supports_destination"`
 	SupportsCDC          bool                     `json:"supports_cdc"`
@@ -1446,6 +1456,7 @@ func mapToMCPConnector(meta connectorMetadataDTO, canonicalID, version string) M
 		Internal:               meta.Internal,
 		Capabilities:           meta.Capabilities,
 		ConfigurationSchema:    meta.ConfigSchema, // Map config_schema -> configuration_schema
+		ConfigAliases:          meta.ConfigAliases,
 		SupportsSource:         meta.SupportsSource,
 		SupportsDestination:    meta.SupportsDestination,
 		SupportsCDC:            meta.SupportsCDC,
