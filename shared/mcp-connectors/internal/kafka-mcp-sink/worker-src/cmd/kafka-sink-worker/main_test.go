@@ -747,11 +747,45 @@ func TestCDCObjectKeyLayout(t *testing.T) {
 	if key != want {
 		t.Errorf("expected %q, got %q", want, key)
 	}
-	// Partition 0 → no -p suffix; leading prefix slash trimmed; gzip adds .gz.
+	// Partition 0 → no -p suffix; leading prefix slash trimmed.
+	// Parquet keeps a bare ".parquet" even under gzip: the codec is stored per column
+	// chunk inside the file's own footer, so the writer emits an ordinary parquet file
+	// and a ".parquet.gz" name would advertise an external gzip stream that is not there.
 	key2 := cdcObjectKey("p/", "sch", "t", "2026-01-25", "", fixedTS, 0, 1, 1, "parquet", "gzip")
-	want2 := "p/sch/t/2026-01-25/20260125-143000000-1.parquet.gz"
+	want2 := "p/sch/t/2026-01-25/20260125-143000000-1.parquet"
 	if key2 != want2 {
 		t.Errorf("expected %q, got %q", want2, key2)
+	}
+	// Control: a format that really is wrapped externally still carries the suffix, so a
+	// regression that dropped the suffix for everything cannot pass this test.
+	key3 := cdcObjectKey("p/", "sch", "t", "2026-01-25", "", fixedTS, 0, 1, 1, "jsonl", "gzip")
+	want3 := "p/sch/t/2026-01-25/20260125-143000000-1.jsonl.gz"
+	if key3 != want3 {
+		t.Errorf("expected %q, got %q", want3, key3)
+	}
+}
+
+func TestFileExtCompressionSuffixSkipsSelfCompressingFormats(t *testing.T) {
+	// fileExt is the sink's other naming path (single-event writes). It has to agree
+	// with cdcObjectKey, or the same bytes would be named differently by the two halves.
+	cases := []struct {
+		format, compression, want string
+	}{
+		{"parquet", "gzip", "parquet"},
+		{"parquet", "zstd", "parquet"},
+		{"parquet", "none", "parquet"},
+		{"parquet", "", "parquet"},
+		{"PARQUET", "gzip", "parquet"},
+		// Controls: externally-wrapped formats keep their codec suffix.
+		{"jsonl", "gzip", "jsonl.gz"},
+		{"json", "gzip", "json.gz"},
+		{"csv", "zstd", "csv.zst"},
+		{"ndjson", "gzip", "jsonl.gz"},
+	}
+	for _, c := range cases {
+		if got := fileExt(c.format, c.compression); got != c.want {
+			t.Errorf("fileExt(%q, %q) = %q, want %q", c.format, c.compression, got, c.want)
+		}
 	}
 }
 
@@ -1232,6 +1266,73 @@ func TestParseCDCMessageDestinationNamespace(t *testing.T) {
 				t.Fatalf("sm.Table = %q, want %q", sm.Table, "rsync_public.customers")
 			}
 		})
+	}
+}
+
+// TestParseCDCMessageObjectStorageKeepsSourceSchema locks the other half of the
+// DBOrSchema overload, which the test above only covers for relational destinations.
+//
+// For object storage, DBOrSchema is not a namespace at all: it is the <db_or_schema>
+// PATH SEGMENT of the bronze key, which the SinkMessage.DestNamespace and
+// destinationNamespaceForStats doc comments both define as the SOURCE schema.
+// Assigning the orchestrator-injected destination namespace there overwrote it with
+// whatever that namespace happened to be — for a MongoDB→GCS pipeline, the connector
+// type — so every collection landed under bronze/mongodb/ instead of bronze/shop/, and
+// two source databases sharing a collection name interleaved into one path with nothing
+// in the rows to tell them apart.
+func TestParseCDCMessageObjectStorageKeepsSourceSchema(t *testing.T) {
+	mkPayload := func() map[string]interface{} {
+		return map[string]interface{}{
+			"op":    "c",
+			"after": map[string]interface{}{"_id": "abc", "name": "a"},
+			"source": map[string]interface{}{
+				"table":  "customers",
+				"schema": "shop",
+			},
+		}
+	}
+	msg := kafka.Message{Topic: "rsync.cdc-ec6d3a3b.shop.customers", Offset: 5010}
+
+	// The live MongoDB→GCS shape: the orchestrator injects the connector type as the
+	// destination namespace. Every object-storage destination must ignore it here.
+	for _, dest := range []string{"gcs", "aws-s3", "s3", "minio", "azure-blob"} {
+		t.Run(dest, func(t *testing.T) {
+			cfg := &WorkerConfig{
+				PipelineID:           "p1",
+				SinkMode:             "cdc",
+				DestinationConnector: dest,
+				DestinationNamespace: "mongodb",
+			}
+			sm, err := parseCDCMessage(cfg, msg, mkPayload(), map[string]interface{}{})
+			if err != nil {
+				t.Fatalf("parseCDCMessage error: %v", err)
+			}
+			if sm.DBOrSchema != "" {
+				t.Fatalf("sm.DBOrSchema = %q, want empty so cdcObjectPath derives the source schema", sm.DBOrSchema)
+			}
+			// End-to-end on the value that actually reaches the key: the bronze path
+			// segment must be the source database, not the connector type.
+			dbs, tbl := cdcObjectPath(sm)
+			if dbs != "shop" || tbl != "customers" {
+				t.Fatalf("cdcObjectPath = %q/%q, want shop/customers", dbs, tbl)
+			}
+		})
+	}
+
+	// Control: a relational destination still receives the namespace, so a fix that
+	// simply stopped assigning DBOrSchema everywhere cannot pass this test.
+	cfg := &WorkerConfig{
+		PipelineID:           "p1",
+		SinkMode:             "cdc",
+		DestinationConnector: "postgresql",
+		DestinationNamespace: "analytics",
+	}
+	sm, err := parseCDCMessage(cfg, msg, mkPayload(), map[string]interface{}{})
+	if err != nil {
+		t.Fatalf("parseCDCMessage error: %v", err)
+	}
+	if sm.DBOrSchema != "analytics" {
+		t.Fatalf("relational sm.DBOrSchema = %q, want analytics", sm.DBOrSchema)
 	}
 }
 

@@ -146,12 +146,26 @@ Sink=Go `kafka-mcp-sink`. v1 = in scope for this workstream; **defer** = Phase 5
 |---|---|---|---|---|---|---|
 | `path_prefix` | string | — | `""` | both | Py | base key prefix |
 | `file_format` | string | select | `json` | both | Py | `csv,tsv,json,jsonl,parquet,avro,orc,arrow,xlsx` |
-| `compression` | string | select | `none` | both | Py | `none,gzip,bzip2,snappy,lz4,zstd` (codecs lib-gated on image) |
+| `compression` | string | select | `gzip` | both | Py | `none,gzip,bzip2` (gcs/azure) · `+snappy,lz4,zstd` (aws-s3) — codecs lib-gated on image |
 | `compression` = `infer` | (enum add) | select | — | S | Py | auto-detect from extension; v1 |
 
 > **Codec reality:** `json/jsonl/csv/tsv + gzip` are safely real in `base_connector.convert_data_to_format`.
 > `parquet/avro/orc/arrow/xlsx` + `snappy/lz4/zstd` are **library-gated** — only offer them when the
 > image ships the dep (`pyarrow`, `fastavro`, `python-snappy`, `lz4`, `zstandard`, `openpyxl`).
+> This is why the default is **`gzip`** and not snappy: one `compression` field covers every
+> `file_format` the connector offers, and gzip is the only codec valid for all of them — stdlib
+> for the text formats, a real parquet codec, and present in all three enums. gcs/azure ship
+> neither `python-snappy`, `lz4` nor `zstandard`, so those three are aws-s3-only.
+>
+> **Parquet carries its codec INSIDE the file** (per column chunk, in its own footer), so a
+> compressed parquet object is still named `.parquet` — never `.parquet.gz`. `bzip2` is a valid
+> wrapper codec but **not** a parquet codec, so `parquet` + `bzip2` is rejected outright rather
+> than producing a file no reader accepts.
+>
+> **`none` means none.** The form seeds each field from this schema `default` and persists what it
+> seeds, so whatever the default says is both what the connection modal displays and what the
+> writer does. A writer that substituted a codec the stored config doesn't name would make the two
+> disagree silently — the reason the preference lives here and not in the writer.
 
 ### Group C — Destination partitioning (Sink-enforced)
 

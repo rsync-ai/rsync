@@ -1834,7 +1834,8 @@ class BaseMCPConnector(ABC):
             content = self._convert_to_tsv(data)
         
         elif format_val == 'parquet':
-            content = self._convert_to_parquet(data)
+            # Codec goes INSIDE the file; the external wrapper below skips parquet.
+            content = self._convert_to_parquet(data, compression)
         
         elif format_val == 'avro':
             content = self._convert_to_avro(data)
@@ -1855,8 +1856,14 @@ class BaseMCPConnector(ABC):
                 f"Check connector's metadata.json for advertised formats."
             )
         
-        # Apply compression if requested
-        if compression and compression != 'none':
+        # Apply compression if requested.
+        #
+        # Parquet is excluded: its codec is already baked into the file above, per
+        # column chunk, recorded in the footer. Wrapping a finished parquet file in an
+        # external gzip/zstd stream moves the magic bytes and the footer away from
+        # where the format says they are, and BigQuery, hive and pyarrow all refuse to
+        # read the result -- a silently unreadable object, not a smaller one.
+        if compression and compression != 'none' and format_val != 'parquet':
             content = self._compress_data(content, compression)
         
         return content
@@ -1911,12 +1918,29 @@ class BaseMCPConnector(ABC):
         
         return output.getvalue().encode('utf-8')
     
-    def _convert_to_parquet(self, data: List) -> bytes:
+    # Codecs parquet can record in its own footer. 'none' and 'uncompressed' are two
+    # spellings of the same thing (no codec); bzip2 is absent because parquet has no
+    # bzip2 codec, even though _compress_data accepts it as an external wrapper.
+    PARQUET_COMPRESSION_CODECS = (
+        'none', 'uncompressed', 'snappy', 'gzip', 'zstd', 'lz4', 'brotli',
+    )
+
+    def _convert_to_parquet(self, data: List, compression: str = 'none') -> bytes:
         """
         Convert list of dicts to Parquet bytes.
-        
+
+        Parquet compresses ITSELF: the codec is recorded per column chunk inside the
+        file's own footer, so it must be applied here, while the file is written, and
+        never as an external wrapper around the finished bytes.
+
+        Args:
+            data: List of dictionaries to convert
+            compression: the codec to record in the file -- one of
+                snappy/gzip/zstd/lz4/brotli -- or 'none'/'uncompressed' for no codec.
+
         Raises:
             ImportError: If pyarrow is not installed
+            ValueError: If compression is not a codec parquet can store
         """
         try:
             import pyarrow as pa
@@ -1926,16 +1950,37 @@ class BaseMCPConnector(ABC):
                 "pyarrow is required for Parquet format. "
                 "Install it with: pip install pyarrow>=14.0.0"
             )
-        
+
+        codec = (compression or 'none').strip().lower()
+        if codec == 'gz':
+            codec = 'gzip'
+        if codec not in self.PARQUET_COMPRESSION_CODECS:
+            raise ValueError(
+                f"Unsupported Parquet compression: '{compression}'. "
+                f"Parquet stores its codec internally and supports: "
+                f"{', '.join(self.PARQUET_COMPRESSION_CODECS)}."
+            )
+
         if not data:
             # Return empty parquet
             table = pa.table({})
         else:
             table = pa.Table.from_pylist(data)
-        
+
         buffer = io.BytesIO()
-        # Don't force codec here - let compression be handled separately
-        pq.write_table(table, buffer, compression=None)
+        # 'none' means exactly what it says here, the same as it does for every other
+        # format: write no codec. Do NOT quietly substitute pyarrow's default -- the
+        # connection form stores this value and shows it back, so a file that disagrees
+        # with the configured value is a bug nobody can see. A sensible DEFAULT is the
+        # configuration schema's job, which is why the cloud-storage connectors ship
+        # `"compression": {"default": "gzip"}` rather than leaving it at 'none'.
+        #
+        # pyarrow spells "no codec" as 'none' and rejects 'uncompressed', so the two
+        # accepted spellings collapse to one here.
+        pq.write_table(
+            table, buffer,
+            compression='none' if codec == 'uncompressed' else codec,
+        )
         return buffer.getvalue()
     
     def _convert_to_avro(self, data: List) -> bytes:
