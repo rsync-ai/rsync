@@ -2762,7 +2762,7 @@ func cdcObjectKey(prefix, dbOrSchema, table, dateSeg, partSegs string, tsMs int6
 		dateSeg = timePartitionSegment(tsMs, "")
 	}
 	ext := format
-	if strings.EqualFold(strings.TrimSpace(compression), "gzip") {
+	if strings.EqualFold(strings.TrimSpace(compression), "gzip") && !compressionIsInternalToFormat(format) {
 		ext = fmt.Sprintf("%s.gz", format)
 	}
 	name := objectTimestamp(tsMs)
@@ -2925,6 +2925,20 @@ func toStringSlice(v interface{}) []string {
 	return out
 }
 
+// compressionIsInternalToFormat reports whether the format compresses itself, so the
+// codec belongs INSIDE the file and must not appear in the object name.
+//
+// Parquet stores its codec per column chunk in its own footer; a reader picks it up from
+// there. Wrapping a whole parquet file in an external gzip stream — which is what a
+// ".parquet.gz" name advertises — produces a blob that BigQuery, hive and pyarrow all
+// refuse, because the magic bytes and footer are no longer where the format says. So a
+// compressed parquet object is still named ".parquet". Only parquet is listed: the other
+// self-describing formats here (avro/orc/arrow) still take the external-wrapper path in
+// the Python writer, and naming must match what is actually written.
+func compressionIsInternalToFormat(format string) bool {
+	return strings.EqualFold(strings.TrimSpace(format), "parquet")
+}
+
 func fileExt(format, compression string) string {
 	ext := strings.ToLower(strings.TrimSpace(format))
 	if ext == "" {
@@ -2936,6 +2950,9 @@ func fileExt(format, compression string) string {
 	}
 	comp := strings.ToLower(strings.TrimSpace(compression))
 	if comp == "" || comp == "none" {
+		return ext
+	}
+	if compressionIsInternalToFormat(ext) {
 		return ext
 	}
 	switch comp {
@@ -6238,7 +6255,21 @@ keyDone:
 	// (WorkerConfig.DestinationNamespace). Carry it onto every CDC SinkMessage so the
 	// relational write paths route to <namespace>.<bare-table> (mirrors batch). Empty
 	// => unchanged: addNamespaceParam no-ops and the connector falls back to config.
-	sm.DBOrSchema = strings.TrimSpace(cfg.DestinationNamespace)
+	//
+	// NOT for object storage. There DBOrSchema is not a namespace at all — it is the
+	// <db_or_schema> PATH SEGMENT of the bronze key, which the layout and both the
+	// SinkMessage.DestNamespace and destinationNamespaceForStats doc comments define as
+	// the SOURCE schema (the batch path fills it that way from the db_or_schema header).
+	// Assigning the destination namespace here overwrote that with whatever the
+	// orchestrator injected — for a MongoDB→GCS pipeline, the connector type — so every
+	// collection landed under bronze/mongodb/ instead of bronze/<database>/, and two
+	// source databases sharing a collection name would interleave into one path with no
+	// way to tell their rows apart. Leaving it empty hands the key to cdcObjectPath's
+	// existing fallback, which derives the schema from sm.Table ("shop.customers" →
+	// "shop"). Relational destinations are untouched.
+	if !isObjectStorageConnector(cfg.DestinationConnector) {
+		sm.DBOrSchema = strings.TrimSpace(cfg.DestinationNamespace)
+	}
 	sm.DestNamespace = destinationNamespaceForStats(cfg, sm.DBOrSchema)
 
 	return sm, nil

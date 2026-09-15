@@ -1,6 +1,7 @@
 package storage
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -66,13 +67,16 @@ func TestKeyBuilder_PartKey(t *testing.T) {
 		WithCompression("gzip").
 		WithRunDate("2024-01-15")
 
-	expected := "data/my-test-pipeline/public/users/dt=2024-01-15/part-000000.parquet.gz"
+	// Compressed parquet is still named ".parquet": the codec lives in the file's own
+	// footer, not in an external stream, so ".parquet.gz" would name a wrapper that
+	// isn't there and every reader trusting the name would fail on the object.
+	expected := "data/my-test-pipeline/public/users/dt=2024-01-15/part-000000.parquet"
 	result := kb.PartKey(0)
 	if result != expected {
 		t.Errorf("PartKey(0) = %q, want %q", result, expected)
 	}
 
-	expected = "data/my-test-pipeline/public/users/dt=2024-01-15/part-000042.parquet.gz"
+	expected = "data/my-test-pipeline/public/users/dt=2024-01-15/part-000042.parquet"
 	result = kb.PartKey(42)
 	if result != expected {
 		t.Errorf("PartKey(42) = %q, want %q", result, expected)
@@ -197,7 +201,14 @@ func TestKeyBuilder_FileExtensions(t *testing.T) {
 		{"json", "", "json"},
 		{"jsonl", "gzip", "jsonl.gz"},
 		{"ndjson", "none", "jsonl"}, // normalized
-		{"parquet", "snappy", "parquet.snappy"},
+		// Parquet carries its codec in its own footer, so the name never gains a
+		// compression suffix whatever codec is configured.
+		{"parquet", "snappy", "parquet"},
+		{"parquet", "gzip", "parquet"},
+		{"parquet", "zstd", "parquet"},
+		{"parquet", "none", "parquet"},
+		// Controls: every other format still takes the external wrapper, and must
+		// still say so in the name.
 		{"csv", "zstd", "csv.zst"},
 		{"avro", "lz4", "avro.lz4"},
 		{"json", "brotli", "json.brotli"}, // custom compression
@@ -216,7 +227,10 @@ func TestKeyBuilder_FileExtensions(t *testing.T) {
 
 			result := kb.PartKey(0)
 			expectedSuffix := "part-000000." + tt.expected
-			if !contains(result, expectedSuffix) {
+			// HasSuffix, not contains: "part-000000.parquet" is a substring of
+			// "part-000000.parquet.gz", so a contains-check would pass on exactly the
+			// wrong names the parquet rows exist to catch.
+			if !strings.HasSuffix(result, expectedSuffix) {
 				t.Errorf("PartKey(0) with format=%s, compression=%s = %q, want suffix %q",
 					tt.format, tt.compression, result, expectedSuffix)
 			}

@@ -102,8 +102,8 @@
       },
       "compression": {
         "type": "string",
-        "description": "Compression type",
-        "default": "none",
+        "description": "Compression codec. Parquet records it inside the file, so the object keeps its .parquet name; text formats (csv/tsv/json/jsonl) are wrapped and the object gains a matching suffix. Pick 'none' only if you deliberately want uncompressed objects. bzip2 is not a valid Parquet codec.",
+        "default": "gzip",
         "enum": [
           "none",
           "gzip",
@@ -330,8 +330,8 @@
       },
       "compression": {
         "type": "string",
-        "description": "Compression type",
-        "default": "none",
+        "description": "Compression codec. Parquet records it inside the file, so the object keeps its .parquet name; text formats (csv/tsv/json/jsonl) are wrapped and the object gains a matching suffix. Pick 'none' only if you deliberately want uncompressed objects. bzip2 is not a valid Parquet codec.",
+        "default": "gzip",
         "enum": [
           "none",
           "gzip",

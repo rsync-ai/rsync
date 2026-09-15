@@ -154,8 +154,18 @@ func (kb *KeyBuilder) DatasetPrefix() string {
 }
 
 // fileExtension returns the file extension based on format and compression
+//
+// Parquet is the exception: its codec lives per column chunk inside the file's own
+// footer, so a compressed parquet object is still named ".parquet". Naming it
+// ".parquet.gz" advertises an external gzip stream that isn't there, and every reader
+// that believes the name — BigQuery, hive, pyarrow — then fails on the file. The Kafka
+// sink's cdcObjectKey enforces the same rule via compressionIsInternalToFormat; the two
+// namers must agree, because either one can be the thing that wrote the object.
 func (kb *KeyBuilder) fileExtension() string {
 	ext := kb.Format
+	if strings.EqualFold(strings.TrimSpace(kb.Format), "parquet") {
+		return ext
+	}
 	if kb.Compression != "" && kb.Compression != "none" {
 		switch kb.Compression {
 		case "gzip", "gz":
