@@ -46,6 +46,14 @@ COPY shared/mcp-connectors/internal/kafka-mcp-sink/versions /app/versions
 # Build-time Go worker (overrides any checked-in binary).
 COPY --from=worker-builder /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/kafka-sink-worker /app/worker/kafka-sink-worker
 
+# Run as an unprivileged user (defense-in-depth: the sink processes untrusted
+# upstream data, so least privilege limits blast radius). Nothing here writes to
+# disk at runtime -- the Go worker streams to the destination -- so /app only
+# needs to be readable. uid 1000 matches the connector-fs-init convention; port
+# 8000 is unprivileged so no extra caps are needed.
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
+
 ENV MCP_HTTP_MODE=true
 ENV DOCKER_CONTAINER=true
 ENV MCP_PORT=8000
