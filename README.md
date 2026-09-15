@@ -9,8 +9,8 @@
 > **Describe a data pipeline in plain English. rsync plans it, asks you when it needs a
 > decision, then runs it on durable infrastructure you host yourself.**
 
-rsync.ai is a self-hosted data platform for moving data between databases, warehouses,
-object stores and APIs. You describe the job in a sentence; an agent turns it into an
+rsync.ai is an AI-native data pipeline platform. It is self-hosted and moves data between
+databases, warehouses, object stores and APIs. You describe the job in a sentence; an agent turns it into an
 explicit, staged plan, pauses for you when something is ambiguous, and executes it on
 Temporal so a long sync survives restarts. Batch and change-data-capture are both
 first-class. Twenty-one connectors ship in the box.
