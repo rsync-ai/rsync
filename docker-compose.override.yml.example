@@ -13,7 +13,7 @@ services:
   # Production routes via the api-gateway proxy; this is dev-only convenience.
   tool-generator:
     ports:
-      - "5010:5010"
+      - "127.0.0.1:5010:5010"
     environment:
       # Allow CORS from your frontend dev origin(s) for /v1/discover etc.
       - TG_ALLOWED_ORIGINS=http://localhost:3000

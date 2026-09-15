@@ -229,6 +229,16 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
+      # arm64 is cross-built on the amd64 runner. The Go and Maven builder stages
+      # compile on $BUILDPLATFORM and only emit for $TARGETARCH, so emulation is
+      # paid by the RUN steps of each runtime stage (apk/apt/pip/npm), not by
+      # the compilers. Without this step the arm64 half of every build fails
+      # with `exec format error` -- at release time, where it is expensive.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          platforms: arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
@@ -237,6 +247,11 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          # Both platforms in one manifest index, so `docker pull` and the kubelet
+          # pick the host's native image. Every doc that names a platform set
+          # declares it in a `published-platforms` sentinel checked against this
+          # line by test_published_image_platforms_match_the_docs.py.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -407,6 +422,16 @@ jobs:
             type=raw,value=${{ matrix.version }}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
+      # arm64 is cross-built on the amd64 runner. The Go and Maven builder stages
+      # compile on $BUILDPLATFORM and only emit for $TARGETARCH, so emulation is
+      # paid by the RUN steps of each runtime stage (apk/apt/pip/npm), not by
+      # the compilers. Without this step the arm64 half of every build fails
+      # with `exec format error` -- at release time, where it is expensive.
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@1f40c72289eff860ee54a304f1438e3cff362e0a # v4.3.0
+        with:
+          platforms: arm64
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4
 
@@ -415,6 +440,11 @@ jobs:
         with:
           context: ${{ matrix.context }}
           file: ${{ matrix.dockerfile }}
+          # Both platforms in one manifest index, so `docker pull` and the kubelet
+          # pick the host's native image. Every doc that names a platform set
+          # declares it in a `published-platforms` sentinel checked against this
+          # line by test_published_image_platforms_match_the_docs.py.
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

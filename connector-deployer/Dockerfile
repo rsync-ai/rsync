@@ -19,7 +19,9 @@ ARG BUILDKIT_VERSION=v0.31.2
 FROM moby/buildkit:${BUILDKIT_VERSION} AS buildkit
 
 # ---- build ----
-FROM golang:1.25 AS build
+# Compiles natively on $BUILDPLATFORM; the GOARCH=${TARGETARCH} below already made
+# this a cross-compile, so a multi-arch publish need not run it under QEMU.
+FROM --platform=$BUILDPLATFORM golang:1.25 AS build
 WORKDIR /src
 
 # Cache modules first.

@@ -40,53 +40,28 @@ Oracle's free tier has two layers:
 
 #### ARM64 compatibility
 
-<!-- published-platforms: linux/amd64 -->
+<!-- published-platforms: linux/amd64, linux/arm64 -->
 <!-- The prose below was written against that platform set, which is computed from
-     .github/workflows/docker-publish.yml, not asserted here. If the workflow starts
-     building another platform, test_published_image_platforms_match_the_docs.py goes
+     .github/workflows/docker-publish.yml, not asserted here. If the workflow's
+     platform set changes, test_published_image_platforms_match_the_docs.py goes
      red and points at this block. -->
-> [!WARNING]
-> **rsync.ai does not publish `linux/arm64` images.** Every `ghcr.io/rsync-ai/*`
-> image is built by `docker-publish.yml` on `runs-on: ubuntu-latest` with no
-> `platforms:` key on either `docker/build-push-action` step, so buildx tags each
-> one for the runner's own platform and nothing else. All 14 images the
-> quickstart compose pulls carry a single `linux/amd64` entry and no arm64 entry.
-> Both documented install paths — `install.sh` and the Helm chart — **pull** those
-> images rather than building them, so an A1.Flex VM is not a supported target
-> today without one of the workarounds below.
+A1.Flex is a supported target. Every `ghcr.io/rsync-ai/*` image is published as
+a multi-arch index with a native `linux/amd64` and a native `linux/arm64` entry,
+and the third-party dependencies (`postgres:16-alpine`, `redis:7-alpine`,
+`confluentinc/cp-kafka`, `temporalio/auto-setup`, `quay.io/minio/minio`) publish
+arm64 as well. `install.sh` and `docker compose pull` pick the host's native
+image with no emulation and no flags.
 
-This section predates published images and used to read as a green light. It is
-not one. What is true, and what is not:
-
-| | Multi-arch `linux/arm64`? |
-|---|---|
-| `postgres:16-alpine`, `redis:7-alpine`, `confluentinc/cp-kafka:7.6.1`, `temporalio/auto-setup`, `quay.io/minio/minio` | yes — the third-party dependencies are fine |
-| `ghcr.io/rsync-ai/*` (api-gateway, orchestrator, frontend, llm-service-oss, temporal-adapter, and the connector images) | **no** — `linux/amd64` only |
-
-The failure is not a clean one. `docker compose pull` reports
-`no matching manifest for linux/arm64/v8 in the manifest list entries`; on
-Kubernetes the same gap surfaces as `ImagePullBackOff` with no arm64 candidate.
-Worse, if a qemu handler *is* registered the pull succeeds and the containers
-then die with `exec format error`, which reads like an application bug.
-`install.sh` now checks the daemon's architecture up front and says so before it
-writes anything.
-
-Two ways to run on A1.Flex today:
-
-1. **Emulate.** Register the x86-64 binfmt handler, then install normally.
-   Expect a substantial slowdown, especially on the Python services:
-   ```bash
-   docker run --privileged --rm tonistiigi/binfmt --install amd64
-   ```
-2. **Build natively from source** on the VM, which produces real arm64 images:
-   ```bash
-   git clone https://github.com/rsync-ai/rsync.git && cd rsync
-   docker compose -f docker-compose.yml build
-   ```
-
-If you want a $0 VM that needs neither, take the two `VM.Standard.E2.1.Micro`
-x86 instances instead — but 1 GB of RAM each is far below the 6 GB the stack
-wants, so they suit a single external component, not the whole stack.
+> [!NOTE]
+> Multi-arch publishing applies to release tags cut after it landed. An older
+> tag carries a single `linux/amd64` entry, and on an arm64 host it fails with
+> `no matching manifest for linux/arm64/v8` — or, if a qemu handler happens to be
+> registered, runs emulated and slowly. Check the tag you are about to install:
+> ```bash
+> docker manifest inspect ghcr.io/rsync-ai/api-gateway:<tag> | grep '"architecture"'
+> ```
+> If `arm64` is missing, use a newer tag or build natively from a checkout
+> (`docker compose -f docker-compose.yml build`).
 
 #### Cost for demo stack
 | Resource | Cost |
@@ -101,7 +76,7 @@ Only external cost: OpenAI API calls (~$1–5/month for demo traffic). You can e
 #### Limitations
 - No managed Kafka (MSK equivalent) in Always Free
 - No managed PostgreSQL (RDS equivalent) in Always Free
-- **ARM64 is not a published target** — `ghcr.io/rsync-ai/*` is `linux/amd64` only; emulate or build from source (see above)
+- **ARM64 needs a multi-arch release tag** — tags cut before multi-arch publishing are `linux/amd64` only (see above)
 - Single VM — no HA for demo purposes
 
 ---

@@ -1,4 +1,8 @@
-FROM golang:1.25-alpine AS worker-builder
+# --platform=$BUILDPLATFORM: the compiler runs natively on the build host and
+# cross-compiles for $TARGETARCH, so a multi-arch publish does not run `go build`
+# under QEMU. CGO is off (no C toolchain in this image), which is what makes the
+# cross-compile a pure GOARCH switch.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS worker-builder
 ENV GONOSUMDB=* GONOSUMCHECK=* GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /src
@@ -11,7 +15,9 @@ COPY shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/ /src/shared/mcp-c
 
 WORKDIR /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
 RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux go build -o kafka-sink-worker ./cmd/kafka-sink-worker
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o kafka-sink-worker ./cmd/kafka-sink-worker
 
 FROM python:3.13-slim
 
@@ -39,6 +45,14 @@ COPY shared/mcp-connectors/internal/kafka-mcp-sink/versions /app/versions
 
 # Build-time Go worker (overrides any checked-in binary).
 COPY --from=worker-builder /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/kafka-sink-worker /app/worker/kafka-sink-worker
+
+# Run as an unprivileged user (defense-in-depth: the sink processes untrusted
+# upstream data, so least privilege limits blast radius). Nothing here writes to
+# disk at runtime -- the Go worker streams to the destination -- so /app only
+# needs to be readable. uid 1000 matches the connector-fs-init convention; port
+# 8000 is unprivileged so no extra caps are needed.
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
 
 ENV MCP_HTTP_MODE=true
 ENV DOCKER_CONTAINER=true

@@ -5,7 +5,9 @@
 # - RSync SMTs built from source (multi-stage) so builds are self-contained
 #
 
-FROM maven:3.9.9-eclipse-temurin-21 AS smt-builder
+# The SMT jar is JVM bytecode -- identical for every target -- so it is built once,
+# natively on $BUILDPLATFORM, rather than under QEMU for each platform.
+FROM --platform=$BUILDPLATFORM maven:3.9.9-eclipse-temurin-21 AS smt-builder
 WORKDIR /build
 
 # Cache dependencies with pom first

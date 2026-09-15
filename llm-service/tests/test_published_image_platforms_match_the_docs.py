@@ -1,21 +1,19 @@
 """Three files describe which platforms rsync.ai publishes. Only one of them builds.
 
-`docker-publish.yml` sets no `platforms:` key on either `docker/build-push-action`
-step, and every job runs on `ubuntu-latest`, so buildx tags each image for the
-runner's own platform and nothing else: all 14 published images carry a single
-`linux/amd64` entry. Meanwhile `docs/deployment/cloud-options.md` recommended an
-ARM64 Oracle A1.Flex VM as the flagship free tier, and said multi-arch was fine.
+`docker-publish.yml` is the only source of truth: the `platforms:` key on each
+`docker/build-push-action` step -- or, with no key, the runner's own platform --
+is the set every `ghcr.io/rsync-ai/*` image carries. The deployment docs once
+recommended an ARM64 Oracle A1.Flex VM while every image was `linux/amd64` only.
+That claim had been true when it was written, and went false silently, the way a
+status claim does: nothing fires when a doc's premise expires.
 
-That claim was true when it was written -- the product published no images then,
-and the section was about third-party dependencies. It went false silently, the
-way a status claim does: nothing fires when a doc's premise expires.
-
-So the docs no longer assert a platform set; they *declare* the one they were
+So the docs do not assert a platform set; they *declare* the one they were
 written against, in a `<!-- published-platforms: ... -->` sentinel, and this file
 computes the real set from the workflow and compares. It is deliberately
-bidirectional. Adding arm64 to the workflow is a good change, and it makes the
-warnings in both docs and the preflight in `install.sh` wrong in the obstructive
-direction -- turning the guard red is how the person doing it finds out.
+bidirectional. Adding a platform makes single-arch warnings, the installer's arch
+preflight and the quickstart's `platform:` pins wrong in the obstructive
+direction; dropping one makes the docs promise hosts the images cannot run on.
+Turning the guard red is how the person making either change finds out.
 """
 
 import os
@@ -134,6 +132,10 @@ def test_the_preflight_warns_rather_than_exiting_when_the_daemon_is_unreadable()
     reason; treating it as amd64 would hide the real warning. It has to warn and
     continue, which is also what check_ram does with an unreadable total.
     """
+    if len(_published_platforms()) > 1:
+        # Multi-arch: there is no preflight to hold to anything, and the test above
+        # asserts it stays gone. This branch pins the single-arch shape only.
+        return
     src = open(INSTALL_SH, encoding="utf-8").read()
     body = src[src.index("check_arch() {") : src.index("check_ram() {")]
     empty_branch = re.search(r'if\s+\[\[\s+-z\s+"\$darch"\s+\]\];\s*then(.*?)\n\s*fi', body, re.S)
@@ -198,3 +200,45 @@ def test_quickstart_pins_the_platform_it_publishes_on_every_ghcr_service():
         "fails with `no matching manifest for linux/arm64/v8` -- even after check_arch() has "
         "already warned the operator and they chose to continue."
     )
+
+
+def test_a_build_for_a_platform_the_runner_cannot_execute_sets_up_qemu_first():
+    """Cross-compiling the builder stage is not the whole build.
+
+    The Go and Maven builder stages run on `$BUILDPLATFORM` and only emit for
+    `$TARGETARCH`, but every runtime stage still RUNs apk/apt/pip/npm as the
+    target architecture. On an amd64 runner that needs a binfmt handler, which is
+    what `docker/setup-qemu-action` registers. Without it the arm64 half of every
+    image fails with `exec format error` -- in the publish run, where a failure
+    costs a release rather than a PR.
+    """
+    doc = yaml.safe_load(open(WORKFLOW, encoding="utf-8"))
+    foreign_builds = 0
+
+    for job_name, job in doc["jobs"].items():
+        steps = job.get("steps") or []
+        runs_on = job.get("runs-on")
+        native = RUNNER_PLATFORM.get(runs_on if isinstance(runs_on, str) else None)
+        for i, step in enumerate(steps):
+            if "build-push-action" not in str(step.get("uses", "")):
+                continue
+            declared = str((step.get("with") or {}).get("platforms") or "")
+            foreign = {p.strip() for p in declared.split(",") if p.strip()} - {native}
+            if not foreign:
+                continue
+            foreign_builds += 1
+            assert any("setup-qemu-action" in str(s.get("uses", "")) for s in steps[:i]), (
+                f"job {job_name!r} builds {sorted(foreign)} on a {native} runner "
+                f"(runs-on={runs_on!r}) with no docker/setup-qemu-action step before its "
+                "build-push step. Every runtime-stage RUN for those platforms will fail "
+                "with `exec format error`."
+            )
+
+    # Anti-vacuity: a multi-arch workflow whose build steps this loop failed to see
+    # would otherwise pass with nothing checked.
+    if len(_published_platforms()) > 1:
+        assert foreign_builds >= 2, (
+            f"docker-publish.yml publishes {sorted(_published_platforms())} but only "
+            f"{foreign_builds} build-push step(s) were checked for a QEMU setup -- expected "
+            "the image and connector builds"
+        )

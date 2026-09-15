@@ -30,7 +30,7 @@ services:
       MYSQL_USER: rsync
       MYSQL_PASSWORD: rsyncpass
     ports:
-      - "3306:3306"
+      - "127.0.0.1:3306:3306"
     volumes:
       - mysql_source_data:/var/lib/mysql
     healthcheck:
@@ -51,7 +51,7 @@ services:
       POSTGRES_PASSWORD: rsyncpass
       POSTGRES_DB: dest_db
     ports:
-      - "5433:5432"
+      - "127.0.0.1:5433:5432"
     volumes:
       - postgres_dest_data:/var/lib/postgresql/data
     healthcheck:

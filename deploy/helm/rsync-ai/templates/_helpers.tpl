@@ -849,17 +849,15 @@ docker-compose.yml gives every one of these `postgres: condition: service_health
 a startup Dial loses and workflows come up disabled. Kubernetes has no depends_on,
 and the chart shipped without an equivalent, so that race was wide open here.
 
-It matters more on Kubernetes than it did on compose, because losing the race here
-is not self-correcting. The api-gateway does not crash: db.Init retries the ping
-for 60s (DB_CONNECT_TIMEOUT, api-gateway/internal/db/db.go), and if the deadline
-passes it logs one warning and carries on -- but main() only runs migrations inside
-Init's success branch (cmd/server/main.go:306), so schemaReady stays false for the
-life of the process. Postgres arriving a minute later does not fix it: the pool
-pings fine and /ready still answers 503 schema_not_migrated, so the pod sits at 0/1
-until something restarts it. That failure is loud -- readiness is /ready, not
-/health -- but "loud and permanent" is still a broken install. Waiting here is what
-makes the boot order deterministic instead of leaving it to whichever pod the
-scheduler starts first.
+Losing the race here is recoverable but slow. db.Init retries the ping for 60s
+(DB_CONNECT_TIMEOUT, api-gateway/internal/db/db.go); if the deadline passes, main()
+exits non-zero (cmd/server/main.go) and the kubelet restarts the container. It exits
+rather than carrying on because migrations only run in Init's success branch -- a
+process that continued would answer /ready 503 schema_not_migrated forever, even
+after Postgres arrived. Each lost race still costs a minute plus CrashLoopBackOff's
+growing delay and a restart count that reads like a bug. Waiting here is what makes
+the boot order deterministic instead of leaving it to whichever pod the scheduler
+starts first.
 
 Uses the calling service's OWN image so this adds no image to pull; every app image
 in this chart carries sh and nc (verified in-cluster, not assumed).

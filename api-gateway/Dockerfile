@@ -1,4 +1,8 @@
-FROM golang:1.25-alpine AS builder
+# --platform=$BUILDPLATFORM: the compiler runs natively on the build host and
+# cross-compiles for $TARGETARCH, so a multi-arch publish does not run `go build`
+# under QEMU. CGO is off (no C toolchain in this image), which is what makes the
+# cross-compile a pure GOARCH switch.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 # Fix go mod download failures on new VMs (rate limits / sum DB connectivity)
 ENV GONOSUMDB=* GONOSUMCHECK=* GOPROXY=https://proxy.golang.org,direct
 
@@ -25,6 +29,8 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Copy source code
 COPY api-gateway/ /build/api-gateway/
 
+ARG TARGETOS
+ARG TARGETARCH
 # Build — mount Go build cache so incremental rebuilds reuse prior compiler output.
 # On the prod VM this cuts the go build step from ~180s to ~20s after the first build.
 RUN --mount=type=cache,target=/root/.cache/go-build \
@@ -37,7 +43,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     # this image. Prod could not be redeployed for two days as a result, which also
     # stranded two pending migrations. Every other Dockerfile here already uses the
     # package form; this was the last single-file build.
-    go build -o bin/server ./cmd/server
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o bin/server ./cmd/server
 
 FROM alpine:3.24
 
