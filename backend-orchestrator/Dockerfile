@@ -2,7 +2,7 @@
 # cross-compiles for $TARGETARCH, so a multi-arch publish does not run `go build`
 # under QEMU. CGO is off (no C toolchain in this image), which is what makes the
 # cross-compile a pure GOARCH switch.
-FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 ENV GONOSUMDB=* GONOSUMCHECK=* GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /build

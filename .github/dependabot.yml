@@ -232,7 +232,7 @@ updates:
   #     end-to-end run is the step after that, not the blocker.
   #   * golang / maven: multi-stage BUILDER stages -- they never reach a shipped
   #     layer, so the CVE benefit is exactly zero. golang additionally would ship
-  #     a binary whose stdlib is not the one `toolchain go1.25.13` pins for CI and
+  #     a binary whose stdlib is not the one the go.mod `toolchain` line pins for CI and
   #     govulncheck (see the CVE note in the go.mod files).
   #
   # These holds ARE `ignore` entries below. The first version of this block left
@@ -319,7 +319,7 @@ updates:
       - dependency-name: "debezium/connect"
         update-types: ["version-update:semver-minor", "version-update:semver-major"]
       # golang: builder stage only, so the shipped-CVE benefit is exactly zero,
-      # and a newer base builds against a stdlib that `toolchain go1.25.13` does
+      # and a newer base builds against a stdlib that the go.mod `toolchain` line does
       # not pin for CI and govulncheck. Patch bumps still flow -- that is the
       # channel that tracks the pin.
       - dependency-name: "golang"
