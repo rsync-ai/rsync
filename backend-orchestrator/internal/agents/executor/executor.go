@@ -5788,6 +5788,94 @@ func (a *Agent) produceBatchWithOutbox(ctx context.Context, kafkaTopic string, k
 	return nil
 }
 
+// deriveCDCTopicParts splits a live, provider-reported Debezium topic into the two
+// parts buildCDCSinkTopics needs: the connector topic prefix and the database/schema
+// qualifier. Debezium topics are "{prefix}.{db}.{table}" — but since the platform
+// namespaced its own topics (kafkaclient.DefaultTopicPrefix, "rsync.") the name on the
+// wire is "{ns}{prefix}.{db}.{table}", so splitting the FULL name on its first dot
+// yields the NAMESPACE as the prefix and the connector id as the db qualifier. That is
+// the exact defect this function exists to prevent: the producer side qualifies through
+// kafkaclient.Topic while this consumer side re-derived the name by hand, and
+// kafkaclient.Topic's own doc names the consequence — "a rename applied to producers but
+// missed on consumers does not fail — the consumer simply subscribes to a topic nobody
+// writes and blocks forever with no error."
+//
+// The namespace is stripped before the split and restored afterwards ONLY when the input
+// actually carried it, so a bare legacy topic on a namespaced deployment does not get a
+// namespace invented for it. An unset KAFKA_TOPIC_PREFIX (the migration lever) degrades
+// to the historical behaviour exactly.
+func deriveCDCTopicParts(kafkaTopic string) (prefix, dbQualifier string) {
+	t := strings.TrimSpace(kafkaTopic)
+	if t == "" {
+		return "", ""
+	}
+
+	ns := kafkaclient.TopicPrefix()
+	bare := t
+	hadNamespace := ns != "" && strings.HasPrefix(t, ns)
+	if hadNamespace {
+		bare = t[len(ns):]
+	}
+
+	i := strings.Index(bare, ".")
+	if i <= 0 {
+		return "", ""
+	}
+	prefix = strings.TrimSpace(bare[:i])
+	if prefix == "" {
+		return "", ""
+	}
+	if hadNamespace {
+		prefix = ns + prefix
+	}
+
+	if remainder := strings.TrimSpace(bare[i+1:]); remainder != "" {
+		if j := strings.Index(remainder, "."); j > 0 {
+			dbQualifier = strings.TrimSpace(remainder[:j])
+		}
+	}
+	return prefix, dbQualifier
+}
+
+// ensureProviderTopicSubscribed is the connector-agnostic backstop for the topic
+// rebuild below. kafkaTopic is a LIVE topic the CDC provider just reported, so a
+// correct derivation must reproduce it; if the rebuilt list does not contain it, the
+// derivation is wrong and EVERY name in the list is a topic nobody writes to. The sink
+// then subscribes, reports Stable, and delivers zero rows forever while the pipeline
+// shows healthy — the worst failure mode this system has.
+//
+// The repair is a union rather than an error on purpose. Subscribing to the
+// provider-reported topic is always safe (it is exactly what this code passed before
+// the multi-table rebuild existed), so the union cannot break a working pipeline,
+// whereas failing closed on exact string containment would false-positive on Oracle
+// (identifiers folded to uppercase) and SQL Server (extra database segment) and take
+// down connectors that were working. So: degrade to the single-table floor plus a loud
+// error, never to silence.
+//
+// Containment is compared case-insensitively for the same Oracle/SQL-Server reason.
+// The caller must run this BEFORE the EnsureTopicExists pre-create, which would
+// otherwise CREATE the bogus topics and mask the defect completely.
+func ensureProviderTopicSubscribed(topics []string, kafkaTopic, pipelineID string) []string {
+	want := strings.TrimSpace(kafkaTopic)
+	if want == "" || len(topics) == 0 {
+		return topics
+	}
+	for _, t := range topics {
+		if strings.EqualFold(strings.TrimSpace(t), want) {
+			return topics
+		}
+	}
+	log.WithFields(log.Fields{
+		"pipeline_id":     pipelineID,
+		"provider_topic":  want,
+		"derived_topics":  topics,
+		"topic_namespace": kafkaclient.TopicPrefix(),
+	}).Error("🛑 CDC topic derivation did not reproduce the provider-reported topic — " +
+		"subscribing to it as well so the sink cannot silently consume nothing. " +
+		"The derived topics are likely wrong and other tables may not be delivered.")
+	return append([]string{want}, topics...)
+}
+
 // startKafkaMCPSink starts the generic Kafka sink to write to destination
 // buildCDCSinkTopics maps HITL-selected tables to the exact Debezium topic names the
 // kafka-mcp-sink must subscribe to.
@@ -6264,22 +6352,11 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 	// the backfilled rows in "pipeline.<id>.data" are never applied to the destination.
 	// (isBatchBackfillTopic is computed once above, near the consumer-group selection.)
 	if syncMode == "cdc" && tablesCount > 0 && !isBatchBackfillTopic {
-		// Derive topic prefix from the first table topic (e.g. "cdc-4631bd14").
-		prefix := strings.TrimSpace(kafkaTopic)
-		if i := strings.Index(prefix, "."); i > 0 {
-			prefix = strings.TrimSpace(prefix[:i])
-		}
-
-		// Extract the database/schema qualifier from kafkaTopic.
-		// Debezium topic format: "{prefix}.{db}.{table}" (MySQL) or "{prefix}.{schema}.{table}" (PG).
-		// When HITL-selected table names are bare (e.g. "big_table"), we need to re-qualify them
-		// so the sink subscribes to the correct topic (e.g. "cdc-xxxx.e2e_db.big_table").
-		dbQualifier := ""
-		if remainder := strings.TrimPrefix(strings.TrimSpace(kafkaTopic), prefix+"."); remainder != "" {
-			if i := strings.Index(remainder, "."); i > 0 {
-				dbQualifier = remainder[:i]
-			}
-		}
+		// Derive the namespace-qualified topic prefix (e.g. "rsync.cdc-4631bd14") and the
+		// database/schema qualifier from the first table's live topic. Splitting the raw
+		// name on its first dot here is what broke MongoDB multi-collection CDC: it took
+		// the "rsync" namespace as the prefix. See deriveCDCTopicParts.
+		prefix, dbQualifier := deriveCDCTopicParts(kafkaTopic)
 
 		// Build topic list from selected tables.
 		if prefix != "" && len(tablesList) > 0 {
@@ -6294,6 +6371,12 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 				srcType = task.Source.Type
 			}
 			if topics := buildCDCSinkTopics(prefix, dbQualifier, srcType, tablesList, unifiedTopic); len(topics) > 0 {
+				// Backstop before the pre-create below. Skipped when a unified topic is
+				// configured: that mode deliberately remaps dimension tables away from
+				// their own Debezium topic, so the provider topic may be absent by design.
+				if unifiedTopic == "" {
+					topics = ensureProviderTopicSubscribed(topics, kafkaTopic, task.PipelineID)
+				}
 				topicsParam = topics
 			}
 		}
