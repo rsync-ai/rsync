@@ -2590,13 +2590,27 @@ func hivePartitionSegments(row map[string]interface{}, cols []string) string {
 	return b.String()
 }
 
-// timePartitionSegment builds the DMS-style time-bucket path segment for a destination's
-// partition_time_granularity — a plain date folder (no "dt=" key), matching an AWS DMS S3
-// target with date-based folder partitioning. Finer granularity appends a sub-folder:
+// timePartitionSegment builds the time-bucket path segment for a destination's
+// partition_time_granularity:
 //
-//	"", "none", "day" -> "2006-01-02"      (e.g. 2026-06-30)
-//	"hour"            -> "2006-01-02/15"
-//	"month"           -> "2006-01"
+//	"", "none" -> "2006-01-02"           (e.g. 2026-06-30)  -- legacy plain folder
+//	"day"      -> "dt=2006-01-02"         (e.g. dt=2026-06-30)
+//	"hour"     -> "dt=2006-01-02/hour=15"
+//	"month"    -> "dt=2006-01"
+//
+// An explicitly configured granularity emits Hive "key=value" segments, which is what
+// this option has always been documented to produce (cloud-storage-config.md, the
+// partition_time_granularity row: "time-bucketed prefix (dt=…[/hour=…])"). The code
+// emitted a plain date folder instead, so a CDC bronze prefix could not be registered
+// as a partitioned external table: BigQuery's hive_partitioning_mode and Athena's
+// partition projection both require literal key=value path segments, and a bare
+// "2026-06-30" folder is read as another level of the table path rather than as a
+// partition value. Every query then scans every date.
+//
+// "none" (the schema default) keeps the plain DMS-style folder, so keys written by an
+// unconfigured destination stay byte-identical and no existing layout moves underneath
+// a table someone has already registered. Opting into a granularity opts you into the
+// Hive layout.
 //
 // The returned segment has no trailing slash (cdcObjectKey adds the separator).
 func timePartitionSegment(tsMs int64, granularity string) string {
@@ -2606,10 +2620,12 @@ func timePartitionSegment(tsMs int64, granularity string) string {
 	t := time.UnixMilli(tsMs).UTC()
 	switch strings.ToLower(strings.TrimSpace(granularity)) {
 	case "hour":
-		return fmt.Sprintf("%s/%s", t.Format("2006-01-02"), t.Format("15"))
+		return fmt.Sprintf("dt=%s/hour=%s", t.Format("2006-01-02"), t.Format("15"))
 	case "month":
-		return t.Format("2006-01")
-	default: // "", "none", "day"
+		return fmt.Sprintf("dt=%s", t.Format("2006-01"))
+	case "day":
+		return fmt.Sprintf("dt=%s", t.Format("2006-01-02"))
+	default: // "", "none"
 		return utcDatePartition(tsMs)
 	}
 }

@@ -161,7 +161,9 @@ CDC bronze objects land in a layout that reads like an AWS DMS S3 target with da
 folder partitioning (sink `cdcObjectKey`):
 
 ```
-CDC:    <prefix>/<db_or_schema>/<table>/<col=val/…><YYYY-MM-DD>[/HH]/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<offset>.<ext>
+CDC:    <prefix>/<db_or_schema>/<table>/<col=val/…><time-bucket>/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<offset>.<ext>
+        where <time-bucket> = YYYY-MM-DD                 when partition_time_granularity is unset/none
+                            = dt=YYYY-MM-DD[/hour=HH]    when it is day/hour (month → dt=YYYY-MM)
 batch:  <prefix>/<dataset>/<db_or_schema>/<table>/<col=val/…>dt=<YYYY-MM-DD>/part-<offset:06d>[-<chunk>].<ext>
 ```
 
@@ -169,7 +171,14 @@ batch:  <prefix>/<dataset>/<db_or_schema>/<table>/<col=val/…>dt=<YYYY-MM-DD>/p
   There is deliberately **no** pipeline-id / dataset segment, so two pipelines writing the
   same `schema.table` must use distinct `path_prefix` values (as with DMS endpoints).
 - `<db_or_schema>` / `<table>` come from the source schema/table (`cdcObjectPath` splits
-  `sm.Table`). The date folder is **plain** (`2026-06-30`, no `dt=`) — DMS-style.
+  `sm.Table`). With `partition_time_granularity` unset (or `none`, the default) the date
+  folder is **plain** (`2026-06-30`, no `dt=`) — DMS-style. Setting a granularity opts into
+  the **Hive** layout (`dt=2026-06-30[/hour=14]`) instead, which is what a partitioned
+  external table needs: BigQuery's `hive_partitioning_mode` and Athena's partition
+  projection recognise a partition only from a literal `key=value` path segment, and read a
+  bare `2026-06-30` folder as another level of the table path — so no column exists to prune
+  on and every query scans every date. Unset stays byte-identical to the pre-existing keys,
+  so an already-registered table never has its layout move underneath it.
 - The leaf leads with the **event timestamp** (`YYYYMMDD-HHMMSSmmm`, from the change's
   source commit time) for DMS readability, then a **Kafka offset** tiebreaker (and `-p<n>`
   for a multi-partition topic). The offset is what guarantees uniqueness + idempotency: a

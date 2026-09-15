@@ -23,7 +23,13 @@ type ServerInfo struct {
 	StdinPipe       io.WriteCloser   // Pipe to write to server stdin
 	StdoutPipe      io.ReadCloser    // Pipe to read from server stdout
 	ResponseDecoder *json.Decoder    // Decoder for stdout
-	mu              sync.RWMutex     // Protect concurrent access
+	// DepsError records that the stdio runtime fell back to the system interpreter
+	// because dependency setup failed (e.g. the connectors mount is read-only, so the
+	// venv could not be created). The process still starts, so every third-party import
+	// inside the connector fails with a bare "No module named 'X'" that reads as a broken
+	// connector. Callers MUST attach this to any failure they surface.
+	DepsError string
+	mu        sync.RWMutex // Protect concurrent access
 }
 
 // ServerConfig holds configuration for starting an MCP server

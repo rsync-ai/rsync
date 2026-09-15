@@ -656,13 +656,13 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 	connectorPath := filepath.Join(sm.toolsDir, resolvedDir)
 
 	// Prepare runtime (Python, Node, Go, etc.)
-	exe, args, venvPath, err := sm.prepareRuntime(connectorPath, config.Name)
+	plan, err := sm.prepareRuntime(connectorPath, config.Name)
 	if err != nil {
 		return finish(nil, fmt.Errorf("failed to prepare runtime: %w", err))
 	}
 
 	// Prepare command
-	cmd := exec.Command(exe, args...)
+	cmd := exec.Command(plan.exe, plan.args...)
 	cmd.Dir = connectorPath
 
 	// Set environment variables from config
@@ -717,7 +717,10 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 		StartedAt: time.Now(),
 		Status:    "running",
 		ConnType:  "stdio",
-		VenvPath:  venvPath,
+		VenvPath:  plan.venvPath,
+	}
+	if plan.depsErr != nil {
+		server.DepsError = plan.depsErr.Error()
 	}
 
 	// Store server with versioned key (short critical section)
@@ -837,8 +840,21 @@ func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version stri
 	return true, building
 }
 
+// runtimePlan is how StartServer will spawn a stdio connector.
+//
+// depsErr is non-nil when dependency setup failed and exe fell back to the system
+// interpreter. The process still starts and every operation still runs, so this is the
+// only record that the connector is running without its drivers — it must reach the
+// caller, or a missing import impersonates a connector defect.
+type runtimePlan struct {
+	exe      string
+	args     []string
+	venvPath string
+	depsErr  error
+}
+
 // prepareRuntime determines the execution command based on metadata or defaults
-func (sm *ServerManager) prepareRuntime(connectorPath, name string) (string, []string, string, error) {
+func (sm *ServerManager) prepareRuntime(connectorPath, name string) (runtimePlan, error) {
 	// 1. Try to read metadata.json for runtime info
 	metadataPath := filepath.Join(connectorPath, "metadata.json")
 	var runtime string
@@ -861,18 +877,18 @@ func (sm *ServerManager) prepareRuntime(connectorPath, name string) (string, []s
 		if entrypoint == "" {
 			entrypoint = "index.js"
 		}
-		return "node", []string{filepath.Join(connectorPath, entrypoint)}, "", nil
+		return runtimePlan{exe: "node", args: []string{filepath.Join(connectorPath, entrypoint)}}, nil
 
 	case "go":
 		// Assume pre-compiled binary or go run
 		if entrypoint == "" {
 			// Look for main.go
 			if _, err := os.Stat(filepath.Join(connectorPath, "main.go")); err == nil {
-				return "go", []string{"run", filepath.Join(connectorPath, "main.go")}, "", nil
+				return runtimePlan{exe: "go", args: []string{"run", filepath.Join(connectorPath, "main.go")}}, nil
 			}
-			return "", nil, "", fmt.Errorf("unknown entrypoint for go runtime")
+			return runtimePlan{}, fmt.Errorf("unknown entrypoint for go runtime")
 		}
-		return filepath.Join(connectorPath, entrypoint), []string{}, "", nil
+		return runtimePlan{exe: filepath.Join(connectorPath, entrypoint), args: []string{}}, nil
 
 	default:
 		// Default to Python (backward compatibility)
@@ -888,18 +904,25 @@ func (sm *ServerManager) prepareRuntime(connectorPath, name string) (string, []s
 			if _, err := os.Stat(altScript); err == nil {
 				scriptPath = altScript
 			} else {
-				return "", nil, "", fmt.Errorf("connector script not found: %s", scriptPath)
+				return runtimePlan{}, fmt.Errorf("connector script not found: %s", scriptPath)
 			}
 		}
 
-		// Python setup
-		pythonExe, err := sm.ensureDependencies(connectorPath, name)
-		if err != nil {
-			log.Warnf("Failed to setup dependencies for %s: %v, using system python", name, err)
+		// Python setup. A failure here is NOT fatal — the system interpreter may already
+		// carry the connector's imports — but it is carried out in depsErr so the caller
+		// can say so when an operation then fails on a missing module.
+		pythonExe, depsErr := sm.ensureDependencies(connectorPath, name)
+		if depsErr != nil {
+			log.Warnf("Failed to setup dependencies for %s: %v, using system python", name, depsErr)
 			pythonExe = "python3"
 		}
 
-		return pythonExe, []string{scriptPath}, filepath.Join(connectorPath, "venv"), nil
+		return runtimePlan{
+			exe:      pythonExe,
+			args:     []string{scriptPath},
+			venvPath: filepath.Join(connectorPath, "venv"),
+			depsErr:  depsErr,
+		}, nil
 	}
 }
 
