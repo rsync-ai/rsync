@@ -10,6 +10,8 @@ of pymongo methods:
   * ``client.server_info()``                                   (discover_schema)
   * ``db.list_collection_names()``                             (discover_schema)
   * ``coll.find(limit=N)`` / ``coll.find(query).sort("_id", 1).limit(n)``
+  * ``coll.with_options(read_preference=...).find(filter, projection)
+    .sort([(k, d), ...]).skip(n).limit(n).max_time_ms(ms)``   (find — Data Explorer)
   * ``coll.count_documents({})``                               (discover_schema)
   * ``client.close()``
 
@@ -52,23 +54,142 @@ def _apply_id_gt(docs: List[Dict[str, Any]], query: Optional[Dict[str, Any]]):
 
 
 class FakeCursor:
-    """Supports the chained ``.find(q).sort("_id", 1).limit(n)`` and iteration."""
+    """Supports ``.find(q).sort(...).skip(n).limit(n).max_time_ms(ms)`` and iteration.
 
-    def __init__(self, docs: List[Dict[str, Any]]):
+    ``sort`` takes pymongo's two shapes: ``sort("_id", 1)`` (export) and a list of
+    ``(field, direction)`` pairs (find). ``error`` is raised on iteration, which is
+    where pymongo surfaces server errors such as ExecutionTimeout.
+    """
+
+    def __init__(self, docs: List[Dict[str, Any]], error: Optional[Exception] = None):
         self._docs = list(docs)
+        self._error = error
         self.sorted_by = None
+        self.skipped = 0
+        self.limited = None
+        self.max_time = None
 
     def sort(self, key, direction=1):
-        self.sorted_by = (key, direction)
-        self._docs.sort(key=lambda d: d.get(key), reverse=direction < 0)
+        keys = list(key) if isinstance(key, list) else [(key, direction)]
+        self.sorted_by = keys if isinstance(key, list) else (key, direction)
+        # Stable multi-key sort: apply keys last-to-first. Missing fields sort
+        # first ascending, as in MongoDB (null/missing is the lowest BSON type).
+        for field, d in reversed(keys):
+            self._docs.sort(key=lambda doc, f=field: _sort_key(doc, f), reverse=d < 0)
+        return self
+
+    def skip(self, n):
+        self.skipped = n
+        self._docs = self._docs[n:]
         return self
 
     def limit(self, n):
+        self.limited = n
         self._docs = self._docs[:n]
         return self
 
+    def max_time_ms(self, ms):
+        self.max_time = ms
+        return self
+
     def __iter__(self):
+        if self._error is not None:
+            raise self._error
         return iter(self._docs)
+
+
+def _get_path(doc: Any, path: str):
+    """Resolve a dotted path. Returns ``(found, value)``."""
+    cur = doc
+    for part in path.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return (False, None)
+    return (True, cur)
+
+
+def _sort_key(doc: Any, field: str):
+    found, value = _get_path(doc, field)
+    return (1, value) if found and value is not None else (0, 0)
+
+
+def _cmp(value, op, target) -> bool:
+    try:
+        return {"$gt": value > target, "$gte": value >= target,
+                "$lt": value < target, "$lte": value <= target}[op]
+    except TypeError:  # MongoDB does not compare across BSON types
+        return False
+
+
+def _match_condition(found: bool, value: Any, cond: Any) -> bool:
+    is_operator_doc = isinstance(cond, dict) and cond and all(
+        isinstance(k, str) and k.startswith("$") for k in cond)
+    if not is_operator_doc:
+        if isinstance(value, list) and not isinstance(cond, list):
+            return cond in value
+        return found and value == cond if cond is not None else (not found or value is None)
+    for op, target in cond.items():
+        if op == "$eq":
+            ok = _match_condition(found, value, target)
+        elif op == "$ne":
+            ok = not _match_condition(found, value, target)
+        elif op in ("$gt", "$gte", "$lt", "$lte"):
+            ok = found and value is not None and _cmp(value, op, target)
+        elif op == "$in":
+            ok = any(_match_condition(found, value, t) for t in target)
+        elif op == "$nin":
+            ok = not any(_match_condition(found, value, t) for t in target)
+        elif op == "$exists":
+            ok = found == bool(target)
+        elif op == "$not":
+            ok = not _match_condition(found, value, target)
+        elif op == "$regex":
+            import re as _re
+            flags = _re.I if "i" in cond.get("$options", "") else 0
+            ok = isinstance(value, str) and _re.search(target, value, flags) is not None
+        elif op == "$options":
+            ok = True
+        else:
+            raise NotImplementedError(f"fake matcher does not model {op}")
+        if not ok:
+            return False
+    return True
+
+
+def _match_query(doc: Dict[str, Any], query: Optional[Dict[str, Any]]) -> bool:
+    """A small query engine for ``find``: equality, comparison, $in/$nin, $exists,
+    $not, $regex, $and/$or/$nor, dotted paths. Not a full MongoDB — just enough to
+    show the connector sends the filter it validated."""
+    if not query:
+        return True
+    for key, cond in query.items():
+        if key == "$and":
+            ok = all(_match_query(doc, sub) for sub in cond)
+        elif key == "$or":
+            ok = any(_match_query(doc, sub) for sub in cond)
+        elif key == "$nor":
+            ok = not any(_match_query(doc, sub) for sub in cond)
+        else:
+            found, value = _get_path(doc, key)
+            ok = _match_condition(found, value, cond)
+        if not ok:
+            return False
+    return True
+
+
+def _project(doc: Dict[str, Any], projection: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Top-level 0/1 projection (enough for the connector's find)."""
+    if not projection:
+        return dict(doc)
+    include = {k for k, v in projection.items() if v and k != "_id"}
+    if include:
+        out = {k: v for k, v in doc.items() if k in include}
+        if projection.get("_id", 1) and "_id" in doc:
+            out = {"_id": doc["_id"], **out}
+        return out
+    exclude = {k for k, v in projection.items() if not v}
+    return {k: v for k, v in doc.items() if k not in exclude}
 
 
 class _FakeInsertManyResult:
@@ -122,18 +243,29 @@ class FakeCollection:
         self.bulk_ops: List[Dict[str, Any]] = []
         self.delete_calls: List[Dict[str, Any]] = []
         self.index_calls: List[Any] = []   # create_index keys, so tests assert indexing
+        self.options_calls: List[Dict[str, Any]] = []  # with_options kwargs (read_preference)
+        self.find_error: Optional[Exception] = None     # raised when a find cursor iterates
+        self.last_cursor: Optional[FakeCursor] = None
 
     def create_index(self, keys, **kw):
         self.index_calls.append(keys)
         # pymongo returns the index name; the value is unused by the connector.
         return "_".join(f"{k}_{d}" for k, d in keys) if isinstance(keys, list) else str(keys)
 
-    def find(self, query=None, limit=None, projection=None):
-        self.find_calls.append({"query": query, "limit": limit, "projection": projection})
-        docs = _apply_id_gt(self._docs, query)
+    def find(self, filter=None, projection=None, limit=None, **kw):
+        # pymongo's signature: find(filter=None, projection=None, ...). The log key
+        # stays "query" — existing export tests read find_calls[-1]["query"].
+        self.find_calls.append({"query": filter, "limit": limit, "projection": projection})
+        docs = [_project(d, projection) for d in self._docs if _match_query(d, filter)]
         if limit is not None:          # discover_schema: coll.find(limit=sample_size)
             docs = docs[:limit]
-        return FakeCursor(docs)
+        self.last_cursor = FakeCursor(docs, error=self.find_error)
+        return self.last_cursor
+
+    def with_options(self, **kw):
+        """pymongo returns a new Collection; returning self keeps the call logs in one place."""
+        self.options_calls.append(kw)
+        return self
 
     def count_documents(self, flt, **kw):
         return len(_apply_id_gt(self._docs, flt) if flt else self._docs)

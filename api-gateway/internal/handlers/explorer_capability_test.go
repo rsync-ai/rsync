@@ -89,10 +89,28 @@ func TestResolveExplorerCapability_Delegated(t *testing.T) {
 // never surface (they 400 on query) — resolve to Supported=false so the frontend
 // filter and the gateway gate both exclude them without any defensive code.
 func TestResolveExplorerCapability_Unsupported(t *testing.T) {
-	// mongodb is reserved for a future Document Explorer and must NOT be surfaced yet.
-	for _, ct := range []string{"snowflake", "mongodb", "shopify", "aws-s3", "gcs", "azure-blob", "stripe", "github", "metabase", "", "unknown-connector"} {
+	for _, ct := range []string{"snowflake", "shopify", "aws-s3", "gcs", "azure-blob", "stripe", "github", "metabase", "", "unknown-connector"} {
 		if cap := ResolveExplorerCapability(ct); cap.Supported {
 			t.Errorf("%q: Supported=true, want false (must not appear in Explorer)", ct)
+		}
+	}
+}
+
+// TestResolveExplorerCapability_MongoDocumentMode pins MongoDB to read-only document
+// browse: surfaced, but never with a SQL dialect or query language, so none of the SQL
+// paths (query, export, NL->SQL) can accept it.
+func TestResolveExplorerCapability_MongoDocumentMode(t *testing.T) {
+	for _, ct := range []string{"mongodb", "MongoDB", "mongodb-atlas"} {
+		cap := ResolveExplorerCapability(ct)
+		want := ExplorerCapability{
+			ExecStrategy: execDelegated, QueryLanguage: langDocument,
+			SchemaStrategy: schemaMCPDiscover, Supported: true,
+		}
+		if cap != want {
+			t.Errorf("%q: got %+v, want %+v", ct, cap, want)
+		}
+		if d := dialectFromConnectorType(ct); d != "" {
+			t.Errorf("%q: dialectFromConnectorType=%q, want empty (no NL->SQL for documents)", ct, d)
 		}
 	}
 }

@@ -23,10 +23,10 @@ type ExplorerCapability struct {
 	// dialect-routed) or execDelegated (routed through the connector's MCP export tool
 	// via the orchestrator). Empty when unsupported.
 	ExecStrategy string
-	// QueryLanguage is the user-facing query surface. Currently always langSQL (SQL
-	// editor + NL->SQL); a langDocument browse mode for document stores (MongoDB) is
-	// designed but deferred to a future Document Explorer. Drives the frontend
-	// explorer_mode.
+	// QueryLanguage is the user-facing query surface: langSQL (SQL editor + NL->SQL)
+	// or langDocument (read-only document browse through the connector's `find` tool,
+	// POST /explorer/documents/find). Drives the frontend explorer_mode. Every SQL
+	// path (query, export, NL->SQL) must require langSQL, not just Supported.
 	QueryLanguage string
 	// SchemaStrategy is how the schema panel is populated: schemaSQLIntrospection
 	// (information_schema / SHOW TABLES via the direct driver) or schemaMCPDiscover
@@ -53,10 +53,9 @@ const (
 )
 
 // User-facing query languages (also surfaced to the frontend as explorer_mode).
-// A "document" language for document stores (MongoDB) is deferred to a future
-// Document Explorer; only SQL is surfaced today.
 const (
-	langSQL = "sql"
+	langSQL      = "sql"
+	langDocument = "document"
 )
 
 // Schema discovery strategies.
@@ -134,10 +133,14 @@ func ResolveExplorerCapability(connectorType string) ExplorerCapability {
 			SchemaStrategy: schemaMCPDiscover, Supported: true,
 		}
 	case strings.Contains(ct, "mongo"):
-		// MongoDB is non-SQL (document_db). A read-only document-browse mode is
-		// designed but intentionally deferred to a future Document Explorer — for now
-		// the Data Explorer is SQL/warehouse only, so Mongo is not surfaced.
-		return ExplorerCapability{Supported: false}
+		// MongoDB is non-SQL (document_db): surfaced in read-only document-browse
+		// mode. Reads go through the connector's `find` tool via the orchestrator,
+		// collections come from discover_schema. No SQL dialect, no NL->SQL, no export,
+		// and nothing to materialize.
+		return ExplorerCapability{
+			ExecStrategy: execDelegated, QueryLanguage: langDocument,
+			SchemaStrategy: schemaMCPDiscover, Supported: true,
+		}
 	default:
 		// snowflake (reserved for a later PR), object stores, SaaS, etc. are not
 		// Explorer-queryable yet.

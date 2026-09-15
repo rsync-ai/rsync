@@ -7811,6 +7811,76 @@ func (a *Agent) ExplorerExecute(ctx context.Context, connectorType string, confi
 	return extractRowsAffected(resp.Result), nil
 }
 
+// ExplorerFindError is a `find` the connector refused or could not run. Code is the
+// connector's error_code (operator_not_allowed, invalid_filter, query_timeout,
+// connection_failed, ...) and Path locates the problem inside the request
+// (filter.$or[1].$where). The connector never puts a filter VALUE in Message.
+type ExplorerFindError struct {
+	Code    string
+	Path    string
+	Message string
+}
+
+func (e *ExplorerFindError) Error() string { return e.Message }
+
+// ExplorerFind runs a read-only document query for the Data Explorer's document mode
+// through the connector's MCP `find` tool. spec carries collection, filter,
+// projection, sort, limit, cursor and skip; the api-gateway has already validated
+// them against the same operator allowlist the connector enforces, and loaded the
+// connection workspace-scoped. Reachable only via requirePrincipal.
+//
+// Deliberately NOT executeWithRetry: a refused filter is deterministic and its
+// message does not match the retry classifier's 4xx markers, so it would be retried
+// with backoff before failing the same way. A browse click wants one attempt.
+func (a *Agent) ExplorerFind(ctx context.Context, connectorType string, config map[string]interface{}, spec map[string]interface{}) (map[string]interface{}, error) {
+	traceID := telemetry.TraceIDFromContext(ctx)
+	// SECURITY: never log the filter, projection or config values — only shape metadata.
+	log.WithField("trace_id", traceID).Infof("📄 Explorer find for %s (config_keys=%d, spec_keys=%d)", connectorType, len(config), len(spec))
+
+	stringConfig := make(map[string]string)
+	for k, v := range config {
+		stringConfig[k] = fmt.Sprintf("%v", v)
+	}
+	version := strings.TrimSpace(stringConfig["connector_version"])
+	if version == "" {
+		version = strings.TrimSpace(stringConfig["version"])
+	}
+
+	params := make(map[string]interface{}, len(spec)+1)
+	for k, v := range spec {
+		params[k] = v
+	}
+	params["config"] = stringConfig
+
+	resp, err := a.mcpClient.ExecuteWithContext(ctx, mcp.ExecuteRequest{
+		Connector: connectorType,
+		Version:   version,
+		Operation: "find",
+		Config:    stringConfig,
+		Params:    params,
+	})
+	if err != nil {
+		return nil, &ExplorerFindError{Code: "connection_failed", Message: fmt.Sprintf("explorer_find: %s connector unreachable: %v", connectorType, err)}
+	}
+	if resp == nil {
+		return nil, &ExplorerFindError{Code: "query_failed", Message: "explorer_find: empty connector response"}
+	}
+	if !resp.Success {
+		fe := &ExplorerFindError{Code: "query_failed", Message: resp.Error}
+		if code, ok := resp.Result["error_code"].(string); ok && code != "" {
+			fe.Code = code
+		}
+		if path, ok := resp.Result["path"].(string); ok {
+			fe.Path = path
+		}
+		if fe.Message == "" {
+			fe.Message = "explorer_find: find reported failure"
+		}
+		return nil, fe
+	}
+	return resp.Result, nil
+}
+
 // extractRowsAffected pulls an affected-row count out of an MCP `execute` result,
 // tolerating the common key spellings connectors use (JSON numbers decode to float64).
 // Returns nil when no count is present.

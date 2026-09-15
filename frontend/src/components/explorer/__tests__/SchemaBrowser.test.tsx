@@ -106,6 +106,24 @@ describe("SchemaBrowser (Athena layout)", () => {
     expect(screen.queryByRole("button", { name: "orders" })).not.toBeInTheDocument()
   })
 
+  it("names the items with itemLabel (document mode: collections)", () => {
+    const onInsertTable = vi.fn()
+    render(
+      <SchemaBrowser
+        tables={TABLES}
+        itemLabel="collections"
+        insertTitle="Open collection"
+        onInsertTable={onInsertTable}
+      />,
+    )
+    expect(screen.getByText("Collections (1)")).toBeInTheDocument()
+    expect(screen.queryByText(/Tables \(/)).not.toBeInTheDocument()
+    expect(screen.getByPlaceholderText("Filter collections…")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Insert table events" })).toHaveAttribute("title", "Open collection")
+    fireEvent.change(screen.getByPlaceholderText("Filter collections…"), { target: { value: "zzz" } })
+    expect(screen.getByText(/No collections match/)).toBeInTheDocument()
+  })
+
   it("shows a loading state", () => {
     render(<SchemaBrowser tables={[]} loading />)
     expect(screen.getByText(/loading/i)).toBeInTheDocument()
