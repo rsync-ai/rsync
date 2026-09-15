@@ -14,7 +14,7 @@ notices are reproduced here to satisfy their redistribution terms. Nothing here 
 > release tree and commit the result. A blocking [`Licenses`](.github/workflows/licenses.yml)
 > CI check independently fails any PR that introduces a new GPL / AGPL / SSPL / BUSL dependency.
 
-_Inventory: 137 Go module@version rows, 27 Python packages, 49 frontend (npm) direct
+_Inventory: 138 Go module@version rows, 27 Python packages, 49 frontend (npm) direct
 production dependencies._
 
 > **Provenance, honestly.** The Go table was rebuilt on 2026-08-25 directly from
@@ -53,7 +53,7 @@ must remain separable and replaceable.
 
 ## License distribution (shipped surface)
 
-- **Go** (137 module@version rows): Apache-2.0 x 59; MIT x 43; BSD-3-Clause x 24; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
+- **Go** (138 module@version rows): Apache-2.0 x 59; MIT x 43; BSD-3-Clause x 25; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
 - **Python** (27 packages): Apache-2.0 x 9; MIT x 7; BSD-3-Clause x 6; Apache-2.0 OR BSD-3-Clause x 2; LGPL-3.0-or-later x 1; MIT-0 x 1; UPL-1.0 OR Apache-2.0 x 1
 - **Frontend** (49 direct prod deps): MIT x 46; Apache-2.0 x 2; ISC x 1
 
@@ -100,7 +100,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/facebookgo/clock](https://github.com/facebookgo/clock) | v0.0.0-20150410010913-600d898af40a | MIT |
 | [github.com/felixge/httpsnoop](https://github.com/felixge/httpsnoop) | v1.0.4 | MIT |
 | [github.com/fsnotify/fsnotify](https://github.com/fsnotify/fsnotify) | v1.9.0 | BSD-3-Clause |
-| [github.com/gabriel-vasile/mimetype](https://github.com/gabriel-vasile/mimetype) | v1.4.13 | MIT |
+| [github.com/gabriel-vasile/mimetype](https://github.com/gabriel-vasile/mimetype) | v1.4.15 | MIT |
 | [github.com/gin-contrib/sse](https://github.com/gin-contrib/sse) | v1.1.0 | MIT |
 | [github.com/gin-gonic/gin](https://github.com/gin-gonic/gin) | v1.12.0 | MIT |
 | [github.com/go-logr/logr](https://github.com/go-logr/logr) | v1.4.3 | Apache-2.0 |
@@ -108,7 +108,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/go-logr/stdr](https://github.com/go-logr/stdr) | v1.2.2 | Apache-2.0 |
 | [github.com/go-playground/locales](https://github.com/go-playground/locales) | v0.14.1 | MIT |
 | [github.com/go-playground/universal-translator](https://github.com/go-playground/universal-translator) | v0.18.1 | MIT |
-| [github.com/go-playground/validator/v10](https://github.com/go-playground/validator) | v10.30.3 | MIT |
+| [github.com/go-playground/validator/v10](https://github.com/go-playground/validator) | v10.30.4 | MIT |
 | [github.com/go-redis/redis/v8](https://github.com/go-redis/redis) | v8.11.5 | BSD-2-Clause |
 | [github.com/go-sql-driver/mysql](https://github.com/go-sql-driver/mysql) | v1.10.1 | MPL-2.0 |
 | [github.com/go-viper/mapstructure/v2](https://github.com/go-viper/mapstructure) | v2.5.0 | MIT |
@@ -125,7 +125,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/hashicorp/go-uuid](https://github.com/hashicorp/go-uuid) | v1.0.3 | MPL-2.0 |
 | [github.com/jackc/pgpassfile](https://github.com/jackc/pgpassfile) | v1.0.0 | MIT |
 | [github.com/jackc/pgservicefile](https://github.com/jackc/pgservicefile) | v0.0.0-20240606120523-5a60cdf6a761 | MIT |
-| [github.com/jackc/pgx/v5](https://github.com/jackc/pgx) | v5.10.0 | MIT |
+| [github.com/jackc/pgx/v5](https://github.com/jackc/pgx) | v5.11.0 | MIT |
 | [github.com/jackc/puddle/v2](https://github.com/jackc/puddle) | v2.2.2 | MIT |
 | [github.com/jcmturner/aescts/v2](https://github.com/jcmturner/aescts) | v2.0.0 | Apache-2.0 |
 | [github.com/jcmturner/dnsutils/v2](https://github.com/jcmturner/dnsutils) | v2.0.0 | Apache-2.0 |
@@ -134,7 +134,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/jcmturner/rpc/v2](https://github.com/jcmturner/rpc) | v2.0.3 | Apache-2.0 |
 | [github.com/klauspost/compress](https://github.com/klauspost/compress) | v1.19.1 | BSD-3-Clause |
 | [github.com/klauspost/compress](https://github.com/klauspost/compress) | v1.19.2 | BSD-3-Clause |
-| [github.com/leodido/go-urn](https://github.com/leodido/go-urn) | v1.4.0 | MIT |
+| [github.com/leodido/go-urn](https://github.com/leodido/go-urn) | v1.5.0 | MIT |
 | [github.com/linkedin/goavro/v2](https://github.com/linkedin/goavro) | v2.15.0 | Apache-2.0 |
 | [github.com/mattn/go-isatty](https://github.com/mattn/go-isatty) | v0.0.20 | MIT |
 | [github.com/microsoft/go-mssqldb](https://github.com/microsoft/go-mssqldb) | v1.11.0 | BSD-3-Clause |
@@ -188,16 +188,17 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [go.opentelemetry.io/otel/trace](https://github.com/open-telemetry/opentelemetry-go) | v1.44.0 | Apache-2.0 |
 | [go.opentelemetry.io/otel/trace](https://github.com/open-telemetry/opentelemetry-go) | v1.46.0 | Apache-2.0 |
 | [go.opentelemetry.io/proto/otlp](https://github.com/open-telemetry/opentelemetry-proto-go) | v1.11.0 | Apache-2.0 |
-| [go.temporal.io/api](https://github.com/temporalio/api-go) | v1.63.5 | MIT |
+| [go.temporal.io/api](https://github.com/temporalio/api-go) | v1.63.6 | MIT |
 | [go.temporal.io/sdk](https://github.com/temporalio/sdk-go) | v1.48.0 | MIT |
 | [go.uber.org/atomic](https://github.com/uber-go/atomic) | v1.11.0 | MIT |
 | [go.yaml.in/yaml/v3](https://github.com/yaml/go-yaml) | v3.0.5 | Apache-2.0 |
-| [golang.org/x/crypto](https://cs.opensource.google/go/x/crypto) | v0.55.0 | BSD-3-Clause |
+| [golang.org/x/crypto](https://cs.opensource.google/go/x/crypto) | v0.57.0 | BSD-3-Clause |
 | [golang.org/x/net](https://cs.opensource.google/go/x/net) | v0.58.0 | BSD-3-Clause |
 | [golang.org/x/sync](https://cs.opensource.google/go/x/sync) | v0.22.0 | BSD-3-Clause |
-| [golang.org/x/sys](https://cs.opensource.google/go/x/sys) | v0.47.0 | BSD-3-Clause |
+| [golang.org/x/sync](https://cs.opensource.google/go/x/sync) | v0.23.0 | BSD-3-Clause |
+| [golang.org/x/sys](https://cs.opensource.google/go/x/sys) | v0.48.0 | BSD-3-Clause |
 | [golang.org/x/text](https://cs.opensource.google/go/x/text) | v0.40.0 | BSD-3-Clause |
-| [golang.org/x/text](https://cs.opensource.google/go/x/text) | v0.41.0 | BSD-3-Clause |
+| [golang.org/x/text](https://cs.opensource.google/go/x/text) | v0.42.0 | BSD-3-Clause |
 | [golang.org/x/time](https://cs.opensource.google/go/x/time) | v0.3.0 | BSD-3-Clause |
 | [golang.org/x/time](https://cs.opensource.google/go/x/time) | v0.5.0 | BSD-3-Clause |
 | [google.golang.org/genproto/googleapis/api](https://github.com/googleapis/go-genproto) | v0.0.0-20260819154853-08b0e4226688 | Apache-2.0 |

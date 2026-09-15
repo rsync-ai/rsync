@@ -191,8 +191,9 @@ jobs:
           go-version-file: ${{ matrix.module }}/go.mod
           cache: false   # setup-go auto-cache uploads ~3GB per job for no gain here (ci.yml convention)
       # Reachability-based: only fails when the vulnerable symbol is actually
-      # called. setup-go honors the go.mod `toolchain` directive (go1.25.13),
-      # so this analyzes against the PATCHED stdlib — matching the Docker base.
+      # called. setup-go honors the go.mod `toolchain` directive (go1.26.8 for
+      # the three services, go1.25.13 for the other modules), so this analyzes
+      # against the PATCHED stdlib — matching the Docker base.
       # A NEW stdlib CVE surfaces here until the toolchain pin is bumped.
       # A module MAY carry a `.govulncheck-allow.txt` listing GO-XXXX-XXXX IDs it
       # consciously accepts (with justification in that file). The gate still fails
