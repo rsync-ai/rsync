@@ -38,6 +38,8 @@ function view(overrides: Record<string, unknown> = {}) {
       password_configured: true,
       from: "alerts@example.com",
       tls_mode: "starttls",
+      categories: { health: false },
+      extra_recipients: ["oncall@example.com"],
     },
     categories: [
       { id: "data_loss", label: "Data loss & integrity", description: "Rows may be missing." },
@@ -137,6 +139,26 @@ describe("Admin Notifications — editing and saving", () => {
     expect(put.url).toContain("/api/v1/admin/notifications/channels")
     expect(put.body.slack).toEqual({ enabled: true, webhook_url: null, categories: { health: false, data_loss: false } })
     expect(put.body.email).toMatchObject({ smtp_host: "mail.example.org", smtp_port: 587, smtp_password: null, tls_mode: "starttls" })
+  })
+
+  it("shows and saves which alerts are emailed and the alert list", async () => {
+    await renderLoaded()
+
+    expect(screen.getByRole("switch", { name: "Email: Health & capacity" })).toHaveAttribute("aria-checked", "false")
+    expect(screen.getByRole("switch", { name: "Email: Data loss & integrity" })).toHaveAttribute("aria-checked", "true")
+    expect(screen.getByLabelText("Also send to")).toHaveValue("oncall@example.com")
+
+    fireEvent.click(screen.getByRole("switch", { name: "Email: Data loss & integrity" }))
+    fireEvent.change(screen.getByLabelText("Also send to"), {
+      target: { value: "oncall@example.com\n  team@example.com, \n\nlead@example.com" },
+    })
+    mockFetch.mockResolvedValueOnce(res(200, view()))
+    fireEvent.click(screen.getByRole("button", { name: SAVE }))
+
+    await waitFor(() => expect(lastCall("PUT")).not.toBeNull())
+    const put = lastCall("PUT")!
+    expect(put.body.email.categories).toEqual({ health: false, data_loss: false })
+    expect(put.body.email.extra_recipients).toEqual(["oncall@example.com", "team@example.com", "lead@example.com"])
   })
 
   it("sends an empty string only when the admin removes a saved secret", async () => {

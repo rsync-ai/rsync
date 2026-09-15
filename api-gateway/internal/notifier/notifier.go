@@ -663,9 +663,37 @@ func (n *Notifier) deliver(ctx context.Context, userID string, p notificationPay
 			delivered = true
 		}
 	}
-	if plan.email {
-		if err := n.sendEmail(ctx, cfg.Email, userID, p, r); err != nil {
+	ownerAddress := ""
+	if plan.ownerEmail {
+		addr, err := n.ownerEmailAddress(ctx, userID)
+		if err == nil {
+			err = n.sendEmail(ctx, cfg.Email, addr, p, r, fmt.Sprintf(
+				"You can choose which alerts you receive by email in your rsync-ai settings: %s",
+				absoluteActionURL(n.appBaseURL, "/settings")))
+		}
+		if err != nil {
 			errs = append(errs, "email: "+err.Error())
+		} else {
+			delivered = true
+			ownerAddress = addr
+		}
+	}
+	for _, to := range plan.listEmail {
+		// One copy per person: an owner who already got theirs is skipped. An
+		// owner whose own copy failed still gets the list copy.
+		if ownerAddress != "" && strings.EqualFold(to, ownerAddress) {
+			continue
+		}
+		// Each address is its own send, so one bad address neither blocks the
+		// others nor reveals the list in a shared To: header.
+		if err := n.sendEmail(ctx, cfg.Email, to, p, r, fmt.Sprintf(
+			"You receive this because an rsync-ai admin added this address to the instance alert list. Admins manage the list at: %s",
+			absoluteActionURL(n.appBaseURL, "/admin/notifications"))); err != nil {
+			// delivery_error lives on the owner's notification row, so the
+			// address (admin-managed, possibly outside the org) goes to the log
+			// only.
+			log.WithError(err).WithField("to", to).Warn("notifier: alert list email failed")
+			errs = append(errs, "email (alert list): "+err.Error())
 		} else {
 			delivered = true
 		}
@@ -774,19 +802,24 @@ func (n *Notifier) slackPayload(p notificationPayload, r Rendered, actionable bo
 	}
 }
 
-func (n *Notifier) sendEmail(ctx context.Context, ch EmailChannel, userID string, p notificationPayload, r Rendered) error {
-	// Every email alert goes to the pipeline owner's account address.
+// ownerEmailAddress is the pipeline owner's account address.
+func (n *Notifier) ownerEmailAddress(ctx context.Context, userID string) (string, error) {
 	var email sql.NullString
 	err := n.db.QueryRowContext(ctx,
 		`SELECT email FROM users WHERE id = $1`, userID,
 	).Scan(&email)
 	if err != nil {
-		return fmt.Errorf("user email lookup: %w", err)
+		return "", fmt.Errorf("user email lookup: %w", err)
 	}
 	if !email.Valid || strings.TrimSpace(email.String) == "" {
-		return fmt.Errorf("user has no email")
+		return "", fmt.Errorf("user has no email")
 	}
+	return email.String, nil
+}
 
+// sendEmail sends one alert to one address. footer says why this address gets
+// it and where to change that, which differs for the owner and the alert list.
+func (n *Notifier) sendEmail(ctx context.Context, ch EmailChannel, to string, p notificationPayload, r Rendered, footer string) error {
 	pipelineLabel := r.PipelineName
 	if pipelineLabel == "" {
 		pipelineLabel = p.PipelineID
@@ -794,15 +827,15 @@ func (n *Notifier) sendEmail(ctx context.Context, ch EmailChannel, userID string
 
 	subject := fmt.Sprintf("[rsync-ai %s] %s", strings.ToUpper(r.Severity), r.Title)
 	body := fmt.Sprintf(
-		"%s\n\nPipeline: %s\n%s: %s\n\nYou can choose which alerts you receive by email in your rsync-ai settings: %s\n\n--\nAutomated message from rsync-ai notifier",
+		"%s\n\nPipeline: %s\n%s: %s\n\n%s\n\n--\nAutomated message from rsync-ai notifier",
 		bodyText(p.Message, r.Impact),
 		pipelineLabel,
 		r.ActionLabel,
 		absoluteActionURL(n.appBaseURL, p.ActionURL),
-		absoluteActionURL(n.appBaseURL, "/settings"),
+		footer,
 	)
 
-	return sendSMTP(ctx, ch, email.String, emailMessage{Subject: subject, Body: body})
+	return sendSMTP(ctx, ch, to, emailMessage{Subject: subject, Body: body})
 }
 
 // classifySeverity maps event types to {info, warning, critical}.

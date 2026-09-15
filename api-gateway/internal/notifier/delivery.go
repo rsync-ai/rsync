@@ -32,8 +32,9 @@ const (
 	// StatusSuppressed: no channel is configured at all. Persist-only mode.
 	StatusSuppressed = "suppressed"
 	// StatusSkipped: channels are configured, but every one that would have
-	// carried this alert is muted for its category (or the owner turned email
-	// off). Distinct from suppressed and failed on purpose: "you asked not to be
+	// carried this alert is muted for its category (by the admin, or by the
+	// owner for their own email, with no extra recipients left to email).
+	// Distinct from suppressed and failed on purpose: "you asked not to be
 	// told" must never look like "we could not tell you".
 	StatusSkipped = "skipped"
 )
@@ -50,25 +51,39 @@ var ErrChannelNotEnabled = errors.New("that channel is not enabled")
 // smtpRootCAs overrides the system trust store. Tests only.
 var smtpRootCAs *x509.CertPool
 
-// deliveryPlan is which channels one alert goes to. status is set, and both
-// channels are false, when nothing will be sent.
+// deliveryPlan is who one alert goes to. status is set, and nothing else is,
+// when nothing will be sent.
 type deliveryPlan struct {
-	slack  bool
-	email  bool
-	status string
+	slack bool
+	// ownerEmail: the pipeline owner, at their account address.
+	ownerEmail bool
+	// listEmail: the admin's extra recipients. Not de-duplicated against the
+	// owner here, because the owner's address is only known at send time.
+	listEmail []string
+	status    string
 }
 
-// planDelivery applies the admin's Slack mutes and the owner's email choices to
-// one alert. Pure, so the whole matrix is unit-tested.
+// planDelivery applies the admin's Slack and email mutes, the admin's extra
+// recipients, and the owner's email choices to one alert:
+//
+//   - a category the admin muted for email is emailed to nobody
+//   - otherwise the owner is emailed unless they turned email off or muted it
+//   - and every extra recipient is emailed, whatever the owner chose
+//
+// Pure, so the whole matrix is unit-tested.
 func planDelivery(cfg ChannelConfig, category string, prefs EmailPreferences) deliveryPlan {
 	if !cfg.Slack.Enabled && !cfg.Email.Enabled {
 		return deliveryPlan{status: StatusSuppressed}
 	}
+	emailAllowed := cfg.Email.Enabled && !mutedSet(cfg.Email.Muted)[category]
 	p := deliveryPlan{
-		slack: cfg.Slack.Enabled && !mutedSet(cfg.Slack.Muted)[category],
-		email: cfg.Email.Enabled && prefs.Enabled && !mutedSet(prefs.Muted)[category],
+		slack:      cfg.Slack.Enabled && !mutedSet(cfg.Slack.Muted)[category],
+		ownerEmail: emailAllowed && prefs.Enabled && !mutedSet(prefs.Muted)[category],
 	}
-	if !p.slack && !p.email {
+	if emailAllowed {
+		p.listEmail = cfg.Email.ExtraRecipients
+	}
+	if !p.slack && !p.ownerEmail && len(p.listEmail) == 0 {
 		p.status = StatusSkipped
 	}
 	return p
@@ -264,7 +279,7 @@ func SendTestNotification(ctx context.Context, db *sql.DB, channel, toEmail stri
 	if err != nil {
 		return err
 	}
-	settingsURL := appBaseURLFromEnv() + "/admin"
+	settingsURL := appBaseURLFromEnv() + "/admin/notifications"
 	switch channel {
 	case "slack":
 		if !cfg.Slack.Enabled {
@@ -282,7 +297,8 @@ func SendTestNotification(ctx context.Context, db *sql.DB, channel, toEmail stri
 			Subject: "[rsync-ai] Test notification",
 			Body: "Email alerts are working for this rsync-ai instance.\n\n" +
 				"Pipeline owners will receive alerts at their account email address, " +
-				"and can choose which kinds they get in their settings.\n\n" +
+				"and can choose which kinds they get in their settings. " +
+				"Addresses on the admin's alert list receive every alert the admin has not turned off.\n\n" +
 				"Manage notification channels: " + settingsURL + "\n\n--\nAutomated message from rsync-ai notifier",
 		})
 	default:

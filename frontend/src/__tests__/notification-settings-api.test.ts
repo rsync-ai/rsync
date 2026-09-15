@@ -72,6 +72,14 @@ describe("admin notification channels API", () => {
     expect(body.email).toHaveProperty("smtp_password", null)
   })
 
+  it("defaults the email category map and alert list when a gateway omits them", async () => {
+    mockFetch.mockResolvedValue(jsonResponse(CHANNELS))
+    const view = await getNotificationChannels()
+
+    expect(view.email.categories).toEqual({})
+    expect(view.email.extra_recipients).toEqual([])
+  })
+
   it("rejects a 200 whose body is not the channels view", async () => {
     mockFetch.mockResolvedValue(jsonResponse({ settings: {} }))
     await expect(getNotificationChannels()).rejects.toBeInstanceOf(NotificationSettingsError)
@@ -114,6 +122,14 @@ describe("notification preferences API", () => {
 
     expect(prefs.email_categories.other).toBe(false)
     expect(String(mockFetch.mock.calls[0][0])).toContain("/api/v1/notifications/preferences")
+  })
+
+  it("defaults the admin's blocked categories to none", async () => {
+    mockFetch.mockResolvedValue(jsonResponse(PREFS))
+    expect((await getNotificationPreferences()).email_blocked_categories).toEqual([])
+
+    mockFetch.mockResolvedValue(jsonResponse({ ...PREFS, email_blocked_categories: ["health"] }))
+    expect((await getNotificationPreferences()).email_blocked_categories).toEqual(["health"])
   })
 
   it("rejects a body with no email_enabled instead of defaulting it", async () => {

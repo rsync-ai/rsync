@@ -10,7 +10,8 @@ package notifier
 //
 // Arrays cross the driver as comma-joined strings (array_to_string /
 // string_to_array) because this module runs on pgx and has no pq.Array. Category
-// ids are [a-z_] and never contain a comma.
+// ids are [a-z_] and never contain a comma; the admin handler rejects an extra
+// email recipient that does.
 
 import (
 	"context"
@@ -66,14 +67,19 @@ type SlackChannel struct {
 
 // EmailChannel is the effective SMTP configuration, secrets decrypted.
 type EmailChannel struct {
-	Enabled   bool
-	Host      string
-	Port      int
-	Username  string
-	Password  string
-	From      string
-	TLSMode   string
-	SecretErr error
+	Enabled  bool
+	Host     string
+	Port     int
+	Username string
+	Password string
+	From     string
+	TLSMode  string
+	// Muted categories are emailed to nobody, whatever the owner chose.
+	Muted []string
+	// ExtraRecipients get every email alert that is not Muted, regardless of
+	// any user's preferences.
+	ExtraRecipients []string
+	SecretErr       error
 }
 
 // ChannelConfig is what the notifier delivers through.
@@ -98,6 +104,8 @@ type StoredChannelSettings struct {
 	SMTPPasswordEncrypted string
 	SMTPFrom              string
 	SMTPTLSMode           string
+	EmailMuted            []string
+	EmailExtraRecipients  []string
 
 	UpdatedAt time.Time
 }
@@ -106,18 +114,19 @@ type StoredChannelSettings struct {
 // saved channels yet.
 func ReadStoredChannelSettings(ctx context.Context, db *sql.DB) (*StoredChannelSettings, error) {
 	var (
-		s     StoredChannelSettings
-		muted string
+		s                                  StoredChannelSettings
+		muted, emailMuted, extraRecipients string
 	)
 	err := db.QueryRowContext(ctx, `
 		SELECT slack_enabled, slack_webhook_encrypted, array_to_string(slack_muted_categories, ','),
 		       email_enabled, smtp_host, smtp_port, smtp_username, smtp_password_encrypted,
-		       smtp_from, smtp_tls_mode, updated_at
+		       smtp_from, smtp_tls_mode, array_to_string(email_muted_categories, ','),
+		       array_to_string(email_extra_recipients, ','), updated_at
 		FROM notification_channel_settings
 		WHERE id = 1`,
 	).Scan(&s.SlackEnabled, &s.SlackWebhookEncrypted, &muted,
 		&s.EmailEnabled, &s.SMTPHost, &s.SMTPPort, &s.SMTPUsername, &s.SMTPPasswordEncrypted,
-		&s.SMTPFrom, &s.SMTPTLSMode, &s.UpdatedAt)
+		&s.SMTPFrom, &s.SMTPTLSMode, &emailMuted, &extraRecipients, &s.UpdatedAt)
 	if errors.Is(err, sql.ErrNoRows) || isUndefinedTable(err) {
 		// A missing table means migration 102 has not run. The migration runner
 		// logs and starts anyway on failure, so this must read as "no row" (the
@@ -128,6 +137,8 @@ func ReadStoredChannelSettings(ctx context.Context, db *sql.DB) (*StoredChannelS
 		return nil, fmt.Errorf("read notification channel settings: %w", err)
 	}
 	s.SlackMuted = splitIDList(muted)
+	s.EmailMuted = splitIDList(emailMuted)
+	s.EmailExtraRecipients = splitIDList(extraRecipients)
 	return &s, nil
 }
 
@@ -137,9 +148,11 @@ func WriteStoredChannelSettings(ctx context.Context, db *sql.DB, s StoredChannel
 		INSERT INTO notification_channel_settings
 			(id, slack_enabled, slack_webhook_encrypted, slack_muted_categories,
 			 email_enabled, smtp_host, smtp_port, smtp_username, smtp_password_encrypted,
-			 smtp_from, smtp_tls_mode, updated_by, updated_at)
+			 smtp_from, smtp_tls_mode, email_muted_categories, email_extra_recipients,
+			 updated_by, updated_at)
 		VALUES
-			(1, $1, $2, string_to_array($3, ','), $4, $5, $6, $7, $8, $9, $10, NULLIF($11, '')::uuid, NOW())
+			(1, $1, $2, string_to_array($3, ','), $4, $5, $6, $7, $8, $9, $10,
+			 string_to_array($11, ','), string_to_array($12, ','), NULLIF($13, '')::uuid, NOW())
 		ON CONFLICT (id) DO UPDATE SET
 			slack_enabled           = EXCLUDED.slack_enabled,
 			slack_webhook_encrypted = EXCLUDED.slack_webhook_encrypted,
@@ -151,11 +164,14 @@ func WriteStoredChannelSettings(ctx context.Context, db *sql.DB, s StoredChannel
 			smtp_password_encrypted = EXCLUDED.smtp_password_encrypted,
 			smtp_from               = EXCLUDED.smtp_from,
 			smtp_tls_mode           = EXCLUDED.smtp_tls_mode,
+			email_muted_categories  = EXCLUDED.email_muted_categories,
+			email_extra_recipients  = EXCLUDED.email_extra_recipients,
 			updated_by              = EXCLUDED.updated_by,
 			updated_at              = NOW()`,
 		s.SlackEnabled, s.SlackWebhookEncrypted, strings.Join(s.SlackMuted, ","),
 		s.EmailEnabled, s.SMTPHost, s.SMTPPort, s.SMTPUsername, s.SMTPPasswordEncrypted,
-		s.SMTPFrom, s.SMTPTLSMode, updatedBy)
+		s.SMTPFrom, s.SMTPTLSMode, strings.Join(s.EmailMuted, ","), strings.Join(s.EmailExtraRecipients, ","),
+		updatedBy)
 	if err != nil {
 		return fmt.Errorf("write notification channel settings: %w", err)
 	}
@@ -168,12 +184,14 @@ func (s StoredChannelSettings) Decrypt() ChannelConfig {
 		Source: SourceDatabase,
 		Slack:  SlackChannel{Enabled: s.SlackEnabled, Muted: s.SlackMuted},
 		Email: EmailChannel{
-			Enabled:  s.EmailEnabled,
-			Host:     s.SMTPHost,
-			Port:     s.SMTPPort,
-			Username: s.SMTPUsername,
-			From:     s.SMTPFrom,
-			TLSMode:  s.SMTPTLSMode,
+			Enabled:         s.EmailEnabled,
+			Host:            s.SMTPHost,
+			Port:            s.SMTPPort,
+			Username:        s.SMTPUsername,
+			From:            s.SMTPFrom,
+			TLSMode:         s.SMTPTLSMode,
+			Muted:           s.EmailMuted,
+			ExtraRecipients: s.EmailExtraRecipients,
 		},
 	}
 	if s.SlackWebhookEncrypted != "" {

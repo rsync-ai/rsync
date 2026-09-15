@@ -23,7 +23,7 @@ const notificationTestKey = "unit-test-encryption-key-0123456789ab"
 var notificationChannelColumns = []string{
 	"slack_enabled", "slack_webhook_encrypted", "slack_muted_categories",
 	"email_enabled", "smtp_host", "smtp_port", "smtp_username", "smtp_password_encrypted",
-	"smtp_from", "smtp_tls_mode", "updated_at",
+	"smtp_from", "smtp_tls_mode", "email_muted_categories", "email_extra_recipients", "updated_at",
 }
 
 func clearNotificationEnv(t *testing.T) {
@@ -89,7 +89,7 @@ func TestAdminGetNotificationChannelsNeverReturnsSecrets(t *testing.T) {
 		sqlmock.NewRows(notificationChannelColumns).AddRow(
 			true, webhook, "health",
 			true, "smtp.example.com", 587, "user", password,
-			"alerts@example.com", "starttls", time.Now()))
+			"alerts@example.com", "starttls", "schema_drift", "oncall@example.com,team@example.com", time.Now()))
 
 	resp := doNotificationJSON(notificationRouter("admin-1"), http.MethodGet, "/admin/notifications/channels", "")
 	if resp.Code != http.StatusOK {
@@ -111,6 +111,12 @@ func TestAdminGetNotificationChannelsNeverReturnsSecrets(t *testing.T) {
 	if view.Slack.Categories["health"] || !view.Slack.Categories["data_loss"] {
 		t.Errorf("categories = %v, want health off and everything else on", view.Slack.Categories)
 	}
+	if view.Email.Categories["schema_drift"] || !view.Email.Categories["health"] {
+		t.Errorf("email categories = %v, want schema_drift off and everything else on", view.Email.Categories)
+	}
+	if want := []string{"oncall@example.com", "team@example.com"}; strings.Join(view.Email.ExtraRecipients, ",") != strings.Join(want, ",") {
+		t.Errorf("extra recipients = %v, want %v", view.Email.ExtraRecipients, want)
+	}
 }
 
 func TestAdminGetNotificationChannelsReportsEnvFallback(t *testing.T) {
@@ -131,6 +137,9 @@ func TestAdminGetNotificationChannelsReportsEnvFallback(t *testing.T) {
 	if view.Source != "environment" || !view.Slack.Enabled || !view.Slack.WebhookConfigured {
 		t.Errorf("view = %+v", view)
 	}
+	if !strings.Contains(resp.Body.String(), `"extra_recipients":[]`) {
+		t.Errorf("extra_recipients should be an empty list, not null: %s", resp.Body.String())
+	}
 }
 
 func TestAdminUpdateNotificationChannelsValidation(t *testing.T) {
@@ -150,7 +159,16 @@ func TestAdminUpdateNotificationChannelsValidation(t *testing.T) {
 		"port out of range":             `{"slack":{"enabled":false},"email":{"enabled":false,"smtp_port":70000}}`,
 		"unknown tls mode":              `{"slack":{"enabled":false},"email":{"enabled":false,"tls_mode":"ssl"}}`,
 		"password over plaintext":       `{"slack":{"enabled":false},"email":{"enabled":true,"smtp_host":"smtp.example.com","from":"a@example.com","smtp_username":"u","smtp_password":"p","tls_mode":"none"}}`,
+		"unknown email category":        `{"slack":{"enabled":false},"email":{"enabled":false,"categories":{"everything":false}}}`,
+		"bad extra recipient":           `{"slack":{"enabled":false},"email":{"enabled":false,"extra_recipients":["not-an-address"]}}`,
+		"extra recipient with a comma":  `{"slack":{"enabled":false},"email":{"enabled":false,"extra_recipients":["a@example.com, b@example.com"]}}`,
+		"extra recipient with a CRLF":   `{"slack":{"enabled":false},"email":{"enabled":false,"extra_recipients":["a@example.com\r\nBcc: x@example.com"]}}`,
 	}
+	many := make([]string, maxEmailExtraRecipients+1)
+	for i := range many {
+		many[i] = `"user` + strings.Repeat("x", i) + `@example.com"`
+	}
+	cases["too many extra recipients"] = `{"slack":{"enabled":false},"email":{"enabled":false,"extra_recipients":[` + strings.Join(many, ",") + `]}}`
 	t.Setenv("ENCRYPTION_KEY", notificationTestKey)
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -174,16 +192,18 @@ func TestAdminUpdateNotificationChannelsEncryptsAndInheritsSecrets(t *testing.T)
 	mock := withMockGlobalDB(t)
 
 	mock.ExpectQuery(`FROM notification_channel_settings`).WillReturnError(sql.ErrNoRows)
-	var webhookCipher, muted, passwordCipher, tlsMode string
+	var webhookCipher, muted, passwordCipher, tlsMode, emailMuted, extra string
 	mock.ExpectExec(`INSERT INTO notification_channel_settings`).WithArgs(
 		true, capture{&webhookCipher}, capture{&muted},
 		true, "smtp.example.com", sqlmock.AnyArg(), "user", capture{&passwordCipher},
-		"alerts@example.com", capture{&tlsMode}, "admin-1",
+		"alerts@example.com", capture{&tlsMode}, capture{&emailMuted}, capture{&extra}, "admin-1",
 	).WillReturnResult(sqlmock.NewResult(0, 1))
 
 	const hook = "https://hooks.slack.com/services/T000/B000/abcdef"
 	body := `{"slack":{"enabled":true,"webhook_url":"` + hook + `","categories":{"health":false,"data_loss":true}},
-		"email":{"enabled":true,"smtp_host":" smtp.example.com ","smtp_username":"user","from":"alerts@example.com"}}`
+		"email":{"enabled":true,"smtp_host":" smtp.example.com ","smtp_username":"user","from":"alerts@example.com",
+		"categories":{"schema_drift":false,"health":true},
+		"extra_recipients":[" On-call <oncall@example.com> ","ONCALL@example.com","","team@example.com"]}}`
 	resp := doNotificationJSON(notificationRouter("admin-1"), http.MethodPut, "/admin/notifications/channels", body)
 	if resp.Code != http.StatusOK {
 		t.Fatalf("status %d: %s", resp.Code, resp.Body.String())
@@ -203,6 +223,10 @@ func TestAdminUpdateNotificationChannelsEncryptsAndInheritsSecrets(t *testing.T)
 	}
 	if muted != "health" || tlsMode != "starttls" {
 		t.Errorf("muted=%q tls=%q", muted, tlsMode)
+	}
+	// Bare addresses, blanks dropped, de-duplicated case-insensitively.
+	if emailMuted != "schema_drift" || extra != "oncall@example.com,team@example.com" {
+		t.Errorf("email muted=%q extra recipients=%q", emailMuted, extra)
 	}
 	if strings.Contains(resp.Body.String(), "abcdef") || strings.Contains(resp.Body.String(), "env-password") {
 		t.Errorf("response contains a secret: %s", resp.Body.String())
@@ -269,8 +293,32 @@ func TestNotificationPreferences(t *testing.T) {
 		if !view.EmailEnabled || view.EmailCategories["schema_drift"] || !view.EmailCategories["other"] {
 			t.Errorf("view = %+v", view)
 		}
+		if !strings.Contains(resp.Body.String(), `"email_blocked_categories":[]`) {
+			t.Errorf("email_blocked_categories should be an empty list, not null: %s", resp.Body.String())
+		}
 		if err := mock.ExpectationsWereMet(); err != nil {
 			t.Error(err)
+		}
+	})
+
+	t.Run("categories the admin blocked for email", func(t *testing.T) {
+		notifier.InvalidateChannelCache()
+		mock := withMockGlobalDB(t)
+		mock.ExpectQuery(`FROM user_notification_preferences`).WithArgs(user).WillReturnError(sql.ErrNoRows)
+		mock.ExpectQuery(`FROM notification_channel_settings`).WillReturnRows(
+			sqlmock.NewRows(notificationChannelColumns).AddRow(
+				false, "", "",
+				true, "smtp.example.com", 587, "", "",
+				"alerts@example.com", "starttls", "schema_drift,health", "", time.Now()))
+
+		resp := doNotificationJSON(notificationRouter(user), http.MethodGet, "/notifications/preferences", "")
+		if resp.Code != http.StatusOK {
+			t.Fatalf("status %d: %s", resp.Code, resp.Body.String())
+		}
+		var view notificationPreferencesView
+		_ = json.Unmarshal(resp.Body.Bytes(), &view)
+		if strings.Join(view.EmailBlockedCategories, ",") != "schema_drift,health" || !view.Channels.Email {
+			t.Errorf("view = %+v", view)
 		}
 	})
 }

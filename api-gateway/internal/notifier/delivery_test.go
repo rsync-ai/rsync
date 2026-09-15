@@ -19,17 +19,24 @@ import (
 	"net/http/httptest"
 	"net/mail"
 	"net/textproto"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/DATA-DOG/go-sqlmock"
 )
 
 func TestPlanDelivery(t *testing.T) {
 	slackOn := SlackChannel{Enabled: true}
 	emailOn := EmailChannel{Enabled: true}
+	list := []string{"oncall@example.com"}
+	emailWithList := EmailChannel{Enabled: true, ExtraRecipients: list}
+	adminBlocksRunStatus := EmailChannel{Enabled: true, Muted: []string{CategoryRunStatus}, ExtraRecipients: list}
 	defaults := DefaultEmailPreferences()
+	ownerOff := EmailPreferences{Enabled: false}
 
 	cases := []struct {
 		name       string
@@ -37,23 +44,33 @@ func TestPlanDelivery(t *testing.T) {
 		category   string
 		prefs      EmailPreferences
 		wantSlack  bool
-		wantEmail  bool
+		wantOwner  bool
+		wantList   []string
 		wantStatus string
 	}{
-		{"nothing configured", ChannelConfig{}, CategoryDataLoss, defaults, false, false, StatusSuppressed},
-		{"both on", ChannelConfig{Slack: slackOn, Email: emailOn}, CategoryHealth, defaults, true, true, ""},
-		{"slack muted for category", ChannelConfig{Slack: SlackChannel{Enabled: true, Muted: []string{CategoryHealth}}, Email: emailOn}, CategoryHealth, defaults, false, true, ""},
-		{"slack mute of another category", ChannelConfig{Slack: SlackChannel{Enabled: true, Muted: []string{CategoryHealth}}}, CategoryDataLoss, defaults, true, false, ""},
-		{"owner turned email off", ChannelConfig{Email: emailOn}, CategoryRunStatus, EmailPreferences{Enabled: false}, false, false, StatusSkipped},
-		{"owner muted the category", ChannelConfig{Email: emailOn}, CategoryRunStatus, EmailPreferences{Enabled: true, Muted: []string{CategoryRunStatus}}, false, false, StatusSkipped},
-		{"owner mute ignores Slack", ChannelConfig{Slack: slackOn, Email: emailOn}, CategoryRunStatus, EmailPreferences{Enabled: false}, true, false, ""},
-		{"other is on by default", ChannelConfig{Slack: slackOn}, CategoryOther, defaults, true, false, ""},
+		{"nothing configured", ChannelConfig{}, CategoryDataLoss, defaults, false, false, nil, StatusSuppressed},
+		{"both on", ChannelConfig{Slack: slackOn, Email: emailOn}, CategoryHealth, defaults, true, true, nil, ""},
+		{"slack muted for category", ChannelConfig{Slack: SlackChannel{Enabled: true, Muted: []string{CategoryHealth}}, Email: emailOn}, CategoryHealth, defaults, false, true, nil, ""},
+		{"slack mute of another category", ChannelConfig{Slack: SlackChannel{Enabled: true, Muted: []string{CategoryHealth}}}, CategoryDataLoss, defaults, true, false, nil, ""},
+		{"owner turned email off", ChannelConfig{Email: emailOn}, CategoryRunStatus, ownerOff, false, false, nil, StatusSkipped},
+		{"owner muted the category", ChannelConfig{Email: emailOn}, CategoryRunStatus, EmailPreferences{Enabled: true, Muted: []string{CategoryRunStatus}}, false, false, nil, StatusSkipped},
+		{"owner mute ignores Slack", ChannelConfig{Slack: slackOn, Email: emailOn}, CategoryRunStatus, ownerOff, true, false, nil, ""},
+		{"other is on by default", ChannelConfig{Slack: slackOn}, CategoryOther, defaults, true, false, nil, ""},
+
+		// Admin email controls.
+		{"alert list with owner", ChannelConfig{Email: emailWithList}, CategoryHealth, defaults, false, true, list, ""},
+		{"alert list ignores the owner's email switch", ChannelConfig{Email: emailWithList}, CategoryHealth, ownerOff, false, false, list, ""},
+		{"alert list ignores the owner's mute", ChannelConfig{Email: emailWithList}, CategoryHealth, EmailPreferences{Enabled: true, Muted: []string{CategoryHealth}}, false, false, list, ""},
+		{"admin block stops the owner and the list", ChannelConfig{Email: adminBlocksRunStatus}, CategoryRunStatus, defaults, false, false, nil, StatusSkipped},
+		{"admin block leaves Slack alone", ChannelConfig{Slack: slackOn, Email: adminBlocksRunStatus}, CategoryRunStatus, defaults, true, false, nil, ""},
+		{"admin block of another category", ChannelConfig{Email: adminBlocksRunStatus}, CategoryDataLoss, defaults, false, true, list, ""},
+		{"alert list needs email enabled", ChannelConfig{Slack: slackOn, Email: EmailChannel{ExtraRecipients: list}}, CategoryHealth, defaults, true, false, nil, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := planDelivery(tc.cfg, tc.category, tc.prefs)
-			if got.slack != tc.wantSlack || got.email != tc.wantEmail || got.status != tc.wantStatus {
-				t.Errorf("planDelivery = %+v, want slack=%v email=%v status=%q", got, tc.wantSlack, tc.wantEmail, tc.wantStatus)
+			if got.slack != tc.wantSlack || got.ownerEmail != tc.wantOwner || !reflect.DeepEqual(got.listEmail, tc.wantList) || got.status != tc.wantStatus {
+				t.Errorf("planDelivery = %+v, want slack=%v owner=%v list=%v status=%q", got, tc.wantSlack, tc.wantOwner, tc.wantList, tc.wantStatus)
 			}
 		})
 	}
@@ -179,12 +196,20 @@ type fakeSMTP struct {
 
 	mu sync.Mutex
 	smtpSession
+	// delivered: every message accepted, in order.
+	delivered []smtpSession
 }
 
 func (f *fakeSMTP) snapshot() smtpSession {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.smtpSession
+}
+
+func (f *fakeSMTP) all() []smtpSession {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]smtpSession(nil), f.delivered...)
 }
 
 func startFakeSMTP(t *testing.T, opt fakeSMTPOptions) *fakeSMTP {
@@ -273,6 +298,7 @@ func (f *fakeSMTP) serve(conn net.Conn, opt fakeSMTPOptions, tlsCfg *tls.Config)
 			}
 			f.mu.Lock()
 			f.data = string(b)
+			f.delivered = append(f.delivered, f.smtpSession)
 			f.mu.Unlock()
 			reply("250 queued")
 		case "QUIT":
@@ -422,5 +448,34 @@ func TestSendSMTPValidation(t *testing.T) {
 	}
 	if err := sendSMTP(ctx, cases[0].ch, "o@e.com", emailMessage{}); !errors.Is(err, secretErr) {
 		t.Errorf("want SecretErr surfaced, got %v", err)
+	}
+}
+
+// The test message's link must open the page where channels are managed, not
+// the admin landing page. Slack builds the same URL but its client refuses
+// loopback, so the email path pins it.
+func TestSendTestNotificationLinksToNotificationSettings(t *testing.T) {
+	t.Setenv("ENCRYPTION_KEY", testEncryptionKey)
+	clearNotifierEnv(t)
+	t.Setenv("APP_BASE_URL", "https://rsync.test/")
+	f := startFakeSMTP(t, fakeSMTPOptions{})
+	ch := emailChannelFor(t, f, TLSModeNone)
+
+	mockDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mockDB.Close()
+	mock.ExpectQuery(`FROM notification_channel_settings`).WillReturnRows(
+		sqlmock.NewRows(channelColumns).AddRow(
+			false, "", "",
+			true, ch.Host, ch.Port, "", "",
+			ch.From, TLSModeNone, "", "", time.Now()))
+
+	if err := SendTestNotification(context.Background(), mockDB, "email", "admin@example.com"); err != nil {
+		t.Fatalf("send: %v", err)
+	}
+	if got := f.snapshot().data; !strings.Contains(got, "https://rsync.test/admin/notifications") {
+		t.Errorf("test email does not link to /admin/notifications:\n%s", got)
 	}
 }

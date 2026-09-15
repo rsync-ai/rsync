@@ -39,9 +39,9 @@ beforeEach(() => {
 
 const sw = (name: string) => screen.getByRole("switch", { name })
 
-async function renderLoaded(body = prefs()) {
+async function renderLoaded(body = prefs(), props: { email?: string; isAdmin?: boolean } = {}) {
   mockFetch.mockResolvedValueOnce(res(200, body))
-  render(<NotificationPreferencesCard />)
+  render(<NotificationPreferencesCard {...props} />)
   await waitFor(() => expect(sw("Email notifications")).toBeInTheDocument())
 }
 
@@ -87,6 +87,36 @@ describe("NotificationPreferencesCard", () => {
 
     expect(sw("Email: Data loss & integrity")).toBeDisabled()
     expect(sw("Email: Data loss & integrity")).toHaveAttribute("aria-checked", "false")
+  })
+
+  it("locks a category the admin turned off for email", async () => {
+    await renderLoaded(prefs({ email_categories: { data_loss: true, schema_drift: true }, email_blocked_categories: ["data_loss"] }))
+
+    expect(sw("Email: Data loss & integrity")).toBeDisabled()
+    expect(sw("Email: Data loss & integrity")).toHaveAttribute("aria-checked", "false")
+    expect(screen.getByText(/turned off for email by your admin/i)).toBeInTheDocument()
+    expect(sw("Email: Schema changes")).toBeEnabled()
+    expect(sw("Email: Schema changes")).toHaveAttribute("aria-checked", "true")
+  })
+
+  it("says it is only about the user's own email, and names the address", async () => {
+    await renderLoaded(prefs(), { email: "ada@example.com" })
+
+    expect(screen.getByText("My email alerts")).toBeInTheDocument()
+    expect(screen.getByText(/only affects emails sent to you/i)).toBeInTheDocument()
+    expect(screen.getByText("Send alerts about your pipelines to ada@example.com")).toBeInTheDocument()
+  })
+
+  it("points admins, and only admins, at the delivery settings", async () => {
+    await renderLoaded(prefs({ channels: { email: false, slack: false } }), { isAdmin: true })
+    const links = screen.getAllByRole("link", { name: /admin → notifications/i })
+    expect(links.length).toBe(2)
+    links.forEach((l) => expect(l).toHaveAttribute("href", "/admin/notifications"))
+  })
+
+  it("shows non-admins no admin link", async () => {
+    await renderLoaded(prefs({ channels: { email: false, slack: false } }))
+    expect(screen.queryByRole("link", { name: /admin → notifications/i })).not.toBeInTheDocument()
   })
 
   it("says email is not set up when the instance has no SMTP", async () => {

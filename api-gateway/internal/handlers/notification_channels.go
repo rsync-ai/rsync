@@ -49,7 +49,16 @@ type emailChannelView struct {
 	PasswordConfigured bool   `json:"password_configured"`
 	From               string `json:"from"`
 	TLSMode            string `json:"tls_mode"`
+	// Categories: which alerts are emailed at all. An off category reaches
+	// no one by email, whatever a user chose on /settings.
+	Categories map[string]bool `json:"categories"`
+	// ExtraRecipients receive every enabled category, whatever users chose.
+	ExtraRecipients []string `json:"extra_recipients"`
 }
+
+// maxEmailExtraRecipients caps the admin alert list. Each address is its own
+// SMTP session per alert, so the cap bounds how long one alert can take.
+const maxEmailExtraRecipients = 20
 
 type notificationChannelsView struct {
 	// Source is "database" once an admin has saved channels, "environment"
@@ -79,6 +88,8 @@ func buildNotificationChannelsView(stored *notifier.StoredChannelSettings) notif
 				PasswordConfigured: env.Email.Password != "",
 				From:               env.Email.From,
 				TLSMode:            env.Email.TLSMode,
+				Categories:         categoryEnabledMap(nil),
+				ExtraRecipients:    []string{},
 			},
 			Categories: notifier.Categories(),
 		}
@@ -100,6 +111,8 @@ func buildNotificationChannelsView(stored *notifier.StoredChannelSettings) notif
 			PasswordConfigured: stored.SMTPPasswordEncrypted != "",
 			From:               stored.SMTPFrom,
 			TLSMode:            stored.SMTPTLSMode,
+			Categories:         categoryEnabledMap(stored.EmailMuted),
+			ExtraRecipients:    nonNilStrings(stored.EmailExtraRecipients),
 		},
 		Categories: notifier.Categories(),
 	}
@@ -139,6 +152,50 @@ func mutedCategories(requested map[string]bool, current []string) ([]string, err
 	return muted, nil
 }
 
+// nonNilStrings keeps an empty list as [] in JSON rather than null.
+func nonNilStrings(s []string) []string {
+	if s == nil {
+		return []string{}
+	}
+	return s
+}
+
+// normalizeExtraRecipients validates the admin alert list and returns bare,
+// de-duplicated addresses in the order given. A nil request means "unchanged"
+// and returns current.
+func normalizeExtraRecipients(requested, current []string) ([]string, error) {
+	if requested == nil {
+		return nonNilStrings(current), nil
+	}
+	out := []string{}
+	seen := map[string]bool{}
+	for _, raw := range requested {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		// Stored comma-joined across pgx (channels.go), and a line break could
+		// start a new SMTP header, so neither may appear in an address.
+		if strings.ContainsAny(v, ",\r\n") {
+			return nil, fmt.Errorf("extra_recipients: %q must be a single email address", v)
+		}
+		parsed, err := mail.ParseAddress(v)
+		if err != nil {
+			return nil, fmt.Errorf("extra_recipients: %q is not a valid email address", v)
+		}
+		key := strings.ToLower(parsed.Address)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, parsed.Address)
+	}
+	if len(out) > maxEmailExtraRecipients {
+		return nil, fmt.Errorf("extra_recipients: at most %d addresses", maxEmailExtraRecipients)
+	}
+	return out, nil
+}
+
 // AdminGetNotificationChannels handles GET /api/v1/admin/notifications/channels.
 func AdminGetNotificationChannels(c *gin.Context) {
 	database := db.GetDB()
@@ -171,6 +228,9 @@ type updateNotificationChannelsRequest struct {
 		SMTPPassword *string `json:"smtp_password"`
 		From         string  `json:"from"`
 		TLSMode      string  `json:"tls_mode"`
+		// Categories and ExtraRecipients: omitted keeps the saved value.
+		Categories      map[string]bool `json:"categories"`
+		ExtraRecipients []string        `json:"extra_recipients"`
 	} `json:"email"`
 }
 
@@ -246,12 +306,13 @@ func AdminUpdateNotificationChannels(c *gin.Context) {
 		return
 	}
 	var env notifier.ChannelConfig
-	var currentSlackMuted []string
+	var currentSlackMuted, currentEmailMuted, currentExtraRecipients []string
 	storedWebhook, storedPassword := "", ""
 	if stored == nil {
 		env = notifier.EnvChannelConfig()
 	} else {
 		currentSlackMuted = stored.SlackMuted
+		currentEmailMuted, currentExtraRecipients = stored.EmailMuted, stored.EmailExtraRecipients
 		storedWebhook, storedPassword = stored.SlackWebhookEncrypted, stored.SMTPPasswordEncrypted
 	}
 
@@ -305,6 +366,16 @@ func AdminUpdateNotificationChannels(c *gin.Context) {
 			return
 		}
 	}
+	emailMuted, err := mutedCategories(e.Categories, currentEmailMuted)
+	if err != nil {
+		badRequest(err.Error())
+		return
+	}
+	extraRecipients, err := normalizeExtraRecipients(e.ExtraRecipients, currentExtraRecipients)
+	if err != nil {
+		badRequest(err.Error())
+		return
+	}
 
 	webhookCipher, err := resolveChannelSecret(req.Slack.WebhookURL, stored, storedWebhook, env.Slack.WebhookURL)
 	if err != nil {
@@ -348,6 +419,8 @@ func AdminUpdateNotificationChannels(c *gin.Context) {
 		SMTPPasswordEncrypted: passwordCipher,
 		SMTPFrom:              from,
 		SMTPTLSMode:           tlsMode,
+		EmailMuted:            emailMuted,
+		EmailExtraRecipients:  extraRecipients,
 	}
 	adminID := c.GetString("admin_user_id")
 	if err := notifier.WriteStoredChannelSettings(ctx, database, next, adminID); err != nil {
@@ -372,6 +445,8 @@ func AdminUpdateNotificationChannels(c *gin.Context) {
 		"smtp_port":              next.SMTPPort,
 		"smtp_tls_mode":          next.SMTPTLSMode,
 		"smtp_password_changed":  e.SMTPPassword != nil,
+		"email_muted_categories": next.EmailMuted,
+		"email_extra_recipients": next.EmailExtraRecipients,
 	})
 
 	next.UpdatedAt = time.Now().UTC()
@@ -450,19 +525,24 @@ type notificationPreferencesView struct {
 		Email bool `json:"email"`
 		Slack bool `json:"slack"`
 	} `json:"channels"`
+	// EmailBlockedCategories: categories the admin turned off for email. The
+	// user's own switch for these has no effect, so the UI shows them locked.
+	EmailBlockedCategories []string `json:"email_blocked_categories"`
 }
 
 func buildNotificationPreferencesView(ctx context.Context, prefs notifier.EmailPreferences) notificationPreferencesView {
 	v := notificationPreferencesView{
-		EmailEnabled:    prefs.Enabled,
-		EmailCategories: categoryEnabledMap(prefs.Muted),
-		Categories:      notifier.Categories(),
+		EmailEnabled:           prefs.Enabled,
+		EmailCategories:        categoryEnabledMap(prefs.Muted),
+		Categories:             notifier.Categories(),
+		EmailBlockedCategories: []string{},
 	}
 	if cfg, err := notifier.CachedChannelConfig(ctx, db.GetDB()); err != nil {
 		log.WithError(err).Warn("notification preferences: could not read channel availability")
 	} else {
 		v.Channels.Email = cfg.Email.Enabled
 		v.Channels.Slack = cfg.Slack.Enabled
+		v.EmailBlockedCategories = nonNilStrings(cfg.Email.Muted)
 	}
 	return v
 }

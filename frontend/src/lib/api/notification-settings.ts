@@ -2,12 +2,14 @@
  * Notification delivery settings — where alerts go outside the bell.
  *
  * Two audiences, one module:
- *   - Admin (instance-wide): Slack webhook + SMTP server, and which alert
- *     categories reach Slack. handlers/notification_channels.go
+ *   - Admin (instance-wide): Slack webhook + SMTP server, which alert
+ *     categories reach Slack and email at all, and extra addresses that get
+ *     every emailed alert. handlers/notification_channels.go
  *       GET  /admin/notifications/channels -> NotificationChannels
  *       PUT  /admin/notifications/channels  NotificationChannelsUpdate
  *       POST /admin/notifications/test      { channel }
- *   - Every user: whether they get email at all, and which categories.
+ *   - Every user: whether they get email at all, and which categories — within
+ *     what the admin allows (email_blocked_categories).
  *       GET  /notifications/preferences -> NotificationPreferences
  *       PUT  /notifications/preferences  { email_enabled, email_categories }
  *
@@ -50,6 +52,10 @@ export interface NotificationChannels {
     from: string
     /** "opportunistic" only appears in environment mode. */
     tls_mode: SmtpTlsMode | "opportunistic" | string
+    /** Categories emailed at all. Off = no owner and no alert-list address gets it. */
+    categories: CategoryToggles
+    /** Addresses that receive every emailed alert, whatever the owner chose. */
+    extra_recipients: string[]
   }
   categories: NotificationCategory[]
 }
@@ -70,6 +76,9 @@ export interface NotificationChannelsUpdate {
     smtp_password?: string | null
     from: string
     tls_mode: SmtpTlsMode
+    categories?: CategoryToggles
+    /** Omit keeps the saved list; [] clears it. */
+    extra_recipients?: string[]
   }
 }
 
@@ -83,6 +92,8 @@ export interface TestNotificationResult {
 export interface NotificationPreferences {
   email_enabled: boolean
   email_categories: CategoryToggles
+  /** Categories the admin turned off for email; the user cannot turn them on. */
+  email_blocked_categories: string[]
   categories: NotificationCategory[]
   /** Which channels the instance has switched on. */
   channels: { email: boolean; slack: boolean }
@@ -126,6 +137,11 @@ function channelsView(res: Response, data: NotificationChannels): NotificationCh
   return {
     ...data,
     slack: { ...data.slack, categories: data.slack.categories ?? {} },
+    email: {
+      ...data.email,
+      categories: data.email.categories ?? {},
+      extra_recipients: Array.isArray(data.email.extra_recipients) ? data.email.extra_recipients : [],
+    },
     categories: Array.isArray(data.categories) ? data.categories : [],
   }
 }
@@ -137,6 +153,7 @@ function preferencesView(res: Response, data: NotificationPreferences): Notifica
   return {
     ...data,
     email_categories: data.email_categories ?? {},
+    email_blocked_categories: Array.isArray(data.email_blocked_categories) ? data.email_blocked_categories : [],
     categories: Array.isArray(data.categories) ? data.categories : [],
     channels: { email: data.channels?.email === true, slack: data.channels?.slack === true },
   }

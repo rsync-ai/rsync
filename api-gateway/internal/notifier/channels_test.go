@@ -18,7 +18,7 @@ const testEncryptionKey = "unit-test-encryption-key-0123456789ab"
 var channelColumns = []string{
 	"slack_enabled", "slack_webhook_encrypted", "slack_muted_categories",
 	"email_enabled", "smtp_host", "smtp_port", "smtp_username", "smtp_password_encrypted",
-	"smtp_from", "smtp_tls_mode", "updated_at",
+	"smtp_from", "smtp_tls_mode", "email_muted_categories", "email_extra_recipients", "updated_at",
 }
 
 func clearNotifierEnv(t *testing.T) {
@@ -74,7 +74,7 @@ func TestLoadChannelConfigFromDatabase(t *testing.T) {
 		sqlmock.NewRows(channelColumns).AddRow(
 			true, webhook, "health,data_loss",
 			false, "smtp.example.com", 465, "user", password,
-			"alerts@example.com", TLSModeTLS, time.Now()))
+			"alerts@example.com", TLSModeTLS, "schema_drift", "oncall@example.com,team@example.com", time.Now()))
 
 	cfg, err := LoadChannelConfig(context.Background(), mockDB)
 	if err != nil {
@@ -91,6 +91,10 @@ func TestLoadChannelConfigFromDatabase(t *testing.T) {
 	}
 	if cfg.Email.Enabled || cfg.Email.Password != "hunter2" || cfg.Email.Port != 465 || cfg.Email.TLSMode != TLSModeTLS {
 		t.Errorf("email = %+v", cfg.Email)
+	}
+	if !reflect.DeepEqual(cfg.Email.Muted, []string{"schema_drift"}) ||
+		!reflect.DeepEqual(cfg.Email.ExtraRecipients, []string{"oncall@example.com", "team@example.com"}) {
+		t.Errorf("email muted=%v extra=%v", cfg.Email.Muted, cfg.Email.ExtraRecipients)
 	}
 }
 

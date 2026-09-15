@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Separator } from "@/components/ui/separator"
 import { Switch } from "@/components/ui/switch"
+import { Textarea } from "@/components/ui/textarea"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { toast } from "sonner"
 import { AlertTriangle, Info, Loader2, Mail, MessageSquare, Save, Send } from "lucide-react"
@@ -39,6 +40,19 @@ interface ChannelForm {
   clearPassword: boolean
   from: string
   tlsMode: SmtpTlsMode
+  emailCategories: CategoryToggles
+  /** One address per line (commas also split), as typed. */
+  extraRecipients: string
+}
+
+const MAX_EXTRA_RECIPIENTS = 20
+
+/** Splits the "Also send to" box into addresses; the server validates each one. */
+function parseRecipients(text: string): string[] {
+  return text
+    .split(/[\n,;]+/)
+    .map((a) => a.trim())
+    .filter(Boolean)
 }
 
 const TLS_MODES: { value: SmtpTlsMode; label: string }[] = [
@@ -64,6 +78,8 @@ function formFromView(view: NotificationChannels): ChannelForm {
     // The environment fallback reports "opportunistic" (STARTTLS when offered),
     // which cannot be saved. STARTTLS is the strict version of the same thing.
     tlsMode: tls === "tls" || tls === "none" ? tls : "starttls",
+    emailCategories: { ...view.email.categories },
+    extraRecipients: view.email.extra_recipients.join("\n"),
   }
 }
 
@@ -83,6 +99,8 @@ function updateFromForm(form: ChannelForm): NotificationChannelsUpdate {
       smtp_password: form.clearPassword ? "" : form.smtpPassword || null,
       from: form.from.trim(),
       tls_mode: form.tlsMode,
+      categories: form.emailCategories,
+      extra_recipients: parseRecipients(form.extraRecipients),
     },
   }
 }
@@ -204,8 +222,8 @@ export default function AdminNotificationsPage() {
               </p>
             ) : (
               <p>
-                Alerts always appear in the in-app bell. These settings also send them to Slack and to
-                each pipeline owner by email
+                Alerts always appear in the in-app bell. These settings also send them to Slack, to
+                each pipeline owner by email, and to any address on the email alert list
                 {view.updated_at ? ` · last saved ${new Date(view.updated_at).toLocaleString()}` : ""}.
               </p>
             )}
@@ -304,7 +322,8 @@ export default function AdminNotificationsPage() {
                     Email (SMTP)
                   </CardTitle>
                   <CardDescription>
-                    Email each pipeline owner. Users choose which categories they receive under Settings.
+                    Email each pipeline owner and the alert list below. Owners can turn categories off for
+                    themselves under Settings, but cannot turn on one you switched off here.
                   </CardDescription>
                 </div>
                 <Switch
@@ -401,6 +420,47 @@ export default function AdminNotificationsPage() {
                   value={form.from}
                   onChange={(e) => patch({ from: e.target.value })}
                 />
+              </div>
+
+              <Separator />
+              <div className="space-y-3">
+                <div>
+                  <p className="text-sm font-medium">Alerts sent by email</p>
+                  <p className="text-xs text-zinc-500">
+                    A category switched off here is emailed to nobody — not owners, not the alert list. It still
+                    appears in the bell and in Slack.
+                  </p>
+                </div>
+                {view.categories.map((cat) => (
+                  <div key={cat.id} className="flex items-center justify-between gap-4">
+                    <div>
+                      <p className="text-sm">{cat.label}</p>
+                      <p className="text-xs text-zinc-500">{cat.description}</p>
+                    </div>
+                    <Switch
+                      aria-label={`Email: ${cat.label}`}
+                      checked={form.emailCategories[cat.id] !== false}
+                      onCheckedChange={(v) =>
+                        patch({ emailCategories: { ...form.emailCategories, [cat.id]: v } })
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="email-extra-recipients">Also send to</Label>
+                <Textarea
+                  id="email-extra-recipients"
+                  rows={3}
+                  placeholder={"oncall@example.com\ndata-team@example.com"}
+                  value={form.extraRecipients}
+                  onChange={(e) => patch({ extraRecipients: e.target.value })}
+                />
+                <p className="text-xs text-zinc-500">
+                  One address per line, up to {MAX_EXTRA_RECIPIENTS}. These addresses get every alert emailed
+                  above, whatever each owner chose — use it for an on-call inbox or a team list.
+                </p>
               </div>
 
               <TestRow

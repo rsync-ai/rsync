@@ -33,6 +33,7 @@ export default function SettingsPage() {
   const [showNewPw, setShowNewPw] = useState(false)
   const [showConfirmPw, setShowConfirmPw] = useState(false)
   const [changingPassword, setChangingPassword] = useState(false)
+  const [isAdmin, setIsAdmin] = useState(false)
 
   useEffect(() => {
     setMounted(true)
@@ -43,9 +44,10 @@ export default function SettingsPage() {
           router.push(`/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`)
           return
         }
-        const data = await res.json() as { name?: string; email: string }
+        const data = await res.json() as { name?: string; email: string; role?: string }
         setName(data.name ?? "")
         setEmail(data.email)
+        setIsAdmin(data.role === "admin")
         setProfileLoaded(true)
       } catch {
         router.push(`/logout?next=${encodeURIComponent(`${window.location.pathname}${window.location.search}`)}`)
@@ -265,7 +267,7 @@ export default function SettingsPage() {
       </Card>
 
       {/* Notifications — real email preferences (the old switches saved nothing) */}
-      <NotificationPreferencesCard />
+      <NotificationPreferencesCard email={profileLoaded ? email : undefined} isAdmin={isAdmin} />
 
       {/* Appearance */}
       <Card>
