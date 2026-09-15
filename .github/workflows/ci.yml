@@ -138,6 +138,20 @@ jobs:
               # connector tree; its subject does not, so without this path a PR fixing
               # (or re-breaking) the script alone would skip the job.
               - 'scripts/mcp-connectors/**'
+              # And the three Go service trees, for the same reason a fourth
+              # time. Two guards here read Go sources directly:
+              # test_chart_sets_every_service_url_env.py looks for env vars whose
+              # fallback is a bare compose service name and asserts the chart
+              # sets them -- and every instance of that defect ORIGINATED in a Go
+              # change, not a chart change; and
+              # test_failure_alerts_can_reach_a_self_host.py reads
+              # api-gateway/internal/notifier/notifier.go. Without these paths a
+              # PR touching only Go would skip llm-service-unit, so both guards
+              # would miss precisely the change they exist to catch -- and a
+              # skipped check reads as a passing one.
+              - 'api-gateway/**'
+              - 'backend-orchestrator/**'
+              - 'backend-temporal-adapter/**'
               # And once more, for the same reason. test_kafka_init_builders_
               # stay_in_lockstep.py compares SEVEN copies of the SASL
               # mechanism -> JAAS login module mapping. Five live under paths
