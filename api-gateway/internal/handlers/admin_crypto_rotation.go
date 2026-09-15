@@ -153,6 +153,30 @@ func AdminRotateEncryptionKeys(c *gin.Context) {
 		},
 	)
 
+	// notification_channel_settings (migration 102) is a single row, id = 1.
+	// The Slack webhook URL is itself the credential.
+	rotateTable(
+		"notification_channel_settings.slack_webhook_encrypted",
+		`SELECT id::text, slack_webhook_encrypted FROM notification_channel_settings WHERE slack_webhook_encrypted <> ''`,
+		`UPDATE notification_channel_settings SET slack_webhook_encrypted = $1, updated_at = NOW() WHERE id = $2::smallint`,
+		func(rows *sql.Rows) (string, string, error) {
+			var id string
+			var sec string
+			return id, sec, rows.Scan(&id, &sec)
+		},
+	)
+
+	rotateTable(
+		"notification_channel_settings.smtp_password_encrypted",
+		`SELECT id::text, smtp_password_encrypted FROM notification_channel_settings WHERE smtp_password_encrypted <> ''`,
+		`UPDATE notification_channel_settings SET smtp_password_encrypted = $1, updated_at = NOW() WHERE id = $2::smallint`,
+		func(rows *sql.Rows) (string, string, error) {
+			var id string
+			var sec string
+			return id, sec, rows.Scan(&id, &sec)
+		},
+	)
+
 	c.JSON(http.StatusOK, gin.H{
 		"success":  true,
 		"dry_run":  req.DryRun,

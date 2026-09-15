@@ -190,6 +190,11 @@ export const API_ENDPOINTS = {
     UNREAD_COUNT: `${API_GATEWAY_URL}/api/v1/notifications/unread-count`,
     MARK_READ: `${API_GATEWAY_URL}/api/v1/notifications/mark-read`,
     MARK_ALL_READ: `${API_GATEWAY_URL}/api/v1/notifications/mark-all-read`,
+    // Per-user email opt-out (the caller's own preferences)
+    PREFERENCES: `${API_GATEWAY_URL}/api/v1/notifications/preferences`,
+    // Instance-wide Slack + SMTP delivery (admin only)
+    ADMIN_CHANNELS: `${API_GATEWAY_URL}/api/v1/admin/notifications/channels`,
+    ADMIN_TEST: `${API_GATEWAY_URL}/api/v1/admin/notifications/test`,
   },
 
   // Chat (multi-turn conversation with slot-filling)

@@ -876,6 +876,9 @@ func main() {
 		api.GET("/notifications/unread-count", handlers.GetUnreadNotificationCount)
 		api.POST("/notifications/mark-read", handlers.MarkNotificationRead)
 		api.POST("/notifications/mark-all-read", handlers.MarkAllNotificationsRead)
+		// The caller's own email alert choices (master switch + muted categories).
+		api.GET("/notifications/preferences", handlers.GetNotificationPreferences)
+		api.PUT("/notifications/preferences", handlers.UpdateNotificationPreferences)
 
 		// Pipeline Schedules (Temporal Schedules)
 		api.POST("/pipelines/:id/schedules", handlers.CreatePipelineSchedule)
@@ -1082,6 +1085,12 @@ func main() {
 			// Instance settings
 			admin.GET("/settings", handlers.AdminGetSettings)
 			admin.PATCH("/settings", handlers.AdminUpdateSettings)
+
+			// Notification channels: the instance Slack webhook + SMTP relay the
+			// notifier delivers through (overrides the SMTP_* env vars once saved).
+			admin.GET("/notifications/channels", handlers.AdminGetNotificationChannels)
+			admin.PUT("/notifications/channels", handlers.AdminUpdateNotificationChannels)
+			admin.POST("/notifications/test", handlers.AdminTestNotificationChannel)
 
 			// System health
 			admin.GET("/health", handlers.AdminSystemHealth)

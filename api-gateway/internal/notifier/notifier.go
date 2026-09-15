@@ -9,21 +9,25 @@
 // this is the consumer.
 //
 // Scope (pilot-ready):
-//   * Persist EVERY event into pipeline_notifications keyed by
+//   - Persist EVERY event into pipeline_notifications keyed by
 //     dedup_key so the UI can render an inbox.
-//   * Best-effort external delivery via:
-//       - Slack webhook (env NOTIFIER_SLACK_WEBHOOK_URL) — POST
-//         minimal payload
-//       - SMTP email to the pipeline owner (env SMTP_HOST/SMTP_USER/
-//         SMTP_PASSWORD/SMTP_FROM — same vars the explorer share/email
-//         flow already uses)
-//   * If neither channel is configured, persist-only mode (the UI
+//   - Best-effort external delivery via:
+//   - one instance-wide Slack incoming webhook
+//   - SMTP email to the pipeline owner
+//     configured by an admin in the UI (notification_channel_settings,
+//     migration 102), falling back to the NOTIFIER_SLACK_WEBHOOK_URL /
+//     SMTP_* env vars when no admin has saved channels. See channels.go.
+//   - Every alert has a category (categories.go). The admin mutes
+//     categories for Slack; each owner mutes categories, or all email,
+//     for themselves. A muted alert is still persisted, with
+//     delivery_status = 'skipped'.
+//   - If neither channel is configured, persist-only mode (the UI
 //     still surfaces unread).
 //
-// Out of scope for this PR:
-//   * Per-user channel preferences (everyone gets the same channels).
-//   * PagerDuty / Opsgenie / webhook.site integrations.
-//   * Retry on delivery failure (we mark delivery_status=failed and
+// Out of scope:
+//   - Per-user Slack destinations (Slack is one instance channel).
+//   - PagerDuty / Opsgenie / webhook.site integrations.
+//   - Retry on delivery failure (we mark delivery_status=failed and
 //     move on; the row stays in the DB for manual replay).
 package notifier
 
@@ -33,14 +37,15 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
-	"net/smtp"
 	"os"
 	"strings"
 	"time"
 
 	rsynckafka "api-gateway/internal/kafka"
+	"api-gateway/internal/safehttp"
 	"api-gateway/internal/slack"
 
 	"github.com/IBM/sarama"
@@ -106,19 +111,13 @@ func (t notifierTopics) all() []string {
 // Notifier wraps the sarama ConsumerGroup that reads from the
 // notification topics.
 type Notifier struct {
-	db           *sql.DB
-	consumer     sarama.ConsumerGroup
-	cancel       context.CancelFunc
-	done         chan struct{}
-	slackWebhook string
-	smtpHost     string
-	smtpPort     string
-	smtpUser     string
-	smtpPassword string
-	smtpFrom     string
-	emailEnabled bool
-	slackEnabled bool
-	httpClient   *http.Client
+	db       *sql.DB
+	consumer sarama.ConsumerGroup
+	cancel   context.CancelFunc
+	done     chan struct{}
+	// httpClient posts Slack webhooks. SSRF-guarded (safehttp), because an
+	// admin-supplied URL is otherwise a request to anywhere this pod can reach.
+	httpClient *http.Client
 	// appBaseURL is the public frontend origin used to turn a persisted
 	// relative action_url into an absolute link at delivery time.
 	appBaseURL string
@@ -165,15 +164,7 @@ func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, e
 
 	consumerCtx, cancel := context.WithCancel(ctx)
 
-	// APP_BASE_URL is the public frontend origin used to turn a persisted
-	// relative action_url (e.g. /pipelines/{id}/schema-changes) into an
-	// absolute link that resolves in Slack/email. Same env var + default the
-	// api-gateway auth/invite emails already use, so prod is configured with
-	// no new wiring; local/dev falls back to the frontend dev origin.
-	appBaseURL := strings.TrimRight(strings.TrimSpace(os.Getenv("APP_BASE_URL")), "/")
-	if appBaseURL == "" {
-		appBaseURL = "http://localhost:3000"
-	}
+	appBaseURL := appBaseURLFromEnv()
 
 	// Only emit interactive Approve/Reject buttons when Slack request-signing is
 	// configured — otherwise the inbound receiver can't verify clicks and the
@@ -185,23 +176,25 @@ func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, e
 		consumer:             consumer,
 		cancel:               cancel,
 		done:                 make(chan struct{}),
-		slackWebhook:         strings.TrimSpace(os.Getenv("NOTIFIER_SLACK_WEBHOOK_URL")),
-		smtpHost:             strings.TrimSpace(os.Getenv("SMTP_HOST")),
-		smtpPort:             strings.TrimSpace(os.Getenv("SMTP_PORT")),
-		smtpUser:             strings.TrimSpace(os.Getenv("SMTP_USER")),
-		smtpPassword:         strings.TrimSpace(os.Getenv("SMTP_PASSWORD")),
-		smtpFrom:             strings.TrimSpace(os.Getenv("SMTP_FROM")),
-		httpClient:           &http.Client{Timeout: 10 * time.Second},
+		httpClient:           safehttp.NewClient(slackTimeout),
 		appBaseURL:           appBaseURL,
 		interactiveApprovals: interactiveApprovals,
 		topics:               resolveNotifierTopics(),
 	}
-	n.slackEnabled = n.slackWebhook != ""
-	n.emailEnabled = n.smtpHost != "" && n.smtpFrom != ""
+
+	// Logged once for the operator. Delivery re-reads the settings (cached
+	// channelCacheTTL), so an admin's change applies without a restart.
+	startupCtx, startupCancel := context.WithTimeout(ctx, 5*time.Second)
+	channels, channelsErr := LoadChannelConfig(startupCtx, db)
+	startupCancel()
+	if channelsErr != nil {
+		log.WithError(channelsErr).Warn("notifier: could not read notification channel settings at startup; will retry on each alert")
+	}
 
 	log.WithFields(log.Fields{
-		"slack_enabled":         n.slackEnabled,
-		"email_enabled":         n.emailEnabled,
+		"channel_source":        channels.Source,
+		"slack_enabled":         channels.Slack.Enabled,
+		"email_enabled":         channels.Email.Enabled,
 		"app_base_url":          n.appBaseURL,
 		"interactive_approvals": n.interactiveApprovals,
 		"topics":                strings.Join(n.topics.all(), ","),
@@ -210,6 +203,18 @@ func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, e
 
 	go n.run(consumerCtx)
 	return n, nil
+}
+
+// appBaseURLFromEnv is the public frontend origin used to turn a persisted
+// relative action_url (e.g. /pipelines/{id}/schema-changes) into an absolute
+// link that resolves in Slack/email. Same env var + default the api-gateway
+// auth/invite emails already use, so prod is configured with no new wiring;
+// local/dev falls back to the frontend dev origin.
+func appBaseURLFromEnv() string {
+	if v := strings.TrimRight(strings.TrimSpace(os.Getenv("APP_BASE_URL")), "/"); v != "" {
+		return v
+	}
+	return "http://localhost:3000"
 }
 
 // Stop gracefully shuts down the notifier consumer.
@@ -562,6 +567,10 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 		// Kept for support ("quote this code"), never shown as the headline.
 		metaMap["error_code"] = code
 	}
+	// The category decides who is told (see planDelivery). Persisted so a
+	// 'skipped' row can say which mute skipped it.
+	category := CategoryFor(code, p.Type)
+	metaMap["category"] = category
 	// Embed the full structured error envelope into metadata so the
 	// frontend can render code, remediation steps, copy-pasteable SQL,
 	// doc_url, etc. Persisting it here means the UI doesn't need a
@@ -594,17 +603,12 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	actionable := se != nil && se.Code == "SCHEMA_DRIFT_DETECTED" && strings.TrimSpace(p.PipelineID) != ""
 
 	// External delivery is best-effort.
-	delivered, deliveryErr := n.deliver(ctx, userID.String, p, rendered, actionable)
-	status := "delivered"
+	status, deliveryErr := n.deliver(ctx, userID.String, p, rendered, actionable, category)
 	var errStr sql.NullString
-	if !delivered {
-		status = "failed"
-		if deliveryErr != nil {
-			errStr = sql.NullString{String: deliveryErr.Error(), Valid: true}
-		}
-	}
-	if !n.slackEnabled && !n.emailEnabled {
-		status = "suppressed" // no channel configured; persist-only mode
+	if deliveryErr != nil {
+		// Recorded even when another channel delivered, so a half-broken setup
+		// is visible on the row instead of hiding behind 'delivered'.
+		errStr = sql.NullString{String: deliveryErr.Error(), Valid: true}
 	}
 	_, _ = n.db.ExecContext(ctx, `
 		UPDATE pipeline_notifications
@@ -618,33 +622,63 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 		"pipeline_id":     p.PipelineID,
 		"type":            p.Type,
 		"severity":        severity,
+		"category":        category,
 		"delivery_status": status,
 	}).Info("🔔 Notification persisted")
 
 	return nil
 }
 
-func (n *Notifier) deliver(ctx context.Context, userID string, p notificationPayload, r Rendered, actionable bool) (bool, error) {
-	if !n.slackEnabled && !n.emailEnabled {
-		return false, nil
+// deliver sends one alert through every channel its category is not muted on,
+// and returns the delivery_status to record plus any send error.
+func (n *Notifier) deliver(ctx context.Context, userID string, p notificationPayload, r Rendered, actionable bool, category string) (string, error) {
+	cfg, err := CachedChannelConfig(ctx, n.db)
+	if err != nil {
+		return StatusFailed, err
 	}
-	anyDelivered := false
-	var lastErr error
-	if n.slackEnabled {
-		if err := n.sendSlack(ctx, p, r, actionable); err != nil {
-			lastErr = err
+
+	prefs := DefaultEmailPreferences()
+	if cfg.Email.Enabled {
+		saved, err := ReadEmailPreferences(ctx, n.db, userID)
+		if err != nil {
+			// Sending an alert the owner muted is recoverable; dropping one they
+			// wanted because a preference read failed is not.
+			log.WithError(err).WithField("user_id", userID).Warn("notifier: could not read email preferences; sending with defaults")
 		} else {
-			anyDelivered = true
+			prefs = saved
 		}
 	}
-	if n.emailEnabled {
-		if err := n.sendEmail(ctx, userID, p, r); err != nil {
-			lastErr = err
+
+	plan := planDelivery(cfg, category, prefs)
+	if plan.status != "" {
+		return plan.status, nil
+	}
+
+	delivered := false
+	var errs []string
+	if plan.slack {
+		if err := sendSlackWebhook(ctx, n.httpClient, cfg.Slack, n.slackPayload(p, r, actionable)); err != nil {
+			errs = append(errs, "slack: "+err.Error())
 		} else {
-			anyDelivered = true
+			delivered = true
 		}
 	}
-	return anyDelivered, lastErr
+	if plan.email {
+		if err := n.sendEmail(ctx, cfg.Email, userID, p, r); err != nil {
+			errs = append(errs, "email: "+err.Error())
+		} else {
+			delivered = true
+		}
+	}
+
+	status := StatusFailed
+	if delivered {
+		status = StatusDelivered
+	}
+	if len(errs) > 0 {
+		return status, errors.New(strings.Join(errs, "; "))
+	}
+	return status, nil
 }
 
 // bodyText joins the event's detail message with the catalog's impact line —
@@ -740,29 +774,8 @@ func (n *Notifier) slackPayload(p notificationPayload, r Rendered, actionable bo
 	}
 }
 
-func (n *Notifier) sendSlack(ctx context.Context, p notificationPayload, r Rendered, actionable bool) error {
-	payload := n.slackPayload(p, r, actionable)
-	body, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, "POST", n.slackWebhook, strings.NewReader(string(body)))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := n.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return nil
-	}
-	return fmt.Errorf("slack webhook returned HTTP %d", resp.StatusCode)
-}
-
-func (n *Notifier) sendEmail(ctx context.Context, userID string, p notificationPayload, r Rendered) error {
-	// Look up the user's email — every notification goes to the
-	// pipeline owner. Per-user channel prefs are out of scope for
-	// the pilot.
+func (n *Notifier) sendEmail(ctx context.Context, ch EmailChannel, userID string, p notificationPayload, r Rendered) error {
+	// Every email alert goes to the pipeline owner's account address.
 	var email sql.NullString
 	err := n.db.QueryRowContext(ctx,
 		`SELECT email FROM users WHERE id = $1`, userID,
@@ -774,17 +787,6 @@ func (n *Notifier) sendEmail(ctx context.Context, userID string, p notificationP
 		return fmt.Errorf("user has no email")
 	}
 
-	port := n.smtpPort
-	if port == "" {
-		port = "587"
-	}
-	addr := n.smtpHost + ":" + port
-
-	var auth smtp.Auth
-	if n.smtpUser != "" && n.smtpPassword != "" {
-		auth = smtp.PlainAuth("", n.smtpUser, n.smtpPassword, n.smtpHost)
-	}
-
 	pipelineLabel := r.PipelineName
 	if pipelineLabel == "" {
 		pipelineLabel = p.PipelineID
@@ -792,22 +794,15 @@ func (n *Notifier) sendEmail(ctx context.Context, userID string, p notificationP
 
 	subject := fmt.Sprintf("[rsync-ai %s] %s", strings.ToUpper(r.Severity), r.Title)
 	body := fmt.Sprintf(
-		"%s\r\n\r\nPipeline: %s\r\n%s: %s\r\n\r\n--\r\nAutomated message from rsync-ai notifier",
-		strings.ReplaceAll(bodyText(p.Message, r.Impact), "\n", "\r\n"),
+		"%s\n\nPipeline: %s\n%s: %s\n\nYou can choose which alerts you receive by email in your rsync-ai settings: %s\n\n--\nAutomated message from rsync-ai notifier",
+		bodyText(p.Message, r.Impact),
 		pipelineLabel,
 		r.ActionLabel,
 		absoluteActionURL(n.appBaseURL, p.ActionURL),
+		absoluteActionURL(n.appBaseURL, "/settings"),
 	)
-	msg := []byte(strings.Join([]string{
-		"From: " + n.smtpFrom,
-		"To: " + email.String,
-		"Subject: " + subject,
-		"Content-Type: text/plain; charset=utf-8",
-		"",
-		body,
-	}, "\r\n"))
 
-	return smtp.SendMail(addr, auth, n.smtpFrom, []string{email.String}, msg)
+	return sendSMTP(ctx, ch, email.String, emailMessage{Subject: subject, Body: body})
 }
 
 // classifySeverity maps event types to {info, warning, critical}.

@@ -15,6 +15,7 @@ import {
   FileText,
   TestTube,
   Gauge,
+  Bell,
 } from "lucide-react"
 
 const items = [
@@ -24,6 +25,7 @@ const items = [
   { name: "Invitations", href: "/admin/invitations", icon: Mail },
   { name: "Audit Log", href: "/admin/audit", icon: ScrollText },
   { name: "Settings", href: "/admin/settings", icon: Settings },
+  { name: "Notifications", href: "/admin/notifications", icon: Bell },
   { name: "Health", href: "/admin/health", icon: Activity },
   { name: "Pipelines", href: "/admin/pipelines", icon: GitBranch },
   { name: "Executions", href: "/admin/executions", icon: Play },

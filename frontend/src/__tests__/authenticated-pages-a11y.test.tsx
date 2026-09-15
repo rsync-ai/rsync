@@ -121,11 +121,28 @@ beforeEach(() => {
 
 describe("authenticated pages — no serious/critical axe violations", () => {
   it("/settings", async () => {
-    mockFetch.mockResolvedValue(res({ name: "Ada Lovelace", email: "ada@example.com" }))
+    mockFetch.mockImplementation((url: string) => {
+      if (url === API_ENDPOINTS.NOTIFICATIONS.PREFERENCES) {
+        return Promise.resolve(
+          res({
+            email_enabled: true,
+            email_categories: { data_loss: true, run_status: false },
+            categories: [
+              { id: "data_loss", label: "Data loss & integrity", description: "Rows may be missing." },
+              { id: "run_status", label: "Run failed or stopped", description: "A run ended with an error." },
+            ],
+            channels: { email: false, slack: true },
+          }),
+        )
+      }
+      return Promise.resolve(res({ name: "Ada Lovelace", email: "ada@example.com" }))
+    })
 
     const { container } = render(<SettingsPage />)
-    // Wait for the profile GET to land, so the real (non-empty) form is measured.
+    // Wait for the profile GET and the preferences GET to land, so the real
+    // (non-empty) form and the real notification switches are measured.
     await waitFor(() => expect(screen.getByDisplayValue("ada@example.com")).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByRole("switch", { name: "Email: Run failed or stopped" })).toBeInTheDocument())
 
     expect(await blockingViolations(container)).toEqual([])
   })
