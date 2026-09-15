@@ -76,6 +76,14 @@
     "connection_string",
     "tls"
   ],
+  "config_aliases": {
+    "host": [
+      "connection_string",
+      "mongodb_connection_string",
+      "mongodb_uri",
+      "uri"
+    ]
+  },
   "configuration_schema": {
     "type": "object",
     "properties": {

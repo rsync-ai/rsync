@@ -21,6 +21,7 @@ import { Loader2, Eye, EyeOff, CheckCircle2, AlertCircle, Zap, Clock, Info, Data
 import {
   ConfigProperty,
   MCPConnector,
+  missingRequiredConfigFields,
   missingRequiredCredentials,
 } from "@/lib/types/mcp-connector"
 import { testMCPConnection } from "@/lib/api/mcp-connectors"
@@ -937,22 +938,35 @@ export function GenericConnectorForm({
       "token_type",
     ])
 
-    const missingFields = requiredFields.filter((field) => {
-      if (formData[field]) return false
+    const isSatisfied = (field: string) => {
+      if (formData[field]) return true
       // If OAuth has completed, allow saving without manually entering token/app credentials.
-      if (oauthTokenId && connector.oauth_provider && oauthSatisfiedFields.has(field)) return false
+      if (oauthTokenId && connector.oauth_provider && oauthSatisfiedFields.has(field)) return true
       // Phase 13g — credentials supplied via the multi-auth picker satisfy the
       // schema's required fields (the picker writes to authValues, not formData).
-      if (hasMultiAuth && authValues[field]) return false
-      return true
-    })
+      if (hasMultiAuth && authValues[field]) return true
+      return false
+    }
+
+    // config_aliases lets an alternative key stand in for a required one — an
+    // Atlas `connection_string` for `host`, an oracle `dsn` for host+port. The
+    // orchestrator's pre-start gate already accepts those; without honouring
+    // them here the form refuses to save a connection the server would run.
+    const missingFields = missingRequiredConfigFields(
+      requiredFields,
+      connector.config_aliases,
+      isSatisfied,
+    )
     if (missingFields.length > 0) {
       const firstMissing = missingFields[0]
+      const alternatives = connector.config_aliases?.[firstMissing] || []
       setError({
         message: `Please fill in the required field: ${formatLabel(firstMissing)}`,
-        suggestion: missingFields.length > 1 
-          ? `Also missing: ${missingFields.slice(1).map(formatLabel).join(", ")}` 
-          : undefined,
+        suggestion: alternatives.length > 0
+          ? `Or supply one of: ${alternatives.map(formatLabel).join(", ")}`
+          : missingFields.length > 1
+            ? `Also missing: ${missingFields.slice(1).map(formatLabel).join(", ")}`
+            : undefined,
         field: firstMissing,
       })
       document.getElementById(firstMissing)?.focus()

@@ -657,6 +657,23 @@ GITHUB_CLIENT_SECRET=
 GOOGLE_CLIENT_ID=
 GOOGLE_CLIENT_SECRET=
 
+# ── Failure alerts (optional — but this is how you learn a pipeline broke) ─────
+# A pipeline that fails or is stopped always records a notification you can read
+# in the UI. Filling either block below also pushes it to your team, which is the
+# difference between finding out now and finding out when someone asks where the
+# data went.
+#
+# Slack: one incoming-webhook URL, no app install needed.
+#   https://api.slack.com/messaging/webhooks
+NOTIFIER_SLACK_WEBHOOK_URL=
+# Email: BOTH SMTP_HOST and SMTP_FROM are needed. Setting only the host leaves
+# email off and looks exactly like leaving it off on purpose.
+SMTP_HOST=
+SMTP_PORT=587
+SMTP_USER=
+SMTP_PASSWORD=
+SMTP_FROM=
+
 # ── Version ───────────────────────────────────────────────────────────────────
 # See the notes at the end of this file. Derived from RSYNC_REF at install time so
 # the images match the compose file this .env sits next to; written out rather

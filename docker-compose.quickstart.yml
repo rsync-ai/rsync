@@ -1187,6 +1187,29 @@ services:
       HUBSPOT_CLIENT_SECRET: ${HUBSPOT_CLIENT_SECRET:-}
       SALESFORCE_CLIENT_ID: ${SALESFORCE_CLIENT_ID:-}
       SALESFORCE_CLIENT_SECRET: ${SALESFORCE_CLIENT_SECRET:-}
+      # Notifier delivery. api-gateway ALWAYS runs the notifier consumer
+      # (cmd/server/main.go) and always persists to pipeline_notifications, but
+      # Slack/email fan-out is enabled purely by the presence of these values:
+      # slackEnabled = NOTIFIER_SLACK_WEBHOOK_URL != "", and emailEnabled needs
+      # BOTH SMTP_HOST and SMTP_FROM (notifier.go:199-200). Until this block
+      # existed the vars were simply not passed through here, so a self-host got
+      # persist-only alerting -- rows in the DB, nothing in Slack or email, and
+      # no error at any layer to say so. Every one defaults empty: unset stays
+      # persist-only, which is the safe default for a fresh install.
+      NOTIFIER_SLACK_WEBHOOK_URL: ${NOTIFIER_SLACK_WEBHOOK_URL:-}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      # Required for email delivery, not optional: SMTP_HOST alone leaves
+      # emailEnabled false and the omission looks identical to "email off".
+      SMTP_FROM: ${SMTP_FROM:-}
+      # The absolute base every alert's "Open pipeline" link is built on
+      # (notifier.go:173). It falls back to http://localhost:3000 in code, which
+      # is a dead link in every alert on a server install -- so it follows
+      # NEXTAUTH_URL, the value install.sh actually persists and the same one
+      # RSYNC_CORS_ORIGINS below already keys on.
+      APP_BASE_URL: ${APP_BASE_URL:-${NEXTAUTH_URL:-http://localhost:3000}}
       FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
       # CORS allowlist: must match the frontend origin so browser requests succeed
       RSYNC_CORS_ORIGINS: ${NEXTAUTH_URL:-http://localhost:3000}

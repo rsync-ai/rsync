@@ -319,6 +319,9 @@ func (c *Client) ExecuteWithContext(ctx context.Context, req ExecuteRequest) (*E
 	}
 
 	if resp != nil && !resp.Success {
+		if server.ConnType == "stdio" {
+			resp.Error = annotateStdioFailure(req.Connector, version, server, resp.Error)
+		}
 		span.SetStatus(codes.Error, resp.Error)
 	} else {
 		span.SetStatus(codes.Ok, "")
@@ -326,6 +329,32 @@ func (c *Client) ExecuteWithContext(ctx context.Context, req ExecuteRequest) (*E
 
 	return resp, nil
 }
+
+// annotateStdioFailure names the transport in a failed stdio response.
+//
+// StartServer only reaches the stdio fallback after every Docker container candidate
+// failed, so a failure here is as likely to mean "this connector's container has not
+// finished deploying" as it is to say anything about the connector. And when dependency
+// setup also failed (read-only connectors mount), the subprocess is running on the
+// orchestrator's own interpreter, which carries no connector drivers — so the connector
+// reports a bare "No module named 'X'" that reads as a broken connector and sends the
+// operator to debug something that is fine. Both facts are known here and nowhere else in
+// the response, so attach them.
+// See KI-FIRST-CONNECTION-TEST-FALLS-BACK-TO-AN-UNUSABLE-STDIO-INTERPRETER in CAPABILITIES.md.
+func annotateStdioFailure(connector, version string, server *ServerInfo, errMsg string) string {
+	if errMsg == "" || strings.Contains(errMsg, stdioFallbackMarker) {
+		return errMsg
+	}
+	if server.DepsError != "" {
+		return fmt.Sprintf("%s [%s: connector %s@%s ran as a subprocess inside the orchestrator because no Docker container was reachable, and its dependencies could not be installed there (%s) — this error describes the fallback interpreter, not the connector. If the connector was only just added, its container may still be deploying; retry in a moment.]",
+			errMsg, stdioFallbackMarker, connector, version, server.DepsError)
+	}
+	return fmt.Sprintf("%s [%s: connector %s@%s ran as a subprocess inside the orchestrator because no Docker container was reachable. If the connector was only just added, its container may still be deploying; retry in a moment.]",
+		errMsg, stdioFallbackMarker, connector, version)
+}
+
+// stdioFallbackMarker makes the annotation greppable and idempotent.
+const stdioFallbackMarker = "mcp stdio fallback"
 
 // executeViaStdio executes operation using persistent stdio connection
 func (c *Client) executeViaStdio(ctx context.Context, server *ServerInfo, req JSONRPCRequest) (*ExecuteResponse, error) {

@@ -6,7 +6,40 @@ import (
 	"path/filepath"
 	"reflect"
 	"testing"
+
+	"github.com/rsync-ai/backend-orchestrator/internal/connectorpaths"
 )
+
+// shippedMetadata loads a public database connector's REAL metadata.json.
+//
+// It resolves through latest.json with the same resolver the orchestrator itself
+// uses, rather than naming versions/v1.0.0: per CLAUDE.md the canonical source is
+// versions/<latest.json current_version>, so a hardcoded version dir stops
+// pointing at the code that runs the moment anyone bumps it.
+//
+// Every failure here is t.Fatalf, never t.Skipf. These files ship in this repo,
+// so "not present" means the test lost its subject — and a skipped test is
+// indistinguishable from a passing one in a CI summary, which is how a guard
+// silently stops guarding.
+func shippedMetadata(t *testing.T, connector string) ConnectorMetadata {
+	t.Helper()
+	root := filepath.Join("..", "..", "..", "shared", "mcp-connectors",
+		"public", "database", connector)
+	path, ok := connectorpaths.ResolveVersionedMetadataPath(root)
+	if !ok {
+		t.Fatalf("cannot resolve %s metadata via %s/latest.json; this file ships in "+
+			"this repo, so it has moved rather than become inapplicable", connector, root)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("cannot read %s: %v", path, err)
+	}
+	var md ConnectorMetadata
+	if err := json.Unmarshal(raw, &md); err != nil {
+		t.Fatalf("%s does not unmarshal into ConnectorMetadata: %v", path, err)
+	}
+	return md
+}
 
 // TestMissingRequiredConfig covers the connector config field-alias gate.
 //
@@ -67,16 +100,7 @@ func TestMissingRequiredConfig(t *testing.T) {
 // keeps passing after someone drops config_aliases from the file that actually
 // ships, which is precisely the regression worth catching.
 func TestOracleDSNSatisfiesRequiredConfig(t *testing.T) {
-	path := filepath.Join("..", "..", "..", "shared", "mcp-connectors",
-		"public", "database", "oracle", "versions", "v1.0.0", "metadata.json")
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Skipf("oracle metadata not present in this tree: %v", err)
-	}
-	var md ConnectorMetadata
-	if err := json.Unmarshal(raw, &md); err != nil {
-		t.Fatalf("oracle metadata.json does not unmarshal into ConnectorMetadata: %v", err)
-	}
+	md := shippedMetadata(t, "oracle")
 
 	// Vacuity floor: an empty required list makes every assertion below trivially
 	// true, and a typo in the path would produce exactly that.
@@ -99,6 +123,71 @@ func TestOracleDSNSatisfiesRequiredConfig(t *testing.T) {
 		missing := missingRequiredConfig(md.RequiredConfig, md.ConfigAliases, cfg)
 		if len(missing) == 0 {
 			t.Fatal("the gate accepted an oracle connection naming no host and no dsn; " +
+				"the alias map has been widened until it no longer gates anything")
+		}
+	})
+}
+
+// TestMongoAtlasConnectionStringSatisfiesRequiredConfig is the oracle case again
+// on the connector a MongoDB→GCS pipeline actually starts from, driven by the
+// REAL mongodb metadata off disk.
+//
+// Regression: mongodb's required_config is [host, database], but MongoDB Atlas
+// is reachable only as `mongodb+srv://…` — SRV resolves the seed list, so there
+// is no single host:port to name — and the connector's own _build_uri returns an
+// explicit connection_string and never reads `host` at all
+// (connector.py, versions/v1.0.0). The gate therefore rejected every Atlas
+// connection before the container started, over a field the connector ignores.
+//
+// The gate checks key PRESENCE, not value, so the only way through was a
+// placeholder host. That is not a workaround worth documenting: it makes a
+// connection that works look identical to one misconfigured with a real but
+// wrong host.
+func TestMongoAtlasConnectionStringSatisfiesRequiredConfig(t *testing.T) {
+	md := shippedMetadata(t, "mongodb")
+
+	// Vacuity floor — see the oracle test above for why this must be asserted
+	// rather than assumed.
+	if len(md.RequiredConfig) == 0 {
+		t.Fatalf("mongodb declares no required_config; the gate assertions below would be vacuous")
+	}
+
+	// Every key _build_uri accepts as an explicit URI. The alias map and that
+	// function must stay in lockstep: an alias the connector does not read lets a
+	// connection start that cannot possibly connect.
+	for _, key := range []string{"connection_string", "mongodb_connection_string", "mongodb_uri", "uri"} {
+		t.Run(key+"-only connection is accepted", func(t *testing.T) {
+			cfg := map[string]string{
+				key:        "mongodb+srv://u:p@cluster0.abcd.mongodb.net/?retryWrites=true",
+				"database": "shop",
+			}
+			if missing := missingRequiredConfig(md.RequiredConfig, md.ConfigAliases, cfg); len(missing) != 0 {
+				t.Fatalf("an Atlas connection supplied via %s was rejected with missing=%v; "+
+					"config_aliases must map host onto the URI chain _build_uri reads", key, missing)
+			}
+		})
+	}
+
+	t.Run("a self-hosted host:port connection is still accepted", func(t *testing.T) {
+		cfg := map[string]string{"host": "mongo.internal", "port": "27017", "database": "shop"}
+		if missing := missingRequiredConfig(md.RequiredConfig, md.ConfigAliases, cfg); len(missing) != 0 {
+			t.Fatalf("adding aliases broke the pre-existing discrete-field path: missing=%v", missing)
+		}
+	})
+
+	t.Run("database has no alias and is still required", func(t *testing.T) {
+		cfg := map[string]string{"connection_string": "mongodb+srv://u:p@cluster0.abcd.mongodb.net/"}
+		missing := missingRequiredConfig(md.RequiredConfig, md.ConfigAliases, cfg)
+		if len(missing) != 1 || missing[0] != "database" {
+			t.Fatalf("missing = %v, want exactly [database]; a URI does not name the database "+
+				"rsync captures collections from", missing)
+		}
+	})
+
+	t.Run("a connection naming neither host nor any URI key is still rejected", func(t *testing.T) {
+		cfg := map[string]string{"database": "shop", "user": "u", "password": "p"}
+		if missing := missingRequiredConfig(md.RequiredConfig, md.ConfigAliases, cfg); len(missing) == 0 {
+			t.Fatal("the gate accepted a mongodb connection naming no host and no URI; " +
 				"the alias map has been widened until it no longer gates anything")
 		}
 	})

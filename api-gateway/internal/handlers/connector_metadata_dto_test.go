@@ -2,6 +2,8 @@ package handlers
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
 )
@@ -151,6 +153,105 @@ func TestMapToMCPConnector_publicListWireShape(t *testing.T) {
 		if _, ok := w[k]; !ok {
 			t.Errorf("wire is missing required key %q", k)
 		}
+	}
+}
+
+// TestMapToMCPConnector_carriesConfigAliases drives the mapper with the REAL
+// shipped metadata off disk, not a fixture.
+//
+// Regression: the connection form gates Save on configuration_schema.required
+// with no alias awareness (frontend GenericConnectorForm.tsx), while the
+// orchestrator's pre-start gate honours config_aliases
+// (backend-orchestrator/internal/mcp/server_manager.go, missingRequiredConfig).
+// This DTO never carried config_aliases, so the field could not reach the form
+// even once a connector declared it — making the UI strictly stricter than the
+// server. A MongoDB Atlas connection, which supplies connection_string and no
+// host, was unsaveable; oracle-by-dsn had the same shape.
+//
+// Reading the shipped files rather than a fixture is deliberate: a fixture keeps
+// passing after someone drops config_aliases from the metadata that actually
+// ships, which is precisely the regression worth catching.
+func TestMapToMCPConnector_carriesConfigAliases(t *testing.T) {
+	// Resolved through latest.json, not a hardcoded versions/v1.0.0: per CLAUDE.md
+	// the canonical source is versions/<current_version>, so a pinned version dir
+	// stops pointing at the shipped file the moment anyone bumps it. The
+	// orchestrator's shared resolver lives under backend-orchestrator/internal/,
+	// which Go's internal rule puts out of reach of this module, so the two-field
+	// read is inlined here.
+	metaPath := func(t *testing.T, connector string) string {
+		t.Helper()
+		root := filepath.Join("..", "..", "..", "shared", "mcp-connectors",
+			"public", "database", connector)
+		raw, err := os.ReadFile(filepath.Join(root, "latest.json"))
+		if err != nil {
+			t.Fatalf("cannot read %s/latest.json: %v", connector, err)
+		}
+		var latest struct {
+			CurrentVersion string `json:"current_version"`
+		}
+		if err := json.Unmarshal(raw, &latest); err != nil {
+			t.Fatalf("%s/latest.json does not parse: %v", connector, err)
+		}
+		if latest.CurrentVersion == "" {
+			t.Fatalf("%s/latest.json names no current_version", connector)
+		}
+		return filepath.Join(root, "versions", latest.CurrentVersion, "metadata.json")
+	}
+
+	for _, tc := range []struct {
+		connector string
+		aliased   string // canonical required field that must be aliasable
+		via       string // one alias key that must satisfy it
+	}{
+		{"mongodb", "host", "connection_string"},
+		{"oracle", "host", "dsn"},
+	} {
+		t.Run(tc.connector, func(t *testing.T) {
+			// t.Fatalf, never t.Skipf: this metadata ships in this repo, so absence
+			// means the test lost its subject — and a skip reads exactly like a pass
+			// in a CI summary, which is how a guard silently stops guarding.
+			path := metaPath(t, tc.connector)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("cannot read %s: %v", path, err)
+			}
+			var meta connectorMetadataDTO
+			if err := json.Unmarshal(raw, &meta); err != nil {
+				t.Fatalf("%s does not unmarshal into connectorMetadataDTO: %v", path, err)
+			}
+
+			// Vacuity floor: an unmarshal that silently produced an empty struct
+			// (a renamed json tag, a wrong path) would make every check below
+			// trivially true.
+			if len(meta.ConfigAliases) == 0 {
+				t.Fatalf("%s declares no config_aliases on disk; the wire assertions below would be vacuous", tc.connector)
+			}
+
+			var w map[string]interface{}
+			b, _ := json.Marshal(mapToMCPConnector(meta, tc.connector, "1.0.0"))
+			if err := json.Unmarshal(b, &w); err != nil {
+				t.Fatalf("wire round-trip failed: %v", err)
+			}
+			wire, ok := w["config_aliases"].(map[string]interface{})
+			if !ok {
+				t.Fatalf("wire drops config_aliases; the connection form cannot honour what it cannot see (got %#v)", w["config_aliases"])
+			}
+			alts, ok := wire[tc.aliased].([]interface{})
+			if !ok {
+				t.Fatalf("wire config_aliases has no entry for %q: %#v", tc.aliased, wire)
+			}
+			found := false
+			for _, a := range alts {
+				if s, _ := a.(string); s == tc.via {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Errorf("%s: %q is not listed as an alias for %q (%v); a connection supplying only %s is still unsaveable in the UI",
+					tc.connector, tc.via, tc.aliased, alts, tc.via)
+			}
+		})
 	}
 }
 

@@ -178,6 +178,41 @@ export function missingRequiredCredentials(
   )
 }
 
+/**
+ * Which of `requiredFields` are still unsatisfied, honouring `config_aliases`.
+ *
+ * A connector may declare that a required field can be satisfied by an
+ * alternative key instead — a whole connection URI standing in for the discrete
+ * host/port it encodes. The orchestrator's pre-start gate already works this way
+ * (backend-orchestrator/internal/mcp/server_manager.go, missingRequiredConfig);
+ * this is the form agreeing with the server it is gating for.
+ *
+ * Without it the UI is STRICTER than the runtime, and the failure is silent in
+ * the worst way: the connector would work, but the connection cannot be saved.
+ * MongoDB Atlas is the live case — it is reachable only by `mongodb+srv://` in
+ * `connection_string`, there is no `host` to type, and the connector's
+ * `_build_uri` ignores `host` entirely once a URI is present. Oracle-by-`dsn`
+ * has the same shape.
+ *
+ * Emptiness is judged by `isSatisfied`, supplied by the caller because a field
+ * can be satisfied from several places (typed value, completed OAuth, the
+ * multi-auth picker). Note this is deliberately stricter than the Go gate on one
+ * axis: the server accepts a declared-but-empty key, this requires a value. An
+ * empty `connection_string` satisfies nobody.
+ */
+export function missingRequiredConfigFields(
+  requiredFields: string[],
+  configAliases: Record<string, string[]> | undefined,
+  isSatisfied: (field: string) => boolean,
+): string[] {
+  return requiredFields.filter((field) => {
+    if (isSatisfied(field)) return false
+    const alts = configAliases?.[field]
+    if (!alts?.length) return true
+    return !alts.some((alt) => isSatisfied(alt))
+  })
+}
+
 // Full MCP Connector metadata (from API)
 export interface MCPConnector {
   name: string
@@ -189,6 +224,12 @@ export interface MCPConnector {
   color: string
   capabilities: Record<string, unknown> | string[]
   configuration_schema: ConfigurationSchema
+  // Maps a canonical required field onto alternative keys that also satisfy it,
+  // mirroring the orchestrator's pre-start gate. Present only on connectors that
+  // declare it (mongodb: host <- connection_string; oracle: host/port <- dsn).
+  // Consumed by missingRequiredConfigFields — see its doc comment for why the
+  // form must honour this or it is stricter than the server it gates for.
+  config_aliases?: Record<string, string[]>
   supports_source: boolean
   supports_destination: boolean
   supports_cdc: boolean
