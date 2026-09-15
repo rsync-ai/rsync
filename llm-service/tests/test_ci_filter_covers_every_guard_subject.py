@@ -116,6 +116,17 @@ GUARDS = [
     # runs produces a green check with no error at any layer. Same shape, one
     # level up.
     "test_failure_alerts_can_reach_a_self_host.py",
+    # Enrolled 2026-09-15 with the connector-mount fix. Its subjects are
+    # docker-compose.yml and docker-compose.quickstart.yml, plus the Go and Python
+    # trees it walks for the catalog paths they open -- all already covered, by
+    # `docker-compose*.yml`, `backend-temporal-adapter/**`, `backend-orchestrator/**`,
+    # `api-gateway/**` and the llm-service patterns, so ci.yml needed no change.
+    # Enrolled for the reason every entry above gives, and this pass measured it
+    # rather than assuming: written, run green at 12 passed, then
+    # `--collect-only | grep` for its name against THIS file returned 0 while this
+    # file reported `183 passed` -- a number that looks like coverage and was, for
+    # the new guard, coverage of nothing.
+    "test_quickstart_mounts_the_tree_the_code_reads.py",
 ]
 
 

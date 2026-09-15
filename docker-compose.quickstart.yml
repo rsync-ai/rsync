@@ -1089,6 +1089,25 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       LOG_LEVEL: info
       ENVIRONMENT: production
+    volumes:
+      # REQUIRED, and this file is the only one that ever missed it: this is the
+      # container that runs ConnectorAvailabilityActivityV2, and that activity
+      # resolves connectors off the LOCAL FILESYSTEM — connector_check_activity.go:93-97
+      # stats /app/shared/mcp-connectors/{public,internal,} and /app/tools. Without
+      # the mount every root Stat fails, so checkConnectorExists returns false for
+      # EVERY connector, the workflow escalates to GenerateConnectorActivityV2, and
+      # the user sees "Connector generation failed for <x>" for a connector that is
+      # sitting right there in the volume. Nothing about it is connector-specific;
+      # no pipeline of any kind can be created.
+      # docker-compose.yml (base, which prod/staging/e2e/ci-isolate all overlay)
+      # has carried this mount from the start — `./shared:/app/shared`, commented
+      # "Required for connector filesystem checks". This quickstart is the one
+      # standalone compose, so it is the only file that had to repeat it, and the
+      # only deployment path that broke: every self-host install.
+      # Read-only on purpose: the adapter only ever reads this tree (ReadDir/Stat/
+      # ReadFile/WalkDir). Generation output is written by tool-generator, which
+      # mounts the same volume read-write.
+      - mcp_connectors:/app/shared/mcp-connectors:ro
 
   api-gateway:
     image: ghcr.io/rsync-ai/api-gateway:${RSYNC_VERSION:-latest}
