@@ -26,6 +26,7 @@ import yaml
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "docker-publish.yml")
 INSTALL_SH = os.path.join(REPO_ROOT, "install.sh")
+QUICKSTART = os.path.join(REPO_ROOT, "docker-compose.quickstart.yml")
 DOCS = [
     os.path.join(REPO_ROOT, "docs", "deployment", "cloud-options.md"),
     os.path.join(REPO_ROOT, "docs", "deployment", "kubernetes.md"),
@@ -140,4 +141,60 @@ def test_the_preflight_warns_rather_than_exiting_when_the_daemon_is_unreadable()
     assert "return 0" in empty_branch.group(1), (
         "check_arch now exits when it cannot read the daemon's architecture. An unreadable "
         "arch is not evidence of a wrong one -- warn and continue, as check_ram does."
+    )
+
+
+def test_quickstart_pins_the_platform_it_publishes_on_every_ghcr_service():
+    """`check_arch()` warning-then-continuing is not the same as continuing successfully.
+
+    The two tests above hold the WARNING accurate; neither one holds the "yes,
+    continue anyway" path WORKING. Before this guard, an operator who answered
+    yes still hit `docker compose pull` asking the registry for a manifest that
+    does not exist -- `no matching manifest for linux/arm64/v8` -- because
+    nothing in docker-compose.quickstart.yml told compose which platform to
+    request for the 14 `ghcr.io/rsync-ai/*` images it pulls. That is the same
+    failure the warning describes, arriving one step later than the guard could
+    see it: this file only ever parsed the warning text and install.sh, never
+    the compose file operators actually run.
+
+    Third-party images (postgres, kafka, redis, temporal, minio) are deliberately
+    exempt -- they already publish native arm64 manifests, and pinning those too
+    would only add emulation overhead with no upside.
+    """
+    doc = yaml.safe_load(open(QUICKSTART, encoding="utf-8"))
+    actual = _published_platforms()
+
+    ghcr_services = {
+        name: svc
+        for name, svc in doc["services"].items()
+        if str(svc.get("image", "")).startswith("ghcr.io/rsync-ai/")
+    }
+    # Anti-vacuity: a moved or renamed image reference would otherwise let this
+    # guard pass over an empty set.
+    assert len(ghcr_services) >= 10, (
+        f"found only {len(ghcr_services)} ghcr.io/rsync-ai/* services in "
+        f"{os.path.relpath(QUICKSTART, REPO_ROOT)} -- expected at least 10. Did the image "
+        "prefix or the compose file move?"
+    )
+
+    if len(actual) > 1:
+        # Multi-arch publish: a hardcoded pin would now be the obstruction --
+        # it would stop compose negotiating the arm64 manifest on hosts that
+        # could run it natively.
+        pinned = {n for n, svc in ghcr_services.items() if svc.get("platform")}
+        assert not pinned, (
+            f"docker-publish.yml now publishes {sorted(actual)}, so the images are multi-arch. "
+            f"Remove the now-obstructive `platform:` pin from: {sorted(pinned)}."
+        )
+        return
+
+    only_platform = next(iter(actual))
+    unpinned = {n for n, svc in ghcr_services.items() if svc.get("platform") != only_platform}
+    assert not unpinned, (
+        f"docker-publish.yml publishes {sorted(actual)} only, but these "
+        f"docker-compose.quickstart.yml services don't pin `platform: {only_platform}`: "
+        f"{sorted(unpinned)}. Without the pin, `docker compose pull` on a host whose daemon "
+        "architecture differs asks the registry for a manifest that was never published and "
+        "fails with `no matching manifest for linux/arm64/v8` -- even after check_arch() has "
+        "already warned the operator and they chose to continue."
     )
