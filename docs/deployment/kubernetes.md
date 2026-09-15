@@ -25,24 +25,24 @@ Both run the same `ghcr.io/rsync-ai/*` images at the same version.
 
 ## Install
 
-**Requirements:** Kubernetes ≥ 1.25, Helm ≥ 3.8 (OCI support), **`linux/amd64`
-nodes**, a default StorageClass, and — for anything beyond evaluation — managed
-Postgres, Redis, Kafka and object storage.
+**Requirements:** Kubernetes ≥ 1.25, Helm ≥ 3.8 (OCI support), `linux/amd64` or
+`linux/arm64` nodes, a default StorageClass, and — for anything beyond evaluation —
+managed Postgres, Redis, Kafka and object storage.
 
-<!-- published-platforms: linux/amd64 -->
+<!-- published-platforms: linux/amd64, linux/arm64 -->
 <!-- The prose below was written against that platform set, which is computed from
-     .github/workflows/docker-publish.yml, not asserted here. If the workflow starts
-     building another platform, test_published_image_platforms_match_the_docs.py goes
+     .github/workflows/docker-publish.yml, not asserted here. If the workflow's
+     platform set changes, test_published_image_platforms_match_the_docs.py goes
      red and points at this block. -->
-> [!WARNING]
-> **The node architecture is a hard requirement, and it fails late.** Every
-> `ghcr.io/rsync-ai/*` image is `linux/amd64` only — `docker-publish.yml` sets no
-> `platforms:` key, so buildx tags each image for its `ubuntu-latest` runner and
-> nothing else. On an arm64 node pool (GKE T2A/Axion, EKS Graviton, AKS Ampere)
-> `helm install` reports success and every pod then sits in `ImagePullBackOff`
-> with no arm64 candidate. Nothing in the chart can catch this: a manifest is
-> resolved by the kubelet, long after the render the chart is able to validate.
-> Pin an amd64 pool, or build the images yourself from a checkout.
+> [!NOTE]
+> **Every `ghcr.io/rsync-ai/*` image is a multi-arch index** (`linux/amd64` and
+> `linux/arm64`), so arm64 node pools (GKE T2A/Axion, EKS Graviton, AKS Ampere)
+> and mixed pools pull the native image with no `nodeSelector`. That holds for
+> release tags cut after multi-arch publishing landed. An older tag is amd64-only,
+> and on an arm64 node `helm install` reports success while every pod sits in
+> `ImagePullBackOff` — nothing in the chart can catch that, because the kubelet
+> resolves the manifest long after the render. Check before pinning a tag:
+> `docker manifest inspect ghcr.io/rsync-ai/api-gateway:<tag> | grep '"architecture"'`.
 
 ### From the published chart
 

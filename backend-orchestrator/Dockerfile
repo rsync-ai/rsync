@@ -1,4 +1,8 @@
-FROM golang:1.25-alpine AS builder
+# --platform=$BUILDPLATFORM: the compiler runs natively on the build host and
+# cross-compiles for $TARGETARCH, so a multi-arch publish does not run `go build`
+# under QEMU. CGO is off (no C toolchain in this image), which is what makes the
+# cross-compile a pure GOARCH switch.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 ENV GONOSUMDB=* GONOSUMCHECK=* GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /build
@@ -20,11 +24,13 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 # Copy source code
 COPY backend-orchestrator/ /build/backend-orchestrator/
 
+ARG TARGETOS
+ARG TARGETARCH
 # Build — mount Go build cache so incremental rebuilds reuse prior compiler output.
 # On the prod VM this cuts the go build step from ~180s to ~20s after the first build.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    go build -o bin/orchestrator ./cmd/orchestrator
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o bin/orchestrator ./cmd/orchestrator
 
 FROM alpine:3.24
 

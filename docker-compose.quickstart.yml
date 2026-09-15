@@ -7,24 +7,6 @@
 # All images are pre-built and pulled from GHCR — no source code required.
 # Requires: Docker 24+, docker compose v2, and an .env file (see install.sh).
 #
-# ── Platform ─────────────────────────────────────────────────────────────────
-# Every `ghcr.io/rsync-ai/*` service carries an explicit `platform: linux/amd64`:
-# docker-publish.yml sets no `platforms:` key on its build steps and runs on
-# `ubuntu-latest`, so all 14 published images are linux/amd64 only (verified
-# anonymously against GHCR; see test_published_image_platforms_match_the_docs.py).
-# Without the pin, a `docker compose pull` on an arm64 daemon (Apple Silicon,
-# Graviton, Ampere, Oracle A1.Flex) asks the registry for a native arm64
-# manifest that does not exist and fails with `no matching manifest for
-# linux/arm64/v8`, even after install.sh's check_arch() has already warned the
-# operator and they chose to continue. The pin makes that "continue anyway"
-# choice actually work: Docker Desktop runs the amd64 images under emulation
-# (correct, slower); a Linux arm64 host additionally needs the qemu-x86_64
-# binfmt handler registered (`docker run --privileged --rm tonistiigi/binfmt
-# --install amd64`), which install.sh already tells the operator to do.
-# Third-party images below (postgres, redis, kafka, temporal, minio) are NOT
-# pinned — they already publish native arm64 manifests, and forcing them to
-# amd64 would only add emulation overhead with no upside.
-#
 # ── Sizing ───────────────────────────────────────────────────────────────────
 # Targets a 4 vCPU / 16 GiB host. Every service carries an explicit `mem_limit`,
 # which is doing two jobs: it stops one runaway container from taking the host
@@ -622,7 +604,6 @@ services:
   # the PII scanner. See .github/workflows/docker-publish.yml.
   llm-service:
     image: ghcr.io/rsync-ai/llm-service-oss:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-llm-service
     logging:
       driver: json-file
@@ -748,7 +729,6 @@ services:
   # docker-compose.oss.yml so layering the two merges cleanly.
   connector-seed:
     image: ghcr.io/rsync-ai/connector-seed:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-connector-seed
     restart: "no"
     logging:
@@ -784,7 +764,6 @@ services:
     # stack with `unable to prepare context: path "./connector-deployer" not
     # found`. Published by docker-publish.yml alongside the other core services.
     image: ghcr.io/rsync-ai/connector-deployer:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-connector-deployer
     logging:
       driver: json-file
@@ -825,7 +804,6 @@ services:
   # `tool-generator` — every peer resolves it by that hostname.
   tool-generator:
     image: ghcr.io/rsync-ai/connector-lifecycle:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-tool-generator
     logging:
       driver: json-file
@@ -871,7 +849,6 @@ services:
 
   planner:
     image: ghcr.io/rsync-ai/llm-service-oss:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-planner
     logging:
       driver: json-file
@@ -937,7 +914,6 @@ services:
 
   orchestrator:
     image: ghcr.io/rsync-ai/orchestrator:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-orchestrator
     logging:
       driver: json-file
@@ -1036,7 +1012,6 @@ services:
 
   temporal-adapter:
     image: ghcr.io/rsync-ai/temporal-adapter:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-temporal-adapter
     logging:
       driver: json-file
@@ -1111,7 +1086,6 @@ services:
 
   api-gateway:
     image: ghcr.io/rsync-ai/api-gateway:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-api-gateway
     logging:
       driver: json-file
@@ -1275,7 +1249,6 @@ services:
 
   frontend:
     image: ghcr.io/rsync-ai/frontend:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-frontend
     logging:
       driver: json-file
@@ -1327,7 +1300,6 @@ services:
 
   minio-mcp:
     image: ghcr.io/rsync-ai/mcp-minio:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-ai-minio-v1-0-0-mcp
     logging:
       driver: json-file
@@ -1370,7 +1342,6 @@ services:
   # duplicate container. Do not shorten it.
   sample-data-mcp:
     image: ghcr.io/rsync-ai/mcp-sample-data:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-ai-sample-data-v1-0-0-mcp
     logging:
       driver: json-file
@@ -1396,7 +1367,6 @@ services:
   # was already paying to run half of it.
   kafka-connect:
     image: ghcr.io/rsync-ai/kafka-connect:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: kafka-connect
     logging:
       driver: json-file
@@ -1533,7 +1503,6 @@ services:
 
   debezium-mcp:
     image: ghcr.io/rsync-ai/mcp-debezium:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-ai-debezium-v1-0-0-mcp
     logging:
       driver: json-file
@@ -1574,7 +1543,6 @@ services:
 
   kafka-mcp-sink-mcp:
     image: ghcr.io/rsync-ai/mcp-kafka-sink:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-ai-kafka-mcp-sink-v1-0-0-mcp
     logging:
       driver: json-file
@@ -1635,7 +1603,6 @@ services:
   # design — a stack that only RUNS existing connectors never needs it.
   context7-mcp:
     image: ghcr.io/rsync-ai/mcp-context7:${RSYNC_VERSION:-latest}
-    platform: linux/amd64
     container_name: rsync-context7-mcp
     logging:
       driver: json-file

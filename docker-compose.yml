@@ -117,7 +117,15 @@ services:
         max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     ports:
-      - "${RSYNC_HP_POSTGRES:-5432}:5432"
+      # Every host port in this file binds 127.0.0.1. A port with no host IP binds
+      # 0.0.0.0, and Docker writes its own iptables rules AHEAD of ufw/firewalld,
+      # so "the firewall is on" does not close it -- on a laptop that is the coffee
+      # shop's Wi-Fi reaching an unauthenticated Postgres, Kafka, Redis and the
+      # orchestrator's internal routes. The two user-facing ports (frontend,
+      # api-gateway) read RSYNC_BIND_ADDR like docker-compose.quickstart.yml does,
+      # so a dev who wants the UI on the LAN sets that one knob and exposes only
+      # those two. Nothing else here is meant to be reachable off the box.
+      - "127.0.0.1:${RSYNC_HP_POSTGRES:-5432}:5432"
     environment:
       - POSTGRES_USER=user
       - POSTGRES_PASSWORD=password
@@ -151,7 +159,7 @@ services:
         max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     ports:
-      - "${RSYNC_HP_KAFKA:-9092}:9092"
+      - "127.0.0.1:${RSYNC_HP_KAFKA:-9092}:9092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
@@ -282,7 +290,7 @@ services:
         # profiles: without required:false = "depends on undefined service".
         required: false
     ports:
-      - "${RSYNC_HP_SCHEMA_REGISTRY:-8085}:8080"
+      - "127.0.0.1:${RSYNC_HP_SCHEMA_REGISTRY:-8085}:8080"
     environment:
       # No KAFKA_*/REGISTRY_* keys here, on purpose. Apicurio 3 reads apicurio.*-prefixed
       # config; KAFKA_BOOTSTRAP_SERVERS and REGISTRY_KAFKASQL_TOPIC (the Apicurio-2 spelling)
@@ -350,7 +358,7 @@ services:
       - POSTGRES_SEEDS=postgres
       - DYNAMIC_CONFIG_FILE_PATH=config/dynamicconfig/development-sql.yaml
     ports:
-      - "${RSYNC_HP_TEMPORAL:-7233}:7233"
+      - "127.0.0.1:${RSYNC_HP_TEMPORAL:-7233}:7233"
     healthcheck:
       test: ["CMD", "tctl", "--address", "temporal:7233", "workflow", "list"]
       interval: 10s
@@ -374,7 +382,7 @@ services:
       - TEMPORAL_ADDRESS=temporal:7233
       - TEMPORAL_CORS_ORIGINS=http://localhost:3000
     ports:
-      - "${RSYNC_HP_TEMPORAL_UI:-8233}:8080"
+      - "127.0.0.1:${RSYNC_HP_TEMPORAL_UI:-8233}:8080"
 
   # Temporal Admin Tools
   temporal-admin-tools:
@@ -450,7 +458,7 @@ services:
       OTEL_SERVICE_NAME: "temporal-adapter"
       OTEL_ENABLED: "true"
     ports:
-      - "${RSYNC_HP_TEMPORAL_ADAPTER:-8082}:8082"
+      - "127.0.0.1:${RSYNC_HP_TEMPORAL_ADAPTER:-8082}:8082"
     volumes:
       # Required for connector filesystem checks + (optional) connector generation output
       - ./shared:/app/shared
@@ -941,7 +949,7 @@ services:
       - OTEL_SERVICE_NAME=context7-mcp
       - OTEL_ENABLED=true
     ports:
-      - "${RSYNC_HP_CONTEXT7:-8087}:8080"
+      - "127.0.0.1:${RSYNC_HP_CONTEXT7:-8087}:8080"
     # Add DNS servers to resolve external hostnames
     dns:
       - 8.8.8.8
@@ -974,7 +982,7 @@ services:
         max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     ports:
-      - "${RSYNC_HP_REDIS:-6379}:6379"
+      - "127.0.0.1:${RSYNC_HP_REDIS:-6379}:6379"
     command:
       - sh
       - -c
@@ -1029,7 +1037,7 @@ services:
       #   agent.control.commands.<type> topic (kafka-topics --alter ...).
       replicas: 1
     ports:
-      - "${RSYNC_HP_ORCHESTRATOR:-8081}:8080" # Internal port for debugging
+      - "127.0.0.1:${RSYNC_HP_ORCHESTRATOR:-8081}:8080" # Internal port for debugging
     environment:
       # Kafka client security for a BYO/managed broker. See x-kafka-security at
       # the top of this file; every key defaults to empty and empty means unset,
@@ -1216,8 +1224,12 @@ services:
       context: .
       dockerfile: api-gateway/Dockerfile
     container_name: rsync-ai-api-gateway
+    # main() exits when the database is unreachable at boot (db.Init has already
+    # retried for DB_CONNECT_TIMEOUT). The restart is what turns that exit into a
+    # recovery once Postgres is up; without it the container just stays down.
+    restart: unless-stopped
     ports:
-      - "${RSYNC_HP_API_GATEWAY:-5001}:8080" # Public API port (5001 to avoid macOS AirPlay on 5000)
+      - "${RSYNC_BIND_ADDR:-127.0.0.1}:${RSYNC_HP_API_GATEWAY:-5001}:8080" # Public API port (5001 to avoid macOS AirPlay on 5000)
     environment:
       # Kafka client security for a BYO/managed broker. See x-kafka-security at
       # the top of this file; every key defaults to empty and empty means unset,
@@ -1697,7 +1709,7 @@ services:
       # JIT Integration: Shared volume for connector existence checks
       - ./shared/mcp-connectors:/app/shared/mcp-connectors:ro
     ports:
-      - "${RSYNC_HP_PLANNER:-8001}:5011"
+      - "127.0.0.1:${RSYNC_HP_PLANNER:-8001}:5011"
     command: ["python", "-m", "src.agents.planner.service"]
     # Long-form depends_on: the short list form cannot carry `required: false`,
     # and the `kafka` entry below needs it — see docker-compose.byo-kafka.yml.
@@ -1737,7 +1749,7 @@ services:
       - path: ./frontend/.env
         required: false
     ports:
-      - "${RSYNC_HP_FRONTEND:-3000}:3000"
+      - "${RSYNC_BIND_ADDR:-127.0.0.1}:${RSYNC_HP_FRONTEND:-3000}:3000"
     environment:
       # Internal URLs for server-side fetches (within Docker network)
       - API_GATEWAY_INTERNAL_URL=http://api-gateway:8080
@@ -1822,8 +1834,8 @@ services:
       - /var/lib/docker/containers:/var/lib/docker/containers:ro
       - fluentbit_state:/var/log/flb-state
     ports:
-      - "${RSYNC_HP_FLUENT:-24224}:24224"
-      - "${RSYNC_HP_FLUENT:-24224}:24224/udp"
+      - "127.0.0.1:${RSYNC_HP_FLUENT:-24224}:24224"
+      - "127.0.0.1:${RSYNC_HP_FLUENT:-24224}:24224/udp"
     depends_on:
       - otel-collector
     extra_hosts:
@@ -1855,10 +1867,10 @@ services:
     volumes:
       - ./deploy/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
     ports:
-      - "${RSYNC_HP_OTEL_GRPC:-14317}:4317"  # OTLP gRPC receiver (host-port shifted to avoid a collision)
-      - "${RSYNC_HP_OTEL_HTTP:-14318}:4318"  # OTLP HTTP receiver  
-      - "${RSYNC_HP_OTEL_FLUENTFWD:-8006}:8006"   # Fluentforward receiver
-      - "${RSYNC_HP_OTEL_HEALTH:-13133}:13133" # Health check
+      - "127.0.0.1:${RSYNC_HP_OTEL_GRPC:-14317}:4317"  # OTLP gRPC receiver (host-port shifted to avoid a collision)
+      - "127.0.0.1:${RSYNC_HP_OTEL_HTTP:-14318}:4318"  # OTLP HTTP receiver  
+      - "127.0.0.1:${RSYNC_HP_OTEL_FLUENTFWD:-8006}:8006"   # Fluentforward receiver
+      - "127.0.0.1:${RSYNC_HP_OTEL_HEALTH:-13133}:13133" # Health check
     extra_hosts:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped

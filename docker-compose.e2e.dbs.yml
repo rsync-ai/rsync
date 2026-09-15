@@ -32,7 +32,7 @@ services:
       - MYSQL_USER=e2e_user
       - MYSQL_PASSWORD=e2e_password
     ports:
-      - "${RSYNC_HP_MYSQL_E2E:-3307}:3306"
+      - "127.0.0.1:${RSYNC_HP_MYSQL_E2E:-3307}:3306"
     volumes:
       - ./e2e/mysql/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -63,7 +63,7 @@ services:
       - POSTGRES_PASSWORD=e2e_password
       - POSTGRES_DB=e2e_db
     ports:
-      - "${RSYNC_HP_POSTGRES_E2E:-5433}:5432"
+      - "127.0.0.1:${RSYNC_HP_POSTGRES_E2E:-5433}:5432"
     volumes:
       - ./e2e/postgres/init:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -100,8 +100,8 @@ services:
       - MINIO_ROOT_USER=minioadmin
       - MINIO_ROOT_PASSWORD=minioadmin
     ports:
-      - "${RSYNC_HP_MINIO:-9000}:9000"
-      - "${RSYNC_HP_MINIO_CONSOLE:-9001}:9001"
+      - "127.0.0.1:${RSYNC_HP_MINIO:-9000}:9000"
+      - "127.0.0.1:${RSYNC_HP_MINIO_CONSOLE:-9001}:9001"
     volumes:
       - minio_data:/data
     healthcheck:
@@ -149,7 +149,7 @@ services:
     volumes:
       - ./e2e/mock_github_server.py:/app/mock_github_server.py:ro
     ports:
-      - "${RSYNC_HP_MOCK_GITHUB:-8099}:8080"
+      - "127.0.0.1:${RSYNC_HP_MOCK_GITHUB:-8099}:8080"
     healthcheck:
       # Use IPv4 explicitly: Alpine wget may prefer IPv6 ::1 for localhost
       # while the server binds only on 0.0.0.0, causing false "Connection refused".
@@ -174,7 +174,7 @@ services:
     volumes:
       - ./e2e/mock_graphql_server.py:/app/mock_graphql_server.py:ro
     ports:
-      - "${RSYNC_HP_MOCK_GRAPHQL:-8098}:8080"
+      - "127.0.0.1:${RSYNC_HP_MOCK_GRAPHQL:-8098}:8080"
     healthcheck:
       # IPv4 explicit: Alpine wget may prefer IPv6 ::1 while the server binds 0.0.0.0.
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"]

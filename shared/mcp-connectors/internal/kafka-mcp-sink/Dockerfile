@@ -1,4 +1,8 @@
-FROM golang:1.25-alpine AS worker-builder
+# --platform=$BUILDPLATFORM: the compiler runs natively on the build host and
+# cross-compiles for $TARGETARCH, so a multi-arch publish does not run `go build`
+# under QEMU. CGO is off (no C toolchain in this image), which is what makes the
+# cross-compile a pure GOARCH switch.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS worker-builder
 ENV GONOSUMDB=* GONOSUMCHECK=* GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /src
@@ -11,7 +15,9 @@ COPY shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/ /src/shared/mcp-c
 
 WORKDIR /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
 RUN go mod download
-RUN CGO_ENABLED=0 GOOS=linux go build -o kafka-sink-worker ./cmd/kafka-sink-worker
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o kafka-sink-worker ./cmd/kafka-sink-worker
 
 FROM python:3.13-slim
 

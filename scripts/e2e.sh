@@ -21,10 +21,10 @@ case "$1" in
     cd e2e && python3 test_pipeline_full.py
     ;;
   mysql)
-    mysql -h 127.0.0.1 -P 3307 -u e2e_user -pe2e_password e2e_db
+    docker compose -p rsync-ai-e2e -f docker-compose.e2e.dbs.yml exec mysql-e2e mysql -u e2e_user -pe2e_password e2e_db
     ;;
   postgres)
-    psql -h 127.0.0.1 -p 5433 -U e2e_user -d e2e_db
+    docker compose -p rsync-ai-e2e -f docker-compose.e2e.dbs.yml exec postgres-e2e psql -U e2e_user -d e2e_db
     ;;
   logs)
     docker compose -p rsync-ai-e2e -f docker-compose.e2e.dbs.yml logs -f

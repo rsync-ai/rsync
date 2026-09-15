@@ -428,11 +428,12 @@ def test_wait_healthy_succeeds_when_the_gateway_is_ready(tmp_path):
 def test_a_gateway_that_is_up_but_has_no_database_is_not_ready(tmp_path):
     """Liveness is not readiness, and only one of the two can see this failure.
 
-    api-gateway's `/health` is a hardcoded 200 literal, and `cmd/server/main.go`
-    logs-and-continues when `db.Init()` fails ("using mock data") and when
-    migrations fail. A gateway with no database therefore answers `/health` 200
-    forever. `/ready` (`cmd/server/ready.go`) 503s with the reason instead, so
-    polling it is the difference between a working install and a mock one.
+    api-gateway's `/health` is a hardcoded 200 literal. `cmd/server/main.go`
+    exits when `db.Init()` cannot reach Postgres, but logs-and-continues when
+    migrations fail, so a gateway whose schema was never created answers
+    `/health` 200 forever. `/ready` (`cmd/server/ready.go`) 503s with the reason
+    instead, so polling it is the difference between a working install and a
+    broken one.
     """
     out = _drive_wait_healthy(tmp_path, _CURL_503)
     assert out["RC"] != "0", (

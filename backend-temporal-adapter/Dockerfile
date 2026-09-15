@@ -1,5 +1,9 @@
 # Build stage
-FROM golang:1.25-alpine AS builder
+# --platform=$BUILDPLATFORM: the compiler runs natively on the build host and
+# cross-compiles for $TARGETARCH, so a multi-arch publish does not run `go build`
+# under QEMU. CGO is off (no C toolchain in this image), which is what makes the
+# cross-compile a pure GOARCH switch.
+FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 ENV GONOSUMDB=* GONOSUMCHECK=* GOPROXY=https://proxy.golang.org,direct
 
 WORKDIR /build
@@ -17,9 +21,11 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 
 COPY backend-temporal-adapter/ /build/backend-temporal-adapter/
 
+ARG TARGETOS
+ARG TARGETARCH
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=linux go build -o temporal-adapter ./cmd/adapter
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o temporal-adapter ./cmd/adapter
 
 # Runtime stage
 FROM alpine:3.24

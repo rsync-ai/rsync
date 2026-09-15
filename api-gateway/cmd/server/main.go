@@ -302,9 +302,15 @@ func main() {
 		}()
 	}
 
-	// Initialize Database
+	// Initialize Database. db.Init has already retried for DB_CONNECT_TIMEOUT, so
+	// an error here means Postgres stayed unreachable for that whole window. Exit
+	// rather than serve: migrations only run in the success branch below, so a
+	// process that carried on answered /ready 503 schema_not_migrated for the rest
+	// of its life -- even after Postgres came back -- and nothing restarts a
+	// process that never exits. A non-zero exit is what compose's restart policy
+	// and the kubelet both know how to recover from.
 	if err := db.Init(); err != nil {
-		log.Warnf("⚠️  Database connection failed: %v (using mock data)", err)
+		log.Fatalf("❌ Database unreachable after the DB_CONNECT_TIMEOUT retry window: %v -- exiting so the restart policy retries with a fresh process", err)
 	} else {
 		// Run Migrations
 		log.Info("🔄 Running database migrations...")
