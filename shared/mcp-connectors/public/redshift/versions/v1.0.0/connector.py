@@ -238,6 +238,32 @@ class RedshiftMCPServer(DestinationLoadMixin, BaseMCPConnector):
             raise ValueError(f"Unsafe table identifier: {table}")
         return f'"{s}"."{t}"'
 
+    def _config_with_namespace(self, params: Dict[str, Any], config: Dict[str, Any],
+                               table: str) -> Dict[str, Any]:
+        """Return a config copy whose ``schema`` is overridden by an explicit
+        ``namespace`` param when the table is bare — the destination-namespace
+        contract the sink forwards (bare table + separate ``namespace``/
+        ``db_or_schema``, so a source-qualified table can't leak). Applying it in
+        ``load`` and ``merge`` is what keeps the write in the schema the pipeline
+        asked for; without it ``_qualify_table`` falls back to
+        ``config["schema"] or "public"`` and the rows land in the connection's
+        default schema — rows "loaded", but silently mis-routed. Mirrors the
+        snowflake/databricks helper of the same name.
+
+        ``export`` deliberately does NOT use this: a destination namespace must
+        never retarget a source read.
+        """
+        ns = (params.get("namespace") or params.get("db_or_schema")
+              or params.get("destination_namespace") or "").strip()
+        # Empty and the literal "default" both mean "no real namespace" (the sink's
+        # isRealNamespace); they must leave the connection's schema untouched.
+        if not ns or ns.lower() == "default":
+            return config
+        qcfg = dict(config)
+        if "." not in str(table).strip('"'):
+            qcfg["schema"] = ns
+        return qcfg
+
     @staticmethod
     def _coerce(v: Any) -> Any:
         """Coerce non-scalar row values for the DB driver (dict/list -> JSON)."""
@@ -443,7 +469,7 @@ class RedshiftMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     "fell_back": False, "message": "No data to load"}
 
         try:
-            fq = self._qualify_table(config, table)
+            fq = self._qualify_table(self._config_with_namespace(params, config, table), table)
             columns = self._collect_columns(rows)
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": str(e)}
@@ -508,7 +534,7 @@ class RedshiftMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     "error": "Missing key fields for merge (key_fields/primary_keys)"}
 
         try:
-            target_fq = self._qualify_table(config, table)
+            target_fq = self._qualify_table(self._config_with_namespace(params, config, table), table)
             columns = self._collect_columns(rows)
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": str(e)}

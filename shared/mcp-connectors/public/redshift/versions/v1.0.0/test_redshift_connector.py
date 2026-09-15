@@ -161,6 +161,79 @@ def test_load_rejects_unsafe_column_identifier():
     assert "column" in out.get("error", "").lower(), out
 
 
+# ===================== destination namespace routing ========================
+#
+# The sink (kafka-sink-worker ``addNamespaceParam``) bares the target table and
+# forwards the pipeline's ``destination_namespace`` separately, setting BOTH
+# ``namespace`` and ``db_or_schema`` to the same value — so a connector honouring
+# either key alone is compliant. Empty and the literal "default" both mean "no
+# real namespace" (the sink's ``isRealNamespace``). Before the fix this connector
+# read neither key, so ``_qualify_table`` fell back to ``config["schema"] or
+# "public"`` and every write landed in the connection's schema: rows "loaded",
+# silently mis-routed, and invisible to any row count.
+
+def test_namespace_param_routes_load_to_that_schema():
+    s, conn = _rs_fakes.make_connector(rs)
+    out = s.load({**CFG, "table": "t", "data": _rows(2), "namespace": "ns"})
+    assert out["success"] is True, out
+    inserts = [e for e in conn.all_execs() if e["sql"].startswith("INSERT INTO")]
+    assert len(inserts) == 1, inserts
+    assert '"ns"."t"' in inserts[0]["sql"], inserts[0]["sql"]
+    assert '"public"."t"' not in inserts[0]["sql"], inserts[0]["sql"]
+
+
+def test_namespace_param_routes_merge_to_that_schema():
+    s, conn = _rs_fakes.make_connector(rs)
+    out = s.merge({**CFG, "table": "t", "data": _rows(2),
+                   "key_fields": ["id"], "namespace": "ns"})
+    assert out["success"] is True, out
+    sqls = [e["sql"] for e in conn.all_execs()]
+    # stage DDL, the DELETE USING and the INSERT SELECT all name the target.
+    targeted = [q for q in sqls if '"ns"."t"' in q]
+    assert len(targeted) >= 2, sqls
+    assert not [q for q in sqls if '"public"."t"' in q], sqls
+
+
+def test_db_or_schema_alone_is_honoured_like_namespace():
+    """Either key alone is the whole contract — addNamespaceParam sets both."""
+    s, conn = _rs_fakes.make_connector(rs)
+    out = s.load({**CFG, "table": "t", "data": _rows(1), "db_or_schema": "ns2"})
+    assert out["success"] is True, out
+    inserts = [e for e in conn.all_execs() if e["sql"].startswith("INSERT INTO")]
+    assert '"ns2"."t"' in inserts[0]["sql"], inserts[0]["sql"]
+
+
+def test_empty_and_default_namespace_fall_back_to_the_connection_schema():
+    for ns in ("", "   ", "default", "DEFAULT"):
+        s, conn = _rs_fakes.make_connector(rs)
+        out = s.load({**CFG, "table": "t", "data": _rows(1), "namespace": ns})
+        assert out["success"] is True, (ns, out)
+        inserts = [e for e in conn.all_execs() if e["sql"].startswith("INSERT INTO")]
+        assert '"public"."t"' in inserts[0]["sql"], (ns, inserts[0]["sql"])
+
+
+def test_an_already_qualified_table_wins_over_the_namespace():
+    """A schema-qualified table names its own schema; the namespace must not
+    override it (the sink bares the table precisely so this cannot collide)."""
+    s, conn = _rs_fakes.make_connector(rs)
+    out = s.load({**CFG, "table": "other.t", "data": _rows(1), "namespace": "ns"})
+    assert out["success"] is True, out
+    inserts = [e for e in conn.all_execs() if e["sql"].startswith("INSERT INTO")]
+    assert '"other"."t"' in inserts[0]["sql"], inserts[0]["sql"]
+
+
+def test_source_reads_ignore_a_destination_namespace():
+    """``export`` is a SOURCE read — a destination namespace must never retarget
+    it, or a pipeline writing to schema X would start reading from X too."""
+    s, conn = _rs_fakes.make_connector(rs, rows=_rows(2))
+    out = s.export({**CFG, "table": "t", "limit": 10, "namespace": "ns"})
+    assert out["success"] is True, out
+    selects = [e["sql"] for e in conn.all_execs() if "SELECT" in e["sql"].upper()]
+    assert selects, conn.all_execs()
+    assert any('"public"."t"' in q for q in selects), selects
+    assert not [q for q in selects if '"ns"."t"' in q], selects
+
+
 # =================== dialect correctness (the gotchas) ======================
 
 def test_build_copy_sql_uses_s3_not_stdin():

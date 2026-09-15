@@ -535,6 +535,63 @@ class MongodbMCPServer(BaseMCPConnector):
     def _database_name(self, config: Dict[str, Any]) -> str:
         return str(config.get("database") or config.get("db_name") or config.get("db") or "").strip()
 
+    @staticmethod
+    def _is_real_namespace(ns: str) -> bool:
+        """Mirror of the sink's ``isRealNamespace`` (kafka-sink-worker main.go).
+
+        Empty and the literal ``"default"`` both mean "this pipeline has no real
+        destination namespace" and MUST resolve identically, or a historical
+        single-namespace pipeline would start routing somewhere new on upgrade.
+        The sink already filters both in ``addNamespaceParam``; re-checking here
+        keeps a hand-built call (tests, direct MCP use) on the same contract.
+        """
+        ns = (ns or "").strip()
+        return bool(ns) and ns.lower() != "default"
+
+    def _target_database(self, config: Dict[str, Any], params: Dict = None) -> str:
+        """Resolve the database a DESTINATION write lands in.
+
+        MongoDB is a single-namespace destination exactly like ClickHouse: the
+        database IS the per-pipeline namespace analog. The sink bares the
+        collection name and forwards the pipeline's ``destination_namespace``
+        separately as ``namespace``/``db_or_schema`` (kafka-sink-worker
+        ``addNamespaceParam``); honour that override, else fall back to the
+        connection config.
+
+        Until this existed every write path resolved ``config["database"]``
+        unconditionally, so a pipeline with a locked ``destination_namespace``
+        had it silently discarded and rows landed in the connection's database —
+        which, when that database is also another pipeline's SOURCE, is
+        cross-pipeline contamination that no row count or LAG metric can see.
+
+        SOURCE reads (``discover_schema``, ``export``) deliberately keep using
+        ``_database_name``: a destination namespace must never retarget a read.
+        """
+        ns = ""
+        if params:
+            ns = str(params.get("namespace") or params.get("db_or_schema") or "").strip()
+        if self._is_real_namespace(ns):
+            return ns
+        return self._database_name(config)
+
+    def _prepared_with_namespace(self, prepared: Dict, params: Dict) -> Dict:
+        """Carry the destination namespace across ``prepare_import_data``.
+
+        The shared ``prepare_import_data`` (base_connector) returns a FIXED key
+        whitelist — success/config/table/data/mode/schema/database/row_count — so
+        the sink's ``namespace``/``db_or_schema`` do NOT survive it. Every write
+        path below resolves its database from ``prepared``, so without this the
+        namespace would still be dropped even with ``_target_database`` wired in:
+        a fix that looks complete and changes nothing.
+        """
+        if not prepared.get("success"):
+            return prepared
+        for key in ("namespace", "db_or_schema"):
+            val = (params or {}).get(key)
+            if val is not None and key not in prepared:
+                prepared[key] = val
+        return prepared
+
     def _get_config(self, params: Dict) -> Dict[str, Any]:
         """Connection config with MONGODB_* env BACKFILL (never an override).
 
@@ -1200,7 +1257,7 @@ class MongodbMCPServer(BaseMCPConnector):
         counted) so a replayed CDC insert never fails the batch.
         """
         params = params or {}
-        prepared = self.prepare_import_data(params)
+        prepared = self._prepared_with_namespace(self.prepare_import_data(params), params)
         if not prepared.get("success"):
             return prepared
 
@@ -1222,7 +1279,7 @@ class MongodbMCPServer(BaseMCPConnector):
         client = None
         try:
             client = self._get_client(config)
-            coll = client[self._database_name(config)][collection]
+            coll = client[self._target_database(config, prepared)][collection]
             if mode == "replace":
                 coll.delete_many({})
             try:
@@ -1247,7 +1304,7 @@ class MongodbMCPServer(BaseMCPConnector):
     def upsert_data(self, params: Dict = None) -> Dict[str, Any]:
         """Idempotent replace keyed on _id / key_fields (CDC insert + update)."""
         params = params or {}
-        prepared = self.prepare_import_data(params)
+        prepared = self._prepared_with_namespace(self.prepare_import_data(params), params)
         if not prepared.get("success"):
             return prepared
         collection = self._resolve_collection(prepared, params)
@@ -1267,7 +1324,7 @@ class MongodbMCPServer(BaseMCPConnector):
         try:
             from pymongo import ReplaceOne
             client = self._get_client(config)
-            coll = client[self._database_name(config)][collection]
+            coll = client[self._target_database(config, prepared)][collection]
             self._ensure_key_index(coll, key_fields)
 
             ops = []
@@ -1298,7 +1355,7 @@ class MongodbMCPServer(BaseMCPConnector):
     def delete_data(self, params: Dict = None) -> Dict[str, Any]:
         """Delete documents by key field(s) (CDC delete)."""
         params = params or {}
-        prepared = self.prepare_import_data(params)
+        prepared = self._prepared_with_namespace(self.prepare_import_data(params), params)
         if not prepared.get("success"):
             return prepared
         collection = self._resolve_collection(prepared, params)
@@ -1325,7 +1382,7 @@ class MongodbMCPServer(BaseMCPConnector):
         client = None
         try:
             client = self._get_client(config)
-            coll = client[self._database_name(config)][collection]
+            coll = client[self._target_database(config, prepared)][collection]
             self._ensure_key_index(coll, key_fields)
             # Single key → one $in delete; composite key → $or of equality filters.
             if len(key_fields) == 1:
@@ -1343,8 +1400,14 @@ class MongodbMCPServer(BaseMCPConnector):
         """Drop a collection — the reload-mode cleanup step. On run_mode=reload the
         orchestrator drops the destination so the next import rebuilds from scratch;
         for MongoDB that means dropping the collection. Dropping a non-existent
-        collection is a no-op. The namespace param is ignored (the database comes
-        from the connection config)."""
+        collection is a no-op.
+
+        The drop MUST resolve the same database the write paths resolve — the sink
+        forwards the namespace here unconditionally (``addNamespaceParam(dropArgs,
+        sm.DBOrSchema)``), so a drop that ignored it would clear the connection's
+        database while the data lived under the pipeline's namespace: reload mode
+        would then accumulate duplicates forever, having "cleaned" the wrong place.
+        """
         params = params or {}
         config = self._get_config(params)
         raw = params.get("collection") or params.get("table") or ""
@@ -1356,7 +1419,7 @@ class MongodbMCPServer(BaseMCPConnector):
         client = None
         try:
             client = self._get_client(config)
-            db = client[self._database_name(config)]
+            db = client[self._target_database(config, params)]
             try:
                 existed = collection in db.list_collection_names()
             except Exception:

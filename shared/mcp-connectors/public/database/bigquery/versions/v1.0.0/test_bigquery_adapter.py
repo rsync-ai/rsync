@@ -252,6 +252,112 @@ def test_export_query_mode_flags_truncation():
     assert out2.get("truncated") is False, out2
 
 
+# ===================== destination namespace routing ========================
+#
+# The sink (kafka-sink-worker ``addNamespaceParam``) bares the target table and
+# forwards the pipeline's ``destination_namespace`` separately, setting BOTH
+# ``namespace`` and ``db_or_schema`` to the same value — so honouring either key
+# alone is compliant. Empty and the literal "default" both mean "no real
+# namespace" (the sink's ``isRealNamespace``). BigQuery's namespace analog is the
+# DATASET. Before the fix this adapter read neither key, so every write resolved
+# ``config["dataset_id"]`` and landed in the connection's dataset: rows "loaded",
+# silently mis-routed, and invisible to any row count.
+
+def test_namespace_param_routes_import_data_to_that_dataset():
+    adapter, client = _bq_fakes.make_adapter(warehouse_adapters)
+    out = adapter.import_data(CONFIG, {"table": "t", "data": _rows(2),
+                                       "namespace": "ns"})
+    assert out["success"] is True, out
+    assert [i["fq"] for i in client.inserted] == ["proj.ns.t"], client.inserted
+
+
+def test_namespace_param_routes_load_to_that_dataset():
+    adapter, client = _bq_fakes.make_adapter(warehouse_adapters)
+    with env(RSYNC_BQ_LOAD_JOB=None):
+        out = adapter.load(CONFIG, {"table": "t", "data": _rows(2),
+                                    "namespace": "ns"})
+    assert out["success"] is True, out
+    assert [i["fq"] for i in client.inserted] == ["proj.ns.t"], client.inserted
+
+
+def test_namespace_param_routes_merge_to_that_dataset():
+    adapter, client = _bq_fakes.make_adapter(warehouse_adapters)
+    out = adapter.merge(CONFIG, {"table": "t", "data": _rows(2),
+                                 "key_fields": ["id"], "namespace": "ns"})
+    assert out["success"] is True, out
+    merges = [q for q in client.queries if q.lstrip().startswith("MERGE")]
+    assert merges, client.queries
+    assert "`proj.ns.t`" in merges[0], merges[0]
+    assert "proj.ds.t" not in merges[0], merges[0]
+    # the staging table follows the target dataset, not the connection's
+    assert all(f["fq"].startswith("proj.ns._rsync_staging_") for f in client.loaded), \
+        client.loaded
+
+
+def test_db_or_schema_alone_is_honoured_like_namespace():
+    """Either key alone is the whole contract — addNamespaceParam sets both."""
+    adapter, client = _bq_fakes.make_adapter(warehouse_adapters)
+    out = adapter.import_data(CONFIG, {"table": "t", "data": _rows(1),
+                                       "db_or_schema": "ns2"})
+    assert out["success"] is True, out
+    assert [i["fq"] for i in client.inserted] == ["proj.ns2.t"], client.inserted
+
+
+def test_empty_and_default_namespace_fall_back_to_the_connection_dataset():
+    for ns in ("", "   ", "default", "DEFAULT"):
+        adapter, client = _bq_fakes.make_adapter(warehouse_adapters)
+        out = adapter.import_data(CONFIG, {"table": "t", "data": _rows(1),
+                                           "namespace": ns})
+        assert out["success"] is True, (ns, out)
+        assert [i["fq"] for i in client.inserted] == ["proj.ds.t"], (ns, client.inserted)
+
+
+def test_an_already_qualified_table_wins_over_the_namespace():
+    """A dataset- or fully-qualified table names its own dataset; the namespace
+    must not override it (the sink bares the table so this cannot collide)."""
+    adapter, client = _bq_fakes.make_adapter(warehouse_adapters)
+    adapter.import_data(CONFIG, {"table": "other.t", "data": _rows(1),
+                                 "namespace": "ns"})
+    adapter.import_data(CONFIG, {"table": "p2.other.t", "data": _rows(1),
+                                 "namespace": "ns"})
+    assert [i["fq"] for i in client.inserted] == ["proj.other.t", "p2.other.t"], \
+        client.inserted
+
+
+def test_source_reads_ignore_a_destination_namespace():
+    """``export`` is a SOURCE read — a destination namespace must never retarget
+    it, or a pipeline writing to dataset X would start reading from X too."""
+    adapter, client = _bq_fakes.make_adapter(warehouse_adapters,
+                                             query_rows=[{"id": 1}])
+    out = adapter.export(CONFIG, {"table": "t", "limit": 10, "namespace": "ns"})
+    assert out["success"] is True, out
+    assert client.queries, "export must issue a query"
+    assert any("proj.ds.t" in q for q in client.queries), client.queries
+    assert not [q for q in client.queries if "proj.ns.t" in q], client.queries
+
+
+def test_cdc_offsets_table_stays_in_the_connection_dataset():
+    """The offsets table is per-CONNECTION control-plane state keyed by
+    pipeline_id. The sink's seed call (callGetCDCOffsets) forwards NO namespace
+    and ``get_cdc_offsets`` reads ``_offsets_fq(config)`` — the connection's
+    dataset — so an offsets table that followed the DATA into the namespace
+    could never be read back and the restart high-water seed would silently
+    return empty. The data moves; the offsets must not."""
+    adapter, client = _bq_fakes.make_adapter(warehouse_adapters)
+    out = adapter.merge(CONFIG, {
+        "table": "t", "data": _rows(1), "key_fields": ["id"], "namespace": "ns",
+        "kafka_offset": [{"pipeline_id": "p1", "topic": "tp", "partition": 0,
+                          "offset": 42}],
+    })
+    assert out["success"] is True, out
+    offset_merges = [q for q in client.queries if "_rsync_cdc_offsets" in q]
+    assert len(offset_merges) == 1, client.queries
+    assert "`proj.ds._rsync_cdc_offsets`" in offset_merges[0], offset_merges[0]
+    assert "proj.ns._rsync_cdc_offsets" not in offset_merges[0], offset_merges[0]
+    # and the reader resolves the same place
+    assert adapter._offsets_fq(CONFIG) == "proj.ds._rsync_cdc_offsets"
+
+
 # ================================= runner ===================================
 
 def _run():
