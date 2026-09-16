@@ -8,6 +8,7 @@ import (
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
+	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
@@ -342,6 +343,12 @@ func expectSchedulePreamble(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
 		WithArgs(savedQueryID, wsScopeUser, wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	// The visibility half of requireVisibleSavedQuery. The role gate above answers
+	// "you are a member"; this one answers "and you may see this row".
+	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+		WithArgs(savedQueryID, wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"visible"}).AddRow(1))
+	// The trigger pipeline takes the role gate alone: no per-member visibility there.
 	mock.ExpectQuery(`FROM pipelines r\s+JOIN workspace_members`).
 		WithArgs(schedTriggerPipeline, wsScopeUser, wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
@@ -472,5 +479,124 @@ func TestCreateSavedQuerySchedule_SecondScheduleIsAConflictNotAServerError(t *te
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("%v", err)
+	}
+}
+
+// ============================================================================
+// Whose models a member may reach by id
+// ============================================================================
+// Every per-id model endpoint gated on requireResourceRole ALONE, and that gate is
+// membership plus role by design — it joins workspace_members and carries no visibility
+// predicate. loadSavedQuerySchedule then filters on saved_query_id only, so a member
+// could read, pause, retarget, run and delete another member's PRIVATE model and its
+// schedule: ids that answer 404 on GET /explorer/saved/:id. The list endpoint was never
+// affected; it carries the visibility predicate in its own query, which is what made the
+// gap easy to miss.
+//
+// The refusal is 404 "not found" everywhere, identical to a nonexistent id. Before the
+// fix the responses were distinguishable — a live id answered "no schedule for this
+// saved query" or 200 where a nonexistent one answered "not found" — which is an
+// existence oracle on its own, needing no schedule to exist at all.
+
+// Another member's private model, in the same workspace the caller belongs to.
+const otherMembersPrivateModel = "77777777-7777-7777-7777-777777777777"
+
+func perIDErrorBody(t *testing.T, raw []byte) string {
+	t.Helper()
+	var body struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("response is not JSON: %v (%s)", err, raw)
+	}
+	return body.Error
+}
+
+// Every per-id entry point, one table. A new route that gates on the role half alone
+// belongs here; leaving it out is how the next one of these ships.
+func TestPerIDModelEndpoints_AnotherMembersPrivateModelIsNotFound(t *testing.T) {
+	cases := []struct {
+		name   string
+		method string
+		route  string
+		path   string
+		h      gin.HandlerFunc
+	}{
+		{"read the schedule", http.MethodGet, "/explorer/saved/:id/schedule", "/schedule", GetSavedQuerySchedule},
+		{"read the run history", http.MethodGet, "/explorer/saved/:id/runs", "/runs", ListSavedQueryRuns},
+		{"create a schedule", http.MethodPost, "/explorer/saved/:id/schedule", "/schedule", CreateSavedQuerySchedule},
+		{"pause the schedule", http.MethodPost, "/explorer/saved/:id/schedule/pause", "/schedule/pause", PauseSavedQuerySchedule},
+		{"delete the schedule", http.MethodDelete, "/explorer/saved/:id/schedule", "/schedule", DeleteSavedQuerySchedule},
+		{"retarget the materialization", http.MethodPut, "/explorer/saved/:id/materialization", "/materialization", SetSavedQueryMaterialization},
+		{"run it by hand", http.MethodPost, "/explorer/saved/:id/run", "/run", RunSavedQueryModel},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mock, cleanup := wsScopeMockDB(t)
+			defer cleanup()
+
+			// The role gate passes: the caller really is an admin of the workspace
+			// holding that model. That is exactly why it is not enough on its own.
+			mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+				WithArgs(otherMembersPrivateModel, wsScopeUser, wsScopeWS).
+				WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+			// Private, written by someone else: the predicate matches nothing.
+			mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+				WithArgs(otherMembersPrivateModel, wsScopeWS, wsScopeUser).
+				WillReturnRows(sqlmock.NewRows([]string{"visible"}))
+
+			r := savedQueryRouter(tc.method, tc.route, "admin", tc.h)
+			w := doJSON(r, tc.method, "/explorer/saved/"+otherMembersPrivateModel+tc.path, nil)
+
+			if w.Code != http.StatusNotFound {
+				t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+			}
+			// 403, or any message naming the schedule, would confirm the id is real.
+			if got := perIDErrorBody(t, w.Body.Bytes()); got != "not found" {
+				t.Errorf("error = %q, want the same %q a nonexistent id gives", got, "not found")
+			}
+			// No expectation is queued past the refusal, so a handler that read the
+			// schedule, the runs or the model row anyway hits an unexpected query and
+			// fails here rather than passing quietly.
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("sql expectations: %v", err)
+			}
+		})
+	}
+}
+
+// The positive control for the table above. Feed the same visibility query a row and the
+// handler must carry on to its own work — proving the 404s come from the visibility
+// predicate and not from a gate that refuses every model it is shown.
+func TestPerIDModelEndpoints_AVisibleModelStillReachesTheHandler(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+		WithArgs(savedQueryID, wsScopeUser, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+		WithArgs(savedQueryID, wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"visible"}).AddRow(1))
+	// Past the gate: the handler's own read runs, and finds no schedule.
+	mock.ExpectQuery(`FROM saved_query_schedules s[\s\S]+WHERE s.saved_query_id = \$1`).
+		WithArgs(savedQueryID).
+		WillReturnRows(sqlmock.NewRows([]string{"schedule_id"}))
+
+	r := savedQueryRouter(http.MethodGet, "/explorer/saved/:id/schedule", "admin", GetSavedQuerySchedule)
+	w := doJSON(r, http.MethodGet, "/explorer/saved/"+savedQueryID+"/schedule", nil)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+	// A DIFFERENT 404: this one is the handler's own answer, which only a caller who
+	// passed the gate can see. Getting "not found" here would mean the control proved
+	// nothing, because the gate would have refused a model the caller may see.
+	if got := perIDErrorBody(t, w.Body.Bytes()); got != "no schedule for this saved query" {
+		t.Fatalf("error = %q, want the handler's own answer past the gate", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
 	}
 }
