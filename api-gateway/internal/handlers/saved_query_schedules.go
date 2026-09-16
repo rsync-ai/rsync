@@ -147,7 +147,7 @@ func SetSavedQueryMaterialization(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saved query id"})
 		return
 	}
-	if _, ok := requireResourceRole(c, "saved_queries", id, modelRunMinRole); !ok {
+	if !requireVisibleSavedQuery(c, id, modelRunMinRole) {
 		return
 	}
 
@@ -294,7 +294,7 @@ func RunSavedQueryModel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saved query id"})
 		return
 	}
-	if _, ok := requireResourceRole(c, "saved_queries", id, modelRunMinRole); !ok {
+	if !requireVisibleSavedQuery(c, id, modelRunMinRole) {
 		return
 	}
 	userID, ok := resolveUserID(c)
@@ -347,7 +347,7 @@ func CreateSavedQuerySchedule(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saved query id"})
 		return
 	}
-	if _, ok := requireResourceRole(c, "saved_queries", id, modelRunMinRole); !ok {
+	if !requireVisibleSavedQuery(c, id, modelRunMinRole) {
 		return
 	}
 	userID, ok := resolveUserID(c)
@@ -529,7 +529,7 @@ func GetSavedQuerySchedule(c *gin.Context) {
 		return
 	}
 	// Reading a schedule is a read: viewers may see that a model is scheduled.
-	if _, ok := requireResourceRole(c, "saved_queries", id, security.WSViewer); !ok {
+	if !requireVisibleSavedQuery(c, id, security.WSViewer) {
 		return
 	}
 	s, ok := loadSavedQuerySchedule(c, database, id)
@@ -753,7 +753,7 @@ func ListSavedQueryRuns(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saved query id"})
 		return
 	}
-	if _, ok := requireResourceRole(c, "saved_queries", id, security.WSViewer); !ok {
+	if !requireVisibleSavedQuery(c, id, security.WSViewer) {
 		return
 	}
 
@@ -1393,8 +1393,75 @@ func nextScheduleRun(scheduleType string, spec ScheduleSpec, from time.Time) *ti
 	return nil
 }
 
+// requireVisibleSavedQuery is the complete gate for a saved query reached by id: workspace
+// membership and role, AND the visibility half requireResourceRole does not do.
+//
+// It exists as one function because the two halves were separable, and everything that
+// called only the first half was wrong. Reaching a model by id — its schedule, its run
+// history, its materialization, a manual run — asked only whether the caller belonged to
+// the workspace holding it, so a member could read, pause, retarget, run and delete
+// another member's PRIVATE model's schedule: ids that answer 404 on every direct read.
+// New per-id endpoints should call this rather than requireResourceRole.
+//
+// requireResourceRole proves membership and role, by design and by its own comment —
+// there is no created_by fallback in it. Visibility is a separate column: a private saved
+// query belongs to its author, and `visibility = 'workspace' OR created_by = $n` is the
+// predicate every read of the row already uses.
+//
+// The refusal is the one loadSavedQuery gives a row the caller may not see: 404 "not
+// found", identical to the answer for an id that does not exist, so a member cannot probe
+// which private ids are real. workspace_id is bound too, rather than trusted from the role
+// gate above, so the predicate is complete wherever this is called from.
+//
+// Both halves write their own response, so a false return means the reply has been sent.
+func requireVisibleSavedQuery(c *gin.Context, id string, min security.WorkspaceRole) bool {
+	if _, ok := requireResourceRole(c, "saved_queries", id, min); !ok {
+		return false
+	}
+	return savedQueryVisibleToCaller(c, id)
+}
+
+// savedQueryVisibleToCaller is the visibility half on its own. Prefer
+// requireVisibleSavedQuery, which runs both; call this one directly only where the role
+// gate has already run against a different resource.
+func savedQueryVisibleToCaller(c *gin.Context, id string) bool {
+	userID, ok := resolveUserID(c)
+	if !ok {
+		return false
+	}
+	activeWS := c.GetString(ctxWorkspaceID)
+	if activeWS == "" {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return false
+	}
+	database := db.GetDB()
+	if database == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return false
+	}
+
+	var visible int
+	err := database.QueryRowContext(c.Request.Context(), `
+		SELECT 1
+		FROM saved_queries
+		WHERE id = $1 AND workspace_id = $2
+		  AND (visibility = 'workspace' OR created_by = $3)
+	`, id, activeWS, userID).Scan(&visible)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+		return false
+	}
+	if err != nil {
+		log.WithError(err).Error("failed to check whether a saved query is visible to this caller")
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "database not available"})
+		return false
+	}
+	return true
+}
+
 // mutableSavedQuerySchedule is the shared preamble for every schedule mutation:
-// validate the id, require admin on the saved query, and load the live schedule.
+// validate the id, require admin on a saved query the caller may SEE, and load the live
+// schedule.
 func mutableSavedQuerySchedule(c *gin.Context) (*sql.DB, string, *SavedQuerySchedule, bool) {
 	database := db.GetDB()
 	if database == nil {
@@ -1406,7 +1473,7 @@ func mutableSavedQuerySchedule(c *gin.Context) (*sql.DB, string, *SavedQuerySche
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid saved query id"})
 		return nil, "", nil, false
 	}
-	if _, ok := requireResourceRole(c, "saved_queries", id, modelRunMinRole); !ok {
+	if !requireVisibleSavedQuery(c, id, modelRunMinRole) {
 		return nil, "", nil, false
 	}
 	s, ok := loadSavedQuerySchedule(c, database, id)
@@ -1425,7 +1492,9 @@ func mutableSavedQuerySchedule(c *gin.Context) (*sql.DB, string, *SavedQuerySche
 }
 
 // loadSavedQuerySchedule reads the live schedule for a saved query and computes
-// Blocked. The caller must already have passed a role gate on the saved query.
+// Blocked. It filters on saved_query_id alone, so the caller must already have passed
+// requireVisibleSavedQuery — the ROLE half by itself is what let a member read, pause,
+// retarget and delete another member's private model's schedule.
 func loadSavedQuerySchedule(c *gin.Context, database *sql.DB, savedQueryID string) (*SavedQuerySchedule, bool) {
 	var s SavedQuerySchedule
 	var specJSON []byte
