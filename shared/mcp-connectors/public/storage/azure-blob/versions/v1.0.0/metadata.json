@@ -20,6 +20,8 @@
   "supports_source": true,
   "supports_destination": true,
   "supports_cdc": false,
+  "supports_ddl": false,
+  "auto_create_destination_tables": true,
   "spec_version": "1.0",
   "generated_at": "2026-06-22T00:00:00.000000",
   "status": "active",
@@ -607,7 +609,9 @@
       "gzip",
       "bzip2"
     ],
-    "supports_cdc": false
+    "supports_cdc": false,
+    "supports_ddl": false,
+    "auto_create_destination_tables": true
   },
   "operations": [
     {
