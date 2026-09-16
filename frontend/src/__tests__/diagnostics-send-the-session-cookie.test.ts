@@ -25,7 +25,11 @@ import { DIAGNOSTIC_TESTS } from "@/lib/diagnostics/tests"
 
 const CTX = {
   apiUrl: "http://35.192.196.2:5001",
-  wsUrl: "ws://35.192.196.2:5001/ws",
+  // Never dialled: HTTP_PROBES below filters the websocket probe out, so this value
+  // only has to satisfy the context type. Kept on the secure scheme because the
+  // plaintext one trips the insecure-websocket scanner, and an inert fixture is not
+  // worth a suppression the repo has no other instance of.
+  wsUrl: "wss://35.192.196.2:5001/ws",
   authHeaders: {} as Record<string, string>,
 }
 
