@@ -123,31 +123,99 @@ type AssessmentReport struct {
 	SinkSupportDDL bool              `json:"destination_supports_ddl"`
 }
 
+// assessmentGateOutcome is what the pre-migration gate decided about a run.
+type assessmentGateOutcome int
+
+const (
+	// assessmentGateAllow — nothing stands in the way; dispatch the run.
+	assessmentGateAllow assessmentGateOutcome = iota
+	// assessmentGateBlocked — the report carries ERROR-severity findings.
+	// Not waivable: acknowledging warnings must never start a run the
+	// assessment says cannot succeed.
+	assessmentGateBlocked
+	// assessmentGateNeedsAck — warnings only, and the caller hasn't ack'd
+	// them yet. Re-submitting with ack_warnings: true clears this.
+	assessmentGateNeedsAck
+)
+
+// evaluateAssessmentGate decides whether a run may proceed given its assessment
+// report and whether the caller acknowledged warnings.
+//
+// The two severities are NOT interchangeable and this is the whole point of the
+// function: `ack_warnings` waives warnings, and only warnings. RunPipeline used
+// to skip the entire assessment when ack_warnings was set, so a single flag
+// silently waived blocking ERRORS too — a caller who had ack'd a warning once
+// could start any subsequent run no matter what the assessment found. Extracted
+// as a pure function so that boundary is unit-testable rather than buried in an
+// HTTP handler.
+func evaluateAssessmentGate(report *AssessmentReport, ackWarnings bool) assessmentGateOutcome {
+	if report == nil {
+		return assessmentGateAllow
+	}
+	if report.Blocking {
+		return assessmentGateBlocked
+	}
+	// Defence in depth: trust an ERROR finding even if Blocking wasn't set.
+	for _, t := range report.Tables {
+		for _, f := range t.Findings {
+			if f.Severity == AssessmentError {
+				return assessmentGateBlocked
+			}
+		}
+	}
+	if ackWarnings {
+		return assessmentGateAllow
+	}
+	for _, t := range report.Tables {
+		for _, f := range t.Findings {
+			if f.Severity == AssessmentWarning {
+				return assessmentGateNeedsAck
+			}
+		}
+	}
+	return assessmentGateAllow
+}
+
 // sinksWithAutoCreate is a fast-path whitelist for connectors that are
-// statically known to support DDL auto-create. For any connector NOT in
-// this map, sinkSupportsAutoCreate falls through to connectorSupportsDDL
-// (tools.go) which reads the authoritative `supports_ddl` flag from the
-// connector's metadata.json via the in-memory index. This means any new
-// connector only needs a correct metadata.json — no code changes here.
+// statically known to materialise a missing destination table. For any
+// connector NOT in this map, sinkSupportsAutoCreate falls through to the
+// connector's own metadata.json via the in-memory index, so a new connector
+// only needs correct metadata — no code changes here.
 //
 // MongoDB is whitelisted explicitly: it auto-creates collections on first write
-// (auto_create_destination_tables=true) but has NO DDL (supports_ddl=false), so
-// the connectorSupportsDDL fallback would wrongly report it can't auto-create.
+// (auto_create_destination_tables=true) but has NO DDL (supports_ddl=false).
 var sinksWithAutoCreate = map[string]bool{
 	"postgresql": true,
 	"mysql":      true,
 	"mongodb":    true,
 }
 
+// sinkSupportsAutoCreate reports whether the destination will have somewhere to
+// write without the user pre-creating anything. That is a strictly WIDER
+// question than "can it run CREATE TABLE":
+//
+//   - relational sinks answer yes by issuing DDL        (supports_ddl=true)
+//   - MongoDB answers yes by creating the collection    (supports_ddl=false)
+//   - gcs / aws-s3 / azure-blob answer yes because an object store has no
+//     tables to create at all — the sink writes an object per batch
+//
+// Checking only supports_ddl collapsed those last two cases into "can't
+// auto-create" and raised a BLOCKING SINK_NO_DDL error on every table of every
+// MongoDB→object-storage pipeline — a stop the user could not clear, since
+// there is no table to go and pre-create. Consult auto_create_destination_tables
+// first and fall back to supports_ddl for connectors that predate that flag.
 func sinkSupportsAutoCreate(connectorType string) bool {
 	ct := strings.ToLower(strings.TrimSpace(connectorType))
 	// Fast path for statically-known connectors.
 	if sinksWithAutoCreate[ct] {
 		return true
 	}
-	// Dynamic path: read supports_ddl from the connector's metadata.json
-	// via the in-memory connector index (5-second TTL cache in tools.go).
-	// Returns false on any lookup failure — fail-closed.
+	// Dynamic path: the connector's own declared capability. Both readers are
+	// backed by the in-memory connector index (5-second TTL cache in tools.go)
+	// and return false on any lookup failure — fail-closed.
+	if connectorAutoCreatesDestinationTables(ct) {
+		return true
+	}
 	return connectorSupportsDDL(ct)
 }
 

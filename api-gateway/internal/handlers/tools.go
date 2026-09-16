@@ -277,15 +277,15 @@ func invalidateLifecycleCache(connectorType string) {
 	}
 }
 
-// connectorSupportsDDL reads the `supports_ddl` flag from the connector's
+// connectorMetadataBool reads a boolean capability flag from the connector's
 // metadata.json via the in-memory connector index (5-second TTL cache). Returns
-// false on any lookup failure — fail-closed so unknown connectors don't
-// accidentally get DDL auto-create permissions.
+// false on any lookup failure — fail-closed so an unknown connector never gets a
+// capability it hasn't declared.
 //
-// Checks both top-level `supports_ddl` and `capabilities.supports_ddl` since
-// older connector metadata puts it at the root and newer generated connectors
-// put it inside the capabilities block.
-func connectorSupportsDDL(connectorType string) bool {
+// Checks both the top-level key and `capabilities.<key>` since older connector
+// metadata puts these at the root and newer generated connectors put them inside
+// the capabilities block (the generator emits both — see spec.py to_metadata).
+func connectorMetadataBool(connectorType, key string) bool {
 	target := canonicalizeConnectorID(connectorType)
 	if target == "" {
 		return false
@@ -320,12 +320,12 @@ func connectorSupportsDDL(connectorType string) bool {
 		if !matched {
 			continue
 		}
-		// Found the connector. Prefer top-level `supports_ddl`, then capabilities block.
-		if v, ok := raw["supports_ddl"].(bool); ok {
+		// Found the connector. Prefer the top-level key, then the capabilities block.
+		if v, ok := raw[key].(bool); ok {
 			return v
 		}
 		if caps, ok := raw["capabilities"].(map[string]interface{}); ok {
-			if v, ok := caps["supports_ddl"].(bool); ok {
+			if v, ok := caps[key].(bool); ok {
 				return v
 			}
 		}
@@ -333,6 +333,26 @@ func connectorSupportsDDL(connectorType string) bool {
 		return false
 	}
 	return false
+}
+
+// connectorSupportsDDL reports whether a connector can issue real DDL (CREATE
+// TABLE and friends) at its destination. Fail-closed for unknown connectors so
+// they don't accidentally get DDL permissions.
+func connectorSupportsDDL(connectorType string) bool {
+	return connectorMetadataBool(connectorType, "supports_ddl")
+}
+
+// connectorAutoCreatesDestinationTables reports whether a destination connector
+// materialises a missing destination table by itself — either by issuing DDL, or
+// because the destination has no tables to create in the first place (an object
+// store writes an object per batch; there is nothing to pre-create).
+//
+// Deliberately SEPARATE from supports_ddl: MongoDB and the three object stores
+// all auto-create with supports_ddl=false, and conflating the two is what made
+// every MongoDB→GCS/S3/Azure-Blob pipeline fail pre-flight with a SINK_NO_DDL
+// error the user had no way to act on.
+func connectorAutoCreatesDestinationTables(connectorType string) bool {
+	return connectorMetadataBool(connectorType, "auto_create_destination_tables")
 }
 
 // connectorProductionVerified reads the `production_verified` flag from a

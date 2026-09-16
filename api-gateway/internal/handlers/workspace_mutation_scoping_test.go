@@ -172,8 +172,9 @@ func TestRunPipeline_MemberCanRunSharedPipeline(t *testing.T) {
 		WithArgs(sqlmock.AnyArg(), wsScopePipeline).
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
-	// ack_warnings=true skips the assessment gate; cost/plan/cooldown gates fail
-	// open on their unmocked queries.
+	// ack_warnings=true waives the assessment's WARNINGS (the assessment itself
+	// always runs, and here it falls through on its unmocked queries, as do the
+	// cost/plan/cooldown gates).
 	r := wsScopeRouter(http.MethodPost, "/api/v1/pipelines/:id/run", RunPipeline)
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/pipelines/"+wsScopePipeline+"/run?ack_warnings=true", nil)

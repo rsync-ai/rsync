@@ -2842,29 +2842,25 @@ func RunPipeline(c *gin.Context) {
 		}
 	}
 
-	// Pre-migration assessment gate. Skip when:
-	//   - the client explicitly acknowledged warnings (`ack_warnings: true`)
-	//   - a query param overrides (curl-friendly: ?ack_warnings=true)
-	// Errors are always blocking. Warnings block unless ack'd. Info
-	// findings pass through silently.
-	if !ackWarnings {
+	// Pre-migration assessment gate. The assessment ALWAYS runs: `ack_warnings`
+	// (body flag or curl-friendly ?ack_warnings=true) waives WARNINGS only.
+	// Errors are blocking and are never waivable — see evaluateAssessmentGate.
+	// Info findings pass through silently.
+	{
 		assessCtx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
 		report, status, errResp, err := buildPipelineAssessment(assessCtx, database, c.GetString("workspace_id"), id, userID)
 		cancel()
 		if err == nil && report != nil && errResp == nil {
-			hasWarnings := false
-			for _, t := range report.Tables {
-				for _, f := range t.Findings {
-					if f.Severity == AssessmentWarning {
-						hasWarnings = true
-						break
-					}
-				}
-				if hasWarnings {
-					break
-				}
-			}
-			if report.Blocking || hasWarnings {
+			switch evaluateAssessmentGate(report, ackWarnings) {
+			case assessmentGateBlocked:
+				c.JSON(http.StatusUnprocessableEntity, gin.H{
+					"error":      "pre_migration_assessment_blocked",
+					"message":    "Pre-migration assessment found blocking errors",
+					"assessment": report,
+					"hint":       "These are errors, not warnings — ack_warnings does not clear them. Fix the reported problems, then re-run.",
+				})
+				return
+			case assessmentGateNeedsAck:
 				c.JSON(http.StatusUnprocessableEntity, gin.H{
 					"error":      "pre_migration_assessment",
 					"message":    "Pre-migration assessment requires acknowledgement before run",
