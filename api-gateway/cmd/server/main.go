@@ -682,12 +682,12 @@ func main() {
 	// CORS. This MUST be registered before ANY route, and that is not a style
 	// preference — gin copies the group's current handler chain into each route at
 	// REGISTRATION time (gin/routergroup.go combineHandlers does make+copy), so a
-	// later r.Use() cannot reach a route that is already registered. Installed here
-	// it was installed below the public routes, which meant /health, /api/health,
-	// /version, /ready and /ws answered with no Access-Control-* headers at all
-	// while every /api/v1 route had them — and the browser turned that into an
-	// opaque "Failed to fetch" on the one probe whose whole job is to say whether
-	// the gateway is reachable. Engine.Use also rebuilds the 404/405 handlers, so a
+	// later r.Use() cannot reach a route that is already registered. It previously
+	// sat below the public routes, which meant /health, /api/health, /version,
+	// /ready and /ws answered with no Access-Control-* headers at all while every
+	// /api/v1 route had them — and the browser turned that into an opaque
+	// "Failed to fetch" on the one probe whose whole job is to say whether the
+	// gateway is reachable. Engine.Use also rebuilds the 404/405 handlers, so a
 	// NONEXISTENT path did return CORS headers: poking a neighbouring URL to debug
 	// this gives exactly the inverted answer.
 	r.Use(corsMiddleware())
