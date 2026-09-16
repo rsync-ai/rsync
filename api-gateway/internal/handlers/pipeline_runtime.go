@@ -44,6 +44,13 @@ type RuntimeLiveness struct {
 	LastEventAt   *time.Time `json:"last_event_at,omitempty"`
 	LastHealthyAt *time.Time `json:"last_healthy_at,omitempty"`
 	StaleSeconds  int64      `json:"stale_seconds,omitempty"`
+	// PendingEvents is captured-minus-applied summed across the pipeline's CDC
+	// tables: how many change events the source produced that the destination has
+	// not written yet. It is what separates a quiet stream from a wedged one when
+	// StaleSeconds is high, so it carries NO omitempty — zero is the load-bearing
+	// value ("nothing is waiting"), and omitting it would leave a client unable to
+	// tell "no backlog" from "field absent".
+	PendingEvents int64 `json:"pending_events"`
 }
 
 type RuntimeBlocker struct {
@@ -121,10 +128,13 @@ func GetPipelineRuntime(c *gin.Context) {
 		&blockType, &blockDesc, &progressUpdatedAt,
 	)
 
-	// 3) Latest CDC event (if mode=cdc) — used to compute liveness staleness.
+	// 3) Latest CDC event (if mode=cdc) — used to compute liveness staleness,
+	//    plus the captured-minus-applied backlog that says whether staleness means
+	//    "wedged" or merely "quiet".
 	var lastEventAt sql.NullTime
+	var pendingEvents int64
 	if mode == "cdc" {
-		lastEventAt = loadCDCLiveness(database, pipelineID)
+		lastEventAt, pendingEvents = loadCDCLiveness(database, pipelineID)
 	}
 
 	// 4) Dependency manifest + observed health (left join — manifest may be empty
@@ -159,8 +169,9 @@ func GetPipelineRuntime(c *gin.Context) {
 	if mode == "cdc" && lastEventAt.Valid {
 		stale := int64(time.Since(lastEventAt.Time).Seconds())
 		rt.Liveness = &RuntimeLiveness{
-			LastEventAt:  &lastEventAt.Time,
-			StaleSeconds: stale,
+			LastEventAt:   &lastEventAt.Time,
+			StaleSeconds:  stale,
+			PendingEvents: pendingEvents,
 		}
 	}
 
@@ -227,15 +238,27 @@ func runtimeMessage(phase, rawStatus, message string) string {
 // cdcLivenessPhase dead (KI-CDC-RUNTIME-LIVENESS-WRONG-TABLE). A query error is logged (not
 // discarded) and degrades to an invalid time, so liveness reads "unknown" rather than
 // failing the whole endpoint. Family-agnostic (mode='cdc' covers MySQL and PG).
-func loadCDCLiveness(database *sql.DB, pipelineID string) sql.NullTime {
+// It also returns the pipeline's PENDING event backlog: captured (total_events, the
+// source-side count) minus applied (applied_total_events, the destination-side count),
+// summed over the pipeline's CDC tables and floored at zero. The two counters are written
+// by different producers and can be observed mid-update, so a transiently negative per-table
+// delta is clamped rather than allowed to cancel out a real backlog on another table.
+//
+// The backlog is what makes the staleness number interpretable. Staleness alone cannot tell
+// "the sink is wedged" from "nobody has written to the source lately" — and on a low-traffic
+// source the second is the normal state. See cdcLivenessPhase.
+func loadCDCLiveness(database *sql.DB, pipelineID string) (sql.NullTime, int64) {
 	var lastAppliedAt sql.NullTime
+	var pending int64
 	if err := database.QueryRow(`
-		SELECT MAX(last_applied_ts) FROM pipeline_run_table_stats
+		SELECT MAX(last_applied_ts),
+		       COALESCE(SUM(GREATEST(COALESCE(total_events, 0) - COALESCE(applied_total_events, 0), 0)), 0)
+		FROM pipeline_run_table_stats
 		WHERE pipeline_id = $1 AND mode = 'cdc'
-	`, pipelineID).Scan(&lastAppliedAt); err != nil {
+	`, pipelineID).Scan(&lastAppliedAt, &pending); err != nil {
 		log.Debugf("runtime: cdc liveness query failed (treating as unknown): %v", err)
 	}
-	return lastAppliedAt
+	return lastAppliedAt, pending
 }
 
 // loadRuntimeDeps reads the dependency manifest + health for a pipeline and
@@ -384,12 +407,37 @@ func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, livene
 // So: a dead required dependency still wins (a failure is a failure), then staleness,
 // then degraded. "degraded" now means "still moving, but something is wrong" —
 // which is what the dependency panel is for.
+//
+// Staleness ALONE, however, does not mean stalled, and treating it that way was its own
+// bug (KI-CDC-QUIET-STREAM-REPORTS-IDLE): a CDC stream over a low-traffic source spends
+// most of its life with nothing to apply, so `StaleSeconds > 300` fires on a perfectly
+// healthy pipeline and the UI offers Resume for a connector that never stopped. Proven
+// live: rows inserted into the source landed in the destination ~93 s later, with no user
+// action, while the badge read Idle.
+//
+// PendingEvents is what tells the two apart. It is captured-minus-applied — the source
+// produced N events the destination has not written — so:
+//
+//	stale + backlog waiting   -> genuinely not draining        -> idle
+//	stale + nothing waiting   -> caught up, source is quiet     -> streaming
+//
+// The healthy-dep requirement on that second branch is deliberate and load-bearing. A
+// `degraded` verdict means a probe saw something wrong (the dropped-source-table case is
+// exactly a connector that stays RUNNING while capturing nothing), and there BOTH counters
+// freeze together, so the backlog reads zero for the wrong reason. Requiring "healthy"
+// keeps that repro reporting idle. The same clause holds "unknown" (legacy pipelines with
+// no dependency manifest) at the old conservative answer rather than silently upgrading it.
 func cdcLivenessPhase(depHealth string, liveness *RuntimeLiveness) string {
 	if depHealth == "unhealthy" {
 		return "failed" // a required dep is dead — surface as failure, not "still streaming"
 	}
 	if liveness != nil && liveness.StaleSeconds > 300 {
-		// No CDC event for 5+ minutes — likely stalled. UI surfaces this.
+		if liveness.PendingEvents == 0 && depHealth == "healthy" {
+			// Nothing captured is waiting to be applied and every dependency probe is
+			// green: the stream is idle-but-alive, not stalled.
+			return "streaming"
+		}
+		// A backlog is sitting undrained, or a probe is unhappy — really stalled.
 		return "idle"
 	}
 	if depHealth == "degraded" {
