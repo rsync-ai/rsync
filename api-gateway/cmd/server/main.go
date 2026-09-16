@@ -48,6 +48,74 @@ func isProductionLikeEnv() bool {
 	}
 }
 
+// corsMiddleware answers cross-origin requests for the whole gateway.
+//   - Dev default: allow http://localhost:3000, plus any loopback port so preview
+//     servers and autoPort dev servers work without re-configuring env every time.
+//   - Prod: allowlist via RSYNC_CORS_ORIGINS (comma-separated).
+//
+// It is a named function rather than an inline closure so the registration order —
+// which is the part that actually broke — can be asserted in a test. See its r.Use
+// call site for why that order matters.
+//
+// NOTE: Allowing a header in CORS does NOT imply the backend trusts it. We still
+// reject dev identity headers in production at the auth layer.
+func corsMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		origin := strings.TrimSpace(c.GetHeader("Origin"))
+		env := strings.ToLower(strings.TrimSpace(os.Getenv("ENVIRONMENT")))
+
+		allowed := map[string]struct{}{}
+		raw := strings.TrimSpace(os.Getenv("RSYNC_CORS_ORIGINS"))
+		if raw != "" {
+			for _, part := range strings.Split(raw, ",") {
+				o := strings.TrimSpace(part)
+				if o != "" {
+					allowed[o] = struct{}{}
+				}
+			}
+		} else if env != "production" && env != "prod" {
+			allowed["http://localhost:3000"] = struct{}{}
+		}
+
+		// In dev, also accept any http://localhost:<port> or 127.0.0.1:<port>
+		// so preview servers / CLI tools / autoPort dev servers work without
+		// needing explicit env config every time the port changes.
+		isDevLoopback := false
+		if env != "production" && env != "prod" && origin != "" {
+			if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
+				isDevLoopback = true
+			}
+		}
+
+		if origin != "" {
+			if _, ok := allowed[origin]; ok || isDevLoopback {
+				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
+				c.Writer.Header().Set("Vary", "Origin")
+			}
+		}
+
+		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
+		allowHeaders := "Content-Type, Authorization, X-Trace-ID, Origin, Accept, traceparent, tracestate"
+		if env != "production" && env != "prod" {
+			// Dev-only compatibility (frontend tests still send this)
+			allowHeaders += ", X-User-ID"
+		}
+		// Future-proof for cookie auth + CSRF
+		allowHeaders += ", X-CSRF-Token"
+		// Active-workspace selector (membership-verified server-side).
+		allowHeaders += ", X-Workspace-ID"
+		c.Writer.Header().Set("Access-Control-Allow-Headers", allowHeaders)
+		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
+		c.Writer.Header().Set("Access-Control-Expose-Headers", "X-Trace-ID, traceparent, tracestate")
+
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	}
+}
+
 // resolveKafkaBrokers turns the KAFKA_BROKERS bootstrap string into the list
 // every Kafka client in this process is handed.
 //
@@ -611,6 +679,19 @@ func main() {
 	// prometheus receiver → the OTLP backend. F-Obs-2.
 	r.Use(metrics.HTTPMetricsMiddleware())
 
+	// CORS. This MUST be registered before ANY route, and that is not a style
+	// preference — gin copies the group's current handler chain into each route at
+	// REGISTRATION time (gin/routergroup.go combineHandlers does make+copy), so a
+	// later r.Use() cannot reach a route that is already registered. It previously
+	// sat below the public routes, which meant /health, /api/health, /version,
+	// /ready and /ws answered with no Access-Control-* headers at all while every
+	// /api/v1 route had them — and the browser turned that into an opaque
+	// "Failed to fetch" on the one probe whose whole job is to say whether the
+	// gateway is reachable. Engine.Use also rebuilds the 404/405 handlers, so a
+	// NONEXISTENT path did return CORS headers: poking a neighbouring URL to debug
+	// this gives exactly the inverted answer.
+	r.Use(corsMiddleware())
+
 	// Prometheus /metrics — Go runtime + process metrics out of the box.
 	// Scraped by the otel-collector / external Prometheus to track 4xx/5xx
 	// rates, latency percentiles, and DB pool exhaustion.
@@ -698,67 +779,6 @@ func main() {
 			return
 		}
 		websocket.ServeWs(hub, c)
-	})
-
-	// API Routes (CORS)
-	// - Dev default: allow http://localhost:3000
-	// - Prod: allowlist via RSYNC_CORS_ORIGINS (comma-separated)
-	//
-	// NOTE: Allowing a header in CORS does NOT imply the backend trusts it.
-	// We still reject dev identity headers in production at the auth layer.
-	r.Use(func(c *gin.Context) {
-		origin := strings.TrimSpace(c.GetHeader("Origin"))
-		env := strings.ToLower(strings.TrimSpace(os.Getenv("ENVIRONMENT")))
-
-		allowed := map[string]struct{}{}
-		raw := strings.TrimSpace(os.Getenv("RSYNC_CORS_ORIGINS"))
-		if raw != "" {
-			for _, part := range strings.Split(raw, ",") {
-				o := strings.TrimSpace(part)
-				if o != "" {
-					allowed[o] = struct{}{}
-				}
-			}
-		} else if env != "production" && env != "prod" {
-			allowed["http://localhost:3000"] = struct{}{}
-		}
-
-		// In dev, also accept any http://localhost:<port> or 127.0.0.1:<port>
-		// so preview servers / CLI tools / autoPort dev servers work without
-		// needing explicit env config every time the port changes.
-		isDevLoopback := false
-		if env != "production" && env != "prod" && origin != "" {
-			if strings.HasPrefix(origin, "http://localhost:") || strings.HasPrefix(origin, "http://127.0.0.1:") {
-				isDevLoopback = true
-			}
-		}
-
-		if origin != "" {
-			if _, ok := allowed[origin]; ok || isDevLoopback {
-				c.Writer.Header().Set("Access-Control-Allow-Origin", origin)
-				c.Writer.Header().Set("Vary", "Origin")
-			}
-		}
-
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS, PATCH")
-		allowHeaders := "Content-Type, Authorization, X-Trace-ID, Origin, Accept, traceparent, tracestate"
-		if env != "production" && env != "prod" {
-			// Dev-only compatibility (frontend tests still send this)
-			allowHeaders += ", X-User-ID"
-		}
-		// Future-proof for cookie auth + CSRF
-		allowHeaders += ", X-CSRF-Token"
-		// Active-workspace selector (membership-verified server-side).
-		allowHeaders += ", X-Workspace-ID"
-		c.Writer.Header().Set("Access-Control-Allow-Headers", allowHeaders)
-		c.Writer.Header().Set("Access-Control-Allow-Credentials", "true")
-		c.Writer.Header().Set("Access-Control-Expose-Headers", "X-Trace-ID, traceparent, tracestate")
-
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-		c.Next()
 	})
 
 	// Public Auth Routes (no auth middleware required)

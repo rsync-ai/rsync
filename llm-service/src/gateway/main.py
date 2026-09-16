@@ -810,6 +810,22 @@ default_client = None if USE_MOCK else _create_async_client(DEFAULT_LLM_PROVIDER
 # When LLM_PROVIDER=groq set this to e.g. "llama-3.3-70b-versatile".
 DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
 
+
+def resolve_model(config: dict, override: str | None = None) -> str:
+    """Pick the model to call for a prompt-registry prompt.
+
+    Resolution order: per-request override → LLM_MODEL env var → prompt YAML default.
+
+    Every prompt YAML hard-codes `model: gpt-4o`, and `PromptRegistry.get_config`
+    has no environment awareness at all, so that literal is what any caller
+    reading `config["model"]` directly will send. On a self-hosted stack running
+    Ollama there is no `gpt-4o` and the provider answers with a 404 — the call
+    site, not the config, is what decides whether the deployment's own
+    LLM_MODEL is honoured. Route every call site through here so a new endpoint
+    cannot reintroduce that by reading the config key directly.
+    """
+    return override or DEFAULT_LLM_MODEL or config["model"]
+
 # Explorer offline mode.
 # Default is now False — Explorer uses the same LLM_PROVIDER as the rest of the stack
 # (Azure OpenAI in production). Set EXPLORER_OFFLINE_ONLY=true to force Ollama for air-gapped
@@ -1878,7 +1894,7 @@ async def diagnose_pipeline(request: DiagnoseRequest):
         )
         config = registry.get_config("diagnose/pipeline_failure")
         response = await default_client.chat.completions.create(
-            model=config["model"],
+            model=resolve_model(config),
             messages=messages,
             temperature=config["parameters"].get("temperature", 0.2),
             max_tokens=config["parameters"].get("max_tokens", 600),
@@ -2054,8 +2070,7 @@ async def completion(request: PromptRequest):
             messages = registry.render_messages(request.prompt_name, request.variables)
             config = registry.get_config(request.prompt_name)
             
-            # Resolution order: per-request override → LLM_MODEL env var → prompt YAML default
-            model = request.model_override or DEFAULT_LLM_MODEL or config["model"]
+            model = resolve_model(config, request.model_override)
             
             response = await default_client.chat.completions.create(
                 model=model,

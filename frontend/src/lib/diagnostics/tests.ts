@@ -22,7 +22,15 @@ function assertEnv(name: string): boolean {
 const MAX_ERROR_BODY = 300
 
 async function fetchOk(url: string, init?: RequestInit): Promise<Response> {
-  const res = await fetch(url, { cache: "no-store", ...init })
+  // credentials:"include" is not optional here. The session lives in a cookie on the
+  // API's origin, and the API is cross-origin from the frontend on every real install
+  // (frontend :3000, gateway :5001), where fetch's default "same-origin" silently omits
+  // it — so three of the four API probes reported {"error":"No authorization token"}
+  // and read as a broken backend. The admin gate on this very page already reaches the
+  // same API with the same cookie through authFetch, which sets this; these probes were
+  // the only callers that did not. It goes BEFORE the spread so an explicit per-call
+  // value still wins.
+  const res = await fetch(url, { cache: "no-store", credentials: "include", ...init })
   if (!res.ok) {
     const text = (await res.text().catch(() => "")).trim()
 
