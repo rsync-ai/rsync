@@ -381,10 +381,10 @@ connection in a surviving external database.
   given here ("never minted for any image in this repo") expired on 2026-08-19 —
   [docker-publish.yml](../../../.github/workflows/docker-publish.yml) pushes
   `type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}`, and both
-  `v0.1.0`, `v0.1.1`, `v0.1.2` and `v0.1.3` were tag refs, so `latest` does now exist —
+  `v0.1.0`, `v0.1.1`, `v0.1.2`, `v0.1.3` and `v0.1.4` were tag refs, so `latest` does now exist —
   all 34 packages carry it, confirmed by an anonymous manifest fetch. The chart
   resolves `.tag | default global.image.tag | default .Chart.AppVersion`, which
-  is **0.1.3** today (the first tag built for both `amd64` and `arm64`); move it with
+  is **0.1.4** today (the first tag built for both `amd64` and `arm64`); move it with
   `global.image.tag`, not with `latest`.
 
 ## Troubleshooting

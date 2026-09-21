@@ -9,21 +9,18 @@ All notable changes to Rsync AI are documented in this file.
 
 ## [Unreleased]
 
-Everything below is on `main` and has not been published under a release heading.
-A version heading opens here when a release is cut; until then this section is the
-whole changelog.
+Nothing yet: everything up to `v0.1.4` is listed under its own heading below.
 
-### v0.1.4 — everything since v0.1.3
+## [0.1.4] - 2026-09-21
 
-The `## [0.1.4]` heading opens once the `v0.1.4` tag exists (the changelog guard rejects a
-heading whose tag does not); until then these entries sit under `[Unreleased]`.
+Everything since v0.1.3.
 
-#### Kubernetes
+### Kubernetes
 - **One-command installer** (`install-k8s.sh`) that fits the cluster it lands on, waits for a
   slow image pull instead of failing, and keeps Kafka Connect credentials across a pod
   restart. The chart's default image tag is multi-arch (`amd64` and `arm64`).
 
-#### Change data capture
+### Change data capture
 - Auto-pickup: a new source table joins a running "whole database" CDC pipeline.
 - MongoDB: a stalled source now fails loudly instead of reporting healthy; the heartbeat
   topic is named with the key Debezium reads; editing a pipeline's tables updates
@@ -32,28 +29,32 @@ heading whose tag does not); until then these entries sit under `[Unreleased]`.
 - Fixes for wrong row counts, counters that reset on restart, and cooldowns that never blocked.
 - The assessor warns about PostgreSQL tables without a primary key that sit outside a CDC pipeline.
 
-#### Connections and storage
+### Connections and storage
 - A Scope step, server-level MySQL, MongoDB and ClickHouse connections, multi-database CDC and
   mirror mapping; namespace listing (`GET /connections/:id/namespaces`).
 - Table discovery lists up to 5000 tables with totals.
 - Object-storage layout v2 for GCS, S3 and Azure Blob (no pipeline id in the path).
 - Deleting a pipeline closes six cleanup gaps and no longer un-owns destination data.
 
-#### Security
+### Security
 - Plain-`http` OAuth token endpoints are refused for Kafka in all four runtimes.
 - The connector deploy gate fails closed when `ENVIRONMENT` is unset; MongoDB URI aliases are masked.
 - Compose Kafka Connect honours `KAFKA_*` security settings.
 
-#### Interface
+### Interface
 - Monitoring Overview shows freshness, backlog, Kafka lag and failures; the pipeline page has an
   Assessment tab; Activity replaces Trace and Live events; Data flow reads top-down.
 - Explorer: a model page shows its lineage graph, its schedule in words and who runs it.
 - Stage durations come from one formatter, so a single transition no longer reads as a retry.
 
-#### Removed
+### Removed
 - The bundled observability-backend stack. Telemetry still exports over OTLP to whichever
   collector you configure; the seeded `sentinel_config` keys are now backend-neutral
   (migration `100`).
+
+## Earlier changes
+
+Entries from before the release tags; they are not tied to a version.
 
 ### 📚 Documentation
 

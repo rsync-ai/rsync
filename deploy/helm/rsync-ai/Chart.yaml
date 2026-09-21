@@ -7,7 +7,7 @@ type: application
 
 # Chart version. Released in lockstep with appVersion: the workflow derives both
 # from the same git tag, so a chart and the images it points at are never skewed.
-version: 0.1.3
+version: 0.1.4
 
 # appVersion is the image tag the chart defaults to (global.image.tag is empty,
 # so every component resolves through here). The release job overwrites BOTH this
@@ -27,10 +27,11 @@ version: 0.1.3
 # was built before the workflow added linux/arm64, so every image in it is
 # amd64-only -- an install on Apple Silicon, Graviton, Axion or Ampere nodes sat in
 # ErrImagePull ("no match for platform in manifest"). 0.1.3 is the first tag built
-# for both, checked 2026-09-21 by anonymous manifest fetch: all 33 images the chart
-# and the installer can name (13 chart images + 20 connectors) list amd64 and arm64.
+# for both, and 0.1.4 keeps it: checked 2026-09-21 by anonymous manifest fetch, all 34
+# packages the release publishes (13 service images + 21 connectors) list amd64 and
+# arm64 at 0.1.4.
 # Re-check that, not just that the images exist, before moving this again.
-appVersion: "0.1.3"
+appVersion: "0.1.4"
 
 keywords:
   - etl
