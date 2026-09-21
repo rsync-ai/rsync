@@ -12,7 +12,7 @@ import logging
 import json
 
 try:
-    from ...utils.openai_client import make_sync_client, resolve_provider, get_default_model
+    from ...utils.openai_client import make_sync_client, resolve_provider, get_default_model, llm_configured
 except ImportError:
     import importlib.util as _ilu, os as _os
     _spec = _ilu.spec_from_file_location(
@@ -24,6 +24,7 @@ except ImportError:
     make_sync_client = _m.make_sync_client
     resolve_provider  = _m.resolve_provider
     get_default_model = _m.get_default_model
+    llm_configured = _m.llm_configured
     del _ilu, _os, _spec, _m
 
 from ..pii_scanner.ml_detector import MLPIIDetector
@@ -568,9 +569,11 @@ def suggest_transforms_node(state: SuggestionState) -> SuggestionState:
 
     # Resolve provider and build client. Supports openai / groq / ollama via LLM_PROVIDER.
     _provider = resolve_provider()
-    if _provider == "openai" and not (os.getenv("OPENAI_API_KEY") or "").strip():
+    # resolve_provider() never answers "openai" without a key (it falls back to
+    # Ollama), so ask whether an LLM is set up rather than inspecting its answer.
+    if not llm_configured():
         # We intentionally do not hallucinate transforms without an LLM call.
-        logger.warning("No LLM configured (LLM_PROVIDER=%s); skipping transform suggestions", _provider)
+        logger.warning("No LLM configured (LLM_PROVIDER=%s); skipping transform suggestions", os.getenv("LLM_PROVIDER", ""))
         return {
             **state,
             "transform_suggestions": [],

@@ -105,7 +105,7 @@ export function SyncModeSelector({
                 {/* Recommended badge */}
                 {config.recommended && (
                   <Badge 
-                    className="absolute -top-2 -right-2 bg-emerald-500 text-white text-xs"
+                    className="absolute -top-2 -right-2 bg-emerald-700 text-white text-xs"
                   >
                     Default
                   </Badge>

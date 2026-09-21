@@ -11,6 +11,7 @@ import {
   Zap,
 } from "lucide-react"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { withoutPassedOverStages } from "@/lib/pipeline/stageDefinitions"
 import { authFetch } from "@/lib/api/auth-fetch"
 import {
   LinearTimeline,
@@ -22,6 +23,11 @@ import { StageDetailPanel } from "./StageDetailPanel"
 import { PipelineInsightsBar } from "./PipelineInsightsBar"
 import { PipelineCopilotDock } from "./PipelineCopilotDock"
 import { SchemaEvolutionPanel } from "./SchemaEvolutionPanel"
+import {
+  normalizeStrategyMode,
+  type DataLoadingStrategy,
+  type StrategyMode,
+} from "@/lib/pipeline/dataLoadingStrategy"
 
 interface StepsDAGTabProps {
   pipelineId: string
@@ -44,6 +50,7 @@ type PipelineRunEvent = {
 type PipelineSummary = {
   id: string
   name?: string | null
+  data_loading_strategy?: DataLoadingStrategy | null
   source_connection_id?: string | null
   destination_connection_id?: string | null
 }
@@ -132,6 +139,11 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
   const [viewMode, setViewMode] = useState<"auto" | "dag" | "timeline">("auto")
   const [selectedStageId, setSelectedStageId] = useState<string | null>(null)
   const [pipelineName, setPipelineName] = useState<string | undefined>(undefined)
+  // The pipeline's real sync mode. The plan's own `mode` is the planner's guess and
+  // is often absent, and the old `|| "batch"` fallback labelled CDC pipelines batch.
+  const [pipelineMode, setPipelineMode] = useState<StrategyMode | null>(null)
+  const summaryMode: StrategyMode | null =
+    pipelineMode ?? (executionPlan?.mode ? normalizeStrategyMode(executionPlan.mode) : null)
 
   const lastUserInteractionAtRef = useRef<number>(0)
   const didInitConnectorOverridesRef = useRef<boolean>(false)
@@ -205,6 +217,10 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
         if (pipelineRes?.ok) {
           const p = (await pipelineRes.json().catch(() => null)) as PipelineSummary | null
           if (p?.name) setPipelineName(p.name)
+          const strategy = p?.data_loading_strategy
+          if (strategy?.mode || strategy?.effective_sync_mode) {
+            setPipelineMode(normalizeStrategyMode(strategy.mode || strategy.effective_sync_mode))
+          }
           const srcId = (p?.source_connection_id || "").trim()
           const dstId = (p?.destination_connection_id || "").trim()
           const connFetches: Array<Promise<Response | null>> = []
@@ -427,6 +443,11 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
     return copy
   }, [resolvedStages, events, executionId])
 
+  // The plan keeps a node for a stage the run passed over (Generating Connectors
+  // when the connector exists), so the graph drew 9 steps beside the Overview's
+  // 8 (#41). Both now drop the same stages.
+  const countedStages = useMemo(() => withoutPassedOverStages(enrichedStages), [enrichedStages])
+
   // A "fast re-run" (Reload of an already-configured pipeline) skips the agent/planning
   // stages on the backend, so the execution plan carries only the executor stage. Replaying
   // the planning steps would be misleading — instead we show the DATA FLOW that actually runs:
@@ -439,12 +460,12 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
   }, [resolvedStages])
 
   const displayStages = useMemo(() => {
-    if (!isFastRerun) return enrichedStages
-    if (!connectorOverrides.source && !connectorOverrides.destination) return enrichedStages
+    if (!isFastRerun) return countedStages
+    if (!connectorOverrides.source && !connectorOverrides.destination) return countedStages
 
     const out: ExecutionPlanStage[] = []
     let prevId = ""
-    for (const s of enrichedStages) {
+    for (const s of countedStages) {
       if (s.id !== "executor") {
         out.push(s)
         prevId = s.id
@@ -480,7 +501,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
       }
     }
     return out
-  }, [isFastRerun, enrichedStages, connectorOverrides])
+  }, [isFastRerun, countedStages, connectorOverrides])
 
   const hasStages = displayStages.length > 0
 
@@ -579,7 +600,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
         </div>
       ) : !executionPlan || !executionPlan.stages || executionPlan.stages.length === 0 ? (
         <div className="flex flex-col items-center justify-center py-12 text-center">
-          <div className="text-zinc-500">No execution plan available</div>
+          <div className="text-zinc-500 dark:text-zinc-400">No execution plan available</div>
           <p className="text-xs text-zinc-400 mt-2">Run this pipeline to see execution steps</p>
         </div>
       ) : (
@@ -619,15 +640,22 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
 
           {/* Summary */}
           <div className="flex items-center gap-4 pt-4 border-t text-sm text-zinc-600 dark:text-zinc-400">
-            <span>
-              Mode: <span className="font-medium">{executionPlan.mode || "batch"}</span>
-            </span>
-            {executionPlan.estimated_time && (
+            {summaryMode && (
               <span>
-                Est. Time:{" "}
-                <span className="font-medium">{Math.round(executionPlan.estimated_time / 60)}min</span>
+                Mode: <span className="font-medium">{summaryMode === "cdc" ? "CDC" : "Batch"}</span>
               </span>
             )}
+            {/* A stream has no end, so a run-time estimate means nothing for CDC. */}
+            {summaryMode !== "cdc" && executionPlan.estimated_time ? (
+              <span>
+                Est. Time:{" "}
+                <span className="font-medium">
+                  {executionPlan.estimated_time < 60
+                    ? "<1min"
+                    : `${Math.round(executionPlan.estimated_time / 60)}min`}
+                </span>
+              </span>
+            ) : null}
             {executionPlan.metadata?.node_count && (
               <span>
                 Nodes: <span className="font-medium">{executionPlan.metadata.node_count}</span>

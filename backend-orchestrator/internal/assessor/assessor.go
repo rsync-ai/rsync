@@ -60,6 +60,11 @@ type Check struct {
 	// Message — short human description ("MySQL binlog_format is 'STATEMENT'").
 	Message string `json:"message"`
 
+	// Object — the table/collection a per-object check is about, empty for a
+	// server-level check. The gateway's Assessment tab groups one code's checks
+	// into a single row and lists these as the affected objects.
+	Object string `json:"object,omitempty"`
+
 	// Remediation — populated when Passed=false. Carries the fix.
 	Remediation *diagnose.Remediation `json:"remediation,omitempty"`
 }
@@ -129,8 +134,10 @@ type Input struct {
 	NominatedKeys map[string][]string
 
 	// PipelineID — optional, when assessment runs in the context of a
-	// specific pipeline. Used only for log lines / metadata; assessors
-	// must not couple to pipeline state.
+	// specific pipeline. Used for log lines / metadata, and to recognise the
+	// pipeline's own replication slot / publication on the source (their
+	// names start with cdc.PipelineResourcePrefix). Assessors must not read
+	// pipeline state from rsync's own database.
 	PipelineID string
 
 	// SyncMode — the pipeline's intended replication mode: "cdc", "batch",
@@ -396,7 +403,10 @@ func Summarize(r *Result) {
 		switch {
 		case c.Passed:
 			r.PassedCount++
-		case c.Severity == SeverityWarning:
+		case c.Severity == SeverityWarning, c.Severity == SeverityInfo:
+			// An info check that did not pass is an advisory (e.g. an unlimited
+			// max_slot_wal_keep_size): worth showing, never a reason to block,
+			// so it must not reach FailedCount and flip BlocksStart.
 			r.WarningCount++
 		default:
 			r.FailedCount++
@@ -412,6 +422,12 @@ func Summarize(r *Result) {
 	default:
 		r.OverallStatus = "passed"
 	}
+}
+
+// withObject records which table/collection a per-object check is about.
+func withObject(c Check, object string) Check {
+	c.Object = object
+	return c
 }
 
 // BlocksStart returns true when the Result should prevent pipeline start

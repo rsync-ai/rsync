@@ -1,7 +1,7 @@
 "use client"
 
 import { useEffect, useRef, useState } from "react"
-import { Activity, AlertTriangle, CheckCircle2, HeartPulse } from "lucide-react"
+import { Activity, CheckCircle2, HeartPulse } from "lucide-react"
 
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
@@ -13,8 +13,9 @@ import {
 } from "@/lib/hooks/usePipelineRuntime"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { DiagnosePanel } from "@/components/pipeline/DiagnosePanel"
-import { eventDetail, eventLabel, eventStageLabel, isNoiseEvent } from "./eventDisplay"
+import { tableStatusBreakdown } from "./executionSummary"
 import { cn } from "@/lib/utils"
+import { dependencyStatusLabel } from "@/lib/pipeline/dependencyStatus"
 
 // ---------------------------------------------------------------------------
 // Shared shapes — mirror the api-gateway responses described in the task.
@@ -24,7 +25,11 @@ interface TableStatsSummary {
   total_tables?: number
   tables_completed?: number
   tables_failed?: number
+  tables_degraded?: number
   tables_running?: number
+  // A selected CDC table that has reported nothing yet (table_stats.go). It is
+  // not in tables_running, so the footer must show it or the counts don't add up.
+  tables_waiting_for_data?: number
   total_read_rows?: number | null
   total_inserted_rows?: number | null
   total_inserts?: number | null
@@ -40,22 +45,6 @@ interface TableStatsSummary {
 interface TableStatsResponse {
   summary: TableStatsSummary
   tables?: unknown[]
-}
-
-interface PipelineRunEvent {
-  event_id: string
-  seq?: number
-  event_type: string
-  stage_id?: string
-  stage_group?: string
-  severity?: string
-  occurred_at?: string
-  received_at: string
-  payload: Record<string, unknown>
-}
-
-interface EventsResponse {
-  events: PipelineRunEvent[]
 }
 
 // ---------------------------------------------------------------------------
@@ -94,40 +83,15 @@ function num(v: number | null | undefined): number {
   return typeof v === "number" ? v : 0
 }
 
-function relTime(iso: string | undefined, now: number): string {
-  if (!iso) return ""
-  const secs = (now - new Date(iso).getTime()) / 1000
-  const s = Math.max(0, Math.floor(secs))
-  if (s < 60) return `${s}s ago`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m ago`
-  const h = Math.floor(m / 60)
-  if (h < 24) return `${h}h ago`
-  return `${Math.floor(h / 24)}d ago`
-}
-
-function severityDot(severity: string | undefined): string {
-  switch ((severity || "").toLowerCase()) {
-    case "error":
-    case "critical":
-      return "bg-red-500"
-    case "warning":
-    case "warn":
-      return "bg-amber-500"
-    default:
-      return "bg-muted-foreground/40"
-  }
-}
-
-// Generic 5s-polling JSON fetch hook used for table-stats and events.
+// Generic 5s-polling JSON fetch hook used for table-stats.
 //
-// A 404 is an ordinary failure here, not an empty result. Both endpoints this
-// hook is pointed at answer "nothing to report" with a 200 and an empty body
-// (`table_stats.go:436`, `pipeline_events.go:331`); each returns 404 from only
-// two places — an id that does not parse as a UUID, and `requirePipelineWorkspaceRole`,
-// which 404s a pipeline that does not exist OR sits outside the caller's ACTIVE
-// workspace (`pipeline_ownership.go:21`, deliberately indistinguishable, so the
-// response cannot be used to probe for pipelines in other tenants).
+// A 404 is an ordinary failure here, not an empty result. The endpoint answers
+// "nothing to report" with a 200 and an empty body (`table_stats.go:436`), and
+// returns 404 from only two places — an id that does not parse as a UUID, and
+// `requirePipelineWorkspaceRole`, which 404s a pipeline that does not exist OR
+// sits outside the caller's ACTIVE workspace (`pipeline_ownership.go:21`,
+// deliberately indistinguishable, so the response cannot be used to probe for
+// pipelines in other tenants).
 //
 // This used to set a `disabledRef` on 404 and return: no error, no cleared data,
 // and every later tick a no-op. The card then showed its empty state — the same
@@ -136,14 +100,27 @@ function severityDot(severity: string | undefined): string {
 // enough; only a page reload was.
 //
 // Nothing here needs a per-call "treat 404 as empty" option. That would only be
-// justified by an endpoint whose 404 means absence, and neither of these two has
-// one. `CDCLagAlertsPanel` hides itself on 404 for a genuinely different endpoint
+// justified by an endpoint whose 404 means absence, and this one has none.
+// `CDCLagAlertsPanel` hides itself on 404 for a genuinely different endpoint
 // (`MONITORING.SENTINEL_ISSUES`, whose 404 means the feature is not enabled) —
 // that precedent is about that endpoint, not about the status code.
 function usePolledJson<T>(url: string | null): { data: T | null; error: string | null } {
   const [data, setData] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
   const inflightRef = useRef<AbortController | null>(null)
+
+  // What this state is about. When the URL changes the answer it holds is about
+  // something else — another pipeline, another run — so it has to go, or the
+  // card shows the previous pipeline's numbers until the first response for the
+  // new one lands (see the same reset in usePipelineRuntime). Cleared during
+  // render, because an effect would paint that frame first. A failed poll on an
+  // unchanged URL is the opposite case and keeps its data, below.
+  const [subject, setSubject] = useState(url)
+  if (url !== subject) {
+    setSubject(url)
+    setData(null)
+    setError(null)
+  }
 
   useEffect(() => {
     if (!url) return
@@ -236,7 +213,7 @@ function DependenciesCard({
                         <span className="ml-1.5 text-muted-foreground">{dep.identifier}</span>
                       ) : null}
                     </span>
-                    <span className="text-muted-foreground capitalize shrink-0">{dep.status}</span>
+                    <span className="text-muted-foreground capitalize shrink-0">{dependencyStatusLabel(dep)}</span>
                   </div>
                   {dep.status !== "healthy" && dep.last_error ? (
                     <p className="text-[11px] text-muted-foreground mt-0.5 break-words">{dep.last_error}</p>
@@ -353,122 +330,14 @@ function ThroughputCard({
               label="Tables completed"
               value={`${num(s.tables_completed)} / ${num(s.total_tables)}`}
             />
-            {num(s.tables_failed) > 0 && (
-              <ThroughputRow label="Tables failed" value={fmtNum(s.tables_failed)} />
-            )}
-            {num(s.tables_running) > 0 && (
-              <ThroughputRow label="Tables running" value={fmtNum(s.tables_running)} />
-            )}
+            {/* Every table not completed lands in exactly one row, so the rows
+                below plus "completed" add up to the total. This used to list
+                failed and running only; degraded and no-data-yet tables were
+                counted in the total and shown nowhere. */}
+            {tableStatusBreakdown(s).rows.map((row) => (
+              <ThroughputRow key={row.key} label={row.label} value={row.count.toLocaleString()} />
+            ))}
           </div>
-        )}
-      </CardContent>
-    </Card>
-  )
-}
-
-function EventRow({ ev, now }: { ev: PipelineRunEvent; now: number }) {
-  const detail = eventDetail(ev)
-  const stage = eventStageLabel(ev)
-  return (
-    <li className="flex items-start gap-2 text-xs">
-      <span className={cn("mt-1.5 h-2 w-2 rounded-full shrink-0", severityDot(ev.severity))} />
-      <div className="min-w-0 flex-1">
-        <div className="flex items-center justify-between gap-2">
-          <span className="truncate font-medium text-foreground">
-            {eventLabel(ev)}
-            {stage ? <span className="ml-1 font-normal text-muted-foreground">· {stage}</span> : null}
-          </span>
-          <span className="shrink-0 text-[11px] text-muted-foreground">
-            {relTime(ev.occurred_at || ev.received_at, now)}
-          </span>
-        </div>
-        {detail ? <p className="text-[11px] text-muted-foreground break-words">{detail}</p> : null}
-      </div>
-    </li>
-  )
-}
-
-// Exported so the card can be rendered on its own in tests. MonitorTab itself
-// pulls in the runtime poller and the diagnose panel, neither of which this card
-// uses.
-export function LiveEventsCard({ pipelineId }: { pipelineId: string }) {
-  // 120, not 60. Roughly a fifth of the rows on this stream are heartbeats and
-  // metrics ticks (345 of 1614 measured on prod), and they are now hidden — so a
-  // 60-row page would have rendered ~47 lines and silently dropped the oldest
-  // real ones off the end of the window.
-  const { data, error } = usePolledJson<EventsResponse>(
-    `${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?limit=120`,
-  )
-  const events = data?.events ?? []
-  const [showRoutine, setShowRoutine] = useState(false)
-  // Tick so relative times stay current without calling Date.now() in render.
-  const [now, setNow] = useState(() => Date.now())
-  useEffect(() => {
-    const t = window.setInterval(() => setNow(Date.now()), 1000)
-    return () => window.clearInterval(t)
-  }, [])
-
-  const notable = events.filter((ev) => !isNoiseEvent(ev))
-  const routineCount = events.length - notable.length
-
-  // A read that failed is not an empty stream. Keep whatever the last good poll
-  // returned — retracting the feed on one bad tick would be its own defect — but
-  // never let "no rows" and "could not ask" share a rendering.
-  const failedRead = error !== null && events.length === 0
-
-  return (
-    <Card>
-      <CardHeader className="pb-3">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <AlertTriangle className="h-4 w-4" />
-          Live events
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="space-y-2">
-        {failedRead ? (
-          <p className="text-xs text-muted-foreground">
-            Could not load recent events ({error}). Retrying…
-          </p>
-        ) : events.length === 0 ? (
-          <p className="text-xs text-muted-foreground">No recent events.</p>
-        ) : (
-          <>
-            {error && (
-              <p className="text-[11px] text-amber-700 dark:text-amber-400">
-                These events may be out of date — could not refresh ({error}).
-              </p>
-            )}
-            {notable.length > 0 && (
-              <ul className="max-h-80 overflow-auto space-y-1.5 pr-1">
-                {notable.map((ev) => (
-                  <EventRow key={ev.event_id} ev={ev} now={now} />
-                ))}
-              </ul>
-            )}
-            {routineCount > 0 && (
-              <>
-                {/* Hiding rows without saying so is its own small lie. The count
-                    is the honest part, and the rows stay one click away. */}
-                <button
-                  type="button"
-                  onClick={() => setShowRoutine((v) => !v)}
-                  className="text-[11px] text-muted-foreground underline underline-offset-2 hover:text-foreground"
-                >
-                  {showRoutine ? "Hide" : "Show"} {routineCount} routine progress update
-                  {routineCount === 1 ? "" : "s"}
-                </button>
-                {showRoutine && (
-                  <ul className="max-h-60 overflow-auto space-y-1.5 pr-1 opacity-70">
-                    {events
-                      .filter((ev) => isNoiseEvent(ev))
-                      .map((ev) => (
-                        <EventRow key={ev.event_id} ev={ev} now={now} />
-                      ))}
-                  </ul>
-                )}
-              </>
-            )}
-          </>
         )}
       </CardContent>
     </Card>
@@ -498,14 +367,13 @@ export function MonitorTab({ pipelineId }: { pipelineId: string }) {
 
   return (
     <div className="space-y-4">
-      <DependenciesCard runtime={runtime} error={runtimeError} />
       <ThroughputCard
         pipelineId={pipelineId}
         executionId={runtime?.execution_id}
         mode={runtime?.mode}
       />
-      <LiveEventsCard pipelineId={pipelineId} />
       <DiagnoseCard pipelineId={pipelineId} />
+      <DependenciesCard runtime={runtime} error={runtimeError} />
     </div>
   )
 }

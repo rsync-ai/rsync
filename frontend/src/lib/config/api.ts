@@ -212,11 +212,15 @@ export const API_ENDPOINTS = {
     DELETE: (id: string) => `${API_GATEWAY_URL}/api/v1/connections/${id}`,
     TEST: `${API_GATEWAY_URL}/api/v1/connections/test`,
     TEST_BY_ID: (id: string) => `${API_GATEWAY_URL}/api/v1/connections/${id}/test`,
+    // The databases or schemas a connection reaches (the Scope step's preview).
+    NAMESPACES: (id: string) => `${API_GATEWAY_URL}/api/v1/connections/${id}/namespaces`,
+    NAMESPACES_PREVIEW: `${API_GATEWAY_URL}/api/v1/connections/namespaces`,
   },
   
   // MCP Connectors (unified endpoints)
   CONNECTORS: {
     LIST: `${API_GATEWAY_URL}/api/v1/connectors`,
+    NAMESPACE_MODELS: `${API_GATEWAY_URL}/api/v1/connectors/namespace-models`,
     GET: (name: string) => `${API_GATEWAY_URL}/api/v1/connectors/${name}`,
     LOGO: (name: string) => `${API_GATEWAY_URL}/api/v1/connectors/${name}/logo`,
     GENERATE: `${API_GATEWAY_URL}/api/v1/connectors/generate`,
@@ -244,6 +248,7 @@ export const API_ENDPOINTS = {
     CREATE: `${API_GATEWAY_URL}/api/v1/pipelines`,
     STATS: `${API_GATEWAY_URL}/api/v1/pipelines/stats`,
     COMPARE: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/compare`,
+    TRENDS: (id: string, limit = 10) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/trends?limit=${limit}`,
     CDC_RECOVER: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/cdc/recover`,
     CDC_BACKFILL: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/cdc/backfill`,
     GET: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}`,
@@ -267,6 +272,7 @@ export const API_ENDPOINTS = {
     // Canonical runtime view — single source of truth for "what is this pipeline
     // doing right now". Replaces UI-side state derivation.
     RUNTIME: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/runtime`,
+    RUNTIME_INTERNAL: (id: string) => `${API_GATEWAY_URL_INTERNAL}/api/v1/pipelines/${id}/runtime`,
     DIAGNOSE: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/diagnose`,
     TABLE_STATS: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/table-stats`,
     EVENTS: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/events`,
@@ -275,6 +281,7 @@ export const API_ENDPOINTS = {
       `${API_GATEWAY_URL}/api/v1/pipelines/${id}/schema-changes/${changeId}/approve`,
     SCHEMA_CHANGE_REJECT: (id: string, changeId: string) =>
       `${API_GATEWAY_URL}/api/v1/pipelines/${id}/schema-changes/${changeId}/reject`,
+    SCHEMA_DRIFT_POLICY: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/schema-drift-policy`,
   },
   
   // Monitoring

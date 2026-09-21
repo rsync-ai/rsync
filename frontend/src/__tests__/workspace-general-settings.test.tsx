@@ -182,3 +182,13 @@ describe("WorkspaceGeneralSettings — leave", () => {
     expect(pushMock).not.toHaveBeenCalled()
   })
 })
+
+describe("WorkspaceGeneralSettings — role (#56)", () => {
+  it("does not print the role again: the settings page banner above the tabs owns it", async () => {
+    routeFetch()
+    renderGeneral({ currentRole: "admin" })
+    await screen.findByLabelText(/workspace name/i)
+    expect(screen.queryByText(/your role/i)).toBeNull()
+    expect(screen.queryByText("Admin")).toBeNull()
+  })
+})

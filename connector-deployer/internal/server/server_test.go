@@ -106,6 +106,12 @@ func TestAuth(t *testing.T) {
 		{"unset in prod ⇒ 503", "", "production", "", http.StatusServiceUnavailable},
 		{"unset in prod (prod alias) ⇒ 503", "", "prod", "anything", http.StatusServiceUnavailable},
 		{"unset in dev ⇒ allow", "", "development", "", http.StatusOK},
+		{"unset in dev (dev alias) ⇒ allow", "", "dev", "", http.StatusOK},
+		// An ENVIRONMENT that is not explicitly dev fails closed. These used to
+		// fall through to allow: the gate only refused production/prod.
+		{"unset, ENVIRONMENT unset ⇒ 503", "", "", "", http.StatusServiceUnavailable},
+		{"unset, ENVIRONMENT staging ⇒ 503", "", "staging", "", http.StatusServiceUnavailable},
+		{"unset, ENVIRONMENT typo ⇒ 503", "", "prodution", "anything", http.StatusServiceUnavailable},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

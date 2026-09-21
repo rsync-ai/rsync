@@ -109,7 +109,7 @@ export function VendorPicker({
                   <div className="font-medium text-zinc-900 dark:text-zinc-100">
                     {v.display_name}
                   </div>
-                  <div className="text-[11px] text-zinc-500">
+                  <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
                     {v.apis.length} {v.apis.length === 1 ? "API" : "APIs"} · {v.category}
                   </div>
                 </div>
@@ -141,7 +141,7 @@ export function VendorPicker({
                 <div className="font-medium text-zinc-900 dark:text-zinc-100">
                   Use “{apiName.trim()}” as a custom API
                 </div>
-                <div className="text-[11px] text-zinc-500">
+                <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
                   We&apos;ll discover protocol, auth, and operations from the docs URL.
                 </div>
               </div>
@@ -208,7 +208,7 @@ function VariantCard({
                 Recommended
               </span>
             )}
-            <span className="text-[10px] uppercase tracking-wide text-zinc-500 font-mono">
+            <span className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 font-mono">
               {api.protocol}
             </span>
           </div>
@@ -217,7 +217,7 @@ function VariantCard({
               {api.reason}
             </div>
           )}
-          <div className="mt-1 text-[10px] font-mono text-zinc-500 truncate">
+          <div className="mt-1 text-[10px] font-mono text-zinc-500 dark:text-zinc-400 truncate">
             {api.endpoint_template}
           </div>
         </div>

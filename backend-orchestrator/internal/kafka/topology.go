@@ -681,6 +681,14 @@ func (tm *TopologyManager) ListTopics(ctx context.Context) (map[string]*TopicInf
 // table topic, say) would be absent from a stale entry and get left behind
 // permanently, since nothing ever revisits a deleted pipeline.
 func (tm *TopologyManager) ListTopicNamesFresh(ctx context.Context) ([]string, error) {
+	// Sarama's admin client is blocking and takes no context, so ctx can only
+	// bind at the call boundary. Check it BEFORE taking the lock: a caller whose
+	// deadline has already passed must not queue behind an in-flight admin call
+	// and then spend another broker round-trip it no longer has budget for.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
@@ -698,6 +706,10 @@ func (tm *TopologyManager) ListTopicNamesFresh(ctx context.Context) ([]string, e
 
 // ListConsumerGroupNames returns every consumer group ID known to the cluster.
 func (tm *TopologyManager) ListConsumerGroupNames(ctx context.Context) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	tm.mu.RLock()
 	defer tm.mu.RUnlock()
 
@@ -717,6 +729,10 @@ func (tm *TopologyManager) ListConsumerGroupNames(ctx context.Context) ([]string
 // Kafka rejects this with NonEmptyGroup while any member is still joined, so
 // callers must stop the group's consumers first.
 func (tm *TopologyManager) DeleteConsumerGroup(ctx context.Context, group string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -745,6 +761,10 @@ func (tm *TopologyManager) GetTopic(ctx context.Context, name string) (*TopicInf
 
 // DeleteTopic deletes a topic
 func (tm *TopologyManager) DeleteTopic(ctx context.Context, name string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 

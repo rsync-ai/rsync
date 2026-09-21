@@ -130,8 +130,8 @@ func TestConfiguredGranularityIsHiveParseable(t *testing.T) {
 // The end-to-end shape a BigQuery external table is pointed at: with a granularity set, a
 // CDC object key must carry dt= between the table prefix and the leaf.
 func TestCDCObjectKeyIsHivePartitionedWhenGranularitySet(t *testing.T) {
-	got := cdcObjectKey("bronze", "shop", "orders", timePartitionSegment(fixedTS, "day"), "", fixedTS, 0, 7, 7, "jsonl", "none")
-	want := "bronze/shop/orders/dt=2026-01-25/20260125-143000000-7.jsonl"
+	got := cdcObjectKey("bronze", "pipe-1", "shop", "orders", timePartitionSegment(fixedTS, "day"), "", fixedTS, 0, 7, 7, "jsonl", "none")
+	want := "bronze/pipe-1/shop/orders/dt=2026-01-25/20260125-143000000-7.jsonl"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
@@ -140,7 +140,7 @@ func TestCDCObjectKeyIsHivePartitionedWhenGranularitySet(t *testing.T) {
 func TestCDCObjectKeyWithPartition(t *testing.T) {
 	// Hive partition segments are inserted between the table and the date folder;
 	// a non-zero Kafka partition folds into the leaf (-p2), then the offset tiebreaker.
-	got := cdcObjectKey("prefix", "public", "users", "2026-01-25/14", "region=us-east/tier=gold/", fixedTS, 2, 5, 9, "jsonl", "none")
+	got := cdcObjectKey("prefix", "", "public", "users", "2026-01-25/14", "region=us-east/tier=gold/", fixedTS, 2, 5, 9, "jsonl", "none")
 	want := "prefix/public/users/region=us-east/tier=gold/2026-01-25/14/20260125-143000000-p2-5.jsonl"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)
@@ -149,7 +149,7 @@ func TestCDCObjectKeyWithPartition(t *testing.T) {
 
 func TestCDCObjectKeyNoPartitionCols(t *testing.T) {
 	// Default: no partSegs, plain date folder, partition 0 → DMS-style timestamp leaf.
-	got := cdcObjectKey("prefix", "public", "users", "2026-01-25", "", fixedTS, 0, 1, 1, "jsonl", "none")
+	got := cdcObjectKey("prefix", "", "public", "users", "2026-01-25", "", fixedTS, 0, 1, 1, "jsonl", "none")
 	want := "prefix/public/users/2026-01-25/20260125-143000000-1.jsonl"
 	if got != want {
 		t.Errorf("got %q, want %q", got, want)

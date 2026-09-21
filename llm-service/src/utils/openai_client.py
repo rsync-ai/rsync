@@ -7,6 +7,11 @@ Supports four providers via the LLM_PROVIDER environment variable:
   groq    — Groq API (groq.com, OpenAI-compatible; GROQ_API_KEY required)
   ollama  — Local Ollama (default when no cloud key is present)
 
+OpenAI wire protocol, key from the VM (Vertex AI):
+  OPENAI_API_KEY_SOURCE=gcp-metadata — send a Google OAuth access token from the
+      GCE metadata server instead of OPENAI_API_KEY, refreshed before it expires.
+      Only used when OPENAI_BASE_URL is an https://*.googleapis.com endpoint.
+
 Azure OpenAI environment variables:
   AZURE_OPENAI_ENDPOINT    — e.g. https://myresource.openai.azure.com
   AZURE_OPENAI_API_KEY     — Azure API key (falls back to OPENAI_API_KEY)
@@ -26,12 +31,20 @@ Usage:
     model    = get_default_model(provider)  # honours LLM_MODEL env var
 """
 
+import logging
 import os
+import re
+import threading
+from typing import Awaitable, Callable, Union
 from urllib.parse import urlparse
 from openai import OpenAI, AsyncOpenAI, AzureOpenAI, AsyncAzureOpenAI
 
+logger = logging.getLogger(__name__)
+
 __all__ = [
     "resolve_provider",
+    "llm_configured",
+    "explorer_llm_configured",
     "get_default_model",
     "env_bool",
     "resolve_explorer_provider",
@@ -40,6 +53,7 @@ __all__ = [
     "rank_tables_default_model",
     "make_sync_client",
     "make_async_client",
+    "openai_api_key",
     "client_egress_host",
     "_ollama_base_url",
 ]
@@ -76,6 +90,207 @@ def _ollama_base_url() -> str:
     return url
 
 
+# Example values this repo's env templates and docs have shipped in credential
+# slots. An operator who copied one of those files has not set up an LLM, so these
+# count as unset. Compared lower-cased.
+_PLACEHOLDER_CREDENTIALS = frozenset({"sk-...", "sk-proj-...", "sk-xxx", "gsk_..."})
+# "your-openai-key-here", "YOUR_API_KEY_HERE", "sk-proj-your-openai-key-here".
+_PLACEHOLDER_SHAPE = re.compile(r"your[-_ ].*key[-_ ]here", re.IGNORECASE)
+# "<azure-key>", "https://<resource>.openai.azure.com": a slot to fill in.
+_TEMPLATE_SLOT = re.compile(r"<[^<>]+>")
+# Variables already reported, so the warning is logged once per variable per process.
+_PLACEHOLDER_WARNED: set = set()
+
+# What a credential variable holds, read the way the client reads it.
+_UNSET = "unset"
+_EXAMPLE = "example"
+_REAL = "real"
+
+
+def _is_placeholder_credential(value: str, accept_examples: bool = False) -> bool:
+    v = (value or "").strip()
+    if not v:
+        return False
+    # A <slot> is never a key, not even a dummy one for a server that ignores keys.
+    if _TEMPLATE_SLOT.search(v):
+        return True
+    if accept_examples:
+        return False
+    return v.lower() in _PLACEHOLDER_CREDENTIALS or bool(_PLACEHOLDER_SHAPE.search(v))
+
+
+def _credential(*names: str, accept_examples: bool = False) -> str:
+    """
+    What the credential the client would send holds: ``_UNSET``, ``_EXAMPLE`` or ``_REAL``.
+
+    ``names`` are read in order and the first one that is set is used, exactly as
+    the clients read ``(os.getenv(A) or os.getenv(B) or "").strip()``: a variable
+    holding only spaces is still the one sent, and it is sent blank. An example
+    value copied from a template or the docs is logged once per variable, by name
+    and never by value.
+
+    ``accept_examples`` is for a key sent to an endpoint the operator named
+    (OPENAI_BASE_URL): a local server that ignores keys is often given a dummy
+    one such as ``sk-xxx``, and only that server can say whether the key works.
+    A ``<slot>`` is still an example there.
+    """
+    for name in names:
+        raw = os.getenv(name)
+        if not raw:
+            continue
+        value = raw.strip()
+        if not value:
+            return _UNSET
+        if _is_placeholder_credential(value, accept_examples=accept_examples):
+            if name not in _PLACEHOLDER_WARNED:
+                _PLACEHOLDER_WARNED.add(name)
+                logger.warning(
+                    "%s holds an example value copied from a template or the docs, "
+                    "not a real one, so no LLM is set up from it. Put the real value "
+                    "in .env, or leave it empty to run without an LLM.",
+                    name,
+                )
+            return _EXAMPLE
+        return _REAL
+    return _UNSET
+
+
+def _set_credential(*names: str, accept_examples: bool = False) -> bool:
+    """True when the credential the client would send holds a real value."""
+    return _credential(*names, accept_examples=accept_examples) == _REAL
+
+
+def _resolve_azure() -> str:
+    """
+    "azure" when the Azure client could work, else "ollama".
+
+    The client sends AZURE_OPENAI_ENDPOINT and the first set key of
+    AZURE_OPENAI_API_KEY / OPENAI_API_KEY. If either one holds an example value
+    the call cannot succeed, whatever the other holds. Otherwise a real endpoint
+    or a real key is enough, as it always was.
+    """
+    endpoint = _credential("AZURE_OPENAI_ENDPOINT")
+    key = _credential("AZURE_OPENAI_API_KEY", "OPENAI_API_KEY")
+    if _EXAMPLE in (endpoint, key):
+        return "ollama"
+    return "azure" if _REAL in (endpoint, key) else "ollama"
+
+
+# Provider names resolve_provider knows. Anything else OpenAI-compatible (Vertex AI,
+# OpenRouter, LiteLLM) is "openai" with OPENAI_BASE_URL.
+_KNOWN_PROVIDERS = ("openai", "azure", "groq", "ollama")
+# LLM_PROVIDER values that mean "this install runs without an LLM".
+_NO_LLM_CHOICES = frozenset({"none", "disabled", "off", "false", "0"})
+# Fallbacks already reported, so each is logged once per process.
+_FALLBACK_WARNED: set = set()
+
+
+def _warn_once(key: str, message: str, *args) -> None:
+    if key in _FALLBACK_WARNED:
+        return
+    _FALLBACK_WARNED.add(key)
+    logger.warning(message, *args)
+
+
+def _warn_fallback(provider: str, needs: str) -> None:
+    """A chosen cloud provider is missing its credential, so the answer is "ollama"."""
+    _warn_once(
+        f"fallback:{provider}",
+        "LLM provider %s was chosen but %s is not set to a real value, so this service "
+        "resolves to the local Ollama fallback instead. Features that need an LLM report "
+        "that none is set up. Put the value in .env and restart.",
+        provider,
+        needs,
+    )
+
+
+# OPENAI_API_KEY_SOURCE: where an OpenAI-protocol client gets its bearer token.
+_KEY_SOURCE_GCP_METADATA = "gcp-metadata"
+
+
+def _openai_key_source() -> str:
+    """"" (the key is OPENAI_API_KEY) or ``gcp-metadata``."""
+    raw = (os.getenv("OPENAI_API_KEY_SOURCE") or "").strip().lower()
+    if raw in ("", "env"):
+        return ""
+    if raw == _KEY_SOURCE_GCP_METADATA:
+        return raw
+    # Not echoed: a key pasted into the wrong variable must not reach the log.
+    _warn_once(
+        "key-source",
+        "OPENAI_API_KEY_SOURCE holds a value this service does not know (the one "
+        "supported value is gcp-metadata), so OPENAI_API_KEY is used as the key.",
+    )
+    return ""
+
+
+def _base_url_is_google() -> bool:
+    """True when OPENAI_BASE_URL is an https endpoint on googleapis.com."""
+    parsed = urlparse((os.getenv("OPENAI_BASE_URL") or "").strip())
+    host = (parsed.hostname or "").lower()
+    return parsed.scheme == "https" and (host == "googleapis.com" or host.endswith(".googleapis.com"))
+
+
+def _gcp_metadata_key_usable() -> bool:
+    """
+    Whether OPENAI_API_KEY_SOURCE=gcp-metadata may be used.
+
+    The token it sends is the VM service account's, good for every Google API the
+    account can reach. It goes only to a googleapis.com host over https; any other
+    OPENAI_BASE_URL (a proxy, a typo, OpenAI itself) gets nothing.
+    """
+    if _base_url_is_google():
+        return True
+    _warn_once(
+        "key-source-host",
+        "OPENAI_API_KEY_SOURCE=gcp-metadata sends this VM's Google service account token, "
+        "so it is only used when OPENAI_BASE_URL is an https://*.googleapis.com endpoint "
+        "such as Vertex AI. OPENAI_BASE_URL is not one, so no LLM is set up from it.",
+    )
+    return False
+
+
+def _openai_key_set() -> bool:
+    """True when an OpenAI-protocol client would send a usable bearer token."""
+    if _openai_key_source() == _KEY_SOURCE_GCP_METADATA:
+        return _gcp_metadata_key_usable()
+    return _set_credential("OPENAI_API_KEY", accept_examples=_openai_base_url_is_custom())
+
+
+_GCP_TOKEN = None
+_GCP_TOKEN_LOCK = threading.Lock()
+
+
+def _gcp_metadata_token():
+    """The process-wide token cache, so every client shares one refresh."""
+    global _GCP_TOKEN
+    with _GCP_TOKEN_LOCK:
+        if _GCP_TOKEN is None:
+            from src.utils.gcp_access_token import MetadataAccessToken
+
+            _GCP_TOKEN = MetadataAccessToken()
+        return _GCP_TOKEN
+
+
+def openai_api_key(async_client: bool = False) -> Union[str, Callable[[], str], Callable[[], Awaitable[str]]]:
+    """
+    What an OpenAI-protocol client is given as ``api_key``.
+
+    OPENAI_API_KEY as it stands, or, with OPENAI_API_KEY_SOURCE=gcp-metadata and a
+    googleapis.com base URL, a function the SDK calls before every request. A
+    Vertex AI access token lasts an hour; a client built once at startup with the
+    token as a string sent it until it expired and then failed every call.
+    ``async_client`` picks the coroutine the async client needs. Returns "" when
+    the metadata source is chosen for a host it may not be sent to.
+    """
+    if _openai_key_source() == _KEY_SOURCE_GCP_METADATA:
+        if not _gcp_metadata_key_usable():
+            return ""
+        token = _gcp_metadata_token()
+        return token.aget if async_client else token.get
+    return os.getenv("OPENAI_API_KEY", "")
+
+
 def resolve_provider(explicit: str = "") -> str:
     """
     Resolve which LLM provider to use.
@@ -88,33 +303,111 @@ def resolve_provider(explicit: str = "") -> str:
          else "ollama". Groq is NEVER auto-selected — it is opt-in only via an
          explicit LLM_PROVIDER=groq, so a stray GROQ_API_KEY cannot silently
          route prompts to an undisclosed external LLM.
+
+    A credential holding an example value from a template (``sk-...``,
+    ``your-openai-key-here``, ``<azure-key>``) counts as empty, so no client is
+    pointed at a cloud provider with a key that cannot work. The exception is
+    OPENAI_API_KEY when OPENAI_BASE_URL names another endpoint: whatever key the
+    operator gave that server is theirs to judge, unless it is a ``<slot>``.
+    OPENAI_API_KEY_SOURCE=gcp-metadata stands in for OPENAI_API_KEY on a
+    googleapis.com base URL.
+
+    A chosen provider without its credential, and a provider name this function
+    does not know, still resolve (to "ollama", and to auto-detect) but are logged
+    once each. They used to be silent, so ``LLM_PROVIDER=groq`` with the key never
+    reaching the container looked exactly like a working Groq setup.
     """
     p = (explicit or os.getenv("LLM_PROVIDER", "")).strip().lower()
 
     if p == "azure":
-        # Valid if endpoint or any key is set
-        has_endpoint = bool((os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip())
-        has_key = bool((os.getenv("AZURE_OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip())
-        return "azure" if (has_endpoint or has_key) else "ollama"
+        resolved = _resolve_azure()
+        if resolved == "ollama":
+            _warn_fallback("azure", "AZURE_OPENAI_ENDPOINT or AZURE_OPENAI_API_KEY")
+        return resolved
 
     if p == "groq":
-        return "groq" if (os.getenv("GROQ_API_KEY") or "").strip() else "ollama"
+        if _set_credential("GROQ_API_KEY"):
+            return "groq"
+        _warn_fallback("groq", "GROQ_API_KEY")
+        return "ollama"
 
     if p == "openai":
-        # Fail-open: no key → fall back to offline
-        return "openai" if (os.getenv("OPENAI_API_KEY") or "").strip() else "ollama"
+        # Fail-open: no key → fall back to offline, and say so.
+        if _openai_key_set():
+            return "openai"
+        _warn_fallback("openai", "OPENAI_API_KEY (or OPENAI_API_KEY_SOURCE)")
+        return "ollama"
 
     if p == "ollama":
         return "ollama"
 
-    # Auto-detect: Azure endpoint present takes priority
-    if (os.getenv("AZURE_OPENAI_ENDPOINT") or "").strip():
-        return "azure"
-    if (os.getenv("OPENAI_API_KEY") or "").strip():
+    if p and p not in _NO_LLM_CHOICES:
+        # Not echoed, for the same reason as OPENAI_API_KEY_SOURCE.
+        _warn_once(
+            "unknown-provider",
+            "The LLM provider setting holds a name this service does not know; the known "
+            "ones are %s, or none to run without an LLM. For Vertex AI, OpenRouter or any "
+            "other OpenAI-compatible endpoint use openai with OPENAI_BASE_URL. Choosing a "
+            "provider from the credentials that are set instead.",
+            ", ".join(_KNOWN_PROVIDERS),
+        )
+
+    # Auto-detect: an Azure endpoint takes priority. One that still holds an
+    # example value means Azure was meant but not finished. Falling through to
+    # OPENAI_API_KEY would send prompts, and perhaps an Azure key (the Azure
+    # client also reads its key from OPENAI_API_KEY), to a different vendor.
+    if _credential("AZURE_OPENAI_ENDPOINT") != _UNSET:
+        return _resolve_azure()
+    if _openai_key_set():
         return "openai"
     # Groq is opt-in only (explicit LLM_PROVIDER=groq); auto-detect never
     # silently routes prompts to Groq — an undisclosed external LLM egress.
     return "ollama"
+
+
+def llm_configured(explicit: str = "") -> bool:
+    """
+    Report whether the operator actually set up an LLM.
+
+    ``resolve_provider`` never says "none": with no usable cloud credentials it
+    answers "ollama", so a stack with no LLM at all used to send every prompt to
+    an Ollama nobody started and fail mid-request. The pipeline intent parser,
+    raw SQL in the Data Explorer and the existing connectors need no LLM, so an
+    install without one is legitimate; the LLM-only features must say "set up an
+    LLM first" instead of timing out against a guess.
+
+    Configured means one of:
+      * the choice resolves to a cloud provider whose credentials are present
+        (an example value copied from a template is not a credential);
+      * the operator explicitly chose Ollama (LLM_PROVIDER=ollama).
+
+    Ollama reached only by fallback is NOT configured. Compose always sends a
+    default OLLAMA_URL, so the presence of that variable says nothing about
+    whether an Ollama exists. An explicit ``none`` / ``off`` wins over any key
+    left in the environment.
+    """
+    choice = (explicit or os.getenv("LLM_PROVIDER", "")).strip().lower()
+    if choice in _NO_LLM_CHOICES:
+        return False
+    if resolve_provider(choice) != "ollama":
+        return True
+    return choice == "ollama"
+
+
+def explorer_llm_configured(override_env: str = "") -> bool:
+    """
+    ``llm_configured`` for the provider that serves Data Explorer prompts.
+
+    Follows the same precedence as ``resolve_explorer_provider``:
+    EXPLORER_OFFLINE_ONLY is an explicit choice of Ollama, then the endpoint's own
+    override, then EXPLORER_LLM_PROVIDER, then LLM_PROVIDER.
+    """
+    if _env_bool("EXPLORER_OFFLINE_ONLY", False):
+        return True
+    explicit = (os.getenv(override_env) or "").strip() if override_env else ""
+    return llm_configured(
+        explicit or os.getenv("EXPLORER_LLM_PROVIDER") or os.getenv("LLM_PROVIDER", "")
+    )
 
 
 def get_default_model(provider: str) -> str:
@@ -170,7 +463,13 @@ def explorer_default_model(provider: str) -> str:
     DeploymentNotFound unless a deployment happens to carry that name — the
     rest of the stack already runs on LLM_MODEL, so Explorer must too.
 
-    Offline, OLLAMA_MODEL wins instead: see the return below.
+    Offline reads OLLAMA_MODEL for the same reason it refuses LLM_MODEL: the
+    name has to be one Ollama actually holds. Refusing LLM_MODEL keeps a cloud
+    model name out of the offline path, but the literal it fell back to was no
+    likelier to be in the volume — a deployment that pulled one model got a
+    working /chat beside an Explorer asking for llama3:latest. OLLAMA_MODEL is
+    an Ollama-side name by construction, so honouring it cannot reintroduce
+    what the refusal was protecting against.
     """
     if provider in ("openai", "azure"):
         override = (os.getenv("LLM_MODEL") or "").strip()
@@ -183,16 +482,9 @@ def explorer_default_model(provider: str) -> str:
         return "gpt-4o-mini"
     if provider == "groq":
         return "llama-3.3-70b-versatile"
-    # Ollama, and the only branch here with no hosted catalog behind it: the name
-    # has to be a model the server has actually pulled, or the request comes back
-    # `model "..." not found, try pulling it first`. OLLAMA_MODEL is the name the
-    # bundled overlay downloads (docker-compose.ollama.yml) and the sibling
-    # explorer_default_sql_model below already reads, so an offline install that
-    # pulled one model now gets that model here too. Without this the Explorer
-    # chat was the one Ollama path that could not be pointed at the model on
-    # disk by any environment variable, and it asked for a llama3:latest nothing
-    # had downloaded — beside a /chat that worked.
-    return (os.getenv("OLLAMA_MODEL") or "llama3:latest").strip()
+    if provider == "ollama":
+        return (os.getenv("OLLAMA_MODEL") or "llama3:latest").strip()
+    return "llama3:latest"
 
 
 def explorer_default_sql_model(provider: str) -> str:
@@ -302,7 +594,7 @@ def make_sync_client(provider: str = "", timeout: float = 45.0, max_retries: int
         )
     # openai
     kwargs: dict = {
-        "api_key": os.getenv("OPENAI_API_KEY", ""),
+        "api_key": openai_api_key(),
         "timeout": timeout,
         "max_retries": max_retries,
     }
@@ -348,7 +640,7 @@ def make_async_client(provider: str = "", timeout: float = 120.0) -> AsyncOpenAI
             timeout=timeout,
         )
     # openai
-    kwargs: dict = {"api_key": os.getenv("OPENAI_API_KEY", ""), "timeout": timeout}
+    kwargs: dict = {"api_key": openai_api_key(async_client=True), "timeout": timeout}
     _base = (os.getenv("OPENAI_BASE_URL") or "").strip()
     if _base:
         kwargs["base_url"] = _base

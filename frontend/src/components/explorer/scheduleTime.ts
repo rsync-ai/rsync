@@ -33,15 +33,83 @@ export function formatNextRun(iso: string): string {
  * The absolute local time, for the title attribute. A relative string is easier to
  * read at a glance but ambiguous when it matters — someone deciding whether to wait
  * for the next rebuild or force one needs the wall-clock time, in their own zone.
+ *
+ * Defined in @/lib/utils so pages outside the explorer share it; re-exported here
+ * for the existing imports.
  */
-export function formatAbsoluteTime(iso: string): string {
-  const d = new Date(iso)
-  if (Number.isNaN(d.getTime())) return ""
-  return d.toLocaleString(undefined, {
-    month: "short",
-    day: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZoneName: "short",
-  })
+export { formatAbsoluteTime } from "@/lib/utils"
+
+// ---------------------------------------------------------------------------
+// Refetching when a next run comes due
+// ---------------------------------------------------------------------------
+// A list fetched once shows next_run_at as it was at fetch time. When that instant
+// passes, the tick has fired and the server already knows the following one, but
+// nothing re-asks — so the row sits on "due now" indefinitely. These helpers tell a
+// list when to re-ask, and what to say in the gap before it does.
+
+/**
+ * How long after a next run comes due to refetch. The server recomputes next_run_at
+ * from its own clock, so asking at the exact instant would often get the same
+ * (now past) time back; a few seconds' grace absorbs the tick and ordinary skew.
+ */
+export const NEXT_RUN_REFETCH_GRACE_MS = 5_000
+
+/**
+ * The longest a refetch is ever put off. setTimeout stores its delay as a signed
+ * 32-bit int, and anything above 2^31-1 ms (~24.8 days) fires immediately instead —
+ * a monthly schedule would otherwise refetch in a tight loop. An hour is far inside
+ * that bound, and a timer that re-arms hourly costs nothing.
+ */
+export const NEXT_RUN_REFETCH_MAX_DELAY_MS = 60 * 60 * 1000
+
+/**
+ * Milliseconds until a list showing these next_run_at values should refetch, or
+ * null when nothing needs it (every value is missing or unparseable).
+ *
+ * An upcoming time is refetched NEXT_RUN_REFETCH_GRACE_MS after it; the earliest one
+ * wins. A time already past — the browser clock ahead of the server's, or a refetch
+ * that came back before the server moved on — is retried after as long as it has
+ * been overdue (never less than the grace). That backs off on its own, so a value
+ * the server keeps reporting in the past costs a handful of requests, not a loop.
+ */
+export function nextRunRefetchDelay(
+  nextRunAts: ReadonlyArray<string | null | undefined>,
+  now: number = Date.now(),
+): number | null {
+  let delay: number | null = null
+  for (const iso of nextRunAts) {
+    if (!iso) continue
+    const at = new Date(iso).getTime()
+    if (Number.isNaN(at)) continue
+    const d =
+      at > now
+        ? at - now + NEXT_RUN_REFETCH_GRACE_MS
+        : Math.max(NEXT_RUN_REFETCH_GRACE_MS, now - at)
+    if (delay === null || d < delay) delay = d
+  }
+  if (delay === null) return null
+  return Math.min(delay, NEXT_RUN_REFETCH_MAX_DELAY_MS)
+}
+
+/**
+ * The next-run label for a time that may already have passed. An upcoming time reads
+ * as formatNextRun does ("in 4m"). A past one reads as the wall-clock time it was
+ * due ("due Aug 15, 10:00 AM UTC") rather than only "due now", which after a missed
+ * refetch would say nothing about when.
+ *
+ * The absolute formatter is passed in (callers hand it formatAbsoluteTime) rather than
+ * named here, so this helper does not depend on where that function is defined. `now`
+ * decides past versus upcoming; the upcoming wording itself is formatNextRun's, which
+ * reads the real clock.
+ */
+export function formatNextRunOrDue(
+  iso: string,
+  formatAbsolute: (iso: string) => string,
+  now: number = Date.now(),
+): string {
+  const at = new Date(iso).getTime()
+  if (Number.isNaN(at)) return ""
+  if (at > now) return formatNextRun(iso)
+  const absolute = formatAbsolute(iso)
+  return absolute ? `due ${absolute}` : "due now"
 }

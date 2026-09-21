@@ -46,7 +46,7 @@ function StatCard({ title, value, iconName, color, bgColor, subtitle, href }: St
         {/* Always render the subtitle line (placeholder when absent) so cards
             without a subtitle — Sources/Destinations — stay the same height as
             Pipelines/Executions and all four align uniformly. */}
-        <p className="text-xs text-zinc-400 dark:text-zinc-500">{subtitle ?? " "}</p>
+        <p className="text-xs text-zinc-400">{subtitle ?? " "}</p>
       </div>
       <div className={`rounded-full p-3 ${bgColor}`}>
         <Icon className={`h-5 w-5 ${color}`} />

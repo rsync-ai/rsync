@@ -124,7 +124,7 @@ export function SchemaEvolutionPanel({ pipelineId }: SchemaEvolutionPanelProps) 
             Schema Evolution
           </span>
           {pending.length > 0 && (
-            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-amber-600 text-white">
+            <span className="text-[10px] font-bold px-1.5 py-0.5 rounded-full bg-amber-700 text-white">
               {pending.length} pending
             </span>
           )}
@@ -170,7 +170,7 @@ export function SchemaEvolutionPanel({ pipelineId }: SchemaEvolutionPanelProps) 
 
       {/* Recently resolved (collapsed summary) */}
       {resolved.length > 0 && (
-        <div className="text-[10px] text-zinc-500 pt-1 border-t border-amber-200 dark:border-amber-900/40">
+        <div className="text-[10px] text-zinc-500 dark:text-zinc-400 pt-1 border-t border-amber-200 dark:border-amber-900/40">
           {resolved.filter((c) => c.status === "applied").length} applied ·{" "}
           {resolved.filter((c) => c.status === "rejected").length} rejected ·{" "}
           {resolved.filter((c) => c.status === "failed").length} failed
@@ -210,13 +210,13 @@ function SchemaChangeCard({
             {change.table_name}
           </div>
           {change.user_message && (
-            <div className="text-[10px] text-zinc-500 truncate">{change.user_message}</div>
+            <div className="text-[10px] text-zinc-500 dark:text-zinc-400 truncate">{change.user_message}</div>
           )}
         </div>
         <button
           type="button"
           onClick={onToggleExpand}
-          className="shrink-0 p-0.5 text-zinc-400 hover:text-zinc-600"
+          className="shrink-0 p-0.5 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
         >
           {expanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
         </button>
@@ -269,7 +269,7 @@ function SchemaChangeCard({
           type="button"
           onClick={onApprove}
           disabled={actioning}
-          className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-50"
+          className="inline-flex items-center gap-1 text-[11px] font-medium px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-50"
         >
           <Check className="h-3 w-3" />
           Apply migration

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -739,11 +740,11 @@ func TestNormalizeTableForPath(t *testing.T) {
 }
 
 func TestCDCObjectKeyLayout(t *testing.T) {
-	// DMS-style: <prefix>/<db_or_schema>/<table>/<YYYY-MM-DD>/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<offset>.<ext>.
-	// No dataset segment; plain date folder; a non-zero Kafka partition folds into the leaf.
+	// DMS-style: <prefix>/<pipeline>/<db_or_schema>/<table>/<YYYY-MM-DD>/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<offset>.<ext>.
+	// Pipeline-id slug segment (#14); plain date folder; a non-zero Kafka partition folds into the leaf.
 	// fixedTS = 2026-01-25 14:30:00.000Z → timestamp stem 20260125-143000000.
-	key := cdcObjectKey("prefix", "public", "users", "2026-01-25", "", fixedTS, 3, 100, 110, "jsonl", "none")
-	want := "prefix/public/users/2026-01-25/20260125-143000000-p3-100.jsonl"
+	key := cdcObjectKey("prefix", "abc-123", "public", "users", "2026-01-25", "", fixedTS, 3, 100, 110, "jsonl", "none")
+	want := "prefix/abc-123/public/users/2026-01-25/20260125-143000000-p3-100.jsonl"
 	if key != want {
 		t.Errorf("expected %q, got %q", want, key)
 	}
@@ -751,14 +752,14 @@ func TestCDCObjectKeyLayout(t *testing.T) {
 	// Parquet keeps a bare ".parquet" even under gzip: the codec is stored per column
 	// chunk inside the file's own footer, so the writer emits an ordinary parquet file
 	// and a ".parquet.gz" name would advertise an external gzip stream that is not there.
-	key2 := cdcObjectKey("p/", "sch", "t", "2026-01-25", "", fixedTS, 0, 1, 1, "parquet", "gzip")
+	key2 := cdcObjectKey("p/", "", "sch", "t", "2026-01-25", "", fixedTS, 0, 1, 1, "parquet", "gzip")
 	want2 := "p/sch/t/2026-01-25/20260125-143000000-1.parquet"
 	if key2 != want2 {
 		t.Errorf("expected %q, got %q", want2, key2)
 	}
 	// Control: a format that really is wrapped externally still carries the suffix, so a
 	// regression that dropped the suffix for everything cannot pass this test.
-	key3 := cdcObjectKey("p/", "sch", "t", "2026-01-25", "", fixedTS, 0, 1, 1, "jsonl", "gzip")
+	key3 := cdcObjectKey("p/", "", "sch", "t", "2026-01-25", "", fixedTS, 0, 1, 1, "jsonl", "gzip")
 	want3 := "p/sch/t/2026-01-25/20260125-143000000-1.jsonl.gz"
 	if key3 != want3 {
 		t.Errorf("expected %q, got %q", want3, key3)
@@ -1269,18 +1270,15 @@ func TestParseCDCMessageDestinationNamespace(t *testing.T) {
 	}
 }
 
-// TestParseCDCMessageObjectStorageKeepsSourceSchema locks the other half of the
+// TestParseCDCMessageObjectStorageHonorsNamespace locks the object-storage half of the
 // DBOrSchema overload, which the test above only covers for relational destinations.
 //
-// For object storage, DBOrSchema is not a namespace at all: it is the <db_or_schema>
-// PATH SEGMENT of the bronze key, which the SinkMessage.DestNamespace and
-// destinationNamespaceForStats doc comments both define as the SOURCE schema.
-// Assigning the orchestrator-injected destination namespace there overwrote it with
-// whatever that namespace happened to be — for a MongoDB→GCS pipeline, the connector
-// type — so every collection landed under bronze/mongodb/ instead of bronze/shop/, and
-// two source databases sharing a collection name interleaved into one path with nothing
-// in the rows to tell them apart.
-func TestParseCDCMessageObjectStorageKeepsSourceSchema(t *testing.T) {
+// For object storage DBOrSchema is the <db_or_schema> PATH SEGMENT of the bronze key.
+// The batch writer fills it with the resolved destination namespace (HITL "Path prefix")
+// and falls back to the source database; CDC must do the same (#14: the user set "cdc",
+// the orchestrator logged resolved=cdc, and objects still landed under the source DB).
+// A placeholder namespace ("" / "default") must still fall back to the source schema.
+func TestParseCDCMessageObjectStorageHonorsNamespace(t *testing.T) {
 	mkPayload := func() map[string]interface{} {
 		return map[string]interface{}{
 			"op":    "c",
@@ -1293,30 +1291,49 @@ func TestParseCDCMessageObjectStorageKeepsSourceSchema(t *testing.T) {
 	}
 	msg := kafka.Message{Topic: "rsync.cdc-ec6d3a3b.shop.customers", Offset: 5010}
 
-	// The live MongoDB→GCS shape: the orchestrator injects the connector type as the
-	// destination namespace. Every object-storage destination must ignore it here.
+	// The live MongoDB→GCS shape from #14: HITL path prefix "cdc".
 	for _, dest := range []string{"gcs", "aws-s3", "s3", "minio", "azure-blob"} {
 		t.Run(dest, func(t *testing.T) {
 			cfg := &WorkerConfig{
-				PipelineID:           "p1",
+				PipelineID:           "2F1c-Pipe",
 				SinkMode:             "cdc",
 				DestinationConnector: dest,
-				DestinationNamespace: "mongodb",
+				DestinationNamespace: "cdc",
 			}
 			sm, err := parseCDCMessage(cfg, msg, mkPayload(), map[string]interface{}{})
 			if err != nil {
 				t.Fatalf("parseCDCMessage error: %v", err)
 			}
-			if sm.DBOrSchema != "" {
-				t.Fatalf("sm.DBOrSchema = %q, want empty so cdcObjectPath derives the source schema", sm.DBOrSchema)
+			if sm.DBOrSchema != "cdc" {
+				t.Fatalf("sm.DBOrSchema = %q, want the resolved namespace cdc", sm.DBOrSchema)
 			}
-			// End-to-end on the value that actually reaches the key: the bronze path
-			// segment must be the source database, not the connector type.
+			// End-to-end on the key that actually reaches the connector.
 			dbs, tbl := cdcObjectPath(sm)
-			if dbs != "shop" || tbl != "customers" {
-				t.Fatalf("cdcObjectPath = %q/%q, want shop/customers", dbs, tbl)
+			key := cdcObjectKey("demo", cdcPipelineSegment(cfg, sm), dbs, tbl, "dt=2026-09-16", "", fixedTS, 0, 9, 9, "parquet", "none")
+			if want := "demo/2f1c-pipe/cdc/customers/dt=2026-09-16/"; !strings.HasPrefix(key, want) {
+				t.Fatalf("cdc key = %q, want prefix %q", key, want)
 			}
 		})
+	}
+
+	// Placeholder namespaces fall back to the source schema (batch does the same).
+	for _, ns := range []string{"", "default", "  "} {
+		cfg := &WorkerConfig{PipelineID: "p1", SinkMode: "cdc", DestinationConnector: "gcs", DestinationNamespace: ns}
+		sm, err := parseCDCMessage(cfg, msg, mkPayload(), map[string]interface{}{})
+		if err != nil {
+			t.Fatalf("parseCDCMessage error: %v", err)
+		}
+		if dbs, tbl := cdcObjectPath(sm); dbs != "shop" || tbl != "customers" {
+			t.Fatalf("namespace %q: cdcObjectPath = %q/%q, want shop/customers", ns, dbs, tbl)
+		}
+	}
+
+	// Two pipelines on one connection capturing the same collection must not share a key.
+	smA := &SinkMessage{Table: "shop.customers"}
+	kA := cdcObjectKey("demo", cdcPipelineSegment(&WorkerConfig{PipelineID: "pipe-a"}, smA), "shop", "customers", "dt=2026-09-16", "", fixedTS, 0, 9, 9, "parquet", "none")
+	kB := cdcObjectKey("demo", cdcPipelineSegment(&WorkerConfig{PipelineID: "pipe-b"}, smA), "shop", "customers", "dt=2026-09-16", "", fixedTS, 0, 9, 9, "parquet", "none")
+	if kA == kB {
+		t.Fatalf("two pipelines produced the same CDC key %q", kA)
 	}
 
 	// Control: a relational destination still receives the namespace, so a fix that

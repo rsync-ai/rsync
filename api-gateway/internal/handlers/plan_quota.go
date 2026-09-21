@@ -248,13 +248,8 @@ func checkPipelineCreateOK(parent context.Context, database *sql.DB, workspaceID
 		return true, nil
 	}
 
-	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
-	defer cancel()
-
-	var count int
-	if err := database.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM pipelines WHERE workspace_id = $1`, workspaceID,
-	).Scan(&count); err != nil {
+	count, err := countWorkspacePipelines(parent, database, workspaceID)
+	if err != nil {
 		log.WithError(err).Warnf("plan_quota: count pipelines failed for workspace %s; allowing", workspaceID)
 		return true, nil
 	}
@@ -271,6 +266,57 @@ func checkPipelineCreateOK(parent context.Context, database *sql.DB, workspaceID
 		}
 	}
 	return true, nil
+}
+
+// countWorkspacePipelines is the ONE pipeline-count meter: the number the
+// create gate (checkPipelineCreateOK) compares against the plan limit. Every
+// "N/limit pipelines used" display must read it through here so the banner can
+// never disagree with enforcement (issues #7/#21).
+func countWorkspacePipelines(parent context.Context, database *sql.DB, workspaceID string) (int, error) {
+	if database == nil || workspaceID == "" {
+		return 0, fmt.Errorf("plan_quota: no database or workspace")
+	}
+	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+	defer cancel()
+	var count int
+	err := database.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM pipelines WHERE workspace_id = $1`, workspaceID,
+	).Scan(&count)
+	return count, err
+}
+
+// planSummary is the body of GET /api/v1/usage/plan: the ACTIVE workspace's
+// plan, pipeline meter and expiry, resolved exactly as the create gate resolves
+// them. Field names match /auth/me so the plan banner can switch sources without
+// a shape change.
+func planSummary(parent context.Context, database *sql.DB, workspaceID string) gin.H {
+	quota := resolvePlanQuota(parent, database, workspaceID)
+	used := 0
+	if n, err := countWorkspacePipelines(parent, database, workspaceID); err == nil {
+		used = n
+	}
+	resp := gin.H{
+		"workspace_id":    workspaceID,
+		"plan":            quota.plan,
+		"pipelines_used":  used,
+		"pipelines_limit": nil, // null ⇒ unlimited
+		"trial_ends_at":   nil,
+		"blocked":         quota.blocked,
+	}
+	if quota.effectiveLimit >= 0 {
+		resp["pipelines_limit"] = quota.effectiveLimit
+	}
+	if database != nil && workspaceID != "" {
+		ctx, cancel := context.WithTimeout(parent, 2*time.Second)
+		defer cancel()
+		var expiresAt sql.NullTime
+		if err := database.QueryRowContext(ctx,
+			`SELECT plan_expires_at FROM workspaces WHERE id = $1`, workspaceID,
+		).Scan(&expiresAt); err == nil && expiresAt.Valid {
+			resp["trial_ends_at"] = expiresAt.Time.UTC().Format(time.RFC3339)
+		}
+	}
+	return resp
 }
 
 // pipelineCreateBlockedMessage returns a non-empty, user-facing reason string

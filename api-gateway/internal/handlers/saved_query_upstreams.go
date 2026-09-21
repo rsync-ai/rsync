@@ -16,8 +16,8 @@ import (
 	"api-gateway/internal/validators"
 )
 
-// Answers "which pipeline produces the tables this model reads?" so the schedule
-// dialog can offer an upstream instead of asking the user to remember one.
+// Answers "which pipeline or model produces the tables this model reads?" so the
+// schedule dialog can offer an upstream instead of asking the user to remember one.
 //
 // The answer is a SUGGESTION and nothing here writes anything. That is the design, not
 // a limitation: an inferred edge that re-derives itself whenever someone edits the SQL
@@ -37,18 +37,29 @@ import (
 //      warehouse; a pipeline landing "analytics.orders" into a different destination
 //      produces a different table that merely shares a name.
 //
+// Models are producers on the same terms as the asset graph's: a model with
+// materialization='table' builds its target_table on its own connection, which is
+// already a destination-side name, so rule 1 holds for it by construction. A
+// 'statement' model writes the tables its own SQL names (modelProducedTables), which
+// are destination-side for the same reason. Neither is an OBSERVED fact — a model is
+// offered before it has ever run, because the schedule being set up may well be what
+// makes it run.
+//
 // destination_qualified_name is NULL for object-storage destinations and any sink older
 // than 089, so those pipelines cannot be suggested. That is a miss, and a miss is the
 // right way to be wrong here: the dialog falls back to the manual picker the user
 // already has, whereas a confident wrong answer gets a schedule hung off an unrelated
 // pipeline.
 
-// upstreamCandidate is one pipeline that has been observed writing a table this model
-// reads.
+// upstreamCandidate is one producer — a pipeline observed writing a table, or a model
+// declared to build one — of a table this model reads.
 type upstreamCandidate struct {
-	PipelineID   string `json:"pipeline_id"`
-	PipelineName string `json:"pipeline_name"`
-	// The destination table that matched, as the pipeline recorded it.
+	// Kind and ID are exactly what a schedule's upstream list takes, so the dialog can
+	// hand a candidate to the picker without translating it.
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// The table that matched, as its producer recorded it.
 	Table string `json:"table"`
 	// The reference in the model's SQL that matched it, as written.
 	MatchedReference string `json:"matched_reference"`
@@ -63,17 +74,27 @@ type upstreamSuggestionResponse struct {
 	References []string            `json:"references"`
 	Unresolved []string            `json:"unresolved"`
 	Candidates []upstreamCandidate `json:"candidates"`
-	// Ambiguous is true when some reference matched more than one pipeline. The UI must
-	// not pre-select anything in that case.
+	// Ambiguous is true when some reference could be more than one DIFFERENT table —
+	// `orders` matching both analytics.orders and staging.orders because the SQL named
+	// no schema. Two producers of the SAME table is fan-in, not ambiguity: both really
+	// do write it, a schedule can follow both, and flagging it would bury the real
+	// uncertainty under every table that happens to have two loaders. This is the
+	// asset graph's definition, and deliberately so.
 	Ambiguous bool `json:"ambiguous"`
 }
 
-// SuggestSavedQueryUpstreams lists the pipelines that produce this model's inputs.
+// SuggestSavedQueryUpstreams lists the pipelines and models that produce this model's
+// inputs.
 // GET /api/v1/explorer/saved/:id/upstreams
 //
 // Read-only, so it needs no more than the role that can read the query itself. It
 // reveals which pipelines write into the workspace's own warehouse, which a member can
-// already list directly.
+// already list directly, and which models build tables there — limited to the models
+// this user can see, so a private model is never named to anyone but its author.
+//
+// The query itself is loaded through loadSavedQuery, like every other read of the row.
+// Workspace membership alone is not enough: the answer lists every table the SQL reads,
+// so another member's private query must 404 here exactly as it does on GET.
 func SuggestSavedQueryUpstreams(c *gin.Context) {
 	database := db.GetDB()
 	if database == nil {
@@ -89,69 +110,68 @@ func SuggestSavedQueryUpstreams(c *gin.Context) {
 	if _, ok := requireResourceRole(c, "saved_queries", id, security.WSViewer); !ok {
 		return
 	}
-
-	var sqlText, connectionID, workspaceID string
-	err := database.QueryRowContext(c.Request.Context(),
-		`SELECT sql_text, connection_id::text, workspace_id::text
-		 FROM saved_queries WHERE id = $1`, id).Scan(&sqlText, &connectionID, &workspaceID)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "saved query not found"})
+	userID, ok := resolveUserID(c)
+	if !ok {
 		return
 	}
-	if err != nil {
-		log.WithError(err).Error("upstream suggestion: could not read the saved query")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load saved query"})
+	q, ok := loadSavedQuery(c, id, userID)
+	if !ok {
 		return
 	}
 
-	resp, err := resolveUpstreams(c.Request.Context(), database, sqlText, connectionID, workspaceID)
+	resp, err := resolveUpstreams(c.Request.Context(), database, upstreamLookup{
+		SavedQueryID: id,
+		SQLText:      q.SQLText,
+		ConnectionID: q.ConnectionID,
+		WorkspaceID:  q.WorkspaceID,
+		UserID:       userID,
+	})
 	if err != nil {
 		log.WithError(err).Error("upstream suggestion: could not resolve table references")
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up upstream pipelines"})
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to look up upstream producers"})
 		return
 	}
 	c.JSON(http.StatusOK, resp)
 }
 
-// resolveUpstreams is the whole of the inference, separated from the HTTP layer so it
-// can be tested against a database without a router.
+// upstreamLookup is the model whose inputs are being resolved, and who is asking.
+type upstreamLookup struct {
+	SavedQueryID string
+	SQLText      string
+	ConnectionID string
+	WorkspaceID  string
+	// UserID decides which private models are visible as producers.
+	UserID string
+}
+
+// resolveUpstreams loads the producers that could feed this model and hands them to
+// buildUpstreamSuggestion. It is separated from the HTTP layer so it can be tested
+// against a database without a router; the rule itself lives in the builder, which
+// needs no database at all.
 func resolveUpstreams(
 	ctx context.Context,
 	database *sql.DB,
-	sqlText, connectionID, workspaceID string,
+	in upstreamLookup,
 ) (upstreamSuggestionResponse, error) {
-	resp := upstreamSuggestionResponse{
-		References: []string{},
-		Unresolved: []string{},
-		Candidates: []upstreamCandidate{},
-	}
-
-	refs := validators.ExtractTableReferences(sqlText)
+	refs := validators.ExtractTableReferences(in.SQLText)
 	if len(refs) == 0 {
-		return resp, nil
-	}
-
-	for _, ref := range refs {
-		resp.References = append(resp.References, ref.Qualified())
+		return buildUpstreamSuggestion(nil, nil, in.SavedQueryID), nil
 	}
 
 	// One query for all references rather than one per reference: a model with a dozen
 	// inputs should not be a dozen round trips, and the match is a simple membership
 	// test on two candidate spellings per reference.
 	//
-	// Comparison is lower(); table names are matched case-insensitively even though a
-	// quoted identifier is case-sensitive to the engine. That direction is deliberate:
-	// it can over-match (offering a candidate a stricter comparison would have skipped)
-	// and a person confirms the choice, whereas exact matching would silently drop
-	// every reference whose case differs from how the sink recorded it.
+	// Comparison is lower() here because matchTableReference compares lower(); the two
+	// have to agree or this query fetches rows the matcher then refuses.
 	wanted := make([]string, 0, len(refs)*2)
 	for _, ref := range refs {
 		wanted = append(wanted, strings.ToLower(ref.SchemaQualified()))
 		// The bare name is fetched only for a reference that named no schema. This is a
-		// PREFILTER, not the rule: the pairing loop below decides what actually matches,
+		// PREFILTER, not the rule: matchTableReference decides what actually matches,
 		// and it enforces the same condition independently. Widening this line changes
 		// how many rows come back, never the answer — whereas dropping the guard in the
-		// pairing loop changes the answer. Do not read this as making that one redundant.
+		// matcher changes the answer. Do not read this as making that one redundant.
 		if len(ref.Parts) == 1 {
 			wanted = append(wanted, strings.ToLower(ref.Name()))
 		}
@@ -178,84 +198,145 @@ func resolveUpstreams(
 		        lower(s.destination_qualified_name) = ANY($3)
 		     OR lower(s.table_name) = ANY($3)
 		      )`,
-		workspaceID, connectionID, pgdriver.StringArray(wanted))
+		in.WorkspaceID, in.ConnectionID, pgdriver.StringArray(wanted))
 	if err != nil {
-		return resp, err
+		return upstreamSuggestionResponse{}, err
 	}
 	defer rows.Close()
 
-	type produced struct {
-		pipelineID, pipelineName, destQualified, tableName string
-	}
-	var rowsOut []produced
+	var producers []tableProducer
 	for rows.Next() {
-		var p produced
-		if err := rows.Scan(&p.pipelineID, &p.pipelineName, &p.destQualified, &p.tableName); err != nil {
-			return resp, err
+		p := tableProducer{ConnectionID: in.ConnectionID, Kind: assetKindPipeline}
+		if err := rows.Scan(&p.Table.ProducerID, &p.Table.ProducerName, &p.Table.DestQualified, &p.Table.TableName); err != nil {
+			return upstreamSuggestionResponse{}, err
 		}
-		rowsOut = append(rowsOut, p)
+		producers = append(producers, p)
 	}
 	if err := rows.Err(); err != nil {
-		return resp, err
+		return upstreamSuggestionResponse{}, err
 	}
 
-	// Pair each reference with the pipelines that match it.
+	// Models are not prefiltered by name the way pipelines are: target_table holds
+	// whatever the user typed, and the split that turns it into a schema and a table
+	// lives in Go (splitModelTarget). A SQL spelling of that split would be a second
+	// copy of it, free to drift from the one the asset graph uses. One connection's
+	// materialized models is a list people wrote by hand, so reading all of it is cheap.
 	//
-	// A bare table name is only ever matched for a reference that named NO schema —
-	// `FROM orders`, which leans on the connection's search_path and is how most ad-hoc
-	// SQL is written. When the SQL does name a schema, that schema is information, and
-	// falling back to the name alone throws it away: `shop.orders` failing to match
-	// `analytics.orders` means the model reads some other table, not that we should
-	// offer the pipeline that writes the one we found. Getting this backwards is not a
-	// near miss — for a CDC pipeline, `shop.orders` is the SOURCE name of the very table
-	// `analytics.orders` is the destination name of, so the resolver would confidently
-	// answer for a table the model never reads.
+	// The visibility predicate is the saved-query list's own: a private model is its
+	// author's, and naming it as a producer would disclose it to everyone else. It
+	// applies to both materializations alike — a statement model's SQL names its tables
+	// as plainly as a table model's target_table does.
+	//
+	// sql_text is read for statement models, which record no target. Filtering this to
+	// 'table' alone is how statement models went unoffered while modelProducedTables,
+	// and every unit test of it, already knew how to read them.
+	modelRows, err := database.QueryContext(ctx, `
+		SELECT sq.id::text,
+		       COALESCE(sq.name, ''),
+		       sq.materialization,
+		       COALESCE(sq.target_table, ''),
+		       COALESCE(sq.sql_text, '')
+		FROM saved_queries sq
+		WHERE sq.workspace_id = $1::uuid
+		  AND sq.connection_id = $2::uuid
+		  AND sq.materialization IN ('table', 'statement')
+		  AND (sq.visibility = 'workspace' OR sq.created_by = $3)`,
+		in.WorkspaceID, in.ConnectionID, in.UserID)
+	if err != nil {
+		return upstreamSuggestionResponse{}, err
+	}
+	defer modelRows.Close()
+
+	for modelRows.Next() {
+		var id, name, materialization, target, sqlText string
+		if err := modelRows.Scan(&id, &name, &materialization, &target, &sqlText); err != nil {
+			return upstreamSuggestionResponse{}, err
+		}
+		for _, table := range modelProducedTables(id, name, materialization, target, sqlText) {
+			producers = append(producers, tableProducer{
+				ConnectionID: in.ConnectionID, Kind: assetKindModel, Table: table,
+			})
+		}
+	}
+	if err := modelRows.Err(); err != nil {
+		return upstreamSuggestionResponse{}, err
+	}
+
+	return buildUpstreamSuggestion(refs, producers, in.SavedQueryID), nil
+}
+
+// buildUpstreamSuggestion pairs each table the model reads with the producers that
+// write it. Every producer passed in must be on the model's own connection — the
+// loader guarantees that, and it is why table identity below needs no connection.
+//
+// The rule itself lives in matchTableReference, shared with the workspace asset graph:
+// the graph is what this suggestion is drawn on, so the two cannot be allowed to
+// disagree about which producer feeds which table.
+func buildUpstreamSuggestion(
+	refs []validators.TableRef,
+	producers []tableProducer,
+	selfID string,
+) upstreamSuggestionResponse {
+	resp := upstreamSuggestionResponse{
+		References: []string{},
+		Unresolved: []string{},
+		Candidates: []upstreamCandidate{},
+	}
+
+	tables := make([]producedTable, 0, len(producers))
+	// A producer id is a uuid, unique across pipelines and models alike, so the id is
+	// enough to recover which kind a match came from.
+	kindOf := make(map[string]string, len(producers))
+	for _, p := range producers {
+		tables = append(tables, p.Table)
+		kindOf[p.Table.ProducerID] = p.Kind
+	}
+
 	seen := map[string]bool{}
 	for _, ref := range refs {
-		wantQualified := strings.ToLower(ref.SchemaQualified())
-		wantName := strings.ToLower(ref.Name())
-		unqualified := len(ref.Parts) == 1
+		resp.References = append(resp.References, ref.Qualified())
 
-		var strong, weak []produced
-		for _, p := range rowsOut {
-			switch {
-			case p.destQualified != "" && strings.ToLower(p.destQualified) == wantQualified:
-				strong = append(strong, p)
-			case unqualified && strings.ToLower(p.tableName) == wantName:
-				weak = append(weak, p)
+		matches, qualified := matchTableReference(ref, tables)
+		// A model that reads the table it builds is an incremental pattern, not its own
+		// upstream. Offering it would invite a schedule that waits on itself — which the
+		// cycle check refuses anyway, one click after the dialog suggested it.
+		kept := matches[:0:0]
+		for _, m := range matches {
+			if m.ProducerID != selfID {
+				kept = append(kept, m)
 			}
 		}
-		matches := strong
-		qualified := true
-		if len(matches) == 0 {
-			matches, qualified = weak, false
-		}
-		if len(matches) == 0 {
+		if len(kept) == 0 {
 			resp.Unresolved = append(resp.Unresolved, ref.Qualified())
 			continue
 		}
-		if len(matches) > 1 {
-			resp.Ambiguous = true
-		}
-		for _, m := range matches {
-			key := m.pipelineID + "\x00" + ref.Qualified()
+
+		hitTables := map[string]bool{}
+		for _, m := range kept {
+			hitTables[producedTableKey("", m)] = true
+
+			key := m.ProducerID + "\x00" + ref.Qualified()
 			if seen[key] {
 				continue
 			}
 			seen[key] = true
-			table := m.destQualified
+			table := m.DestQualified
 			if table == "" {
-				table = m.tableName
+				table = m.TableName
 			}
 			resp.Candidates = append(resp.Candidates, upstreamCandidate{
-				PipelineID:       m.pipelineID,
-				PipelineName:     m.pipelineName,
+				Kind:             kindOf[m.ProducerID],
+				ID:               m.ProducerID,
+				Name:             m.ProducerName,
 				Table:            table,
 				MatchedReference: ref.Qualified(),
 				Qualified:        qualified,
 			})
 		}
+		if len(hitTables) > 1 {
+			resp.Ambiguous = true
+		}
 	}
 
-	return resp, nil
+	return resp
 }

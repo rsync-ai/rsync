@@ -69,3 +69,21 @@ func TestComputeConsumerGroupLag_GuardsMissingAndRacyOffsets(t *testing.T) {
 		t.Errorf("racy/missing offsets should clamp to 0 lag, got %d", v)
 	}
 }
+
+// TestSumCommittedOffsets_SkipsNeverCommittedPartitions locks the scoping of the committed
+// position the sink-lag alarm compares between ticks. A never-committed partition (-1)
+// belongs to another pipeline's topic; counting it would subtract from the sum, and a
+// foreign topic appearing or disappearing from the fetch would read as this sink moving.
+func TestSumCommittedOffsets_SkipsNeverCommittedPartitions(t *testing.T) {
+	committed := map[string]map[int32]int64{
+		"dbz.public.orders":      {0: 100, 1: 40},
+		"dbz.public.customers":   {0: 0},
+		"foreign.other_pipeline": {0: -1, 1: -1},
+	}
+	if got := sumCommittedOffsets(committed); got != 140 {
+		t.Fatalf("sumCommittedOffsets = %d, want 140", got)
+	}
+	if got := sumCommittedOffsets(nil); got != 0 {
+		t.Fatalf("sumCommittedOffsets(nil) = %d, want 0", got)
+	}
+}

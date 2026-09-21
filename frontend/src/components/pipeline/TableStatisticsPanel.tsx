@@ -21,11 +21,14 @@ import {
   Search,
   Database,
   AlertTriangle,
+  Clock,
 } from "lucide-react"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { toast } from "sonner"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { classifyError } from "@/lib/utils/error-handling"
+import { formatAbsoluteTime } from "@/lib/utils"
+import { formatDurationBetween } from "@/lib/duration"
 
 type TableStat = {
   schema_name?: string
@@ -70,7 +73,9 @@ type TableStatsSummary = {
   tables_failed: number
   tables_running: number
   tables_degraded?: number
-  
+  // Selected CDC tables with nothing captured or applied yet (not in tables_running).
+  tables_waiting_for_data?: number
+
   // Batch aggregates
   total_read_rows?: number
   total_inserted_rows?: number
@@ -113,6 +118,23 @@ function formatNumber(num?: number | null): string {
 }
 
 /**
+ * Status of a selected CDC table the backend has no stats row for: nothing has
+ * been captured or applied. Its counters are absent, and it is not running.
+ */
+const TABLE_STATUS_WAITING_FOR_DATA = "waiting_for_data"
+const NO_DATA_YET = "No data yet"
+
+function isWaitingForData(table: Pick<TableStat, "status">): boolean {
+  return table.status === TABLE_STATUS_WAITING_FOR_DATA
+}
+
+/** A count cell: "No data yet" for a table that has reported nothing, else the number. */
+function formatCount(table: Pick<TableStat, "status">, num?: number | null): string {
+  if (isWaitingForData(table) && (num === undefined || num === null)) return NO_DATA_YET
+  return formatNumber(num)
+}
+
+/**
  * Placeholder cells for the columns belonging to the mode this row is NOT.
  *
  * In a mixed pipeline the header carries batch columns AND CDC columns
@@ -130,30 +152,22 @@ function notApplicableCells(count: number, keyPrefix: string) {
   ))
 }
 
+// In the viewer's zone, with the zone named. This used to print the UTC wall-clock
+// time ("10:00:00") with no zone, which a viewer outside UTC reads as their own.
 function formatTimestamp(ts?: string): string {
-  if (!ts) return ""
-  try {
-    return new Date(ts).toISOString().slice(11, 19)
-  } catch {
-    return ""
-  }
+  return ts ? formatAbsoluteTime(ts) : ""
 }
 
+/**
+ * Blank, not a dash, when a table has no start yet: this is a dense per-table grid
+ * where an empty cell is quieter than a row of dashes. The words are the shared
+ * ones — this panel used to render a stopwatch ("15:26") beside the Overview's
+ * "15m 26s" for the same table, which reads as two different measurements.
+ */
 function formatElapsed(start?: string, end?: string): string {
   if (!start) return ""
-  try {
-    const startMs = new Date(start).getTime()
-    const endMs = end ? new Date(end).getTime() : Date.now()
-    if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs) return ""
-    const totalSec = Math.floor((endMs - startMs) / 1000)
-    const h = Math.floor(totalSec / 3600)
-    const m = Math.floor((totalSec % 3600) / 60)
-    const s = totalSec % 60
-    if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`
-    return `${m}:${String(s).padStart(2, "0")}`
-  } catch {
-    return ""
-  }
+  const out = formatDurationBetween(start, end)
+  return out === "—" ? "" : out
 }
 
 function splitQualifiedName(q?: string): { schema?: string; name: string } {
@@ -196,6 +210,13 @@ function StatusBadge({ status }: { status: string }) {
         <Badge variant="outline" className="gap-1 border-amber-400 bg-amber-50 text-amber-700 dark:border-amber-600 dark:bg-amber-950/30 dark:text-amber-400">
           <AlertTriangle className="h-3 w-3" />
           Degraded
+        </Badge>
+      )
+    case TABLE_STATUS_WAITING_FOR_DATA:
+      return (
+        <Badge variant="outline" className="gap-1 text-muted-foreground">
+          <Clock className="h-3 w-3" />
+          {NO_DATA_YET}
         </Badge>
       )
     default:
@@ -292,6 +313,12 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
   const resolvedMode = summary?.mode || mode || "batch"
   const isBatch = resolvedMode === "batch" || resolvedMode === "mixed"
   const isCDC = resolvedMode === "cdc" || resolvedMode === "mixed"
+  // Every table is still waiting for its first event: the CDC totals are not a
+  // measured 0, so they say so.
+  const allTablesWaitingForData =
+    !!summary && summary.total_tables > 0 && (summary.tables_waiting_for_data ?? 0) === summary.total_tables
+  const formatSummaryTotal = (num?: number | null) =>
+    allTablesWaitingForData ? NO_DATA_YET : formatNumber(num)
 
   if (loading) {
     return (
@@ -428,6 +455,14 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
                 <div className="text-xs text-muted-foreground">Failed</div>
                 <div className="text-xl font-semibold text-red-600">{summary.tables_failed}</div>
               </div>
+              {(summary.tables_waiting_for_data ?? 0) > 0 && (
+                <div>
+                  <div className="text-xs text-muted-foreground">{NO_DATA_YET}</div>
+                  <div className="text-xl font-semibold text-muted-foreground">
+                    {summary.tables_waiting_for_data}
+                  </div>
+                </div>
+              )}
 
               {isBatch && (summary.total_read_rows !== undefined || summary.total_inserted_rows !== undefined) && (
                 <>
@@ -447,37 +482,37 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
                   {summary.total_inserts !== undefined && (
                     <div>
                       <div className="text-xs text-muted-foreground">Captured Inserts</div>
-                      <div className="text-xl font-semibold">{formatNumber(summary.total_inserts)}</div>
+                      <div className="text-xl font-semibold">{formatSummaryTotal(summary.total_inserts)}</div>
                     </div>
                   )}
                   {summary.total_updates !== undefined && (
                     <div>
                       <div className="text-xs text-muted-foreground">Captured Updates</div>
-                      <div className="text-xl font-semibold">{formatNumber(summary.total_updates)}</div>
+                      <div className="text-xl font-semibold">{formatSummaryTotal(summary.total_updates)}</div>
                     </div>
                   )}
                   {summary.total_deletes !== undefined && (
                     <div>
                       <div className="text-xs text-muted-foreground">Captured Deletes</div>
-                      <div className="text-xl font-semibold">{formatNumber(summary.total_deletes)}</div>
+                      <div className="text-xl font-semibold">{formatSummaryTotal(summary.total_deletes)}</div>
                     </div>
                   )}
                   {summary.total_applied_inserts !== undefined && (
                     <div>
                       <div className="text-xs text-muted-foreground">Applied Inserts</div>
-                      <div className="text-xl font-semibold">{formatNumber(summary.total_applied_inserts)}</div>
+                      <div className="text-xl font-semibold">{formatSummaryTotal(summary.total_applied_inserts)}</div>
                     </div>
                   )}
                   {summary.total_applied_updates !== undefined && (
                     <div>
                       <div className="text-xs text-muted-foreground">Applied Updates</div>
-                      <div className="text-xl font-semibold">{formatNumber(summary.total_applied_updates)}</div>
+                      <div className="text-xl font-semibold">{formatSummaryTotal(summary.total_applied_updates)}</div>
                     </div>
                   )}
                   {summary.total_applied_deletes !== undefined && (
                     <div>
                       <div className="text-xs text-muted-foreground">Applied Deletes</div>
-                      <div className="text-xl font-semibold">{formatNumber(summary.total_applied_deletes)}</div>
+                      <div className="text-xl font-semibold">{formatSummaryTotal(summary.total_applied_deletes)}</div>
                     </div>
                   )}
                 </>
@@ -624,31 +659,31 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
                       (table.mode === "cdc" ? (
                         <>
                           <TableCell className="text-right font-mono text-sm">
-                            {formatNumber(table.inserts)}
+                            {formatCount(table, table.inserts)}
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm">
-                            {formatNumber(table.updates)}
+                            {formatCount(table, table.updates)}
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm">
-                            {formatNumber(table.deletes)}
+                            {formatCount(table, table.deletes)}
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm">
-                            {formatNumber(table.total_events)}
+                            {formatCount(table, table.total_events)}
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">
                             {formatTimestamp(table.last_event_ts)}
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm">
-                            {formatNumber(table.applied_inserts)}
+                            {formatCount(table, table.applied_inserts)}
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm">
-                            {formatNumber(table.applied_updates)}
+                            {formatCount(table, table.applied_updates)}
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm">
-                            {formatNumber(table.applied_deletes)}
+                            {formatCount(table, table.applied_deletes)}
                           </TableCell>
                           <TableCell className="text-right font-mono text-sm">
-                            {formatNumber(table.applied_total_events)}
+                            {formatCount(table, table.applied_total_events)}
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">
                             {formatTimestamp(table.last_applied_ts)}
@@ -666,10 +701,14 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
                       title={
                         (table.dlq_rows ?? 0) > 0
                           ? "Rows the destination rejected after every retry. Parked in the dead-letter queue; they will not arrive on their own."
-                          : "No rows dropped"
+                          : isWaitingForData(table)
+                            ? "Nothing has been captured for this table yet"
+                            : "No rows dropped"
                       }
                     >
-                      {formatNumber(table.dlq_rows ?? 0)}
+                      {isWaitingForData(table) && !(table.dlq_rows ?? 0)
+                        ? NO_DATA_YET
+                        : formatNumber(table.dlq_rows ?? 0)}
                     </TableCell>
                     <TableCell className="text-xs text-muted-foreground">
                       {formatTimestamp(table.updated_at)}

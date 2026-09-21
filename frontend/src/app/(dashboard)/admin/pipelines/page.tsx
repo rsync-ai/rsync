@@ -95,7 +95,7 @@ export default function AdminPipelinesPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader heading="Admin: Pipelines" description="Pipelines across all users" />
+      <PageHeader heading="Admin" description="Pipelines across all users" />
       <AdminNav />
 
       <Card className="p-4">
@@ -108,7 +108,13 @@ export default function AdminPipelinesPage() {
               load()
             }}
           >
-            <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by name, pipeline id, or email…" />
+            <Input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search name, id or email…"
+              title="Search by name, pipeline id, or email"
+              aria-label="Search pipelines"
+            />
             <Button type="submit" variant="outline">
               Search
             </Button>
@@ -159,7 +165,7 @@ export default function AdminPipelinesPage() {
 
           <div className="mt-4 space-y-2">
             {data.data.length === 0 ? (
-              <div className="text-sm text-zinc-500">No pipelines found</div>
+              <div className="text-sm text-zinc-500 dark:text-zinc-400">No pipelines found</div>
             ) : (
               data.data.map((p) => (
                 <div
@@ -179,9 +185,9 @@ export default function AdminPipelinesPage() {
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="min-w-0">
                       <div className="font-medium text-zinc-900 dark:text-white truncate">{p.name || p.id}</div>
-                      <div className="mt-1 text-xs text-zinc-500 font-mono">{p.id}</div>
+                      <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 font-mono">{p.id}</div>
                       {p.created_by_email ? (
-                        <div className="mt-1 text-xs text-zinc-500">Owner: {p.created_by_email}</div>
+                        <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">Owner: {p.created_by_email}</div>
                       ) : null}
                     </div>
                     <div className="flex items-center gap-2">

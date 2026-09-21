@@ -63,7 +63,9 @@ export function PipelineInsightsBar({ pipelineName, stages }: PipelineInsightsBa
                 icon={<AlertTriangle className="h-3 w-3" />}
                 tone="amber"
               >
-                {anomalies.length > 0 ? `Why are ${anomalies.length} stage${anomalies.length > 1 ? "s" : ""} slow?` : "Investigate failures"}
+                {anomalies.length > 0
+                  ? `Why ${anomalies.length === 1 ? "is 1 stage" : `are ${anomalies.length} stages`} slow?`
+                  : "Investigate failures"}
               </Chip>
             )}
             {longestStage && anomalies.length === 0 && (

@@ -40,6 +40,12 @@ from src.utils.connector_paths import iter_connector_dirs, resolve_current_dir
 
 logger = logging.getLogger("cdc-config-generator")
 
+# Kept byte-identical to _DEFAULT_HEARTBEAT_INTERVAL_MS in the debezium MCP connector
+# (shared/mcp-connectors/internal/debezium/versions/v1.0.0/connector.py), which is the
+# live path. This module is advisory, so a divergence here is wrong advice rather than
+# an outage — but advice that contradicts the connector is still a bug.
+MONGO_HEARTBEAT_INTERVAL_MS = "300000"  # 5 minutes
+
 
 @dataclass
 class CDCConfigResult:
@@ -87,9 +93,11 @@ class CDCConfigGenerator:
     # name to a list, and the publication rule below must hold for it on day one.
     POSTGRES_CONNECTOR_CLASS = "io.debezium.connector.postgresql.PostgresConnector"
     
-    # Mirrors isPostgresFamily() in backend-orchestrator/internal/agents/executor/
-    # executor.go (names normalised to lower_snake there and here). Adding a new
-    # PostgreSQL derivative means adding it to BOTH.
+    # Mirrors postgresFamilyTypes in backend-orchestrator/internal/agents/executor/
+    # hybrid_cdc.go (names normalised to lower_snake there and here). Both are pinned
+    # to shared/postgres_family_golden.json (tests/test_postgres_family_golden.py and
+    # executor/postgres_family_golden_test.go): a new PostgreSQL derivative goes in
+    # the golden, then in BOTH lists.
     POSTGRES_FAMILY = {
         "postgresql",
         "postgres",
@@ -594,6 +602,27 @@ class CDCConfigGenerator:
         "verify-ca", "verify_ca", "verify-full", "verify-identity", "verify_identity",
     })
 
+    @staticmethod
+    def _mongo_capture_scope(collection_include_list: str) -> Dict[str, str]:
+        """capture.scope/target for a MongoDB config, mirroring the debezium MCP
+        connector's mongo_capture_databases: scope the change stream to the one
+        database every collection is in, so a user with read on only that database
+        is not refused a cluster-wide stream (#19). Several databases, or any
+        unqualified entry, keep Debezium's deployment default."""
+        forbidden = set('/\\. "$*<>:|?')
+        dbs: List[str] = []
+        for entry in (e.strip() for e in (collection_include_list or "").split(",")):
+            if not entry:
+                continue
+            db, sep, coll = entry.partition(".")
+            if not sep or not db or not coll or set(db) & forbidden:
+                return {}
+            if db not in dbs:
+                dbs.append(db)
+        if len(dbs) != 1:
+            return {}
+        return {"capture.scope": "database", "capture.target": dbs[0]}
+
     @classmethod
     def _mongo_connection_string(
         cls,
@@ -714,7 +743,7 @@ class CDCConfigGenerator:
                 # upsert stays correct.
                 #
                 # ADVISORY ONLY. The config that actually starts a connector is built
-                # by _build_connector_config in the debezium MCP connector
+                # by _build_config in the debezium MCP connector
                 # (shared/mcp-connectors/internal/debezium/versions/v1.0.0/connector.py).
                 # _mongo_connection_string below mirrors that function; this branch is
                 # never the live path, so a divergence here is wrong advice, not an
@@ -725,6 +754,15 @@ class CDCConfigGenerator:
                 "capture.mode": "change_streams_update_full",
                 "database.include.list": db_name,
                 "collection.include.list": table_list,
+                # Heartbeats keep the stored resume token younger than the oplog on an
+                # IDLE source, which is the failure the live path exists to prevent:
+                # Debezium only commits a fresh token when it emits an event, so a quiet
+                # source ages its token until MongoDB rejects it with
+                # ChangeStreamHistoryLost. Kept here only so this advice does not
+                # contradict the connector — the live values (and the product-namespaced
+                # topic prefix) are set in _build_config.
+                "heartbeat.interval.ms": MONGO_HEARTBEAT_INTERVAL_MS,
+                **self._mongo_capture_scope(table_list),
             },
             
             "sqlserver": {

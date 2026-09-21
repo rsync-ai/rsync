@@ -1,0 +1,56 @@
+{
+  "_comment": "The one delete_prefix contract every object-storage connector returns (gcs, aws-s3, azure-blob, and connector.py.j2 for generated cloud_storage connectors). Reload trusts this result to decide whether a table folder is empty, so it must fail closed. Pinned by shared/mcp-connectors/tests/test_delete_prefix_contract.py.",
+  "required_keys": ["success", "deleted", "failed", "complete"],
+  "invariant": "success == (complete and failed == 0)",
+  "max_keys_per_call": 1000,
+  "prefix_normalization": [
+    {"requested": "a/b", "listed": "a/b/"},
+    {"requested": "a/b/", "listed": "a/b/"},
+    {"requested": "  a/b  ", "listed": "a/b/"}
+  ],
+  "refused_prefixes": ["", "   ", "/", "//"],
+  "base_prefix_guard": [
+    {"base": "data", "requested": "data/orders", "allowed": true},
+    {"base": "/data/", "requested": "/data/orders/", "allowed": true},
+    {"base": "data", "requested": "data", "allowed": true},
+    {"base": "data", "requested": "database/orders", "allowed": false},
+    {"base": "data", "requested": "other/orders", "allowed": false}
+  ],
+  "scenarios": {
+    "many_pages_all_deleted": {
+      "objects_under_prefix": 5001,
+      "sibling_objects": ["a/bc/keep.parquet", "a/b", "a/b_old/keep.parquet"],
+      "requested_prefix": "a/b",
+      "expect": {"success": true, "complete": true, "deleted": 5001, "failed": 0, "siblings_intact": true}
+    },
+    "empty_folder": {
+      "objects_under_prefix": 0,
+      "requested_prefix": "a/b",
+      "expect": {"success": true, "complete": true, "deleted": 0, "failed": 0}
+    },
+    "per_key_failure": {
+      "objects_under_prefix": 2500,
+      "refused_keys": 1,
+      "requested_prefix": "a/b",
+      "expect": {"success": false, "complete": true, "deleted": 2499, "failed": 1}
+    },
+    "listing_error_mid_way": {
+      "objects_under_prefix": 3500,
+      "listing_fails_on_page": 2,
+      "requested_prefix": "a/b",
+      "expect": {"success": false, "complete": false, "deleted": 1000, "failed": 0}
+    },
+    "max_objects_bound_with_objects_left": {
+      "objects_under_prefix": 2500,
+      "max_objects": 1500,
+      "requested_prefix": "a/b",
+      "expect": {"success": false, "complete": false, "deleted": 1500, "failed": 0}
+    },
+    "max_pages_bound_with_objects_left": {
+      "objects_under_prefix": 2500,
+      "max_pages": 2,
+      "requested_prefix": "a/b",
+      "expect": {"success": false, "complete": false, "deleted": 2000, "failed": 0}
+    }
+  }
+}

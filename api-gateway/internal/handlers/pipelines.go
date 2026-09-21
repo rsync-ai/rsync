@@ -4,7 +4,9 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"regexp"
@@ -22,6 +24,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rsync-ai/backend-orchestrator/pkg/namespacemodel"
 	"go.temporal.io/sdk/client"
 )
 
@@ -149,30 +152,14 @@ var genericSourceDefaults = map[string]struct{}{
 	"main":    {}, // SQLite
 }
 
-// destDefaultSchemaName is the SINGLE EXTENSION POINT for new destination types.
-// It returns the name that the destination engine uses for its default
-// schema/database/dataset. Adding a new destination: add one case here.
-// Returns "" for destinations that have no universal default (e.g. BigQuery
-// datasets are user-defined) — callers should leave the field blank so the
-// user is prompted to supply a name.
+// destDefaultSchemaName returns the name the destination engine uses for its
+// default schema/database/dataset: the destination_default of the connector's
+// namespace_model block (pkg/namespacemodel). Returns "" for destinations that
+// have no universal default (e.g. BigQuery datasets are user-defined) and for
+// unknown types — callers should leave the field blank so the user is prompted
+// to supply a name.
 func destDefaultSchemaName(destConnType string) string {
-	switch strings.ToLower(strings.TrimSpace(destConnType)) {
-	case "postgresql", "postgres", "pg", "redshift", "aurora_postgresql", "aurora-postgresql":
-		return "public"
-	case "snowflake":
-		return "public" // Snowflake's built-in default schema is PUBLIC
-	case "mysql", "mariadb", "aurora_mysql", "aurora-mysql":
-		return "default"
-	case "clickhouse", "clickhouse-cloud":
-		return "default"
-	case "databricks", "delta", "delta-lake":
-		return "default"
-	case "bigquery":
-		return "" // no universal default dataset; force user to name it
-	case "s3", "aws-s3", "minio", "gcs", "azure-blob", "object-storage":
-		return "" // path-style destinations; no schema concept
-	}
-	return "" // unknown destination: do not translate
+	return namespacemodel.For(destConnType).DestinationDefault
 }
 
 // seedDestinationNamespace returns the recommended namespace label for a newly-
@@ -193,6 +180,15 @@ func destDefaultSchemaName(destConnType string) string {
 // directly. Adding a new destination type only requires one entry in
 // destDefaultSchemaName; nothing else changes.
 func seedDestinationNamespace(srcConnType, destConnType string) string {
+	// Object storage (#13): the namespace is the <db_or_schema> segment of the
+	// object key, and left empty the writers fill it from the SOURCE database or
+	// schema (the batch path from the source's database, the CDC sink from the
+	// event's db). Any seed replaces that with a fixed name — for a sqlserver or
+	// snowflake source the connector type below, so every database would share one
+	// "sqlserver/" folder. The user can still type a path prefix.
+	if namespaceKindForConnector(destConnType) == "path" {
+		return ""
+	}
 	candidate := sourceSchemaCanonicalName(srcConnType)
 	if _, isGeneric := genericSourceDefaults[strings.ToLower(candidate)]; isGeneric {
 		// Always use the destination's own default name (may be "" for BigQuery
@@ -247,23 +243,11 @@ func resolveDestinationNamespace(database *sql.DB, pipelineID, sourceConnectorTy
 
 // namespaceKindForConnector reports what a "namespace" means for a given
 // destination engine, so the destination-mapping HITL can label its field
-// correctly (PR-C). PG-family + warehouses isolate by SQL schema; MySQL-family +
-// ClickHouse by database; BigQuery by dataset; object stores by path/prefix.
-// Unknown types default to "schema" — the most common relational case.
+// correctly (PR-C): the destination_namespace of the connector's
+// namespace_model block — "schema", "database", "dataset", "prefix" or "path".
+// Unknown types default to "schema", the most common relational case.
 func namespaceKindForConnector(connectorType string) string {
-	switch strings.ToLower(strings.TrimSpace(connectorType)) {
-	case "postgresql", "postgres", "pg", "redshift", "snowflake":
-		return "schema"
-	case "mysql", "mariadb", "clickhouse":
-		return "database"
-	case "bigquery":
-		return "dataset"
-	case "sqlite":
-		return "prefix"
-	case "s3", "aws-s3", "minio", "gcs", "azure-blob", "object-storage":
-		return "path"
-	}
-	return "schema"
+	return namespacemodel.For(connectorType).DestinationNamespace
 }
 
 // DestinationConfig is the per-pipeline destination mapping persisted under
@@ -443,10 +427,15 @@ func computeDataLoadingStrategy(database *sql.DB, p *Pipeline) *DataLoadingStrat
 
 	effectiveSyncMode := resolveEffectiveSyncMode(database, p.ID, sourceConnID, p.SyncMode, p.CDCMode)
 	effectiveCDCMode := ""
-	if p.CDCMode != nil && strings.TrimSpace(*p.CDCMode) != "" {
-		effectiveCDCMode = strings.ToLower(strings.TrimSpace(*p.CDCMode))
-	} else if connCDCMode != "" {
-		effectiveCDCMode = connCDCMode
+	if effectiveSyncMode == "cdc" {
+		// A CDC mode is only meaningful for a CDC pipeline: batch pipelines (and
+		// batch source connections) carry the cdc_mode='initial' column default,
+		// which used to surface here as a CDC option on a batch pipeline.
+		if p.CDCMode != nil && strings.TrimSpace(*p.CDCMode) != "" {
+			effectiveCDCMode = strings.ToLower(strings.TrimSpace(*p.CDCMode))
+		} else if connCDCMode != "" {
+			effectiveCDCMode = connCDCMode
+		}
 	}
 
 	// Schedule presence (for batch pipelines)
@@ -482,45 +471,64 @@ func computeDataLoadingStrategy(database *sql.DB, p *Pipeline) *DataLoadingStrat
 		strategy.EffectiveSyncMode = "batch"
 	}
 
-	steps := make([]string, 0, 5)
-
 	if effectiveSyncMode == "cdc" {
 		strategy.OngoingSync = "cdc_stream"
 		if strings.EqualFold(strings.TrimSpace(effectiveCDCMode), "streaming_only") {
 			strategy.InitialLoad = "none"
-			steps = append(steps, "Backfill: Skip historical backfill (start streaming new changes only)")
 		} else {
 			strategy.InitialLoad = "full_snapshot"
-			steps = append(steps, "Backfill: Take an initial snapshot of selected tables")
-		}
-		steps = append(steps, "Keep in sync: Stream INSERT/UPDATE/DELETE continuously (CDC)")
-		steps = append(steps, "Reruns: CDC is continuous; use Restart CDC to recover if needed")
-		if dataset != "" {
-			steps = append(steps, fmt.Sprintf("Destination layout: Write under dataset %q", dataset))
 		}
 	} else {
 		strategy.InitialLoad = "full_snapshot"
 		if hasSchedule && strings.EqualFold(strings.TrimSpace(scheduleStatus), "active") {
 			strategy.OngoingSync = "scheduled_batch"
-			steps = append(steps, "Backfill: Copy selected tables in batch runs (historical snapshot)")
-			steps = append(steps, "Keep in sync: Runs automatically on schedule")
 		} else {
 			strategy.OngoingSync = "manual_batch"
-			steps = append(steps, "Backfill: Copy selected tables in batch runs (historical snapshot)")
+		}
+	}
+
+	strategy.ExplanationSteps = dataLoadingStrategySteps(effectiveSyncMode, effectiveCDCMode, scheduleStatus, rerunDefault, dataset)
+	return strategy
+}
+
+// dataLoadingStrategySteps builds the strategy card's explanation lines. The
+// frontend builds the same lines itself when a strategy arrives without them
+// (computeStrategySteps in frontend/src/lib/pipeline/dataLoadingStrategy.ts), so
+// both are pinned to shared/data_loading_strategy_golden.json
+// (data_loading_strategy_golden_test.go and dataLoadingStrategyGolden.test.ts).
+// Inputs are normalised here the way the frontend normalises them.
+func dataLoadingStrategySteps(syncMode, cdcMode, scheduleStatus, rerunDefault, dataset string) []string {
+	norm := func(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
+	dataset = strings.TrimSpace(dataset)
+
+	steps := make([]string, 0, 4)
+	if norm(syncMode) == "cdc" {
+		if norm(cdcMode) == "streaming_only" {
+			steps = append(steps, "Backfill: Skip historical backfill (start streaming new changes only)")
+		} else {
+			steps = append(steps, "Backfill: Take an initial snapshot of selected tables")
+		}
+		steps = append(steps, "Keep in sync: Stream INSERT/UPDATE/DELETE continuously (CDC)")
+		steps = append(steps, "Reruns: CDC is continuous; use Restart CDC to recover if needed")
+	} else {
+		steps = append(steps, "Backfill: Copy selected tables in batch runs (historical snapshot)")
+		if norm(scheduleStatus) == "active" {
+			steps = append(steps, "Keep in sync: Runs automatically on schedule")
+		} else {
 			steps = append(steps, "Keep in sync: Runs when you click Run")
 		}
-		if rerunDefault == "reload" {
+		if norm(rerunDefault) == "reload" {
 			steps = append(steps, "Reruns: Default is Reload (rebuild from scratch)")
 		} else {
 			steps = append(steps, "Reruns: Default is Resume (continue from last checkpoint)")
 		}
-		if dataset != "" {
-			steps = append(steps, fmt.Sprintf("Destination layout: Write under dataset %q", dataset))
-		}
 	}
-
-	strategy.ExplanationSteps = steps
-	return strategy
+	if dataset != "" {
+		// Plain quotes, not %q: this is display text, and %q's Go escaping showed a
+		// dataset with a quote or backslash differently from the frontend's copy.
+		steps = append(steps, `Destination layout: Write under dataset "`+dataset+`"`)
+	}
+	return steps
 }
 
 func safeDeref(p *string) string {
@@ -857,6 +865,227 @@ func scheduleStatusHint(scheduleJSON, derivedStatus string) string {
 	return hint
 }
 
+// pipelineDerivedStatusCaseSQL is the ONE definition of a pipeline's list badge
+// (derived_status). It is spliced into three queries that used to carry their own
+// hand-copied CASE and had drifted apart: the list page query, the list COUNT
+// query (so a ?status= filter's total matches the rows it pages over) and the
+// "Running" stat card in GetPipelineStats. The COUNT copy had lost the first
+// branch entirely, so a status filter could count a pipeline the page badged
+// differently.
+//
+// Every query splicing it must expose the same aliases:
+//
+//	p  = pipelines
+//	pp = pipeline_progress        (LEFT JOIN, one row per pipeline)
+//	le = latest executions row    (LEFT JOIN; execution_id, execution_status,
+//	                               started_at, completed_at)
+//	so = latest live schedule     (LEFT JOIN; schedule_id, schedule_status)
+//
+// CDC vs the finished snapshot run (issue #6: list "Completed", detail
+// "Running"). The temporal-adapter CLOSES a CDC pipeline's executions row as
+// 'completed' at the backfill→streaming handoff and rewrites pipeline_progress to
+// status='running' / 'Streaming pipeline active' for that same execution
+// (pipeline_status_activity.go "streaming_active"), while the stream keeps
+// running. Two branches used to turn that closed snapshot row into 'passed':
+//
+//  1. the stale-heartbeat branch below, whenever a later progress event left
+//     pp.status at 'processing' on the closed execution — now skipped for CDC
+//     when the closed row is a success (a failed/cancelled close still wins);
+//  2. the 24h success fallback, for a streaming pipeline whose sync_mode/cdc_mode
+//     was never persisted — now pre-empted by `pp.status = 'running'`, a status
+//     only the streaming path writes (nl_pipeline_v2_workflow.go executor stage
+//     and the streaming_active reconcile). The detail page's /state reads that
+//     same pp.status, so the two surfaces now give the same answer.
+//
+// `pp.status = 'running'` sits AFTER the explicit pipelines.status branches and
+// the CDC dead-dependency downgrade on purpose: pausing/stopping writes only
+// pipelines.status (pipeline_progress still says 'running'), and /state lets
+// pipelines.status win the same way, so a paused stream must stay 'paused' and a
+// dead one 'failed'. The CDC predicates use the NULL-safe
+// `IS DISTINCT FROM` / `IS NULL` negation — a plain NOT(p.sync_mode = 'cdc' OR
+// …) is NULL for a batch row with a NULL sync_mode and would silently drop it.
+// Never reference p.mode here: pipelines has no such column and PostgreSQL
+// resolves it to the mode() ordered-set aggregate instead of failing.
+// pipelineRowIsCDCSQL: is pipeline row p CDC? An explicit sync_mode wins; a
+// cdc_mode only counts when sync_mode is unset (legacy rows). A batch pipeline
+// created from chat used to persist the source connection's cdc_mode column
+// default ('initial'), and `p.cdc_mode IS NOT NULL` then made that batch
+// pipeline "CDC": its list badge stayed 'running' forever after it completed
+// and GetPipeline skipped its status reconciliation. Never NULL (every operand
+// is COALESCEd or IS [NOT] NULL), so NOT (...) is NULL-safe for batch rows.
+const pipelineRowIsCDCSQL = `(LOWER(COALESCE(TRIM(p.sync_mode), '')) = 'cdc' OR (COALESCE(TRIM(p.sync_mode), '') = '' AND p.cdc_mode IS NOT NULL))`
+
+// pipelineListIsCDCSQL is the list's ?type= predicate: the pipeline row first,
+// then the source connection's sync_mode only when the pipeline has no mode of
+// its own. connections.cdc_mode is not a signal: it defaults to 'initial' on
+// every connection, so `sc.cdc_mode IS NOT NULL` filed every pipeline as CDC.
+const pipelineListIsCDCSQL = `(` + pipelineRowIsCDCSQL + ` OR (COALESCE(TRIM(p.sync_mode), '') = '' AND p.cdc_mode IS NULL AND LOWER(COALESCE(TRIM(sc.sync_mode), '')) = 'cdc'))`
+
+const pipelineDerivedStatusCaseSQL = `CASE
+      -- If the latest execution is terminal but pipeline_progress is still "processing" for the same execution,
+      -- prefer the executions row. This prevents the list UI getting stuck on "Running" due to late heartbeats
+      -- or missed terminal events in the progress projector. NOT for a CDC pipeline whose execution closed
+      -- successfully: that close is the backfill→streaming handoff, not the end of the pipeline.
+      WHEN le.execution_id IS NOT NULL
+        AND le.completed_at IS NOT NULL
+        AND pp.execution_id = le.execution_id
+        AND pp.status IN ('processing', 'waiting_for_user')
+        AND (
+          NOT ` + pipelineRowIsCDCSQL + `
+          OR COALESCE(le.execution_status, '') NOT IN ('success', 'completed')
+        )
+      THEN CASE
+        WHEN le.execution_status IN ('success', 'completed') THEN 'passed'
+        WHEN le.execution_status = 'failed' THEN 'failed'
+        WHEN le.execution_status IN ('cancelled', 'stopped') THEN 'stopped'
+        ELSE 'idle'
+      END
+      -- Prefer pipeline_progress (what the detail page uses) for active in-flight runs.
+      WHEN pp.status = 'processing' THEN 'running'
+      -- Surface HITL pauses distinctly so a run parked on user input doesn't
+      -- masquerade as 'running' in the list (the detail page already shows
+      -- "Needs input"). The frontend badge delegates unknown list tokens to the
+      -- shared execution-status helper, which renders waiting_for_user as amber.
+      WHEN pp.status = 'waiting_for_user' THEN 'waiting_for_user'
+      WHEN pp.status = 'completed' THEN 'passed'
+      WHEN pp.status = 'failed' THEN 'failed'
+      WHEN pp.status = 'cancelled' THEN 'stopped'
+      -- Prefer pipeline-level terminal status (authoritative) over a potentially stale executions row.
+      WHEN LOWER(p.status) = 'stopped' THEN 'stopped'
+      WHEN LOWER(p.status) = 'paused' THEN 'paused'
+      WHEN LOWER(p.status) = 'failed' THEN 'failed'
+      WHEN LOWER(p.status) = 'completed' THEN 'passed'
+      -- A CDC/streaming pipeline whose required dependency (Debezium/MCP/sink) is
+      -- currently unhealthy is a dead stream, not a live one. Mirror /runtime's
+      -- dependency-aware verdict (phase='failed' when any dependency is unhealthy)
+      -- so the list card doesn't optimistically show 'running'/'passed' for a feed
+      -- that has silently died. Explicit terminal/paused states above still win.
+      WHEN ` + pipelineRowIsCDCSQL + `
+           AND EXISTS (
+             SELECT 1 FROM pipeline_dependencies d
+             JOIN pipeline_dependency_health h ON h.dependency_id = d.id
+             WHERE d.pipeline_id = p.id AND h.status = 'unhealthy'
+           )
+      THEN 'failed'
+      -- The streaming handoff writes pipeline_progress.status = 'running' (and only
+      -- the streaming path does). It must win over the closed snapshot execution row
+      -- below, which would otherwise read as a finished run.
+      WHEN pp.status = 'running' THEN 'running'
+      -- Fallback to execution status for non-terminal pipelines.
+      WHEN le.execution_status = 'running' THEN 'running'
+      WHEN le.execution_status = 'failed' AND le.started_at >= NOW() - INTERVAL '24 hours' THEN 'failed'
+      -- A "completed"/"success" execution row means a finished run only for BATCH
+      -- pipelines. For CDC/streaming, the temporal-adapter deliberately CLOSES the
+      -- executions row at the backfill→streaming handoff (pipeline_status_activity.go)
+      -- while the feed keeps running under CDC sentinel supervision. Exclude CDC here
+      -- and fall through to the CDC-continuous 'running' branch below; the
+      -- dependency-aware check above already downgrades a genuinely dead stream to
+      -- 'failed'. NULL-safe so a batch pipeline with a NULL sync_mode is kept.
+      WHEN (le.execution_status = 'success' OR le.execution_status = 'completed')
+           AND le.started_at >= NOW() - INTERVAL '24 hours'
+           AND NOT ` + pipelineRowIsCDCSQL + ` THEN 'passed'
+      -- CDC pipelines are continuous; treat as running by default (unless explicitly paused/stopped/failed above).
+      WHEN ` + pipelineRowIsCDCSQL + ` THEN 'running'
+      WHEN so.schedule_id IS NOT NULL AND so.schedule_status = 'active' THEN 'scheduled'
+      ELSE 'idle'
+    END`
+
+// executionLiveCDCStreamSQL (aliases e, p, pp) is true for the run a live CDC
+// stream belongs to. At the backfill→streaming handoff the temporal-adapter closes
+// that run's executions row as 'completed' (pipeline_status_activity.go) and writes
+// pipeline_progress.status='running' for the same execution id; the feed keeps
+// running. Read raw, the row said "Success" with an end time and Re-run buttons while
+// the pipeline page said LIVE (UI #35). The conditions that end the stream are the
+// ones pipelineDerivedStatusCaseSQL uses to stop calling a CDC pipeline 'running':
+// an explicit stopped/paused/failed/completed pipeline, or an unhealthy dependency.
+// pp.status='running' is written only by the streaming handoff, so it counts even
+// for a pipeline whose sync_mode was never persisted (the list reads it the same
+// way); 'processing' is also a batch heartbeat, so it counts only for a CDC row.
+// Never NULL, so it is safe to scan and to negate.
+const executionLiveCDCStreamSQL = `COALESCE((
+      e.status IN ('completed', 'success')
+      AND pp.execution_id = e.id
+      AND (pp.status = 'running' OR (pp.status = 'processing' AND ` + pipelineRowIsCDCSQL + `))
+      AND LOWER(COALESCE(p.status, '')) NOT IN ('stopped', 'paused', 'failed', 'completed')
+      AND NOT EXISTS (
+        SELECT 1 FROM pipeline_dependencies d
+        JOIN pipeline_dependency_health h ON h.dependency_id = d.id
+        WHERE d.pipeline_id = p.id AND h.status = 'unhealthy'
+      )
+    ), false)`
+
+// executionFromSQL is the FROM clause every executions read shares, so a list, its
+// COUNT, and the single-run read agree on status. ls.live_stream is computed once
+// per row and read by executionStatusSQL / executionEndTimeSQL /
+// executionRecordsProcessedSQL.
+const executionFromSQL = `
+		FROM executions e
+		LEFT JOIN pipelines p ON e.pipeline_id = p.id
+		LEFT JOIN pipeline_progress pp ON pp.pipeline_id = e.pipeline_id
+		CROSS JOIN LATERAL (SELECT ` + executionLiveCDCStreamSQL + ` AS live_stream) ls`
+
+// executionStatusSQL is the status the executions endpoints report.
+const executionStatusSQL = `CASE
+         WHEN ls.live_stream THEN 'running'
+         -- An execution's own TERMINAL status wins over pipeline_progress,
+         -- for SUCCESS as well as failure. pipeline_progress is a real-time
+         -- UI projection that can lag/disagree in BOTH directions:
+         --   (a) Phase 1's postflight silent-drop guard flips
+         --       executions.status='failed' AFTER the projector wrote
+         --       pp.status='completed' (was masking real failures as
+         --       "Success"); and
+         --   (b) a genuinely completed execution whose pp row is still
+         --       'processing' was painted "Running" with a live Cancel
+         --       button (R3). Terminal exec status wins either way.
+         WHEN e.status IN ('completed', 'success', 'cancelled', 'failed', 'error',
+                           'silent_drop_detected',
+                           'silent_partial_drop_detected',
+                           'credential_check_failed') THEN e.status
+         WHEN pp.execution_id = e.id THEN
+           CASE pp.status
+             WHEN 'processing' THEN 'running'
+             WHEN 'waiting_for_user' THEN 'waiting_for_user'
+             ELSE pp.status
+           END
+         ELSE e.status
+       END`
+
+// executionEndTimeSQL: a live stream has not ended, whatever end_time the handoff
+// stamped on its row.
+const executionEndTimeSQL = `CASE
+         WHEN ls.live_stream THEN NULL
+         ELSE COALESCE(
+           e.end_time,
+           CASE
+             WHEN pp.execution_id = e.id AND pp.status IN ('completed','failed','cancelled') THEN pp.updated_at
+             ELSE NULL
+           END
+         )
+       END`
+
+// executionRecordsProcessedSQL: rows written for this run, summed from
+// destination-truth table stats. GREATEST() picks the batch (inserted_rows) or CDC
+// (applied_*) family per table; SUM is NOT gated on table status, so partial /
+// degraded runs still report a count (BUG-8). CDC stats are keyed by
+// execution_id = pipeline_id (migration 090), so a CDC run's rows are found through
+// orchestration_execution_id, or — for the live stream on a sink too old to send
+// that id — through the pipeline key itself. Matching only execution_id = e.id
+// showed "—" Records for a streaming run (UI #43).
+const executionRecordsProcessedSQL = `COALESCE((
+         SELECT SUM(
+           GREATEST(
+             COALESCE(s.inserted_rows, 0),
+             COALESCE(s.applied_inserts, 0) + COALESCE(s.applied_updates, 0) + COALESCE(s.applied_deletes, 0)
+           )
+         )
+         FROM pipeline_run_table_stats s
+         WHERE s.pipeline_id = e.pipeline_id
+           AND (
+             s.execution_id = e.id
+             OR (s.execution_id = e.pipeline_id AND (s.orchestration_execution_id = e.id OR ls.live_stream))
+           )
+       ), 0)`
+
 // ListPipelines returns all pipelines with enriched data (no N+1)
 // GET /api/v1/pipelines?page=1&per_page=25&q=&created_from=&created_to=&status=
 func ListPipelines(c *gin.Context) {
@@ -1015,69 +1244,7 @@ base AS (
         )
       ELSE NULL
     END AS last_execution,
-    CASE
-      -- If the latest execution is terminal but pipeline_progress is still "processing" for the same execution,
-      -- prefer the executions row. This prevents the list UI getting stuck on "Running" due to late heartbeats
-      -- or missed terminal events in the progress projector.
-      WHEN le.execution_id IS NOT NULL
-        AND le.completed_at IS NOT NULL
-        AND pp.execution_id = le.execution_id
-        AND pp.status IN ('processing', 'waiting_for_user')
-      THEN CASE
-        WHEN le.execution_status IN ('success', 'completed') THEN 'passed'
-        WHEN le.execution_status = 'failed' THEN 'failed'
-        WHEN le.execution_status IN ('cancelled', 'stopped') THEN 'stopped'
-        ELSE 'idle'
-      END
-      -- Prefer pipeline_progress (what the detail page uses) for active in-flight runs.
-      WHEN pp.status = 'processing' THEN 'running'
-      -- Surface HITL pauses distinctly so a run parked on user input doesn't
-      -- masquerade as 'running' in the list (the detail page already shows
-      -- "Needs input"). The frontend badge delegates unknown list tokens to the
-      -- shared execution-status helper, which renders waiting_for_user as amber.
-      WHEN pp.status = 'waiting_for_user' THEN 'waiting_for_user'
-      WHEN pp.status = 'completed' THEN 'passed'
-      WHEN pp.status = 'failed' THEN 'failed'
-      WHEN pp.status = 'cancelled' THEN 'stopped'
-      -- Prefer pipeline-level terminal status (authoritative) over a potentially stale executions row.
-      WHEN LOWER(p.status) = 'stopped' THEN 'stopped'
-      WHEN LOWER(p.status) = 'paused' THEN 'paused'
-      WHEN LOWER(p.status) = 'failed' THEN 'failed'
-      WHEN LOWER(p.status) = 'completed' THEN 'passed'
-      -- A CDC/streaming pipeline whose required dependency (Debezium/MCP/sink) is
-      -- currently unhealthy is a dead stream, not a live one. Mirror /runtime's
-      -- dependency-aware verdict (phase='failed' when any dependency is unhealthy)
-      -- so the list card doesn't optimistically show 'running'/'passed' for a feed
-      -- that has silently died. Explicit terminal/paused states above still win.
-      WHEN (p.sync_mode = 'cdc' OR p.cdc_mode IS NOT NULL)
-           AND EXISTS (
-             SELECT 1 FROM pipeline_dependencies d
-             JOIN pipeline_dependency_health h ON h.dependency_id = d.id
-             WHERE d.pipeline_id = p.id AND h.status = 'unhealthy'
-           )
-      THEN 'failed'
-      -- Fallback to execution status for non-terminal pipelines.
-      WHEN le.execution_status = 'running' THEN 'running'
-      WHEN le.execution_status = 'failed' AND le.started_at >= NOW() - INTERVAL '24 hours' THEN 'failed'
-      -- A "completed"/"success" execution row means a finished run only for BATCH
-      -- pipelines. For CDC/streaming, the temporal-adapter deliberately CLOSES the
-      -- executions row at the backfill→streaming handoff (pipeline_status_activity.go)
-      -- while the feed keeps running under CDC sentinel supervision. Without this CDC
-      -- exclusion the closed backfill row masks a live stream as "Completed" on the
-      -- list card (the detail page is unaffected — GET /pipelines/:id skips CDC
-      -- reconciliation, and the frontend overlays /runtime). Exclude CDC here and fall
-      -- through to the CDC-continuous 'running' branch below; the dependency-aware
-      -- check above already downgrades a genuinely dead stream to 'failed'. The
-      -- IS DISTINCT FROM / IS NULL form is NULL-safe so a batch pipeline with a NULL
-      -- sync_mode is not accidentally excluded (a plain NOT(...) would yield NULL).
-      WHEN (le.execution_status = 'success' OR le.execution_status = 'completed')
-           AND le.started_at >= NOW() - INTERVAL '24 hours'
-           AND p.sync_mode IS DISTINCT FROM 'cdc' AND p.cdc_mode IS NULL THEN 'passed'
-      -- CDC pipelines are continuous; treat as running by default (unless explicitly paused/stopped/failed above).
-      WHEN (p.sync_mode = 'cdc' OR p.cdc_mode IS NOT NULL) THEN 'running'
-      WHEN so.schedule_id IS NOT NULL AND so.schedule_status = 'active' THEN 'scheduled'
-      ELSE 'idle'
-    END AS derived_status
+    ` + pipelineDerivedStatusCaseSQL + ` AS derived_status
   FROM pipelines p
   LEFT JOIN pipeline_progress pp ON pp.pipeline_id = p.id
   LEFT JOIN connections sc ON p.source_connection_id = sc.id
@@ -1098,19 +1265,13 @@ base AS (
       OR (
         $6 = 'cdc'
         AND (
-          LOWER(COALESCE(p.sync_mode, '')) = 'cdc'
-          OR p.cdc_mode IS NOT NULL
-          OR LOWER(COALESCE(sc.sync_mode, '')) = 'cdc'
-          OR sc.cdc_mode IS NOT NULL
+          ` + pipelineListIsCDCSQL + `
         )
       )
       OR (
         $6 = 'etl'
         AND NOT (
-          LOWER(COALESCE(p.sync_mode, '')) = 'cdc'
-          OR p.cdc_mode IS NOT NULL
-          OR LOWER(COALESCE(sc.sync_mode, '')) = 'cdc'
-          OR sc.cdc_mode IS NOT NULL
+          ` + pipelineListIsCDCSQL + `
         )
       )
     )
@@ -1181,41 +1342,13 @@ LIMIT $7 OFFSET $8
 WITH base AS (
   SELECT
     p.id,
-    CASE
-      WHEN pp.status = 'processing' THEN 'running'
-      WHEN pp.status = 'waiting_for_user' THEN 'waiting_for_user'
-      WHEN pp.status = 'completed' THEN 'passed'
-      WHEN pp.status = 'failed' THEN 'failed'
-      WHEN pp.status = 'cancelled' THEN 'stopped'
-      WHEN LOWER(p.status) = 'stopped' THEN 'stopped'
-      WHEN LOWER(p.status) = 'paused' THEN 'paused'
-      WHEN LOWER(p.status) = 'failed' THEN 'failed'
-      WHEN LOWER(p.status) = 'completed' THEN 'passed'
-      -- Dependency-aware CDC failure (mirrors /runtime; see main query for rationale).
-      WHEN (p.sync_mode = 'cdc' OR p.cdc_mode IS NOT NULL)
-           AND EXISTS (
-             SELECT 1 FROM pipeline_dependencies d
-             JOIN pipeline_dependency_health h ON h.dependency_id = d.id
-             WHERE d.pipeline_id = p.id AND h.status = 'unhealthy'
-           )
-      THEN 'failed'
-      WHEN le.execution_status = 'running' THEN 'running'
-      WHEN le.execution_status = 'failed' AND le.started_at >= NOW() - INTERVAL '24 hours' THEN 'failed'
-      -- Exclude CDC from the terminal-completed branch: a closed backfill execution
-      -- row must not mask a live stream as "Completed" (mirrors the main query; see
-      -- the full rationale there). NULL-safe negation keeps NULL-sync_mode batch rows.
-      WHEN (le.execution_status = 'success' OR le.execution_status = 'completed')
-           AND le.started_at >= NOW() - INTERVAL '24 hours'
-           AND p.sync_mode IS DISTINCT FROM 'cdc' AND p.cdc_mode IS NULL THEN 'passed'
-      WHEN (p.sync_mode = 'cdc' OR p.cdc_mode IS NOT NULL) THEN 'running'
-      WHEN so.schedule_id IS NOT NULL AND so.schedule_status = 'active' THEN 'scheduled'
-      ELSE 'idle'
-    END AS derived_status
+    ` + pipelineDerivedStatusCaseSQL + ` AS derived_status
   FROM pipelines p
   LEFT JOIN pipeline_progress pp ON pp.pipeline_id = p.id
   LEFT JOIN connections sc ON p.source_connection_id = sc.id
   LEFT JOIN (
-    SELECT DISTINCT ON (e.pipeline_id) e.pipeline_id, e.status AS execution_status, e.start_time AS started_at
+    SELECT DISTINCT ON (e.pipeline_id) e.pipeline_id, e.id AS execution_id, e.status AS execution_status,
+           e.start_time AS started_at, e.end_time AS completed_at
     FROM executions e ORDER BY e.pipeline_id, e.start_time DESC
   ) le ON le.pipeline_id = p.id
   LEFT JOIN (
@@ -1232,19 +1365,13 @@ WITH base AS (
       OR (
         $6 = 'cdc'
         AND (
-          LOWER(COALESCE(p.sync_mode, '')) = 'cdc'
-          OR p.cdc_mode IS NOT NULL
-          OR LOWER(COALESCE(sc.sync_mode, '')) = 'cdc'
-          OR sc.cdc_mode IS NOT NULL
+          ` + pipelineListIsCDCSQL + `
         )
       )
       OR (
         $6 = 'etl'
         AND NOT (
-          LOWER(COALESCE(p.sync_mode, '')) = 'cdc'
-          OR p.cdc_mode IS NOT NULL
-          OR LOWER(COALESCE(sc.sync_mode, '')) = 'cdc'
-          OR sc.cdc_mode IS NOT NULL
+          ` + pipelineListIsCDCSQL + `
         )
       )
     )
@@ -1475,9 +1602,19 @@ func GetPipeline(c *gin.Context) {
 
 	if err != nil {
 		log.Printf("[GetPipeline] Query error: %v", err)
-		c.JSON(http.StatusNotFound, gin.H{
-			"error":   "pipeline_not_found",
-			"message": "Pipeline not found",
+		// Only a missing row is "not found": the gate saw the pipeline, so this is
+		// a delete that landed in between. Any other error (connection, timeout,
+		// scan) is a failed read — a 404 there tells the UI a live pipeline is gone.
+		if errors.Is(err, sql.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{
+				"error":   "pipeline_not_found",
+				"message": "Pipeline not found",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error":   "pipeline_fetch_failed",
+			"message": "Failed to load pipeline",
 		})
 		return
 	}
@@ -1656,13 +1793,10 @@ func GetPipeline(c *gin.Context) {
 	}
 
 	// Skip reconciliation for CDC pipelines (continuous) unless explicitly paused/stopped/failed.
-	isCDC := false
-	if p.SyncMode != nil && strings.EqualFold(strings.TrimSpace(*p.SyncMode), "cdc") {
-		isCDC = true
-	}
-	if p.CDCMode != nil && strings.TrimSpace(*p.CDCMode) != "" {
-		isCDC = true
-	}
+	// Same rule as pipelineRowIsCDCSQL: an explicit sync_mode wins over a stray
+	// cdc_mode, or a completed batch pipeline carrying cdc_mode='initial' skipped
+	// this reconciliation and kept reading "running" on its detail page.
+	isCDC := pipelineModeIsCDC(p.SyncMode, p.CDCMode)
 
 	if !isCDC {
 		// Best-effort lookup of pipeline_progress status (used for active runs).
@@ -1873,6 +2007,10 @@ func CreatePipeline(c *gin.Context) {
 	var configJSON []byte
 	if len(req.SelectedTables) > 0 {
 		createTables := normalizeSelectedTables(req.SelectedTables)
+		// The rule the user expressed, captured before expansion: a pipeline
+		// created as "this whole database" must keep matching tables created
+		// later, which is what the CDC auto-pickup watcher re-applies.
+		createRule := selectionRuleTokens(createTables)
 		// Expand a "*" / "<ns>.*" sentinel supplied at create time into an
 		// explicit list so config.selected_tables never persists a raw sentinel.
 		if resolved, _, rerr := resolveSelectionForPipeline(c, sourceConnectionID, createTables); rerr != nil {
@@ -1882,7 +2020,8 @@ func CreatePipeline(c *gin.Context) {
 			createTables = resolved
 		}
 		if b, mErr := json.Marshal(map[string]interface{}{
-			"selected_tables": createTables,
+			"selected_tables":     createTables,
+			tableSelectionRuleKey: createRule,
 		}); mErr == nil {
 			configJSON = b
 		}
@@ -2017,6 +2156,14 @@ func CreatePipeline(c *gin.Context) {
 
 // resolveEffectiveSyncMode resolves whether a pipeline should be treated as batch or cdc.
 // Priority: pipeline sync_mode override, pipeline cdc_mode presence, source connection sync_mode, default batch.
+// pipelineModeIsCDC mirrors pipelineRowIsCDCSQL for a loaded pipeline row.
+func pipelineModeIsCDC(syncMode, cdcMode *string) bool {
+	if syncMode != nil && strings.TrimSpace(*syncMode) != "" {
+		return strings.EqualFold(strings.TrimSpace(*syncMode), "cdc")
+	}
+	return cdcMode != nil && strings.TrimSpace(*cdcMode) != ""
+}
+
 func resolveEffectiveSyncMode(database *sql.DB, pipelineID string, sourceConnectionID string, syncMode *string, cdcMode *string) string {
 	if syncMode != nil && strings.TrimSpace(*syncMode) != "" {
 		return strings.ToLower(strings.TrimSpace(*syncMode))
@@ -2208,6 +2355,36 @@ func UpdatePipeline(c *gin.Context) {
 
 	updates := map[string]interface{}{}
 
+	// Status follows what the pipeline is doing, so it is not settable here. Writing
+	// "archived" left CDC running with its replication slot, and archived pipelines do
+	// not block a connection delete, whose cascade then erased the slot's record. A
+	// client echoing the current status back is accepted as a no-op. Checked before
+	// any write so a rejected request changes nothing.
+	if req.Status != nil {
+		status := strings.TrimSpace(*req.Status)
+		if status == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+			return
+		}
+		var current string
+		err := database.QueryRow("SELECT status FROM pipelines WHERE id = $1 AND workspace_id = $2", id, wsID).Scan(&current)
+		if err == sql.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "Pipeline not found"})
+			return
+		}
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update pipeline"})
+			return
+		}
+		if !strings.EqualFold(status, strings.TrimSpace(current)) {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error":   "status_not_settable",
+				"message": "A pipeline's status follows what it is doing and cannot be set directly. Use POST /pipelines/:id/stop, /pause or /resume, or DELETE /pipelines/:id.",
+			})
+			return
+		}
+	}
+
 	// Defense-in-depth: every UPDATE re-filters on workspace_id so a race
 	// between the membership gate and the write cannot cross workspaces. A
 	// pipeline is workspace-owned, so any member may edit a teammate's pipeline.
@@ -2232,19 +2409,6 @@ func UpdatePipeline(c *gin.Context) {
 		desc := *req.Description
 		updates["description"] = desc
 		if _, err := database.Exec("UPDATE pipelines SET description=$1, updated_at=NOW() WHERE id=$2 AND workspace_id=$3", desc, id, wsID); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update pipeline"})
-			return
-		}
-	}
-
-	if req.Status != nil {
-		status := strings.TrimSpace(*req.Status)
-		if status == "" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
-			return
-		}
-		updates["status"] = status
-		if _, err := database.Exec("UPDATE pipelines SET status=$1, updated_at=NOW() WHERE id=$2 AND workspace_id=$3", status, id, wsID); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update pipeline"})
 			return
 		}
@@ -2292,7 +2456,10 @@ func DeletePipeline(c *gin.Context) {
 	// orchestrator drop the real slot. Bounded + synchronous; failures don't
 	// block the delete because the CDC reconciler reaps any orphaned slot as a
 	// safety net (065/reconciler sweep).
-	runCDCCleanupSync(c.Request.Context(), id)
+	var teardownWarnings []string
+	if w := runCDCCleanupSync(c.Request.Context(), id); w != "" {
+		teardownWarnings = append(teardownWarnings, w)
+	}
 
 	// Collect any Temporal schedule IDs attached to this pipeline BEFORE deleting
 	// the row. pipeline_schedules has an ON DELETE CASCADE FK to pipelines
@@ -2342,6 +2509,25 @@ func DeletePipeline(c *gin.Context) {
 
 	// Pipeline delete is also workspace-scoped — a row in another workspace will
 	// not match and we'll 404 below.
+	// Models that rebuilt only after this pipeline would otherwise stay active with no
+	// upstream at all. In this transaction so a delete that rolls back pauses nothing.
+	if _, err := pauseTriggersOrphanedBy(c.Request.Context(), tx, upstreamKindPipeline, id); err != nil {
+		log.Printf("Failed to pause model schedules orphaned by pipeline delete: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete pipeline"})
+		return
+	}
+
+	// Record who owned this pipeline's destination namespace BEFORE the row that
+	// answers that question disappears. Nothing on the destination is dropped —
+	// the data stays exactly where it is — but ownership of it is answered from
+	// `pipelines` (destination_mapping.go namespaceTableOwner), so deleting the
+	// row would silently hand the namespace to the next pipeline pointed at the
+	// same connection, which adopts the tables and can then reload-drop them.
+	// Same transaction as the delete, so the pipeline and its tombstone can never
+	// disagree. Best-effort: a gateway running ahead of migration 110 has no such
+	// table, and failing the delete over it would be worse than the leak.
+	writeDestinationNamespaceTombstone(c.Request.Context(), tx, id, wsID)
+
 	result, err := tx.Exec("DELETE FROM pipelines WHERE id=$1 AND workspace_id=$2", id, wsID)
 	if err != nil {
 		log.Printf("Failed to delete pipeline: %v", err)
@@ -2364,9 +2550,11 @@ func DeletePipeline(c *gin.Context) {
 		if verr := database.QueryRow(`SELECT COUNT(*) FROM pipelines WHERE id = $1`, id).Scan(&remaining); verr == nil && remaining == 0 {
 			committed = true
 			deleteTemporalSchedulesBestEffort(c.Request.Context(), temporalScheduleIDs)
-			runKafkaTeardownSync(c.Request.Context(), id)
+			if w := runKafkaTeardownSync(c.Request.Context(), id); w != "" {
+				teardownWarnings = append(teardownWarnings, w)
+			}
 			logAudit(c, "delete_pipeline", "pipeline", id, map[string]interface{}{"commit_error": err.Error()})
-			c.JSON(http.StatusOK, gin.H{"message": "Pipeline deleted successfully"})
+			c.JSON(http.StatusOK, deletePipelineResponse(teardownWarnings))
 			return
 		}
 
@@ -2381,11 +2569,24 @@ func DeletePipeline(c *gin.Context) {
 	// …and its Kafka topics and consumer groups. This one runs AFTER the delete
 	// on purpose: while the pipelines row exists, the CDC table-stats agent and
 	// the sink workers recreate any consumer group we remove.
-	runKafkaTeardownSync(c.Request.Context(), id)
+	if w := runKafkaTeardownSync(c.Request.Context(), id); w != "" {
+		teardownWarnings = append(teardownWarnings, w)
+	}
 
 	logAudit(c, "delete_pipeline", "pipeline", id, nil)
 
-	c.JSON(http.StatusOK, gin.H{"message": "Pipeline deleted successfully"})
+	c.JSON(http.StatusOK, deletePipelineResponse(teardownWarnings))
+}
+
+// deletePipelineResponse is the delete's success body. The row is gone either way;
+// warnings name any source-side or Kafka cleanup that did not finish, so a leaked
+// replication slot or sink worker is visible to the caller instead of only in logs.
+func deletePipelineResponse(warnings []string) gin.H {
+	body := gin.H{"message": "Pipeline deleted successfully"}
+	if len(warnings) > 0 {
+		body["warnings"] = warnings
+	}
+	return body
 }
 
 // listTemporalScheduleIDs returns the Temporal schedule IDs currently attached to
@@ -2439,8 +2640,8 @@ func deleteTemporalSchedulesBestEffort(ctx context.Context, temporalScheduleIDs 
 // Errors are logged, not fatal: the CDC reconciler reaps any slot left behind,
 // so a transient orchestrator outage cannot block a user's delete. Bounded so a
 // slow/unreachable orchestrator never hangs the request indefinitely.
-func runCDCCleanupSync(parent context.Context, pipelineID string) {
-	postOrchestratorTeardown(parent, "/api/v1/cdc/cleanup", pipelineID, 30*time.Second,
+func runCDCCleanupSync(parent context.Context, pipelineID string) string {
+	return postOrchestratorTeardown(parent, "/api/v1/cdc/cleanup", pipelineID, 30*time.Second,
 		"CDC cleanup", "reconciler will reap any orphaned slot")
 }
 
@@ -2455,36 +2656,70 @@ func runCDCCleanupSync(parent context.Context, pipelineID string) {
 //
 // Best-effort: nothing here can fail the delete. A leaked topic costs disk and
 // shows up in the broker listing; it never breaks a pipeline.
-func runKafkaTeardownSync(parent context.Context, pipelineID string) {
-	postOrchestratorTeardown(parent, "/api/v1/cdc/kafka-teardown", pipelineID, 45*time.Second,
+func runKafkaTeardownSync(parent context.Context, pipelineID string) string {
+	return postOrchestratorTeardown(parent, "/api/v1/cdc/kafka-teardown", pipelineID, 45*time.Second,
 		"Kafka teardown", "topics and consumer groups will be left behind")
 }
 
 // postOrchestratorTeardown is the shared bounded, best-effort POST behind the two
 // teardown calls above: {"pipeline_id": …} to an internal orchestrator endpoint,
-// authenticated with the internal service secret, every failure logged rather
-// than surfaced. `label` names the step in logs and `fallback` describes what
-// happens if it doesn't run, so an operator reading the log knows the blast
-// radius without opening the code.
-func postOrchestratorTeardown(parent context.Context, path, pipelineID string, timeout time.Duration, label, fallback string) {
+// authenticated with the internal service secret. Nothing here fails the delete.
+// `label` names the step and `fallback` describes what happens if it doesn't run,
+// so an operator reading the log knows the blast radius without opening the code.
+//
+// It returns "" when the orchestrator reports success, otherwise a short warning
+// for the delete response. Full detail goes to the log only: the orchestrator's
+// error strings come from source-database drivers and are not for the API body.
+func postOrchestratorTeardown(parent context.Context, path, pipelineID string, timeout time.Duration, label, fallback string) string {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	body, _ := json.Marshal(map[string]string{"pipeline_id": pipelineID})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		orchestratorBaseURL()+path, strings.NewReader(string(body)))
 	if err != nil {
-		log.Printf("%s: failed to build request for pipeline %s: %v", label, pipelineID, err)
-		return
+		log.Warnf("%s: failed to build request for pipeline %s: %v", label, pipelineID, err)
+		return fmt.Sprintf("%s did not run: %s", label, fallback)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	setInternalServiceSecret(req)
 	resp, err := (&http.Client{Timeout: timeout}).Do(req)
 	if err != nil {
-		log.Printf("%s: request failed for pipeline %s: %v (%s)", label, pipelineID, err, fallback)
-		return
+		log.Warnf("%s: request failed for pipeline %s: %v (%s)", label, pipelineID, err, fallback)
+		return fmt.Sprintf("%s did not run (orchestrator unreachable): %s", label, fallback)
 	}
+	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	resp.Body.Close()
+	summary, detail := teardownOutcome(resp.StatusCode, respBody)
+	if summary != "" {
+		log.Warnf("%s: FAILED for pipeline %s: %s (%s)", label, pipelineID, detail, fallback)
+		return fmt.Sprintf("%s did not finish (%s): %s", label, summary, fallback)
+	}
 	log.Printf("%s: completed for pipeline %s (HTTP %d)", label, pipelineID, resp.StatusCode)
+	return ""
+}
+
+// teardownOutcome reads an orchestrator teardown response. Both endpoints answer
+// 200 with {"success": false, "errors": [...]} when a step fails, so the status
+// code alone reports a leaked slot or sink worker as "completed". It returns a
+// short summary ("" on success) and the detail for the log.
+func teardownOutcome(status int, body []byte) (summary, detail string) {
+	var parsed struct {
+		Success *bool    `json:"success"`
+		Errors  []string `json:"errors"`
+		Error   string   `json:"error"`
+	}
+	_ = json.Unmarshal(body, &parsed)
+	if status < 200 || status >= 300 {
+		detail = strings.TrimSpace(parsed.Error)
+		if detail == "" {
+			detail = strings.Join(parsed.Errors, "; ")
+		}
+		return fmt.Sprintf("HTTP %d", status), fmt.Sprintf("HTTP %d: %s", status, detail)
+	}
+	if parsed.Success != nil && !*parsed.Success {
+		return fmt.Sprintf("%d error(s)", len(parsed.Errors)), strings.Join(parsed.Errors, "; ")
+	}
+	return "", ""
 }
 
 // cancelRunningWorkflowsBestEffort cancels the Temporal workflow of every
@@ -2583,14 +2818,17 @@ func GetPipelineStats(c *gin.Context) {
 	// forever, and would otherwise inflate "Total runs", the Running card, and
 	// the run-history list. Real executions get a fresh uuid.New(), so
 	// `id = pipeline_id` cannot collide with one.
+	//
+	// Completed/failed read the same derived status as the executions list, so a
+	// CDC run that is still streaming (its row closed 'completed' at the
+	// backfill→streaming handoff) is not counted as completed here while the list
+	// and the pipeline page call it running.
 	var completed, failed, totalExecs int
 	if err := database.QueryRow(`
 		SELECT
-			COUNT(*) FILTER (WHERE e.status = 'completed'),
-			COUNT(*) FILTER (WHERE e.status = 'failed'),
-			COUNT(*)
-		FROM executions e
-		JOIN pipelines p ON p.id = e.pipeline_id
+			COUNT(*) FILTER (WHERE (`+executionStatusSQL+`) IN ('completed', 'success')),
+			COUNT(*) FILTER (WHERE (`+executionStatusSQL+`) = 'failed'),
+			COUNT(*)`+executionFromSQL+`
 		WHERE p.workspace_id = $1
 		  AND e.id <> e.pipeline_id
 	`, wsID).Scan(&completed, &failed, &totalExecs); err != nil {
@@ -2600,45 +2838,37 @@ func GetPipelineStats(c *gin.Context) {
 	// The "Running" card must count PIPELINES the list would badge 'running', not
 	// open executions rows. A streaming CDC pipeline has NO executions row in
 	// status 'running' (the temporal-adapter closes it at the backfill→streaming
-	// handoff — the same reason derived_status excludes CDC from its 'passed'
-	// branch), so the old COUNT(*) FILTER (WHERE e.status = 'running') read 0 on
-	// the very page whose row badge said "Running". The predicates below mirror
-	// the list's derived_status precedence (the CASE above: pp.status branches,
-	// the terminal p.status suppressors, the CDC dependency-health downgrade, the
-	// open-execution branch, and the CDC-continuous default): progress
-	// 'processing' wins, a terminal progress/pipeline status suppresses, then
-	// either an open execution (batch) or a CDC pipeline with no unhealthy
-	// dependency (streaming). Exactly one row per pipeline — pipeline_progress's
-	// PK is pipeline_id and both probes are EXISTS — so a pipeline that has BOTH
-	// a running execution and a live stream is counted once.
+	// handoff), so the old COUNT(*) FILTER (WHERE e.status = 'running') read 0 on
+	// the very page whose row badge said "Running".
+	//
+	// It evaluates the list's own derived_status CASE (pipelineDerivedStatusCaseSQL)
+	// over the same joins, instead of a hand-mirrored copy of its predicates: that
+	// copy had already drifted from the list (it ignored the stale-heartbeat branch
+	// and could not follow the pp.status='running' streaming branch), which is how
+	// the card and the row badges disagreed. `le` is the latest executions row
+	// exactly as the list reads it — including a synthetic `id = pipeline_id` CDC
+	// audit row when that is the newest, because the list does not exclude it
+	// either and the card's contract is "what the list badges". pipeline_progress's
+	// PK is pipeline_id and both subqueries are DISTINCT ON pipeline_id, so each
+	// pipeline is counted at most once.
 	var running int
 	if err := database.QueryRow(`
 		SELECT COUNT(*)
 		FROM pipelines p
 		LEFT JOIN pipeline_progress pp ON pp.pipeline_id = p.id
+		LEFT JOIN (
+		  SELECT DISTINCT ON (e.pipeline_id) e.pipeline_id, e.id AS execution_id, e.status AS execution_status,
+		         e.start_time AS started_at, e.end_time AS completed_at
+		  FROM executions e
+		  JOIN pipelines ep ON ep.id = e.pipeline_id AND ep.workspace_id = $1
+		  ORDER BY e.pipeline_id, e.start_time DESC
+		) le ON le.pipeline_id = p.id
+		LEFT JOIN (
+		  SELECT DISTINCT ON (ps.pipeline_id) ps.pipeline_id, ps.schedule_id, ps.status AS schedule_status
+		  FROM pipeline_schedules ps WHERE ps.status != 'deleted' ORDER BY ps.pipeline_id, ps.created_at DESC
+		) so ON so.pipeline_id = p.id
 		WHERE p.workspace_id = $1
-		  AND (
-		    pp.status = 'processing'
-		    OR (
-		      COALESCE(pp.status, '') NOT IN ('completed', 'failed', 'cancelled', 'waiting_for_user')
-		      AND LOWER(COALESCE(p.status, '')) NOT IN ('stopped', 'paused', 'failed', 'completed')
-		      AND (
-		        EXISTS (
-		          SELECT 1 FROM executions e
-		          WHERE e.pipeline_id = p.id AND e.status = 'running'
-		            AND e.id <> e.pipeline_id
-		        )
-		        OR (
-		          (p.sync_mode = 'cdc' OR p.cdc_mode IS NOT NULL)
-		          AND NOT EXISTS (
-		            SELECT 1 FROM pipeline_dependencies d
-		            JOIN pipeline_dependency_health h ON h.dependency_id = d.id
-		            WHERE d.pipeline_id = p.id AND h.status = 'unhealthy'
-		          )
-		        )
-		      )
-		    )
-		  )
+		  AND (`+pipelineDerivedStatusCaseSQL+`) = 'running'
 	`, wsID).Scan(&running); err != nil {
 		running = 0
 	}
@@ -2851,6 +3081,15 @@ func RunPipeline(c *gin.Context) {
 		report, status, errResp, err := buildPipelineAssessment(assessCtx, database, c.GetString("workspace_id"), id, userID)
 		cancel()
 		if err == nil && report != nil && errResp == nil {
+			// Keep this run in the Assessment tab's history. Best-effort:
+			// a failed write never changes what the gate decides.
+			recCtx, recCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+			if runID, rerr := recordAssessmentRun(recCtx, database, id, AssessmentTriggerRunGate, userID, report); rerr != nil {
+				log.Printf("[RunPipeline] record assessment run pipeline=%s: %v", id, rerr)
+			} else {
+				report.RunID = runID
+			}
+			recCancel()
 			switch evaluateAssessmentGate(report, ackWarnings) {
 			case assessmentGateBlocked:
 				c.JSON(http.StatusUnprocessableEntity, gin.H{
@@ -3632,6 +3871,10 @@ type Execution struct {
 	// status, so partial-sync / degraded runs that wrote some rows still
 	// report a count instead of "—".
 	Metrics *ExecutionMetrics `json:"metrics,omitempty"`
+	// LiveStream marks the run a live CDC stream belongs to (executionLiveCDCStreamSQL).
+	// Its row reports 'running', but it is not a cancellable run: CancelExecution
+	// refuses it (the row is closed) and the stream is stopped from the pipeline.
+	LiveStream bool `json:"live_stream,omitempty"`
 	// Scheduling metadata (optional)
 	TriggerSource string     `json:"trigger_source,omitempty"` // manual, scheduled
 	ScheduleID    *string    `json:"schedule_id,omitempty"`
@@ -3698,70 +3941,30 @@ func ListExecutions(c *gin.Context) {
 	}
 
 	query := `
-		SELECT 
+		SELECT
 		       e.id,
 		       e.pipeline_id,
-		       CASE
-		         -- An execution's own TERMINAL status wins over pipeline_progress,
-		         -- for SUCCESS as well as failure. pipeline_progress is a real-time
-		         -- UI projection that can lag/disagree in BOTH directions:
-		         --   (a) Phase 1's postflight silent-drop guard flips
-		         --       executions.status='failed' AFTER the projector wrote
-		         --       pp.status='completed' (was masking real failures as
-		         --       "Success"); and
-		         --   (b) a genuinely completed execution whose pp row is still
-		         --       'processing' was painted "Running" with a live Cancel
-		         --       button (R3). Terminal exec status wins either way.
-		         WHEN e.status IN ('completed', 'success', 'cancelled', 'failed', 'error',
-		                           'silent_drop_detected',
-		                           'silent_partial_drop_detected',
-		                           'credential_check_failed') THEN e.status
-		         WHEN pp.execution_id = e.id THEN
-		           CASE pp.status
-		             WHEN 'processing' THEN 'running'
-		             WHEN 'waiting_for_user' THEN 'waiting_for_user'
-		             ELSE pp.status
-		           END
-		         ELSE e.status
-		       END as status,
+		       ` + executionStatusSQL + ` AS status,
+		       ls.live_stream,
 		       COALESCE(e.trigger_source, 'manual') as trigger_source,
 		       e.schedule_id,
 		       e.scheduled_time,
 		       e.start_time,
-		       COALESCE(
-		         e.end_time,
-		         CASE 
-		           WHEN pp.execution_id = e.id AND pp.status IN ('completed','failed','cancelled') THEN pp.updated_at
-		           ELSE NULL
-		         END
-		       ) as end_time,
+		       ` + executionEndTimeSQL + ` AS end_time,
 		       e.error_message,
 		       COALESCE(p.name, 'Unknown Pipeline') as pipeline_name,
-		       -- BUG-8: rows written for this run, summed from destination-truth
-		       -- table stats. GREATEST() picks the batch (inserted_rows) or CDC
-		       -- (applied_*) family per table; SUM is NOT gated on table status,
-		       -- so partial / degraded runs still report a count.
-		       COALESCE((
-		         SELECT SUM(
-		           GREATEST(
-		             COALESCE(s.inserted_rows, 0),
-		             COALESCE(s.applied_inserts, 0) + COALESCE(s.applied_updates, 0) + COALESCE(s.applied_deletes, 0)
-		           )
-		         )
-		         FROM pipeline_run_table_stats s
-		         WHERE s.execution_id = e.id
-		       ), 0) AS records_processed
-		FROM executions e
-		LEFT JOIN pipelines p ON e.pipeline_id = p.id
-		LEFT JOIN pipeline_progress pp ON pp.pipeline_id = e.pipeline_id
+		       ` + executionRecordsProcessedSQL + ` AS records_processed
+	` + executionFromSQL + `
 		WHERE p.workspace_id = $1
 		  AND e.id <> e.pipeline_id
 	`
 	args := []interface{}{scopeWS}
 	argIdx := 2
 
+	// The filter matches the status the row reports, so ?status=running finds a
+	// live CDC stream and ?status=completed no longer does.
 	if status != "" {
-		query += fmt.Sprintf(" AND e.status = $%d", argIdx)
+		query += " AND (" + executionStatusSQL + ") = $" + strconv.Itoa(argIdx)
 		args = append(args, status)
 		argIdx++
 	}
@@ -3850,10 +4053,10 @@ func ListExecutions(c *gin.Context) {
 	// COUNT query — same WHERE conditions, no LIMIT, so total reflects reality even when
 	// the page is capped at `limit`.
 	var totalCount int
-	countQuery := `SELECT COUNT(*) FROM executions e LEFT JOIN pipelines p ON e.pipeline_id = p.id WHERE p.workspace_id = $1 AND e.id <> e.pipeline_id`
+	countQuery := `SELECT COUNT(*)` + executionFromSQL + ` WHERE p.workspace_id = $1 AND e.id <> e.pipeline_id`
 	countArgs := []interface{}{scopeWS}
 	if status != "" {
-		countQuery += " AND e.status = $2"
+		countQuery += " AND (" + executionStatusSQL + ") = $2"
 		countArgs = append(countArgs, status)
 	}
 	if pipelineID != "" {
@@ -3883,7 +4086,7 @@ func ListExecutions(c *gin.Context) {
 		var scheduledTime sql.NullTime
 		var recordsProcessed int64
 		err := rows.Scan(
-			&e.ID, &e.PipelineID, &e.Status,
+			&e.ID, &e.PipelineID, &e.Status, &e.LiveStream,
 			&e.TriggerSource, &scheduleID, &scheduledTime,
 			&e.StartTime, &e.EndTime, &errorMessage,
 			&e.PipelineName, &recordsProcessed,
@@ -3978,64 +4181,25 @@ func GetExecution(c *gin.Context) {
 		SELECT
 		       e.id,
 		       e.pipeline_id,
-		       CASE
-		         -- An execution's own TERMINAL status wins over pipeline_progress,
-		         -- for SUCCESS as well as failure. pipeline_progress is a real-time
-		         -- UI projection that can lag/disagree in BOTH directions:
-		         --   (a) Phase 1's postflight silent-drop guard flips
-		         --       executions.status='failed' AFTER the projector wrote
-		         --       pp.status='completed' (was masking real failures as
-		         --       "Success"); and
-		         --   (b) a genuinely completed execution whose pp row is still
-		         --       'processing' was painted "Running" with a live Cancel
-		         --       button (R3). Terminal exec status wins either way.
-		         WHEN e.status IN ('completed', 'success', 'cancelled', 'failed', 'error',
-		                           'silent_drop_detected',
-		                           'silent_partial_drop_detected',
-		                           'credential_check_failed') THEN e.status
-		         WHEN pp.execution_id = e.id THEN
-		           CASE pp.status
-		             WHEN 'processing' THEN 'running'
-		             WHEN 'waiting_for_user' THEN 'waiting_for_user'
-		             ELSE pp.status
-		           END
-		         ELSE e.status
-		       END as status,
+		       `+executionStatusSQL+` AS status,
+		       ls.live_stream,
 		       COALESCE(e.trigger_source, 'manual') as trigger_source,
 		       e.schedule_id,
 		       e.scheduled_time,
 		       e.start_time,
-		       COALESCE(
-		         e.end_time,
-		         CASE 
-		           WHEN pp.execution_id = e.id AND pp.status IN ('completed','failed','cancelled') THEN pp.updated_at
-		           ELSE NULL
-		         END
-		       ) as end_time,
+		       `+executionEndTimeSQL+` AS end_time,
 		       e.error_message,
 		       COALESCE(p.name, 'Unknown Pipeline') as pipeline_name,
-		       -- Same derivation as ListExecutions (see the subquery there and in
-		       -- ListPipelines/GetPipeline). executions.metrics is a vestigial
+		       -- Same derivation as ListExecutions. executions.metrics is a vestigial
 		       -- jsonb column with no writer; the real count lives in
 		       -- pipeline_run_table_stats and is summed at read time. Without this
 		       -- the detail page showed no record count while the list row it was
 		       -- opened from showed one — the same execution, two answers.
-		       COALESCE((
-		         SELECT SUM(
-		           GREATEST(
-		             COALESCE(s.inserted_rows, 0),
-		             COALESCE(s.applied_inserts, 0) + COALESCE(s.applied_updates, 0) + COALESCE(s.applied_deletes, 0)
-		           )
-		         )
-		         FROM pipeline_run_table_stats s
-		         WHERE s.execution_id = e.id
-		       ), 0) AS records_processed
-		FROM executions e
-		LEFT JOIN pipelines p ON e.pipeline_id = p.id
-		LEFT JOIN pipeline_progress pp ON pp.pipeline_id = e.pipeline_id
+		       `+executionRecordsProcessedSQL+` AS records_processed
+	`+executionFromSQL+`
 		WHERE e.id = $1 AND p.workspace_id = $2
 	`, id, scopeWS).Scan(
-		&e.ID, &e.PipelineID, &e.Status,
+		&e.ID, &e.PipelineID, &e.Status, &e.LiveStream,
 		&e.TriggerSource, &scheduleID, &scheduledTime,
 		&e.StartTime, &e.EndTime, &errorMessage, &e.PipelineName,
 		&recordsProcessed,

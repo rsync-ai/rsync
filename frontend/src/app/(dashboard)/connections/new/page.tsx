@@ -22,6 +22,7 @@ import { fetchMCPConnectors, fetchMCPConnector, saveConnection } from "@/lib/api
 import { GenericConnectorForm } from "@/components/connectors/GenericConnectorForm"
 import { classifyError } from "@/lib/utils/error-handling"
 import { ConnectionLogo } from "@/components/connectors/ConnectionLogo"
+import { safeNextPath } from "@/lib/auth/safe-next"
 
 // The wizard owns direction + connector selection; the shared GenericConnectorForm
 // owns configure + test + save (name, type, sync/CDC mode, the auth-method picker,
@@ -35,8 +36,14 @@ function NewConnectionPageContent() {
   const router = useRouter()
   const searchParams = useSearchParams()
 
-  // Where to return after creation (pipeline/CDC deep-links pass this).
-  const returnTo = searchParams.get("returnTo") || "/connections"
+  // Where to return after creation (pipeline/CDC deep-links pass this). It comes
+  // from the URL, so only an app-relative path is followed; "//evil.com" or
+  // "javascript:" falls back to the list instead of leaving the app.
+  const requestedReturnTo = searchParams.get("returnTo")
+  const returnTo =
+    requestedReturnTo && safeNextPath(requestedReturnTo) === requestedReturnTo
+      ? requestedReturnTo
+      : "/connections"
   // Support both `type` (preferred) and legacy `connection_type`.
   const preselectedType = (searchParams.get("type") || searchParams.get("connection_type")) as
     | "source"
@@ -166,16 +173,16 @@ function NewConnectionPageContent() {
     <div className="space-y-6 max-w-4xl mx-auto">
       {/* Header */}
       <div className="flex items-center gap-4">
-        <Link href={returnTo}>
-          <Button variant="ghost" size="icon">
+        <Button asChild variant="ghost" size="icon">
+          <Link href={returnTo} aria-label="Back">
             <ArrowLeft className="h-5 w-5" />
-          </Button>
-        </Link>
+          </Link>
+        </Button>
         <div>
           <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-white">
             Add New Connection
           </h1>
-          <p className="text-sm text-zinc-500 mt-1">
+          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">
             Connect a new data source or destination
           </p>
         </div>
@@ -218,7 +225,7 @@ function NewConnectionPageContent() {
                     </div>
                     <div className="text-center">
                       <p className="font-semibold text-zinc-900 dark:text-white">Source</p>
-                      <p className="text-sm text-zinc-500 mt-1">Where data comes from</p>
+                      <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">Where data comes from</p>
                     </div>
                     <Badge variant="secondary">{sourceConnectors.length} connectors</Badge>
                   </button>
@@ -234,7 +241,7 @@ function NewConnectionPageContent() {
                     </div>
                     <div className="text-center">
                       <p className="font-semibold text-zinc-900 dark:text-white">Destination</p>
-                      <p className="text-sm text-zinc-500 mt-1">Where data goes to</p>
+                      <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">Where data goes to</p>
                     </div>
                     <Badge variant="secondary">{destinationConnectors.length} connectors</Badge>
                   </button>
@@ -270,13 +277,13 @@ function NewConnectionPageContent() {
                 ) : availableConnectors.length === 0 ? (
                   <div className="text-center py-12">
                     <Database className="h-12 w-12 mx-auto text-zinc-300 mb-4" />
-                    <p className="text-zinc-500">No connectors available</p>
+                    <p className="text-zinc-500 dark:text-zinc-400">No connectors available</p>
                   </div>
                 ) : (
                   <div className="space-y-6">
                     {Object.entries(groupedConnectors).map(([category, items]) => (
                       <div key={category}>
-                        <h4 className="text-sm font-medium text-zinc-500 mb-3 capitalize">{category}</h4>
+                        <h4 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-3 capitalize">{category}</h4>
                         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
                           {items.map((connector) => (
                             <button
@@ -289,7 +296,7 @@ function NewConnectionPageContent() {
                                 <p className="font-semibold text-zinc-900 dark:text-white group-hover:text-violet-700 dark:group-hover:text-violet-300 truncate">
                                   {connector.display_name}
                                 </p>
-                                <p className="text-xs text-zinc-500 truncate">{connector.description}</p>
+                                <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">{connector.description}</p>
                               </div>
                               {connector.supports_cdc && (
                                 <Badge variant="outline" className="text-xs shrink-0">CDC</Badge>
@@ -331,7 +338,7 @@ function NewConnectionPageContent() {
                     <p className="font-semibold text-zinc-900 dark:text-white truncate">
                       {selectedConnector.display_name}
                     </p>
-                    <p className="text-xs text-zinc-500 truncate">{selectedConnector.description}</p>
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">{selectedConnector.description}</p>
                   </div>
                   <Button variant="outline" size="sm" onClick={backToConnectorList}>
                     <ArrowLeft className="h-4 w-4 mr-2" />
@@ -368,7 +375,7 @@ function StepIndicator({ step, currentStep, label }: { step: Step; currentStep: 
         "flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium transition-all",
         isComplete && "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300",
         isCurrent && "bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300",
-        !isComplete && !isCurrent && "bg-zinc-100 text-zinc-500 dark:bg-zinc-800",
+        !isComplete && !isCurrent && "bg-zinc-100 text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400",
       )}
     >
       {isComplete ? (
@@ -377,7 +384,7 @@ function StepIndicator({ step, currentStep, label }: { step: Step; currentStep: 
         <span
           className={cn(
             "w-5 h-5 rounded-full text-xs flex items-center justify-center",
-            isCurrent ? "bg-violet-600 text-white" : "bg-zinc-300 text-zinc-600",
+            isCurrent ? "bg-violet-600 text-white" : "bg-zinc-300 text-zinc-600 dark:bg-zinc-700 dark:text-zinc-300",
           )}
         >
           {targetIndex + 1}

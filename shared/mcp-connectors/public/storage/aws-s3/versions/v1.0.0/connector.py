@@ -263,6 +263,12 @@ class AwsS3MCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
                     "type": "destination",
                     "description": "Delete all objects under a bucket prefix (guardrailed)"
                 },
+                {
+                    "name": "get_cdc_offsets",
+                    "method": "aws-s3_get_cdc_offsets",
+                    "type": "destination",
+                    "description": "Durable CDC high-water offsets read from this pipeline's object metadata"
+                },
             ],
             "capabilities": {
                 "max_batch_size": self.max_batch_size,
@@ -395,80 +401,283 @@ class AwsS3MCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
     # DESTINATION OPERATIONS (REQUIRED)
     # =========================================================================
     
+    # Object user-metadata keys the kafka-mcp-sink writes on every CDC object
+    # (cdcObjectMetadata in kafka-sink-worker main.go). Keep the two in lockstep.
+    CDC_META_PIPELINE_ID = "rsync_pipeline_id"
+    CDC_META_TOPIC = "rsync_topic"
+    CDC_META_PARTITION = "rsync_partition"
+    CDC_META_LAST_OFFSET = "rsync_last_offset"
+    # An S3 listing carries no user metadata, so get_cdc_offsets HEADs each object.
+    # The scan must answer inside the sink's destination call timeout
+    # (RSYNC_SINK_HTTP_TIMEOUT_SECONDS, default 120s) or the sink skips the seed.
+    # 10 workers = botocore's default max_pool_connections for one client.
+    CDC_OFFSETS_HEAD_WORKERS = 10
+    CDC_OFFSETS_HEAD_CHUNK = 1000
+    CDC_OFFSETS_TIME_BUDGET_S = 60.0
+
+    @staticmethod
+    def _clean_object_metadata(raw: Any) -> Dict[str, str]:
+        """S3 user metadata is a flat str→str map; drop anything else."""
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for k, v in raw.items():
+            key = str(k).strip()
+            if not key or v is None or isinstance(v, (dict, list)):
+                continue
+            out[key] = str(v)
+        return out
+
+    def get_cdc_offsets(self, params: Dict) -> Dict[str, Any]:
+        """Durable CDC high-water marks for a pipeline (Tier C, cdc-exactly-once-offsets.md §5).
+
+        Same contract as gcs and azure-blob: every CDC object the sink writes carries
+        user metadata {rsync_pipeline_id, rsync_topic, rsync_partition,
+        rsync_last_offset}; this returns the max last offset per (topic, partition)
+        under the pipeline's root (`prefix`, sent by the sink) in the §2.3 shape.
+
+        An S3 listing carries no user metadata, so each listed object costs one HEAD.
+        The HEADs run concurrently, newest object first, and stop at a time budget
+        (`time_budget_s`, default 60s) or at `max_objects`; either stop sets
+        truncated=True. A truncated answer can only be LOW (a max over fewer
+        objects): that costs duplicates on a replay, never lost rows, and newest-first
+        keeps the objects written since the last Kafka commit inside the answer.
+        Sidecars (a leaf starting with "_", e.g. _MANIFEST.json, _SUCCESS) are never
+        stamped, so they are not HEADed.
+
+        Never an error (§2.3): first run, a missing prefix/pipeline, or any listing or
+        HEAD failure returns {"success": True, "offsets": []}, which the sink treats as
+        "nothing to skip".
+        """
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        params = params or {}
+        empty: Dict[str, Any] = {"success": True, "offsets": []}
+        pipeline_id = str(params.get("pipeline_id") or "").strip()
+        try:
+            config = self._get_config(params)
+        except Exception as e:  # pragma: no cover - _get_config does not raise today
+            logger.warning("get_cdc_offsets: bad config (%s); returning no offsets", e)
+            return empty
+        bucket = str(params.get("bucket") or config.get("bucket") or config.get("bucket_name") or "").strip()
+        prefix = str(params.get("prefix") or "").strip().lstrip("/")
+        if not pipeline_id or not bucket or not prefix:
+            # Refuse to scan a whole bucket: without the pipeline root there is no
+            # bounded listing, and a wrong answer is worse than no answer.
+            return {**empty, "note": "pipeline_id, bucket and prefix are required to derive offsets"}
+
+        try:
+            max_objects = int(params.get("max_objects") or 0)
+        except (TypeError, ValueError):
+            max_objects = 0
+        try:
+            budget = float(params.get("time_budget_s") or self.CDC_OFFSETS_TIME_BUDGET_S)
+        except (TypeError, ValueError):
+            budget = self.CDC_OFFSETS_TIME_BUDGET_S
+        deadline = time.monotonic() + budget
+
+        listed = []
+        truncated = False
+        try:
+            s3 = self._get_s3_client(config)
+            token = None
+            while True:
+                req = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+                if token:
+                    req["ContinuationToken"] = token
+                resp = s3.list_objects_v2(**req)
+                for obj in resp.get("Contents") or []:
+                    key = str(obj.get("Key") or "")
+                    if not key or key.rsplit("/", 1)[-1].startswith("_"):
+                        continue
+                    lm = obj.get("LastModified")
+                    listed.append((lm.timestamp() if hasattr(lm, "timestamp") else 0.0, key))
+                if not resp.get("IsTruncated"):
+                    break
+                token = resp.get("NextContinuationToken")
+                if not token or time.monotonic() >= deadline:
+                    truncated = True
+                    break
+        except Exception as e:
+            logger.warning("get_cdc_offsets: listing s3://%s/%s failed (%s); returning no offsets",
+                           bucket, prefix, e)
+            return empty
+
+        listed.sort(reverse=True)
+        keys = [k for _, k in listed]
+        if max_objects and len(keys) > max_objects:
+            keys = keys[:max_objects]
+            truncated = True
+
+        def _head(key: str) -> Dict[str, Any]:
+            try:
+                return s3.head_object(Bucket=bucket, Key=key).get("Metadata") or {}
+            except Exception as e:
+                code = str(((getattr(e, "response", None) or {}).get("Error") or {}).get("Code") or "")
+                if code in ("404", "NoSuchKey", "NotFound"):
+                    return {}  # deleted since it was listed
+                raise
+
+        best: Dict[tuple, int] = {}
+        scanned = 0
+        try:
+            with ThreadPoolExecutor(max_workers=self.CDC_OFFSETS_HEAD_WORKERS) as pool:
+                for i in range(0, len(keys), self.CDC_OFFSETS_HEAD_CHUNK):
+                    if time.monotonic() >= deadline:
+                        truncated = True
+                        break
+                    for meta in pool.map(_head, keys[i:i + self.CDC_OFFSETS_HEAD_CHUNK]):
+                        scanned += 1
+                        if str(meta.get(self.CDC_META_PIPELINE_ID) or "").strip() != pipeline_id:
+                            continue
+                        topic = str(meta.get(self.CDC_META_TOPIC) or "").strip()
+                        if not topic:
+                            continue
+                        try:
+                            partition = int(meta.get(self.CDC_META_PARTITION))
+                            last = int(meta.get(self.CDC_META_LAST_OFFSET))
+                        except (TypeError, ValueError):
+                            continue
+                        k = (topic, partition)
+                        if k not in best or last > best[k]:
+                            best[k] = last
+        except Exception as e:
+            logger.warning("get_cdc_offsets: HEAD under s3://%s/%s failed (%s); returning no offsets",
+                           bucket, prefix, e)
+            return empty
+
+        if truncated:
+            logger.warning("get_cdc_offsets: s3://%s/%s scan stopped after %d object(s) "
+                           "(time budget or max_objects); offsets may be low", bucket, prefix, scanned)
+        offsets = [{"topic": t, "partition": p, "offset": o} for (t, p), o in sorted(best.items())]
+        return {"success": True, "offsets": offsets, "objects_scanned": scanned, "truncated": truncated}
+
     def delete_prefix(self, params: Dict) -> Dict[str, Any]:
         """
-        Delete all objects under a bucket prefix.
+        Delete every object under a folder prefix, failing closed.
+
+        Contract (pinned by shared/delete_prefix_contract_golden.json; the gcs and
+        azure-blob connectors return the same shape):
+          {success, deleted, failed, complete, bucket, prefix, errors[, error]}
+        - success is True only when complete is True and failed == 0.
+        - complete is True only when the listing was walked to its end.
+        - The prefix is a folder: 'a/b' is normalised to 'a/b/', so 'a/bc/...'
+          is never listed or deleted.
+        - Pages are bounded: at most 1000 keys per list and per delete call, and at
+          most max_pages pages. Stopping at max_pages or max_objects with objects
+          still listed is complete=False, success=False -- never a silent truncation.
+        - A key the store refuses to delete is counted in failed, never in deleted.
+
         Guardrails:
-        - prefix must be non-empty
-        - if config includes path_prefix/prefix, refuse deletes outside it
+        - prefix must name a folder (refuse deleting the entire bucket)
+        - if config includes path_prefix/prefix, refuse deletes outside that folder
         """
         params = params or {}
         config = self._get_config(params)
 
         bucket = params.get("bucket") or config.get("bucket")
-        prefix = params.get("prefix") or params.get("key_prefix") or params.get("path") or ""
+        raw_prefix = params.get("prefix") or params.get("key_prefix") or params.get("path") or ""
+        result: Dict[str, Any] = {
+            "success": False, "deleted": 0, "failed": 0, "complete": False,
+            "bucket": bucket, "prefix": raw_prefix, "errors": [],
+        }
         if bucket is None or str(bucket).strip() == "":
-            return {"success": False, "error": "Bucket is required"}
-        if prefix is None or str(prefix).strip() == "":
-            return {"success": False, "error": "prefix is required (refusing to delete entire bucket)"}
+            result["error"] = "Bucket is required"
+            return result
+        if str(raw_prefix).strip().strip("/") == "":
+            result["error"] = "prefix is required (refusing to delete entire bucket)"
+            return result
 
-        prefix = str(prefix)
+        # Folder boundary: 'a/b' must never match 'a/bc/...'.
+        prefix = str(raw_prefix).strip()
+        if not prefix.endswith("/"):
+            prefix += "/"
+        result["prefix"] = prefix
 
-        # Guardrail: refuse deletes outside configured base prefix (if provided).
+        # Guardrail: refuse deletes outside the configured base folder (if provided).
         base_prefix = (config.get("path_prefix") or config.get("prefix") or "").strip().strip("/")
-        if base_prefix:
-            target = prefix.strip().lstrip("/")
-            if not target.startswith(base_prefix):
-                return {
-                    "success": False,
-                    "error": f"Refusing to delete outside configured path_prefix/prefix '{base_prefix}' (requested '{prefix}')",
-                }
+        if base_prefix and not prefix.lstrip("/").startswith(base_prefix + "/"):
+            result["error"] = (
+                f"Refusing to delete outside configured path_prefix/prefix '{base_prefix}' "
+                f"(requested '{raw_prefix}')"
+            )
+            return result
 
-        max_objects = int(params.get("max_objects") or 100000)
-        deleted = 0
-        truncated = False
+        page_size = 1000
+        try:
+            max_pages = int(params.get("max_pages") or 100000)
+            max_objects = int(params.get("max_objects") or 0) or None
+        except (TypeError, ValueError):
+            result["error"] = "max_pages and max_objects must be integers"
+            return result
+
+        def _fail_key(key: Any, err: Any) -> None:
+            result["failed"] += 1
+            if len(result["errors"]) < 20:
+                result["errors"].append({"key": key, "error": str(err)[:300]})
 
         try:
             s3 = self._get_s3_client(config)
             token: Optional[str] = None
-            batch: List[Dict[str, str]] = []
-
-            while deleted < max_objects:
-                req: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": min(1000, max_objects - deleted)}
+            pages = 0
+            while True:
+                if pages >= max_pages:
+                    result["error"] = f"stopped after max_pages={max_pages} before the listing ended"
+                    return result
+                req: Dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": page_size}
                 if token:
                     req["ContinuationToken"] = token
                 resp = s3.list_objects_v2(**req)
-                contents = resp.get("Contents") or []
+                pages += 1
+                keys = [
+                    item.get("Key") for item in (resp.get("Contents") or [])
+                    if item.get("Key") and str(item.get("Key")).startswith(prefix)
+                ]
 
-                for item in contents:
-                    k = item.get("Key")
-                    if not k:
-                        continue
-                    batch.append({"Key": k})
-                    if len(batch) >= 1000:
-                        s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
-                        deleted += len(batch)
-                        batch = []
-                        if deleted >= max_objects:
-                            break
+                over_bound = False
+                if max_objects is not None:
+                    room = max(max_objects - (result["deleted"] + result["failed"]), 0)
+                    if len(keys) > room:
+                        keys = keys[:room]
+                        over_bound = True
 
-                if deleted >= max_objects:
-                    truncated = True
-                    break
+                if keys:
+                    try:
+                        del_resp = s3.delete_objects(
+                            Bucket=bucket, Delete={"Objects": [{"Key": k} for k in keys], "Quiet": True}
+                        )
+                    except Exception as e:
+                        for k in keys:
+                            _fail_key(k, e)
+                        result["error"] = f"delete_objects failed: {e}"
+                        return result
+                    errs = (del_resp or {}).get("Errors") or []
+                    for err in errs:
+                        _fail_key(err.get("Key"), f"{err.get('Code')}: {err.get('Message')}")
+                    refused = {err.get("Key") for err in errs}
+                    result["deleted"] += sum(1 for k in keys if k not in refused)
+
+                if over_bound:
+                    result["error"] = f"stopped at max_objects={max_objects} with objects left under the prefix"
+                    return result
 
                 if not resp.get("IsTruncated"):
+                    result["complete"] = True
                     break
-                token = resp.get("NextContinuationToken")
-                if not token:
-                    break
-
-            if batch:
-                s3.delete_objects(Bucket=bucket, Delete={"Objects": batch, "Quiet": True})
-                deleted += len(batch)
-
-            return {"success": True, "bucket": bucket, "prefix": prefix, "deleted": deleted, "truncated": truncated}
+                next_token = resp.get("NextContinuationToken")
+                if not next_token or next_token == token:
+                    result["error"] = "listing reported more objects but returned no new continuation token"
+                    return result
+                token = next_token
         except Exception as e:
-            return {"success": False, "error": str(e), "bucket": bucket, "prefix": prefix}
+            result["error"] = str(e)
+            return result
+
+        if result["failed"]:
+            result["error"] = f"{result['failed']} object(s) under the prefix could not be deleted"
+        result["success"] = result["complete"] and result["failed"] == 0
+        return result
 
     def _object_exists(self, s3, bucket: str, key: str) -> bool:
         try:
@@ -797,7 +1006,14 @@ class AwsS3MCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
                     body = str(payload).encode("utf-8")
             else:
                 body = self.convert_data_to_format(payload, fmt, compression)
-            s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType=content_type)
+            put_args = {"Bucket": bucket, "Key": key, "Body": body, "ContentType": content_type}
+            # CDC provenance (Tier C): the kafka-mcp-sink stamps each CDC object with its
+            # pipeline + Kafka coordinates so get_cdc_offsets can recover the durable
+            # high-water mark. Sent with the PUT so it lands atomically with the bytes.
+            object_metadata = self._clean_object_metadata(params.get("object_metadata"))
+            if object_metadata:
+                put_args["Metadata"] = object_metadata
+            s3.put_object(**put_args)
 
             return {
                 "success": True,

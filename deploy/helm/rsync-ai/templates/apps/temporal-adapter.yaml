@@ -9,6 +9,7 @@ metadata:
     app.kubernetes.io/component: temporal-adapter
 spec:
   replicas: {{ .Values.temporalAdapter.replicaCount }}
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   selector:
     matchLabels:
       {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
@@ -126,8 +127,8 @@ spec:
                   key: ENCRYPTION_KEY
             - name: METRICS_ADDR
               value: ":8082"
-          # This service serves NO /health — port 8082 is the Prometheus
-          # /metrics endpoint and nothing else (cmd/adapter/main.go:145-162).
+          # This service serves NO /health — port 8082 serves only Prometheus
+          # /metrics and the build /version (cmd/adapter/ops_server.go).
           # A TCP check therefore proves the process is up and past its DSN
           # guard; it does NOT prove the Temporal worker registered or is
           # polling its task queue. Do not read a green probe here as "workflows

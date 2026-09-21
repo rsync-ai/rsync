@@ -451,45 +451,71 @@ Suggestions:
 All providers are built by one factory —
 [`utils/openai_client.py`](../../llm-service/src/utils/openai_client.py). There is no
 provider-specific code anywhere else. Four providers: `openai` · `azure` · `groq` · `ollama`,
-selected by `LLM_PROVIDER`.
+selected by `LLM_PROVIDER`. A fifth choice, `none` (or `disabled`, `off`, `false`, `0`), runs the
+stack with no LLM.
 
-Resolution when `LLM_PROVIDER` is unset (`resolve_provider`, `:79-117`): Azure endpoint → `azure`,
+Resolution when `LLM_PROVIDER` is unset (`resolve_provider`, `:294-365`): Azure endpoint → `azure`,
 else `OPENAI_API_KEY` → `openai`, else `ollama`. `LLM_PROVIDER=openai` with no key **fails closed
-to `ollama`** (`:103-105`), and Groq is never auto-selected — it requires an explicit opt-in so a
+to `ollama`** and logs one warning naming the missing key (`:334-339`), and Groq is never auto-selected — it requires an explicit opt-in so a
 stray `GROQ_API_KEY` cannot silently route prompts to an undisclosed external LLM
-(`:100-101`, `:115-117`).
+(`:328-332`, `:363-365`). A named Groq or Azure missing its credential
+resolves to `ollama` the same way, with the same one-time warning.
+
+Routing is not the same as having an LLM. `llm_configured()` (`:368-394`) is true only for a cloud
+provider with credentials, or for Ollama the operator named with `LLM_PROVIDER=ollama`; an explicit
+`none` wins over any key. `explorer_llm_configured()` (`:397-410`) applies the Explorer's own
+precedence and treats `EXPLORER_OFFLINE_ONLY=true` as naming Ollama. When the answer is false, the
+LLM-only endpoints return HTTP 503 `{"error": "llm_not_configured", "message": "Set up an LLM
+first: ..."}` via [`utils/llm_gate.py`](../../llm-service/src/utils/llm_gate.py) instead of calling
+an Ollama nobody started, and `/health` reports `llm_configured`. So the priority is an external LLM
+when credentials are present, Ollama only when chosen, otherwise none — see
+[Which LLM is used](../deployment/self-hosting.md#which-llm-is-used).
 
 ### Model selection
 
-One rule, two levels (`get_default_model`, `:120-138`):
+One rule, two levels (`get_default_model`, `:413-431`):
 
 1. `LLM_MODEL` — overrides everything, for every provider. On Azure this is a **deployment name**.
 2. Otherwise the provider default: `gpt-4o-mini` (openai/azure), `llama-3.3-70b-versatile` (groq),
    `OLLAMA_MODEL` or `qwen2.5:7b` (ollama).
 
+Prompt-registry calls go through `resolve_model` in `gateway/main.py`, which applies the same
+rule with one difference: on the OpenAI protocol with `LLM_MODEL` unset they send the prompt's
+own `model` (`gpt-4o`). Groq, Azure and Ollama get the provider default above instead, since
+none of them serves `gpt-4o` under that name.
+
 Individual agents may override: `RANK_TABLES_MODEL` and the `EXPLORER_*_MODEL` family
 (`EXPLORER_TABLE_LINK_MODEL`, `EXPLORER_COLUMN_LINK_MODEL`, `EXPLORER_NEXT_STEPS_MODEL`,
 `EXPLORER_QUERY_SPEC_MODEL`, `EXPLORER_SQL_MODEL`, `EXPLORER_SQL_MODEL_MYSQL`,
-`EXPLORER_SQL_OPENAI_MODEL`, `EXPLORER_SQL_FALLBACK_MODELS`). tool-generator has no model
-variable of its own — it reads `LLM_MODEL` like every other agent.
+`EXPLORER_SQL_OPENAI_MODEL`, `EXPLORER_SQL_FALLBACK_MODELS`). tool-generator carries one more,
+`RSYNC_TOOL_GENERATOR_MODEL`, but only inside its own agent package: the directory
+`src/agents/tool_generator/agents`, which
+[oss-strip-list.txt](../../llm-service/oss-strip-list.txt) strips from the OSS image. Nothing a
+self-hosted install runs reads that name — set `LLM_MODEL` there instead.
 
 Two deliberate exceptions to "`LLM_MODEL` overrides everything", both in
 [openai_client.py](../../llm-service/src/utils/openai_client.py): the Explorer resolves through
-`explorer_default_model` (`:164`) / `explorer_default_sql_model` (`:198`), and `/agents/rank-tables`
-through `rank_tables_default_model` (`:210`) — which ignores `LLM_MODEL` on OpenAI on purpose, so a
+`explorer_default_model` (`:457`) / `explorer_default_sql_model` (`:490`), and `/agents/rank-tables`
+through `rank_tables_default_model` (`:517`) — which ignores `LLM_MODEL` on OpenAI on purpose, so a
 stack-wide upgrade to `gpt-4o` doesn't silently multiply the cost of a bulk metadata task. Set
 `RANK_TABLES_MODEL` to move it.
 
 **Configuration**:
 ```env
-LLM_PROVIDER=azure          # or openai | groq | ollama
+LLM_PROVIDER=azure          # or openai | groq | ollama | none
 OPENAI_API_KEY=sk-xxx
 LLM_MODEL=gpt-4o-mini       # Azure: the deployment name
 ```
 
-> There is no `OPENAI_MODEL_PLANNING`, `OPENAI_MODEL_INTENT` or `RSYNC_TOOL_GENERATOR_MODEL`
-> variable — earlier revisions of this doc invented all three. Per-agent model selection uses the
-> override names listed above, every one of which is read somewhere under `llm-service/src`.
+Groq takes `GROQ_API_KEY`. Vertex AI and other OpenAI-compatible endpoints are `openai` with
+`OPENAI_BASE_URL`; on a Google Cloud VM, `OPENAI_API_KEY_SOURCE=gcp-metadata` replaces the key
+with the VM service account's token, renewed before it expires
+([`utils/gcp_access_token.py`](../../llm-service/src/utils/gcp_access_token.py)). See
+[Groq, Azure OpenAI and Vertex AI](../deployment/self-hosting.md#groq-azure-openai-and-vertex-ai).
+
+> There is no `OPENAI_MODEL_PLANNING` or `OPENAI_MODEL_INTENT` variable — earlier revisions of this
+> doc invented both. Per-agent model selection uses the override names listed above, and every
+> `EXPLORER_*` / `RANK_TABLES_MODEL` name among them is read somewhere under `llm-service/src`.
 
 ### Ollama (Offline)
 

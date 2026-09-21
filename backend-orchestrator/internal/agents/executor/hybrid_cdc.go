@@ -15,9 +15,10 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 )
 
-// hybridNormalizeDBType lower-cases, normalizes separators, and maps common aliases
-// so source-family detection matches executeStreamingDataTransfer's local normalizer.
-func hybridNormalizeDBType(s string) string {
+// normalizeDBType lower-cases, normalizes separators, and maps common aliases. The
+// one normaliser for source/destination types in this package: the streaming path
+// and the hybrid path used to carry identical private copies.
+func normalizeDBType(s string) string {
 	v := strings.ToLower(strings.TrimSpace(s))
 	v = strings.ReplaceAll(v, "-", "_")
 	switch v {
@@ -30,14 +31,25 @@ func hybridNormalizeDBType(s string) string {
 	}
 }
 
-// hybridIsPostgresFamily reports whether a source type uses PostgreSQL logical
-// replication (where the slot is the durable position anchor — no offset seeding).
-func hybridIsPostgresFamily(t string) bool {
-	switch hybridNormalizeDBType(t) {
-	case "postgresql", "cockroachdb", "cockroach_db", "aurora_postgresql", "alloydb", "neon", "supabase":
-		return true
-	}
-	return false
+// postgresFamilyTypes are the normalised source types that use PostgreSQL logical
+// replication. Pinned, with llm-service's CDCConfigGenerator.POSTGRES_FAMILY, to
+// shared/postgres_family_golden.json (postgres_family_golden_test.go): a new
+// PostgreSQL derivative goes in all three or one of the two tests goes red.
+var postgresFamilyTypes = map[string]bool{
+	"postgresql":        true,
+	"cockroachdb":       true, // CockroachDB
+	"cockroach_db":      true,
+	"aurora_postgresql": true, // AWS Aurora PostgreSQL
+	"alloydb":           true, // GCP AlloyDB
+	"neon":              true, // Neon serverless Postgres
+	"supabase":          true, // Supabase (Postgres under the hood)
+}
+
+// isPostgresFamily reports whether a source type uses PostgreSQL logical
+// replication: the publication must be created before the slot (never Debezium
+// autocreate), and the slot is the durable position anchor (no offset seeding).
+func isPostgresFamily(t string) bool {
+	return postgresFamilyTypes[normalizeDBType(t)]
 }
 
 // hybridSourceConnID extracts the source connection id from params/payload.
@@ -105,7 +117,7 @@ func (a *Agent) recordHybridBackfillDone(ctx context.Context, task ExecutorTask,
 		ResourceType: hybridBackfillMarkerType,
 		ResourceName: fmt.Sprintf("hybrid_backfill_%s", utils.SafeID8(task.PipelineID)),
 		Status:       "active",
-		DatabaseType: hybridNormalizeDBType(task.Source.Type),
+		DatabaseType: normalizeDBType(task.Source.Type),
 		Metadata: map[string]interface{}{
 			"rows_loaded":  rows,
 			"completed_at": time.Now().UTC().Format(time.RFC3339),
@@ -275,7 +287,7 @@ func (a *Agent) executeHybridCDCDataTransfer(ctx context.Context, task ExecutorT
 
 	// ── Phase 1: capture P (and pin WAL for PG) BEFORE the batch reads any data. ──
 	var mysqlPos cdc.BinlogPosition
-	isPG := hybridIsPostgresFamily(sourceType)
+	isPG := isPostgresFamily(sourceType)
 	if isPG {
 		sourceDBName := ""
 		if task.Source.Config != nil {
@@ -301,7 +313,7 @@ func (a *Agent) executeHybridCDCDataTransfer(ctx context.Context, task ExecutorT
 		// historical load this accumulates WAL on the source until CDC starts consuming
 		// and advances confirmed_flush_lsn — monitor pg_replication_slots / disk on big tables.
 		log.WithField("pipeline_id", task.PipelineID).Info("📌 Hybrid CDC: PostgreSQL slot provisioned — WAL pinned at consistent_point (P); source WAL grows until CDC begins consuming")
-	} else if hybridNormalizeDBType(sourceType) == "mysql" {
+	} else if normalizeDBType(sourceType) == "mysql" {
 		mysqlMgr := cdc.NewMySQLManager(a.db)
 		// Ensure server_id exists (idempotent) and capture binlog coords at P.
 		if _, err := mysqlMgr.ProvisionResources(ctx, cdc.CDCResourceConfig{

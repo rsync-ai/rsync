@@ -38,3 +38,42 @@ func TestParseDebeziumChange_FallbacksToTopicSuffix(t *testing.T) {
 	}
 }
 
+
+// Debezium runs with JsonConverter schemas.enable=true, so the change event sits
+// under "payload". Before the unwrap every such message was dropped.
+func TestParseDebeziumChange_UnwrapsSchemaEnvelope(t *testing.T) {
+	envelope := map[string]interface{}{
+		"schema": map[string]interface{}{"type": "struct"},
+		"payload": map[string]interface{}{
+			"op":    "c",
+			"ts_ms": float64(1736400000000),
+			"source": map[string]interface{}{
+				"db": "shop",
+			},
+		},
+	}
+
+	u, ok := ParseDebeziumChange(envelope, "cdc-shop.shop.orders")
+	if !ok {
+		t.Fatalf("expected the schema envelope to parse")
+	}
+	if u.QualifiedName != "shop.orders" {
+		t.Fatalf("expected qualified_name shop.orders, got %q", u.QualifiedName)
+	}
+	if u.Op != "c" {
+		t.Fatalf("expected op c, got %q", u.Op)
+	}
+	if u.Timestamp.UnixMilli() != 1736400000000 {
+		t.Fatalf("expected ts_ms from the inner payload, got %v", u.Timestamp)
+	}
+}
+
+func TestParseDebeziumChange_EnvelopeWithoutOpIsRejected(t *testing.T) {
+	envelope := map[string]interface{}{
+		"schema":  map[string]interface{}{"type": "struct"},
+		"payload": map[string]interface{}{"after": map[string]interface{}{"id": float64(1)}},
+	}
+	if _, ok := ParseDebeziumChange(envelope, "cdc-shop.shop.orders"); ok {
+		t.Fatalf("expected a payload with no op to be rejected")
+	}
+}

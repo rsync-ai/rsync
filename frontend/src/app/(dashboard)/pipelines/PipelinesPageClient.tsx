@@ -31,6 +31,7 @@ import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { captureWorkspace, onActiveWorkspaceChange } from "@/lib/workspace/active-workspace"
 import { toast } from "sonner"
+import { deleteWarningToast, readDeleteWarnings } from "@/lib/utils/delete-warnings"
 import { classifyError, type AppError } from "@/lib/utils/error-handling"
 import { ErrorPage } from "@/components/ui/error-banner"
 import type { ApiErrorBody } from "@/lib/api/types"
@@ -43,6 +44,8 @@ import {
   type PlanLimitPayload,
 } from "@/lib/api/pipelines"
 import { PreMigrationAssessmentModal } from "@/components/pipeline/PreMigrationAssessmentModal"
+import { exportPipelineConfig } from "@/lib/pipeline/pipelineMenuActions"
+import { pipelineIsCDC } from "@/lib/pipeline/syncMode"
 
 interface PipelinesPageState {
   pipelines: PipelineListItem[]
@@ -56,6 +59,17 @@ interface PipelinesPageState {
   }
   loading: boolean
   error: AppError | null
+}
+
+const ACTIVE_POLL_MS = 5_000
+const IDLE_POLL_MS = 30_000
+
+/** 5s while a run is in flight on this page, 30s otherwise — never off. */
+export function pipelinesPollInterval(pipelines: PipelineListItem[]): number {
+  const active = pipelines.some(
+    (p) => p.derived_status === "running" || p.derived_status === "waiting_for_user",
+  )
+  return active ? ACTIVE_POLL_MS : IDLE_POLL_MS
 }
 
 export function PipelinesPageClient() {
@@ -198,21 +212,26 @@ export function PipelinesPageClient() {
     void fetchStats()
   }, [fetchStats])
 
-  // Poll while any pipeline is running OR parked on user input, so the list
-  // refreshes when a HITL prompt is answered elsewhere and the run resumes.
+  // Poll the list AND the stats cards. Fast while any pipeline is running or
+  // parked on user input (a HITL prompt answered elsewhere resumes the run);
+  // slow otherwise, because a row's status also changes with nothing running
+  // here — a Failed CDC stream the healer, a Reload or another tab brings back
+  // stayed "Failed" (and the cards kept their mount-time counts) until a manual
+  // reload (prod retest 2026-09-18).
+  const pollMs = pipelinesPollInterval(state.pipelines)
   useEffect(() => {
-    const hasRunning = state.pipelines.some(
-      (p) => p.derived_status === "running" || p.derived_status === "waiting_for_user",
-    )
-    if (!hasRunning) return
     if (isAnyMenuOpen) return
 
-    const interval = setInterval(fetchPipelines, 5000)
+    const interval = setInterval(() => {
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return
+      void fetchPipelines()
+      void fetchStats()
+    }, pollMs)
 
     return () => {
       clearInterval(interval)
     }
-  }, [state.pipelines, fetchPipelines, isAnyMenuOpen])
+  }, [pollMs, fetchPipelines, fetchStats, isAnyMenuOpen])
 
   // Re-fetch list + stats when the active workspace changes (header switcher or
   // another tab). router.refresh() only re-runs server components; this is a
@@ -296,10 +315,32 @@ export function PipelinesPageClient() {
     }
   }
 
+  const handleStopPipeline = async (id: string) => {
+    try {
+      const res = await authFetch(API_ENDPOINTS.PIPELINES.STOP(id), { method: "POST" })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        const e = classifyError(Object.assign(new Error(), { statusCode: res.status, message: (body as ApiErrorBody)?.error || (body as ApiErrorBody)?.message || res.statusText }), "pipeline.stop")
+        toast.error(e.title, { description: e.hint ?? e.message })
+        return
+      }
+      toast.success("Pipeline stopped")
+      fetchPipelines()
+    } catch (err) {
+      const e = classifyError(err, "pipeline.stop")
+      toast.error(e.title, { description: e.hint ?? e.message })
+    }
+  }
+
   const handleEditPipeline = (id: string) => {
     // TODO: Create draft from pipeline and open panel
     router.push(`/pipelines/${id}`)
   }
+
+  const deleteTarget = deleteTargetId ? state.pipelines.find((p) => p.id === deleteTargetId) : undefined
+  const deleteTargetRunning =
+    deleteTarget?.derived_status === "running" || deleteTarget?.derived_status === "waiting_for_user"
+  const deleteTargetIsCDC = pipelineIsCDC(deleteTarget) === true
 
   const handleDeletePipeline = async (id: string) => {
     setDeleteTargetId(id)
@@ -322,35 +363,21 @@ export function PipelinesPageClient() {
         return
       }
 
-      toast.success("Pipeline deleted")
+      // A 200 can still carry teardown warnings (a slot that would not drop,
+      // Kafka topics left behind). Answering those with a flat success toast hid
+      // every leak behind "Pipeline deleted".
+      const warnings = await readDeleteWarnings(res)
+      if (warnings.length > 0) {
+        const { title, description } = deleteWarningToast(warnings)
+        toast.warning(title, { description, duration: 12000 })
+      } else {
+        toast.success("Pipeline deleted")
+      }
       setDeleteDialogOpen(false)
       setDeleteTargetId(null)
       fetchPipelines()
     } catch (err) {
       const e = classifyError(err, "pipeline.delete")
-      toast.error(e.title, { description: e.hint ?? e.message })
-    }
-  }
-
-  const handleExportConfig = async (id: string) => {
-    try {
-      const res = await authFetch(API_ENDPOINTS.PIPELINES.GET(id))
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        const e = classifyError(Object.assign(new Error(), { statusCode: res.status, message: (body as ApiErrorBody)?.error || (body as ApiErrorBody)?.message || res.statusText }), "pipeline.export")
-        toast.error(e.title, { description: e.hint ?? e.message })
-        return
-      }
-      const data = await res.json()
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement("a")
-      a.href = url
-      a.download = `pipeline-${id}.json`
-      a.click()
-      URL.revokeObjectURL(url)
-    } catch (err) {
-      const e = classifyError(err, "pipeline.export")
       toast.error(e.title, { description: e.hint ?? e.message })
     }
   }
@@ -380,25 +407,25 @@ export function PipelinesPageClient() {
       {pipelineStats && (
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
           <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500">Pipelines</div>
+            <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Pipelines</div>
             <div className="text-xl font-semibold text-zinc-900 dark:text-zinc-100">
               {pipelineStats.total ?? 0}
             </div>
           </div>
           <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500">Running</div>
+            <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Running</div>
             <div className="text-xl font-semibold text-blue-700 dark:text-blue-300">
               {pipelineStats.executions?.running ?? 0}
             </div>
           </div>
           <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500">Successful runs</div>
+            <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Successful runs</div>
             <div className="text-xl font-semibold text-emerald-700 dark:text-emerald-300">
               {pipelineStats.executions?.completed ?? 0}
             </div>
           </div>
           <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-4 py-3">
-            <div className="text-[11px] uppercase tracking-wide text-zinc-500">Failed runs</div>
+            <div className="text-[11px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">Failed runs</div>
             <div className="text-xl font-semibold text-red-700 dark:text-red-300">
               {pipelineStats.executions?.failed ?? 0}
             </div>
@@ -532,7 +559,7 @@ export function PipelinesPageClient() {
           ) : state.pipelines.length === 0 && hasActiveFilters ? (
             // Empty state: filters returned no results
             <div className="flex flex-col items-center justify-center py-16">
-              <div className="text-zinc-500 mb-4">No pipelines match your filters</div>
+              <div className="text-zinc-500 dark:text-zinc-400 mb-4">No pipelines match your filters</div>
               <Button variant="outline" onClick={clearFilters}>
                 Clear Filters
               </Button>
@@ -547,7 +574,8 @@ export function PipelinesPageClient() {
                 onResumePipeline={handleResumePipeline}
                 onEditPipeline={handleEditPipeline}
                 onDeletePipeline={handleDeletePipeline}
-                onExportConfig={handleExportConfig}
+                onStopPipeline={handleStopPipeline}
+                onExportConfig={exportPipelineConfig}
               />
 
               {/* Pagination */}
@@ -592,6 +620,15 @@ export function PipelinesPageClient() {
                       This will cancel any running execution, delete all history, and remove associated schedules. This
                       cannot be undone.
                     </AlertDialogDescription>
+                    {/* The row menu offers Delete on a running pipeline too, as the
+                        detail menu does (#52) — so name what stops, up front. */}
+                    {deleteTargetRunning && (
+                      <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+                        {deleteTargetIsCDC
+                          ? "This pipeline is streaming now — its live stream stops."
+                          : "This pipeline is running now — the run is cancelled, not allowed to finish."}
+                      </p>
+                    )}
                   </AlertDialogHeader>
                   <AlertDialogFooter>
                     <AlertDialogCancel>Cancel</AlertDialogCancel>
@@ -624,6 +661,7 @@ export function PipelinesPageClient() {
           }
         }}
         report={assessmentReport}
+        assessmentTabHref={pendingRunId ? `/pipelines/${pendingRunId}?tab=assessment` : undefined}
         submitting={submittingProceed}
         onProceed={async (nominatedKeys) => {
           if (!pendingRunId) return

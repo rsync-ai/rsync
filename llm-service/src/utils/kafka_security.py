@@ -33,7 +33,10 @@ behaves identically.
 
 from __future__ import annotations
 
+import collections
+import ipaddress
 import json
+import logging
 import os
 import threading
 import time
@@ -58,6 +61,13 @@ ENV_SSL_SKIP_VERIFY = "KAFKA_SSL_SKIP_VERIFY"
 # own kafka-python clients do. Read only by debezium_schema_history_security();
 # nothing in-process uses it.
 ENV_SSL_KEYSTORE_LOCATION = "KAFKA_SSL_KEYSTORE_LOCATION"
+# Where the kafka-connect image's entrypoint writes that one file when it is
+# given only the two-path pair (RSYNC_CLIENT_PEM in
+# shared/internal/infra/kafka-connect/connect-entrypoint.sh). A path in the
+# CONNECT container, not this one: the schema-history client runs inside the
+# Connect worker. The debezium connector carries the same constant, and
+# test_debezium_schema_history_parity.py pins all three together.
+CONNECT_IMAGE_CLIENT_PEM = "/kafka/rsync-tls/client.pem"
 
 # OIDC client-credentials settings for KAFKA_SASL_MECHANISM=OAUTHBEARER.
 # Spellings copied from the Go module (config.go EnvOAuth*) rather than invented:
@@ -73,6 +83,12 @@ ENV_OAUTH_CLIENT_ID = "KAFKA_SASL_OAUTHBEARER_CLIENT_ID"
 ENV_OAUTH_CLIENT_SECRET = "KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET"
 ENV_OAUTH_SCOPE = "KAFKA_SASL_OAUTHBEARER_SCOPE"
 ENV_OAUTH_EXTENSIONS = "KAFKA_SASL_OAUTHBEARER_EXTENSIONS"
+# Re-permits an http:// token endpoint that is not on loopback. Exists only for
+# a test rig running a throwaway IdP; see _token_endpoint_is_insecure for why
+# the default is a refusal rather than a warning.
+ENV_OAUTH_ALLOW_INSECURE_TOKEN_ENDPOINT = (
+    "KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT"
+)
 
 # Schema Registry is a separate service with separate credentials — a cluster can
 # require SASL while its registry is open, or the reverse. Confluent's own
@@ -316,6 +332,40 @@ def _build_oidc_token_provider(
     return _OIDCTokenProvider()
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True for a host that cannot leave this machine.
+
+    ``localhost`` and every ``*.localhost`` name are reserved for loopback by
+    RFC 6761; a literal address is loopback when the IP says so (127.0.0.0/8,
+    ::1), which is wider than string-matching "127.0.0.1". The trailing dot of
+    a fully-qualified name is stripped first, because ``localhost.`` resolves
+    to loopback and would otherwise be treated as a remote host.
+    """
+    host = host.strip().rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _token_endpoint_is_insecure(raw: str) -> bool:
+    """True when fetching a token from ``raw`` would leak the client secret.
+
+    The client-credentials grant POSTs the client secret to this URL on every
+    token fetch. Over http to a remote host that is a permanent credential
+    handed to anyone on the path -- worse than the replayable bearer token it
+    buys, and not repairable by any broker-side setting. Loopback is exempt
+    because the request never reaches a wire (Google's Workload Identity token
+    server is exactly this: ``http://localhost:14293``).
+    """
+    parts = urllib.parse.urlsplit(raw.strip())
+    if parts.scheme.lower() == "https" or not parts.hostname:
+        return False
+    return not _is_loopback_host(parts.hostname)
+
+
 def _oauth_settings() -> Tuple[str, str, str, str, Dict[str, str]]:
     """Resolve the OIDC client-credentials settings, or fail closed."""
     endpoint = (os.getenv(ENV_OAUTH_TOKEN_ENDPOINT) or "").strip()
@@ -324,6 +374,24 @@ def _oauth_settings() -> Tuple[str, str, str, str, Dict[str, str]]:
             f"{ENV_SASL_MECHANISM}={MECHANISM_OAUTHBEARER} requires "
             f"{ENV_OAUTH_TOKEN_ENDPOINT} (the OIDC token endpoint to fetch the "
             "bearer token from)"
+        )
+    scheme = urllib.parse.urlsplit(endpoint).scheme.lower()
+    if scheme not in ("https", "http"):
+        raise KafkaSecurityError(
+            f"{ENV_OAUTH_TOKEN_ENDPOINT}={endpoint!r} has scheme {scheme!r}; "
+            "the client-credentials grant is an HTTP POST "
+            "(want https://issuer/oauth2/token)"
+        )
+    allow_insecure = (
+        os.getenv(ENV_OAUTH_ALLOW_INSECURE_TOKEN_ENDPOINT) or ""
+    ).strip().lower() in _TRUTHY
+    if not allow_insecure and _token_endpoint_is_insecure(endpoint):
+        raise KafkaSecurityError(
+            f"{ENV_OAUTH_TOKEN_ENDPOINT}={endpoint!r} is http and its host is "
+            f"not loopback, so {ENV_OAUTH_CLIENT_SECRET} would be sent in the "
+            "clear on every token fetch; use https, a loopback address, or set "
+            f"{ENV_OAUTH_ALLOW_INSECURE_TOKEN_ENDPOINT}=true for a disposable "
+            "test rig"
         )
     client_id = (
         os.getenv(ENV_OAUTH_CLIENT_ID) or os.getenv(ENV_SASL_USERNAME) or ""
@@ -389,6 +457,11 @@ def kafka_security_kwargs() -> Dict[str, Any]:
             f"{ENV_SECURITY_PROTOCOL}={protocol!r} is not supported; "
             f"expected one of {sorted(_PROTOCOLS)}"
         )
+
+    # Every Kafka client in this service is built from these kwargs, so this is
+    # the one place that guarantees the explainer is recording before a client
+    # can fail. See explain_failure() for why the exception alone is not enough.
+    arm_failure_explainer()
 
     kwargs: Dict[str, Any] = {"security_protocol": protocol}
 
@@ -456,6 +529,177 @@ def kafka_security_kwargs() -> Dict[str, Any]:
             kwargs["sasl_plain_password"] = password
 
     return kwargs
+
+
+# ---------------------------------------------------------------------------
+# Why a connection failed
+#
+# kafka-python raises the WRONG exception for every auth and TLS failure there
+# is. The broker does not answer "403" -- it closes the socket, or it answers a
+# SaslAuthenticationException that the client swallows into its connection
+# state machine and then retries. What surfaces to the caller, seconds later, is
+#
+#     KafkaTimeoutError: Failed to update metadata after 60.0 secs
+#
+# for a wrong password, an untrusted CA, a missing client certificate, an
+# expired token and a broker that is genuinely down -- one message for five
+# unrelated causes, none of which it names. Operators read it as "the network",
+# and a Kafka security misconfiguration is then invisible for as long as it
+# takes someone to run a CLI client by hand.
+#
+# The real verdict IS available: kafka-python logs it on the `kafka` logger at
+# WARNING/ERROR before it converts the failure into retry state. So this keeps
+# the last few such records and hands the most specific one back alongside the
+# useless exception. Read-only -- it adds a handler, never a filter, and leaves
+# propagate alone, so a service's own logging is unchanged.
+#
+# Adapted from the kafka-matrix probe's log capture, which is where this was
+# first needed (deploy/helm/rsync-ai/test/kind/kafka-matrix/probe.py) -- and
+# which is the reason it lives HERE rather than in each caller: the probe and
+# the services have to agree about what "the cause" is, or the matrix cannot
+# be evidence for the product.
+# ---------------------------------------------------------------------------
+
+# A record is a candidate cause only if it mentions one of these. Everything
+# kafka-python logs at WARNING is otherwise routine reconnect chatter.
+_CAUSE_KEYS = (
+    "authenticat",        # SaslAuthenticationFailed, "authentication failed"
+    "sasl",
+    "ssl",
+    "certificate",
+    "tls",
+    "handshake",
+    "unknown authority",
+    "verify failed",
+    "token",
+    "unauthor",
+    "403",
+    "401",
+)
+
+# Ties broken toward the most specific verdict. A broker that refuses a client
+# usually ALSO races a plain "socket disconnected" onto the same logger, and
+# that one is true but useless -- it is the symptom the caller already has.
+_CAUSE_RANK = (
+    "saslauthenticationfailed",
+    "authentication failed",
+    "certificate_verify_failed",
+    "certificate verify failed",
+    "unknown authority",
+    "bad certificate",
+    "certificate required",
+    "handshake",
+    "invalid_token",
+    "invalid_client",
+    "could not obtain",
+)
+
+# Bounded on purpose: this is armed for the life of a long-running service, and
+# an unbounded list of every Kafka warning is a slow leak. Only the last few
+# matter -- the cause is logged within milliseconds of the failure.
+_CAUSE_BUFFER_SIZE = 32
+_cause_records: "collections.deque[str]" = collections.deque(maxlen=_CAUSE_BUFFER_SIZE)
+_cause_lock = threading.Lock()
+_cause_armed = False
+
+
+class _CauseRecorder(logging.Handler):
+    """Keeps the text of kafka-python's own warnings, and nothing else."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+        except Exception:  # noqa: BLE001 -- a broken format string is not our failure
+            return
+        with _cause_lock:
+            _cause_records.append(message)
+
+
+def _secret_values() -> List[str]:
+    """Every configured value that must never appear in a surfaced message.
+
+    kafka-python does not log credentials today, but this text is built from a
+    third party's log records and is handed to callers that log it, put it in an
+    API response, or -- via the LLM call sites -- into a prompt. Redacting at
+    the boundary is cheap; auditing every future kafka-python release is not.
+    """
+    values = []
+    for name in (ENV_SASL_PASSWORD, ENV_OAUTH_CLIENT_SECRET,
+                 ENV_SR_PASSWORD, ENV_SR_BASIC_AUTH):
+        value = (os.getenv(name) or "").strip()
+        # Below 8 characters a "secret" is more likely to be a substring of
+        # ordinary words in the message than the credential itself, and
+        # redacting those would corrupt the very text this exists to surface.
+        if len(value) >= 8:
+            values.append(value)
+    return values
+
+
+def _redact(text: str) -> str:
+    for value in _secret_values():
+        text = text.replace(value, "***")
+    return text
+
+
+def arm_failure_explainer() -> None:
+    """Start recording kafka-python's warnings so explain_failure() can use them.
+
+    Idempotent and safe to call from any thread; kafka_security_kwargs() calls
+    it, so every client built through this module is covered without the call
+    site remembering.
+    """
+    global _cause_armed
+    with _cause_lock:
+        if _cause_armed:
+            return
+        _cause_armed = True
+    handler = _CauseRecorder(level=logging.WARNING)
+    logger = logging.getLogger("kafka")
+    logger.addHandler(handler)
+    # Arming is a diagnostic aid and must be invisible in the service's own
+    # output, so the ONLY level this touches is one nobody chose: a kafka logger
+    # still at NOTSET that inherits a threshold above WARNING, where the records
+    # this depends on are never created at all. A level set ON the kafka logger
+    # -- including a quieter one -- is a deliberate choice about kafka's output
+    # and is left exactly as found, as is propagate.
+    if (
+        logger.level == logging.NOTSET
+        and logger.getEffectiveLevel() > logging.WARNING
+    ):
+        logger.setLevel(logging.WARNING)
+
+
+def failure_cause() -> Optional[str]:
+    """The most specific auth/TLS verdict kafka-python has logged, if any."""
+    with _cause_lock:
+        candidates = [m for m in _cause_records
+                      if any(k in m.lower() for k in _CAUSE_KEYS)]
+    if not candidates:
+        return None
+    # Most recent first, then most specific: a stale record from an earlier
+    # reconnect must not outrank the one that explains this failure.
+    candidates.reverse()
+    best = min(candidates, key=lambda m: next(
+        (i for i, r in enumerate(_CAUSE_RANK) if r in m.lower()), len(_CAUSE_RANK)))
+    return _redact(" ".join(best.split()))[:400]
+
+
+def explain_failure(exc: BaseException) -> str:
+    """`exc`, plus the real cause when kafka-python logged one.
+
+    Use this in the broad `except Exception` around any Kafka client startup:
+    the exception alone is `KafkaTimeoutError: Failed to update metadata`, which
+    is the same string for a wrong password and an unplugged broker.
+    """
+    described = _redact(f"{type(exc).__name__}: {exc}")
+    cause = failure_cause()
+    return f"{described} | cause: {cause}" if cause else described
+
+
+def reset_failure_cause() -> None:
+    """Drop recorded records. For tests, and for a caller retrying a new config."""
+    with _cause_lock:
+        _cause_records.clear()
 
 
 def describe() -> str:
@@ -658,7 +902,14 @@ def debezium_schema_history_security() -> Dict[str, str]:
             if "ssl_cafile" in base:
                 props[prefix + "ssl.truststore.type"] = "PEM"
                 props[prefix + "ssl.truststore.location"] = base["ssl_cafile"]
+            # mTLS. An explicit combined file wins; with only the two-path pair
+            # the Connect image has built one at a fixed path, so point there.
+            # Omitting it would leave the history client without a certificate
+            # on a cluster that requires one -- the connector snapshots, then
+            # fails its first history write with a handshake alert.
             keystore = (os.getenv(ENV_SSL_KEYSTORE_LOCATION) or "").strip()
+            if not keystore and "ssl_certfile" in base:
+                keystore = CONNECT_IMAGE_CLIENT_PEM
             if keystore:
                 props[prefix + "ssl.keystore.type"] = "PEM"
                 props[prefix + "ssl.keystore.location"] = keystore

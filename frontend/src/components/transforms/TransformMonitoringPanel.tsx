@@ -97,7 +97,7 @@ export function TransformMonitoringPanel({ pipelineId }: { pipelineId: string })
 
   if (loading) {
     return (
-      <div role="status" aria-live="polite" className="text-sm text-zinc-500">
+      <div role="status" aria-live="polite" className="text-sm text-zinc-500 dark:text-zinc-400">
         Loading transform history…
       </div>
     )
@@ -120,7 +120,7 @@ export function TransformMonitoringPanel({ pipelineId }: { pipelineId: string })
         </div>
 
         {!rollup || rollup.length === 0 ? (
-          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500">
+          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500 dark:text-zinc-400">
             No transform runs recorded yet.
           </div>
         ) : (
@@ -130,7 +130,7 @@ export function TransformMonitoringPanel({ pipelineId }: { pipelineId: string })
                 Transform run history — one row per execution, newest first, with net rows in and out,
                 rows dropped, duration and data freshness.
               </caption>
-              <thead className="bg-zinc-50 dark:bg-zinc-900/60 text-xs text-zinc-500">
+              <thead className="bg-zinc-50 dark:bg-zinc-900/60 text-xs text-zinc-500 dark:text-zinc-400">
                 <tr>
                   <th scope="col" className="px-3 py-2 text-left font-medium">Run</th>
                   <th scope="col" className="px-3 py-2 text-right font-medium">Transforms</th>
@@ -167,11 +167,11 @@ export function TransformMonitoringPanel({ pipelineId }: { pipelineId: string })
                       {r.rows_dropped > 0 ? (
                         <span className="text-amber-700 dark:text-amber-400">−{formatCount(r.rows_dropped)}</span>
                       ) : (
-                        <span className="text-zinc-500" title="No rows removed by this run's transforms">—</span>
+                        <span className="text-zinc-500 dark:text-zinc-400" title="No rows removed by this run's transforms">—</span>
                       )}
                     </td>
-                    <td className="px-3 py-2 text-right tabular-nums text-zinc-500">{formatDuration(r.total_duration_ms)}</td>
-                    <td className="px-3 py-2 text-right text-zinc-500">
+                    <td className="px-3 py-2 text-right tabular-nums text-zinc-500 dark:text-zinc-400">{formatDuration(r.total_duration_ms)}</td>
+                    <td className="px-3 py-2 text-right text-zinc-500 dark:text-zinc-400">
                       {r.latest_activity_at ? (
                         <div className="flex flex-col items-end leading-tight">
                           <time dateTime={r.latest_activity_at}>{formatAge(r.latest_activity_at)}</time>
@@ -192,7 +192,7 @@ export function TransformMonitoringPanel({ pipelineId }: { pipelineId: string })
             Showing the most recent runs only — older executions are not listed.
           </p>
         )}
-        <p className="text-xs text-zinc-500">
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
           &ldquo;Dropped&rdquo; is the rows a run actually removed (e.g. filter, null-handling, validation);
           transforms that don&apos;t reduce rows show &ldquo;—&rdquo;. &ldquo;Rows in → out&rdquo; is net across
           the whole run, not per transform step.
@@ -207,13 +207,13 @@ export function TransformMonitoringPanel({ pipelineId }: { pipelineId: string })
         </div>
 
         {slots.length === 0 ? (
-          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500">
+          <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500 dark:text-zinc-400">
             No transform configuration recorded across the pipeline&apos;s runs yet.
           </div>
         ) : (
           <>
             {!hasChanges && (
-              <p className="text-xs text-zinc-500">
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
                 No configuration changes across the recorded runs — showing the current baseline for each transform.
               </p>
             )}
@@ -254,12 +254,12 @@ function ConfigSlotCard({ slot }: { slot: ConfigSlot }) {
               )}
               <span className="font-medium text-zinc-900 dark:text-white truncate">{slot.table_name}</span>
               <Badge variant="outline" className="font-mono text-[10px]">#{slot.transform_order}</Badge>
-              <span className="text-xs text-zinc-500">{slot.transform_type}</span>
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">{slot.transform_type}</span>
             </div>
             {hasChanges ? (
               <Badge variant="secondary" className="shrink-0">{slot.revision_count} versions</Badge>
             ) : (
-              <Badge variant="outline" className="shrink-0 text-zinc-500">baseline</Badge>
+              <Badge variant="outline" className="shrink-0 text-zinc-500 dark:text-zinc-400">baseline</Badge>
             )}
           </button>
         </CollapsibleTrigger>
@@ -280,7 +280,7 @@ function ConfigSlotCard({ slot }: { slot: ConfigSlot }) {
                       {rev.execution_id.slice(0, 8)}
                     </Link>
                     {isCurrent && <Badge variant="success" className="text-[10px]">current</Badge>}
-                    <time dateTime={rev.first_seen_at} className="text-xs text-zinc-500">
+                    <time dateTime={rev.first_seen_at} className="text-xs text-zinc-500 dark:text-zinc-400">
                       {formatAbsoluteTime(rev.first_seen_at) || formatAge(rev.first_seen_at)}
                     </time>
                     {changed.length > 0 ? (
@@ -294,7 +294,7 @@ function ConfigSlotCard({ slot }: { slot: ConfigSlot }) {
                         </Badge>
                       ))
                     ) : (
-                      <span className="text-[10px] text-zinc-500">baseline</span>
+                      <span className="text-[10px] text-zinc-500 dark:text-zinc-400">baseline</span>
                     )}
                   </div>
                   <RevisionConfig rev={rev} prev={prev} />
@@ -333,7 +333,7 @@ function RevisionConfig({ rev, prev }: { rev: ConfigRevision; prev?: ConfigRevis
         const showDiff = isChanged && prev && before[k] !== undefined
         return (
           <Fragment key={k}>
-            <dt className={isChanged ? "text-blue-600 dark:text-blue-400 font-semibold" : "text-zinc-500"}>{k}</dt>
+            <dt className={isChanged ? "text-blue-600 dark:text-blue-400 font-semibold" : "text-zinc-500 dark:text-zinc-400"}>{k}</dt>
             <dd className="text-zinc-800 dark:text-zinc-200 break-all">
               {showDiff ? (
                 <>

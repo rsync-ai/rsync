@@ -17,13 +17,19 @@ import {
   Play,
   Layers,
 } from "lucide-react"
-import { formatDateTime, cn } from "@/lib/utils"
+import { cn, formatElapsed } from "@/lib/utils"
+import { LocalDateTime } from "@/components/ui/local-date-time"
 import { ExecutionDetailClient } from "@/components/executions/ExecutionDetailClient"
 import { TransformExecutionLogsPanel, type TransformExecutionLog } from "@/components/transforms/TransformExecutionLogsPanel"
 import { ExecutionComparison } from "@/components/executions/ExecutionComparison"
-import { TableStatisticsPanel } from "@/components/pipeline/TableStatisticsPanel"
+import { RunLogPanel } from "@/components/executions/RunLogPanel"
 import { DiagnosisCard, type DiagnosisData } from "@/components/chat/DiagnosisCard"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import {
+  pickExecutionFreshness,
+  type FreshnessLabel,
+  type RuntimeLivenessLike,
+} from "@/lib/pipeline/executionFreshness"
 import { cookies } from "next/headers"
 import { activeWorkspaceCookieHeader } from "@/lib/workspace/server-workspace"
 import {
@@ -40,13 +46,15 @@ interface Props {
 
 // formatAge renders a coarse "how long ago" label for the freshness KPI. Computed
 // at render (the page is force-dynamic), so it reflects staleness at page load.
+// Floored like every other age in the app: rounding made 15h40m read "16h ago"
+// here while the pipeline page said "15h ago" for the same moment.
 function formatAge(ms: number): string {
   if (ms < 45_000) return "just now"
-  const mins = Math.round(ms / 60_000)
-  if (mins < 60) return `${mins}m ago`
-  const hrs = Math.round(ms / 3_600_000)
+  const mins = Math.floor(ms / 60_000)
+  if (mins < 60) return `${Math.max(1, mins)}m ago`
+  const hrs = Math.floor(ms / 3_600_000)
   if (hrs < 24) return `${hrs}h ago`
-  const days = Math.round(ms / 86_400_000)
+  const days = Math.floor(ms / 86_400_000)
   return `${days}d ago`
 }
 
@@ -70,11 +78,9 @@ export default async function ExecutionDetailPage({ params }: Props) {
   let diagnosis: DiagnosisData | null = null
   let config: ExecutionStatusConfig = statusConfig.pending
   let freshnessAge = "—"
+  // ISO string, rendered by <LocalDateTime> so it shows in the viewer's zone.
   let freshnessAbs: string | null = null
-  // Whether data actually LANDED. Only a clean success may claim "Landed …"; a
-  // failed / silent-drop / still-running execution shows "Last activity" instead,
-  // so the freshness card never contradicts a red "Execution Failed" banner.
-  let freshnessLanded = false
+  let freshnessLabel: FreshnessLabel = "Last activity"
 
   try {
     const res = await fetch(API_ENDPOINTS.EXECUTIONS.GET_INTERNAL(id), {
@@ -98,6 +104,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
       status: normalizeExecutionStatus(rawExecution.status, rawExecution.error_message),
       startedAt: rawExecution.start_time ? new Date(rawExecution.start_time) : new Date(),
       finishedAt: rawExecution.end_time ? new Date(rawExecution.end_time) : null,
+      liveStream: rawExecution.live_stream === true,
       error: rawExecution.error_message || null,
       nodeResults: Array.isArray(rawExecution.node_results) ? rawExecution.node_results : [],
       pipeline: rawExecution.pipeline || { 
@@ -121,10 +128,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
         const diffMs = end.getTime() - start.getTime()
         
         if (diffMs < 0) return "0s"
-        if (diffMs < 1000) return `${diffMs}ms`
-        if (diffMs < 60000) return `${Math.round(diffMs / 1000)}s`
-        if (diffMs < 3600000) return `${Math.round(diffMs / 60000)}m ${Math.round((diffMs % 60000) / 1000)}s`
-        return `${Math.round(diffMs / 3600000)}h ${Math.round((diffMs % 3600000) / 60000)}m`
+        return formatElapsed(diffMs)
       } catch (e) {
         return "-"
       }
@@ -148,23 +152,37 @@ export default async function ExecutionDetailPage({ params }: Props) {
       transformLogs = []
     }
 
-    // Freshness KPI: how recently did this run's data land? Prefer the most recent
-    // transform-log activity, fall back to the execution end_time. Derived at render
-    // (force-dynamic) — no new endpoint. Absent when neither source has a timestamp.
-    const landedTimes: number[] = []
-    if (execution.finishedAt) landedTimes.push(new Date(execution.finishedAt).getTime())
-    for (const l of transformLogs) {
-      const ts = l.updated_at || l.created_at
-      if (ts) {
-        const m = new Date(ts).getTime()
-        if (!Number.isNaN(m)) landedTimes.push(m)
+    // Freshness KPI. A live stream has no end time, so it reads the pipeline's
+    // runtime liveness — the same "last event" the pipeline page shows. Best-effort:
+    // an unreadable runtime falls back to the landed time.
+    let liveness: RuntimeLivenessLike | null = null
+    if (execution.liveStream && execution.pipelineId) {
+      try {
+        const rtRes = await fetch(API_ENDPOINTS.PIPELINES.RUNTIME_INTERNAL(execution.pipelineId), {
+          cache: "no-store",
+          headers: { ...authHeaders },
+        })
+        if (rtRes.ok) {
+          const rt = (await rtRes.json()) as { liveness?: RuntimeLivenessLike | null } | null
+          liveness = rt && typeof rt.liveness === "object" ? rt.liveness : null
+        }
+      } catch {
+        liveness = null
       }
     }
-    if (landedTimes.length) {
-      const latest = Math.max(...landedTimes)
-      freshnessAbs = formatDateTime(new Date(latest))
-      freshnessAge = formatAge(Math.max(0, Date.now() - latest))
-      freshnessLanded = execution.status === "completed" || execution.status === "success"
+    const now = Date.now()
+    const freshness = pickExecutionFreshness({
+      status: execution.status,
+      liveStream: execution.liveStream,
+      finishedAt: execution.finishedAt,
+      transformTimes: transformLogs.map((l) => l.updated_at || l.created_at),
+      liveness,
+      now,
+    })
+    freshnessLabel = freshness.label
+    if (freshness.at !== null) {
+      freshnessAbs = new Date(freshness.at).toISOString()
+      freshnessAge = formatAge(Math.max(0, now - freshness.at))
     }
 
     // Fetch the Phase 3 diagnosis for failed/silent-drop executions. Best-effort:
@@ -217,7 +235,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
       <div className="flex flex-col items-center justify-center min-h-[400px] gap-4">
         <AlertTriangle className="h-10 w-10 text-red-500" />
         <h2 className="text-xl font-semibold">Failed to load execution details</h2>
-        <p className="text-zinc-500">{String(error)}</p>
+        <p className="text-zinc-500 dark:text-zinc-400">{String(error)}</p>
         <Link href="/executions">
           <Button variant="outline">Back to Executions</Button>
         </Link>
@@ -231,11 +249,11 @@ export default async function ExecutionDetailPage({ params }: Props) {
     <div className="space-y-6">
       {/* Header */}
       <div className="flex items-center gap-4">
-        <Link href="/executions">
-          <Button variant="ghost" size="icon">
+        <Button asChild variant="ghost" size="icon">
+          <Link href="/executions" aria-label="Back to executions">
             <ArrowLeft className="h-5 w-5" />
-          </Button>
-        </Link>
+          </Link>
+        </Button>
         <div className="flex-1">
           <div className="flex items-center gap-3">
             <h1 className="text-2xl font-bold text-zinc-900 dark:text-white">
@@ -246,7 +264,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
               {config.label}
             </Badge>
           </div>
-          <p className="text-sm text-zinc-500 mt-1 font-mono">
+          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1 font-mono">
             {execution.id}
           </p>
         </div>
@@ -261,7 +279,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
                 <GitBranch className="h-5 w-5 text-violet-600 dark:text-violet-400" />
               </div>
               <div>
-                <p className="text-xs text-zinc-500">Pipeline</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">Pipeline</p>
                 <Link 
                   href={`/pipelines/${execution.pipeline.id}`}
                   className="text-sm font-semibold text-zinc-900 dark:text-white hover:text-violet-600 dark:hover:text-violet-400"
@@ -280,13 +298,13 @@ export default async function ExecutionDetailPage({ params }: Props) {
                 <Calendar className="h-5 w-5 text-blue-600 dark:text-blue-400" />
               </div>
               <div>
-                <p className="text-xs text-zinc-500">Started At</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">Started At</p>
                 <p className="text-sm font-semibold text-zinc-900 dark:text-white">
-                  {formatDateTime(execution.startedAt)}
+                  <LocalDateTime value={execution.startedAt} />
                 </p>
                 {execution.finishedAt && (
-                  <p className="text-xs text-zinc-500 mt-1">
-                    Ended {formatDateTime(execution.finishedAt)}
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+                    Ended <LocalDateTime value={execution.finishedAt} />
                   </p>
                 )}
               </div>
@@ -301,7 +319,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
                 <Timer className="h-5 w-5 text-emerald-600 dark:text-emerald-400" />
               </div>
               <div>
-                <p className="text-xs text-zinc-500">Duration</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">Duration</p>
                 <p className="text-sm font-semibold text-zinc-900 dark:text-white">
                   {duration}
                 </p>
@@ -321,7 +339,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
                   <Layers className="h-5 w-5 text-amber-600 dark:text-amber-400" />
                 </div>
                 <div>
-                  <p className="text-xs text-zinc-500">Nodes Executed</p>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">Nodes Executed</p>
                   <p className="text-sm font-semibold text-zinc-900 dark:text-white">
                     {nodeResults.length} nodes
                   </p>
@@ -338,13 +356,13 @@ export default async function ExecutionDetailPage({ params }: Props) {
                 <Clock className="h-5 w-5 text-teal-600 dark:text-teal-400" />
               </div>
               <div>
-                <p className="text-xs text-zinc-500">Data Freshness</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">Data Freshness</p>
                 <p className="text-sm font-semibold text-zinc-900 dark:text-white">
                   {freshnessAge}
                 </p>
                 {freshnessAbs && (
-                  <p className="text-xs text-zinc-500 mt-1">
-                    {freshnessLanded ? "Landed" : "Last activity"} {freshnessAbs}
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">
+                    {freshnessLabel} <LocalDateTime value={freshnessAbs} />
                   </p>
                 )}
               </div>
@@ -385,6 +403,11 @@ export default async function ExecutionDetailPage({ params }: Props) {
         </div>
       )}
 
+      {/* The run's own log — where "View Logs" in a pipeline's ⋯ menu lands (#logs). */}
+      {execution.pipelineId && (
+        <RunLogPanel pipelineId={execution.pipelineId} executionId={execution.id} />
+      )}
+
       {/* Node Results */}
       <Card>
         <CardHeader className="pb-4">
@@ -398,13 +421,19 @@ export default async function ExecutionDetailPage({ params }: Props) {
         </CardContent>
       </Card>
 
-      {/* Per-table sync stats for this execution. Sorted failures-first by default. */}
+      {/* Row counts per table live on the pipeline's Table statistics tab; this
+          page used to repeat them where a run's log belongs. */}
       {execution.pipelineId && (
-        <TableStatisticsPanel
-          pipelineId={execution.pipelineId}
-          executionId={execution.id}
-          pipelineStatus={execution.status}
-        />
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">
+          Row counts per table are on the pipeline&apos;s{" "}
+          <Link
+            href={`/pipelines/${execution.pipelineId}?tab=table-stats`}
+            className="font-medium text-blue-700 underline-offset-2 hover:underline dark:text-blue-300"
+          >
+            Table statistics tab
+          </Link>
+          .
+        </p>
       )}
 
       {/* Comparison with previous run — uses /api/v1/pipelines/:id/compare
@@ -414,6 +443,9 @@ export default async function ExecutionDetailPage({ params }: Props) {
         <ExecutionComparison pipelineId={execution.pipelineId} executionId={execution.id} />
       )}
 
+      {/* Only batch runs record per-node results. A CDC run never has any, and an
+          empty "No node results available" card read as missing data. */}
+      {nodeResults.length > 0 && (
       <Card>
         <CardHeader className="pb-4">
           <CardTitle className="text-lg flex items-center gap-2">
@@ -422,12 +454,6 @@ export default async function ExecutionDetailPage({ params }: Props) {
           </CardTitle>
         </CardHeader>
         <CardContent>
-          {nodeResults.length === 0 ? (
-            <div className="text-center py-8 text-zinc-500">
-              <Layers className="h-10 w-10 mx-auto mb-3 opacity-50" />
-              <p>No node results available</p>
-            </div>
-          ) : (
             <div className="space-y-4">
               {nodeResults.map((node: any, index: number) => {
                 const nodeConfig = statusConfig[node?.status as keyof typeof statusConfig] || statusConfig.pending
@@ -457,7 +483,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
                             <p className="font-semibold text-zinc-900 dark:text-white">
                               {node?.node_name || `Node ${index + 1}`}
                             </p>
-                            <p className="text-xs text-zinc-500 mt-0.5">
+                            <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-0.5">
                               {node?.node_id}
                             </p>
                           </div>
@@ -467,7 +493,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
                         </div>
                         
                         {node?.duration_ms !== undefined && (
-                          <p className="text-sm text-zinc-500 mt-2">
+                          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-2">
                             Duration: {node.duration_ms}ms
                             {node.row_count !== undefined && ` • ${node.row_count} rows processed`}
                           </p>
@@ -484,9 +510,9 @@ export default async function ExecutionDetailPage({ params }: Props) {
                 )
               })}
             </div>
-          )}
         </CardContent>
       </Card>
+      )}
 
       {/* Actions */}
       <ExecutionDetailClient 
@@ -494,6 +520,7 @@ export default async function ExecutionDetailPage({ params }: Props) {
           id: execution.id,
           status: execution.status,
           pipelineId: execution.pipelineId || "",
+          liveStream: execution.liveStream === true,
         }} 
       />
     </div>

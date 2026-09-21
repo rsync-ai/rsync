@@ -23,7 +23,7 @@ import { ConnectorLogo } from "@/components/connectors/ConnectorLogo"
 import { formatDateTime } from "@/lib/utils"
 // `stageDurationMs` lives in dagHelpers, which imports only the TYPE from this
 // file — an `import type` is erased at compile time, so this is not a runtime cycle.
-import { stageDurationMs } from "./dagHelpers"
+import { formatDuration, stageDurationMs } from "./dagHelpers"
 
 // =============================================================================
 // Types
@@ -194,16 +194,12 @@ export function getNodeKindTextColor(kind: string): string {
     condition: "text-orange-600 dark:text-orange-400",
     api_call: "text-indigo-600 dark:text-indigo-400",
   }
-  return map[kind] || "text-zinc-500"
+  return map[kind] || "text-zinc-500 dark:text-zinc-400"
 }
 
-export function formatDuration(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
-  const m = Math.floor(ms / 60000)
-  const s = Math.round((ms % 60000) / 1000)
-  return s > 0 ? `${m}m ${s}s` : `${m}m`
-}
+// Lives in dagHelpers so the Overview's stage list can share it without pulling
+// in this component; re-exported for the existing importers.
+export { formatDuration }
 
 // =============================================================================
 // Layout Functions
@@ -341,7 +337,7 @@ export function DAGVisualization({ stages, compact = false, onNodeClick, selecte
 
   if (layout.nodes.length === 0) {
     return (
-      <div className="flex items-center justify-center py-12 text-zinc-500">
+      <div className="flex items-center justify-center py-12 text-zinc-500 dark:text-zinc-400">
         No DAG nodes to display
       </div>
     )
@@ -707,7 +703,7 @@ export function LinearTimeline({ stages, compact = false, onStageClick, selected
                     {typeof stage.progress === "number" && stage.progress > 0 && (
                       <div className="flex items-center gap-2 justify-end">
                         <Progress value={stage.progress} className="w-24" />
-                        <span className="text-sm text-zinc-600">{stage.progress}%</span>
+                        <span className="text-sm text-zinc-600 dark:text-zinc-400">{stage.progress}%</span>
                       </div>
                     )}
                     {/* Duration pill */}

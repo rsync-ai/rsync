@@ -33,14 +33,28 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { toast } from "sonner"
+import {
+  connectorDeployingErrorMessage,
+  connectorDeployingMessage,
+  connectorDeployingSaveNotice,
+  isConnectorDeployingResponse,
+} from "@/lib/errors/connector-deploying"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { MCPConnector } from "@/lib/types/mcp-connector"
+import { MCPConnector, getConnectorDisplayName } from "@/lib/types/mcp-connector"
+import { formatConfigLabel } from "@/lib/utils/config-label"
 import { OAuthConnectButton } from "@/components/oauth/OAuthConnectButton"
 import { GenericConnectorForm } from "@/components/connectors/GenericConnectorForm"
 import { ConnectionLogo } from "@/components/connectors/ConnectionLogo"
+import {
+  ConnectionTestBadge,
+  LastTestFailedAlert,
+  connectionTestState,
+  lastTestSummary,
+} from "@/components/connectors/ConnectionTestStatus"
 import { httpErrorFromResponse, parseApiError, classifyError } from "@/lib/utils/error-handling"
 import type { ApiErrorBody } from "@/lib/api/types"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 interface Connection {
   id: string
@@ -52,7 +66,11 @@ interface Connection {
   cdc_mode?: "initial" | "streaming_only"
   config: Record<string, unknown>
   status: string
+  // Derived by the gateway from the stored last_test_status (connections.go).
   is_connected?: boolean
+  last_tested_at?: string
+  last_test_status?: string
+  last_test_error?: string
   // OAuth token expiry surfaced by api-gateway (BUG-2/10/NEW-2).
   is_expired?: boolean
   created_at: string
@@ -68,6 +86,124 @@ type BlockingPipeline = {
 
 interface Props {
   params: Promise<{ id: string }>
+}
+
+// ---------------------------------------------------------------------------
+// Configuration summary rows (issue #11).
+//
+// The summary used to print every stored config value as-is. Two things went
+// wrong with that: a cleared MongoDB port had been saved as `port: 0`, so the
+// page said "Port 0"; and a MongoDB URI stored under `mongodb_uri` or `uri` is
+// not masked by the gateway, so its username and password were printed. The
+// rules below fix both for connections already stored — no migration needed.
+// Kept module-private: a Next page file may only export the page itself.
+// ---------------------------------------------------------------------------
+
+const SECRET_MASK = "••••••••"
+
+// A config key names a secret when it contains any of these or ends in "_key".
+// Together they cover every key the gateway masks (its exact list, suffixes and
+// substrings; connection_string is handled below) plus "token" anywhere, so a
+// secret the gateway returns unmasked, such as "AuthToken", is still hidden.
+const SENSITIVE_KEY_PARTS = [
+  "password", "passwd", "secret", "token", "api_key", "apikey", "access_key",
+  "private_key", "credential", "service_account",
+]
+
+// Keys that hold a whole connection URI. The value can carry a username and
+// password, so it is never printed: only the host list it points at.
+const CONNECTION_STRING_KEYS = new Set([
+  "connection_string", "mongodb_connection_string", "mongodb_uri", "uri",
+])
+
+// The MongoDB connector's id and its aliases, compared the way connection
+// validation folds a type: lower-case, with spaces, "-" and "_" removed.
+const MONGODB_CONNECTOR_TYPES = new Set(["mongodb", "mongo", "mongodbatlas", "atlas"])
+
+function foldConnectorType(connectorType: string | undefined): string {
+  return (connectorType || "").trim().toLowerCase().replace(/[\s_-]/g, "")
+}
+
+const URI_HOST = /^(?:[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?|\[[0-9A-Fa-f:.]+\])(?::\d{1,5})?$/
+
+function isSensitiveKey(key: string): boolean {
+  const k = key.toLowerCase()
+  return k.endsWith("_key") || SENSITIVE_KEY_PARTS.some((part) => k.includes(part))
+}
+
+// The host list of `scheme://[user:pass@]host[:port][,host…][/db][?opts]`, with
+// the credentials dropped. Returns null whenever the value does not split
+// cleanly — the caller then masks it, so a malformed URI can never leak part of
+// a password as a "host".
+function connectionStringHosts(raw: unknown): string | null {
+  if (typeof raw !== "string") return null
+  const match = /^[a-z][a-z0-9+.-]*:\/\/([\s\S]*)$/i.exec(raw.trim())
+  if (!match) return null
+  const rest = match[1]
+  const end = rest.search(/[/?#]/)
+  const authority = end < 0 ? rest : rest.slice(0, end)
+  // An "@" after the authority means a password held an unescaped / ? or #:
+  // there is no safe place to cut, so give up.
+  if (end >= 0 && rest.slice(end).includes("@")) return null
+  const hosts = authority.slice(authority.lastIndexOf("@") + 1).split(",")
+  if (!hosts.every((host) => URI_HOST.test(host))) return null
+  return hosts.join(", ")
+}
+
+function isPortKey(key: string): boolean {
+  return key === "port" || key.endsWith("_port")
+}
+
+// 0, "", null and non-numbers mean "no port was set": the connector uses its
+// default, so the page shows no port rather than a number nothing listens on.
+function isSetPort(value: unknown): boolean {
+  if (typeof value === "number") return Number.isFinite(value) && value > 0
+  if (typeof value === "string") return /^\d+$/.test(value.trim()) && Number(value) > 0
+  return false
+}
+
+type ConfigRow = { key: string; label: string; value: string }
+
+function configSummaryRows(
+  connectorType: string | undefined,
+  config: Record<string, unknown> | null | undefined,
+): ConfigRow[] {
+  if (!config) return []
+  const entries = Object.entries(config)
+  const isMongo = MONGODB_CONNECTOR_TYPES.has(foldConnectorType(connectorType))
+  const connectionString = entries.find(
+    ([key, value]) => CONNECTION_STRING_KEYS.has(key) && typeof value === "string" && value.trim() !== "",
+  )
+  // MongoDB reads only the connection string when one is set (host and port are
+  // ignored), so its host list replaces the host/port rows.
+  const mongoUriHosts = isMongo && connectionString ? connectionStringHosts(connectionString[1]) : null
+
+  const rows: ConfigRow[] = []
+  for (const [key, value] of entries) {
+    const label = formatConfigLabel(key)
+    if (isPortKey(key)) {
+      if (!isSetPort(value)) continue
+      if (isMongo && connectionString) continue
+    }
+    if (key === "host" && mongoUriHosts) continue
+    if (isSensitiveKey(key)) {
+      rows.push({ key, label, value: SECRET_MASK })
+      continue
+    }
+    if (typeof value === "string" && (CONNECTION_STRING_KEYS.has(key) || /^[a-z][a-z0-9+.-]*:\/\/[^@]*@/i.test(value.trim()))) {
+      if (value.trim() === "") {
+        rows.push({ key, label, value })
+        continue
+      }
+      // Any URI — or anything under a connection-string key — shows only its
+      // hosts; if those can't be read safely, it is masked like a password.
+      const hosts = connectionStringHosts(value)
+      rows.push(hosts ? { key, label: `${label} Host`, value: hosts } : { key, label, value: SECRET_MASK })
+      continue
+    }
+    rows.push({ key, label, value: String(value) })
+  }
+  return rows
 }
 
 export default function ConnectionDetailPage({ params }: Props) {
@@ -189,8 +325,28 @@ export default function ConnectionDetailPage({ params }: Props) {
       })
       
       if (!response.ok) {
-        const body = await response.json().catch(() => ({}))
-        throw Object.assign(new Error(), { statusCode: response.status, message: (body as ApiErrorBody)?.error || (body as ApiErrorBody)?.message || `HTTP ${response.status}` })
+        const body = (await response.json().catch(() => ({}))) as ApiErrorBody & { test_error?: string }
+        // The connector's container is still being set up: not a failed test, so
+        // tell the user to wait and save again instead of showing an error.
+        const deploying = connectorDeployingSaveNotice(response.status, body)
+        if (deploying) {
+          toast.info(deploying.title, { description: deploying.description })
+          throw Object.assign(new Error(deploying.description), { statusCode: response.status, alreadyReported: true })
+        }
+        // An edit that changes the config is tested before it is saved. Show the
+        // connector's own error: the generic 422 hint ("Check that all required
+        // fields are filled in correctly") would hide why the save was refused.
+        const refusal =
+          response.status === 422 && body.error === "connection_test_failed" && body.test_error
+            ? { title: "Connection test failed — changes not saved", description: body.test_error }
+            : response.status === 422 && body.error === "secret_required" && body.message
+              ? { title: "Changes not saved", description: body.message }
+              : null
+        if (refusal) {
+          toast.error(refusal.title, { description: refusal.description })
+          throw Object.assign(new Error(refusal.description), { statusCode: response.status, alreadyReported: true })
+        }
+        throw Object.assign(new Error(), { statusCode: response.status, message: body?.error || body?.message || `HTTP ${response.status}` })
       }
 
       toast.success("Connection updated successfully")
@@ -203,8 +359,10 @@ export default function ConnectionDetailPage({ params }: Props) {
         setConnection(connData)
       }
     } catch (err) {
-      const e = classifyError(err, "connections.update")
-      toast.error(e.title, { description: e.hint ?? e.message })
+      if (!(err as { alreadyReported?: boolean })?.alreadyReported) {
+        const e = classifyError(err, "connections.update")
+        toast.error(e.title, { description: e.hint ?? e.message })
+      }
       throw err
     }
   }
@@ -247,6 +405,17 @@ export default function ConnectionDetailPage({ params }: Props) {
     }
   }
 
+  // Re-read the connection after a test: the gateway stores the result
+  // (last_test_status / last_test_error) and derives is_connected from it.
+  const refreshConnection = async () => {
+    try {
+      const response = await authFetch(API_ENDPOINTS.CONNECTIONS.GET(id), { cache: "no-store" })
+      if (response.ok) setConnection(await response.json())
+    } catch {
+      // Non-critical: the toast already reported the result.
+    }
+  }
+
   const handleTestConnection = async () => {
     try {
       setTesting(true)
@@ -262,20 +431,19 @@ export default function ConnectionDetailPage({ params }: Props) {
               ? result.message
               : "Connection is working properly",
         })
-        // Optimistic update: show Connected immediately (backend doesn't persist is_connected on test)
-        setConnection((prev) => (prev ? { ...prev, is_connected: true, is_expired: false } : prev))
-        // Persist so the list page also shows Connected after navigating back
-        sessionStorage.setItem(`connection_tested_${id}`, "true")
-        // Refresh from backend; keep is_connected=true even if backend didn't persist it
-        const updatedResponse = await authFetch(API_ENDPOINTS.CONNECTIONS.GET(id), { cache: "no-store" })
-        if (updatedResponse.ok) {
-          const fresh = await updatedResponse.json()
-          setConnection({ ...fresh, is_connected: true, is_expired: false })
-        }
+        await refreshConnection()
+      } else if (isConnectorDeployingResponse(result)) {
+        // Connector container is still being set up on first use — not a failure.
+        toast.info("Connector is still being set up", {
+          description:
+            connectorDeployingErrorMessage(result.error || result.message) ?? connectorDeployingMessage(),
+        })
       } else {
         toast.error("Connection test failed", {
           description: result.error || result.message || "Unable to connect",
         })
+        // The failure is stored too; the alert below the header shows it.
+        await refreshConnection()
       }
     } catch (err) {
       const e = classifyError(err, "connections.test")
@@ -333,7 +501,7 @@ export default function ConnectionDetailPage({ params }: Props) {
   if (!connection) {
     return (
       <div className="text-center py-12">
-        <p className="text-zinc-500">Connection not found</p>
+        <p className="text-zinc-500 dark:text-zinc-400">Connection not found</p>
         <Button variant="outline" className="mt-4" asChild>
           <Link href="/connections">Back to Connections</Link>
         </Button>
@@ -341,16 +509,18 @@ export default function ConnectionDetailPage({ params }: Props) {
     )
   }
 
+  const testState = connectionTestState(connection)
+
   return (
     <div className="space-y-6 max-w-4xl">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <Link href="/connections">
-            <Button variant="ghost" size="icon">
+          <Button asChild variant="ghost" size="icon">
+            <Link href="/connections" aria-label="Back to connections">
               <ArrowLeft className="h-5 w-5" />
-            </Button>
-          </Link>
+            </Link>
+          </Button>
           <ConnectionLogo connectorType={connection.connector_type} size="lg" />
           <div>
             <div className="flex items-center gap-3">
@@ -372,22 +542,22 @@ export default function ConnectionDetailPage({ params }: Props) {
                   {connection.sync_mode === "cdc" ? "Real-time CDC" : "Batch"}
                 </Badge>
               )}
-              {connection.is_expired && (
+              {testState === "expired" && (
                 <Badge className="bg-red-100 text-red-700 border-red-200 dark:bg-red-900/30 dark:text-red-300 dark:border-red-800">
                   <AlertTriangle className="h-3 w-3 mr-1" />
                   Token expired — re-authenticate
                 </Badge>
               )}
             </div>
-            <p className="text-sm text-zinc-500 mt-1 capitalize">
-              {connection.connector_type} connection
+            <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">
+              {getConnectorDisplayName(connection.connector_type)} connection
             </p>
           </div>
         </div>
         
         <div className="flex items-center gap-3">
           {/* Re-authenticate button — only shown when oauth token is expired */}
-          {connection.is_expired && connector?.oauth_provider && (
+          {testState === "expired" && connector?.oauth_provider && (
             <OAuthConnectButton
               provider={connector.oauth_provider}
               displayName={connection.name}
@@ -428,33 +598,27 @@ export default function ConnectionDetailPage({ params }: Props) {
         </div>
       </div>
 
+      {/* Why the last test failed — above the details, where the fix starts. */}
+      <LastTestFailedAlert connection={connection} onRetest={handleTestConnection} testing={testing} />
+
       {/* Connection Details Card */}
       <Card>
         <CardContent className="p-6">
           <div className="grid gap-6 md:grid-cols-2">
             <div>
-              <h3 className="text-sm font-medium text-zinc-500 mb-1">Connection ID</h3>
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-1">Connection ID</h3>
               <p className="font-mono text-sm">{connection.id}</p>
             </div>
             <div>
-              <h3 className="text-sm font-medium text-zinc-500 mb-1">Connector Type</h3>
-              <p className="capitalize">{connection.connector_type}</p>
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-1">Connector Type</h3>
+              <p>{getConnectorDisplayName(connection.connector_type)}</p>
             </div>
             <div>
-              <h3 className="text-sm font-medium text-zinc-500 mb-1">Status</h3>
-              {connection.is_expired ? (
-                <Badge className="bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
-                  <AlertTriangle className="h-3 w-3 mr-1" />
-                  Token Expired
-                </Badge>
-              ) : (
-                <Badge variant={connection.status === "active" ? "default" : "secondary"}>
-                  {connection.status}
-                </Badge>
-              )}
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-1">Status</h3>
+              <ConnectionTestBadge connection={connection} />
             </div>
             <div>
-              <h3 className="text-sm font-medium text-zinc-500 mb-1">Sync Mode</h3>
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-1">Sync Mode</h3>
               <p>
                 {connection.sync_mode === "cdc" 
                   ? connection.cdc_mode === "streaming_only"
@@ -464,42 +628,45 @@ export default function ConnectionDetailPage({ params }: Props) {
               </p>
             </div>
             <div>
-              <h3 className="text-sm font-medium text-zinc-500 mb-1">Created</h3>
-              <p>{new Date(connection.created_at).toLocaleString()}</p>
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-1">Last test</h3>
+              <p
+                data-testid="connection-last-test"
+                title={connection.last_tested_at ? formatAbsoluteTime(connection.last_tested_at) : undefined}
+              >
+                {lastTestSummary(connection)}
+              </p>
             </div>
             <div>
-              <h3 className="text-sm font-medium text-zinc-500 mb-1">Last Updated</h3>
-              <p>{new Date(connection.updated_at).toLocaleString()}</p>
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-1">Created</h3>
+              <p>{formatAbsoluteTime(connection.created_at)}</p>
+            </div>
+            <div>
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-1">Last Updated</h3>
+              <p>{formatAbsoluteTime(connection.updated_at)}</p>
             </div>
           </div>
           
           {connection.description && (
             <div className="mt-6 pt-6 border-t">
-              <h3 className="text-sm font-medium text-zinc-500 mb-1">Description</h3>
+              <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-1">Description</h3>
               <p className="text-zinc-700 dark:text-zinc-300">{connection.description}</p>
             </div>
           )}
 
           {/* Configuration Summary */}
           <div className="mt-6 pt-6 border-t">
-            <h3 className="text-sm font-medium text-zinc-500 mb-3">Configuration</h3>
+            <h3 className="text-sm font-medium text-zinc-500 dark:text-zinc-400 mb-3">Configuration</h3>
             <div className="grid gap-3 md:grid-cols-2">
-              {connection.config && Object.entries(connection.config).map(([key, value]) => {
-                // Hide sensitive fields
-                const isSensitive = ['password', 'secret', 'token', 'api_key', 'secret_key', 'access_key'].some(
-                  s => key.toLowerCase().includes(s)
-                )
-                return (
-                  <div key={key} className="flex items-center justify-between p-3 bg-zinc-50 dark:bg-zinc-800/50 rounded-lg">
-                    <span className="text-sm text-zinc-600 dark:text-zinc-400 capitalize">
-                      {key.replace(/_/g, ' ')}
-                    </span>
-                    <span className="text-sm font-medium text-zinc-900 dark:text-white">
-                      {isSensitive ? '••••••••' : String(value)}
-                    </span>
-                  </div>
-                )
-              })}
+              {configSummaryRows(connection.connector_type, connection.config).map((row) => (
+                <div key={row.key} className="flex items-center justify-between p-3 bg-zinc-50 dark:bg-zinc-800/50 rounded-lg">
+                  <span className="text-sm text-zinc-600 dark:text-zinc-400">
+                    {row.label}
+                  </span>
+                  <span className="text-sm font-medium text-zinc-900 dark:text-white">
+                    {row.value}
+                  </span>
+                </div>
+              ))}
             </div>
           </div>
         </CardContent>
@@ -538,7 +705,7 @@ export default function ConnectionDetailPage({ params }: Props) {
               connectionId={connection.id}
             />
           ) : (
-            <div className="py-8 text-center text-zinc-500">
+            <div className="py-8 text-center text-zinc-500 dark:text-zinc-400">
               <RefreshCw className="h-6 w-6 animate-spin mx-auto mb-2" />
               Loading connector schema...
             </div>

@@ -71,6 +71,17 @@ GUARDS = [
     # directly above: scripts/flip/apply-ci-split.py plus the ci.yml it
     # rewrites, covered by `scripts/flip/**` and `.github/workflows/**`.
     "test_flip_drops_a_changes_output_no_job_reads.py",
+    # Enrolled 2026-09-06. Third of the same family, and the same reason: its
+    # subjects are scripts/flip/apply-ci-split.py and the .github/workflows tree
+    # it reads to prove the post-condition holds on the produced files, both
+    # already covered -- but coverage that is never asserted is coverage nobody
+    # can tell from its absence.
+    "test_flip_refuses_a_stale_self_hosted_claim.py",
+    # Enrolled 2026-09-21. Fourth of the same family and the same reason: its subjects
+    # are scripts/flip/apply-ci-split.py, scripts/flip/assert-ci-split.py and every
+    # workflow under .github/workflows, covered by `scripts/flip/**` and
+    # `.github/workflows/**`. It is the one that runs the whole split on the real tree.
+    "test_flip_split_applies_to_the_current_workflows.py",
     # Enrolled 2026-09-08 with the CDC-profile fix. Its subjects are install.sh,
     # docker-compose.quickstart.yml, deploy/helm/rsync-ai/values.yaml and
     # backend-orchestrator/internal/workers/infra_preflight.go. The first three
@@ -87,15 +98,30 @@ GUARDS = [
     # were added to the `llm` filter in the same change, because a PR deleting the
     # adapter's dial retry touched nothing this job was gated on.
     "test_chart_waits_for_the_dependency_that_is_fatal_to_miss.py",
-    # Enrolled 2026-09-08 with the bundled-Ollama install. Its subjects are
-    # install.sh, docker-compose.ollama.yml and docker-compose.quickstart.yml,
+    # Enrolled 2026-09-07 with the bundled-Ollama overlay. Subjects are
+    # docker-compose.ollama.yml, docker-compose.quickstart.yml and install.sh,
+    # covered by `docker-compose*.yml` and `install.sh`. Enrolled for the reason
+    # the entries above give: GUARDS is a hand-maintained literal, so a guard that
+    # is never added to it reads exactly like one whose subjects are all covered.
+    "test_internal_llm_overlay_is_complete.py",
+    # Enrolled 2026-09-07 alongside the entry above -- the chart half of the same
+    # change. Subjects are deploy/helm/rsync-ai/{values.yaml,templates/_helpers.tpl,
+    # templates/infra/ollama.yaml,templates/jobs/ollama-pull.yaml,
+    # templates/apps/generation.yaml,templates/validate.yaml} plus
+    # docker-compose.ollama.yml, covered by `deploy/helm/**` and
+    # `docker-compose*.yml`. Both were already patterns before this test existed,
+    # which is exactly the case this literal is for: a guard whose subjects are
+    # covered but which is absent here is indistinguishable from one nobody
+    # enrolled because nothing gates it.
+    "test_chart_internal_llm_is_complete.py",
+    # Enrolled 2026-09-08 with the bundled-Ollama installer path. Its subjects
+    # are install.sh, docker-compose.ollama.yml and docker-compose.quickstart.yml,
     # all three already covered -- by `install.sh` and by the `docker-compose*.yml`
     # glob. Nothing in ci.yml had to change for it; it is listed for the reason
-    # every entry above gives, and it is the reason that made this pass: the
-    # guard was written, ran green, and a `--collect-only | grep` for its name
-    # returned NOTHING, because GUARDS is a hand-maintained literal and an
-    # absent guard produces zero cases -- indistinguishable in the log from a
-    # guard whose every subject is covered.
+    # every entry above gives, and this guard is the case that reason describes
+    # most exactly: GUARDS is a hand-maintained literal, an absent guard
+    # produces zero parametrised cases, and zero cases in the log is
+    # indistinguishable from a guard whose every subject is covered.
     "test_the_internal_llm_needs_no_manual_step.py",
     # Enrolled 2026-09-09 with the OTel export-error fix. Its subjects are the
     # three internal/telemetry packages in backend-orchestrator, api-gateway and
@@ -127,6 +153,37 @@ GUARDS = [
     # file reported `183 passed` -- a number that looks like coverage and was, for
     # the new guard, coverage of nothing.
     "test_quickstart_mounts_the_tree_the_code_reads.py",
+    # Enrolled 2026-09-18 with the security.yml consolidation. Its subjects are
+    # scripts/security/ci-scan.py and .github/workflows/security.yml. The
+    # workflow was covered by `.github/workflows/**`; the script was not, so the
+    # filter gained it in the same change -- it decides which modules a PR's
+    # blocking govulncheck scans, and a PR editing only it must run this guard.
+    "test_security_scan_scope.py",
+    # Enrolled 2026-09-18 with the duplicate-logic goldens. Their subjects are
+    # shared/sensitive_keys_golden.json and shared/postgres_family_golden.json,
+    # which the Go copies of the same lists are pinned to as well. Neither file is
+    # under a pattern the llm filter already had, so the filter gained both in the
+    # same change: a PR that edits only a golden is the drift these tests exist
+    # to catch, and without the entries it would have skipped this job.
+    "test_sensitive_keys_golden.py",
+    "test_postgres_family_golden.py",
+    # Enrolled 2026-09-20 with the plain-http OAuth token endpoint refusal. Its
+    # subjects are the eight files that each decide, separately, whether such an
+    # endpoint is refused. Seven matched a pattern the llm filter already had --
+    # shared/go/kafkaclient/config.go did not, and that is the tier the rule was
+    # written in first, so the filter gained `shared/go/kafkaclient/**` in the
+    # same change. Enrolling it was not enough on its own: the guard originally
+    # built each path from `REPO / "a" / "b"` segments, which _subjects_of
+    # cannot read, so this census would have counted it as declaring no subject
+    # and failed loudly at test_every_guard_declares_at_least_one_subject. The
+    # guard now writes one whole repo-relative string per subject.
+    #
+    # test_kafka_failure_explainer.py, written in the same change, is NOT
+    # enrolled: it imports the explainer and drives it, reading no file outside
+    # llm-service/tests, so `llm-service/**` already covers everything that can
+    # trigger it. That is the "genuinely reads nothing" case the assertion below
+    # names, not an omission.
+    "test_insecure_token_endpoint_rule_is_one_rule.py",
 ]
 
 

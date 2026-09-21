@@ -1,0 +1,646 @@
+{
+  "description": "Shared test vectors for the namespace filter (issue #31). Loaded by shared/mcp-connectors/tests/test_namespace_filter.py (Python: public/namespace_filter.py), backend-orchestrator/pkg/namespacefilter/filter_test.go (Go) and frontend/src/lib/pipeline/__tests__/namespaceFilter.test.ts (the connection modal's TypeScript preview copy). Each case gives a connection config. A case with expect_error=true must fail to parse. Otherwise the parsed mode and patterns must equal expect_mode/expect_patterns, and applying the filter to candidates (with system_names always rejected) must keep exactly expect_kept, in order, and set the no-match warning exactly when expect_warning is true.",
+  "cases": [
+    {
+      "name": "missing mode means all",
+      "config": {},
+      "expect_mode": "all",
+      "expect_patterns": [],
+      "candidates": [
+        "sales",
+        "hr"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "sales",
+        "hr"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "empty mode means all and ignores patterns",
+      "config": {
+        "namespace_filter_mode": "",
+        "namespace_filter_patterns": "sales"
+      },
+      "expect_mode": "all",
+      "expect_patterns": [
+        "sales"
+      ],
+      "candidates": [
+        "sales",
+        "hr"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "sales",
+        "hr"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "mode is trimmed and case-insensitive",
+      "config": {
+        "namespace_filter_mode": "  Include ",
+        "namespace_filter_patterns": "hr"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "hr"
+      ],
+      "candidates": [
+        "sales",
+        "hr"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "hr"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "many stars against a long non-matching name stays fast and does not match",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b"
+      ],
+      "candidates": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "stars in the middle must match segments in order",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "s*l*s"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "s*l*s"
+      ],
+      "candidates": [
+        "sales",
+        "slabs",
+        "sls",
+        "lass",
+        "salesx"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "sales",
+        "slabs",
+        "sls"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "unknown mode fails closed",
+      "config": {
+        "namespace_filter_mode": "everything",
+        "namespace_filter_patterns": "sales"
+      },
+      "expect_error": true
+    },
+    {
+      "name": "include with no patterns fails closed",
+      "config": {
+        "namespace_filter_mode": "include"
+      },
+      "expect_error": true
+    },
+    {
+      "name": "include with only separators and spaces fails closed",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": " , ,, "
+      },
+      "expect_error": true
+    },
+    {
+      "name": "exclude with no patterns means all",
+      "config": {
+        "namespace_filter_mode": "exclude",
+        "namespace_filter_patterns": ""
+      },
+      "expect_mode": "exclude",
+      "expect_patterns": [],
+      "candidates": [
+        "sales",
+        "hr"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "sales",
+        "hr"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "all mode still drops system namespaces",
+      "config": {
+        "namespace_filter_mode": "all"
+      },
+      "expect_mode": "all",
+      "expect_patterns": [],
+      "candidates": [
+        "admin",
+        "local",
+        "config",
+        "demo"
+      ],
+      "system_names": [
+        "admin",
+        "local",
+        "config"
+      ],
+      "expect_kept": [
+        "demo"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "include literal names with trimming and empty entries dropped",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": " sales , ,hr,"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "sales",
+        "hr"
+      ],
+      "candidates": [
+        "sales",
+        "hr",
+        "sales_archive",
+        "finance"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "sales",
+        "hr"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "include trailing star glob",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "sales*"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "sales*"
+      ],
+      "candidates": [
+        "public",
+        "sales",
+        "sales_archive",
+        "presales"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "sales",
+        "sales_archive"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "star matches the empty run of characters",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "app*db"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "app*db"
+      ],
+      "candidates": [
+        "appdb",
+        "app_prod_db",
+        "app",
+        "appdb2"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "appdb",
+        "app_prod_db"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "leading star and lone star",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "*_archive,*"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "*_archive",
+        "*"
+      ],
+      "candidates": [
+        "sales_archive",
+        "hr"
+      ],
+      "system_names": [
+        "pg_catalog"
+      ],
+      "expect_kept": [
+        "sales_archive",
+        "hr"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "match is anchored to the full name",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "sales"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "sales"
+      ],
+      "candidates": [
+        "sales",
+        "presales",
+        "sales2",
+        "my_sales_db"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "sales"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "names match case-insensitively (Oracle owners are upper-case)",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "hr,sales*"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "hr",
+        "sales*"
+      ],
+      "candidates": [
+        "HR",
+        "SALES_2024",
+        "Sales",
+        "SYS"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "HR",
+        "SALES_2024",
+        "Sales"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "system names are rejected case-insensitively and before include",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "*"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "*"
+      ],
+      "candidates": [
+        "SYS",
+        "SYSTEM",
+        "HR"
+      ],
+      "system_names": [
+        "sys",
+        "system"
+      ],
+      "expect_kept": [
+        "HR"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "exclude drops matches and keeps the rest",
+      "config": {
+        "namespace_filter_mode": "exclude",
+        "namespace_filter_patterns": "test*, tmp"
+      },
+      "expect_mode": "exclude",
+      "expect_patterns": [
+        "test*",
+        "tmp"
+      ],
+      "candidates": [
+        "prod",
+        "test",
+        "testing",
+        "tmp",
+        "tmp2"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "prod",
+        "tmp2"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "regex metacharacters are literal",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "a.b,c+d,e?f,g[1],h|i,(j),k^l$,m\\n,o{2}"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "a.b",
+        "c+d",
+        "e?f",
+        "g[1]",
+        "h|i",
+        "(j)",
+        "k^l$",
+        "m\\n",
+        "o{2}"
+      ],
+      "candidates": [
+        "a.b",
+        "axb",
+        "c+d",
+        "ccd",
+        "e?f",
+        "ef",
+        "g[1]",
+        "g1",
+        "h|i",
+        "h",
+        "(j)",
+        "j",
+        "k^l$",
+        "kl",
+        "m\\n",
+        "mn",
+        "o{2}",
+        "oo"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "a.b",
+        "c+d",
+        "e?f",
+        "g[1]",
+        "h|i",
+        "(j)",
+        "k^l$",
+        "m\\n",
+        "o{2}"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "zero matches on include is a warning, not an error",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "missing_db"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "missing_db"
+      ],
+      "candidates": [
+        "sales",
+        "hr"
+      ],
+      "system_names": [],
+      "expect_kept": [],
+      "expect_warning": true
+    },
+    {
+      "name": "exclude that removes everything warns",
+      "config": {
+        "namespace_filter_mode": "exclude",
+        "namespace_filter_patterns": "*"
+      },
+      "expect_mode": "exclude",
+      "expect_patterns": [
+        "*"
+      ],
+      "candidates": [
+        "sales",
+        "hr"
+      ],
+      "system_names": [],
+      "expect_kept": [],
+      "expect_warning": true
+    },
+    {
+      "name": "no candidates with an active filter warns",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "sales"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "sales"
+      ],
+      "candidates": [],
+      "system_names": [],
+      "expect_kept": [],
+      "expect_warning": true
+    },
+    {
+      "name": "mode all never warns even when nothing is left",
+      "config": {
+        "namespace_filter_mode": "all"
+      },
+      "expect_mode": "all",
+      "expect_patterns": [],
+      "candidates": [
+        "admin"
+      ],
+      "system_names": [
+        "admin"
+      ],
+      "expect_kept": [],
+      "expect_warning": false
+    },
+    {
+      "name": "exactly 128-byte pattern is accepted",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "candidates": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "a"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "129-byte pattern fails closed",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expect_error": true
+    },
+    {
+      "name": "pattern length is measured in UTF-8 bytes, not characters",
+      "config": {
+        "namespace_filter_mode": "exclude",
+        "namespace_filter_patterns": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé"
+      },
+      "expect_error": true
+    },
+    {
+      "name": "exactly 100 patterns is accepted",
+      "config": {
+        "namespace_filter_mode": "include",
+        "namespace_filter_patterns": "db0,db1,db2,db3,db4,db5,db6,db7,db8,db9,db10,db11,db12,db13,db14,db15,db16,db17,db18,db19,db20,db21,db22,db23,db24,db25,db26,db27,db28,db29,db30,db31,db32,db33,db34,db35,db36,db37,db38,db39,db40,db41,db42,db43,db44,db45,db46,db47,db48,db49,db50,db51,db52,db53,db54,db55,db56,db57,db58,db59,db60,db61,db62,db63,db64,db65,db66,db67,db68,db69,db70,db71,db72,db73,db74,db75,db76,db77,db78,db79,db80,db81,db82,db83,db84,db85,db86,db87,db88,db89,db90,db91,db92,db93,db94,db95,db96,db97,db98,db99"
+      },
+      "expect_mode": "include",
+      "expect_patterns": [
+        "db0",
+        "db1",
+        "db2",
+        "db3",
+        "db4",
+        "db5",
+        "db6",
+        "db7",
+        "db8",
+        "db9",
+        "db10",
+        "db11",
+        "db12",
+        "db13",
+        "db14",
+        "db15",
+        "db16",
+        "db17",
+        "db18",
+        "db19",
+        "db20",
+        "db21",
+        "db22",
+        "db23",
+        "db24",
+        "db25",
+        "db26",
+        "db27",
+        "db28",
+        "db29",
+        "db30",
+        "db31",
+        "db32",
+        "db33",
+        "db34",
+        "db35",
+        "db36",
+        "db37",
+        "db38",
+        "db39",
+        "db40",
+        "db41",
+        "db42",
+        "db43",
+        "db44",
+        "db45",
+        "db46",
+        "db47",
+        "db48",
+        "db49",
+        "db50",
+        "db51",
+        "db52",
+        "db53",
+        "db54",
+        "db55",
+        "db56",
+        "db57",
+        "db58",
+        "db59",
+        "db60",
+        "db61",
+        "db62",
+        "db63",
+        "db64",
+        "db65",
+        "db66",
+        "db67",
+        "db68",
+        "db69",
+        "db70",
+        "db71",
+        "db72",
+        "db73",
+        "db74",
+        "db75",
+        "db76",
+        "db77",
+        "db78",
+        "db79",
+        "db80",
+        "db81",
+        "db82",
+        "db83",
+        "db84",
+        "db85",
+        "db86",
+        "db87",
+        "db88",
+        "db89",
+        "db90",
+        "db91",
+        "db92",
+        "db93",
+        "db94",
+        "db95",
+        "db96",
+        "db97",
+        "db98",
+        "db99"
+      ],
+      "candidates": [
+        "db0",
+        "db99",
+        "db100"
+      ],
+      "system_names": [],
+      "expect_kept": [
+        "db0",
+        "db99"
+      ],
+      "expect_warning": false
+    },
+    {
+      "name": "101 patterns fail closed",
+      "config": {
+        "namespace_filter_mode": "exclude",
+        "namespace_filter_patterns": "db0,db1,db2,db3,db4,db5,db6,db7,db8,db9,db10,db11,db12,db13,db14,db15,db16,db17,db18,db19,db20,db21,db22,db23,db24,db25,db26,db27,db28,db29,db30,db31,db32,db33,db34,db35,db36,db37,db38,db39,db40,db41,db42,db43,db44,db45,db46,db47,db48,db49,db50,db51,db52,db53,db54,db55,db56,db57,db58,db59,db60,db61,db62,db63,db64,db65,db66,db67,db68,db69,db70,db71,db72,db73,db74,db75,db76,db77,db78,db79,db80,db81,db82,db83,db84,db85,db86,db87,db88,db89,db90,db91,db92,db93,db94,db95,db96,db97,db98,db99,db100"
+      },
+      "expect_error": true
+    }
+  ]
+}

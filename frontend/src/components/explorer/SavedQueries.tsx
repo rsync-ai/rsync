@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { toast } from "sonner"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { Badge } from "@/components/ui/badge"
@@ -48,7 +48,7 @@ import { canEditSavedQuery } from "@/lib/workspace/roles"
 import { SavedQueryEditDialog } from "./SavedQueryEditDialog"
 import { SavedQueryHistoryDialog } from "./SavedQueryHistoryDialog"
 import { SavedQueryModelDialog } from "./SavedQueryModelDialog"
-import { formatAbsoluteTime, formatNextRun } from "./scheduleTime"
+import { formatAbsoluteTime, formatNextRunOrDue, nextRunRefetchDelay } from "./scheduleTime"
 
 // Saved queries are workspace-scoped server-side records (migration 084), unlike
 // Query History which stays a per-browser localStorage scratchpad. The two are
@@ -202,11 +202,11 @@ function modelBadges(q: SavedQuery) {
           }
         >
           <Clock className="h-2.5 w-2.5 mr-0.5" />
-          {q.next_run_at ? formatNextRun(q.next_run_at) : "scheduled"}
+          {q.next_run_at ? formatNextRunOrDue(q.next_run_at, formatAbsoluteTime) : "scheduled"}
         </Badge>
       )}
       {q.schedule_status === "paused" && (
-        <Badge variant="outline" className="text-[10px] text-zinc-500">
+        <Badge variant="outline" className="text-[10px] text-zinc-500 dark:text-zinc-400">
           <Clock className="h-2.5 w-2.5 mr-0.5" />
           paused
         </Badge>
@@ -253,13 +253,29 @@ export function SavedQueries({
   const canSaveQuery = can("save_query")
   const canSchedule = can("schedule_query")
 
-  const load = useCallback(async () => {
+  // Counts user-visible loads. A background refetch applies its result only if no such
+  // load started while it was in flight — including the one a connection switch
+  // starts — so a late timed refetch cannot put another connection's rows back.
+  const foregroundLoads = useRef(0)
+  // Bumped when a background refetch settles, success or not, so the timer below
+  // re-arms even when a failed refetch left `items` untouched.
+  const [backgroundRefetches, setBackgroundRefetches] = useState(0)
+
+  // `background` is the timed refetch below: no spinner, and a failure keeps the rows
+  // already shown instead of swapping a working list for an error. Every other caller
+  // passes nothing and behaves exactly as before.
+  const load = useCallback(async (opts?: { background?: boolean }) => {
+    const background = opts?.background === true
     if (!connectionId) {
-      setItems([])
+      if (!background) setItems([])
       return
     }
-    setLoading(true)
-    setListError(null)
+    const seq = background ? foregroundLoads.current : ++foregroundLoads.current
+    const stale = () => background && seq !== foregroundLoads.current
+    if (!background) {
+      setLoading(true)
+      setListError(null)
+    }
     try {
       const res = await authFetch(
         `/api/v1/explorer/saved?connection_id=${encodeURIComponent(connectionId)}`
@@ -267,28 +283,44 @@ export function SavedQueries({
       if (res.status === 403) {
         // A 403 here just means the caller is below viewer in this workspace;
         // an empty panel is the honest rendering, not an error toast on mount.
-        setItems([])
+        if (!stale()) setItems([])
         return
       }
       if (!res.ok) {
         // Every other failure is a failure to LOAD, not a confirmed absence. Rendering
         // it as "No saved queries yet" tells the user their saved work is gone, and
         // invites them to re-save queries they already have.
-        setListError(`Could not load saved queries (HTTP ${res.status}).`)
+        if (!background) setListError(`Could not load saved queries (HTTP ${res.status}).`)
         return
       }
       const data = await res.json()
+      if (stale()) return
       setItems(Array.isArray(data?.saved_queries) ? data.saved_queries : [])
+      if (background) setListError(null)
     } catch {
-      setListError("Could not reach the server to load saved queries.")
+      if (!background) setListError("Could not reach the server to load saved queries.")
     } finally {
-      setLoading(false)
+      if (background) setBackgroundRefetches((n) => n + 1)
+      else setLoading(false)
     }
   }, [connectionId])
 
   useEffect(() => {
     void load()
   }, [load])
+
+  // next_run_at is an instant computed server-side, so once it passes the badge has
+  // nothing true to show until the server is asked for the following one. Re-ask a
+  // few seconds after the earliest comes due. Active schedules only — the badge is
+  // shown for nothing else, so no other row's time should cost a request.
+  useEffect(() => {
+    const delay = nextRunRefetchDelay(
+      items.map((q) => (q.schedule_status === "active" ? q.next_run_at : null)),
+    )
+    if (delay === null) return
+    const timer = setTimeout(() => void load({ background: true }), delay)
+    return () => clearTimeout(timer)
+  }, [items, load, backgroundRefetches])
 
   const handleSave = async () => {
     const trimmed = name.trim()
@@ -350,7 +382,7 @@ export function SavedQueries({
   return (
     <div className="space-y-3">
       <div className="flex items-center justify-between">
-        <span className="text-xs text-zinc-500">
+        <span className="text-xs text-zinc-500 dark:text-zinc-400">
           Shared with your workspace. Query History stays local to this browser.
         </span>
         <Button
@@ -373,14 +405,14 @@ export function SavedQueries({
 
       <div className="h-[400px] overflow-auto rounded-md border p-1">
         {loading ? (
-          <div className="flex items-center justify-center py-8 text-sm text-zinc-500">
+          <div className="flex items-center justify-center py-8 text-sm text-zinc-500 dark:text-zinc-400">
             <Loader2 className="h-4 w-4 mr-2 animate-spin" />
             Loading saved queries…
           </div>
         ) : listError ? (
           <div className="flex flex-col items-center gap-2 py-6 text-center">
             <p className="text-sm text-red-600 dark:text-red-400">{listError}</p>
-            <p className="text-xs text-zinc-500">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Your saved queries have not been changed.
             </p>
             <Button size="sm" variant="outline" onClick={() => void load()}>
@@ -388,7 +420,7 @@ export function SavedQueries({
             </Button>
           </div>
         ) : items.length === 0 ? (
-          <div className="text-sm text-zinc-500 py-6 text-center">
+          <div className="text-sm text-zinc-500 dark:text-zinc-400 py-6 text-center">
             No saved queries yet. Run something useful, then Save current.
           </div>
         ) : (
@@ -438,7 +470,7 @@ export function SavedQueries({
                     <Button
                       size="sm"
                       variant="ghost"
-                      className="h-6 px-1.5 text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                      className="h-6 px-1.5 text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
                       aria-label={`Schedule ${q.name}`}
                       disabled={!canSchedule}
                       title={
@@ -463,7 +495,7 @@ export function SavedQueries({
                     <Button
                       size="sm"
                       variant="ghost"
-                      className="h-6 px-1.5 text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                      className="h-6 px-1.5 text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
                       aria-label={`Edit ${q.name}`}
                       disabled={!canEdit}
                       title={
@@ -489,7 +521,7 @@ export function SavedQueries({
                     <Button
                       size="sm"
                       variant="ghost"
-                      className="h-6 px-1.5 text-xs text-zinc-500 hover:text-zinc-900 dark:hover:text-zinc-100"
+                      className="h-6 px-1.5 text-xs text-zinc-500 dark:text-zinc-400 hover:text-zinc-900 dark:hover:text-zinc-100"
                       aria-label={`History of ${q.name}`}
                       title="Earlier versions, and any edit waiting for approval"
                       onClick={(e) => {
@@ -567,7 +599,7 @@ export function SavedQueries({
             <div className="flex items-center justify-between rounded-md border p-3">
               <div className="space-y-0.5">
                 <Label htmlFor="saved-query-share">Share with workspace</Label>
-                <p className="text-xs text-zinc-500">
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
                   Off means only you can see it.
                 </p>
               </div>
@@ -579,7 +611,7 @@ export function SavedQueries({
             </div>
 
             <div className="rounded-md border bg-zinc-50 dark:bg-zinc-900 p-2">
-              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">SQL</div>
+              <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1">SQL</div>
               <pre className="font-mono text-xs whitespace-pre-wrap break-all max-h-32 overflow-auto">
                 {currentSql}
               </pre>

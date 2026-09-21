@@ -250,6 +250,17 @@ once it is green -- broke. Caught by rendering every stage INCLUDING the base.
 {{- if not $oauth.tokenEndpoint }}
 {{- fail "kafka.external.saslMechanism=OAUTHBEARER requires kafka.external.oauth.tokenEndpoint.\n\nEvery client fetches its own token from that URL; there is no username or\npassword to fall back on. Left empty, the JVM containers fail at configure()\nwith \"sasl.oauthbearer.token.endpoint.url value must be non-null\" and the Go\nand Python clients cannot start their token providers." }}
 {{- end }}
+{{/*
+Scheme first, so the insecure check below can assume http(s) and the operator
+gets the error that names their actual mistake. A typo'd scheme reaches the JVM
+as "Malformed URL" from inside a login callback, with no setting named.
+*/}}
+{{- if not (or (hasPrefix "http://" ($oauth.tokenEndpoint | lower)) (hasPrefix "https://" ($oauth.tokenEndpoint | lower))) }}
+{{- fail (printf "kafka.external.oauth.tokenEndpoint=%q is not an http:// or https:// URL.\n\nIt is fetched over HTTP by every client; no other scheme is supported." $oauth.tokenEndpoint) }}
+{{- end }}
+{{- if and (include "rsync-ai.kafka.insecureTokenEndpoint" $oauth.tokenEndpoint) (not $oauth.allowInsecureTokenEndpoint) }}
+{{- fail (printf "kafka.external.oauth.tokenEndpoint=%q is http:// and its host is not loopback.\n\nThe client-credentials grant POSTs kafka.external.oauth.clientSecret to that\nURL on EVERY token fetch, so the hop does not just expose the short-lived\nbearer token — it hands out the long-lived credential that mints them, to\nanyone on the path. No broker-side setting repairs that.\n\nUse https, or a loopback endpoint (localhost / 127.0.0.0/8 / ::1 — what\nGoogle's Workload Identity token sidecar on localhost:14293 uses; the request\nnever leaves the pod). For a disposable test rig only, set\nkafka.external.oauth.allowInsecureTokenEndpoint=true." $oauth.tokenEndpoint) }}
+{{- end }}
 {{- if not $oauth.clientId }}
 {{- fail "kafka.external.saslMechanism=OAUTHBEARER requires kafka.external.oauth.clientId.\n\nIt is a plain value, not a secret — set it here even when the client secret\ncomes from secrets.existingSecret (key KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET).\nsaslUsername is deliberately NOT a fallback: an operator who set it for a\nprevious SCRAM deployment would silently authenticate as the wrong principal." }}
 {{- end }}

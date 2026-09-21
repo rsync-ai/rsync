@@ -6,7 +6,9 @@ import { ArrowLeft } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { PageHeader } from "@/components/layout/PageHeader"
 import { SchemaDriftApprovalList } from "@/components/pipeline/SchemaDriftApprovalList"
+import { SchemaDriftPolicyCard } from "@/components/pipeline/SchemaDriftPolicyCard"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { pipelineIsCDC } from "@/lib/pipeline/syncMode"
 
 export const dynamic = "force-dynamic"
 
@@ -40,11 +42,11 @@ async function getPipeline(id: string) {
       id: raw.id as string,
       name: (raw.name as string) || "this pipeline",
       destConnectorType: (raw.destination_connection?.connector_type as string | undefined) ?? null,
-      // Same CDC test the pipeline detail page uses (sync_mode, or a persisted
-      // cdc_mode for pipelines created before sync_mode was written). Batch and CDC
-      // have genuinely different approval policies, and this page has to say which
-      // one the user is looking at.
-      isCDC: raw.sync_mode === "cdc" || Boolean(raw.cdc_mode),
+      // Same CDC test the pipeline detail page uses (explicit sync_mode wins; a
+      // persisted cdc_mode only decides for pipelines created before sync_mode was
+      // written). Batch and CDC have genuinely different approval policies, and
+      // this page has to say which one the user is looking at.
+      isCDC: pipelineIsCDC(raw as { sync_mode?: string; cdc_mode?: string }) === true,
     }
   } catch {
     return null
@@ -72,6 +74,8 @@ export default async function SchemaChangesPage({ params }: Props) {
             : `Review and approve schema-drift changes detected for “${pipeline.name}”.`
         }
       />
+      {/* What gets filed for review, above the list of what was filed. */}
+      <SchemaDriftPolicyCard pipelineId={id} isCDC={pipeline.isCDC} />
       <SchemaDriftApprovalList
         pipelineId={id}
         destConnectorType={pipeline.destConnectorType}

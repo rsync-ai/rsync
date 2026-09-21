@@ -1,15 +1,16 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest"
 import type { Mock } from "vitest"
-import { render, screen, waitFor } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor } from "@testing-library/react"
 import axe from "axe-core"
 
 import SettingsPage from "@/app/(dashboard)/settings/page"
 import ConnectionsPage from "@/app/(dashboard)/connections/page"
 import { Sidebar } from "@/components/layout/Sidebar"
+import { AgenticPipelineHome } from "@/components/chat/AgenticPipelineHome"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
 
-// KI-2. The Playwright a11y suite (`npm run test:a11y`) is the only thing that can
+// KI-AXE-VIOLATIONS-ON-AUTHENTICATED-PAGES (was KI-2). The Playwright a11y suite (`npm run test:a11y`) is the only thing that can
 // measure these routes end to end, and it CANNOT run them in CI: the frontend-a11y
 // job starts no api-gateway, so `e2e/fixtures/auth.setup.ts` skips on its :5001
 // health probe and all four authenticated specs in `e2e/a11y/authenticated_pages.spec.ts`
@@ -94,25 +95,6 @@ beforeAll(() => {
     unobserve() {}
     disconnect() {}
   }
-  // The connections page overlays optimistic test results from sessionStorage;
-  // Node's storage shim can leave it without the Storage methods (see vitest.setup.ts
-  // for the same problem on localStorage).
-  if (typeof window.sessionStorage?.getItem !== "function") {
-    const store = new Map<string, string>()
-    Object.defineProperty(window, "sessionStorage", {
-      configurable: true,
-      value: {
-        get length() {
-          return store.size
-        },
-        key: (i: number) => Array.from(store.keys())[i] ?? null,
-        getItem: (k: string) => store.get(k) ?? null,
-        setItem: (k: string, v: string) => void store.set(k, String(v)),
-        removeItem: (k: string) => void store.delete(k),
-        clear: () => store.clear(),
-      } as Storage,
-    })
-  }
 })
 
 beforeEach(() => {
@@ -176,6 +158,18 @@ describe("authenticated pages — no serious/critical axe violations", () => {
 
     const { container } = render(<ConnectionsPage />)
     await waitFor(() => expect(screen.getByText("Analytics Postgres")).toBeInTheDocument())
+
+    expect(await blockingViolations(container)).toEqual([])
+  })
+
+  it("/chat landing (AgenticPipelineHome)", async () => {
+    mockFetch.mockImplementation(() => Promise.resolve(res({ connections: [], pipelines: [], total: 0 })))
+
+    const { container } = render(<AgenticPipelineHome onSubmit={() => {}} />)
+    // Type an intent so the icon-only submit arrow is enabled — the state a user
+    // actually reaches it in (#47 prod retest: it had no accessible name).
+    fireEvent.change(screen.getByPlaceholderText(/sync mysql to s3/), { target: { value: "sync pg to gcs" } })
+    expect(screen.getByRole("button", { name: "Start pipeline chat" })).toBeEnabled()
 
     expect(await blockingViolations(container)).toEqual([])
   })

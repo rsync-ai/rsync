@@ -201,3 +201,86 @@ func TestResolveSinkConsumerGroupFallsBack(t *testing.T) {
 		}
 	})
 }
+
+// TestSinkConsumerGroupsToStopReturnsEveryRegisteredWorker: delete must stop every worker
+// of a hybrid pipeline, not the single one ResolveSinkConsumerGroup picks -- and the
+// derived names as well, because a manifest row that failed to insert (upsertDependency
+// only logs it) would otherwise leave that worker running. Manifest rows come first, in
+// manifest order, and a derived name the manifest already holds is not repeated.
+func TestSinkConsumerGroupsToStopReturnsEveryRegisteredWorker(t *testing.T) {
+	t.Setenv("KAFKA_TOPIC_PREFIX", "rsync.")
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+
+	// The execution-scoped group cannot be derived; only the manifest knows it.
+	manifest := []string{"rsync.sink-abcd1234-9f8e7d6c", "rsync.sink-abcd1234-batch", "rsync.sink-abcd1234"}
+	mock.ExpectQuery(`FROM pipeline_dependencies`).
+		WithArgs(testPipelineID).
+		WillReturnRows(sqlmock.NewRows([]string{"identifier"}).AddRow(manifest[0]).AddRow(manifest[1]).AddRow(manifest[2]))
+
+	got := SinkConsumerGroupsToStop(context.Background(), db, testPipelineID)
+	want := []string{
+		"rsync.sink-abcd1234-9f8e7d6c", "rsync.sink-abcd1234-batch", "rsync.sink-abcd1234",
+		"sink-abcd1234", "sink-abcd1234-batch",
+		"rsync.sink-abcd1234-stream", "sink-abcd1234-stream",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("SinkConsumerGroupsToStop = %v, want the manifest rows then the derived names %v", got, want)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("unmet expectations: %v", err)
+	}
+}
+
+// TestSinkConsumerGroupsToStopFallsBackToBothSpellings: with no manifest row the executor's
+// namespaced group must still be stopped. Stopping only the bare derived name is the
+// "Worker not found" delete that left the real worker running.
+func TestSinkConsumerGroupsToStopFallsBackToBothSpellings(t *testing.T) {
+	t.Setenv("KAFKA_TOPIC_PREFIX", "rsync.")
+
+	db, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	defer db.Close()
+	mock.ExpectQuery(`FROM pipeline_dependencies`).
+		WithArgs(testPipelineID).
+		WillReturnRows(sqlmock.NewRows([]string{"identifier"}))
+
+	got := SinkConsumerGroupsToStop(context.Background(), db, testPipelineID)
+	want := []string{
+		"rsync.sink-abcd1234", "sink-abcd1234",
+		"rsync.sink-abcd1234-batch", "sink-abcd1234-batch",
+		"rsync.sink-abcd1234-stream", "sink-abcd1234-stream",
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("SinkConsumerGroupsToStop = %v, want %v", got, want)
+	}
+
+	t.Run("no prefix does not repeat names", func(t *testing.T) {
+		t.Setenv("KAFKA_TOPIC_PREFIX", "")
+		got := SinkConsumerGroupsToStop(context.Background(), nil, testPipelineID)
+		want := []string{"sink-abcd1234", "sink-abcd1234-batch", "sink-abcd1234-stream"}
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("SinkConsumerGroupsToStop = %v, want %v", got, want)
+		}
+	})
+
+	// The delete path passes the id from a URL parameter as typed. Every producer
+	// derives the name from pipelines.id::text, which is lower-case, so an upper-case
+	// id must still name the real workers.
+	t.Run("upper-case id derives the lower-case names", func(t *testing.T) {
+		got := SinkConsumerGroupsToStop(context.Background(), nil, strings.ToUpper(testPipelineID))
+		if strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("SinkConsumerGroupsToStop(upper-case id) = %v, want %v", got, want)
+		}
+	})
+
+	if got := SinkConsumerGroupsToStop(context.Background(), nil, "  "); got != nil {
+		t.Fatalf("blank pipeline id should stop nothing, got %v", got)
+	}
+}

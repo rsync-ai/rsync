@@ -776,7 +776,9 @@ func RefreshOAuthTokenActivity(ctx context.Context, tokenID string) (map[string]
 	}
 	apiGatewayURL := strings.TrimSpace(os.Getenv("API_GATEWAY_URL"))
 	if apiGatewayURL == "" {
-		apiGatewayURL = "http://api-gateway:5001"
+		// 5001 is the host-published port; inside the compose network the
+		// gateway listens on 8080, as the other two adapter callers assume.
+		apiGatewayURL = "http://api-gateway:8080"
 	}
 	refreshURL := fmt.Sprintf("%s/api/v1/oauth/tokens/%s/refresh", apiGatewayURL, tokenID)
 

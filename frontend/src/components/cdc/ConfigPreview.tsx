@@ -118,7 +118,7 @@ export function ConfigPreview({
       <CardHeader className="pb-3">
         <div className="flex items-center justify-between">
           <CardTitle className="text-base flex items-center gap-2">
-            <Settings className="h-5 w-5 text-zinc-500" />
+            <Settings className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
             Pipeline Configuration
           </CardTitle>
           <div className="flex items-center gap-2">
@@ -168,7 +168,7 @@ export function ConfigPreview({
                         key={item.label}
                         className="flex items-center justify-between px-4 py-3 bg-white dark:bg-zinc-900"
                       >
-                        <span className="text-sm text-zinc-500">{item.label}</span>
+                        <span className="text-sm text-zinc-500 dark:text-zinc-400">{item.label}</span>
                         <span className="text-sm font-mono text-zinc-900 dark:text-white">
                           {item.sensitive && !showSensitive
                             ? maskSensitiveValue(item.value)
@@ -192,7 +192,7 @@ export function ConfigPreview({
             <div className="flex items-center gap-3">
               <Server className="h-5 w-5 text-violet-500" />
               <div>
-                <p className="text-sm text-zinc-500">Pipeline Name</p>
+                <p className="text-sm text-zinc-500 dark:text-zinc-400">Pipeline Name</p>
                 <p className="font-medium text-zinc-900 dark:text-white">
                   {config.pipeline_name}
                 </p>

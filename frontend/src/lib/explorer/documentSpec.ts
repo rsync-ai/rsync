@@ -16,6 +16,8 @@ export type FindField = "collection" | "filter" | "projection" | "sort" | "limit
 export interface FindInputs {
   connectionId: string
   collection: string
+  /** The collection's database; required by a server-level connection, which names none. */
+  database?: string
   filter?: string
   projection?: string
   sort?: string
@@ -94,6 +96,8 @@ export function buildFindBody(input: FindInputs): BuiltFind {
     `"connection_id":${JSON.stringify(input.connectionId)}`,
     `"collection":${JSON.stringify(collection)}`,
   ]
+  const database = (input.database ?? "").trim()
+  if (database) parts.push(`"database":${JSON.stringify(database)}`)
   if (filter.raw) parts.push(`"filter":${filter.raw}`)
   if (projection.raw) parts.push(`"projection":${projection.raw}`)
   if (sort.raw) parts.push(`"sort":${sort.raw}`)

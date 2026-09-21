@@ -224,3 +224,35 @@ func TestParseSinkMessagePopulatesDestNamespaceFromBatchPayload(t *testing.T) {
 			smBlob.DBOrSchema)
 	}
 }
+
+// A batch run into a destination namespace ("demo") sends table="demo.matches"
+// — the DESTINATION identifier. The stats row was labelled with it, so a
+// MongoDB datingapp.matches table showed up as "demo.matches". The executor now
+// also sends source_table; the label must use it while Table (the write path's
+// identifier) is left alone.
+func TestBatchTableStatsLabelWithSourceTable(t *testing.T) {
+	cfg := &WorkerConfig{PipelineID: "p", ExecutionID: "e", Topic: "t", SinkMode: "batch", DestinationConnector: "gcs"}
+	b, _ := json.Marshal(map[string]interface{}{
+		"pipeline_id": "p", "execution_id": "e",
+		"table": "demo.matches", "source_table": "datingapp.matches",
+		"db_or_schema": "demo",
+		"rows":         []interface{}{map[string]interface{}{"id": 1}},
+	})
+	sm, err := parseSinkMessage(cfg, kafka.Message{Value: b})
+	if err != nil {
+		t.Fatalf("parseSinkMessage: %v", err)
+	}
+	if sm.Table != "demo.matches" {
+		t.Errorf("sm.Table = %q, want the destination identifier untouched", sm.Table)
+	}
+	table := statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 3, 3, 10))
+	if table["qualified_name"] != "datingapp.matches" || table["schema"] != "datingapp" || table["name"] != "matches" {
+		t.Errorf("table identity = %#v, want datingapp.matches", table)
+	}
+
+	// No source_table (CDC, older executors): unchanged, keyed on Table.
+	legacy := statsTable(t, buildTableStatsEvent(&SinkMessage{PipelineID: "p", ExecutionID: "e", Table: "demo.matches"}, "batch", "completed", 1, 1, 1))
+	if legacy["qualified_name"] != "demo.matches" {
+		t.Errorf("legacy qualified_name = %v, want demo.matches", legacy["qualified_name"])
+	}
+}

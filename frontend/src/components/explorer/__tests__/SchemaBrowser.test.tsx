@@ -129,6 +129,13 @@ describe("SchemaBrowser (Athena layout)", () => {
     expect(screen.getByText(/loading/i)).toBeInTheDocument()
   })
 
+  // #54: on Postgres the dropdown read "Database" over "public", which is a schema.
+  it("names the dropdown after what the namespace is", () => {
+    render(<SchemaBrowser tables={[{ name: "users", schema: "public" }]} namespaceLabel="Schema" />)
+    expect(screen.getByRole("combobox", { name: "Schema" })).toHaveValue("public")
+    expect(screen.queryByRole("combobox", { name: "Database" })).toBeNull()
+  })
+
   it("shows an empty hint when there are no tables", () => {
     render(<SchemaBrowser tables={[]} emptyHint="Select a connection to browse its schema" />)
     expect(screen.getByText("Select a connection to browse its schema")).toBeInTheDocument()

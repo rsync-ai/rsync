@@ -188,6 +188,12 @@ jobs:
           # that built it landed. The subject is markdown, but the event that
           # falsifies it is a code commit in another tree, so neither a
           # docs-filtered nor a code-filtered job would see both halves.
+          #
+          # test_capabilities_stays_an_index.py keeps CAPABILITIES.md a one-line
+          # index after the 2026-09-16 split (rows <= 400 chars, no duplicate
+          # headlines, <= 150 KB) and checks the #fragment links between it and
+          # CAPABILITIES-ARCHIVE.md, which check-doc-links.sh strips. Every one
+          # of those is broken by a markdown edit alone.
           pytest -q \
             tests/test_doc_merge_claims_are_true.py \
             tests/test_doc_links_resolve.py \
@@ -205,4 +211,7 @@ jobs:
             tests/test_documented_shell_blocks_parse.py \
             tests/test_readme_connector_claims_match_the_catalogue.py \
             tests/test_docs_do_not_call_built_connectors_unbuilt.py \
+            tests/test_deployment_docs_do_not_hand_the_operator_a_step_the_product_runs.py \
+            tests/test_capabilities_stays_an_index.py \
             tests/test_no_bundled_observability_vendor.py
+

@@ -37,6 +37,7 @@ targetRules = ["generic-api-key"]
 paths = [
   '''api-gateway/internal/email/resend_test\.go$''',
   '''api-gateway/internal/handlers/connection_mutation_scoping_test\.go$''',
+  '''api-gateway/internal/handlers/connection_test_status_persist_test\.go$''',
   '''api-gateway/internal/handlers/session_token_at_rest_test\.go$''',
   '''api-gateway/internal/handlers/slack_interactions_test\.go$''',
   '''api-gateway/internal/handlers/workspace_create_role_gate_test\.go$''',

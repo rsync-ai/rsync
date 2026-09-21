@@ -1044,14 +1044,47 @@ type ConsumerGroupLag struct {
 
 // GetConsumerGroupLag retrieves lag information for a specific consumer group
 func (m *Manager) GetConsumerGroupLag(groupID string) (map[string]int64, error) {
+	committed, logEnd, err := m.fetchConsumerGroupOffsets(groupID)
+	if err != nil {
+		return nil, err
+	}
+	return computeConsumerGroupLag(committed, logEnd), nil
+}
+
+// ConsumerGroupDrain is one reading of how far a consumer group is behind and how far it
+// has got. Lag alone cannot tell a sink working through a backlog from a sink that has
+// stopped: both show a large lag. Committed moves only when the group commits, so a
+// caller comparing two readings can tell them apart.
+type ConsumerGroupDrain struct {
+	LagByTopic map[string]int64
+	// Committed is the sum of the group's committed offsets over every partition it has
+	// committed to. Its absolute value means nothing; only a change between readings does.
+	Committed int64
+}
+
+// GetConsumerGroupDrain reads the group's lag and committed position in one pass.
+func (m *Manager) GetConsumerGroupDrain(groupID string) (ConsumerGroupDrain, error) {
+	committed, logEnd, err := m.fetchConsumerGroupOffsets(groupID)
+	if err != nil {
+		return ConsumerGroupDrain{}, err
+	}
+	return ConsumerGroupDrain{
+		LagByTopic: computeConsumerGroupLag(committed, logEnd),
+		Committed:  sumCommittedOffsets(committed),
+	}, nil
+}
+
+// fetchConsumerGroupOffsets returns the group's committed offset and the log-end offset
+// for each topic/partition, the two inputs every lag reading is computed from.
+func (m *Manager) fetchConsumerGroupOffsets(groupID string) (committed, logEnd map[string]map[int32]int64, err error) {
 	if !m.connected {
-		return nil, fmt.Errorf("kafka manager not connected")
+		return nil, nil, fmt.Errorf("kafka manager not connected")
 	}
 
 	// Create a coordinator client to fetch offsets
 	coordinator, err := m.client.Coordinator(groupID)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get coordinator for group %s: %w", groupID, err)
+		return nil, nil, fmt.Errorf("failed to get coordinator for group %s: %w", groupID, err)
 	}
 
 	// Fetch offsets for the consumer group
@@ -1063,7 +1096,7 @@ func (m *Manager) GetConsumerGroupLag(groupID string) (map[string]int64, error) 
 	// Get all topics for this group
 	topics, err := m.client.Topics()
 	if err != nil {
-		return nil, fmt.Errorf("failed to get topics: %w", err)
+		return nil, nil, fmt.Errorf("failed to get topics: %w", err)
 	}
 	for _, topic := range topics {
 		partitions, err := m.client.Partitions(topic)
@@ -1078,12 +1111,12 @@ func (m *Manager) GetConsumerGroupLag(groupID string) (map[string]int64, error) 
 
 	offsetsResponse, err := coordinator.FetchOffset(offsetsRequest)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch offsets: %w", err)
+		return nil, nil, fmt.Errorf("failed to fetch offsets: %w", err)
 	}
 
 	// Collect the group's committed offset per topic/partition. Kafka reports -1 for a
 	// partition the group has NEVER committed to.
-	committed := make(map[string]map[int32]int64)
+	committed = make(map[string]map[int32]int64)
 	for topic, partitions := range offsetsResponse.Blocks {
 		for partition, block := range partitions {
 			if committed[topic] == nil {
@@ -1097,7 +1130,7 @@ func (m *Manager) GetConsumerGroupLag(groupID string) (map[string]int64, error) 
 	// committed to. A per-pipeline sink group commits only to the topics it consumes, so
 	// skipping never-committed (-1) partitions both scopes the result to the pipeline's own
 	// topics and avoids a GetOffset round-trip for every foreign cluster topic.
-	logEnd := make(map[string]map[int32]int64)
+	logEnd = make(map[string]map[int32]int64)
 	for topic, partitions := range committed {
 		for partition, offset := range partitions {
 			if offset < 0 {
@@ -1118,7 +1151,7 @@ func (m *Manager) GetConsumerGroupLag(groupID string) (map[string]int64, error) 
 		}
 	}
 
-	return computeConsumerGroupLag(committed, logEnd), nil
+	return committed, logEnd, nil
 }
 
 // computeConsumerGroupLag is the pure core of GetConsumerGroupLag, split out so the
@@ -1153,6 +1186,20 @@ func computeConsumerGroupLag(committed, logEnd map[string]map[int32]int64) map[s
 		}
 	}
 	return lagByTopic
+}
+
+// sumCommittedOffsets adds up the group's committed offsets, skipping partitions it has
+// never committed to (-1), the same scoping computeConsumerGroupLag uses.
+func sumCommittedOffsets(committed map[string]map[int32]int64) int64 {
+	var total int64
+	for _, partitions := range committed {
+		for _, offset := range partitions {
+			if offset >= 0 {
+				total += offset
+			}
+		}
+	}
+	return total
 }
 
 // consumerGroupLister is the slice of sarama.ClusterAdmin that ListConsumerGroups

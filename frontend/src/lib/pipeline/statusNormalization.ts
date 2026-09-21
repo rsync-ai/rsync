@@ -79,3 +79,47 @@ export function pipelineStatusLabel(s: NormalizedPipelineStatus): string {
   }
 }
 
+
+/**
+ * The `/runtime` phase for a CDC stream that finished setting up but has delivered
+ * nothing (issue #20). The handoff closes the snapshot execution and writes
+ * "Streaming pipeline active" to pipeline_progress, so `/state` says "running" —
+ * and before this phase existed the detail page repeated that for as long as the
+ * stream stayed empty. api-gateway's cdcLivenessPhase (pipeline_runtime.go) returns
+ * it only when no row has ever reached the destination and a grace period has
+ * passed since the handoff; a stream that has delivered data and is merely quiet
+ * never gets it (#7).
+ */
+export const RUNTIME_PHASE_WAITING_FOR_DATA = "waiting_for_data"
+
+export const WAITING_FOR_FIRST_DATA_LABEL = "Waiting for first data"
+
+/**
+ * isWaitingForFirstData is true when a surface that would say "Running" must say
+ * "Waiting for first data" instead. It takes the reconciled `/state` status as well
+ * as the runtime phase because the two are polled separately: a pipeline the user
+ * just paused (or that failed) must not be relabelled by a runtime answer from
+ * before that happened. Only "running" is ever relabelled.
+ *
+ * The phase is typed as a plain string on purpose — usePipelineRuntime's
+ * RuntimePhase union predates this phase.
+ */
+export function isWaitingForFirstData(
+  status: NormalizedPipelineStatus,
+  runtimePhase?: string | null
+): boolean {
+  return status === "running" && runtimePhase === RUNTIME_PHASE_WAITING_FOR_DATA
+}
+
+/**
+ * runtimePhaseLabel is the display label for a `/runtime` phase. Single-word phases
+ * keep the capitalized form the health header always showed ("Streaming", "Idle");
+ * waiting_for_data reads as a sentence rather than as its wire value.
+ */
+export function runtimePhaseLabel(phase?: string | null): string {
+  const p = String(phase || "").trim()
+  if (!p) return "Unknown"
+  if (p === RUNTIME_PHASE_WAITING_FOR_DATA) return WAITING_FOR_FIRST_DATA_LABEL
+  const words = p.replace(/_/g, " ")
+  return words.charAt(0).toUpperCase() + words.slice(1)
+}

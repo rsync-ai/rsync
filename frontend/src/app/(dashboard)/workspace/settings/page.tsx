@@ -33,7 +33,7 @@ export default function WorkspaceSettingsPage() {
     return (
       <div className="space-y-6">
         <PageHeader heading="Workspace settings" description="Manage your workspace, members and roles." />
-        <div className="flex items-center gap-2 text-sm text-zinc-500">
+        <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
           <Loader2 className="h-4 w-4 animate-spin" />
           Loading…
         </div>
@@ -62,7 +62,7 @@ export default function WorkspaceSettingsPage() {
     return (
       <div className="space-y-6">
         <PageHeader heading="Workspace settings" description="Manage your workspace, members and roles." />
-        <p className="text-sm text-zinc-500">
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">
           No workspace selected. Use the workspace switcher in the header to pick one.
         </p>
       </div>
@@ -82,10 +82,10 @@ export default function WorkspaceSettingsPage() {
 
       {/* Persistent role banner so the caller always knows their access level. */}
       <div className="flex flex-wrap items-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm dark:border-zinc-800 dark:bg-zinc-900/50">
-        <span className="text-zinc-500">Your role in this workspace:</span>
+        <span className="text-zinc-500 dark:text-zinc-400">Your role in this workspace:</span>
         <Badge variant={roleBadgeVariant(role)}>{roleLabel}</Badge>
         {isReadOnly && (
-          <span className="text-xs text-zinc-500">— read-only access; ask an admin for more.</span>
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">— read-only access; ask an admin for more.</span>
         )}
       </div>
 

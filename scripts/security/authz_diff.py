@@ -57,7 +57,7 @@ FAMILIES = {
         # here is a data breach, not just a metadata leak. /sample validates the
         # `table` query param BEFORE the ownership check, so a probe value is
         # supplied to actually reach the authz gate (else it 400s pre-authz).
-        "read": ["/api/v1/connections/{id}", "/api/v1/connections/{id}/sample?table=_authz_probe_", "/api/v1/connections/{id}/metadata"],
+        "read": ["/api/v1/connections/{id}", "/api/v1/connections/{id}/sample?table=_authz_probe_", "/api/v1/connections/{id}/metadata", "/api/v1/connections/{id}/namespaces"],
         "write": [("DELETE", "/api/v1/connections/{id}")],
     },
 }

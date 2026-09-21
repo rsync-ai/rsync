@@ -77,7 +77,7 @@ func TestObjectKeysWithNoPathPrefixLandUnderTheDataset(t *testing.T) {
 		"successKey":      successKey(emptyPrefix, dataset, schema, table, dt),
 		"partKey":         partKey(emptyPrefix, dataset, schema, table, "", dt, 42, "", "jsonl"),
 		"partKey/rolled":  partKey(emptyPrefix, dataset, schema, table, "region=eu/", dt, 42, "0001", "jsonl"),
-		"cdcObjectKey": cdcObjectKey(emptyPrefix, schema, table, "dt="+dt, "",
+		"cdcObjectKey": cdcObjectKey(emptyPrefix, dataset, schema, table, "dt="+dt, "",
 			1789000000000, 0, 42, 42, "jsonl", ""),
 	}
 
@@ -107,12 +107,9 @@ func TestObjectKeysWithNoPathPrefixLandUnderTheDataset(t *testing.T) {
 	}
 
 	// The cdc key is the one that matters most for "no data loss": it must sit
-	// under the same <schema>/<table>/ the batch backfill writes to.
-	if want := schema + "/" + table + "/"; !strings.HasPrefix(keys["cdcObjectKey"], want) {
-		t.Fatalf("cdcObjectKey = %q, want it to start with %q so CDC deltas and the batch "+
-			"backfill share one location", keys["cdcObjectKey"], want)
-	}
-	for _, name := range []string{"partitionPrefix", "manifestKey", "successKey", "partKey"} {
+	// under the same <dataset>/<schema>/<table>/ the batch backfill writes to (#14 —
+	// CDC used to drop the dataset segment and land beside the backfill, not in it).
+	for _, name := range []string{"cdcObjectKey", "partitionPrefix", "manifestKey", "successKey", "partKey"} {
 		if want := dataset + "/" + schema + "/" + table + "/"; !strings.HasPrefix(keys[name], want) {
 			t.Fatalf("%s = %q, want it to start with %q", name, keys[name], want)
 		}

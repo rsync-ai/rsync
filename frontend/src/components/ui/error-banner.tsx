@@ -62,7 +62,7 @@ export function ErrorPage({ error, onRetry }: { error: AppError; onRetry?: () =>
       <AlertCircle className="h-10 w-10 text-red-400" />
       <div className="space-y-1">
         <p className="font-semibold text-zinc-800 dark:text-zinc-200">{error.title}</p>
-        <p className="text-sm text-zinc-500 font-mono break-words">{error.message}</p>
+        <p className="text-sm text-zinc-500 dark:text-zinc-400 font-mono break-words">{error.message}</p>
       </div>
       {error.hint && (
         <p className="text-xs text-zinc-400 italic">{error.hint}</p>

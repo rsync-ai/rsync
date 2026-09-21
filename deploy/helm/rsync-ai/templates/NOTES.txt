@@ -13,7 +13,7 @@ No ingress. To reach it locally:
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "rsync-ai.fullname" . }}-frontend 3000:{{ .Values.frontend.service.port }}
   kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "rsync-ai.fullname" . }}-api-gateway 8080:{{ .Values.apiGateway.service.port }}
 
-  Note the frontend was built to call {{ .Values.frontend.apiUrl | default "(unset)" }} from the BROWSER. If that is
+  Note the browser is told to call {{ .Values.frontend.apiUrl | default "(unset)" }} from the BROWSER. If that is
   not reachable from your machine, the page will render and every API call will fail.
 {{- end }}
 

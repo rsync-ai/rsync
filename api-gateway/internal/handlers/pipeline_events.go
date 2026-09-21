@@ -55,6 +55,29 @@ func cursorFromRow(eventID string, seq sql.NullInt64, occurredAt sql.NullTime, r
 	return pipelineEventsCursor{TS: &ts, Seq: seq.Int64, EventID: eventID}
 }
 
+// routineEventTypes repeat on a timer and carry no state change of their own —
+// the same set as ROUTINE_EVENT_TYPES in frontend/src/components/pipeline/eventDisplay.ts.
+var routineEventTypes = []string{"DATA_PLANE_METRICS", "TABLE_STATS"}
+
+// pipelineEventsFilter narrows a run-event page. The zero value is every event
+// of the pipeline.
+type pipelineEventsFilter struct {
+	ExecutionID string
+	EventTypes  []string
+	// RunScope reads ExecutionID as "this run" rather than "rows stamped with this
+	// id". Healer decisions, sentinel alerts and data-plane metrics are written with
+	// no execution id (or, for CDC, the pipeline id), so a strict match leaves a run's
+	// log without the alarms and self-healing steps that happened during it. Run
+	// scope adds those rows when they fall inside the run's start_time..end_time
+	// (open-ended while it runs). Ignored without an ExecutionID.
+	RunScope bool
+	// ExcludeRoutine drops timer ticks — routineEventTypes and stage heartbeats —
+	// unless the row is a warning or an error. A live CDC stream writes one
+	// TABLE_STATS per committed batch, so without this a 100-row page of a run log
+	// is 100 copies of "Table statistics update". Mirrors isNoiseEvent (eventDisplay.ts).
+	ExcludeRoutine bool
+}
+
 // buildPipelineEventsQuery renders the run-event page query and its arguments.
 //
 // Split out of GetPipelineEvents so the SQL can be exercised against a real
@@ -62,10 +85,12 @@ func cursorFromRow(eventID string, seq sql.NullInt64, occurredAt sql.NullTime, r
 // contract of this endpoint and sqlmock cannot check it: it matches statements
 // as strings and never executes them.
 func buildPipelineEventsQuery(
-	pipelineID, execID string, eventTypes []string, cur pipelineEventsCursor, limit int,
+	pipelineID string, f pipelineEventsFilter, cur pipelineEventsCursor, limit int,
 ) (string, []any) {
 	args := []any{pipelineID}
 	argIdx := 2
+	execID := f.ExecutionID
+	eventTypes := f.EventTypes
 
 	query := `
 		SELECT
@@ -85,10 +110,43 @@ func buildPipelineEventsQuery(
 		WHERE e.pipeline_id = $1
 	`
 
-	if execID != "" {
+	switch {
+	case execID != "" && f.RunScope:
+		p := "$" + strconv.Itoa(argIdx) + "::uuid"
+		query += ` AND (
+			e.execution_id = ` + p + `
+			OR (
+				(e.execution_id IS NULL OR e.execution_id = e.pipeline_id)
+				AND EXISTS (
+					SELECT 1 FROM executions x
+					WHERE x.id = ` + p + `
+					  AND x.pipeline_id = e.pipeline_id
+					  AND COALESCE(e.occurred_at, e.received_at) >= x.start_time
+					  AND (x.end_time IS NULL OR COALESCE(e.occurred_at, e.received_at) <= x.end_time)
+				)
+			)
+		)`
+		args = append(args, execID)
+		argIdx++
+	case execID != "":
 		query += " AND e.execution_id = $" + strconv.Itoa(argIdx) + "::uuid"
 		args = append(args, execID)
 		argIdx++
+	}
+
+	if f.ExcludeRoutine {
+		placeholders := make([]string, 0, len(routineEventTypes))
+		for _, t := range routineEventTypes {
+			placeholders = append(placeholders, "$"+strconv.Itoa(argIdx))
+			args = append(args, t)
+			argIdx++
+		}
+		// Severity wins: a warn/error row is never routine, however it is typed.
+		query += ` AND NOT (
+			LOWER(COALESCE(e.severity, '')) NOT IN ('warn', 'warning', 'error', 'critical', 'fatal')
+			AND (e.event_type IN (` + strings.Join(placeholders, ",") + `)
+			     OR COALESCE(e.payload->'metadata'->>'heartbeat', '') = 'true')
+		)`
 	}
 
 	if len(eventTypes) > 0 {
@@ -147,6 +205,9 @@ func buildPipelineEventsQuery(
 
 // GetPipelineEvents returns replayable, redacted run events for a pipeline.
 // GET /api/v1/pipelines/:id/events?execution_id=...&limit=...&before_seq=...&event_types=a,b,c
+//
+//	&scope=run            with execution_id: the run's log (see pipelineEventsFilter.RunScope)
+//	&exclude_routine=true drop timer ticks that are not warnings or errors
 func GetPipelineEvents(c *gin.Context) {
 	database := db.GetDB()
 	if database == nil {
@@ -207,7 +268,13 @@ func GetPipelineEvents(c *gin.Context) {
 
 	// Tenancy is already proven by the gate above, so the query filters on the
 	// pipeline id alone — no join back to pipelines for a creator predicate.
-	query, args := buildPipelineEventsQuery(pipelineID, execID, eventTypes, cursor, limit)
+	filter := pipelineEventsFilter{
+		ExecutionID:    execID,
+		EventTypes:     eventTypes,
+		RunScope:       strings.EqualFold(strings.TrimSpace(c.Query("scope")), "run"),
+		ExcludeRoutine: strings.EqualFold(strings.TrimSpace(c.Query("exclude_routine")), "true"),
+	}
+	query, args := buildPipelineEventsQuery(pipelineID, filter, cursor, limit)
 
 	rows, err := database.Query(query, args...)
 	if err != nil {

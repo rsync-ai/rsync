@@ -43,6 +43,19 @@ except ImportError:  # pragma: no cover - dev/test path
         os.path.dirname(__file__), "..", "..", "..", "..")))
     from canonical_types import canonical_to_ddl, canonicalize_type  # noqa: E402
 
+# Scope filter for a server-level connection (no database named): which
+# databases discovery and export may reach. Shipped the same way as
+# canonical_types (`COPY --from=shared namespace_filter.py`); the import above
+# already put the public/ root on sys.path for dev/test.
+import namespace_filter  # noqa: E402
+
+# A write on a server-level connection (no database named) with no destination
+# namespace from the pipeline has nowhere to go.
+_NO_WRITE_DATABASE = (
+    "This connection names no database and the pipeline sent no destination "
+    "namespace: set a destination database on the pipeline"
+)
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -395,6 +408,29 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             return base
         h = abs(hash(base)) % (10**8)
         return (base[:54] + f"_{h:08d}")[:63]
+
+    def _server_level_read_error(self, config: Dict, table: str) -> Optional[str]:
+        """Why a read of ``table`` is refused on a server-level connection (no
+        database named), or None when it may go ahead.
+
+        With no connection database the table must say which database it is in
+        (``db.table``) and that database must pass the Scope filter; a bare name
+        would otherwise resolve against whatever the server session defaults to.
+        """
+        config = config or {}
+        if str(config.get("database") or config.get("db_name") or "").strip():
+            return None
+        raw = str(table or "").strip().strip("`").strip('"')
+        if "." not in raw:
+            return "This connection names no database: pass the table as <database>.<table>"
+        db = raw.split(".", 1)[0].strip("`").strip('"')
+        try:
+            scope = namespace_filter.parse(config)
+        except namespace_filter.NamespaceFilterError as e:
+            return str(e)
+        if not namespace_filter.allowed(db, scope, self._MYSQL_SYSTEM_DATABASES):
+            return "That database is outside this connection's scope"
+        return None
 
     def _split_mysql_db_table(self, config: Dict, table: str, params: Dict = None) -> (str, str):
         """Single source of truth for resolving (database, bare_table).
@@ -754,6 +790,8 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         db, name = self._split_mysql_db_table(config, table, params)
         if not name or not self._is_safe_ident(name):
             return {"success": False, "error": f"Unsafe or missing table identifier: {name}"}
+        if not db:
+            return {"success": False, "error": _NO_WRITE_DATABASE}
         if db and not self._is_safe_ident(db):
             return {"success": False, "error": f"Unsafe database identifier: {db}"}
         qualified_target = f"`{db}`.`{name}`" if db else f"`{name}`"
@@ -949,6 +987,8 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         db, name = self._split_mysql_db_table(config, table, params)
         if not name or not self._is_safe_ident(name):
             return {"success": False, "error": f"Unsafe or missing table identifier: {name}"}
+        if not db:
+            return {"success": False, "error": _NO_WRITE_DATABASE}
         if db and not self._is_safe_ident(db):
             return {"success": False, "error": f"Unsafe database identifier: {db}"}
         qualified_target = f"`{db}`.`{name}`" if db else f"`{name}`"
@@ -1784,7 +1824,12 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         if not config.get('port'):
             errors.append("Missing required field: port")
         if not config.get('database'):
-            errors.append("Missing required field: database")
+            # Server-level connection: every database the login can see,
+            # narrowed by the Scope filter — which must parse.
+            try:
+                namespace_filter.parse(config)
+            except namespace_filter.NamespaceFilterError as e:
+                errors.append(str(e))
         if not config.get('user'):
             errors.append("Missing required field: user")
         if not config.get('password'):
@@ -1974,10 +2019,7 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         
         database = config.get("database") or ""
         if not database:
-            result["overall_status"] = "failed"
-            add_warning("config_missing", "error", "Missing required config: database", subsystem="tables")
-            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
-            return result
+            return self._discover_mysql_server_level(conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning)
         
         cursor = self._get_cursor(conn, as_dict=True)
         tables = []
@@ -2221,6 +2263,63 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             cursor.close()
             return result
     
+    def _discover_mysql_server_level(self, conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning):
+        """Discovery for a server-level connection (no database named): every
+        database the login can see, minus MySQL's own, narrowed by the Scope
+        filter, each discovered by _discover_mysql_schema_v2. Tables keep their
+        database in "schema"; max_tables caps the total, not each database.
+
+        A scope that does not parse fails closed (overall_status "failed",
+        nothing listed): an unreadable filter must not widen to everything.
+        """
+        import time
+        start_ms = int(time.time() * 1000)
+        try:
+            scope = namespace_filter.parse(config)
+        except namespace_filter.NamespaceFilterError as e:
+            add_warning("config_invalid", "error", str(e), subsystem="tables")
+            result["overall_status"] = "failed"  # after add_warning, which sets partial_success
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            return result
+
+        cursor = self._get_cursor(conn, as_dict=False)
+        try:
+            names = self._mysql_user_databases(cursor)
+        except Exception as e:
+            add_warning("catalog_error", "error", f"Could not list databases: {e}", subsystem="tables")
+            result["overall_status"] = "failed"
+            result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+            return result
+        finally:
+            cursor.close()
+        picked = namespace_filter.apply(sorted(names), scope, self._MYSQL_SYSTEM_DATABASES)
+        if picked.warning:
+            add_warning("scope_empty", "warning", picked.warning, subsystem="tables")
+
+        tables = []
+        available = 0
+        for db in picked.kept:
+            def db_warning(category, severity, message, table=None, subsystem=None, _db=db):
+                add_warning(category, severity, f"{_db}: {message}",
+                            table=f"{_db}.{table}" if table else None, subsystem=subsystem)
+            # LIMIT 0 still runs the count, so total_tables_available stays
+            # true after the cap is reached.
+            one = {"tables": [], "total_tables_available": 0, "overall_status": "success"}
+            self._discover_mysql_schema_v2(
+                conn, {**config, "database": db}, max(0, max_tables - len(tables)),
+                include_columns, include_row_counts, include_relationships, include_indexes,
+                one, db_warning)
+            if one.get("overall_status") == "failed":
+                result["overall_status"] = "partial_success"
+            available += int(one.get("total_tables_available") or 0)
+            tables.extend(one.get("tables") or [])
+
+        result["tables"] = tables
+        result["total_tables_available"] = available
+        result["total_tables_discovered"] = len(tables)
+        result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+        return result
+
     def _discover_postgres_schema_v2(self, conn, config, max_tables, include_columns, include_row_counts, include_relationships, include_indexes, result, add_warning):
         """PostgreSQL schema discovery v2 using pg_catalog"""
         import time
@@ -2952,6 +3051,191 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         return {"success": False, "error": "Schema discovery not supported for this NoSQL database"}
     
     # =========================================================================
+    # BEGIN list_namespaces block
+    # The same text sits in the postgresql, mysql, oracle and sqlserver
+    # connectors and in connector_database.py.j2;
+    # llm-service/tests/test_list_namespaces_block_in_lockstep.py fails when one
+    # copy changes alone. discover_schema resolves schemas through the same
+    # helpers, so the list and discovery never disagree about what is a system
+    # namespace.
+    # =========================================================================
+
+    # Databases MySQL and MongoDB keep for themselves; never user data.
+    _MYSQL_SYSTEM_DATABASES = frozenset({"information_schema", "mysql", "performance_schema", "sys"})
+    _MONGO_SYSTEM_DATABASES = frozenset({"admin", "config", "local"})
+
+    # Oracle-maintained / internal owners we never surface as user data.
+    # Under-filtering is safe (the user still picks the tables to sync);
+    # over-filtering would hide a real schema, so this list stays
+    # conservative + explicit and matches on exact name or a known prefix.
+    _ORACLE_SYSTEM_OWNERS = frozenset({
+        "SYS", "SYSTEM", "XDB", "OUTLN", "DBSNMP", "APPQOSSYS",
+        "GSMADMIN_INTERNAL", "GSMCATUSER", "GSMUSER", "GSMROOTUSER",
+        "CTXSYS", "MDSYS", "MDDATA", "ORDSYS", "ORDDATA", "ORDPLUGINS",
+        "OLAPSYS", "WMSYS", "EXFSYS", "AUDSYS", "LBACSYS", "DVSYS", "DVF",
+        "DBSFWUSER", "GGSYS", "ANONYMOUS", "REMOTE_SCHEDULER_AGENT",
+        "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC", "SYS$UMF", "OJVMSYS",
+        "SI_INFORMTN_SCHEMA", "SPATIAL_CSW_ADMIN_USR",
+        "SPATIAL_WFS_ADMIN_USR", "FLOWS_FILES", "APEX_PUBLIC_USER",
+        "ORACLE_OCM", "XS$NULL", "PDBADMIN", "DGPDB_INT", "DIP",
+        "VECSYS", "GGSHAREDCAP",
+    })
+
+    @classmethod
+    def _is_oracle_system_owner(cls, owner) -> bool:
+        ou = str(owner).upper()
+        return (ou in cls._ORACLE_SYSTEM_OWNERS
+                or ou.startswith("APEX_")
+                or ou.startswith("FLOWS_")
+                or ou.startswith("SYS$"))
+
+    def _postgres_user_schemas(self, cursor) -> List[str]:
+        """Every PostgreSQL schema except the catalogs and the temp/toast schemas."""
+        cursor.execute(
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE schema_name NOT IN ('pg_catalog', 'information_schema') "
+            "AND schema_name NOT LIKE 'pg_temp%' "
+            "AND schema_name NOT LIKE 'pg_toast%' "
+            "ORDER BY schema_name"
+        )
+        return [row[0] for row in (cursor.fetchall() or []) if row and row[0]]
+
+    def _sqlserver_user_schemas(self, cursor) -> List[str]:
+        """sys.schemas minus the built-in system schemas (sys,
+        INFORMATION_SCHEMA, guest) and the fixed database-role schemas
+        (db_owner, db_datareader, ...). dbo IS a user schema and is kept; a user
+        schema like "db_custom" is kept too (an explicit NOT IN list avoids a
+        `db_%` LIKE that would also strip dbo). Names are SQL Server built-ins.
+        """
+        cursor.execute(
+            "SELECT name FROM sys.schemas "
+            "WHERE name NOT IN ("
+            "'sys', 'INFORMATION_SCHEMA', 'guest', "
+            "'db_owner', 'db_accessadmin', 'db_securityadmin', "
+            "'db_ddladmin', 'db_backupoperator', 'db_datareader', "
+            "'db_datawriter', 'db_denydatareader', 'db_denydatawriter') "
+            "ORDER BY name"
+        )
+        return [row[0] for row in (cursor.fetchall() or []) if row and row[0]]
+
+    def _oracle_user_owners(self, cursor) -> List[str]:
+        """Every Oracle owner with tables that is not Oracle's own.
+
+        Prefers the Oracle-sanctioned all_users.oracle_maintained flag (present
+        since 12.1): it excludes EVERY Oracle-internal schema, including ones no
+        static list would know (e.g. 23ai's VECSYS / GGSHAREDCAP). The explicit
+        denylist is a belt-and-braces secondary filter and the fallback for
+        older Oracle that lacks the column. Last resort is the connection's
+        current schema, so a normal single-schema login never regresses to
+        zero tables.
+        """
+        owners = []
+        try:
+            cursor.execute(
+                "SELECT DISTINCT t.owner FROM all_tables t "
+                "JOIN all_users u ON u.username = t.owner "
+                "WHERE u.oracle_maintained = 'N' ORDER BY t.owner"
+            )
+            owners = [
+                row[0] for row in (cursor.fetchall() or [])
+                if row and row[0] and not self._is_oracle_system_owner(row[0])
+            ]
+        except Exception:
+            owners = []
+        if not owners:
+            try:
+                cursor.execute("SELECT DISTINCT owner FROM all_tables ORDER BY owner")
+                owners = [
+                    row[0] for row in (cursor.fetchall() or [])
+                    if row and row[0] and not self._is_oracle_system_owner(row[0])
+                ]
+            except Exception:
+                owners = []
+        if not owners:
+            try:
+                cursor.execute("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")
+                cur_schema = (cursor.fetchone() or [None])[0]
+                owners = [cur_schema] if cur_schema else []
+            except Exception:
+                owners = []
+        return owners
+
+    def _mysql_user_databases(self, cursor) -> List[str]:
+        """Every MySQL database the login can see, minus MySQL's own."""
+        cursor.execute("SELECT schema_name FROM information_schema.schemata ORDER BY schema_name")
+        return [
+            row[0] for row in (cursor.fetchall() or [])
+            if row and row[0] and str(row[0]).lower() not in self._MYSQL_SYSTEM_DATABASES
+        ]
+
+    def list_namespaces(self, params: Dict = None) -> Dict[str, Any]:
+        """List the names one level above a table: the level metadata.json's
+        namespace_model.table_namespace names. Schemas on PostgreSQL and SQL
+        Server, owners on Oracle, databases on MySQL and MongoDB, datasets on a
+        warehouse adapter. System namespaces are left out.
+
+        Returns {"success": True, "namespaces": [sorted names], "current": the
+        namespace the connection itself names, or "" when it names none}, or
+        {"success": False, "error": ...}.
+        """
+        params = params or {}
+        config = self._get_config(params)
+        adapter = getattr(self, "_warehouse_adapter", None)
+        if adapter is not None:
+            if not hasattr(adapter, "list_namespaces"):
+                return {"success": False, "error": "Listing namespaces is not supported by this warehouse adapter"}
+            return adapter.list_namespaces(config)
+        pattern = self.driver_pattern
+        module = pattern.get("module") or ""
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            if pattern.get("is_nosql"):
+                if "mongo" not in module:
+                    return {"success": False, "error": f"Listing namespaces is not supported for {module}"}
+                names = [n for n in conn.list_database_names() if n not in self._MONGO_SYSTEM_DATABASES]
+                current = config.get("database")
+            elif "sqlite" in module:
+                names, current = ["main"], "main"
+            else:
+                cursor = self._get_cursor(conn, as_dict=False)
+                try:
+                    if "mysql" in module:
+                        names = self._mysql_user_databases(cursor)
+                        current = config.get("database")
+                    elif "psycopg2" in module:
+                        names = self._postgres_user_schemas(cursor)
+                        current = config.get("schema")
+                    elif "pyodbc" in module:
+                        names = self._sqlserver_user_schemas(cursor)
+                        current = config.get("schema")
+                    elif "oracledb" in module:
+                        names = self._oracle_user_owners(cursor)
+                        current = str(config.get("owner") or config.get("schema") or "").upper()
+                    else:
+                        return {"success": False, "error": f"Listing namespaces is not supported for {module or 'this driver'}"}
+                finally:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+            return {
+                "success": True,
+                "namespaces": sorted({str(n) for n in names if n}),
+                "current": str(current or "").strip(),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Listing namespaces failed: {e}"}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # END list_namespaces block
+
+    # =========================================================================
     # SOURCE OPERATIONS
     # =========================================================================
     
@@ -3263,6 +3547,9 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         if not table:
             return {"success": False, "error": "Missing 'table' parameter"}
         table = self._normalize_table_for_mysql(config, table)
+        scope_error = self._server_level_read_error(config, table)
+        if scope_error:
+            return {"success": False, "error": scope_error}
 
         conn = None
         try:
@@ -3490,6 +3777,8 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         db, name = self._split_mysql_db_table(config, table, params)
         if not name or not self._is_safe_ident(name):
             return {"success": False, "error": f"Unsafe or missing table identifier: {name}"}
+        if not db:
+            return {"success": False, "error": _NO_WRITE_DATABASE}
         if db and not self._is_safe_ident(db):
             return {"success": False, "error": f"Unsafe database identifier: {db}"}
         qualified_target = f"`{db}`.`{name}`" if db else f"`{name}`"

@@ -153,6 +153,11 @@ def stub_llm(monkeypatch):
 
     monkeypatch.setattr(explorer_api, "explorer_client", _StubClient(_explorer_reply))
     monkeypatch.setattr(gateway_main, "sql_client", _StubClient(_sql_reply))
+    # The routes refuse to run until an LLM is set up (llm_gate). An explicit
+    # local choice counts as set up; the stubs stand in for it.
+    monkeypatch.setenv("LLM_PROVIDER", "ollama")
+    for var in ("EXPLORER_LLM_PROVIDER", "EXPLORER_SQL_PROVIDER"):
+        monkeypatch.delenv(var, raising=False)
 
 
 @pytest.fixture

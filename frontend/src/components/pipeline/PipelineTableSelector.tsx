@@ -12,9 +12,12 @@ import { Loader2, Table as TableIcon, Database, CheckCircle2, Eye, ChevronDown, 
 
 import { resumePipelineTables, type DestinationConfig } from "@/lib/api/pipelines"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { metadataErrorMessage, truncatedTableTotal } from "@/lib/api/connections"
 import { API_ENDPOINTS } from "@/lib/config/api"
-import { kindMeta, validateNamespace, namespaceKindForType, defaultNamespaceForTypes } from "@/lib/pipeline/destinationNamespace"
+import { kindMeta, validateNamespace, namespaceKindForType, defaultNamespaceForTypes, isLayoutV2Destination, validatePipelinePrefix } from "@/lib/pipeline/destinationNamespace"
+import { namespaceModelFor, namespaceModelsSnapshot, useNamespaceModels, type NamespaceModels } from "@/lib/pipeline/namespaceModel"
 import { isInternalExplorerTable } from "@/lib/explorer/internalTables"
+import { displayConnectorName } from "@/lib/connector-display"
 
 export type AvailableTable = {
   name: string
@@ -105,12 +108,12 @@ function TablePreviewPanel({ connectionId, tableName }: { connectionId: string; 
   }, [connectionId, tableName])
 
   if (loading) return (
-    <div className="flex items-center gap-2 p-3 text-xs text-zinc-500">
+    <div className="flex items-center gap-2 p-3 text-xs text-zinc-500 dark:text-zinc-400">
       <Loader2 className="h-3 w-3 animate-spin" /> Loading preview…
     </div>
   )
   if (error) return <div className="p-3 text-xs text-red-500">{error}</div>
-  if (rows.length === 0) return <div className="p-3 text-xs text-zinc-500">No sample rows available</div>
+  if (rows.length === 0) return <div className="p-3 text-xs text-zinc-500 dark:text-zinc-400">No sample rows available</div>
 
   return (
     <div className="overflow-auto max-h-40 rounded border border-zinc-100 dark:border-zinc-800">
@@ -118,7 +121,7 @@ function TablePreviewPanel({ connectionId, tableName }: { connectionId: string; 
         <thead className="sticky top-0 bg-zinc-50 dark:bg-zinc-900">
           <tr>
             {cols.map((c) => (
-              <th key={c} className="px-2 py-1.5 text-left font-medium text-zinc-500 border-b border-zinc-100 dark:border-zinc-800 whitespace-nowrap">{c}</th>
+              <th key={c} className="px-2 py-1.5 text-left font-medium text-zinc-500 dark:text-zinc-400 border-b border-zinc-100 dark:border-zinc-800 whitespace-nowrap">{c}</th>
             ))}
           </tr>
         </thead>
@@ -138,9 +141,90 @@ function TablePreviewPanel({ connectionId, tableName }: { connectionId: string; 
   )
 }
 
+// Source-aware word for a table's `schema` field: a schema inside one database
+// (pg/oracle/sqlserver/redshift), a database (mysql/mariadb/mongo/clickhouse),
+// or a dataset (bigquery) — the source's namespace_model.table_namespace, which
+// the executor's tableNamespaceIsDatabase reads too.
+export function tableNamespaceNoun(
+  sourceType?: string,
+  models: NamespaceModels | undefined = namespaceModelsSnapshot()
+): "database" | "schema" | "dataset" {
+  const t = namespaceModelFor(models, sourceType).table_namespace
+  return t === "database" || t === "dataset" ? t : "schema"
+}
+
+export type TableSourceDescription = {
+  // given   = the backend named the database and the tables agree with it
+  // derived = not named, but every table comes from the same one
+  // mixed   = the tables come from more than one; none is picked for the user
+  // unknown = nothing to go on
+  kind: "given" | "derived" | "mixed" | "unknown"
+  noun: "database" | "schema" | "dataset"
+  // The word shown to the user: the noun, or "database or schema" when the
+  // source type is not known and the noun is only a fallback.
+  unit: string
+  // "Tables in orders_db", "Tables in schema public", "Tables in 3 databases", or "".
+  heading: string
+  // Distinct namespaces across the listed tables, sorted.
+  namespaces: string[]
+}
+
+// describeTableSource says where the tables in the picker come from, so a user
+// with one connection per database can tell which one they are choosing from.
+// A database named by the backend is trusted unless the tables themselves say
+// they span several databases; then every namespace is listed instead of one
+// being guessed.
+export function describeTableSource(input: {
+  sourceDatabase?: string
+  sourceType?: string
+  tables: AvailableTable[]
+  models?: NamespaceModels
+}): TableSourceDescription {
+  const noun = tableNamespaceNoun(input.sourceType, input.models ?? namespaceModelsSnapshot())
+  // With no source type, "schema" is only a fallback: a MongoDB source would be
+  // wrongly called a schema. The wording then names neither.
+  const typeKnown = (input.sourceType || "").trim() !== ""
+  const unit = typeKnown ? noun : "database or schema"
+  const set = new Set<string>()
+  for (const t of input.tables) {
+    const s = (t.schema || "").trim()
+    if (s) set.add(s)
+  }
+  const namespaces = Array.from(set).sort((a, b) => a.localeCompare(b))
+  const given = (input.sourceDatabase || "").trim()
+
+  // Several databases (or several schemas with no database named): list them.
+  if (namespaces.length > 1 && (noun === "database" || !given)) {
+    const units = typeKnown ? `${noun}s` : "databases or schemas"
+    return { kind: "mixed", noun, unit, namespaces, heading: `Tables in ${namespaces.length} ${units}` }
+  }
+  // For a database-namespaced source the tables' own namespace is where they live.
+  if (noun === "database" && namespaces.length === 1) {
+    const only = namespaces[0]
+    return { kind: given === only ? "given" : "derived", noun, unit, namespaces, heading: `Tables in ${only}` }
+  }
+  if (given) {
+    return { kind: "given", noun, unit, namespaces, heading: `Tables in ${given}` }
+  }
+  if (namespaces.length === 1) {
+    const heading = typeKnown ? `Tables in ${noun} ${namespaces[0]}` : `Tables in ${namespaces[0]}`
+    return { kind: "derived", noun, unit, namespaces, heading }
+  }
+  return { kind: "unknown", noun, unit, namespaces, heading: "" }
+}
+
+// How many namespace names the header lists before summarising the rest.
+const MAX_LISTED_NAMESPACES = 6
+
 export function PipelineTableSelector(props: {
   isOpen: boolean
   onClose: () => void
+  // When provided, the footer Cancel button calls this instead of only closing:
+  // the caller ends the run that is waiting on this selection (for a pipeline
+  // being set up, it stops that pipeline). The dialog closes once it resolves; if
+  // it throws, the error is shown and the dialog stays open so the user can retry.
+  // Esc and the close icon still only close the dialog.
+  onCancel?: () => Promise<void> | void
   onResolved?: () => void
   onTablesSelected?: (tables: string[], destinationConfig?: DestinationConfig) => Promise<void> | void
   pipelineId: string
@@ -168,7 +252,14 @@ export function PipelineTableSelector(props: {
   // something is broken when it's just an empty schema.
   discoveryStatus?: "ok" | "empty" | "failed"
   sourceDatabase?: string
+  // The source connection names no database (server-level MySQL/MongoDB/
+  // ClickHouse): the run mirrors each source database at the destination even
+  // when one is picked, so the destination name is optional.
+  sourceServerLevel?: boolean
   discoveryReason?: string
+  // The source's table count when `availableTables` is only part of it (past the
+  // discovery cap); see truncatedTableTotal. Unset when the list is whole.
+  truncatedTotal?: number
   // Destination mapping (PR-C): when provided, render a namespace field + create
   // toggle inside this first-run HITL and send the confirmed mapping alongside the
   // table selection. Pipeline-scoped; pre-filled from the pipeline's destination_config.
@@ -183,6 +274,7 @@ export function PipelineTableSelector(props: {
   const {
     isOpen,
     onClose,
+    onCancel,
     onResolved,
     onTablesSelected,
     pipelineId,
@@ -199,13 +291,16 @@ export function PipelineTableSelector(props: {
     onCdcBackfillNewTablesChange,
     discoveryStatus,
     sourceDatabase,
+    sourceServerLevel = false,
     discoveryReason,
+    truncatedTotal,
     destinationConfig,
     destinationType,
     autoDismissOnResolve = false,
   } = props
 
   const [submitting, setSubmitting] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [expandedPreview, setExpandedPreview] = useState<string | null>(null)
   const [selected, setSelected] = useState<Record<string, boolean>>({})
@@ -220,6 +315,7 @@ export function PipelineTableSelector(props: {
   const [namespaceWildcards, setNamespaceWildcards] = useState<Record<string, boolean>>({})
   const [visibleCount, setVisibleCount] = useState(50)
   const [discoveredTables, setDiscoveredTables] = useState<AvailableTable[]>([])
+  const [discoveredTruncatedTotal, setDiscoveredTruncatedTotal] = useState<number | undefined>(undefined)
   const [discovering, setDiscovering] = useState(false)
   const [discoveryError, setDiscoveryError] = useState<string | null>(null)
   const [discoveryRanEmpty, setDiscoveryRanEmpty] = useState(false)
@@ -238,16 +334,27 @@ export function PipelineTableSelector(props: {
   // otherwise mislabel the field "Schema name" and wrongly require a value. So a
   // path/prefix type-kind wins over the persisted kind; for relational engines the
   // persisted kind (which the user may have customized) still takes precedence.
-  const destTypeKind = namespaceKindForType(destinationType)
+  // Human connector names ("MongoDB", "Google Cloud Storage"), never the raw id
+  // through CSS `capitalize` ("Mongodb", "Gcs") — issue #4.
+  const sourceLabel = displayConnectorName(sourceType)
+  const destinationLabel = displayConnectorName(destinationType)
+  // Undefined until the connectors' namespace models load; the seed below is
+  // re-applied when they arrive, unless the user has already typed.
+  const namespaceModels = useNamespaceModels()
+  const destTypeKind = namespaceKindForType(destinationType, namespaceModels)
   const destKind =
     destTypeKind === "path" || destTypeKind === "prefix"
       ? destTypeKind
       : (destinationConfig?.namespace_kind || "").trim() || destTypeKind
   const destMeta = kindMeta(destKind)
+  // GCS, S3 and Azure Blob write <prefix>/<database>/[<schema>/]<table>/ (object layout v2): the
+  // prefix is this pipeline's folder, required, and keeps source schemas apart on
+  // its own, so none of the flatten/preserve handling below applies to it.
+  const destIsLayoutV2 = isLayoutV2Destination(destinationType)
   // Prefer the stored config value; fall back to the destination-aware default
   // (e.g. "public" for MySQL→PostgreSQL, "" for BigQuery so the user is prompted).
   const [destNamespace, setDestNamespace] = useState(
-    destinationConfig?.namespace || defaultNamespaceForTypes(sourceType, destinationType)
+    destinationConfig?.namespace || defaultNamespaceForTypes(sourceType, destinationType, namespaceModels)
   )
   // destNamespaceError is computed further down, once the table selection state
   // (wholeDatabase / namespace wildcards / checked tables) is known — whether a
@@ -262,7 +369,8 @@ export function PipelineTableSelector(props: {
   // destination-aware fallback. NOTE this is NOT necessarily an engine default —
   // SQL Server / Snowflake / Oracle / Databricks sources seed the source slug
   // ("sqlserver"/…). It is a SEED, never a deliberate choice, until touched.
-  const seededNamespace = destinationConfig?.namespace || defaultNamespaceForTypes(sourceType, destinationType)
+  const seededNamespace =
+    destinationConfig?.namespace || defaultNamespaceForTypes(sourceType, destinationType, namespaceModels)
 
   // Seed the mapping field on open; re-apply a late-arriving destinationConfig
   // (both callers fetch it async AFTER the modal opens) — but NEVER clobber a
@@ -357,6 +465,7 @@ export function PipelineTableSelector(props: {
     if (availableTables.length > 0 || discoveryStatus === "empty") return
 
     setDiscoveredTables([])
+    setDiscoveredTruncatedTotal(undefined)
     setDiscoveryError(null)
     setDiscoveryRanEmpty(false)
     setDiscovering(true)
@@ -384,8 +493,11 @@ export function PipelineTableSelector(props: {
       }
 
       try {
-        const r = await authFetch(`${API_ENDPOINTS.CONNECTIONS.GET(connId)}/metadata`, { cache: "no-store" })
-        if (!r.ok) throw new Error(`HTTP ${r.status}`)
+        // One page holds everything discovery returns (the gateway's default page is 25).
+        const r = await authFetch(`${API_ENDPOINTS.CONNECTIONS.GET(connId)}/metadata?limit=5000`, { cache: "no-store" })
+        // A connection failure comes back as a 422 whose `details` is the
+        // connector's own reason (DNS, auth). Show that, not "HTTP 422".
+        if (!r.ok) throw new Error(await metadataErrorMessage(r))
         const data = (await r.json()) as Record<string, unknown>
         const raw = Array.isArray(data?.["tables"]) ? (data["tables"] as Record<string, unknown>[]) : []
         const parsed = raw
@@ -402,6 +514,7 @@ export function PipelineTableSelector(props: {
           }))
           .filter((t) => t.name)
         setDiscoveredTables(parsed)
+        setDiscoveredTruncatedTotal(truncatedTableTotal(data))
         if (parsed.length === 0) setDiscoveryRanEmpty(true)
       } catch (e) {
         setDiscoveryError(String((e as Error)?.message || "Couldn't fetch tables from source"))
@@ -550,6 +663,7 @@ export function PipelineTableSelector(props: {
     return [...visible].sort((a, b) => tableDisplayName(a).localeCompare(tableDisplayName(b)))
   }, [availableTables, discoveredTables])
   const hasTables = sortedTables.length > 0
+  const sourceTableTotal = availableTables.length > 0 ? truncatedTotal : discoveredTruncatedTotal
 
   // Map of table key → AI suggestion for rows that match a suggestion
   // (drives the "AI suggested" badge and the initial pre-selection).
@@ -583,13 +697,43 @@ export function PipelineTableSelector(props: {
   }, [sortedTables])
 
   // Source-aware label for a namespace unit: schema (pg/oracle/sqlserver/redshift),
-  // database (mysql/mongo/clickhouse), dataset (bigquery).
-  const namespaceNoun = useMemo(() => {
-    const t = (sourceType || "").toLowerCase()
-    if (t.includes("bigquery")) return "dataset"
-    if (t.includes("mysql") || t.includes("mongo") || t.includes("clickhouse")) return "database"
-    return "schema"
-  }, [sourceType])
+  // database (mysql/mariadb/mongo/clickhouse), dataset (bigquery).
+  const namespaceNoun = useMemo(() => tableNamespaceNoun(sourceType, namespaceModels), [sourceType, namespaceModels])
+
+  // Which database these tables come from (issue #14): named by the backend,
+  // derived from the tables, or listed when they span several.
+  const tableSource = useMemo(
+    () => describeTableSource({ sourceDatabase, sourceType, tables: sortedTables, models: namespaceModels }),
+    [sourceDatabase, sourceType, sortedTables, namespaceModels]
+  )
+  // The database that was searched, for the messages shown when no tables came back.
+  const searchedDatabase = (sourceDatabase || "").trim()
+
+  // The connection's display name, so two connections to look-alike databases
+  // can be told apart. Optional: any failure just leaves it out.
+  // Keyed by connection id so a name fetched for one connection is never shown
+  // for another.
+  const [fetchedConnection, setFetchedConnection] = useState<{ id: string; name: string } | null>(null)
+  const connectionName =
+    isOpen && sourceConnectionId && fetchedConnection?.id === sourceConnectionId ? fetchedConnection.name : ""
+  useEffect(() => {
+    if (!isOpen || !sourceConnectionId) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const r = await authFetch(API_ENDPOINTS.CONNECTIONS.GET(sourceConnectionId), { cache: "no-store" })
+        if (!r.ok) return
+        const data = (await r.json()) as Record<string, unknown> | null
+        const name = typeof data?.["name"] === "string" ? data["name"].trim() : ""
+        if (!cancelled && name) setFetchedConnection({ id: sourceConnectionId, name })
+      } catch {
+        // The name is a convenience; the picker works without it.
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [isOpen, sourceConnectionId])
 
   const selectedNamespaces = useMemo(
     () => Object.keys(namespaceWildcards).filter((ns) => namespaceWildcards[ns]),
@@ -767,14 +911,16 @@ export function PipelineTableSelector(props: {
   // >1 source schema and no deliberate namespace is set). Forcing a single
   // target namespace here would either block the user or silently flatten every
   // schema into one namespace (same-named tables collide → data loss, PR #549).
-  const preservesSourceSchemas = showMapping && (wholeDatabase || distinctSelectedSchemas > 1)
+  const preservesSourceSchemas = showMapping && (wholeDatabase || distinctSelectedSchemas > 1 || sourceServerLevel)
   // A destination namespace is required only when the destination has a real
   // namespace concept (schema/database/dataset — createable) AND the selection
   // is single-schema. Path/prefix destinations (object storage, sqlite) and
   // multi-schema selections leave it optional (blank is valid).
-  const namespaceRequired = showMapping && destMeta.createable && !preservesSourceSchemas
+  const namespaceRequired = showMapping && (destIsLayoutV2 || (destMeta.createable && !preservesSourceSchemas))
   const destNamespaceError = showMapping
-    ? validateNamespace(destNamespace, { required: namespaceRequired })
+    ? destIsLayoutV2
+      ? validatePipelinePrefix(destNamespace)
+      : validateNamespace(destNamespace, { required: namespaceRequired })
     : ""
 
   // Safe default for a multi-schema selection: blank ⇒ preserve each source
@@ -793,12 +939,12 @@ export function PipelineTableSelector(props: {
   useEffect(() => {
     if (!isOpen || !showMapping) return
     if (namespaceTouchedRef.current) return
-    if (preservesSourceSchemas) {
+    if (preservesSourceSchemas && !destIsLayoutV2) {
       if (destNamespace.trim() !== "") setDestNamespace("")
     } else if (destNamespace.trim() === "" && seededNamespace) {
       setDestNamespace(seededNamespace)
     }
-  }, [isOpen, showMapping, preservesSourceSchemas, destNamespace, seededNamespace])
+  }, [isOpen, showMapping, preservesSourceSchemas, destIsLayoutV2, destNamespace, seededNamespace])
 
   // Copy helpers for the destination-mapping help text. The goal is that the
   // single-schema and "entire database"/multi-schema cases read as clearly
@@ -870,7 +1016,7 @@ export function PipelineTableSelector(props: {
     // schema instead. Single-schema selections require an explicit name, so an
     // untouched seed there IS the intended target and is used as-is.
     const namespaceIsDeliberate =
-      trimmedNamespace !== "" && (!preservesSourceSchemas || namespaceTouchedRef.current)
+      trimmedNamespace !== "" && (destIsLayoutV2 || !preservesSourceSchemas || namespaceTouchedRef.current)
     let destCfg: DestinationConfig | undefined
     if (showMapping && namespaceIsDeliberate) {
       destCfg = {
@@ -883,7 +1029,7 @@ export function PipelineTableSelector(props: {
         // (destination_schema_mode is sticky; without this the executor would keep
         // mirroring per source schema and ignore the name just typed). Single-schema
         // selections need no directive (there is nothing to preserve/flatten).
-        ...(preservesSourceSchemas ? { schema_mode: "flatten" as const } : {}),
+        ...(preservesSourceSchemas && !destIsLayoutV2 ? { schema_mode: "flatten" as const } : {}),
       }
     } else if (showMapping && preservesSourceSchemas) {
       destCfg = {
@@ -930,6 +1076,24 @@ export function PipelineTableSelector(props: {
     }
   }
 
+  const onCancelClick = async () => {
+    if (!onCancel) {
+      onClose()
+      return
+    }
+    setCancelling(true)
+    setError(null)
+    try {
+      await onCancel()
+      onClose()
+    } catch (e: unknown) {
+      const message = e instanceof Error ? e.message : String(e || "")
+      setError(message || "Could not cancel pipeline setup. Try again.")
+    } finally {
+      setCancelling(false)
+    }
+  }
+
   return (
     <Dialog open={isOpen} onOpenChange={(open) => (!open ? onClose() : null)}>
       <DialogContent className="max-w-3xl max-h-[90vh] flex flex-col overflow-hidden">
@@ -944,16 +1108,58 @@ export function PipelineTableSelector(props: {
             reachable at short viewports (it scrolled off below ~812px). */}
         <div className="flex-1 min-h-0 overflow-y-auto -mx-6 px-6">
         <div className="space-y-3">
-          {/* Source database header */}
-          {(sourceDatabase || sourceType) && (
-            <div className="flex items-center gap-2 px-3 py-2 rounded-lg bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-sm">
-              <Database className="h-4 w-4 text-blue-500 shrink-0" />
-              <span className="text-zinc-500">Source:</span>
-              <span className="font-medium capitalize">
-                {sourceDatabase || sourceType}
-              </span>
+          {/* Source database header: which database (and connection) these tables come from */}
+          {(tableSource.heading || sourceType || connectionName) && (
+            <div
+              data-testid="table-source-header"
+              className="flex items-start gap-2 px-3 py-2 rounded-lg bg-zinc-50 dark:bg-zinc-900 border border-zinc-200 dark:border-zinc-800 text-sm"
+            >
+              <Database className="h-4 w-4 mt-0.5 text-blue-500 shrink-0" />
+              <div className="min-w-0 flex-1 space-y-1">
+                {tableSource.heading ? (
+                  <p className="font-medium break-words" data-testid="table-source-heading">
+                    {tableSource.heading}
+                  </p>
+                ) : sourceType ? (
+                  <p>
+                    <span className="text-zinc-500 dark:text-zinc-400">Source:</span>{" "}
+                    <span className="font-medium">{sourceLabel}</span>
+                  </p>
+                ) : null}
+                {(connectionName || (tableSource.heading && sourceType)) && (
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400 break-words" data-testid="table-source-connection">
+                    {connectionName && (
+                      <>
+                        Connection: <span className="font-medium text-zinc-700 dark:text-zinc-300">{connectionName}</span>
+                      </>
+                    )}
+                    {connectionName && tableSource.heading && sourceType ? " · " : null}
+                    {tableSource.heading && sourceType ? <span>{sourceLabel}</span> : null}
+                  </p>
+                )}
+                {tableSource.kind === "mixed" && (
+                  <div className="space-y-1" data-testid="table-source-namespaces">
+                    <p className="text-xs text-amber-700 dark:text-amber-400">
+                      These tables come from more than one {tableSource.unit}. Each name below starts with its{" "}
+                      {tableSource.unit}, so check it before you select.
+                    </p>
+                    <div className="flex flex-wrap gap-1">
+                      {tableSource.namespaces.slice(0, MAX_LISTED_NAMESPACES).map((ns) => (
+                        <Badge key={ns} variant="outline" className="font-mono text-xs">
+                          {ns}
+                        </Badge>
+                      ))}
+                      {tableSource.namespaces.length > MAX_LISTED_NAMESPACES && (
+                        <Badge variant="outline" className="text-xs">
+                          +{tableSource.namespaces.length - MAX_LISTED_NAMESPACES} more
+                        </Badge>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </div>
               {hasTables && (
-                <Badge variant="secondary" className="ml-auto">{sortedTables.length} table{sortedTables.length !== 1 ? "s" : ""} found</Badge>
+                <Badge variant="secondary" className="shrink-0">{sortedTables.length} table{sortedTables.length !== 1 ? "s" : ""} found</Badge>
               )}
             </div>
           )}
@@ -966,8 +1172,8 @@ export function PipelineTableSelector(props: {
                 <Database className="h-4 w-4 text-violet-500 shrink-0" />
                 Destination mapping
                 {destinationType && (
-                  <span className="ml-auto text-xs font-normal text-zinc-500">
-                    Destination: <span className="font-medium capitalize text-zinc-700 dark:text-zinc-300">{destinationType}</span>
+                  <span className="ml-auto text-xs font-normal text-zinc-500 dark:text-zinc-400">
+                    Destination: <span className="font-medium text-zinc-700 dark:text-zinc-300">{destinationLabel}</span>
                   </span>
                 )}
               </div>
@@ -984,7 +1190,9 @@ export function PipelineTableSelector(props: {
                     setDestNamespace(e.target.value)
                   }}
                   placeholder={
-                    preservesSourceSchemas
+                    destIsLayoutV2
+                      ? "Name this pipeline's folder, e.g. sales_orders"
+                      : preservesSourceSchemas
                       ? `Leave blank to keep each source ${namespaceNoun} separate`
                       : destIsPathStyle
                       ? "Leave blank to write at the destination root"
@@ -994,7 +1202,13 @@ export function PipelineTableSelector(props: {
                 />
                 {/* Help text: explicit about WHAT gets created/where data lands, and
                     clearly distinct for the single-schema vs multi-schema cases. */}
-                {preservesSourceSchemas ? (
+                {destIsLayoutV2 ? (
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                    This pipeline&apos;s folder in the bucket or container. Files are written under{" "}
+                    <span className="font-mono">{destNamespace.trim() || "<prefix>"}/&lt;database&gt;/[&lt;schema&gt;/]&lt;table&gt;/</span>
+                    , so each source {namespaceNoun} keeps its own folder. Lowercase letters, digits and underscores.
+                  </p>
+                ) : preservesSourceSchemas ? (
                   <p className="text-xs text-violet-600 dark:text-violet-400">
                     Your selection spans <span className="font-medium">{sourceSchemaCountLabel}</span>
                     {!wholeDatabase && selectedTables.length > 0 ? ` (${selectedTables.length} table${selectedTables.length !== 1 ? "s" : ""})` : ""}.{" "}
@@ -1038,18 +1252,20 @@ export function PipelineTableSelector(props: {
             {hasTables
               ? "Select which tables to include in this pipeline."
               : discovering
-              ? `Discovering tables from ${sourceType || "source"}…`
+              ? `Discovering tables from ${sourceLabel || "source"}…`
               : discoveryStatus === "empty"
               ? discoveryReason ||
-                (sourceDatabase
-                  ? `"${sourceDatabase}" has no tables. Enter a qualified name like \`otherdb.users\` below.`
-                  : `${sourceType || "Source"} has no tables. Enter a table name manually.`)
+                (searchedDatabase
+                  ? `"${searchedDatabase}" has no tables. Enter a qualified name like \`otherdb.users\` below.`
+                  : `${sourceLabel || "Source"} has no tables. Enter a table name manually.`)
               : discoveryError
               ? `${discoveryError}. Enter table name(s) manually below.`
               : discoveryRanEmpty
-              ? `No tables found in this ${sourceType || "source"} database. Enter a table name manually (e.g. mydb.users).`
-              : sourceType
-              ? `Couldn't list tables from ${sourceType}. Enter the table name(s) manually.`
+              ? searchedDatabase
+                ? `No tables found in "${searchedDatabase}". Enter a table name manually (e.g. mydb.users).`
+                : `No tables found in this ${sourceLabel || "source"} database. Enter a table name manually (e.g. mydb.users).`
+              : sourceLabel
+              ? `Couldn't list tables from ${sourceLabel}. Enter the table name(s) manually.`
               : "Couldn't list tables. Enter the table name(s) manually."}
           </p>
 
@@ -1113,7 +1329,7 @@ export function PipelineTableSelector(props: {
           {hasTables ? (
             <div className="space-y-1.5">
               {/* Whole-database selection: emits a server-resolved "*" sentinel,
-                  so it is NOT bounded by the 100-table discovery preview below. */}
+                  so it is NOT bounded by the discovery cap. */}
               <label
                 className={`flex items-start gap-2 rounded-md border p-2.5 cursor-pointer transition-colors ${
                   wholeDatabase
@@ -1144,17 +1360,18 @@ export function PipelineTableSelector(props: {
                   the server at sync time, so tables beyond the {sortedTables.length}-table preview are included.
                 </p>
               )}
-              {!wholeDatabase && sortedTables.length >= 100 && (
-                <p className="text-xs text-amber-600 dark:text-amber-500">
-                  Showing the first {sortedTables.length} tables (discovery preview is capped). Use
-                  “Select entire database” above to include everything.
+              {!wholeDatabase && sourceTableTotal !== undefined && (
+                <p className="text-xs text-amber-600 dark:text-amber-500" data-testid="tables-truncated-notice">
+                  Showing {sortedTables.length.toLocaleString()} of {sourceTableTotal.toLocaleString()} tables:
+                  the list stops at the discovery limit. Use “Select entire database” above to include
+                  every table.
                 </p>
               )}
             </div>
           ) : null}
 
           {hasTables ? (
-            <div className={`flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-500 ${wholeDatabase ? "opacity-50 pointer-events-none" : ""}`}>
+            <div className={`flex flex-wrap items-center justify-between gap-2 text-xs text-zinc-500 dark:text-zinc-400 ${wholeDatabase ? "opacity-50 pointer-events-none" : ""}`}>
               <span>
                 Showing{" "}
                 <span className="font-medium text-zinc-700 dark:text-zinc-200">{Math.min(visibleTables.length, filteredTables.length)}</span> of{" "}
@@ -1326,16 +1543,16 @@ export function PipelineTableSelector(props: {
 
         <DialogFooter className="gap-2 items-center shrink-0 border-t border-zinc-200 dark:border-zinc-800 pt-4 mt-1">
           {selectedTables.length > 0 && (
-            <span className="text-sm text-zinc-500 mr-auto">
+            <span className="text-sm text-zinc-500 dark:text-zinc-400 mr-auto">
               {selectedTables.length} table{selectedTables.length !== 1 ? "s" : ""} selected
             </span>
           )}
-          <Button variant="outline" onClick={onClose} disabled={submitting}>
-            Cancel
+          <Button variant="outline" onClick={onCancelClick} disabled={submitting || cancelling}>
+            {cancelling ? "Cancelling…" : "Cancel"}
           </Button>
           <Button
             onClick={onConfirm}
-            disabled={submitting || (showMapping && !!destNamespaceError) || (!wholeDatabase && !hasNamespaceWildcards && selectedTables.length === 0 && manualSelectedTables.length === 0)}
+            disabled={submitting || cancelling || (showMapping && !!destNamespaceError) || (!wholeDatabase && !hasNamespaceWildcards && selectedTables.length === 0 && manualSelectedTables.length === 0)}
             className="bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700"
           >
             {submitting ? (

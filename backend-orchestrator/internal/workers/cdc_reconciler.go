@@ -88,6 +88,7 @@ func (r *CDCReconciler) Start(ctx context.Context) {
 	r.sweep(ctx)
 	r.reapSlots(ctx)
 	r.reapPublications(ctx)
+	r.reapCaptureInstances(ctx)
 	for {
 		select {
 		case <-ctx.Done():
@@ -98,6 +99,7 @@ func (r *CDCReconciler) Start(ctx context.Context) {
 			r.sweep(ctx)
 			r.reapSlots(ctx)
 			r.reapPublications(ctx)
+			r.reapCaptureInstances(ctx)
 		}
 	}
 }
@@ -132,6 +134,25 @@ func (r *CDCReconciler) reapPublications(ctx context.Context) {
 	}
 	if dropped > 0 {
 		log.Infof("cdc_reconciler: reaped %d orphaned/stopped PostgreSQL publication(s)", dropped)
+	}
+}
+
+// reapCaptureInstances disables SQL Server capture instances whose owning
+// pipeline no longer exists — the SQL Server analogue of reapSlots. Unlike the
+// two PostgreSQL reapers it deliberately does NOT act on merely 'stopped'
+// pipelines: a capture instance holds the change data itself, so disabling one
+// on a resumable pipeline would discard it and force a re-snapshot. Runs every
+// tick, independently of the connector sweep. Idempotent; all errors logged,
+// never fatal. SQL Server is the only non-PostgreSQL family with a physical
+// resource to reap (Oracle/MySQL cleanup is ledger-only by design).
+func (r *CDCReconciler) reapCaptureInstances(ctx context.Context) {
+	disabled, err := cdc.NewSQLServerManager(r.db).ReapOrphanedCaptureInstances(ctx)
+	if err != nil {
+		log.WithError(err).Debug("cdc_reconciler: capture-instance reap query failed; skipping")
+		return
+	}
+	if disabled > 0 {
+		log.Infof("cdc_reconciler: reaped %d orphaned SQL Server capture instance(s)", disabled)
 	}
 }
 

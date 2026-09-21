@@ -54,6 +54,7 @@ STRIP_LIST = os.path.join(LLM_DIR, "oss-strip-list.txt")
 DOCKERFILE_COMMUNITY = os.path.join(LLM_DIR, "Dockerfile.community")
 DOCKERFILE_LIFECYCLE = os.path.join(LLM_DIR, "Dockerfile.oss")
 FLIP_RUNBOOK = os.path.join(REPO_ROOT, "docs", "internal", "public-flip-runbook.md")
+LEAK_PROOF = os.path.join(REPO_ROOT, "scripts", "oss-leak-proof-test.sh")
 
 # Only these two trees are partitioned. Everything else in the build context
 # (requirements*.txt, conftest.py, the Dockerfiles themselves) is either copied
@@ -114,8 +115,13 @@ def _strip_entries_on_disk():
 
 def test_inputs_are_non_empty():
     """A parser that silently stops matching turns this whole file green."""
+    # 14 entries today, down from 19: promoting the deterministic renderer
+    # (contracts/, generator/, scaffold/, schemas/, templates/, validation/) to the
+    # community image removed six. The floor only has to tell "the parser stopped
+    # matching" from "the list legitimately shrank", so it sits below the real count
+    # with room for the next promotion, not flush against it.
     strips = _strip_list()
-    assert len(strips) >= 15, f"strip list parsed to {len(strips)} entries: {strips}"
+    assert len(strips) >= 10, f"strip list parsed to {len(strips)} entries: {strips}"
 
     community = _copy_sources(DOCKERFILE_COMMUNITY)
     assert len(community) >= 15, f"Dockerfile.community COPY parse: {community}"
@@ -128,6 +134,48 @@ def test_inputs_are_non_empty():
     # shrank" from "git ls-files returned nothing", so it sits below both.
     tracked = [p for tree in PARTITIONED_TREES for p in _tracked(tree)]
     assert len(tracked) >= 60, f"git ls-files found {len(tracked)} files"
+
+
+def test_the_strip_list_floor_is_the_same_number_everywhere_it_is_written():
+    """One list, one floor -- and the floor is written in three places.
+
+    ``scripts/oss-leak-proof-test.sh`` refuses to run when the strip list parses to
+    fewer paths than its own floor, and its comment says that floor exists "to match
+    the guard on the same file in llm-service/tests/test_oss_image_boundary.py".
+    Nothing enforced the match. Lowering the floor here from 15 to 10 -- because the
+    same commit promoted six subtrees out of the list and left it at 14 -- did not
+    touch the shell, so the job aborted before building either image and reported it
+    as a gutted list.
+
+    That is the defect this whole area exists to prevent, one level up: a fact
+    hand-copied into a second file, falsified by the commit that changed the first.
+    So the number is read back out of all three sites rather than asserted to equal
+    anything, and the shell's operator and its error message are read separately --
+    a message left saying ">=15" while the test says 10 is the same defect aimed at
+    whoever has to act on the failure.
+    """
+    own_source = _read(os.path.abspath(__file__))
+    here = re.findall(r"assert len\(strips\) >= (\d+)", own_source)
+    assert len(here) == 1, f"expected exactly one strip-list floor in this file: {here}"
+
+    shell = _read(LEAK_PROOF)
+    operator = re.findall(r'"\$\{#STRIP\[@\]\}"\s+-lt\s+(\d+)', shell)
+    message = re.findall(r"expected the moat list \(>=(\d+)\)", shell)
+    assert len(operator) == 1, f"strip-list floor test not found in {LEAK_PROOF}: {operator}"
+    assert len(message) == 1, f"strip-list floor message not found in {LEAK_PROOF}: {message}"
+
+    floors = {"this file": here[0], "the shell's -lt": operator[0], "the shell's message": message[0]}
+    assert len(set(floors.values())) == 1, (
+        "the strip-list floor disagrees between its copies, so one of them refuses a "
+        f"list the other accepts: {floors}"
+    )
+
+    # A floor above the real count refuses the list it is meant to protect -- which
+    # is exactly how this was found. Both sites are checked against the same parse.
+    assert int(here[0]) <= len(_strip_list()), (
+        f"floor {here[0]} is above the {len(_strip_list())} entries the strip list "
+        "actually has; every consumer of it refuses to run"
+    )
 
 
 def test_the_strip_list_is_internally_consistent():

@@ -41,6 +41,10 @@ function formatEvidenceValue(v: unknown): string {
   }
 }
 
+export const STRATEGY_FETCH_TIMEOUT_MS = 15_000
+export const STRATEGY_FETCH_MAX_RETRIES = 2
+export const STRATEGY_FETCH_RETRY_DELAY_MS = 3_000
+
 interface DataLoadingStrategyCardProps {
   pipelineId?: string
   strategy?: DataLoadingStrategy | null
@@ -67,6 +71,11 @@ export function DataLoadingStrategyCard({
   // once on mount and never again, so it kept advertising a schedule that had just been
   // deleted until a hard reload. Re-fetch when any schedule mutation broadcasts.
   const [scheduleRevision, setScheduleRevision] = useState(0)
+  // "Loading strategy…" used to be permanent when the one GET never settled:
+  // authFetch has no default timeout and nothing retried, so a request that
+  // stalled while the run finished left the Overview spinning until a reload.
+  // Bound each attempt and retry a few times before saying it is unavailable.
+  const [retryAttempt, setRetryAttempt] = useState(0)
   useEffect(() => {
     if (!pipelineId) return
     return onPipelineSchedulesChanged((pid) => {
@@ -80,25 +89,33 @@ export function DataLoadingStrategyCard({
     if (!pipelineId) return
     if (strategyProp) return // explicit beats fetch
 
+    let retryTimer: ReturnType<typeof setTimeout> | undefined
     const run = async () => {
       setLoading(true)
       setError(null)
       try {
-        const p = await getPipeline(pipelineId)
+        const p = await getPipeline(pipelineId, { timeoutMs: STRATEGY_FETCH_TIMEOUT_MS })
         const s = p?.data_loading_strategy as DataLoadingStrategy | undefined
         if (!cancelled) setStrategy(s || null)
-      } catch (e: any) {
-        if (!cancelled) setError(e?.message || "Failed to load strategy")
-      } finally {
         if (!cancelled) setLoading(false)
+      } catch (e: any) {
+        if (cancelled) return
+        if (retryAttempt < STRATEGY_FETCH_MAX_RETRIES) {
+          // Keep the loading label through the retry; a transient stall is not an error.
+          retryTimer = setTimeout(() => setRetryAttempt((n) => n + 1), STRATEGY_FETCH_RETRY_DELAY_MS)
+          return
+        }
+        setError(e?.message || "Failed to load strategy")
+        setLoading(false)
       }
     }
 
     void run()
     return () => {
       cancelled = true
+      if (retryTimer) clearTimeout(retryTimer)
     }
-  }, [pipelineId, strategyProp, scheduleRevision])
+  }, [pipelineId, strategyProp, scheduleRevision, retryAttempt])
 
   const hasStrategy = Boolean(strategy)
   const mode = useMemo(

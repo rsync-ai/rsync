@@ -67,15 +67,16 @@ class FakeCursor:
             sch = p[0] if p else None
             self._one = [len(_TABLES.get(sch, []))]
         elif "index_id IN (0,1)" in s:
-            # per-schema table list
+            # per-schema table list, FETCH NEXT <remaining> ROWS
             sch = p[0] if p else None
-            self._result = list(_TABLES.get(sch, []))
+            self._result = list(_TABLES.get(sch, []))[: p[1] if len(p) > 1 else None]
         elif "sys.columns c" in s and "sys.types" in s:
-            key = (p[0], p[1]) if len(p) >= 2 else None
-            self._result = list(_COLUMNS.get(key, []))
+            # one query per schema: (table, column...) for every table in it
+            self._result = [(tbl,) + col for (sch, tbl), cols in _COLUMNS.items()
+                            if sch == p[0] for col in cols]
         elif "sys.key_constraints" in s:
-            key = (p[0], p[1]) if len(p) >= 2 else None
-            self._result = list(_PKS.get(key, []))
+            self._result = [(tbl,) + pk for (sch, tbl), pks in _PKS.items()
+                            if sch == p[0] for pk in pks]
         elif "sys.foreign_keys" in s:
             self._result = []
         elif "sys.indexes" in s:
@@ -93,13 +94,13 @@ class FakeCursor:
         pass
 
 
-def _discover(config):
+def _discover(config, max_tables=100, cur=None):
     srv = _srv()
-    cur = FakeCursor()
+    cur = cur or FakeCursor()
     srv._get_cursor = lambda conn, as_dict=False: cur
     result = {}
     srv._discover_sqlserver_schema_v2(
-        conn=object(), config=config, max_tables=100,
+        conn=object(), config=config, max_tables=max_tables,
         include_columns=True, include_row_counts=True,
         include_relationships=True, include_indexes=False,
         result=result, add_warning=lambda *a, **k: None,
@@ -146,9 +147,33 @@ def test_explicit_schema_pins_discovery():
     assert result["total_tables_available"] == 2
 
 
+def test_catalog_queries_run_once_per_schema():
+    # Three queries per table ran past the 30s discovery timeout at a few
+    # thousand tables; columns, PKs and FKs are now read once per schema.
+    cur = FakeCursor()
+    result = _discover({}, cur=cur)
+    assert len(result["tables"]) == 4
+    for marker in ("sys.types", "sys.key_constraints", "sys.foreign_keys"):
+        n = sum(1 for sql, _ in cur.executed if marker in sql)
+        assert n == 2, (marker, n)  # 2 schemas, not 4 tables
+
+
+def test_tables_past_max_tables_are_skipped():
+    result = _discover({}, max_tables=3)
+    by = {(t["schema"], t["name"]): t for t in result["tables"]}
+    # dbo.orders, dbo.users, sales.orders; sales.inventory is past the cap and
+    # its catalog rows (returned by the per-schema query) are dropped.
+    assert set(by) == {("dbo", "orders"), ("dbo", "users"), ("sales", "orders")}, set(by)
+    assert result["total_tables_available"] == 4
+    assert by[("sales", "orders")]["primary_keys"] == ["id"]
+    assert {c["name"] for c in by[("sales", "orders")]["columns"]} == {"id", "amount"}
+
+
 if __name__ == "__main__":
     test_multi_schema_discovers_non_dbo_tables()
     test_non_dbo_table_gets_its_pk_and_types()
     test_same_named_tables_do_not_cross_assign()
     test_explicit_schema_pins_discovery()
+    test_catalog_queries_run_once_per_schema()
+    test_tables_past_max_tables_are_skipped()
     print("OK: sqlserver multi-schema discovery tests passed")

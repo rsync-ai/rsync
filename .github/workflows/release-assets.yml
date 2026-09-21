@@ -1,0 +1,46 @@
+name: Attach release assets
+
+on:
+  # Runs when a maintainer publishes a GitHub Release. It never creates or
+  # publishes one itself: cutting a release stays a manual, human decision.
+  #
+  # Why this exists: GitHub counts a download only for a file attached to a
+  # Release. `install.sh` is fetched from raw.githubusercontent.com, which has
+  # no counter, so today the only install signal GitHub keeps is clone traffic
+  # (a 14-day window that includes bots and CI). Attaching the two files an
+  # install needs, plus their checksums, gives an exact per-file
+  # `download_count` and lets a user verify what they ran. The release checklist
+  # is docs/deployment/public-release-checklist.md.
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  attach:
+    name: Attach install files and checksums
+    runs-on: ubuntu-latest
+    # `contents: write` is what `gh release upload` needs, and it is granted to
+    # this one job only.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout the release tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Build SHA256SUMS
+        run: |
+          set -euo pipefail
+          sha256sum install.sh docker-compose.quickstart.yml | tee SHA256SUMS
+
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" install.sh docker-compose.quickstart.yml SHA256SUMS \
+            --clobber --repo "$GITHUB_REPOSITORY"

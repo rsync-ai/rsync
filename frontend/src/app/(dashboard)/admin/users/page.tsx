@@ -58,6 +58,7 @@ import {
   adminUpdateUserStatus,
   adminDeleteUser,
 } from "@/lib/api/admin"
+import { formatDate } from "@/lib/utils"
 
 const roleBadgeVariant: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
   admin: "default",
@@ -218,7 +219,7 @@ export default function AdminUsersPage() {
             <TableBody>
               {users.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center text-sm text-zinc-500 py-8">
+                  <TableCell colSpan={7} className="text-center text-sm text-zinc-500 dark:text-zinc-400 py-8">
                     No users found
                   </TableCell>
                 </TableRow>
@@ -233,11 +234,11 @@ export default function AdminUsersPage() {
                     <TableCell>
                       <Badge variant={statusBadgeVariant[user.status] || "outline"}>{user.status}</Badge>
                     </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-zinc-500">
-                      {new Date(user.created_at).toLocaleDateString()}
+                    <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
+                      {formatDate(user.created_at)}
                     </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-zinc-500">
-                      {user.last_login ? new Date(user.last_login).toLocaleDateString() : "-"}
+                    <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
+                      {user.last_login ? formatDate(user.last_login) : "-"}
                     </TableCell>
                     <TableCell className="text-right">
                       <DropdownMenu>
@@ -267,7 +268,7 @@ export default function AdminUsersPage() {
           </Table>
 
           {total > 50 && (
-            <div className="flex items-center justify-between mt-4 text-sm text-zinc-500">
+            <div className="flex items-center justify-between mt-4 text-sm text-zinc-500 dark:text-zinc-400">
               <span>Showing {offset + 1}-{Math.min(offset + 50, total)} of {total}</span>
               <div className="flex gap-2">
                 <Button variant="outline" size="sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 50))}>

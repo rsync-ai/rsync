@@ -189,8 +189,9 @@ def test_the_bind_address_defaults_to_loopback():
 def _drive_prompt_env(tmp_path, env=None, answers=None):
     """Source install.sh (minus its `main` call) and run prompt_env for real.
 
-    Returns the resulting variables as a dict. `answers` simulates a terminal by
-    feeding fd 3, which is where `ask` reads from.
+    Returns the resulting variables as a dict, plus what prompt_env printed under
+    "_OUTPUT". `answers` simulates a terminal by feeding fd 3, which is where `ask`
+    reads from.
     """
     lib = tmp_path / "install-lib.sh"
     lib.write_text("\n".join(INSTALL_SH.read_text().splitlines()[:-1]) + "\n")
@@ -202,18 +203,22 @@ def _drive_prompt_env(tmp_path, env=None, answers=None):
         answers_file.write_text("\n".join(answers) + "\n")
         tty_setup = f'exec 3< "{answers_file}"\nTTY_OK=1'
 
+    printed = tmp_path / "prompt_env.out"
     driver = tmp_path / "drive.sh"
     driver.write_text(
         "set -uo pipefail\n"
         "TTY_OK=0\n"
         f'source "{lib}" >/dev/null 2>&1\n'
         f"{tty_setup}\n"
-        "prompt_env >/dev/null 2>&1\n"
+        f'prompt_env >"{printed}" 2>&1\n'
         'printf "RSYNC_BIND_ADDR=%s\\n" "${RSYNC_BIND_ADDR:-}"\n'
         'printf "NEXTAUTH_URL=%s\\n" "${NEXTAUTH_URL:-}"\n'
         'printf "PUBLIC_URL=%s\\n" "${PUBLIC_URL:-}"\n'
         'printf "PUBLIC_WS_URL=%s\\n" "${PUBLIC_WS_URL:-}"\n'
         'printf "LLM_PROVIDER=%s\\n" "${LLM_PROVIDER:-}"\n'
+        'printf "LLM_MODEL=%s\\n" "${LLM_MODEL:-}"\n'
+        'printf "OLLAMA_URL=%s\\n" "${OLLAMA_URL:-}"\n'
+        'printf "OPENAI_API_KEY_SET=%s\\n" "${OPENAI_API_KEY:+yes}"\n'
         'printf "RSYNC_COOKIE_SECURE=%s\\n" "${RSYNC_COOKIE_SECURE:-}"\n'
     )
 
@@ -221,7 +226,17 @@ def _drive_prompt_env(tmp_path, env=None, answers=None):
     for key in (
         "PUBLIC_HOST",
         "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
         "LLM_PROVIDER",
+        "LLM_MODEL",
+        "OLLAMA_URL",
+        # Each changes which LLM path prompt_env takes.
+        "OPENAI_API_KEY_SOURCE",
+        "GROQ_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_API_KEY",
+        "AZURE_OPENAI_API_VERSION",
+        "AZURE_OPENAI_DEPLOYMENT",
         "RSYNC_BIND_ADDR",
         "RSYNC_COOKIE_SECURE",
     ):
@@ -235,6 +250,7 @@ def _drive_prompt_env(tmp_path, env=None, answers=None):
     for line in proc.stdout.splitlines():
         key, _, value = line.partition("=")
         out[key] = value
+    out["_OUTPUT"] = printed.read_text() if printed.exists() else ""
     assert "NEXTAUTH_URL" in out, (
         f"prompt_env produced no output -- the driver failed.\n"
         f"stdout={proc.stdout!r}\nstderr={proc.stderr[-2000:]!r}"
@@ -284,7 +300,7 @@ def test_the_proxy_answer_keeps_the_ports_on_loopback(tmp_path):
     """
     got = _drive_prompt_env(
         tmp_path,
-        answers=["2", "rsync.example.com", "2", "admin@example.com"],
+        answers=["2", "rsync.example.com", "2"],
     )
     assert got["RSYNC_BIND_ADDR"] == "127.0.0.1"
     assert got["NEXTAUTH_URL"] == "https://rsync.example.com"
@@ -297,8 +313,8 @@ def test_the_proxy_answer_keeps_the_ports_on_loopback(tmp_path):
         ("unattended localhost", {"PUBLIC_HOST": "localhost"}, None),
         ("unattended host", {"PUBLIC_HOST": "rsync.example.com"}, None),
         ("unattended bare IP", {"PUBLIC_HOST": "203.0.113.10"}, None),
-        ("tty direct", None, ["2", "rsync.example.com", "1", "admin@example.com"]),
-        ("tty proxied", None, ["2", "rsync.example.com", "2", "admin@example.com"]),
+        ("tty direct", None, ["2", "rsync.example.com", "1"]),
+        ("tty proxied", None, ["2", "rsync.example.com", "2"]),
     ],
 )
 def test_scheme_and_bind_address_never_disagree(tmp_path, case, env, answers):
@@ -645,8 +661,8 @@ def test_the_cookie_flag_reaches_the_gateway():
         ("unattended localhost", {"PUBLIC_HOST": "localhost"}, None),
         ("unattended host", {"PUBLIC_HOST": "rsync.example.com"}, None),
         ("unattended bare IP", {"PUBLIC_HOST": "203.0.113.10"}, None),
-        ("tty direct", None, ["2", "rsync.example.com", "1", "admin@example.com"]),
-        ("tty proxied", None, ["2", "rsync.example.com", "2", "admin@example.com"]),
+        ("tty direct", None, ["2", "rsync.example.com", "1"]),
+        ("tty proxied", None, ["2", "rsync.example.com", "2"]),
     ],
 )
 def test_the_cookie_flag_never_disagrees_with_the_scheme(tmp_path, case, env, answers):
@@ -682,3 +698,72 @@ def test_the_cookie_flag_never_disagrees_with_the_scheme(tmp_path, case, env, an
             f"{case}: {url} is plain http but RSYNC_COOKIE_SECURE={secure}. The "
             "browser will discard the cookie and the operator can never log in."
         )
+
+
+# ---------------------------------------------------------------------------
+# install.sh: an LLM is optional
+# ---------------------------------------------------------------------------
+#
+# Pipelines parse intent without a model, the Data Explorer runs raw SQL without
+# one, and existing connectors need none; llm-service answers the features that
+# do need one with "Set up an LLM first". So an unattended install with no key
+# installs without an LLM rather than pulling a multi-GB model nobody asked for,
+# and Ollama is used only when the operator names it.
+
+_NO_TERMINAL_WARNING = "installed without an LLM"
+
+
+def test_an_unattended_install_with_no_key_has_no_llm(tmp_path):
+    got = _drive_prompt_env(tmp_path, env={"PUBLIC_HOST": "localhost"})
+    assert got["LLM_PROVIDER"] == "none"
+    assert got["OPENAI_API_KEY_SET"] == ""
+    # Empty, so a later LLM_PROVIDER=ollama bundles the overlay (see the
+    # "no llm" and "url unset by hand" rows in test_byo_overlays_are_complete).
+    assert got["OLLAMA_URL"] == ""
+    assert _NO_TERMINAL_WARNING in got["_OUTPUT"]
+    assert "Set up an LLM first" in got["_OUTPUT"]
+
+
+def test_an_unattended_install_with_a_key_uses_it(tmp_path):
+    got = _drive_prompt_env(
+        tmp_path, env={"PUBLIC_HOST": "localhost", "OPENAI_API_KEY": "sk-FAKEPLACEHOLDER"}
+    )
+    assert got["LLM_PROVIDER"] == "openai"
+    assert got["OPENAI_API_KEY_SET"] == "yes"
+    assert _NO_TERMINAL_WARNING not in got["_OUTPUT"]
+
+
+def test_an_unattended_install_uses_ollama_only_when_asked(tmp_path):
+    got = _drive_prompt_env(tmp_path, env={"PUBLIC_HOST": "localhost", "LLM_PROVIDER": "ollama"})
+    assert got["LLM_PROVIDER"] == "ollama"
+    assert got["OLLAMA_URL"] == "http://ollama:11434"
+    assert _NO_TERMINAL_WARNING not in got["_OUTPUT"]
+
+
+@pytest.mark.parametrize("choice", ["none", "NONE", "disabled", "off", "false", "0"])
+def test_asking_for_no_llm_wins_over_a_leftover_key(tmp_path, choice):
+    # The spellings llm-service reads as "no LLM". A key still in the shell must
+    # not turn an explicit "none" into OpenAI, and the choice was deliberate, so
+    # it is not announced as a fallback.
+    got = _drive_prompt_env(
+        tmp_path,
+        env={"PUBLIC_HOST": "localhost", "LLM_PROVIDER": choice, "OPENAI_API_KEY": "sk-FAKEPLACEHOLDER"},
+    )
+    assert got["LLM_PROVIDER"] == "none"
+    assert got["OPENAI_API_KEY_SET"] == ""
+    assert _NO_TERMINAL_WARNING not in got["_OUTPUT"]
+
+
+@pytest.mark.parametrize(
+    "answer,provider",
+    [("3", "none"), ("2", "ollama"), ("1", "openai")],
+)
+def test_the_terminal_menu_offers_no_llm(tmp_path, answer, provider):
+    answers = [answer]
+    if provider == "openai":
+        answers.append("sk-FAKEPLACEHOLDER")
+    answers += ["localhost"]
+    got = _drive_prompt_env(tmp_path, answers=answers)
+    assert "3) None" in got["_OUTPUT"]
+    assert got["LLM_PROVIDER"] == provider, got["_OUTPUT"][-2000:]
+    assert _NO_TERMINAL_WARNING not in got["_OUTPUT"]

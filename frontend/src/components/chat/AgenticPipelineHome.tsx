@@ -261,6 +261,7 @@ export function AgenticPipelineHome({
           <Button
             type="submit"
             disabled={!intent.trim()}
+            aria-label="Start pipeline chat"
             className={cn(
               "absolute right-2 rounded-xl px-4 py-2 transition-all",
               intent.trim()

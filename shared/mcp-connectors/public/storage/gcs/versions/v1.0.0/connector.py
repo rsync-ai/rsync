@@ -181,6 +181,8 @@ class GcsMCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
                  "description": "Write data to storage"},
                 {"name": "delete_prefix", "method": "gcs_delete_prefix", "type": "destination",
                  "description": "Delete all objects under a bucket prefix (guardrailed)"},
+                {"name": "get_cdc_offsets", "method": "gcs_get_cdc_offsets", "type": "destination",
+                 "description": "Durable CDC high-water offsets per topic/partition, read from CDC object metadata"},
             ],
             "capabilities": {
                 "max_batch_size": self.max_batch_size,
@@ -306,6 +308,14 @@ class GcsMCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
             else:
                 body = self.convert_data_to_format(payload, fmt, compression)
 
+            # CDC provenance (Tier C): the kafka-mcp-sink stamps each CDC object with its
+            # pipeline + Kafka coordinates so get_cdc_offsets can recover the durable
+            # high-water mark by listing. Set before upload so it lands atomically with
+            # the bytes — an object can never exist without its offsets.
+            object_metadata = self._clean_object_metadata(params.get("object_metadata"))
+            if object_metadata:
+                blob.metadata = object_metadata
+
             blob.upload_from_string(body, content_type=content_type)
             return {
                 "success": True,
@@ -316,40 +326,197 @@ class GcsMCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
         except Exception as e:
             return {"success": False, "error": str(e)}
 
-    def delete_prefix(self, params: Dict) -> Dict[str, Any]:
-        """Delete all blobs under a prefix. Guardrails: prefix required; refuse
-        deletes outside a configured path_prefix/prefix."""
+    # Blob custom-metadata keys the kafka-mcp-sink writes on every CDC object
+    # (cdcObjectMetadata in kafka-sink-worker main.go). Keep the two in lockstep.
+    CDC_META_PIPELINE_ID = "rsync_pipeline_id"
+    CDC_META_TOPIC = "rsync_topic"
+    CDC_META_PARTITION = "rsync_partition"
+    CDC_META_LAST_OFFSET = "rsync_last_offset"
+
+    @staticmethod
+    def _clean_object_metadata(raw: Any) -> Dict[str, str]:
+        """GCS custom metadata is a flat str→str map; drop anything else."""
+        if not isinstance(raw, dict):
+            return {}
+        out: Dict[str, str] = {}
+        for k, v in raw.items():
+            key = str(k).strip()
+            if not key or v is None or isinstance(v, (dict, list)):
+                continue
+            out[key] = str(v)
+        return out
+
+    def get_cdc_offsets(self, params: Dict) -> Dict[str, Any]:
+        """Durable CDC high-water marks for a pipeline (Tier C, cdc-exactly-once-offsets.md §5).
+
+        Object stores have no offsets table. Every CDC object the sink writes carries
+        blob metadata {rsync_pipeline_id, rsync_topic, rsync_partition,
+        rsync_last_offset}; this lists the pipeline's CDC root (`prefix`, sent by the
+        sink as <path_prefix>/<pipeline>/) and returns the max last offset per
+        (topic, partition) in the §2.3 shape. The key leaf alone cannot answer this:
+        it encodes only the batch's FIRST offset and no topic.
+
+        Never an error (§2.3): first run, a missing prefix/pipeline, or any listing
+        failure returns {"success": True, "offsets": []}, which the sink treats as
+        "nothing to skip" — the same as before this tool existed.
+        """
         params = params or {}
-        config = self._get_config(params)
-        bucket = params.get("bucket") or config.get("bucket")
-        prefix = params.get("prefix") or params.get("key_prefix") or params.get("path") or ""
-        if not bucket or str(bucket).strip() == "":
-            return {"success": False, "error": "Bucket is required"}
-        if not prefix or str(prefix).strip() == "":
-            return {"success": False, "error": "prefix is required (refusing to delete entire bucket)"}
+        empty: Dict[str, Any] = {"success": True, "offsets": []}
+        pipeline_id = str(params.get("pipeline_id") or "").strip()
+        try:
+            config = self._get_config(params)
+        except Exception as e:  # pragma: no cover - _get_config does not raise today
+            logger.warning("gcs get_cdc_offsets: bad config (%s); returning no offsets", e)
+            return empty
+        bucket = str(params.get("bucket") or config.get("bucket") or config.get("bucket_name") or "").strip()
+        prefix = str(params.get("prefix") or "").strip().lstrip("/")
+        if not pipeline_id or not bucket or not prefix:
+            # Refuse to scan a whole bucket: without the pipeline root there is no
+            # bounded listing, and a wrong answer is worse than no answer.
+            return {**empty, "note": "pipeline_id, bucket and prefix are required to derive offsets"}
 
-        base_prefix = (config.get("path_prefix") or config.get("prefix") or "").strip().strip("/")
-        if base_prefix:
-            target = str(prefix).strip().lstrip("/")
-            if not target.startswith(base_prefix):
-                return {"success": False,
-                        "error": f"Refusing to delete outside configured path_prefix/prefix '{base_prefix}' (requested '{prefix}')"}
+        max_objects = 0
+        try:
+            max_objects = int(params.get("max_objects") or 0)
+        except (TypeError, ValueError):
+            max_objects = 0
 
-        max_objects = int(params.get("max_objects") or 100000)
-        deleted = 0
+        best: Dict[tuple, int] = {}
+        scanned = 0
         truncated = False
         try:
             client = self._get_gcs_client(config)
-            for blob in client.list_blobs(bucket, prefix=str(prefix)):
-                blob.delete()
-                deleted += 1
-                if deleted >= max_objects:
+            for blob in client.list_blobs(bucket, prefix=prefix):
+                if max_objects and scanned >= max_objects:
                     truncated = True
                     break
-            return {"success": True, "bucket": bucket, "prefix": prefix,
-                    "deleted": deleted, "truncated": truncated}
+                scanned += 1
+                meta = getattr(blob, "metadata", None) or {}
+                if str(meta.get(self.CDC_META_PIPELINE_ID) or "").strip() != pipeline_id:
+                    continue
+                topic = str(meta.get(self.CDC_META_TOPIC) or "").strip()
+                if not topic:
+                    continue
+                try:
+                    partition = int(meta.get(self.CDC_META_PARTITION))
+                    last = int(meta.get(self.CDC_META_LAST_OFFSET))
+                except (TypeError, ValueError):
+                    continue
+                k = (topic, partition)
+                if k not in best or last > best[k]:
+                    best[k] = last
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            logger.warning("gcs get_cdc_offsets: listing gs://%s/%s failed (%s); returning no offsets",
+                           bucket, prefix, e)
+            return empty
+
+        offsets = [{"topic": t, "partition": p, "offset": o} for (t, p), o in sorted(best.items())]
+        return {"success": True, "offsets": offsets, "objects_scanned": scanned, "truncated": truncated}
+
+    def delete_prefix(self, params: Dict) -> Dict[str, Any]:
+        """Delete every blob under a folder prefix, failing closed.
+
+        Contract (pinned by shared/delete_prefix_contract_golden.json; aws-s3 and
+        azure-blob return the same shape):
+          {success, deleted, failed, complete, bucket, prefix, errors[, error]}
+        - success is True only when complete is True and failed == 0.
+        - complete is True only when the listing was walked to its end.
+        - The prefix is a folder: 'a/b' is normalised to 'a/b/', so 'a/bc/...'
+          is never listed or deleted.
+        - Pages are bounded: at most 1000 blobs per listed page, and at most
+          max_pages pages. Stopping at max_pages or max_objects with blobs still
+          listed is complete=False, success=False -- never a silent truncation.
+        - A blob the store refuses to delete is counted in failed, never in
+          deleted; a blob already gone (404) counts as deleted.
+
+        Guardrails: prefix must name a folder (refuse deleting the entire bucket);
+        refuse deletes outside a configured path_prefix/prefix folder."""
+        params = params or {}
+        config = self._get_config(params)
+        bucket = params.get("bucket") or config.get("bucket")
+        raw_prefix = params.get("prefix") or params.get("key_prefix") or params.get("path") or ""
+        result: Dict[str, Any] = {"success": False, "deleted": 0, "failed": 0, "complete": False,
+                                  "bucket": bucket, "prefix": raw_prefix, "errors": []}
+        if not bucket or str(bucket).strip() == "":
+            result["error"] = "Bucket is required"
+            return result
+        if str(raw_prefix).strip().strip("/") == "":
+            result["error"] = "prefix is required (refusing to delete entire bucket)"
+            return result
+
+        # Folder boundary: 'a/b' must never match 'a/bc/...'.
+        prefix = str(raw_prefix).strip()
+        if not prefix.endswith("/"):
+            prefix += "/"
+        result["prefix"] = prefix
+
+        base_prefix = (config.get("path_prefix") or config.get("prefix") or "").strip().strip("/")
+        if base_prefix and not prefix.lstrip("/").startswith(base_prefix + "/"):
+            result["error"] = (f"Refusing to delete outside configured path_prefix/prefix '{base_prefix}' "
+                               f"(requested '{raw_prefix}')")
+            return result
+
+        page_size = 1000
+        try:
+            max_pages = int(params.get("max_pages") or 100000)
+            max_objects = int(params.get("max_objects") or 0) or None
+        except (TypeError, ValueError):
+            result["error"] = "max_pages and max_objects must be integers"
+            return result
+
+        def _fail_key(key: Any, err: Any) -> None:
+            result["failed"] += 1
+            if len(result["errors"]) < 20:
+                result["errors"].append({"key": key, "error": str(err)[:300]})
+
+        def _already_gone(exc: Exception) -> bool:
+            return (getattr(exc, "code", None) == 404
+                    or type(exc).__name__ == "NotFound")
+
+        try:
+            client = self._get_gcs_client(config)
+            page_iter = iter(client.list_blobs(bucket, prefix=prefix, page_size=page_size).pages)
+            pages = 0
+            while True:
+                try:
+                    page = next(page_iter)
+                except StopIteration:
+                    result["complete"] = True
+                    break
+                pages += 1
+                if pages > max_pages:
+                    result["error"] = f"stopped after max_pages={max_pages} before the listing ended"
+                    return result
+                blobs = [b for b in page if str(getattr(b, "name", "") or "").startswith(prefix)]
+
+                over_bound = False
+                if max_objects is not None:
+                    room = max(max_objects - (result["deleted"] + result["failed"]), 0)
+                    if len(blobs) > room:
+                        blobs = blobs[:room]
+                        over_bound = True
+
+                for blob in blobs:
+                    try:
+                        blob.delete()
+                        result["deleted"] += 1
+                    except Exception as e:
+                        if _already_gone(e):
+                            result["deleted"] += 1
+                        else:
+                            _fail_key(blob.name, e)
+
+                if over_bound:
+                    result["error"] = f"stopped at max_objects={max_objects} with blobs left under the prefix"
+                    return result
+        except Exception as e:
+            result["error"] = str(e)
+            return result
+
+        if result["failed"]:
+            result["error"] = f"{result['failed']} blob(s) under the prefix could not be deleted"
+        result["success"] = result["complete"] and result["failed"] == 0
+        return result
 
 
 # =============================================================================

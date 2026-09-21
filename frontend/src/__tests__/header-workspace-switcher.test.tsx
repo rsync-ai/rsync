@@ -142,7 +142,7 @@ describe("Header workspace switcher", () => {
 
     render(<Header />)
     const user = userEvent.setup()
-    await user.click(await screen.findByRole("button", { name: "Switch workspace" }))
+    await user.click(await screen.findByRole("button", { name: /^Switch workspace/ }))
     await user.click(await screen.findByRole("menuitem", { name: /Team B/ }))
   }
 
@@ -286,7 +286,7 @@ describe("Header workspace switcher", () => {
 
     render(<Header />)
     const user = userEvent.setup()
-    await user.click(await screen.findByRole("button", { name: "Switch workspace" }))
+    await user.click(await screen.findByRole("button", { name: /^Switch workspace/ }))
 
     // Scope to each row rather than matching the accessible name, so the assertion
     // pins WHICH row carries the tag — a tag on every row would pass a page-wide check.
@@ -295,5 +295,51 @@ describe("Header workspace switcher", () => {
 
     const teamRow = screen.getByRole("menuitem", { name: /Team A/ })
     expect(within(teamRow).queryByText("Personal")).toBeNull()
+  })
+})
+
+describe("Header — workspace pill (#56)", () => {
+  it("names the current workspace in full: in its accessible name and its hover title", async () => {
+    const long = "Customer Data Platform — Production Analytics"
+    ;(authFetch as Mock).mockImplementation(async (url: string) => {
+      if (url.includes("/workspaces")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ workspaces: [{ id: "ws-a", name: long, slug: "cdp", role: "owner" }] }),
+        }
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    })
+    render(<Header />)
+    const pill = await screen.findByRole("button", { name: `Switch workspace (current: ${long})` })
+    expect(pill).toHaveAttribute("title", long)
+    expect(pill.className).toContain("sm:max-w-[320px]")
+  })
+
+  it("sizes the switcher menu to the name, and titles a row whose name still doesn't fit", async () => {
+    // #56 prod retest: a personal workspace named after an e-mail address was cut to
+    // "jordan.ex…" — the fixed w-56 menu lost its room to the Personal tag and check.
+    const email = "jordan.example@example.com"
+    ;(authFetch as Mock).mockImplementation(async (url: string) => {
+      if (url.includes("/workspaces")) {
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            workspaces: [{ id: "ws-me", name: email, slug: "me", role: "owner", is_personal: true }],
+          }),
+        }
+      }
+      return { ok: true, status: 200, json: async () => ({}) }
+    })
+    render(<Header />)
+    await userEvent.setup().click(await screen.findByRole("button", { name: /^Switch workspace/ }))
+
+    const row = await screen.findByRole("menuitem", { name: new RegExp(email) })
+    expect(within(row).getByText(email)).toHaveAttribute("title", email)
+    const menu = screen.getByRole("menu")
+    expect(menu.className).not.toMatch(/(?<![\w-])w-56(?![\w-])/)
+    expect(menu.className).toContain("w-max")
   })
 })

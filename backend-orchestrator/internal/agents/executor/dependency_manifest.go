@@ -3,6 +3,7 @@ package executor
 import (
 	"database/sql"
 	"encoding/json"
+	"strings"
 
 	"github.com/rsync-ai/shared/pgdriver"
 	log "github.com/sirupsen/logrus"
@@ -54,4 +55,29 @@ func upsertDependency(database *sql.DB, pipelineID, executionID, kind, identifie
 	if err != nil {
 		log.Debugf("dependency_manifest: upsert skipped (%s/%s): %v", kind, identifier, err)
 	}
+}
+
+// versionResolver is the one ServerManager method concreteVersionOrRequested needs.
+type versionResolver interface {
+	ResolveConcreteVersion(connectorName, version string) (string, error)
+}
+
+// concreteVersionOrRequested is the version a dependency identifier carries. The
+// destination identifier always held the resolved version ("gcs@v1.0.0") while
+// the source held whatever was requested ("mongodb@latest", or "mongodb@" when
+// nothing was), so one panel showed both spellings (#56). Resolving the source
+// the same way keeps them alike; when resolution fails the requested version is
+// kept (defaulting to "latest") rather than dropping the dependency row.
+func concreteVersionOrRequested(r versionResolver, connectorType, requested string) string {
+	requested = strings.TrimSpace(requested)
+	if requested == "" {
+		requested = "latest"
+	}
+	if r == nil || connectorType == "" {
+		return requested
+	}
+	if v, err := r.ResolveConcreteVersion(connectorType, requested); err == nil && v != "" {
+		return v
+	}
+	return requested
 }

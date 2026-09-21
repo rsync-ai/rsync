@@ -540,7 +540,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                     placeholder="shopify-admin-graphql"
                     className="w-full text-sm px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500 font-mono"
                   />
-                  <div className="text-[10px] text-zinc-500 mt-1">
+                  <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">
                     The unique slug for this connector. Change it to register multiple variants
                     of the same API (e.g. <code>shopify-admin-graphql</code> vs <code>shopify-storefront</code>).
                   </div>
@@ -559,7 +559,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                   placeholder={apiName ? `${apiName} connector` : "What this connector is for"}
                   className="w-full text-sm px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500"
                 />
-                <div className="text-[10px] text-zinc-500 mt-1">
+                <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">
                   Shown on the connector card. Defaults to <code>&lt;api_name&gt; connector</code>.
                 </div>
               </div>
@@ -577,7 +577,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                       placeholder="https://example.com/docs/api"
                       className="w-full text-sm px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500"
                     />
-                    <div className="text-[10px] text-zinc-500 mt-1">
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">
                       We&apos;ll detect the protocol and extract operations from this URL.
                     </div>
                   </div>
@@ -595,7 +595,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                       <option value="graphql">GraphQL</option>
                       <option value="openapi">OpenAPI / Swagger</option>
                     </select>
-                    <div className="text-[10px] text-zinc-500 mt-1 leading-snug">
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1 leading-snug">
                       <strong>OpenAPI/Swagger</strong>: REST API with a machine-readable spec
                       (best for auto-discovery).{" "}
                       <strong>REST</strong>: HTTP/JSON without a formal spec.{" "}
@@ -624,7 +624,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                       rows={6}
                       className="w-full text-[11px] font-mono px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500"
                     />
-                    <div className="text-[10px] text-zinc-500 mt-1">
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">
                       Deterministic: resources come straight from your spec (no AI guessing). Overrides the docs URL.
                     </div>
                   </div>
@@ -639,7 +639,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                       placeholder="https://api.example.com/graphql"
                       className="w-full text-sm px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500"
                     />
-                    <div className="text-[10px] text-zinc-500 mt-1">
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">
                       We&apos;ll introspect the schema to discover queries deterministically (needs a public/no-auth endpoint).
                     </div>
                   </div>
@@ -654,7 +654,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                       placeholder="https://api.github.com"
                       className="w-full text-sm px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500"
                     />
-                    <div className="text-[10px] text-zinc-500 mt-1">
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">
                       The API host requests target. Also the endpoint when you paste a GraphQL introspection schema below.
                     </div>
                   </div>
@@ -669,7 +669,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                       rows={6}
                       className="w-full text-[11px] font-mono px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500"
                     />
-                    <div className="text-[10px] text-zinc-500 mt-1">
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">
                       Deterministic: types come straight from the schema (no live endpoint or auth needed). Set the REST base URL above to your GraphQL endpoint.
                     </div>
                   </div>
@@ -684,7 +684,7 @@ export function DiscoveryFlow({ onGenerate }: Props) {
                       rows={3}
                       className="w-full text-[11px] font-mono px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700 bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500"
                     />
-                    <div className="text-[10px] text-zinc-500 mt-1">
+                    <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">
                       No spec? Paste any example request from the API docs — we extract the endpoint, base URL, and auth with zero guessing.
                     </div>
                   </div>
@@ -870,7 +870,7 @@ function ResultPanel({
             <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
               Generating connector…
             </div>
-            <div className="text-[11px] text-zinc-500 mt-1">
+            <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1">
               Validating contract, rendering templates, writing artifacts.
             </div>
           </div>
@@ -907,7 +907,7 @@ function ResultPanel({
         ) : contract ? (
           <div className="space-y-3 text-xs">
             <div>
-              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-0.5">
+              <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-0.5">
                 API
               </div>
               <div className="font-mono text-zinc-900 dark:text-zinc-100 break-all">
@@ -933,7 +933,7 @@ function ResultPanel({
             <div className="text-sm font-medium text-zinc-800 dark:text-zinc-200">
               Nothing yet
             </div>
-            <div className="text-[11px] text-zinc-500 mt-1 max-w-[14rem]">
+            <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mt-1 max-w-[14rem]">
               Pick a vendor and hit <strong>Discover</strong>. The contract and
               generated connector will appear here.
             </div>
@@ -961,7 +961,7 @@ function operationsCount(contract: GenerationContract): string {
 function Stat({ label, value }: { label: string; value: string }) {
   return (
     <div>
-      <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-0.5">
+      <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-0.5">
         {label}
       </div>
       <div className="font-mono text-zinc-900 dark:text-zinc-100 truncate">

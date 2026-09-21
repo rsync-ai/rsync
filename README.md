@@ -1,4 +1,4 @@
-# rsync.ai
+# rsync.ai — Self-hosted AI Data Pipelines, CDC, and Lineage
 
 [![License: ELv2](https://img.shields.io/badge/license-ELv2-3b82f6)](LICENSE)
 [![Deploy: Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)](#docker--one-command)
@@ -6,32 +6,84 @@
 [![Connectors](https://img.shields.io/badge/connectors-21-16a34a)](docs/connectors/reference.md)
 [![Docs](https://img.shields.io/badge/docs-read%20the%20guides-64748b)](docs/README.md)
 
-> **Describe a data pipeline in plain English. rsync plans it, asks you when it needs a
-> decision, then runs it on durable infrastructure you host yourself.**
+> **A self-hosted data platform for batch pipelines, CDC, scheduled data models, and
+> lineage.** Describe a pipeline in plain English, approve the plan, and see exactly what
+> ran, failed, or became stale.
 
-rsync.ai is an AI-native data pipeline platform. It is self-hosted and moves data between
-databases, warehouses, object stores and APIs. You describe the job in a sentence; an agent turns it into an
-explicit, staged plan, pauses for you when something is ambiguous, and executes it on
-Temporal so a long sync survives restarts. Batch and change-data-capture are both
-first-class. Twenty-one connectors ship in the box.
+rsync.ai moves data between databases, warehouses, object stores and APIs. You describe the
+job in a sentence; an agent turns it into an explicit, staged plan, pauses for you when
+something is ambiguous, and executes it on Temporal so a long sync survives restarts. Batch
+and change-data-capture are both first-class. Twenty-one connectors ship in the box.
 
 It is **source-available** under the [Elastic License 2.0](LICENSE): run it, modify it,
 and use it internally for free — you just cannot resell it as a hosted service. The
 [full summary is below](#license).
 
-**Try it without a single credential of your own.** The stack bundles a
-`sample-data` source and a throwaway `demo-warehouse` Postgres, so you can build and run
-a real pipeline end to end on the first-run checklist —
-[Try it in 5 minutes](docs/getting-started/quickstart.md#try-it-in-5-minutes-with-no-credentials).
+## What it does
+
+- **Batch and CDC pipelines.** Batch loads between the connectors below, plus
+  Debezium-backed change data capture from PostgreSQL, MySQL, SQL Server, Oracle and
+  MongoDB. A run pauses for your decision where the request is ambiguous, and each stage
+  reports what it did.
+  → [PostgreSQL CDC](docs/solutions/self-hosted-postgresql-cdc-pipeline.md) ·
+  [PostgreSQL to MySQL](docs/solutions/postgresql-to-mysql-data-sync.md) ·
+  [Shopify to PostgreSQL](docs/solutions/shopify-to-postgresql-data-pipeline.md)
+- **Scheduled, dependency-aware SQL models.** Save a query as a model and rebuild it on a
+  cron, an interval, or after the pipeline or model it reads from finishes; edits to
+  scheduled SQL need an admin's approval, and a freshness deadline flags a table that
+  stopped moving.
+  → [Scheduled SQL models](docs/solutions/scheduled-sql-models-with-dependency-triggers.md)
+- **Data Explorer and lineage.** Query what you connected in English or SQL, and see which
+  pipelines write which tables and which models read them. Lineage is table-level, and the
+  lineage view is recent — its page states how far it has been verified.
+  → [Data Explorer](docs/explorer/README.md) ·
+  [Lineage and observability](docs/solutions/data-lineage-and-pipeline-observability.md)
+- **Versioned MCP connectors.** Each of the 21 connectors runs as its own versioned
+  container, so you can upgrade or pin one without touching the rest.
+  → [Connector reference](docs/connectors/reference.md)
+
+More guides: [all solutions](docs/solutions/README.md).
+
+## Quick start
+
+1. **Install** with one command — [Install](#install) below. Docker is the only requirement.
+2. Open `http://localhost:3000` and click **Start with sample data**. The stack bundles a
+   `sample-data` source and a throwaway `demo-warehouse` PostgreSQL, so this needs no
+   credential of your own.
+3. In `/chat`, ask for *"sync customers and orders from sample data to the demo warehouse"*,
+   pick the tables, and confirm.
+
+That path is a batch pipeline. CDC, Shopify and your own databases need a source of your
+own — see the [quickstart](docs/getting-started/quickstart.md#try-it-in-5-minutes-with-no-credentials)
+and the [self-hosting guide](docs/deployment/self-hosting.md).
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    U["You, in plain English"] --> FE["Frontend<br/>Next.js"]
+    FE --> GW["API Gateway<br/>Go"]
+    GW --> ORCH["Orchestrator<br/>Go workers"]
+    ORCH --> TMP["Temporal<br/>durable workflows"]
+    TMP --> CON["MCP connectors<br/>versioned containers"]
+    CON --> DATA[("Your sources and<br/>destinations")]
+```
+
+For CDC, Debezium on Kafka Connect and a sink worker carry the change stream; they start
+with the rest of the default install. [ARCHITECTURE.md](ARCHITECTURE.md) explains why each
+piece was chosen, and [docs/architecture/overview.md](docs/architecture/overview.md) has the
+component and data-flow diagrams.
 
 ## Contents
 
+- [What it does](#what-it-does)
+- [Quick start](#quick-start)
+- [How it fits together](#how-it-fits-together)
 - [Install](#install) — [Docker](#docker--one-command) · [Kubernetes](#kubernetes)
 - [What you get](#what-you-get)
 - [Connectors](#connectors)
 - [The Data Explorer](#the-data-explorer)
 - [How it works](#how-it-works)
-- [Architecture](#architecture)
 - [Requirements](#requirements)
 - [Documentation](#documentation)
 - [Development](#development)
@@ -50,14 +102,17 @@ curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bas
 ```
 
 Requires Docker and nothing else. The installer asks which LLM you want — your own
-OpenAI key, or the Ollama it bundles — generates every other secret itself, and starts
-the full stack. Choose Ollama and there is no key to find and no model to pull by hand:
-the stack ships an Ollama container and a one-shot job that downloads the model before
-anything that would ask for one starts. Open `http://localhost:3000` when it finishes. If
+OpenAI key, the Ollama it bundles, or none for now — generates every other secret itself,
+and starts the full stack. Choose Ollama and there is no key to find and no model to pull
+by hand: the stack ships an Ollama container and a one-shot job that downloads the model
+before anything that would ask for one starts. Choose none and pipelines, raw SQL and the
+shipped connectors still work; the LLM features say `Set up an LLM first` until you add one
+([which LLM is used](docs/deployment/self-hosting.md#which-llm-is-used)). Open
+`http://localhost:3000` when it finishes. If
 the stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
-> **Which code you get.** `v0.1.2`, the current release. Both halves of the install come
+> **Which code you get.** `v0.1.4`, the current release. Both halves of the install come
 > from that one tag: the compose file is fetched from `RSYNC_REF` and the images are
 > pulled at a tag derived from it, so the file and the containers it starts are the same
 > commit. Every image the default compose starts is published at that tag and pullable
@@ -81,17 +136,38 @@ success banner over a dead stack.
 
 ### Kubernetes
 
+Point `kubectl` at any cluster and run:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install-k8s.sh | bash
+```
+
+That is the whole install. It generates every secret, installs the platform, the demo
+warehouse and a working set of connectors, waits for the release, and prints (or, on a
+terminal, opens) the two port-forwards that put the UI at `http://localhost:3000`. Edit
+`~/rsync-ai-k8s/.env` and run it again to change anything — that is also the upgrade path.
+Back that file up: it holds `ENCRYPTION_KEY`. It needs about **8.5 GiB of memory and 3.6
+CPU** free and says so before it starts; on a smaller cluster it installs a lean set
+instead of leaving pods `Pending`. Everything it accepts is listed in the
+[Kubernetes guide](docs/deployment/kubernetes.md#one-command-recommended).
+
+Prefer to run `helm` yourself? A bare `helm install` also needs `connectors.fleet` set, or no
+connector pod starts and no pipeline can reach a source
+([why](docs/deployment/kubernetes.md#connectors-are-pods-you-choose)):
+
 ```bash
 git clone https://github.com/rsync-ai/rsync.git && cd rsync
 helm install rsync ./deploy/helm/rsync-ai \
   --namespace rsync --create-namespace \
   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
+  --set secrets.internalServiceSecret="$(openssl rand -hex 24)" \
   --set secrets.postgresPassword="$(openssl rand -hex 24)" \
   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
   --set frontend.publicUrl=https://app.example.com \
-  --set frontend.apiUrl=https://api.example.com
+  --set frontend.apiUrl=https://api.example.com \
+  -f my-values.yaml   # at least connectors.fleet
 ```
 
 That is the **evaluation** footprint — in-chart Postgres, Redis, Kafka, MinIO and
@@ -111,10 +187,11 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > The chart is also published to the registry, so you can install without cloning:
 >
 > ```bash
-> helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.2 \
+> helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.3 \
 >   --namespace rsync --create-namespace \
 >   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
 >   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
+>   --set secrets.internalServiceSecret="$(openssl rand -hex 24)" \
 >   --set secrets.postgresPassword="$(openssl rand -hex 24)" \
 >   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
 >   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
@@ -125,8 +202,12 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > The two `frontend.*` flags are not optional on either path — the chart refuses to
 > render without them, because the browser calls the API directly and NextAuth
 > builds its callback URLs from `publicUrl`. Point them at the hostnames your
-> ingress will serve. Both paths pull images at `.Chart.AppVersion` (**0.1.2**), and
-> every image the chart names is published at that tag.
+> ingress will serve. No MinIO image override is needed: chart **0.1.2** onward was
+> repackaged after MinIO withdrew `docker.io/minio/*` and its `values.yaml` names
+> quay.io already. Both paths pull rsync's own images at `.Chart.AppVersion`
+> (**0.1.3**), and every `ghcr.io/rsync-ai` image the chart names is published at
+> that tag for both `amd64` and `arm64` (0.1.2 and older are `amd64` only, so they will
+> not start on Apple Silicon, Graviton, Axion or Ampere nodes).
 
 ---
 
@@ -140,7 +221,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 | **Durable execution** | Stages run as Temporal workflows, so a multi-hour sync survives a restart, a redeploy, or a crashed worker. |
 | **You can answer "why did it do that?"** | Every run emits domain events carrying stage state, row counts and a trace id, and the UI shows them stage by stage. |
 | **A SQL and NL query surface** | The [Data Explorer](#the-data-explorer) queries the systems you connected — no second BI tool to stand up first. |
-| **Your infrastructure, your keys** | One Docker command or one Helm chart. Credentials are encrypted at rest with a key you hold; point the LLM at OpenAI or at the [Ollama](docs/deployment/ollama.md) the installer bundles. |
+| **Your infrastructure, your keys** | One Docker command or one Helm chart. Credentials are encrypted at rest with a key you hold; point the LLM at OpenAI or at the [Ollama](docs/deployment/ollama.md) the installer bundles, or run without one. |
 
 ## Connectors
 
@@ -188,34 +269,23 @@ dive on [saved queries, models and schedules](docs/explorer/saved-queries-and-mo
 5. **Watch.** Row counts, stage state and a trace id are emitted as domain events and
    rendered stage by stage in the UI.
 
-## Architecture
-
-```
-User (natural language)
-  → Frontend (Next.js)
-    → API Gateway (Go)
-      → Orchestrator (Go workers)
-        → Temporal (workflow engine)
-          → MCP Connectors (versioned containers per source/destination)
-```
-
-[ARCHITECTURE.md](ARCHITECTURE.md) explains the stack and why each piece was chosen;
-[docs/architecture/overview.md](docs/architecture/overview.md) has the component and
-data-flow diagrams.
-
 ## Requirements
 
 - Docker 24+ and Docker Compose v2 — or, for the Helm path, Kubernetes 1.25+ and Helm 3.8+
 - 8 GB RAM minimum, 16 GB recommended — 12 GB if you let the installer bundle an LLM,
   which it checks and warns about before starting anything
-- No API key required. Bring an OpenAI key if you have one, or choose the bundled
-  [Ollama](docs/deployment/ollama.md) and the installer downloads a model for you
+- No API key required, and no LLM required. Bring an OpenAI key if you have one (it is
+  preferred when present), choose the bundled [Ollama](docs/deployment/ollama.md) and the
+  installer downloads a model for you, or choose none and add one later — the features that
+  need a model say `Set up an LLM first` until then
+  ([which LLM is used](docs/deployment/self-hosting.md#which-llm-is-used))
 
 ## Documentation
 
 | | |
 |---|---|
 | [Quick start](docs/getting-started/quickstart.md) | Local dev setup and first pipeline |
+| [Solutions](docs/solutions/README.md) | PostgreSQL CDC, PostgreSQL to MySQL, Shopify to PostgreSQL, scheduled SQL models, lineage |
 | [Self-hosting](docs/deployment/self-hosting.md) | Production deployment with TLS |
 | [Kubernetes](docs/deployment/kubernetes.md) | Helm chart install on EKS, GKE, AKS, or any cluster |
 | [Oracle Cloud (free)](docs/deployment/oracle-cloud.md) | Free 4 OCPU / 24 GB VM |
@@ -233,8 +303,8 @@ data-flow diagrams.
 ```bash
 git clone https://github.com/rsync-ai/rsync.git
 cd rsync
-cp .env.example .env           # add your OPENAI_API_KEY
-cp llm-service/.env.example llm-service/.env
+cp .env.example .env           # add your OPENAI_API_KEY, if you have one
+cp llm-service/.env.example llm-service/.env   # or set LLM_PROVIDER=none here
 docker compose -p rsync-ai up -d
 open http://localhost:3000
 ```

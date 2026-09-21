@@ -103,7 +103,7 @@ export default function TestSuitePage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader heading="System Test Suite" description="Run diagnostics to verify system components are working" />
+      <PageHeader heading="Admin" description="System test suite: run diagnostics to verify system components are working" />
       <AdminNav />
 
       {accessStatus === "denied" ? <AccessDeniedState /> : null}

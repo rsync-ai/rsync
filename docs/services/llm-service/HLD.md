@@ -21,7 +21,7 @@ It is not directly exposed to the browser in docker-compose; other services call
 
 ### Dependencies
 - LLM provider:
-  - OpenAI (if configured) or local Ollama (if configured)
+  - OpenAI (if configured) or local Ollama (if configured), or none — an install without an LLM is supported
 - Observability:
   - OpenTelemetry tracing + JSON logs
 
@@ -32,5 +32,6 @@ Stateless; can scale horizontally if:
 
 ### Failure Modes
 - LLM provider unavailable ⇒ service can fall back to deterministic/mock logic (degraded quality).
+- No LLM configured ⇒ the LLM-only endpoints answer HTTP 503 `Set up an LLM first` (`src/utils/llm_gate.py`) instead of calling a provider nobody set up.
 
 

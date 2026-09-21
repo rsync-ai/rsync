@@ -4,6 +4,7 @@
  */
 
 import type { DomainEventData } from "@/lib/api/types"
+import { stageTiming } from "@/lib/duration"
 
 // ============================================================================
 // 1) Run-history event normalization (pipeline_run_events → UI timeline)
@@ -46,8 +47,18 @@ export type StageGroup = {
   events: NormalizedRunEvent[]
   startedAt?: string
   completedAt?: string
-  status: "pending" | "running" | "completed" | "failed"
+  // "unknown": nothing loaded says where the stage is. A group only exists
+  // because it has events, so it is never "pending" — that label was the
+  // fallback for a group whose STAGE_STARTED sat on a page not yet loaded.
+  status: "unknown" | "running" | "completed" | "failed"
+  /** Working time, summed across attempts — not first-start-to-last-end. */
   duration?: number
+  /**
+   * How many times the stage started. Above 1 the lane says so, because
+   * `duration` deliberately leaves out the idle gap between attempts and a
+   * reader comparing it against the wall clock would otherwise find it short.
+   */
+  attempts?: number
 }
 
 export type DecisionCard = {
@@ -270,12 +281,262 @@ export function extractHealerActivity(events: PipelineRunEvent[]): HealerActivit
   )
 }
 
+// ---------------------------------------------------------------------------
+// Stage lifecycle de-duplication (Monitoring -> Trace)
+// ---------------------------------------------------------------------------
+//
+// Every stage lifecycle event has two producers:
+//   - the Temporal workflow (`emitStageEvent`, nl_pipeline_v2_workflow.go), stage
+//     ids `capability_resolver` / `connection_validation`, trace_id = execution id;
+//   - the orchestrator worker that runs the stage (`ProgressEmitter.EmitProgress`,
+//     workers/progress_events.go), stage ids `resolver` / `connection_validator`,
+//     trace_id = the worker's OTel trace.
+// Both land in pipeline_run_events with different event_ids (the projector hashes
+// the raw bytes when no event_id is sent), so the Trace tab showed every step
+// twice under two trace ids. Both writers are load-bearing (the workflow's copy
+// carries the execution plan, the worker's copy carries the human summary), so
+// the timeline collapses the pair instead of either producer going quiet.
+
+const STAGE_LIFECYCLE_TYPES = new Set(["STAGE_STARTED", "STAGE_COMPLETED", "STAGE_FAILED"])
+
+/**
+ * The transitions a stage group's status and duration are read from. The feed is
+ * paged newest-first, so a long-running stage's STAGE_STARTED/STAGE_COMPLETED is
+ * usually on a page nobody has loaded; the panel fetches these types on their
+ * own (`event_types=`) and hands them to `groupByStage`, so the badge says the
+ * same thing before and after "Load More".
+ */
+export const STATUS_EVENT_TYPES = [
+  "STAGE_STARTED",
+  "STAGE_COMPLETED",
+  "STAGE_FAILED",
+  "PIPELINE_COMPLETED",
+  "PIPELINE_FAILED",
+  "PIPELINE_WAITING",
+] as const
+const STATUS_EVENT_TYPE_SET = new Set<string>(STATUS_EVENT_TYPES)
+
+// Two copies of one transition are emitted within moments of each other; a real
+// retry of the same stage is separated by a different transition (FAILED ->
+// STARTED), so it is never collapsed by the "same type as the last kept" test.
+const LIFECYCLE_DUPLICATE_WINDOW_MS = 120_000
+
+const CANONICAL_STAGE: Record<string, string> = {
+  resolver: "capability_resolver",
+  connection_validator: "connection_validation",
+}
+
+// Mirrors stageGroupForStage (temporal-adapter) / stageGroupFor (orchestrator)
+// for the stages both know. Used when a row carries a stage_id but no
+// stage_group — the workflow's PIPELINE_WAITING event (table selection) did, so
+// it formed its own "Executor" group with no lifecycle events and sat at
+// "Pending" after the tables were chosen.
+const STAGE_GROUP_FOR_STAGE: Record<string, string> = {
+  intent: "understanding",
+  capability_resolver: "connecting",
+  resolver: "connecting",
+  connection_validator: "connecting",
+  connection_validation: "connecting",
+  connector_check: "connecting",
+  connector_generation: "connecting",
+  discovery: "discovering",
+  planner: "planning",
+  infra_preflight: "infra_preflight",
+  validator: "validating",
+  policy_check: "validating",
+  cost_estimation: "validating",
+  schema_validation: "validating",
+  executor: "executing",
+}
+
+export function canonicalStageId(stage?: string): string {
+  const s = String(stage || "").trim().toLowerCase()
+  return CANONICAL_STAGE[s] || s
+}
+
+// Stages that are their own group whatever group the row carries. Both
+// backends filed infra_preflight under their default "planning" group until
+// 2026-09-19, so stored rows showed the preflight as a second "Planning".
+const OWN_GROUP_STAGES = new Set(["infra_preflight"])
+
+// Group keys whose prettified id is jargon. "ungrouped" is the bucket for rows
+// that name no stage (PIPELINE_CREATED and friends); the Activity tab showed it
+// to users as "Ungrouped".
+const STAGE_GROUP_LABEL: Record<string, string> = {
+  ungrouped: "Other events",
+}
+
+export function stageGroupKey(event: Pick<PipelineRunEvent, "stage_group" | "stage_id">): string {
+  const s = String(event.stage_id || "").trim().toLowerCase()
+  if (OWN_GROUP_STAGES.has(s)) return s
+  if (event.stage_group) return event.stage_group
+  return STAGE_GROUP_FOR_STAGE[s] || event.stage_id || "ungrouped"
+}
+
+/**
+ * The fields duplicate-collapsing reads. Declared apart from `PipelineRunEvent`
+ * because the Overview panel carries its own, looser row type for the same API
+ * rows; a dedupe that only the feed's type could call is a dedupe half the
+ * panels cannot use, which is how the Overview came to time stages from raw
+ * events while the feed timed them from collapsed ones.
+ */
+export type StageLifecycleEvent = {
+  event_type: string
+  stage_id?: string
+  execution_id?: string
+  seq?: number
+  occurred_at?: string
+  received_at?: string
+  payload?: Record<string, any>
+}
+
+function eventTime(e: StageLifecycleEvent): number {
+  const t = new Date(e.occurred_at || e.received_at || "").getTime()
+  return Number.isFinite(t) ? t : 0
+}
+
+function eventTimestamp(e?: PipelineRunEvent): string | undefined {
+  return e ? e.occurred_at || e.received_at : undefined
+}
+
+/** The earlier (`Math.min`) or later (`Math.max`) of two timestamps; unreadable ones don't count. */
+function pickTime(
+  a: string | undefined,
+  b: string | undefined,
+  pick: (x: number, y: number) => number,
+): string | undefined {
+  const ta = a ? new Date(a).getTime() : NaN
+  const tb = b ? new Date(b).getTime() : NaN
+  if (!Number.isFinite(ta)) return Number.isFinite(tb) ? b : a ?? b
+  if (!Number.isFinite(tb)) return a
+  return pick(ta, tb) === ta ? a : b
+}
+
+/** Chronological order with deterministic tie-breaks (seq, then received_at). */
+export function compareRunEventsAsc(a: StageLifecycleEvent, b: StageLifecycleEvent): number {
+  const dt = eventTime(a) - eventTime(b)
+  if (dt !== 0) return dt
+  const sa = typeof a.seq === "number" ? a.seq : Number.MAX_SAFE_INTEGER
+  const sb = typeof b.seq === "number" ? b.seq : Number.MAX_SAFE_INTEGER
+  if (sa !== sb) return sa - sb
+  const ra = new Date(a.received_at || "").getTime() || 0
+  const rb = new Date(b.received_at || "").getTime() || 0
+  return ra - rb
+}
+
+function hasHumanTitle(e: StageLifecycleEvent): boolean {
+  return Boolean(e.payload?.summary || e.payload?.message || e.payload?.stage_summary)
+}
+
+/**
+ * Collapse the two producers' copies of one stage transition into one row,
+ * returning events in chronological order. Non-lifecycle events pass through.
+ */
+export function dedupeStageLifecycleEvents<T extends StageLifecycleEvent>(events: T[]): T[] {
+  const sorted = [...events].sort(compareRunEventsAsc)
+  const out: T[] = []
+  const lastKept = new Map<string, { index: number; type: string; at: number }>()
+  let retimed = false
+  for (const e of sorted) {
+    const type = String(e.event_type || "").toUpperCase()
+    if (!STAGE_LIFECYCLE_TYPES.has(type) || !e.stage_id) {
+      out.push(e)
+      continue
+    }
+    const key = `${e.execution_id || ""}|${canonicalStageId(e.stage_id)}`
+    const prev = lastKept.get(key)
+    const at = eventTime(e)
+    if (prev && prev.type === type && Math.abs(at - prev.at) <= LIFECYCLE_DUPLICATE_WINDOW_MS) {
+      const kept = out[prev.index]
+      // Keep whichever copy carries the human-readable summary, timed from the
+      // first report of a start and the last report of an end. The producers
+      // report one transition seconds apart; taking the earlier end timed
+      // Executing at 33.3s where the Overview (last completion) said 36.5s.
+      const base = !hasHumanTitle(kept) && hasHumanTitle(e) ? e : kept
+      const occurredAt =
+        type === "STAGE_STARTED" ? kept.occurred_at || e.occurred_at : e.occurred_at || kept.occurred_at
+      if (base !== kept || occurredAt !== kept.occurred_at) {
+        out[prev.index] = { ...base, occurred_at: occurredAt }
+        retimed = true
+      }
+      continue
+    }
+    lastKept.set(key, { index: out.length, type, at })
+    out.push(e)
+  }
+  // A later end can move a row past the ones after it; restore the order.
+  return retimed ? out.sort(compareRunEventsAsc) : out
+}
+
 function normalizeSeverity(raw?: string): EventSeverity {
   const s = String(raw || "").toLowerCase()
-  if (s === "error") return "error"
+  if (s === "error" || s === "critical" || s === "fatal") return "error"
   if (s === "warn" || s === "warning") return "warn"
   if (s === "info") return "info"
   return "unknown"
+}
+
+/**
+ * The row's severity, falling back to a sentinel alert's own level.
+ *
+ * SENTINEL_ALERT carries its level in `status` ("warning", "error", "critical"
+ * — `cdc_wal_watchdog.go`, `batch_sentinel.go`) and no top-level `severity`, and
+ * the projector fills the column only from `severity` (`event_projector.go`
+ * storeRunEvent). The column is therefore empty on every alert row, which
+ * rendered a WAL-retention alarm as a green check. Scoped to SENTINEL_ALERT:
+ * on other rows `status` is a lifecycle word, not a level.
+ */
+function rowSeverity(event: PipelineRunEvent): EventSeverity {
+  if (event.severity) return normalizeSeverity(event.severity)
+  if (event.event_type === "SENTINEL_ALERT") return normalizeSeverity(event.payload?.status)
+  return normalizeSeverity(undefined)
+}
+
+/**
+ * Where a stage is, read from its latest transition, and how long it took.
+ *
+ * The latest transition decides, not "any failure anywhere": the feed mixes
+ * every run's rows, and a stage that failed and was retried is not failed. Error
+ * rows keep their own red mark; the badge only answers where the stage is. The
+ * old rule also read error rows, which made the badge change with the pages
+ * loaded, since an older page can hold an error the newest one does not.
+ */
+function stageState(
+  transitions: PipelineRunEvent[], // chronological, one copy per transition
+  latestEventAt: number,
+): { status: StageGroup["status"]; duration?: number; attempts?: number } {
+  const last = transitions[transitions.length - 1]
+  if (!last) return { status: "unknown" }
+  const lastAt = eventTime(last)
+
+  // The duration is every attempt's own span added up, from `stageTiming` — the
+  // same reduction the Overview's stage list runs. This walked back to the LAST
+  // STAGE_STARTED and measured only from there, so a stage that ran twice
+  // reported its second attempt and silently dropped the first: on the live demo
+  // pipeline `infra_preflight` ran 15:58:29→15:58:46 and 16:13:40→16:13:55, and
+  // read "15.0s" here against the Overview's "15m 26s".
+  const timing = stageTiming(
+    transitions.map((t) => ({ type: String(t.event_type || ""), at: eventTime(t) })),
+    latestEventAt,
+  )
+
+  switch (String(last.event_type || "").toUpperCase()) {
+    case "STAGE_FAILED":
+    case "PIPELINE_FAILED":
+      return { status: "failed", duration: timing.activeMs, attempts: timing.attempts }
+    case "STAGE_COMPLETED":
+    case "PIPELINE_COMPLETED":
+      return { status: "completed", duration: timing.activeMs, attempts: timing.attempts }
+    case "STAGE_STARTED":
+      return { status: "running", duration: timing.activeMs, attempts: timing.attempts }
+    default:
+      // PIPELINE_WAITING. A wait with nothing after it anywhere in the run is
+      // still open; once any later event exists the user answered it (e.g.
+      // tables selected). When the stage ended after that is not recorded.
+      return latestEventAt > lastAt
+        ? { status: "completed", attempts: timing.attempts }
+        : { status: "running", duration: timing.activeMs, attempts: timing.attempts }
+  }
 }
 
 export class EventNormalizer {
@@ -291,7 +552,7 @@ export class EventNormalizer {
       seq: event.seq,
       type: event.event_type,
       timestamp: event.occurred_at || event.received_at,
-      severity: normalizeSeverity(event.severity),
+      severity: rowSeverity(event),
       stage: event.stage_id,
       stageGroup: event.stage_group,
       traceId: event.trace_id,
@@ -302,15 +563,44 @@ export class EventNormalizer {
   }
 
   /**
-   * Group events by stage for timeline view
+   * Group events by stage for timeline view.
+   *
+   * `statusEvents` are lifecycle transitions fetched apart from the paged feed
+   * (STATUS_EVENT_TYPES). They add no rows and no groups; they only decide each
+   * group's status and duration, which is what keeps both from changing when
+   * "Load More" pulls in an older page.
    */
-  static groupByStage(events: PipelineRunEvent[]): StageGroup[] {
+  static groupByStage(events: PipelineRunEvent[], statusEvents: PipelineRunEvent[] = []): StageGroup[] {
     const groupMap = new Map<string, PipelineRunEvent[]>()
+    const deduped = dedupeStageLifecycleEvents(events)
 
-    for (const event of events) {
+    // Each group's transitions: the loaded rows' own plus the fetched ones, once each.
+    const seen = new Set<string>()
+    const transitions: PipelineRunEvent[] = []
+    for (const e of [...events, ...statusEvents]) {
+      if (!STATUS_EVENT_TYPE_SET.has(String(e.event_type || "").toUpperCase())) continue
+      if (e.event_id) {
+        if (seen.has(e.event_id)) continue
+        seen.add(e.event_id)
+      }
+      transitions.push(e)
+    }
+    const transitionsByGroup = new Map<string, PipelineRunEvent[]>()
+    for (const e of dedupeStageLifecycleEvents(transitions)) {
+      const key = stageGroupKey(e)
+      if (!transitionsByGroup.has(key)) transitionsByGroup.set(key, [])
+      transitionsByGroup.get(key)!.push(e)
+    }
+
+    // The newest page is always loaded, so this is the same on every page count.
+    let latestEventAt = deduped.length ? eventTime(deduped[deduped.length - 1]) : 0
+    for (const e of transitions) latestEventAt = Math.max(latestEventAt, eventTime(e))
+
+    for (const event of deduped) {
       // Prefer stage_group because it's stable across event producers.
-      // stage_id can be missing or vary (agent name vs plan stage id), which fragments groups.
-      const key = event.stage_group || event.stage_id || "ungrouped"
+      // stage_id can be missing or vary (agent name vs plan stage id), which
+      // fragments groups, so a bare stage_id is mapped to its group first.
+      const key = stageGroupKey(event)
       if (!groupMap.has(key)) {
         groupMap.set(key, [])
       }
@@ -319,30 +609,32 @@ export class EventNormalizer {
 
     const groups: StageGroup[] = []
     for (const [key, stageEvents] of groupMap.entries()) {
-      const normalized = stageEvents.map((e) => this.normalize(e))
-      const sortedByTime = normalized.sort((a, b) => 
-        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
+      // `deduped` is already chronological with tie-breaks; keep that order.
+      const sortedByTime = stageEvents.map((e) => this.normalize(e))
+
+      // The span is what orders the lanes, so — like the badge and the duration
+      // — it must not depend on which pages are loaded. The newest page of a
+      // streaming run holds rows from long after a stage began, so take the
+      // group's transitions into account: they are fetched whole, apart from
+      // the feed. Without them the loaded rows are all there is.
+      const groupTransitions = transitionsByGroup.get(key) || []
+      const firstTransition = groupTransitions[0]
+      const lastTransition = groupTransitions[groupTransitions.length - 1]
+      const startedAt = pickTime(sortedByTime[0]?.timestamp, eventTimestamp(firstTransition), Math.min)
+      const completedAt = pickTime(
+        sortedByTime[sortedByTime.length - 1]?.timestamp,
+        eventTimestamp(lastTransition),
+        Math.max,
       )
+      const { status, duration: stageDuration, attempts } = stageState(groupTransitions, latestEventAt)
 
-      const startedAt = sortedByTime[0]?.timestamp
-      const completedAt = sortedByTime[sortedByTime.length - 1]?.timestamp
-      const hasError = sortedByTime.some((e) => e.severity === "error")
-      const hasCompleted = stageEvents.some((e) => 
-        e.event_type === "STAGE_COMPLETED" || e.event_type === "PIPELINE_COMPLETED"
-      )
-
-      let status: StageGroup["status"] = "pending"
-      if (hasError) {
-        status = "failed"
-      } else if (hasCompleted) {
-        status = "completed"
-      } else if (stageEvents.some((e) => e.event_type === "STAGE_STARTED")) {
-        status = "running"
-      }
-
-      const duration = startedAt && completedAt 
-        ? new Date(completedAt).getTime() - new Date(startedAt).getTime()
-        : undefined
+      // With no transition to measure from, the span of the loaded rows is the
+      // only duration there is.
+      const duration = status !== "unknown"
+        ? stageDuration
+        : startedAt && completedAt
+          ? new Date(completedAt).getTime() - new Date(startedAt).getTime()
+          : undefined
 
       groups.push({
         id: key,
@@ -352,14 +644,17 @@ export class EventNormalizer {
         completedAt,
         status,
         duration,
+        attempts,
       })
     }
 
-    return groups.sort((a, b) => {
-      const aTime = a.startedAt ? new Date(a.startedAt).getTime() : 0
-      const bTime = b.startedAt ? new Date(b.startedAt).getTime() : 0
-      return aTime - bTime
-    })
+    // A lane whose start is missing or unreadable sorts last rather than first:
+    // `NaN - NaN` reads as a tie and would leave it wherever it happened to land.
+    const laneStart = (g: StageGroup) => {
+      const t = g.startedAt ? new Date(g.startedAt).getTime() : NaN
+      return Number.isFinite(t) ? t : Number.POSITIVE_INFINITY
+    }
+    return groups.sort((a, b) => laneStart(a) - laneStart(b))
   }
 
   /**
@@ -542,6 +837,7 @@ export class EventNormalizer {
   }
 
   private static prettifyStageId(id: string): string {
+    if (STAGE_GROUP_LABEL[id]) return STAGE_GROUP_LABEL[id]
     return id
       .replace(/_/g, " ")
       .replace(/\b\w/g, (char) => char.toUpperCase())

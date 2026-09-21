@@ -27,6 +27,7 @@ import (
 // and the workflow is still parked, which is precisely the prod symptom.
 
 const hitlProbeSignal = "hitl-probe-signal"
+const hitlProbeCancelSignal = "hitl-probe-cancel"
 
 type hitlProbePayload struct {
 	Value string `json:"value"`
@@ -37,8 +38,22 @@ type hitlProbePayload struct {
 func hitlProbeWorkflow(ctx workflow.Context, waitFor time.Duration) (string, error) {
 	ch := workflow.GetSignalChannel(ctx, hitlProbeSignal)
 
+	// Mirrors the real workflow: the cancel signal cancels a child context that the
+	// park is handed, and the caller reads its own flag on a false return.
+	cancelCtx, cancel := workflow.WithCancel(ctx)
+	defer cancel()
+	cancelled := false
+	workflow.Go(ctx, func(gCtx workflow.Context) {
+		workflow.GetSignalChannel(gCtx, hitlProbeCancelSignal).Receive(gCtx, nil)
+		cancelled = true
+		cancel()
+	})
+
 	var payload hitlProbePayload
-	if !awaitHITLSignal(ctx, ch, &payload, workflow.Now(ctx).Add(waitFor)) {
+	if !awaitHITLSignal(ctx, cancelCtx, ch, &payload, workflow.Now(ctx).Add(waitFor)) {
+		if cancelled {
+			return "cancelled", nil
+		}
 		return "timeout", nil
 	}
 	return "received:" + payload.Value, nil
@@ -46,9 +61,21 @@ func hitlProbeWorkflow(ctx workflow.Context, waitFor time.Duration) (string, err
 
 func runHITLProbe(t *testing.T, waitFor time.Duration, beforeExec func(env *testsuite.TestWorkflowEnvironment)) string {
 	t.Helper()
+	got, _ := runHITLProbeTimed(t, waitFor, beforeExec)
+	return got
+}
+
+var hitlProbeStart = time.Date(2026, 9, 1, 9, 0, 0, 0, time.UTC)
+
+// runHITLProbeTimed also reports how much workflow time the park took: a run that
+// was cancelled reads "cancelled" whether the park returned on the cancel or only
+// at its deadline, so elapsed time is what tells those apart.
+func runHITLProbeTimed(t *testing.T, waitFor time.Duration, beforeExec func(env *testsuite.TestWorkflowEnvironment)) (string, time.Duration) {
+	t.Helper()
 
 	var ts testsuite.WorkflowTestSuite
 	env := ts.NewTestWorkflowEnvironment()
+	env.SetStartTime(hitlProbeStart)
 	env.RegisterWorkflow(hitlProbeWorkflow)
 	if beforeExec != nil {
 		beforeExec(env)
@@ -67,7 +94,7 @@ func runHITLProbe(t *testing.T, waitFor time.Duration, beforeExec func(env *test
 	if err := env.GetWorkflowResult(&got); err != nil {
 		t.Fatalf("could not read workflow result: %v", err)
 	}
-	return got
+	return got, env.Now().Sub(hitlProbeStart)
 }
 
 // TestAwaitHITLSignalTimesOut: the signal never arrives, so the park must end at
@@ -101,6 +128,94 @@ func TestAwaitHITLSignalExpiredDeadlineDoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestAwaitHITLSignalReturnsOnCancel: the user cancels while the run is parked. The
+// park must end at the cancel, not sit there until the 24h deadline.
+func TestAwaitHITLSignalReturnsOnCancel(t *testing.T) {
+	got, elapsed := runHITLProbeTimed(t, 24*time.Hour, func(env *testsuite.TestWorkflowEnvironment) {
+		env.RegisterDelayedCallback(func() {
+			env.SignalWorkflow(hitlProbeCancelSignal, nil)
+		}, time.Hour)
+	})
+
+	if got != "cancelled" {
+		t.Fatalf("a cancel inside the window should end the park as cancelled, got %q", got)
+	}
+	if elapsed >= 2*time.Hour {
+		t.Fatalf("park ended %s after start; a cancel at 1h must not wait for the 24h deadline", elapsed)
+	}
+}
+
+// TestAwaitHITLSignalOnDefaultCancelVersionIgnoresCancel: replay safety. A history
+// recorded before hitl-wait-honours-cancel has no marker, so GetVersion returns
+// DefaultVersion and the park must behave exactly as it did then: the cancel does
+// not end it, and a signal that arrives afterwards is still taken. Same inputs as
+// TestAwaitHITLSignalReturnsOnCancel plus a later signal, so the version is the
+// only thing that differs.
+func TestAwaitHITLSignalOnDefaultCancelVersionIgnoresCancel(t *testing.T) {
+	got, elapsed := runHITLProbeTimed(t, 24*time.Hour, func(env *testsuite.TestWorkflowEnvironment) {
+		env.OnGetVersion(hitlWaitHonoursCancelVersion, workflow.DefaultVersion, 1).Return(workflow.DefaultVersion)
+		env.RegisterDelayedCallback(func() {
+			env.SignalWorkflow(hitlProbeCancelSignal, nil)
+		}, time.Hour)
+		env.RegisterDelayedCallback(func() {
+			env.SignalWorkflow(hitlProbeSignal, hitlProbePayload{Value: "after-cancel"})
+		}, 2*time.Hour)
+	})
+
+	if got != "received:after-cancel" {
+		t.Fatalf("on DefaultVersion the park must ignore the cancel and take the later signal, got %q", got)
+	}
+	if elapsed < 2*time.Hour {
+		t.Fatalf("park ended %s after start, before the 2h signal it should have waited for", elapsed)
+	}
+}
+
+// hitlProbeCancelledBeforeSelectWorkflow reaches the park with the run already
+// cancelled AND a payload already buffered, the one case where selector order
+// decides the outcome.
+func hitlProbeCancelledBeforeSelectWorkflow(ctx workflow.Context) (string, error) {
+	ch := workflow.GetSignalChannel(ctx, hitlProbeSignal)
+	cancelCtx, cancel := workflow.WithCancel(ctx)
+	defer cancel()
+	cancel()
+
+	if err := workflow.Await(ctx, func() bool { return ch.Len() > 0 }); err != nil {
+		return "", err
+	}
+	var payload hitlProbePayload
+	if !awaitHITLSignal(ctx, cancelCtx, ch, &payload, workflow.Now(ctx).Add(24*time.Hour)) {
+		return "cancelled", nil
+	}
+	return "received:" + payload.Value, nil
+}
+
+// TestAwaitHITLSignalCancelWinsOverPendingSignal: a cancelled run must not resume
+// on a payload that happened to be waiting when the park was entered.
+func TestAwaitHITLSignalCancelWinsOverPendingSignal(t *testing.T) {
+	var ts testsuite.WorkflowTestSuite
+	env := ts.NewTestWorkflowEnvironment()
+	env.RegisterWorkflow(hitlProbeCancelledBeforeSelectWorkflow)
+	env.RegisterDelayedCallback(func() {
+		env.SignalWorkflow(hitlProbeSignal, hitlProbePayload{Value: "late"})
+	}, time.Minute)
+
+	env.ExecuteWorkflow(hitlProbeCancelledBeforeSelectWorkflow)
+
+	if !env.IsWorkflowCompleted() {
+		t.Fatal("workflow did not complete")
+	}
+	if err := env.GetWorkflowError(); err != nil {
+		t.Fatalf("workflow returned an error: %v", err)
+	}
+	var got string
+	if err := env.GetWorkflowResult(&got); err != nil {
+		t.Fatalf("could not read workflow result: %v", err)
+	}
+	if got != "cancelled" {
+		t.Fatalf("a cancelled run must not take the pending payload, got %q", got)
+	}
+}
+
 // TestNoBareHITLChannelReceives is a structural guard, not a behavioral one.
 //
 // Fixing the six known park sites does not stop a seventh from being added as a
@@ -120,6 +235,26 @@ func TestNoBareHITLChannelReceives(t *testing.T) {
 	// inside awaitHITLSignal use the selector callback's channel parameter (`c`),
 	// so they do not match this pattern.
 	bare := regexp.MustCompile(`(\w*Ch)\.Receive\(ctx`)
+
+	// Arming control: the pattern flags the bare park form and leaves the helper's
+	// own receives alone, so "no offenders" below means something.
+	if !bare.MatchString("tablesSelectedCh.Receive(ctx, &tablePayload)") {
+		t.Fatal("pattern does not flag a bare HITL receive; this guard cannot fail")
+	}
+	for _, helperLine := range []string{"c.Receive(ctx, valuePtr)", "ch.Receive(ctx, valuePtr)"} {
+		if bare.MatchString(helperLine) {
+			t.Fatalf("pattern flags awaitHITLSignal's own receive %q", helperLine)
+		}
+	}
+
+	// Denominator: every park records its WaitReason and then waits through
+	// awaitHITLSignal. Equal, non-zero counts show the scan saw the parks, and a park
+	// that waits some other way (not only a bare Receive) breaks the equality.
+	parks := strings.Count(string(body), "state.SetWaitReason(")
+	waits := strings.Count(string(body), "awaitHITLSignal(ctx, childCtx, ")
+	if parks == 0 || waits != parks {
+		t.Fatalf("found %d HITL parks (state.SetWaitReason) but %d awaitHITLSignal waits; every park must wait through the helper", parks, waits)
+	}
 
 	var offenders []string
 	for i, line := range strings.Split(string(body), "\n") {

@@ -45,6 +45,7 @@ export default async function ExecutionsPage() {
     scheduledTime: e.scheduled_time ? new Date(e.scheduled_time) : null,
     startedAt: e.start_time ? new Date(e.start_time) : new Date(),
     finishedAt: e.end_time ? new Date(e.end_time) : null,
+    liveStream: Boolean(e.live_stream),
     error: e.error_message ?? null,
     nodeResults: e.node_results ?? null,
     inputData: e.input_data ?? null,

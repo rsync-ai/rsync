@@ -33,8 +33,7 @@ services:
     role: MCP connector lifecycle + dependency liveness probe.
 
   backend-temporal-adapter:
-    internal_url: http://temporal-adapter:8080
-    health_path: /health
+    internal_url: http://temporal-adapter:8082     # its only listener (METRICS_ADDR): /metrics + /version. NOT 8080, nothing listens there. No /health.
     version_path: /version
     role: Translates pipeline requests into Temporal workflows.
 

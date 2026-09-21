@@ -46,9 +46,17 @@ export interface AdminAuditLog {
 
 export interface ServiceHealth {
   service: string
-  status: "up" | "down" | "degraded"
+  // "unknown" means nothing was asked (admin_health.go, the explorer-freshness-sweep
+  // check) — a different fact from "down", and it arrives on the wire as its own value.
+  status: "up" | "down" | "degraded" | "unknown"
   latency_ms: number
   error?: string
+  /**
+   * Whatever a check knows beyond reachability (admin_health.go serviceHealth.Detail).
+   * Absent for the socket checks; the freshness sweep reports its interval, tick counts
+   * and last result here.
+   */
+  detail?: Record<string, unknown>
 }
 
 export interface PaginatedResponse<T> {

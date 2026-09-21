@@ -363,6 +363,17 @@ Plumbing: `metadata.json` → api-gateway `MCPConnector.SupportedVersions`
 `latest.json.current_version`, which is the only copy that exists and the one the
 Docker build context points at.
 
+##### Supported engine versions
+
+This table is the canonical source for what rsync claims to support. Its strings are mirrored verbatim into each connector's `metadata.json` `supported_versions` and rendered read-only in the config modal. Keep this table and the metadata in lockstep.
+
+| Engine | Batch (snapshot / incremental) | CDC (streaming) |
+|---|---|---|
+| **PostgreSQL** | 9.4 and later (12+ recommended) | 10 and later — logical replication via Debezium `pgoutput` (requires `wal_level=logical`) |
+| **MySQL** | 5.7 and later, including 8.0 (8.0+ recommended); MariaDB 10.x compatible | 5.7 and later, including 8.0 — via Debezium (requires `binlog_format=ROW`, `binlog_row_image=FULL`) |
+
+Notes: batch floors are the absolute minimums the Python connector + driver tolerate; the parenthetical "recommended" is what we advise for production. CDC floors are dictated by Debezium's logical-decoding requirements, not the driver. When changing these strings, update the table and `versions/<current_version>/metadata.json` together.
+
 ## AI Agent Interaction Flow
 
 ```

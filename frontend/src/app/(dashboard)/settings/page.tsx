@@ -122,7 +122,7 @@ export default function SettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <User className="h-5 w-5 text-zinc-500" />
+            <User className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
             Profile
           </CardTitle>
           <CardDescription>Your personal information</CardDescription>
@@ -135,8 +135,11 @@ export default function SettingsPage() {
                 {initials ?? ""}
               </AvatarFallback>
             </Avatar>
-            <div>
-              <p className="text-xs text-zinc-500">Profile photo</p>
+            {/* There is no photo upload, so a "Profile photo" label pointed at a
+                control that doesn't exist (#49). Say what the avatar is instead. */}
+            <div className="min-w-0">
+              <p className="font-medium text-zinc-900 dark:text-white truncate">{name || email}</p>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">Your avatar shows the initials of your name.</p>
             </div>
           </div>
 
@@ -177,7 +180,7 @@ export default function SettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Lock className="h-5 w-5 text-zinc-500" />
+            <Lock className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
             Change Password
           </CardTitle>
           <CardDescription>Update your account password</CardDescription>
@@ -197,7 +200,7 @@ export default function SettingsPage() {
               <button
                 type="button"
                 aria-label={showCurrentPw ? "Hide current password" : "Show current password"}
-                className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
                 onClick={() => setShowCurrentPw((v) => !v)}
               >
                 {showCurrentPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
@@ -220,7 +223,7 @@ export default function SettingsPage() {
                 <button
                   type="button"
                   aria-label={showNewPw ? "Hide new password" : "Show new password"}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
                   onClick={() => setShowNewPw((v) => !v)}
                 >
                   {showNewPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
@@ -241,7 +244,7 @@ export default function SettingsPage() {
                 <button
                   type="button"
                   aria-label={showConfirmPw ? "Hide password confirmation" : "Show password confirmation"}
-                  className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
                   onClick={() => setShowConfirmPw((v) => !v)}
                 >
                   {showConfirmPw ? <EyeOff className="h-4 w-4" /> : <Eye className="h-4 w-4" />}
@@ -273,7 +276,7 @@ export default function SettingsPage() {
       <Card>
         <CardHeader>
           <CardTitle className="flex items-center gap-2">
-            <Palette className="h-5 w-5 text-zinc-500" />
+            <Palette className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
             Appearance
           </CardTitle>
           <CardDescription>Customize the look and feel</CardDescription>
@@ -282,7 +285,7 @@ export default function SettingsPage() {
           <div className="flex items-center justify-between">
             <div>
               <p className="font-medium">Theme</p>
-              <p className="text-sm text-zinc-500">Select your preferred theme</p>
+              <p className="text-sm text-zinc-500 dark:text-zinc-400">Select your preferred theme</p>
             </div>
             {mounted && (
               <div className="flex gap-2">

@@ -1,9 +1,10 @@
 /**
  * Regression tests for the remaining two F-284 consumers on the Monitor tab.
  *
- * #82 fixed the third one (the Live events card). The other two were left, and
- * they have the same shape: a hook that computes an `error` correctly, and a
- * caller that destructures only `data`.
+ * #82 fixed the third one (the Live events card, since removed; its tests now
+ * guard the Activity sub-tab in activity-readable.test.tsx). The other two were
+ * left, and they have the same shape: a hook that computes an `error`
+ * correctly, and a caller that destructures only `data`.
  *
  *   ThroughputCard   `const { data } = usePolledJson(url)` — MonitorTab.tsx:295
  *                    (was :265; the 404 fix below moved it).
@@ -210,21 +211,6 @@ describe("a 404 is a failed read that keeps retrying, not a silent empty state",
     expect(screen.queryByText(/throughput appears once this pipeline runs/i)).toBeNull()
   })
 
-  it("says so for the events feed too", async () => {
-    routeFetch((url) => {
-      if (url.includes("/runtime")) return res(200, RUNTIME_OK)
-      if (url.includes("/table-stats")) return res(200, STATS_OK)
-      return res(404, { error: "Pipeline not found" })
-    })
-
-    render(<MonitorTab pipelineId="p1" />)
-
-    await waitFor(() =>
-      expect(screen.getByText(/could not load recent events \(404\)/i)).toBeInTheDocument(),
-    )
-    expect(screen.queryByText(/no recent events/i)).toBeNull()
-  })
-
   // THE CASE THAT DISCRIMINATES. Rendering an error on the first 404 passes even
   // with the old `disabledRef` still in place, because the ref only silences the
   // *later* ticks. This one advances the clock past the 5s poll and requires the
@@ -273,8 +259,6 @@ describe("a 404 is a failed read that keeps retrying, not a silent empty state",
     render(<MonitorTab pipelineId="p1" />)
 
     await waitFor(() => expect(screen.getByText(/loading throughput/i)).toBeInTheDocument())
-    expect(screen.getByText(/no recent events/i)).toBeInTheDocument()
     expect(screen.queryByText(/couldn't load throughput/i)).toBeNull()
-    expect(screen.queryByText(/could not load recent events/i)).toBeNull()
   })
 })

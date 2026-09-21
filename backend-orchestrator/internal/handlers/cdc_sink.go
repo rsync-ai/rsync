@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/rsync-ai/backend-orchestrator/internal/agents/executor"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
 	"github.com/rsync-ai/shared/crypto"
@@ -94,36 +95,19 @@ func restartCDCSinkWorker(ctx context.Context, db *sql.DB, mcpManager *mcp.Serve
 		return nil, http.StatusBadGateway, err
 	}
 
-	topicPrefix := strings.TrimSpace(fmt.Sprint(cfg["topic.prefix"]))
+	topicPrefix := connectorConfigString(cfg, "topic.prefix")
 	if topicPrefix == "" {
 		return nil, http.StatusBadRequest, errors.New("missing topic.prefix in connector config")
 	}
 
-	tableIncludeList := strings.TrimSpace(fmt.Sprint(cfg["table.include.list"]))
-	if tableIncludeList == "" {
-		return nil, http.StatusBadRequest, errors.New("missing table.include.list in connector config")
+	tables := connectorIncludeList(cfg)
+	if len(tables) == 0 {
+		return nil, http.StatusBadRequest, errors.New("missing table.include.list / collection.include.list in connector config")
 	}
 
-	tables := splitCommaList(tableIncludeList)
-	topics := make([]string, 0, len(tables))
-	seen := map[string]struct{}{}
-	for _, t := range tables {
-		tt := strings.TrimSpace(t)
-		if tt == "" {
-			continue
-		}
-		topic := tt
-		if !strings.HasPrefix(topic, topicPrefix+".") {
-			topic = topicPrefix + "." + tt
-		}
-		if _, ok := seen[topic]; ok {
-			continue
-		}
-		seen[topic] = struct{}{}
-		topics = append(topics, topic)
-	}
+	topics := deriveCDCSinkTopics(topicPrefix, tables)
 	if len(topics) == 0 {
-		return nil, http.StatusBadRequest, errors.New("no topics derived from table.include.list")
+		return nil, http.StatusBadRequest, errors.New("no topics derived from the connector include list")
 	}
 
 	// Destination connection (decrypt config) so sink can write.
@@ -155,6 +139,43 @@ func restartCDCSinkWorker(ctx context.Context, db *sql.DB, mcpManager *mcp.Serve
 		if ns.Valid {
 			destNamespace = strings.TrimSpace(ns.String)
 		}
+	}
+
+	// Source connection: a server-level source (a MySQL/MongoDB/ClickHouse connection
+	// naming no database) mirrors each source database at the destination, and the
+	// object-storage layout reads its family and database. Best-effort, as before.
+	var srcType string
+	var srcCfg map[string]string
+	if srcConnID, serr := findPipelineSourceConnectionID(ctx, db, pipelineID); serr == nil {
+		if t, _, c, cerr := getDecryptedConnectionForSink(ctx, db, srcConnID); cerr == nil {
+			srcType, srcCfg = t, c
+		} else {
+			log.WithFields(log.Fields{"pipeline_id": pipelineID, "error": cerr.Error()}).
+				Warn("cdc sink restart: source connection unreadable; source databases will not be mirrored")
+		}
+	}
+	mirrorSource := executor.MirrorSourceNamespaces(srcType, srcCfg, destConnector, destNamespace,
+		executor.SchemaModeOverride(ctx, db, pipelineID))
+
+	// Object-storage layout (executor/object_layout_v2.go). A restart keeps the
+	// layout the pipeline already writes and never moves it to v2; a v2-capable pipeline
+	// whose layout cannot be read does not restart, rather than switch key shape.
+	layoutFields := executor.ObjectLayout{Version: 1}.SinkConfigFields()
+	if executor.ObjectLayoutAppliesTo(destConnector) {
+		in := executor.ObjectLayoutInput{
+			PipelineID: pipelineID,
+			DestType:   destConnector,
+			Namespace:  destNamespace,
+			DestConnID: destConnID,
+		}
+		if srcType != "" {
+			in.SourceType, in.SourceConfig = srcType, srcCfg
+		}
+		layout, lerr := executor.ResolveObjectLayoutForRestart(ctx, db, in)
+		if lerr != nil {
+			return nil, http.StatusConflict, lerr
+		}
+		layoutFields = layout.SinkConfigFields()
 	}
 
 	// The group the sink ACTUALLY registered — not the derived default. This function
@@ -198,11 +219,15 @@ func restartCDCSinkWorker(ctx context.Context, db *sql.DB, mcpManager *mcp.Serve
 				"sink_mode":               "cdc",
 				"pipeline_id":             pipelineID,
 				// CDC stats use stable execution_id == pipeline_id.
-				"execution_id":          pipelineID,
-				"destination_connector": destConnector,
-				"destination_version":   destConcreteVer,
-				"destination_config":    destCfg,
-				"destination_namespace": destNamespace,
+				"execution_id":            pipelineID,
+				"destination_connector":   destConnector,
+				"destination_version":     destConcreteVer,
+				"destination_config":      destCfg,
+				"destination_namespace":   destNamespace,
+				"mirror_source_namespace": mirrorSource,
+				"storage_layout_version":  layoutFields["storage_layout_version"],
+				"source_family":           layoutFields["source_family"],
+				"source_database":         layoutFields["source_database"],
 			},
 		},
 	})
@@ -232,6 +257,51 @@ func restartCDCSinkWorker(ctx context.Context, db *sql.DB, mcpManager *mcp.Serve
 		"stop_sink":           stopResp,
 		"start_sink":          startResp,
 	}, http.StatusOK, nil
+}
+
+// connectorConfigString reads a Kafka Connect config value as a trimmed string.
+// A missing key yields "" (fmt.Sprint(nil) would yield "<nil>").
+func connectorConfigString(cfg map[string]interface{}, key string) string {
+	v, ok := cfg[key]
+	if !ok || v == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(v))
+}
+
+// connectorIncludeList returns the captured tables of a Debezium connector.
+// Relational connectors use table.include.list; the MongoDB connector uses
+// collection.include.list ("db.collection") instead.
+func connectorIncludeList(cfg map[string]interface{}) []string {
+	for _, key := range []string{"table.include.list", "collection.include.list"} {
+		if items := splitCommaList(connectorConfigString(cfg, key)); len(items) > 0 {
+			return items
+		}
+	}
+	return nil
+}
+
+// deriveCDCSinkTopics maps include-list entries to Debezium topic names
+// (<topic.prefix>.<db>.<table>), de-duplicated in order.
+func deriveCDCSinkTopics(topicPrefix string, tables []string) []string {
+	topics := make([]string, 0, len(tables))
+	seen := map[string]struct{}{}
+	for _, t := range tables {
+		tt := strings.TrimSpace(t)
+		if tt == "" {
+			continue
+		}
+		topic := tt
+		if !strings.HasPrefix(topic, topicPrefix+".") {
+			topic = topicPrefix + "." + tt
+		}
+		if _, ok := seen[topic]; ok {
+			continue
+		}
+		seen[topic] = struct{}{}
+		topics = append(topics, topic)
+	}
+	return topics
 }
 
 func splitCommaList(s string) []string {

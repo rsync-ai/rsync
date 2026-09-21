@@ -43,6 +43,9 @@ func TestDeletePipeline_ReadsAndClearsSchedulesBeforeDelete(t *testing.T) {
 	mock.ExpectExec(`DELETE FROM executions`).
 		WithArgs(wsScopePipeline, wsScopeWS).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	mock.ExpectExec(`UPDATE saved_query_schedules s`).
+		WithArgs(wsScopePipeline).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	mock.ExpectExec(`DELETE FROM pipelines WHERE id=\$1 AND workspace_id=\$2`).
 		WithArgs(wsScopePipeline, wsScopeWS).
 		WillReturnResult(sqlmock.NewResult(0, 1))

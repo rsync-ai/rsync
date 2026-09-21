@@ -26,12 +26,15 @@ func checkPipelineRunCooldown(parent context.Context, database *sql.DB, pipeline
 	ctx, cancel := context.WithTimeout(parent, 1*time.Second)
 	defer cancel()
 
+	// The window is numeric seconds times an interval. Building it as text
+	// (`$2 || ' seconds'`) makes $2 a text parameter, which pgx refuses to encode
+	// an int into, so every check errored and the fail-open above allowed the run.
 	var recent bool
 	err := database.QueryRowContext(ctx,
 		`SELECT EXISTS (
 		     SELECT 1 FROM executions
 		     WHERE pipeline_id = $1
-		       AND start_time > now() - ($2 || ' seconds')::interval
+		       AND start_time > now() - ($2 * INTERVAL '1 second')
 		 )`,
 		pipelineID, cooldownSeconds,
 	).Scan(&recent)

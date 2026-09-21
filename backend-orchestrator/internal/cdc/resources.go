@@ -36,14 +36,33 @@ type CDCResource struct {
 	LastVerifiedAt *time.Time             `json:"last_verified_at,omitempty"`
 }
 
+// pipelineShortID is the pipeline-identifying part of every CDC resource name.
+func pipelineShortID(pipelineID string) string {
+	if len(pipelineID) >= 8 {
+		return pipelineID[:8]
+	}
+	return pipelineID
+}
+
+// PipelineResourcePrefix returns the leading part of a replication slot or
+// publication name that GenerateResourceName builds for this pipeline — the
+// part that does not depend on connection/database/table. Code that must
+// recognise a pipeline's own slot or publication on the source (the
+// pre-migration assessor) matches on this instead of re-deriving the format.
+// Returns "" for other resource types.
+func PipelineResourcePrefix(pipelineID, resourceType string) string {
+	switch resourceType {
+	case "replication_slot":
+		return fmt.Sprintf("debezium_slot_pipe_%s_", pipelineShortID(pipelineID))
+	case "publication":
+		return fmt.Sprintf("debezium_pub_pipe_%s_", pipelineShortID(pipelineID))
+	}
+	return ""
+}
+
 // GenerateResourceName creates deterministic, unique resource names
 func GenerateResourceName(config CDCResourceConfig, resourceType string) string {
-	pipelineShort := ""
-	if len(config.PipelineID) >= 8 {
-		pipelineShort = config.PipelineID[:8]
-	} else {
-		pipelineShort = config.PipelineID
-	}
+	pipelineShort := pipelineShortID(config.PipelineID)
 
 	// Create deterministic hash for additional uniqueness
 	hashInput := fmt.Sprintf(
@@ -59,12 +78,12 @@ func GenerateResourceName(config CDCResourceConfig, resourceType string) string 
 	switch resourceType {
 	case "replication_slot":
 		// PostgreSQL slot names: max 63 chars, lowercase, underscores
-		return fmt.Sprintf("debezium_slot_pipe_%s_%s", pipelineShort, hashShort)
+		return PipelineResourcePrefix(config.PipelineID, resourceType) + hashShort
 
 	case "publication":
 		// PostgreSQL publication names: per-pipeline to avoid shared-resource refcount complexity.
 		// Max identifier length is 63 chars.
-		return fmt.Sprintf("debezium_pub_pipe_%s_%s", pipelineShort, hashShort)
+		return PipelineResourcePrefix(config.PipelineID, resourceType) + hashShort
 
 	case "server_id":
 		// MySQL server ID: numeric, use hash as number
@@ -223,6 +242,42 @@ func GetReapablePublications(ctx context.Context, db *sql.DB) ([]CDCResource, er
 	rows, err := db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query reapable publications: %w", err)
+	}
+	defer rows.Close()
+	return scanCDCResources(rows)
+}
+
+// GetReapableCaptureInstances is the SQL Server analogue of GetReapableSlots,
+// with ONE deliberate difference: it reaps only when the owning pipeline is
+// GONE (pipeline_id NULL via ON DELETE SET NULL, or the pipeline row deleted) —
+// never merely 'stopped'.
+//
+// A stopped PostgreSQL slot is unambiguously harmful (it pins WAL on the source
+// until the disk fills), so reaping it is the safe default. A SQL Server capture
+// instance is the opposite: it is where the change data LIVES. Disabling one on
+// a stopped-but-resumable pipeline discards every change row accumulated since
+// the stop and forces a full re-snapshot on resume. So 'stopped' stays out of
+// this predicate on purpose — do not "harmonize" it with GetReapableSlots.
+//
+// SQL Server is the only non-PostgreSQL family that needs a reaper at all:
+// Oracle (supplemental log groups) and MySQL (server_id) cleanup is ledger-only
+// by design — see oracle.go / mysql.go CleanupResources — so there is nothing
+// physical that can be left behind.
+func GetReapableCaptureInstances(ctx context.Context, db *sql.DB) ([]CDCResource, error) {
+	query := `
+		SELECT cr.id, cr.pipeline_id, cr.connection_id, cr.source_table,
+		       cr.resource_type, cr.resource_name, cr.status,
+		       cr.database_type, cr.metadata, cr.created_at, cr.deleted_at, cr.last_verified_at
+		FROM cdc_resources cr
+		LEFT JOIN pipelines p ON p.id = cr.pipeline_id
+		WHERE cr.resource_type = 'capture_instance'
+		  AND cr.database_type = 'sqlserver'
+		  AND cr.status IN ('active', 'inactive', 'failed', 'orphaned')
+		  AND (cr.pipeline_id IS NULL OR p.id IS NULL)
+	`
+	rows, err := db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query reapable capture instances: %w", err)
 	}
 	defer rows.Close()
 	return scanCDCResources(rows)

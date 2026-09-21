@@ -224,6 +224,9 @@ func GenerateSQL(c *gin.Context) {
 
 	body, _ := io.ReadAll(resp.Body)
 
+	if relayLLMNotConfigured(c, resp.StatusCode, body) {
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		log.Errorf("[GenerateSQL] Text2SQL returned %d: %s", resp.StatusCode, string(body))
 		c.JSON(resp.StatusCode, gin.H{
@@ -3274,6 +3277,9 @@ func ResolveExplorerTables(c *gin.Context) {
 
 	body, _ := io.ReadAll(resp.Body)
 
+	if relayLLMNotConfigured(c, resp.StatusCode, body) {
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		log.Errorf("[ResolveExplorerTables] LLM returned %d: %s", resp.StatusCode, string(body))
 		c.JSON(resp.StatusCode, gin.H{"error": "Table resolution failed", "details": string(body)})
@@ -3429,6 +3435,9 @@ func ResolveExplorerColumns(c *gin.Context) {
 
 	body, _ := io.ReadAll(resp.Body)
 
+	if relayLLMNotConfigured(c, resp.StatusCode, body) {
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		c.JSON(resp.StatusCode, gin.H{"error": "Column resolution failed", "details": string(body)})
 		return
@@ -3556,6 +3565,28 @@ func GetExplorerNextSteps(c *gin.Context) {
 	defer resp.Body.Close()
 
 	body, _ := io.ReadAll(resp.Body)
+
+	if relayLLMNotConfigured(c, resp.StatusCode, body) {
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		// An error body decodes to zero suggestions, which the caller would
+		// read as "nothing to suggest". Say it failed instead. The body is not
+		// logged: a validation error can echo the result profile back.
+		log.Errorf("[GetExplorerNextSteps] llm-service returned status %d", resp.StatusCode)
+		msg := fmt.Sprintf("Could not get next-step suggestions: the explorer service answered with status %d. "+
+			"Try again in a moment; if it keeps failing, check the llm-service logs.", resp.StatusCode)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			// The service rejected this request, so sending it again gives the same answer.
+			msg = fmt.Sprintf("Could not get next-step suggestions: the explorer service rejected the request with status %d. "+
+				"Trying again will not help; check the llm-service logs and that the gateway and llm-service run the same version.", resp.StatusCode)
+		}
+		c.JSON(http.StatusBadGateway, gin.H{
+			"error":           msg,
+			"upstream_status": resp.StatusCode,
+		})
+		return
+	}
 
 	var llmResp struct {
 		Suggestions []NextStepSuggestion `json:"suggestions"`

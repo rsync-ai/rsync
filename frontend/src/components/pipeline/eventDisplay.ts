@@ -1,10 +1,12 @@
 /**
  * Turning a row of `pipeline_run_events` into something an operator can read.
  *
- * The Live events feed used to render `ev.event_type` and `ev.stage_id`
- * verbatim, which meant the most-watched panel on the pipeline page said
- * `STAGE_PROGRESS · executor` sixty times in a row. Everything here exists to
- * answer three questions from data the row already carries:
+ * The Data flow tab's event feed used to render `ev.event_type` and
+ * `ev.stage_id` verbatim, which meant the most-watched panel on the pipeline
+ * page said `STAGE_PROGRESS · executor` sixty times in a row. The Monitoring
+ * card's Activity sub-tab (`ReasoningTimeline`) now reads every row through
+ * these helpers. Everything here exists to answer three questions from data
+ * the row already carries:
  *
  *   - is this row worth a line at all?   → isNoiseEvent
  *   - what happened?                     → eventLabel
@@ -49,11 +51,16 @@ function isAttentionWorthy(severity: string | undefined): boolean {
 /**
  * Event types that repeat on a timer and carry no state change of their own.
  *
- * DATA_PLANE_METRICS is here because the Throughput card sits directly above
- * this feed and shows the very numbers it carries — as a feed row it is a
- * duplicate that arrives every few seconds.
+ * DATA_PLANE_METRICS is here because the Throughput card on the same tab shows
+ * the very numbers it carries — as a feed row it is a duplicate that arrives
+ * every few seconds.
+ *
+ * TABLE_STATS for the same reason: the sink emits one per committed batch
+ * ("CDC statistics update: <table>", kafka-sink-worker main.go), and the Table
+ * statistics card shows the counts it carries. On a live CDC run it filled the
+ * feed with the same line over and over (#56).
  */
-const ROUTINE_EVENT_TYPES = new Set(["DATA_PLANE_METRICS"])
+const ROUTINE_EVENT_TYPES = new Set(["DATA_PLANE_METRICS", "TABLE_STATS"])
 
 /**
  * True when a row is a routine tick rather than something that happened.
@@ -85,6 +92,7 @@ const EVENT_LABELS: Record<string, string> = {
   STAGE_COMPLETED: "Stage completed",
   STAGE_FAILED: "Stage failed",
   DATA_PLANE_METRICS: "Throughput update",
+  TABLE_STATS: "Table statistics update",
   SENTINEL_ALERT: "Monitoring alert",
   healer_decision: "Self-healing decision",
   healer_verified: "Self-healing outcome",
@@ -144,7 +152,11 @@ export function eventDetail(ev: DisplayEvent): string {
   const meta = asObject(p["metadata"]) || {}
 
   // 1. What the producer said.
-  const explicit = asText(p["message"]) || asText(p["summary"]) || asText(p["description"])
+  const explicit =
+    asText(p["message"]) ||
+    asText(p["summary"]) ||
+    asText(p["stage_summary"]) ||
+    asText(p["description"])
   if (explicit) return explicit
 
   // 2. Why the run is parked. On a waiting pipeline this is the single most

@@ -77,7 +77,7 @@ export function NotificationPreferencesCard({ email, isAdmin = false }: { email?
     <Card>
       <CardHeader>
         <CardTitle className="flex items-center gap-2">
-          <Bell className="h-5 w-5 text-zinc-500" />
+          <Bell className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
           My email alerts
         </CardTitle>
         <CardDescription>
@@ -86,7 +86,7 @@ export function NotificationPreferencesCard({ email, isAdmin = false }: { email?
       </CardHeader>
       <CardContent>
         {status === "loading" ? (
-          <p className="flex items-center gap-2 text-sm text-zinc-500">
+          <p className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
             <Loader2 className="h-4 w-4 animate-spin" /> Loading notification preferences…
           </p>
         ) : status === "failed" || !prefs ? (
@@ -112,7 +112,7 @@ export function NotificationPreferencesCard({ email, isAdmin = false }: { email?
             <div className="flex items-center justify-between gap-4">
               <div>
                 <p className="font-medium">Email notifications</p>
-                <p className="text-sm text-zinc-500">
+                <p className="text-sm text-zinc-500 dark:text-zinc-400">
                   {email ? `Send alerts about your pipelines to ${email}` : "Send alerts about your pipelines to your account email"}
                 </p>
               </div>
@@ -133,7 +133,7 @@ export function NotificationPreferencesCard({ email, isAdmin = false }: { email?
                   <div key={cat.id} className="flex items-center justify-between gap-4">
                     <div className={prefs.email_enabled && !blocked ? "" : "opacity-60"}>
                       <p className="text-sm font-medium">{cat.label}</p>
-                      <p className="text-xs text-zinc-500">
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
                         {blocked ? "Turned off for email by your admin." : cat.description}
                       </p>
                     </div>
@@ -150,12 +150,12 @@ export function NotificationPreferencesCard({ email, isAdmin = false }: { email?
               })}
             </div>
             {prefs.channels.slack && (
-              <p className="text-xs text-zinc-500">
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
                 This instance also posts alerts to a shared Slack channel. An admin chooses which categories go there.
               </p>
             )}
             {isAdmin && (
-              <p className="text-xs text-zinc-500">
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
                 Instance-wide delivery (Slack, SMTP, the alert list) is managed in{" "}
                 {adminLink}.
               </p>

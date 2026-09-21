@@ -5,7 +5,7 @@ import Link from "next/link"
 import { Button } from "@/components/ui/button"
 import { AssistantMarkdown } from "@/components/chat/AssistantMarkdown"
 import { PipelineConfirmationInline } from "@/components/chat/PipelineConfirmationInline"
-import { SyncModeChoiceInline } from "@/components/chat/SyncModeChoiceInline"
+import { SyncModeChoiceInline, type DestinationNamespaceHint } from "@/components/chat/SyncModeChoiceInline"
 import { DiagnosisCard, type DiagnosisData } from "@/components/chat/DiagnosisCard"
 import { UpgradeModal } from "@/components/plan/UpgradeModal"
 import type { PlanLimitPayload } from "@/lib/api/pipelines"
@@ -26,6 +26,12 @@ export interface ChatMessage {
     supportedSyncModes: string[]
     sourceSupportsCDC: boolean
     sourceSupportsIncrementalBatch: boolean
+    /** Mode the original request named ("cdc" | "batch"), from the gateway. */
+    requestedSyncMode?: string
+    /** "initial" | "streaming_only" when requestedSyncMode is "cdc". */
+    requestedCdcMode?: string
+    /** Destination database/schema/dataset field on the card (#45). */
+    destinationNamespace?: DestinationNamespaceHint
   }
   syncModeChosen?: string
   diagnosis?: DiagnosisData
@@ -48,6 +54,39 @@ function detectPlanLimit(content: string): PlanLimitPayload | null {
   return null
 }
 
+/**
+ * Maps the gateway's requested_sync_mode/requested_cdc_mode onto a card option
+ * id, or undefined when the request named no mode (or one the card doesn't
+ * offer), in which case the card still asks the user to pick.
+ */
+export function requestedOptionId(
+  optionIds: string[],
+  syncMode?: string,
+  cdcMode?: string,
+): string | undefined {
+  let id: string | undefined
+  if (syncMode === "batch") id = "batch"
+  else if (syncMode === "cdc") id = cdcMode === "streaming_only" ? "cdc_changes_only" : "initial_plus_cdc"
+  return id && optionIds.includes(id) ? id : undefined
+}
+
+const CONFIRM_COMMANDS: Record<string, string> = {
+  batch: "Yes sync_mode=batch",
+  initial_plus_cdc: "Yes sync_mode=cdc cdc_mode=initial",
+  cdc_changes_only: "Yes sync_mode=cdc cdc_mode=streaming_only",
+}
+
+/**
+ * The machine command the confirm card sends. A destination name typed on the
+ * card rides along as destination_namespace=<name>, which the gateway honors
+ * over the destination's default.
+ */
+export function confirmCommand(choiceId: string, destinationNamespace?: string): string {
+  const base = CONFIRM_COMMANDS[choiceId] ?? "Yes"
+  const ns = (destinationNamespace ?? "").trim()
+  return ns ? `${base} destination_namespace=${ns}` : base
+}
+
 export function ChatMessageItem({ message: m, onRunPrompt, onSetInput, onSyncModeChosen }: ChatMessageItemProps) {
   const [upgradePayload, setUpgradePayload] = useState<PlanLimitPayload | null>(null)
 
@@ -55,7 +94,7 @@ export function ChatMessageItem({ message: m, onRunPrompt, onSetInput, onSyncMod
 
   return (
     <div className="text-sm">
-      <div className="text-xs uppercase tracking-wide text-zinc-500">
+      <div className="text-xs uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
         {m.role === "user" ? "You" : "Assistant"}
       </div>
       {/* Assistant replies are authored as Markdown (see prompts/chat/*.md and the
@@ -131,18 +170,19 @@ export function ChatMessageItem({ message: m, onRunPrompt, onSetInput, onSyncMod
                 sourceType={m.confirmationContext.sourceType}
                 destType={m.confirmationContext.destType}
                 initialChosenLabel={m.syncModeChosen}
-                onChoice={(choiceId, _ctx, label) => {
+                requestedOptionId={requestedOptionId(
+                  opts.map((o) => o.id),
+                  m.confirmationContext.requestedSyncMode,
+                  m.confirmationContext.requestedCdcMode,
+                )}
+                destinationNamespace={m.confirmationContext.destinationNamespace}
+                onChoice={(choiceId, ctx, label) => {
                   onSyncModeChosen?.(label)
                   // Send the machine command to the backend, but show the
                   // human-readable label (e.g. "Batch (historical + incremental)")
                   // in the chat history instead of "Yes sync_mode=batch".
-                  if (choiceId === "batch")
-                    return onRunPrompt("Yes sync_mode=batch", label)
-                  if (choiceId === "initial_plus_cdc")
-                    return onRunPrompt("Yes sync_mode=cdc cdc_mode=initial", label)
-                  if (choiceId === "cdc_changes_only")
-                    return onRunPrompt("Yes sync_mode=cdc cdc_mode=streaming_only", label)
-                  return onRunPrompt("Yes", label)
+                  const ns = String(ctx?.destination_namespace || "").trim()
+                  return onRunPrompt(confirmCommand(choiceId, ns), ns ? `${label}, into ${ns}` : label)
                 }}
                 onCancel={() => onRunPrompt("No")}
               />

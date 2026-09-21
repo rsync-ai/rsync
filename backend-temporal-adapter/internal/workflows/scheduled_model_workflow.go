@@ -37,10 +37,29 @@ import (
 // Temporal schedule argument, where it would be frozen at create time and outlive
 // any demotion.
 
-// ScheduledModelRunInput is the input to the model run wrapper workflow.
+// ScheduledModelRunInput is the input to the model run wrapper workflow, and to
+// the activity both the clock path and the event path share.
 type ScheduledModelRunInput struct {
 	ScheduleID   string `json:"schedule_id"`
 	SavedQueryID string `json:"saved_query_id"`
+	// Trigger selects which door of the gateway's run endpoint this call goes
+	// through: empty means the clock path, which is what a schedule's stored
+	// arguments deserialize to, so a schedule created before this field existed
+	// keeps behaving exactly as it did. ModelRefreshWorkflow sets it to the event
+	// schedule_type instead.
+	Trigger string `json:"trigger,omitempty"`
+	// Depth is how many model-to-model hops preceded this rebuild, passed back to the
+	// gateway so the chain it fires next is bounded by the same number as one that never
+	// left the process. Zero for the clock path, which starts no chain.
+	Depth int `json:"depth,omitempty"`
+
+	// Provenance of an event-path rebuild, recorded on its history row by the gateway
+	// (migration 104). Empty on the clock path, and never sent there.
+	UpstreamKind  string `json:"upstream_kind,omitempty"`
+	UpstreamID    string `json:"upstream_id,omitempty"`
+	UpstreamRunID string `json:"upstream_run_id,omitempty"`
+	ExecutionID   string `json:"execution_id,omitempty"`
+	Coalesced     int    `json:"coalesced,omitempty"`
 }
 
 // modelRunActivityResult mirrors the endpoint's response envelope.
@@ -50,6 +69,7 @@ type modelRunActivityResult struct {
 	TargetTable     string `json:"target_table,omitempty"`
 	AutoPauseReason string `json:"auto_pause_reason,omitempty"`
 	Reason          string `json:"reason,omitempty"`
+	SkipReason      string `json:"skip_reason,omitempty"`
 }
 
 // ScheduledModelRunWorkflow is the wrapper workflow a model's Temporal schedule runs.
@@ -79,8 +99,15 @@ func ScheduledModelRunWorkflow(ctx workflow.Context, input ScheduledModelRunInpu
 	})
 
 	var result modelRunActivityResult
+	// Workflow time, so a replay and every delivery of the failure record below carry
+	// the same instant — it is half of the key the gateway dedupes that record on.
+	runStartedAt := workflow.Now(ctx)
 	if err := workflow.ExecuteActivity(ctx, RunModelActivity, input).Get(ctx, &result); err != nil {
 		logger.Error("model run activity failed", "error", err, "saved_query_id", input.SavedQueryID)
+		// The gateway records every run that reaches it; this one never came back, so
+		// nothing on the schedule page would say it failed. Best-effort: the workflow
+		// still fails with the run's own error whatever happens here.
+		recordModelRunFailure(ctx, input, runStartedAt, err)
 		return fmt.Errorf("model run failed: %w", err)
 	}
 
@@ -124,7 +151,21 @@ func RunModelActivity(ctx context.Context, input ScheduledModelRunInput) (*model
 	}
 	url := fmt.Sprintf("%s/api/v1/internal/explorer/models/%s/run", apiGatewayURL, input.SavedQueryID)
 
-	body, err := json.Marshal(map[string]string{"schedule_id": input.ScheduleID})
+	// map[string]any rather than map[string]string: depth is a number, and the gateway
+	// decodes it into an int. Sent only on the event path, where it is the chain bound
+	// the whole hop exists to preserve — a clock run starts no chain and omits it, which
+	// keeps the clock payload byte-identical to what it was before this field existed.
+	payload := map[string]any{"schedule_id": input.ScheduleID}
+	if input.Trigger != "" {
+		payload["trigger"] = input.Trigger
+		payload["depth"] = input.Depth
+		payload["upstream_kind"] = input.UpstreamKind
+		payload["upstream_id"] = input.UpstreamID
+		payload["upstream_run_id"] = input.UpstreamRunID
+		payload["execution_id"] = input.ExecutionID
+		payload["coalesced"] = input.Coalesced
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("failed to encode model run request: %w", err)
 	}

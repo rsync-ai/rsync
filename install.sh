@@ -23,7 +23,7 @@ RSYNC_REPO="${RSYNC_REPO:-rsync-ai/rsync}"
 # compose half and a "last publish" pointer on the image half, so the two halves
 # advance at different rates and a curl-pipe install is not reproducible. A tag
 # takes both halves from the same commit. Pass RSYNC_REF=main to track the branch.
-RSYNC_REF="${RSYNC_REF:-v0.1.2}"
+RSYNC_REF="${RSYNC_REF:-v0.1.4}"
 # The image tag that pairs with RSYNC_REF. Both halves of an install have to name
 # the same code: the compose file is fetched from RSYNC_REF, and the images that
 # compose file starts are pulled at this tag. Left independent they drift, and did
@@ -45,7 +45,16 @@ RSYNC_REF="${RSYNC_REF:-v0.1.2}"
 # `type=ref,event=branch` for a branch (main -> main, slashes to dashes). An
 # explicit RSYNC_VERSION still wins, so deliberately pairing one ref's compose
 # with another ref's images stays available to anyone who needs it.
-if [[ "${RSYNC_REF}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+# Whether RSYNC_REF names a release tag -- which is the same question as whether
+# the ref is allowed to point somewhere new tomorrow. Two decisions read it: the
+# version mapping just below, and whether a re-run may trust the compose file
+# already on disk (in main(), where a branch that moved is invisible to a
+# name-to-name comparison). One function, so the second reader cannot drift from
+# the first, and so a guard can execute the real test instead of restating it.
+ref_is_release_tag() {
+  [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]
+}
+if ref_is_release_tag "${RSYNC_REF}"; then
   RSYNC_VERSION="${RSYNC_VERSION:-${RSYNC_REF#v}}"
 else
   RSYNC_VERSION="${RSYNC_VERSION:-${RSYNC_REF//\//-}}"
@@ -84,22 +93,34 @@ OLLAMA_FILE="docker-compose.ollama.yml"
 OLLAMA_REF="${RSYNC_OLLAMA_REF:-main}"
 OLLAMA_RAW_BASE="https://raw.githubusercontent.com/${RSYNC_REPO}/${OLLAMA_REF}"
 COMPOSE_ARGS=()
-# Set by build_compose_args when the overlay above goes on, and read by
-# start_stack, which behaves differently on that path: the first `up` blocks for
-# the length of a multi-gigabyte download.
-OLLAMA_BUNDLED=0
 # Which optional compose profiles this install activates. `cdc` is in the
 # default because the change-data-capture services are not an add-on: pick a
 # streaming sync in the UI without them and the orchestrator's pre-flight polls
 # three absent containers for two minutes and then fails the run with
 # "kafka-connect is not reachable" -- a message about a container that was never
-# started, on a stack whose install reported success. The profile existed in
-# docker-compose.quickstart.yml and nothing in this script ever activated it, so
-# every install shipped that failure.
+# started, on a stack whose install reported success. The profile existed and
+# nothing in this script ever activated it, so every install shipped that
+# failure.
 #
 # `-` and not `:-` on purpose: RSYNC_PROFILES= (explicitly empty) is the
 # opt-out, and it has to be distinguishable from unset.
 RSYNC_PROFILES="${RSYNC_PROFILES-cdc}"
+# Set by build_compose_args when the overlay above goes on, and read by
+# start_stack, which behaves differently on that path: the first `up` blocks for
+# the length of a multi-gigabyte download.
+OLLAMA_BUNDLED=0
+# Set by check_ports_and_running_install when containers from this install were
+# already running before this run, so the banner can leave out the "create the
+# admin account" hint on an upgrade of a live install. Keyed on running
+# containers, not on "this run wrote the .env": a first run that stopped at a
+# port conflict has written the .env, and the re-run after the fix is still the
+# first time the stack comes up, so its operator still needs the hint.
+STACK_WAS_RUNNING=0
+# The compose project name and the host port api-gateway publishes, both read
+# out of the rendered compose model by check_ports_and_running_install. Empty
+# until then; probe_ready falls back to 5001, the quickstart's own value.
+COMPOSE_PROJECT=""
+API_HOST_PORT=""
 ENV_FILE=".env"
 # HOME is absent from exactly the environments setup_tty() exists to serve. A GCE
 # or cloud-init startup script, a systemd unit, a `docker run` without -e HOME and
@@ -124,16 +145,16 @@ ENV_FILE=".env"
 _home="${HOME:-}"
 [[ -n "$_home" ]] || _home="$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f6 || true)"
 INSTALL_DIR="${RSYNC_INSTALL_DIR:-${_home:-$PWD}/rsync-ai}"
-# The floor tracks what the install actually starts. 6 sized the 18 unprofiled
-# services this file has always started. The cdc profile adds three more
-# containers -- one of them a JVM -- whose mem_limit lines in
-# docker-compose.quickstart.yml come to 2816MB on top of that, so the default
-# set needs 8.
+# The floor tracks what the install actually starts, the same way the LLM floor
+# below does. 6 sized the 18 unprofiled services this file has always started.
+# The cdc profile adds three more containers -- one of them a JVM -- and their
+# mem_limit lines in docker-compose.quickstart.yml come to 2816MB on top of
+# that, so the default set needs 8.
 #
 # Two floors and not one because RSYNC_PROFILES= starts exactly the 18 services
 # 6 was sizing. Warning that operator about a JVM they excluded would be the
-# same defect this change fixes: a message about a container that was never
-# started.
+# same defect this profile change fixes: a message about a container that was
+# never started.
 MIN_RAM_GB_BATCH=6
 MIN_RAM_GB_CDC=8
 MIN_RAM_GB=$MIN_RAM_GB_BATCH
@@ -143,12 +164,11 @@ MIN_RAM_GB=$MIN_RAM_GB_BATCH
 case " ${RSYNC_PROFILES//,/ } " in
   *" cdc "*) MIN_RAM_GB=$MIN_RAM_GB_CDC ;;
 esac
-# What the bundled LLM needs, and not a third opinion on the two floors above: a
-# 7B model at 4-bit is ~5GB resident ON TOP of them, and it stays resident for
-# as long as the container runs. Checked separately, in build_compose_args,
-# because nothing knows whether the LLM is bundled until the .env exists.
+# What the bundled LLM needs, and not a second opinion on the line above: a 7B
+# model at 4-bit is ~5GB resident ON TOP of the stack MIN_RAM_GB sizes, and it
+# stays resident for as long as the container runs.
 MIN_RAM_GB_WITH_LLM=12
-# Written by check_ram so that later check can reuse the reading. 0 means "could
+# Written by check_ram so a later check can reuse the reading. 0 means "could
 # not read this platform", never "no RAM" -- see check_ram's three outcomes.
 DETECTED_RAM_GB=0
 
@@ -257,9 +277,6 @@ check_ram() {
   elif [[ "$OSTYPE" == "darwin"* ]]; then
     ram_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
   fi
-  # Stashed for build_compose_args, which re-checks this same reading against a
-  # higher floor once it knows whether an LLM is being bundled. Reading the
-  # machine twice would be harmless; disagreeing with itself would not.
   DETECTED_RAM_GB=$ram_gb
   # Three outcomes, not two. `ram_gb` stays at its 0 initialiser on any platform
   # neither branch above matches (a BSD, a busybox container, WSL reporting an
@@ -309,60 +326,103 @@ generate_secret() {
   printf '%s' "${raw:0:32}"
 }
 
-prompt_env() {
-  section "Configuration"
-  echo "  We need a few values to set up rsync.ai."
-  echo "  Press Enter to accept defaults where shown."
-  echo ""
+# The provider menu: OpenAI or any OpenAI-compatible endpoint, Ollama, or none.
+# $1 is LLM_PROVIDER lower-cased.
+prompt_llm_menu() {
+  local provider="$1" key_source
+  key_source="$(printf '%s' "${OPENAI_API_KEY_SOURCE:-}" | tr '[:upper:]' '[:lower:]')"
+  case "$key_source" in
+    ""|env|gcp-metadata) ;;
+    *)
+      # Not echoed: a key pasted into the wrong variable must not reach the screen.
+      warn "OPENAI_API_KEY_SOURCE holds a value this installer does not know; the one supported"
+      echo "  value is gcp-metadata. Using OPENAI_API_KEY as the key."
+      key_source=""
+      ;;
+  esac
+  [[ "$key_source" == "gcp-metadata" ]] || OPENAI_API_KEY_SOURCE=""
+  case "$provider" in
+    ""|openai|ollama|none|disabled|off|false|0) ;;
+    *)
+      # Not echoed, for the same reason.
+      warn "LLM_PROVIDER holds a name this installer does not know. The known ones are openai,"
+      echo "  groq, azure, ollama and none. For Vertex AI, OpenRouter or any other OpenAI-compatible"
+      echo "  endpoint use LLM_PROVIDER=openai with OPENAI_BASE_URL."
+      provider=""
+      ;;
+  esac
 
-  if (( ! TTY_OK )); then
-    warn "No terminal available — running non-interactively."
-    echo "  Values come from the environment; anything unset takes its default."
-    echo "  Recognised: OPENAI_API_KEY, OPENAI_BASE_URL, LLM_PROVIDER, LLM_MODEL,"
-    echo "              OLLAMA_URL, PUBLIC_HOST, ADMIN_EMAIL, RSYNC_VERSION"
-    echo ""
-  fi
-
-  # LLM provider: OpenAI (cloud) or Ollama (local, fully offline — no API key)
+  # LLM provider: OpenAI (cloud), Ollama (local, fully offline), or none yet.
+  # An LLM is optional. Pipelines parse their intent without one, the Data
+  # Explorer runs raw SQL without one, and existing connectors need none; the
+  # features that do need a model answer "Set up an LLM first" until one is set.
   echo "  LLM provider:"
   echo "    1) OpenAI  — cloud, needs an API key (best quality)"
   echo "    2) Ollama  — local, fully offline, no key (one is started for you, model included)"
+  echo "    3) None    — set up later; pipelines, raw SQL and existing connectors work without one"
   # Without a terminal, an OPENAI_API_KEY in the environment is a clear enough
-  # statement of intent to pick provider 1; with nothing set, the offline
-  # provider is the only one that can work unattended.
+  # statement of intent to pick provider 1. With nothing set, install without an
+  # LLM: bundling Ollama nobody asked for costs a multi-GB model download and
+  # several GB of resident RAM, and Ollama is only used when the operator names it.
+  # OPENAI_API_KEY_SOURCE=gcp-metadata is the same statement without a key.
   _llm_default=1
-  if [[ -z "${OPENAI_API_KEY:-}" && "${LLM_PROVIDER:-}" != "openai" ]] && (( ! TTY_OK )); then
-    _llm_default=2
+  if [[ -z "${OPENAI_API_KEY:-}" && "$provider" != "openai" && "$key_source" != "gcp-metadata" ]] \
+    && (( ! TTY_OK )); then
+    _llm_default=3
   fi
-  # Records that the OPERATOR asked for Ollama, as opposed to the branch above
-  # defaulting to it because nothing else could work. Only the second case needs
-  # to be announced. `|| true` because a failing [[ ]] is the last command in this
+  # Records that the OPERATOR chose, as opposed to the branch above defaulting
+  # because nothing else could work unattended. Only the second case needs to be
+  # announced. `|| true` because a failing [[ ]] is the last command in this
   # sequence and `set -e` would take the whole script down with it.
   LLM_PROVIDER_EXPLICIT=0
-  [[ "${LLM_PROVIDER:-}" == "ollama" ]] && { _llm_default=2; LLM_PROVIDER_EXPLICIT=1; } || true
+  [[ "$provider" == "ollama" ]] && { _llm_default=2; LLM_PROVIDER_EXPLICIT=1; } || true
+  # The same spellings llm-service reads as "no LLM" (openai_client._NO_LLM_CHOICES).
+  case "$provider" in
+    none|disabled|off|false|0) _llm_default=3; LLM_PROVIDER_EXPLICIT=1 ;;
+  esac
   ask _llm_choice "  Choose [${_llm_default}]: " "$_llm_default"
   # A terminal answer of "2" is also a deliberate choice, not a fallback.
   (( TTY_OK )) && [[ "${_llm_choice:-}" == "2" ]] && LLM_PROVIDER_EXPLICIT=1 || true
-  if [[ "${_llm_choice:-1}" == "2" ]]; then
+  if [[ "${_llm_choice:-1}" == "3" ]]; then
+    LLM_PROVIDER="none"
+    # Left empty so compose's own defaults apply once a provider is chosen.
+    LLM_MODEL=""
+    # Empty rather than a host address: if the operator later sets
+    # LLM_PROVIDER=ollama and re-runs this installer, an empty OLLAMA_URL is what
+    # makes build_compose_args bundle the Ollama overlay.
+    OLLAMA_URL=""
+    OPENAI_API_KEY=""
+    OPENAI_BASE_URL=""
+    clear_hosted_llm_settings
+    info "No LLM set up. Pipelines, raw SQL in the Data Explorer and existing connectors work without one."
+    echo "  Chat beyond pipeline commands, natural-language SQL, pipeline diagnosis and"
+    echo "  connector generation will say \"Set up an LLM first\" until you add one:"
+    echo "    in ${INSTALL_DIR}/${ENV_FILE} set LLM_PROVIDER=openai and OPENAI_API_KEY=sk-..."
+    echo "    (or LLM_PROVIDER=ollama for a local model), then re-run this installer."
+    if (( ! TTY_OK )) && [[ "${LLM_PROVIDER_EXPLICIT:-0}" != "1" ]]; then
+      warn "No terminal and no OPENAI_API_KEY, so rsync was installed without an LLM."
+      echo "  To install with one: OPENAI_API_KEY=sk-... bash, or LLM_PROVIDER=ollama bash"
+    fi
+  elif [[ "${_llm_choice:-1}" == "2" ]]; then
     LLM_PROVIDER="ollama"
     LLM_MODEL="${LLM_MODEL:-qwen2.5:7b}"
-    # The bundled service, not the host. Until docker-compose.ollama.yml grew a
-    # pull job this defaulted to host.docker.internal, which is the right answer
-    # only when the operator already runs an Ollama -- and nothing here started
-    # one, so the common case was a stack that came up green and answered every
-    # prompt with a connection error. An OLLAMA_URL already in the environment
-    # still wins, which is how you keep pointing at a host or a remote Ollama;
-    # build_compose_args reads this value back out of the .env and layers the
-    # overlay only when it names the bundle.
+    # The bundled service, not the host. Until docker-compose.ollama.yml existed
+    # this defaulted to host.docker.internal, which is the right answer only when
+    # the operator already runs an Ollama -- and nothing here started one, so the
+    # common case was a stack that came up green and met every prompt with a
+    # connection error. An OLLAMA_URL already in the environment still wins, which
+    # is how you keep pointing at a host or remote Ollama; build_compose_args
+    # reads this value back and layers the overlay only when it names the bundle.
     OLLAMA_URL="${OLLAMA_URL:-http://ollama:11434}"
     OPENAI_API_KEY=""
     # Ollama is addressed by OLLAMA_URL; carrying an OpenAI-compatible base URL
     # into an offline install would only be a live pointer at a cloud endpoint.
     OPENAI_BASE_URL=""
+    clear_hosted_llm_settings
     info "Using local Ollama at ${OLLAMA_URL} (model ${LLM_MODEL})."
     # Conditional, because it is only true of an Ollama this script does not
     # start. On the bundled path the overlay's ollama-pull job downloads the
-    # model before any service that would ask for one starts, so printing the
+    # model before any service that would ask for it starts, so printing the
     # manual step there tells the operator to do work that is already done.
     if [[ "$OLLAMA_URL" == *"//ollama:"* ]]; then
       info "An Ollama is bundled with the stack; its model is pulled on first start."
@@ -378,28 +438,36 @@ prompt_env() {
       warn "On Linux, also start Ollama on all interfaces or containers cannot reach it:"
       echo "    OLLAMA_HOST=0.0.0.0 ollama serve"
     fi
-    # An unattended run reaches this branch by DEFAULT whenever no OPENAI_API_KEY
-    # is set -- nobody chose Ollama, the script did. Name that, because otherwise
-    # the first symptom is a stack that comes up healthy and cannot answer a prompt.
-    if (( ! TTY_OK )) && [[ "${LLM_PROVIDER_EXPLICIT:-0}" != "1" ]]; then
-      warn "No terminal and no OPENAI_API_KEY, so Ollama was selected for you."
-      echo "  If you meant to use OpenAI, re-run with: OPENAI_API_KEY=sk-... bash"
-    fi
   else
     LLM_PROVIDER="openai"
-    LLM_MODEL="${LLM_MODEL:-gpt-4o}"
     OLLAMA_URL="${OLLAMA_URL:-http://host.docker.internal:11434}"
     # "openai" here names the wire protocol, not the vendor. Vertex AI, Azure,
     # Groq, OpenRouter, Together and vLLM all serve it, and OPENAI_BASE_URL is
     # what points at one of them. Carried through to the generated .env below;
     # empty means api.openai.com, which is the client's own default.
     OPENAI_BASE_URL="${OPENAI_BASE_URL:-}"
-    if [[ -z "${OPENAI_API_KEY:-}" ]]; then
+    if [[ "$key_source" == "gcp-metadata" ]]; then
+      # A Vertex AI access token lasts an hour, so one pasted into OPENAI_API_KEY
+      # stops working an hour after the stack starts. llm-service fetches the VM
+      # service account's token itself and renews it, and sends it only to
+      # googleapis.com; refuse here rather than install a stack that has no key.
+      OPENAI_API_KEY_SOURCE="gcp-metadata"
+      # No key is asked for, and write_env expands this under set -u.
+      OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+      if ! base_url_is_googleapis "$OPENAI_BASE_URL"; then
+        error "OPENAI_API_KEY_SOURCE=gcp-metadata sends this VM's Google service account token,"
+        echo "  so OPENAI_BASE_URL must be an https://*.googleapis.com endpoint. For Vertex AI:" >&2
+        echo "    OPENAI_BASE_URL=https://<location>-aiplatform.googleapis.com/v1/projects/<project>/locations/<location>/endpoints/openapi" >&2
+        exit 1
+      fi
+      info "Using this VM's service account token for ${OPENAI_BASE_URL}, renewed before it expires."
+    elif [[ -z "${OPENAI_API_KEY:-}" ]]; then
       if (( ! TTY_OK )); then
         error "OpenAI was selected but OPENAI_API_KEY is not set, and there is no"
         echo "  terminal to ask on. Either:" >&2
         echo "    curl -sSL <url> | OPENAI_API_KEY=sk-... bash" >&2
         echo "    curl -sSL <url> | LLM_PROVIDER=ollama bash   # fully offline, no key" >&2
+        echo "    curl -sSL <url> | LLM_PROVIDER=none bash     # no LLM; set one up later" >&2
         exit 1
       fi
       # Bounded. `ask` reads fd 3, and a read that hits EOF leaves the variable
@@ -433,6 +501,7 @@ prompt_env() {
           echo "    Pass one non-interactively, or install with no key at all:" >&2
           echo "      curl -sSL <url> | OPENAI_API_KEY=sk-... bash" >&2
           echo "      curl -sSL <url> | LLM_PROVIDER=ollama bash   # fully offline" >&2
+          echo "    Or re-run and choose 3 to install without an LLM for now." >&2
           exit 1
         fi
         if (( require_sk )); then
@@ -444,6 +513,139 @@ prompt_env() {
     else
       info "OPENAI_API_KEY already set in environment"
     fi
+    # gpt-4o is OpenAI's name for a model. Any other endpoint has its own catalog
+    # (Vertex AI google/gemini-2.5-flash, OpenRouter openai/gpt-4o), and asking it
+    # for gpt-4o installs a stack whose every LLM call fails. Only the operator
+    # knows the right name, so ask for it instead of defaulting.
+    if [[ -n "$OPENAI_BASE_URL" ]]; then
+      require_llm_value LLM_MODEL "  Model name as ${OPENAI_BASE_URL} lists it: " \
+        "LLM_PROVIDER=openai OPENAI_BASE_URL=${OPENAI_BASE_URL} LLM_MODEL=<model name> ..."
+    else
+      LLM_MODEL="${LLM_MODEL:-gpt-4o}"
+    fi
+  fi
+}
+
+# LLM_PROVIDER=groq or azure, named in the environment. The menu offers neither,
+# and these used to go through it: the choice was replaced with "openai" and the
+# install asked for an OpenAI key, or, with no terminal and no OPENAI_API_KEY, it
+# installed with no LLM at all. Either way the provider named was not the one set up.
+prompt_llm_named_provider() {
+  local provider="$1"
+  LLM_PROVIDER="$provider"
+  OPENAI_API_KEY_SOURCE=""
+  OLLAMA_URL="${OLLAMA_URL:-http://host.docker.internal:11434}"
+  # write_env expands both under set -u, and neither is asked for on this path.
+  OPENAI_API_KEY="${OPENAI_API_KEY:-}"
+  OPENAI_BASE_URL="${OPENAI_BASE_URL:-}"
+  # Left empty unless given: llm-service then uses the provider's own default
+  # (llama-3.3-70b-versatile on Groq, the deployment on Azure). gpt-4o, the
+  # OpenAI default, is a model neither serves under that name.
+  LLM_MODEL="${LLM_MODEL:-}"
+  if [[ "$provider" == "groq" ]]; then
+    require_llm_value GROQ_API_KEY "  Groq API key (gsk_...): " \
+      "LLM_PROVIDER=groq GROQ_API_KEY=gsk_..."
+    info "Using Groq (model ${LLM_MODEL:-llama-3.3-70b-versatile})."
+    return 0
+  fi
+  require_llm_value AZURE_OPENAI_ENDPOINT "  Azure OpenAI endpoint (https://<resource>.openai.azure.com): " \
+    "LLM_PROVIDER=azure AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com AZURE_OPENAI_API_KEY=..."
+  # llm-service falls back to OPENAI_API_KEY for the Azure key, so either one counts.
+  if [[ -z "${AZURE_OPENAI_API_KEY:-}" && -n "${OPENAI_API_KEY:-}" ]]; then
+    info "Using OPENAI_API_KEY as the Azure OpenAI key."
+  else
+    require_llm_value AZURE_OPENAI_API_KEY "  Azure OpenAI API key: " \
+      "LLM_PROVIDER=azure AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=..."
+  fi
+  # An Azure model is a deployment the operator created and named, so no default
+  # can be right. With neither this nor LLM_MODEL, llm-service asks Azure for a
+  # deployment called gpt-4o-mini.
+  if [[ -z "${AZURE_OPENAI_DEPLOYMENT:-}" && -z "$LLM_MODEL" ]]; then
+    require_llm_value AZURE_OPENAI_DEPLOYMENT "  Azure OpenAI deployment name: " \
+      "LLM_PROVIDER=azure AZURE_OPENAI_ENDPOINT=... AZURE_OPENAI_API_KEY=... AZURE_OPENAI_DEPLOYMENT=<deployment>"
+  fi
+  info "Using Azure OpenAI (deployment ${LLM_MODEL:-${AZURE_OPENAI_DEPLOYMENT:-}})."
+}
+
+# Sets the named variable from the environment or, with a terminal, by asking,
+# three tries at most (see the OpenAI key loop for why the bound matters). With
+# neither, the install stops and prints $3, the settings that supply the value.
+# Values are never echoed back: most of these are keys.
+require_llm_value() {
+  local var="$1" prompt="$2" example="$3" tries=0
+  if [[ -n "${!var:-}" ]]; then
+    info "${var} already set in environment"
+    return 0
+  fi
+  if (( ! TTY_OK )); then
+    error "LLM_PROVIDER=${LLM_PROVIDER} needs ${var}, which is not set, and there is no"
+    echo "  terminal to ask on. Either:" >&2
+    echo "    curl -sSL <url> | ${example} bash" >&2
+    echo "    curl -sSL <url> | LLM_PROVIDER=none bash     # no LLM; set one up later" >&2
+    exit 1
+  fi
+  while (( tries < 3 )); do
+    ask "$var" "$prompt"
+    if [[ -n "${!var:-}" ]]; then
+      return 0
+    fi
+    tries=$(( tries + 1 ))
+    error "  ${var} is required for LLM_PROVIDER=${LLM_PROVIDER}."
+  done
+  echo "    Pass it non-interactively, or install with no LLM for now:" >&2
+  echo "      curl -sSL <url> | ${example} bash" >&2
+  echo "      curl -sSL <url> | LLM_PROVIDER=none bash" >&2
+  exit 1
+}
+
+# Offline and no-LLM installs carry no hosted-provider settings into the .env,
+# for the same reason they carry no OPENAI_API_KEY. A loop, not one NAME="" line
+# each: gitleaks' generic-api-key rule reads the next line's name as the key.
+clear_hosted_llm_settings() {
+  local name
+  for name in OPENAI_API_KEY_SOURCE GROQ_API_KEY AZURE_OPENAI_ENDPOINT \
+    AZURE_OPENAI_API_KEY AZURE_OPENAI_API_VERSION AZURE_OPENAI_DEPLOYMENT; do
+    printf -v "$name" '%s' ""
+  done
+}
+
+# The host test llm-service applies (openai_client._base_url_is_google): https,
+# and a host that is googleapis.com or under it. Userinfo, port, path, query and
+# fragment are stripped first, so https://evil.example#.googleapis.com is refused.
+base_url_is_googleapis() {
+  local url host
+  url="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  [[ "$url" == https://* ]] || return 1
+  host="${url#https://}"
+  host="${host%%[/?#]*}"
+  host="${host##*@}"
+  host="${host%%:*}"
+  [[ "$host" == "googleapis.com" || "$host" == *.googleapis.com ]]
+}
+
+prompt_env() {
+  section "Configuration"
+  echo "  We need a few values to set up rsync.ai."
+  echo "  Press Enter to accept defaults where shown."
+  echo ""
+
+  if (( ! TTY_OK )); then
+    warn "No terminal available — running non-interactively."
+    echo "  Values come from the environment; anything unset takes its default."
+    echo "  Recognised: OPENAI_API_KEY, OPENAI_BASE_URL, OPENAI_API_KEY_SOURCE, LLM_PROVIDER,"
+    echo "              LLM_MODEL, OLLAMA_URL, GROQ_API_KEY, AZURE_OPENAI_ENDPOINT,"
+    echo "              AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION, AZURE_OPENAI_DEPLOYMENT,"
+    echo "              PUBLIC_HOST, RSYNC_VERSION"
+    echo ""
+  fi
+
+  # LLM_PROVIDER, lower-cased the way llm-service reads it.
+  local _llm_named
+  _llm_named="$(printf '%s' "${LLM_PROVIDER:-}" | tr '[:upper:]' '[:lower:]')"
+  if [[ "$_llm_named" == "groq" || "$_llm_named" == "azure" ]]; then
+    prompt_llm_named_provider "$_llm_named"
+  else
+    prompt_llm_menu "$_llm_named"
   fi
 
   # Domain / URL
@@ -506,8 +708,13 @@ prompt_env() {
     RSYNC_COOKIE_SECURE="false"
   fi
 
-  # Admin email
-  ask ADMIN_EMAIL "  Admin email for rsync.ai login: " "${ADMIN_EMAIL:-admin@rsync.ai}"
+  # No admin email question. This used to ask for one, default it to a fixed
+  # address, and write it to RSYNC_ADMIN_EMAILS -- a variable no service reads.
+  # The admin is whoever creates the FIRST account: the api-gateway signup handler
+  # grants role admin while the users table is empty (internal/handlers/auth.go),
+  # and the admin routes check that role (admin_middleware.go), never an email
+  # list. A question whose answer changes nothing is worse than no question: it
+  # hands the operator an address to log in with that no account exists for.
 
   # Auto-generate secrets
   POSTGRES_PASSWORD=$(generate_secret)
@@ -541,7 +748,10 @@ write_env() {
 # rsync.ai environment — generated by install.sh $(date '+%Y-%m-%d %H:%M:%S')
 # DO NOT commit this file to git.
 
-# ── Required ──────────────────────────────────────────────────────────────────
+# ── LLM key (optional) ────────────────────────────────────────────────────────
+# Empty is supported: pipelines, raw SQL and existing connectors need no model.
+# Features that do need one answer "Set up an LLM first" until LLM_PROVIDER below
+# names a provider that is set up.
 OPENAI_API_KEY=${OPENAI_API_KEY}
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -577,7 +787,8 @@ RSYNC_COOKIE_SECURE=${RSYNC_COOKIE_SECURE}
 RSYNC_BIND_ADDR=${RSYNC_BIND_ADDR}
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
-RSYNC_ADMIN_EMAILS=${ADMIN_EMAIL}
+# There is no admin setting. The first account created in the UI becomes the
+# admin, so create yours before anyone else can reach this stack.
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 LLM_PROVIDER=${LLM_PROVIDER}
@@ -588,6 +799,18 @@ OLLAMA_URL=${OLLAMA_URL}
 # "openai" for all of them — it names the wire protocol, not the vendor — and
 # LLM_MODEL must then be a name that endpoint's catalog actually has.
 OPENAI_BASE_URL=${OPENAI_BASE_URL}
+# gcp-metadata = send this VM's Google service account token instead of
+# OPENAI_API_KEY, renewed before its hour runs out. Only used when OPENAI_BASE_URL
+# is an https://*.googleapis.com endpoint (Vertex AI).
+OPENAI_API_KEY_SOURCE=${OPENAI_API_KEY_SOURCE:-}
+# LLM_PROVIDER=groq
+GROQ_API_KEY=${GROQ_API_KEY:-}
+# LLM_PROVIDER=azure. The key falls back to OPENAI_API_KEY, the deployment to
+# LLM_MODEL; an empty API version means 2024-10-21.
+AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
+AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
+AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION:-}
+AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
 
 # ── Object Storage (internal MinIO) ───────────────────────────────────────────
 MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
@@ -664,9 +887,10 @@ EOF
 # RSYNC_PROFILES holds the set this install activates; it defaults to `cdc`.
 #
 #   cdc       change-data-capture (Kafka Connect + Debezium + the sink worker).
-#             ON by default. Absent, a streaming pipeline does not degrade --
-#             the orchestrator's infra pre-flight requires all three services
-#             together and fails the run once they do not answer.
+#             ON by default. Absent, a streaming pipeline does not
+#             degrade -- the orchestrator's infra pre-flight requires all
+#             three services together and fails the run once they do not
+#             answer.
 #   generate  connector generation against live API docs. OFF by default, and it
 #             is the other case: the generator probes context7-mcp with a 3s
 #             timeout and carries on without it, so its absence costs a
@@ -680,9 +904,8 @@ EOF
 #
 #   curl -sSL .../install.sh | RSYNC_PROFILES=cdc,generate bash
 #
-# The resolved set is also written to the generated .env as COMPOSE_PROFILES, so
-# a compose command typed by hand in the install directory starts the same
-# services this script did.
+# Either way the resolved flags are written into the generated compose.sh, so
+# re-running compose by hand keeps whatever this install chose.
 
 # ── Bring-your-own Kafka (optional) ───────────────────────────────────────────
 # Unset, the stack runs the Kafka broker defined in this compose file, over
@@ -801,20 +1024,53 @@ download_compose() {
   info "compose files downloaded (quickstart + both bring-your-own overlays + bundled LLM)"
 }
 
+# The `-f` set is a computed thing, and until now it was computed only in here.
+# An operator who edited the .env and then ran a bare `docker compose up -d` in
+# the install dir got the quickstart file alone: no bring-your-own overlay, no
+# bundled Ollama, and no error either -- just a stack quietly missing whatever
+# the overlays were adding. Write the resolved command out so re-running with
+# the right set is one command, and re-running this installer regenerates it.
+write_compose_helper() {
+  local helper="${INSTALL_DIR}/compose.sh"
+  {
+    echo '#!/usr/bin/env bash'
+    echo '# Generated by install.sh -- do not edit; edit .env and re-run install.sh.'
+    echo '# Runs docker compose with the overlay set your .env selected:'
+    echo '#   ./compose.sh ps                ./compose.sh logs -f api-gateway'
+    echo '#   ./compose.sh up -d             ./compose.sh down'
+    echo 'set -euo pipefail'
+    # Relative --env-file below only resolves from here, and the operator is
+    # likely to invoke this from anywhere.
+    echo 'cd "$(dirname "$0")"'
+    # %q, not %s: INSTALL_DIR is operator-supplied through RSYNC_INSTALL_DIR, and
+    # a space in it would split one -f path into two arguments in the file we are
+    # writing -- a breakage that would surface later, in a shell that is not this
+    # one, as compose complaining about a path nobody typed.
+    printf 'exec docker compose'
+    printf ' %q' "${COMPOSE_ARGS[@]}"
+    printf ' --env-file %q "$@"\n' "$ENV_FILE"
+  } > "$helper"
+  chmod +x "$helper"
+  info "Wrote ${helper} — re-runs compose with this .env's overlay set."
+}
+
 # Which -f files this install actually runs with. Keyed off the .env on disk
 # rather than the sourced shell variables, so an unrelated POSTGRES_HOST already
 # exported in the operator's environment cannot silently disable the bundled
-# database. Each overlay parks its bundled service in a profile that is never
-# activated; the base file carries the matching `required: false` on every
-# depends_on, without which Compose refuses the whole project.
+# database. Each BRING-YOUR-OWN overlay parks its bundled service in a profile
+# that is never activated; the base file carries the matching `required: false`
+# on every depends_on, without which Compose refuses the whole project. The LLM
+# overlay is the other shape -- it parks nothing and adds two services -- so the
+# `required: false` reasoning above does not carry over to it, and must not: its
+# depends_on is a completion gate that has to be able to fail.
 build_compose_args() {
   COMPOSE_ARGS=( -f "${INSTALL_DIR}/${COMPOSE_FILE}" )
   # Unquoted on purpose -- this is the word split that turns "cdc,generate" into
   # two flags. An empty RSYNC_PROFILES yields zero iterations, which is the
-  # opt-out. Flags rather than an exported COMPOSE_PROFILES because an exported
-  # variable dies with this process, while these flags reach the operator: the
-  # status / logs / retry commands printed at the end of a run are built from
-  # COMPOSE_CMD, and COMPOSE_CMD is built from this array.
+  # opt-out. `--profile` rather than exporting COMPOSE_PROFILES because these
+  # flags are also what write_compose_helper bakes into compose.sh: an exported
+  # variable lives in this process and is gone by the time the operator runs the
+  # helper, and the helper is the whole point of writing it.
   local profile
   for profile in ${RSYNC_PROFILES//,/ }; do
     COMPOSE_ARGS+=( --profile "$profile" )
@@ -846,13 +1102,13 @@ build_compose_args() {
   fi
   # The bundled LLM. Two conditions, and the second is the load-bearing one:
   # LLM_PROVIDER=ollama says the LLM tier speaks Ollama, it does not say WHICH
-  # Ollama. Every .env written before this overlay grew a pull job carries
+  # Ollama. Every .env written before this overlay existed carries
   # OLLAMA_URL=http://host.docker.internal:11434 -- an Ollama on the operator's
   # own machine. Layering the overlay on one of those would start a second,
   # empty server that nothing talks to, download several GB into it, and leave
   # the operator's own Ollama serving exactly as before. So it goes on only when
   # the URL names the bundled service, or is blank -- which write_env never
-  # writes, but a hand-edited file can.
+  # writes but a hand-edited file can.
   if [[ "$llm" == "ollama" ]] && [[ -z "$ourl" || "$ourl" == *"//ollama:"* ]]; then
     COMPOSE_ARGS+=( -f "${INSTALL_DIR}/${OLLAMA_FILE}" )
     OLLAMA_BUNDLED=1
@@ -869,8 +1125,395 @@ build_compose_args() {
     fi
   elif [[ "$llm" == "ollama" ]]; then
     info "External Ollama configured (${ourl}) — no LLM container bundled."
+  elif [[ "$llm" == "none" ]]; then
+    info "No LLM configured — the stack runs without one; no LLM container bundled."
   fi
   COMPOSE_CMD="docker compose $(printf '%s ' "${COMPOSE_ARGS[@]}")"
+  write_compose_helper
+}
+
+# ─── Checks before anything starts ───────────────────────────────────────────
+#
+# Both run after build_compose_args, on every run, and before the first pull. A
+# re-run used to check nothing. An .env from an older release that lacked a
+# variable the new compose file requires got as far as `docker compose pull` and
+# died on compose's own interpolation error; a port some other program held got
+# as far as `up -d` and died on "address already in use" with part of the stack
+# already recreated. Both are cheaper to find while nothing has changed.
+
+# Secrets a check may GENERATE into an existing .env when the compose file
+# requires one the .env lacks. The test for membership: the value lives only in
+# the .env and in containers started from it, every reader takes the new value
+# when compose recreates them, and nothing persisted was written under the old
+# one.
+#   INTERNAL_SERVICE_SECRET  service-to-service header, compared per request
+#   JWT_SECRET               a startup guard only; sessions are opaque DB tokens
+#   REDIS_PASSWORD           written to redis.conf at every container start; the
+#                            data file carries no password
+#   MINIO_ACCESS_KEY/SECRET  MinIO's root login, read at start by the server and
+#                            by every client from this same .env
+# Deliberately NOT in the list, and reported instead:
+#   POSTGRES_PASSWORD  the database volume was created with the old one; a new
+#                      value locks every service out of the existing data (and
+#                      for bring-your-own Postgres it is someone else's password)
+#   ENCRYPTION_KEY     every saved connection credential is encrypted under the
+#                      old one; a new value makes all of them unreadable
+ENV_BACKFILLABLE_SECRETS="INTERNAL_SERVICE_SECRET JWT_SECRET REDIS_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY"
+
+# Every ${VAR:?} in the -f files this install runs with, one per line. The same
+# extraction as scripts/check-env-templates.sh required_vars(). A static grep is
+# the right reading, not an approximation: compose interpolates each whole file
+# before it applies profiles, so a `:?` inside a service no profile starts still
+# stops the render.
+compose_required_vars() {
+  local files=() i=0
+  while (( i < ${#COMPOSE_ARGS[@]} )); do
+    if [[ "${COMPOSE_ARGS[$i]}" == "-f" ]] && (( i + 1 < ${#COMPOSE_ARGS[@]} )); then
+      files+=( "${COMPOSE_ARGS[$((i + 1))]}" )
+    fi
+    i=$(( i + 1 ))
+  done
+  # Guarded: "${files[@]}" on an empty array is an unbound variable under
+  # `set -u` on bash 3.2, which is what a stock Mac runs this script with.
+  (( ${#files[@]} > 0 )) || return 0
+  { grep -ohE '\$\{[A-Z_][A-Z0-9_]*:\?' "${files[@]}" 2>/dev/null || true; } \
+    | sed 's/^\${//; s/:?$//' | sort -u
+}
+
+# Whether $1 is exported into this process with a non-empty value. compose reads
+# the process environment ahead of --env-file, so such a value satisfies `:?` for
+# this run. `declare -p` rather than env or printenv, so the value is compared
+# here and never printed.
+var_is_exported_nonempty() {
+  local decl="" flags=""
+  decl=$(declare -p "$1" 2>/dev/null) || return 1
+  flags=${decl#declare -}
+  flags=${flags%% *}
+  [[ "$flags" == *x* && -n "${!1:-}" ]]
+}
+
+# Report every variable the compose files require that the .env does not set.
+# Generates the ones ENV_BACKFILLABLE_SECRETS allows; stops, naming the rest.
+# Never replaces a value that is already there. An EMPTY line (`JWT_SECRET=`) is
+# treated as missing, because `:?` rejects empty exactly as it rejects unset.
+check_env_required() {
+  local envf="${INSTALL_DIR}/${ENV_FILE}" required="" v="" secret="" total=0
+  local fill="" blocked="" env_only=""
+  required=$(compose_required_vars)
+  for v in $required; do
+    total=$(( total + 1 ))
+    [[ -z "$(env_value "$v")" ]] || continue
+    if var_is_exported_nonempty "$v"; then
+      env_only="${env_only} ${v}"
+      continue
+    fi
+    case " ${ENV_BACKFILLABLE_SECRETS} " in
+      *" ${v} "*) fill="${fill} ${v}" ;;
+      *)          blocked="${blocked} ${v}" ;;
+    esac
+  done
+
+  if (( total == 0 )); then
+    warn "Found no required variables in the compose files, so the .env was not checked against them."
+    return 0
+  fi
+
+  # Stop BEFORE generating anything, so a run that is going to exit adds no
+  # secrets the operator did not see land; the re-run after the fix fills them.
+  if [[ -n "$blocked" ]]; then
+    error "${envf} is missing variables this version's compose file requires:"
+    for v in $blocked; do
+      case "$v" in
+        POSTGRES_PASSWORD)
+          echo "    ${v} — set it to the password your database was first created with." >&2
+          echo "      Do not invent a new one: the existing database would reject every service." >&2 ;;
+        ENCRYPTION_KEY)
+          echo "    ${v} — set it to the key this install has always used." >&2
+          echo "      A new key makes every saved connection credential unreadable." >&2 ;;
+        *)
+          echo "    ${v} — no safe default exists; docs/deployment/env-vars.md says what it holds." >&2 ;;
+      esac
+    done
+    echo "  Add each one to ${envf} as a NAME=value line, then re-run this installer." >&2
+    echo "  Nothing has been pulled or started, and this check wrote nothing to the .env." >&2
+    exit 1
+  fi
+
+  for v in $env_only; do
+    warn "${v} is set in this shell's environment but not in ${envf}."
+    echo "  This run uses it; ${INSTALL_DIR}/compose.sh run later from another shell will not."
+    echo "  Add it to ${envf} to make it permanent."
+  done
+
+  for v in $fill; do
+    # Into a variable first, for the reason the INTERNAL_SERVICE_SECRET backfill
+    # in main spells out: inside a command substitution, generate_secret's
+    # `exit 1` would leave an empty value behind instead of stopping the run.
+    secret=$(generate_secret)
+    set_env_value "$v" "$secret"
+    warn "Added a generated ${v} to ${envf}: this version requires it and the file had no value."
+  done
+
+  info "All ${total} variables the compose files require are set in ${envf}."
+}
+
+# The published host ports in a rendered compose model (`docker compose config`
+# on stdin), as tab-separated lines:
+#   project  <name>
+#   port     <service>  <host_ip>  <published>  <target>
+# Read from the RENDERED model rather than the raw YAML, so the ports are the
+# ones `up` will bind: overlays merged, ${RSYNC_BIND_ADDR} resolved from the
+# .env, services outside the active profiles gone. That model carries every
+# secret in the .env, so only these fields leave this function; it is never
+# printed or written to disk. The shape parsed here is compose v2's normalised
+# output -- two-space service keys, and each port as a `- mode:` item with
+# host_ip, target, published and protocol under it.
+compose_published_ports() {
+  # Each item is printed when it ENDS -- at the next item, the next key, the next
+  # service or the end of input -- so the fields can come in any order.
+  awk '
+    function flush() {
+      # host_ip is absent when a mapping names no address, which binds every
+      # interface. Written out as 0.0.0.0 rather than left empty: the reader
+      # splits on tabs, and bash `read` collapses an empty tab-separated field.
+      if (pub ~ /^[0-9]+$/) print "port\t" svc "\t" (hip == "" ? "0.0.0.0" : hip) "\t" pub "\t" (tgt == "" ? "?" : tgt)
+      hip = ""; tgt = ""; pub = ""
+    }
+    /^name:/ { n = $0; sub(/^name:[[:space:]]*/, "", n); gsub(/"/, "", n); print "project\t" n; next }
+    /^services:/ { insvc = 1; next }
+    /^[^[:space:]]/ { flush(); insvc = 0; inports = 0; next }
+    !insvc { next }
+    /^  [^[:space:]#][^:]*:[[:space:]]*$/ {
+      flush(); svc = $0; sub(/^  /, "", svc); sub(/:[[:space:]]*$/, "", svc); inports = 0; next
+    }
+    /^    [^[:space:]]/ { flush(); inports = ($0 ~ /^    ports:[[:space:]]*$/); next }
+    !inports { next }
+    /^      - / { flush() }
+    {
+      kv = $0; sub(/^[[:space:]]*(- )?/, "", kv)
+      k = kv; sub(/:.*/, "", k)
+      val = kv; sub(/^[^:]*:[[:space:]]*/, "", val); gsub(/"/, "", val)
+      if (k == "host_ip") hip = val
+      else if (k == "target") tgt = val
+      else if (k == "published") pub = val
+    }
+    END { flush() }
+  '
+}
+
+# Every running container: name, compose project, compose project dir, ports.
+running_containers() {
+  docker ps --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Label "com.docker.compose.project.working_dir"}}\t{{.Ports}}' 2>/dev/null || true
+}
+
+# The containers in $1 (running_containers output) that publish host TCP port
+# $2, as "name<TAB>project" lines. Docker's Ports column reads like
+# `127.0.0.1:5001->8080/tcp, [::]:5001->8080/tcp`, with a range as 8000-8010.
+containers_on_port() {
+  printf '%s\n' "$1" | awk -F'\t' -v p="$2" '
+    {
+      n = split($4, parts, ", ")
+      for (i = 1; i <= n; i++) {
+        e = parts[i]
+        if (e !~ /->/ || e !~ /\/tcp$/) continue
+        sub(/->.*/, "", e); sub(/.*:/, "", e)
+        lo = e; hi = e
+        if (e ~ /-/) { sub(/-.*/, "", lo); sub(/.*-/, "", hi) }
+        if (p + 0 >= lo + 0 && p + 0 <= hi + 0) { print $1 "\t" $2; break }
+      }
+    }'
+}
+
+# What is listening on TCP port $1. First line: the tool that answered. Then the
+# local address of each listener, one per line.
+#
+# ss (Linux) and netstat (macOS, and Linux with net-tools) come first because
+# they list every process's sockets without root. lsof comes after them because
+# without root it sees only this user's processes, so its silence proves little;
+# it is used when it DOES find something. A bash /dev/tcp connect is the last
+# resort, needs no tool at all, and sees only the address it dials ($2). No
+# branch can fail the script: a missing tool falls through to the next.
+port_listeners() {
+  local port=$1 dial=${2:-127.0.0.1} out=""
+  if command -v ss >/dev/null 2>&1 && out=$(ss -tln 2>/dev/null); then
+    echo "ss"
+    printf '%s\n' "$out" | awk -v p="$port" '
+      $1 == "LISTEN" && $4 ~ ("[.:]" p "$") { print substr($4, 1, length($4) - length(p) - 1) }'
+    return 0
+  fi
+  if command -v netstat >/dev/null 2>&1 && out=$(netstat -an 2>/dev/null); then
+    echo "netstat"
+    printf '%s\n' "$out" | awk -v p="$port" '
+      $1 ~ /^tcp/ && $NF ~ /^LISTEN/ && $4 ~ ("[.:]" p "$") { print substr($4, 1, length($4) - length(p) - 1) }'
+    return 0
+  fi
+  if command -v lsof >/dev/null 2>&1 && out=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null); then
+    echo "lsof"
+    printf '%s\n' "$out" | awk -v p="$port" '
+      NR > 1 { for (i = 1; i <= NF; i++) if ($i ~ ("[.:]" p "$")) print substr($i, 1, length($i) - length(p) - 1) }'
+    return 0
+  fi
+  echo "bash /dev/tcp"
+  # The redirect opens the connection and `:` closes it at once. A refused
+  # connect on a local address returns immediately.
+  if (: <>"/dev/tcp/${dial}/${port}") 2>/dev/null; then
+    echo "$dial"
+  fi
+  return 0
+}
+
+# Whether a listener on local address $1 stops Docker from binding $2 on the
+# same port. A wildcard on either side collides with everything; two specific
+# addresses collide only when they are the same one.
+addr_collides() {
+  local l=$1 b=$2
+  l=${l#[}; l=${l%]}; l=${l%%%*}
+  case "$l" in ""|"*"|0.0.0.0|::|::ffff:0.0.0.0) return 0 ;; esac
+  case "$b" in ""|0.0.0.0|::) return 0 ;; esac
+  [[ "$l" == "$b" || "$l" == "::ffff:${b}" ]]
+}
+
+# "command (pid N)" for the process listening on port $1, or nothing when this
+# user cannot see it -- lsof and ss -p both need root for another user's process.
+port_process_name() {
+  local port=$1 out=""
+  if command -v lsof >/dev/null 2>&1; then
+    out=$(lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>/dev/null | awk 'NR == 2 { print $1 " (pid " $2 ")" }' || true)
+  fi
+  if [[ -z "$out" ]] && command -v ss >/dev/null 2>&1; then
+    out=$(ss -tlnp 2>/dev/null | awk -v p="$port" '
+      $4 ~ ("[.:]" p "$") && match($0, /users:\(\("[^"]*",pid=[0-9]+/) {
+        s = substr($0, RSTART + 9, RLENGTH - 9); name = s; sub(/".*/, "", name)
+        pid = s; sub(/.*pid=/, "", pid); print name " (pid " pid ")"; exit
+      }' || true)
+  fi
+  printf '%s' "$out"
+}
+
+# Announces an install that is already running, then checks every host port the
+# compose model publishes. Ports held by this install's own containers are fine:
+# compose releases each one when it recreates the container that holds it. Any
+# other holder -- another container, or a process -- stops the run here, before
+# a pull, naming the port, the holder, and the ways out.
+check_ports_and_running_install() {
+  local envf="${INSTALL_DIR}/${ENV_FILE}" plan="" cfg_rc=0 containers="" ours="" count=0
+  plan=$(docker compose "${COMPOSE_ARGS[@]}" --env-file "$envf" config 2>/dev/null | compose_published_ports) || cfg_rc=$?
+  if (( cfg_rc != 0 )); then
+    # Not fatal on its own. The pull right after this renders the same model and
+    # fails with compose's full message; this check has nothing to add to that.
+    warn "Could not read the compose files' ports, so the port check was skipped. Compose said:"
+    # Cut at the first quote. Compose's complaint about a malformed .env line
+    # quotes that line, value and all (`unterminated quoted value "...`,
+    # `Invalid template: "${...`), and the .env holds every secret. What stays is
+    # the file, the line number and the kind of error, which is enough to find it.
+    { docker compose "${COMPOSE_ARGS[@]}" --env-file "$envf" config 2>&1 >/dev/null || true; } \
+      | head -3 | sed -e "s/[\"'].*\$/[rest hidden: it can quote a line of the .env]/" -e 's/^/    /'
+    return 0
+  fi
+  COMPOSE_PROJECT=$(printf '%s\n' "$plan" | awk -F'\t' '$1 == "project" { print $2; exit }')
+  API_HOST_PORT=$(printf '%s\n' "$plan" | awk -F'\t' '$1 == "port" && $2 == "api-gateway" { print $4; exit }')
+  containers=$(running_containers)
+
+  if [[ -n "$COMPOSE_PROJECT" ]]; then
+    ours=$(printf '%s\n' "$containers" | awk -F'\t' -v p="$COMPOSE_PROJECT" '$1 != "" && $2 == p' || true)
+  fi
+  if [[ -n "$ours" ]]; then
+    STACK_WAS_RUNNING=1
+    count=$(printf '%s\n' "$ours" | awk 'END { print NR }')
+    info "Found ${count} running containers from an existing rsync.ai install (compose project ${COMPOSE_PROJECT})."
+    echo "  This run upgrades them in place: containers whose image or settings changed are"
+    echo "  recreated, the rest keep running, and the data volumes are kept."
+    # Compose knows a project only by its name, and the dev compose file in the
+    # source tree uses the same one. Containers started from somewhere else are
+    # still "ours" to compose and will be taken over; say so, because the
+    # operator may not mean it.
+    local here="" here_phys="" elsewhere=""
+    here=$(cd "$INSTALL_DIR" 2>/dev/null && pwd) || here="$INSTALL_DIR"
+    here_phys=$(cd "$INSTALL_DIR" 2>/dev/null && pwd -P) || here_phys="$here"
+    elsewhere=$(printf '%s\n' "$ours" | awk -F'\t' -v a="$here" -v b="$here_phys" \
+      '$3 != "" && $3 != a && $3 != b { print $3 }' | sort -u || true)
+    if [[ -n "$elsewhere" ]]; then
+      warn "Some of them were started from a different directory:"
+      printf '%s\n' "$elsewhere" | sed 's/^/    /'
+      echo "  Compose treats every stack named ${COMPOSE_PROJECT} as one, so this run recreates"
+      echo "  those containers from ${INSTALL_DIR} with its .env. If that stack is not this"
+      echo "  install (for example the development stack of a source checkout, which uses the"
+      echo "  same name), stop it first (from its own directory: docker compose stop) and re-run."
+    fi
+  fi
+
+  local kind="" svc="" hip="" port="" tgt="" mine="" other="" seen="" tool="" addrs="" addr=""
+  local holder="" collides=0 checked=0 conflicts=""
+  while IFS=$'\t' read -r kind svc hip port tgt <&4; do
+    [[ "$kind" == "port" ]] || continue
+    checked=$(( checked + 1 ))
+    mine=$(containers_on_port "$containers" "$port" | awk -F'\t' -v p="$COMPOSE_PROJECT" 'p != "" && $2 == p { print $1; exit }')
+    if [[ -n "$mine" ]]; then
+      info "Port ${port} (${svc}) is held by this install's own ${mine}; it is handed over when that container is recreated."
+      continue
+    fi
+    other=$(containers_on_port "$containers" "$port" | awk -F'\t' '{ print; exit }')
+    holder=""
+    if [[ -n "$other" ]]; then
+      holder="Docker container ${other%%$'\t'*}"
+      [[ -z "${other#*$'\t'}" ]] || holder="${holder} (compose project ${other#*$'\t'})"
+    else
+      # Dial the bind address itself when it is a specific one; loopback stands
+      # in for "all interfaces", where any listener would collide anyway.
+      case "$hip" in ""|0.0.0.0|::) seen=$(port_listeners "$port" 127.0.0.1) ;;
+                     *)             seen=$(port_listeners "$port" "$hip") ;;
+      esac
+      tool=${seen%%$'\n'*}
+      addrs=""
+      [[ "$seen" != *$'\n'* ]] || addrs=${seen#*$'\n'}
+      collides=0
+      while IFS= read -r addr; do
+        if [[ -n "$addr" ]] && addr_collides "$addr" "$hip"; then collides=1; fi
+      done <<< "$addrs"
+      if (( collides )); then
+        holder=$(port_process_name "$port")
+        [[ -n "$holder" ]] || holder="a process this user cannot identify (seen by ${tool}; find it with: sudo lsof -nP -iTCP:${port} -sTCP:LISTEN)"
+      fi
+    fi
+    if [[ -n "$holder" ]]; then
+      conflicts="${conflicts}${port}"$'\t'"${svc}"$'\t'"${hip:-0.0.0.0}"$'\t'"${tgt}"$'\t'"${holder}"$'\n'
+    fi
+  done 4<<< "$plan"
+
+  if (( checked == 0 )); then
+    warn "The compose files publish no host ports, so there were none to check."
+    return 0
+  fi
+  if [[ -z "$conflicts" ]]; then
+    info "All ${checked} host ports rsync.ai publishes are free or already held by this install."
+    return 0
+  fi
+
+  local cname=""
+  while IFS=$'\t' read -r port svc hip tgt holder; do
+    [[ -n "$port" ]] || continue
+    error "Port ${port} is already in use, and rsync.ai's ${svc} needs it (${hip}:${port})."
+    echo "    Held by: ${holder}" >&2
+    if [[ "$holder" == "Docker container "* ]]; then
+      cname=${holder#Docker container }
+      cname=${cname%% *}
+      echo "    To free it: docker stop ${cname}" >&2
+    fi
+  done <<< "$conflicts"
+  echo "  To free a port: stop the container or process holding it, then re-run this installer." >&2
+  echo "  To use another port instead: in ${INSTALL_DIR}/${COMPOSE_FILE}, change the host side" >&2
+  echo "  (the number before the last colon) of that service's ports line, change the same port" >&2
+  echo "  in the URLs in ${envf}, and re-run. An upgrade downloads that file again, so" >&2
+  echo "  repeat the edit after one (the old copy is kept next to it as .previous)." >&2
+  if [[ "${RSYNC_SKIP_PORT_CHECK:-}" == "1" ]]; then
+    warn "Continuing anyway because RSYNC_SKIP_PORT_CHECK=1. Starting the stack will fail if the port really is taken."
+    return 0
+  fi
+  echo "  If you are sure the port is free, run the installer again the same way, with" >&2
+  echo "  RSYNC_SKIP_PORT_CHECK=1 on the bash side of the pipe:" >&2
+  echo "    curl -sSL ${RAW_BASE}/install.sh | RSYNC_SKIP_PORT_CHECK=1 bash" >&2
+  echo "  Nothing has been pulled or started." >&2
+  exit 1
 }
 
 pull_images() {
@@ -930,7 +1573,11 @@ probe_ready() {
   # No `-f`: it makes curl exit 22 on a 503 and DISCARD the body, and the body is
   # the diagnosis. A refused connection is still rc != 0; a 503 is rc 0 with a
   # code of 503, which is the distinction this function is built on.
-  out=$(curl -s --max-time 5 -w '\n%{http_code}' http://localhost:5001/ready 2>/dev/null) || return 1
+  #
+  # The port is the one the compose model publishes for api-gateway, not a
+  # literal, so an operator who moved it off a busy 5001 (the port check's own
+  # advice) is probed where the gateway actually listens.
+  out=$(curl -s --max-time 5 -w '\n%{http_code}' "http://localhost:${API_HOST_PORT:-5001}/ready" 2>/dev/null) || return 1
   code="${out##*$'\n'}"
   case "$code" in
     200) return 0 ;;
@@ -938,7 +1585,7 @@ probe_ready() {
       # An image predating /ready. Fall back to liveness so this installer still
       # works against an older pinned RSYNC_VERSION, and say that it did.
       READY_REASON="this image has no /ready endpoint; fell back to /health"
-      if ! curl -sf --max-time 5 http://localhost:5001/health >/dev/null 2>&1; then
+      if ! curl -sf --max-time 5 "http://localhost:${API_HOST_PORT:-5001}/health" >/dev/null 2>&1; then
         READY_REASON="no /ready in this image, and /health did not answer either"
         return 1
       fi
@@ -1044,7 +1691,14 @@ print_success() {
   echo -e "${GREEN}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
   echo ""
   echo -e "  ${BOLD}Open in browser:${NC}  ${NEXTAUTH_URL}"
-  echo -e "  ${BOLD}Admin email:${NC}      ${ADMIN_EMAIL}"
+  # Left out only when this install's containers were already running before
+  # this run: that is an upgrade of a live install, whose admin almost always
+  # exists. Every other success is, or may be, the first time this stack has
+  # served the UI -- including the re-run after a first run that stopped at the
+  # port check -- and there the hint is the whole point.
+  if (( ! STACK_WAS_RUNNING )); then
+    echo -e "  ${BOLD}Admin:${NC}            the first account you sign up with becomes the admin — if this install has none yet, create it now"
+  fi
   echo -e "  ${BOLD}Install dir:${NC}      ${INSTALL_DIR}"
   echo ""
   echo -e "  ${BOLD}Useful commands:${NC}"
@@ -1076,7 +1730,11 @@ print_success() {
 env_value() {
   local key="$1" file="${INSTALL_DIR}/${ENV_FILE}" line=""
   [[ -f "$file" ]] || return 0
-  line=$(grep -E "^[[:space:]]*${key}=" "$file" | tail -1 || true)
+  # `export KEY=value` is a line compose's env-file parser accepts and reads as
+  # KEY, so it is read here too. Missing it made a set value look absent, and the
+  # checks that act on "absent" then either appended a second, later line that
+  # overrode the operator's value, or refused to start over a key that was there.
+  line=$(grep -E "^[[:space:]]*(export[[:space:]]+)?${key}=" "$file" | tail -1 || true)
   line="${line#*=}"
   # Strip one matched pair of surrounding quotes, the way compose's own env-file
   # parser does. Anything else is passed through verbatim.
@@ -1100,8 +1758,12 @@ set_env_value() {
   chmod 600 "$tmp"
   # awk -v, not sed: a ref may contain a slash (release/1.0) and a value an
   # ampersand, both live in a sed replacement and both inert in an awk variable.
+  # An `export KEY=` line is the same key (see env_value) and keeps its prefix.
   awk -v k="$key" -v v="$value" '
-    $0 ~ "^[[:space:]]*" k "=" { if (!seen) { print k "=" v; seen = 1 } ; next }
+    $0 ~ "^[[:space:]]*(export[[:space:]]+)?" k "=" {
+      if (!seen) { p = ""; if (match($0, /^[[:space:]]*export[[:space:]]+/)) p = "export "; print p k "=" v; seen = 1 }
+      next
+    }
     { print }
     END { if (!seen) print k "=" v }
   ' "$file" > "$tmp"
@@ -1114,6 +1776,12 @@ main() {
   section "Pre-flight checks"
   check_docker
   check_ram
+  # Documented by earlier versions of this script as a recognised variable, so
+  # an automated install may still pass it. Say it does nothing rather than
+  # accept it silently.
+  if [[ -n "${ADMIN_EMAIL:-}" ]]; then
+    warn "ADMIN_EMAIL is set but no longer used: the first account created in the UI becomes the admin."
+  fi
 
   # If .env already exists in install dir, skip prompts
   if [[ -f "${INSTALL_DIR}/${ENV_FILE}" ]]; then
@@ -1122,13 +1790,12 @@ main() {
     # Read, never source. See env_value's comment for what sourcing this file does.
     NEXTAUTH_URL="$(env_value NEXTAUTH_URL)"
     NEXTAUTH_URL="${NEXTAUTH_URL:-http://localhost:3000}"
-    ADMIN_EMAIL="$(env_value RSYNC_ADMIN_EMAILS)"
-    ADMIN_EMAIL="${ADMIN_EMAIL:-admin@rsync.ai}"
     # wait_healthy's public-URL probe keys on this; it is written by write_env.
     RSYNC_BIND_ADDR="$(env_value RSYNC_BIND_ADDR)"
     # Backfill INTERNAL_SERVICE_SECRET into .env files created before it existed
-    # (its absence 503s internal OAuth-refresh). Append once; keep any existing value.
-    if ! grep -q '^INTERNAL_SERVICE_SECRET=' "${INSTALL_DIR}/${ENV_FILE}"; then
+    # (its absence 503s internal OAuth-refresh). Keep any existing value, however
+    # it is written (`export` included); fill an empty line where it stands.
+    if [[ -z "$(env_value INTERNAL_SERVICE_SECRET)" ]]; then
       # Into a variable FIRST. Written as `echo "K=$(generate_secret)" >> file`
       # the failure sits inside a command substitution, where `exit 1` exits only
       # the subshell: the redirect still succeeds, an EMPTY value is appended,
@@ -1136,7 +1803,7 @@ main() {
       # same failure aborts under `set -e`.
       local backfilled_secret
       backfilled_secret=$(generate_secret)
-      echo "INTERNAL_SERVICE_SECRET=${backfilled_secret}" >> "${INSTALL_DIR}/${ENV_FILE}"
+      set_env_value INTERNAL_SERVICE_SECRET "$backfilled_secret"
       warn "Backfilled a missing INTERNAL_SERVICE_SECRET into the existing .env."
     fi
 
@@ -1163,19 +1830,51 @@ main() {
     # re-run adopts the requested ref and records it for next time.
     local recorded_ref
     recorded_ref="$(env_value RSYNC_INSTALLED_REF)"
-    if [[ "$recorded_ref" != "$RSYNC_REF" ]]; then
-      if [[ -n "$recorded_ref" ]]; then
+    # Two questions, not one: has the ref CHANGED, and can the ref MOVE. The
+    # second was missing, and it is the only one a branch-tracking install can
+    # answer. A release tag is fixed, so recorded == requested genuinely means
+    # there is nothing to fetch. `main` is not fixed, and it moves under a name
+    # that never changes -- so this comparison, which is name-to-name, read
+    # "main" against "main", skipped the whole block, and left the `[[ -f ]]`
+    # repair below to keep the compose file the FIRST run downloaded, for the
+    # life of the install directory. Measured on the deploy host: a re-run 27
+    # hours after the first install re-read that first file and died pulling an
+    # image the branch had already moved off -- with the fix for that image
+    # sitting in main, fetched by nothing.
+    if [[ "$recorded_ref" != "$RSYNC_REF" ]] || ! ref_is_release_tag "$RSYNC_REF"; then
+      if [[ "$recorded_ref" == "$RSYNC_REF" ]]; then
+        info "Tracking ${RSYNC_REF}, which moves -- re-fetching compose files in case it has."
+      elif [[ -n "$recorded_ref" ]]; then
         info "Installed at ref ${recorded_ref}, ${RSYNC_REF} requested -- refreshing compose files and image tag."
       else
         info "This install predates ref tracking -- adopting ${RSYNC_REF} and refreshing compose files and image tag."
       fi
       # The compose file is the only artifact here an operator may have edited
       # by hand, and this is the one path that overwrites it. Keep the outgoing
-      # copy so the edit is recoverable rather than merely lost.
+      # copy so the edit is recoverable rather than merely lost -- but keep it
+      # only when the download actually changed something. This block now runs
+      # on EVERY re-run of a branch-tracking install, so rotating
+      # unconditionally would replace that backup with an identical copy on the
+      # first re-run that fetched nothing new, losing the one edit it exists to
+      # protect.
+      local outgoing="${INSTALL_DIR}/${COMPOSE_FILE}.outgoing"
+      # A crash between the copy and the compare leaves this behind, and a stale
+      # one would read as this run's snapshot of a compose file that is missing.
+      rm -f "$outgoing"
       if [[ -f "${INSTALL_DIR}/${COMPOSE_FILE}" ]]; then
-        cp "${INSTALL_DIR}/${COMPOSE_FILE}" "${INSTALL_DIR}/${COMPOSE_FILE}.previous"
+        cp "${INSTALL_DIR}/${COMPOSE_FILE}" "$outgoing"
       fi
       download_compose
+      if [[ -f "$outgoing" ]]; then
+        # $(<file) rather than cmp: this installer's dependencies are curl,
+        # docker and coreutils, and cmp ships in diffutils, which a minimal
+        # host need not have. Both sides lose trailing newlines identically.
+        if [[ "$(<"$outgoing")" == "$(<"${INSTALL_DIR}/${COMPOSE_FILE}")" ]]; then
+          rm -f "$outgoing"
+        else
+          mv "$outgoing" "${INSTALL_DIR}/${COMPOSE_FILE}.previous"
+        fi
+      fi
       # Both halves, together, or this fixes half the bug: the compose file
       # names ${RSYNC_VERSION} for every image it starts, and compose reads that
       # from the .env on disk -- never from this script's environment, which is
@@ -1209,22 +1908,19 @@ main() {
     fetch "${OLLAMA_RAW_BASE}/${OLLAMA_FILE}" "${INSTALL_DIR}/${OLLAMA_FILE}"
   fi
 
-  # Record the profile set in the .env, so a compose command typed by hand --
-  # without the --profile flags this script passes -- starts the same services
-  # the install did. Compose reads .env from the project directory, which for an
-  # absolute -f path is the directory holding the compose file, i.e. this one.
-  #
-  # Appended once and never rewritten, the way INTERNAL_SERVICE_SECRET above is,
-  # so an operator who edits the line keeps their edit. The consequence is worth
-  # stating rather than hiding: opting out on a RE-RUN (RSYNC_PROFILES=) leaves
-  # an earlier `cdc` in the .env, so this run's own compose commands drop the CDC
-  # services while a later bare `docker compose up -d` in that directory would
-  # still start them. Delete the line to reset it.
-  if ! grep -q '^COMPOSE_PROFILES=' "${INSTALL_DIR}/${ENV_FILE}"; then
-    echo "COMPOSE_PROFILES=${RSYNC_PROFILES}" >> "${INSTALL_DIR}/${ENV_FILE}"
-  fi
-
   build_compose_args
+
+  # Both before the first pull, so a run that stops here has pulled no image and
+  # recreated no container. It may already have changed files: an upgrade run has
+  # fetched the new compose file (the old one kept as .previous) and rewritten
+  # RSYNC_VERSION and RSYNC_INSTALLED_REF above, and check_env_required writes the
+  # secrets it can generate before the port check runs. check_env_required never
+  # writes when it stops. The .env check goes first because rendering the compose
+  # model -- which the port check reads -- itself fails on a missing required
+  # variable.
+  section "Checking settings and ports"
+  check_env_required
+  check_ports_and_running_install
 
   pull_images
   start_stack

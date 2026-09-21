@@ -1,0 +1,411 @@
+{
+  "events": [
+    {
+      "eventId": "1",
+      "eventTime": "2026-09-11T09:37:43.358718676Z",
+      "eventType": "WorkflowExecutionStarted",
+      "taskId": "33554432",
+      "workflowExecutionStartedEventAttributes": {
+        "workflowType": {
+          "name": "ModelFreshnessWorkflow"
+        },
+        "taskQueue": {
+          "name": "pipeline-workflows",
+          "kind": "Normal"
+        },
+        "input": {
+          "payloads": [
+            {
+              "metadata": {
+                "encoding": "anNvbi9wbGFpbg=="
+              },
+              "data": "e30="
+            }
+          ]
+        },
+        "workflowExecutionTimeout": "0s",
+        "workflowRunTimeout": "0s",
+        "workflowTaskTimeout": "10s",
+        "originalExecutionRunId": "5152fdd8-8687-498c-8c10-9fe8ad3b5bdb",
+        "identity": "1@80f886a00e05@",
+        "firstExecutionRunId": "5152fdd8-8687-498c-8c10-9fe8ad3b5bdb",
+        "attempt": 1,
+        "firstWorkflowTaskBackoff": "0s",
+        "header": {},
+        "workflowId": "model-freshness-sweep"
+      }
+    },
+    {
+      "eventId": "2",
+      "eventTime": "2026-09-11T09:37:43.359436676Z",
+      "eventType": "WorkflowTaskScheduled",
+      "taskId": "33554433",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "pipeline-workflows",
+          "kind": "Normal"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "3",
+      "eventTime": "2026-09-11T09:37:43.379832009Z",
+      "eventType": "WorkflowTaskStarted",
+      "taskId": "33554438",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "2",
+        "identity": "1@80f886a00e05@",
+        "requestId": "9345e046-2f38-41b1-9663-d57cb07b822a",
+        "historySizeBytes": "303"
+      }
+    },
+    {
+      "eventId": "4",
+      "eventTime": "2026-09-11T09:37:43.387307134Z",
+      "eventType": "WorkflowTaskCompleted",
+      "taskId": "33554442",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "2",
+        "startedEventId": "3",
+        "identity": "1@80f886a00e05@",
+        "workerVersion": {
+          "buildId": "a38cbe4dc28f27835d54f1f679a8f14d"
+        },
+        "sdkMetadata": {
+          "langUsedFlags": [
+            3
+          ],
+          "sdkName": "temporal-go",
+          "sdkVersion": "1.48.0"
+        },
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "5",
+      "eventTime": "2026-09-11T09:37:43.387367051Z",
+      "eventType": "TimerStarted",
+      "taskId": "33554443",
+      "timerStartedEventAttributes": {
+        "timerId": "5",
+        "startToFireTimeout": "60s",
+        "workflowTaskCompletedEventId": "4"
+      }
+    },
+    {
+      "eventId": "6",
+      "eventTime": "2026-09-11T09:38:43.389116592Z",
+      "eventType": "TimerFired",
+      "taskId": "33554447",
+      "timerFiredEventAttributes": {
+        "timerId": "5",
+        "startedEventId": "5"
+      }
+    },
+    {
+      "eventId": "7",
+      "eventTime": "2026-09-11T09:38:43.389128176Z",
+      "eventType": "WorkflowTaskScheduled",
+      "taskId": "33554448",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "80f886a00e05:1e36ce76-fdc0-4677-ad42-822fabb989ae",
+          "kind": "Sticky",
+          "normalName": "pipeline-workflows"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "8",
+      "eventTime": "2026-09-11T09:38:43.393301092Z",
+      "eventType": "WorkflowTaskStarted",
+      "taskId": "33554452",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "7",
+        "identity": "1@80f886a00e05@",
+        "requestId": "0380a9ec-9072-4833-b93e-4286b717a414",
+        "historySizeBytes": "680"
+      }
+    },
+    {
+      "eventId": "9",
+      "eventTime": "2026-09-11T09:38:43.397769426Z",
+      "eventType": "WorkflowTaskCompleted",
+      "taskId": "33554456",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "7",
+        "startedEventId": "8",
+        "identity": "1@80f886a00e05@",
+        "workerVersion": {
+          "buildId": "a38cbe4dc28f27835d54f1f679a8f14d"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "10",
+      "eventTime": "2026-09-11T09:38:43.397806176Z",
+      "eventType": "ActivityTaskScheduled",
+      "taskId": "33554457",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "10",
+        "activityType": {
+          "name": "SweepModelFreshnessActivity"
+        },
+        "taskQueue": {
+          "name": "pipeline-workflows",
+          "kind": "Normal"
+        },
+        "header": {},
+        "scheduleToCloseTimeout": "0s",
+        "scheduleToStartTimeout": "0s",
+        "startToCloseTimeout": "60s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "9",
+        "retryPolicy": {
+          "initialInterval": "5s",
+          "backoffCoefficient": 2,
+          "maximumInterval": "30s",
+          "maximumAttempts": 3
+        },
+        "useCompatibleVersion": true
+      }
+    },
+    {
+      "eventId": "11",
+      "eventTime": "2026-09-11T09:38:58.431311294Z",
+      "eventType": "ActivityTaskStarted",
+      "taskId": "33554468",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "10",
+        "identity": "1@80f886a00e05@",
+        "requestId": "6e297e83-3cf6-4fb2-80a1-c6f9983499d9",
+        "attempt": 3,
+        "lastFailure": {
+          "message": "INTERNAL_SERVICE_SECRET is not configured; the freshness sweep cannot authenticate",
+          "source": "GoSDK",
+          "applicationFailureInfo": {}
+        }
+      }
+    },
+    {
+      "eventId": "12",
+      "eventTime": "2026-09-11T09:38:58.442503627Z",
+      "eventType": "ActivityTaskFailed",
+      "taskId": "33554469",
+      "activityTaskFailedEventAttributes": {
+        "failure": {
+          "message": "INTERNAL_SERVICE_SECRET is not configured; the freshness sweep cannot authenticate",
+          "source": "GoSDK",
+          "applicationFailureInfo": {}
+        },
+        "scheduledEventId": "10",
+        "startedEventId": "11",
+        "identity": "1@80f886a00e05@",
+        "retryState": "MaximumAttemptsReached"
+      }
+    },
+    {
+      "eventId": "13",
+      "eventTime": "2026-09-11T09:38:58.442519335Z",
+      "eventType": "WorkflowTaskScheduled",
+      "taskId": "33554470",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "80f886a00e05:1e36ce76-fdc0-4677-ad42-822fabb989ae",
+          "kind": "Sticky",
+          "normalName": "pipeline-workflows"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "14",
+      "eventTime": "2026-09-11T09:38:58.447836044Z",
+      "eventType": "WorkflowTaskStarted",
+      "taskId": "33554474",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "13",
+        "identity": "1@80f886a00e05@",
+        "requestId": "3aa90d69-1ed1-484d-bebe-03037e45281f",
+        "historySizeBytes": "1417"
+      }
+    },
+    {
+      "eventId": "15",
+      "eventTime": "2026-09-11T09:38:58.452562377Z",
+      "eventType": "WorkflowTaskCompleted",
+      "taskId": "33554478",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "13",
+        "startedEventId": "14",
+        "identity": "1@80f886a00e05@",
+        "workerVersion": {
+          "buildId": "a38cbe4dc28f27835d54f1f679a8f14d"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "16",
+      "eventTime": "2026-09-11T09:38:58.452620585Z",
+      "eventType": "TimerStarted",
+      "taskId": "33554479",
+      "timerStartedEventAttributes": {
+        "timerId": "16",
+        "startToFireTimeout": "60s",
+        "workflowTaskCompletedEventId": "15"
+      }
+    },
+    {
+      "eventId": "17",
+      "eventTime": "2026-09-11T09:39:58.454673919Z",
+      "eventType": "TimerFired",
+      "taskId": "33554482",
+      "timerFiredEventAttributes": {
+        "timerId": "16",
+        "startedEventId": "16"
+      }
+    },
+    {
+      "eventId": "18",
+      "eventTime": "2026-09-11T09:39:58.454731252Z",
+      "eventType": "WorkflowTaskScheduled",
+      "taskId": "33554483",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "80f886a00e05:1e36ce76-fdc0-4677-ad42-822fabb989ae",
+          "kind": "Sticky",
+          "normalName": "pipeline-workflows"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "19",
+      "eventTime": "2026-09-11T09:39:58.464530460Z",
+      "eventType": "WorkflowTaskStarted",
+      "taskId": "33554487",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "18",
+        "identity": "1@80f886a00e05@",
+        "requestId": "635e2d5c-9245-4e70-a1c5-1304b2767e16",
+        "historySizeBytes": "1772"
+      }
+    },
+    {
+      "eventId": "20",
+      "eventTime": "2026-09-11T09:39:58.475359127Z",
+      "eventType": "WorkflowTaskCompleted",
+      "taskId": "33554491",
+      "workflowTaskCompletedEventAttributes": {
+        "scheduledEventId": "18",
+        "startedEventId": "19",
+        "identity": "1@80f886a00e05@",
+        "workerVersion": {
+          "buildId": "a38cbe4dc28f27835d54f1f679a8f14d"
+        },
+        "sdkMetadata": {},
+        "meteringMetadata": {}
+      }
+    },
+    {
+      "eventId": "21",
+      "eventTime": "2026-09-11T09:39:58.475461919Z",
+      "eventType": "ActivityTaskScheduled",
+      "taskId": "33554492",
+      "activityTaskScheduledEventAttributes": {
+        "activityId": "21",
+        "activityType": {
+          "name": "SweepModelFreshnessActivity"
+        },
+        "taskQueue": {
+          "name": "pipeline-workflows",
+          "kind": "Normal"
+        },
+        "header": {},
+        "scheduleToCloseTimeout": "0s",
+        "scheduleToStartTimeout": "0s",
+        "startToCloseTimeout": "60s",
+        "heartbeatTimeout": "0s",
+        "workflowTaskCompletedEventId": "20",
+        "retryPolicy": {
+          "initialInterval": "5s",
+          "backoffCoefficient": 2,
+          "maximumInterval": "30s",
+          "maximumAttempts": 3
+        },
+        "useCompatibleVersion": true
+      }
+    },
+    {
+      "eventId": "22",
+      "eventTime": "2026-09-11T09:40:13.509243467Z",
+      "eventType": "ActivityTaskStarted",
+      "taskId": "33554503",
+      "activityTaskStartedEventAttributes": {
+        "scheduledEventId": "21",
+        "identity": "1@80f886a00e05@",
+        "requestId": "44f6017e-a568-44ac-ba9d-74943f1e2737",
+        "attempt": 3,
+        "lastFailure": {
+          "message": "INTERNAL_SERVICE_SECRET is not configured; the freshness sweep cannot authenticate",
+          "source": "GoSDK",
+          "applicationFailureInfo": {}
+        }
+      }
+    },
+    {
+      "eventId": "23",
+      "eventTime": "2026-09-11T09:40:13.523958134Z",
+      "eventType": "ActivityTaskFailed",
+      "taskId": "33554504",
+      "activityTaskFailedEventAttributes": {
+        "failure": {
+          "message": "INTERNAL_SERVICE_SECRET is not configured; the freshness sweep cannot authenticate",
+          "source": "GoSDK",
+          "applicationFailureInfo": {}
+        },
+        "scheduledEventId": "21",
+        "startedEventId": "22",
+        "identity": "1@80f886a00e05@",
+        "retryState": "MaximumAttemptsReached"
+      }
+    },
+    {
+      "eventId": "24",
+      "eventTime": "2026-09-11T09:40:13.523977592Z",
+      "eventType": "WorkflowTaskScheduled",
+      "taskId": "33554505",
+      "workflowTaskScheduledEventAttributes": {
+        "taskQueue": {
+          "name": "80f886a00e05:1e36ce76-fdc0-4677-ad42-822fabb989ae",
+          "kind": "Sticky",
+          "normalName": "pipeline-workflows"
+        },
+        "startToCloseTimeout": "10s",
+        "attempt": 1
+      }
+    },
+    {
+      "eventId": "25",
+      "eventTime": "2026-09-11T09:40:13.529629926Z",
+      "eventType": "WorkflowTaskStarted",
+      "taskId": "33554509",
+      "workflowTaskStartedEventAttributes": {
+        "scheduledEventId": "24",
+        "identity": "1@80f886a00e05@",
+        "requestId": "350d0df9-1f82-41f2-83e6-d59ef6b9fae0",
+        "historySizeBytes": "2509"
+      }
+    }
+  ]
+}

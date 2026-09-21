@@ -10,10 +10,12 @@
  * The invariant these tests hold: **whether Pause renders is decided by the RAW
  * /state verdict (`liveStatus`), never by the /runtime-escalated one** — while the
  * recovery cluster keeps reacting to the escalated verdict. The two are independent,
- * so in the disagreement case BOTH render.
+ * so when a quiet stream reads idle BOTH render. The one exception is an escalation
+ * to failed: a Failed pipeline offers recovery, not Pause (its stop is the ⋯ menu's
+ * Stop Pipeline).
  *
  * Verified RED against the pre-fix code (`{isRunning ? <Pause/> : …}`): the
- * "quiet source" and "runtime failed" cases fail with Pause absent.
+ * "quiet source" case fails with Pause absent.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest"
@@ -105,17 +107,22 @@ describe("CDCPipelineActions — Pause availability (KI-CDC-PAUSE-UNREACHABLE-WH
     expect(screen.getByRole("button", { name: /^resume$/i })).toBeInTheDocument()
   })
 
-  it("still offers Pause when /runtime reports failed dependencies on a running stream", async () => {
-    // The same argument: a stream whose dependencies look unhealthy is exactly the
-    // one an operator most wants to be able to stop.
+  it("a stream /runtime calls FAILED drops Pause and keeps the recovery cluster", async () => {
+    // Prod retest (2026-09-18): the gcs dependency died during a redeploy, the badge
+    // read Failed, and the bar offered Pause · Resume · Restart CDC · Reload. Pause
+    // beside Resume on a Failed pipeline is a contradiction. The non-destructive stop
+    // for a stream /state still calls running moved to the ⋯ menu's Stop Pipeline
+    // (PipelineHeaderOverflowMenu), so Delete is still not the only way down.
     stateSays("running")
     runtimeSays("failed")
     renderActions("running")
 
     await waitFor(() => {
-      expect(screen.getByRole("button", { name: /pause/i })).toBeInTheDocument()
+      expect(screen.getByRole("button", { name: /restart cdc/i })).toBeInTheDocument()
     })
-    expect(screen.getByRole("button", { name: /restart cdc/i })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /^resume$/i })).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /reload/i })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: /pause/i })).not.toBeInTheDocument()
   })
 
   it("healthy running stream is UNCHANGED: Pause only, no recovery cluster", async () => {

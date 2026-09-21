@@ -68,7 +68,7 @@ export default function WorkspaceMembersPage() {
         description="Manage who has access to your workspace and invite teammates."
       />
       {loading ? (
-        <div className="flex items-center gap-2 text-sm text-zinc-500">
+        <div className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
           <Loader2 className="h-4 w-4 animate-spin" />
           Loading…
         </div>
@@ -89,7 +89,7 @@ export default function WorkspaceMembersPage() {
           isPersonal={workspace.is_personal}
         />
       ) : (
-        <p className="text-sm text-zinc-500">
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">
           No workspace selected. Use the workspace switcher in the header to pick one.
         </p>
       )}

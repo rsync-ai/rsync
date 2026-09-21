@@ -5,9 +5,12 @@ import { toast } from "sonner"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
+import { type UpstreamPolicy } from "@/components/explorer/runProvenance"
+import { describeCadence } from "@/components/explorer/scheduledModel"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   Dialog,
@@ -48,7 +51,29 @@ const MANAGE_ROLE_HINT =
 //     the workspace role, or the SQL stopped being a read), and the server re-checks
 //     the condition on resume rather than trusting the click.
 
-export type ModelScheduleType = "cron" | "interval" | "after_pipeline"
+export type ModelScheduleType = "cron" | "interval" | "after_upstream"
+
+/**
+ * One producer a model rebuilds after. Mirrors the gateway's scheduleUpstream exactly:
+ * the pair (kind, id) is the edge, and `name` is joined server-side for display and
+ * ignored on write.
+ *
+ * The two modules share no types, so these three keys are the wire contract. Renaming
+ * one here compiles clean and silently stops matching what the handler reads.
+ */
+export interface ScheduleUpstream {
+  kind: "pipeline" | "model"
+  id: string
+  name?: string
+}
+
+/**
+ * The gateway's maxScheduleUpstreams, restated. Duplicated rather than discovered
+ * because the refusal it produces arrives as a 400 halfway through a click the user
+ * already made; stated here, the picker stops offering a seventeenth box instead of
+ * accepting one and losing it.
+ */
+const MAX_SCHEDULE_UPSTREAMS = 16
 
 export interface ModelScheduleSpec {
   cron?: string
@@ -65,10 +90,18 @@ export interface ModelSchedule {
   run_as_user_id: string
   created_at: string
   updated_at: string
-  /** Set only for schedule_type "after_pipeline"; the upstream that wakes this model. */
-  trigger_pipeline_id?: string
-  /** Joined server-side, so this list never has to resolve an id to a name itself. */
-  trigger_pipeline_name?: string
+  /**
+   * Set only for schedule_type "after_upstream": every pipeline and model whose
+   * completion wakes this one. Whether one of them is enough is `upstream_policy`.
+   *
+   * Names are joined server-side, so nothing here has to resolve an id to a name.
+   */
+  upstreams?: ScheduleUpstream[]
+  /**
+   * "any" (the default) rebuilds on each landing; "all" rebuilds only once every
+   * upstream has completed since the last successful rebuild.
+   */
+  upstream_policy?: UpstreamPolicy
   paused_at?: string
   paused_reason?: string
   // Auto-pause is kept in its own pair of columns server-side so a Resume click can
@@ -119,12 +152,12 @@ interface SavedQueryModelDialogProps {
 }
 
 /**
- * "after_pipeline" sits in the same control as the cadences because to the person
+ * "after_upstream" sits in the same control as the cadences because to the person
  * filling this in it answers the same question — when does this rebuild? — but it is
  * not a cadence: it has no clock, no timezone and no next run, so every branch below
  * that reads one of those has to exclude it.
  */
-type Cadence = "hour" | "day" | "week" | "interval" | "custom" | "after_pipeline"
+type Cadence = "hour" | "day" | "week" | "interval" | "custom" | "after_upstream"
 
 /**
  * What a run of this query does. These are not three preferences over one behaviour;
@@ -203,21 +236,6 @@ function parseCron(cron: string): { cadence: Cadence; hour: string; minute: stri
   return null
 }
 
-function describeSchedule(s: ModelSchedule): string {
-  if (s.schedule_type === "after_pipeline") {
-    // The name is joined server-side. Falling back to the id keeps the sentence true
-    // when the pipeline was deleted out from under the trigger.
-    return `After ${s.trigger_pipeline_name || s.trigger_pipeline_id || "a pipeline"} runs`
-  }
-  if (s.schedule_type === "interval") {
-    const seconds = s.schedule_spec.every_seconds || 0
-    if (seconds % 3600 === 0) return `Every ${seconds / 3600} hour${seconds === 3600 ? "" : "s"}`
-    if (seconds % 60 === 0) return `Every ${seconds / 60} minute${seconds === 60 ? "" : "s"}`
-    return `Every ${seconds} seconds`
-  }
-  return `${s.schedule_spec.cron} (${s.schedule_spec.timezone || "UTC"})`
-}
-
 const WEEKDAYS = [
   { value: "0", label: "Sunday" },
   { value: "1", label: "Monday" },
@@ -228,11 +246,13 @@ const WEEKDAYS = [
   { value: "6", label: "Saturday" },
 ]
 
-/** The two fields of a pipeline this dialog needs: what to store, and what to show. */
 /** One inferred producer of a table this query reads. Mirrors the Go handler's JSON. */
 interface UpstreamCandidate {
-  pipeline_id: string
-  pipeline_name: string
+  /** Kind and id are exactly what a schedule's upstream list takes. */
+  kind: "pipeline" | "model"
+  id: string
+  name: string
+  /** The table that matched: what a pipeline writes, or what a model builds. */
   table: string
   matched_reference: string
   /** False when the match was on table name alone, because the SQL named no schema. */
@@ -243,107 +263,169 @@ interface UpstreamSuggestion {
   references: string[]
   unresolved: string[]
   candidates: UpstreamCandidate[]
-  /** Some table has more than one producer, so there is no single right answer. */
+  /**
+   * Some table name could be more than one different table, because the SQL named no
+   * schema. Two producers of the SAME table is not this: both are offered, and a
+   * schedule can follow both.
+   */
   ambiguous: boolean
 }
 
 /**
- * Offers the pipelines that produce this query's inputs, and never picks one.
+ * Offers the pipelines and models that produce this query's inputs, and never picks one.
  *
- * The inference reads the query's SQL and asks which pipeline last wrote those tables.
- * It is right often enough to save the user a hunt through a list, and wrong often
- * enough that it must not act on its own: a table can have two producers, a name can
- * be matched without a schema, and the SQL can be edited five minutes from now. So
- * every candidate is a button the user presses, the reason for each is shown next to
- * it, and an ambiguous answer says so instead of quietly offering the first row.
+ * The inference reads the query's SQL and asks which pipeline last wrote those tables
+ * and which model is declared to build them. It is right often enough to save the user
+ * a hunt through a list, and wrong often enough that it must not act on its own: a name
+ * can be matched without a schema, a table can have more than one producer, and the SQL
+ * can be edited five minutes from now. So every candidate is a button the user presses,
+ * the reason for each is shown next to it, and an ambiguous answer says so instead of
+ * quietly offering the first row.
  */
 function UpstreamHint({
-  upstreams,
-  pipelineOptions,
-  selectedId,
+  suggestion,
+  options,
+  selectedKeys,
   onPick,
   disabled,
 }: {
-  upstreams: UpstreamSuggestion | null
-  pipelineOptions: TriggerPipeline[]
-  selectedId: string
-  onPick: (id: string) => void
+  suggestion: UpstreamSuggestion | null
+  options: UpstreamOption[]
+  selectedKeys: Set<string>
+  onPick: (o: UpstreamOption) => void
   disabled: boolean
 }): ReactNode {
-  if (!upstreams) return null
+  if (!suggestion) return null
 
-  // Only offer pipelines the picker itself can hold. A candidate missing from the list
-  // (deleted, or filtered by the pipelines endpoint) would set an id the Select cannot
-  // display, leaving the user looking at a placeholder after a successful click.
-  const offerable = upstreams.candidates.filter((c) =>
-    pipelineOptions.some((p) => p.id === c.pipeline_id)
+  // Only offer producers the picker itself lists. A candidate missing from it (deleted,
+  // filtered by its list endpoint, or a model the picker does not offer) would add an
+  // upstream with no box beside it, so the user could not take back what the click did.
+  // The kind has to match as well as the id: the two lists are separate id spaces.
+  const offerable = suggestion.candidates.filter((c) =>
+    options.some((o) => o.kind === c.kind && o.id === c.id)
   )
   if (offerable.length === 0) return null
 
-  // One button per pipeline, not per matched table: two inputs from the same pipeline
+  // One button per producer, not per matched table: two inputs from the same pipeline
   // is one choice, and listing it twice would imply otherwise.
-  const byPipeline = new Map<string, { name: string; tables: string[]; qualified: boolean }>()
+  const byProducer = new Map<
+    string,
+    { kind: UpstreamCandidate["kind"]; id: string; name: string; tables: string[]; qualified: boolean }
+  >()
   for (const c of offerable) {
-    const seen = byPipeline.get(c.pipeline_id)
+    const key = upstreamKey(c)
+    const seen = byProducer.get(key)
     if (seen) {
       if (!seen.tables.includes(c.table)) seen.tables.push(c.table)
       seen.qualified = seen.qualified && c.qualified
     } else {
-      byPipeline.set(c.pipeline_id, {
-        name: c.pipeline_name || c.pipeline_id,
+      byProducer.set(key, {
+        kind: c.kind,
+        id: c.id,
+        name: c.name || c.id,
         tables: [c.table],
         qualified: c.qualified,
       })
     }
   }
+  const producers = Array.from(byProducer.entries())
+  const kinds = new Set(producers.map(([, p]) => p.kind))
+
+  let heading: string
+  if (producers.length === 1) {
+    heading =
+      producers[0][1].kind === "model"
+        ? "This query reads a table another model builds:"
+        : "This query reads a table one of your pipelines produces:"
+  } else if (kinds.size > 1) {
+    heading = "This query reads tables these pipelines and models produce:"
+  } else if (kinds.has("model")) {
+    heading = "This query reads tables these models build:"
+  } else {
+    heading = "This query reads tables these pipelines produce:"
+  }
 
   return (
     <div className="rounded-md border border-zinc-200 bg-zinc-50 p-2.5 dark:border-zinc-800 dark:bg-zinc-900/50">
-      <p className="text-xs text-zinc-600 dark:text-zinc-400">
-        {byPipeline.size === 1
-          ? "This query reads a table one of your pipelines produces:"
-          : "This query reads tables these pipelines produce:"}
-      </p>
+      <p className="text-xs text-zinc-600 dark:text-zinc-400">{heading}</p>
       <ul className="mt-1.5 space-y-1.5">
-        {Array.from(byPipeline.entries()).map(([id, info]) => (
-          <li key={id} className="flex flex-wrap items-center gap-2">
+        {producers.map(([key, info]) => {
+          const following = selectedKeys.has(key)
+          return (
+          <li key={key} className="flex flex-wrap items-center gap-2">
+            {/* Adds, never removes: the checkbox above is where a set is taken apart,
+                and a shortcut that also un-picks would be two meanings on one control. */}
             <Button
               type="button"
               size="sm"
-              variant={selectedId === id ? "secondary" : "outline"}
+              variant={following ? "secondary" : "outline"}
               className="h-7 text-xs"
-              disabled={disabled || selectedId === id}
-              onClick={() => onPick(id)}
+              disabled={disabled || following}
+              onClick={() => onPick({ kind: info.kind, id: info.id, name: info.name })}
             >
-              {selectedId === id ? `Following ${info.name}` : `Follow ${info.name}`}
+              {following ? `Following ${info.name}` : `Follow ${info.name}`}
             </Button>
-            <span className="text-xs text-zinc-500">
-              writes {info.tables.join(", ")}
+            <span className="text-xs text-zinc-500 dark:text-zinc-400">
+              {info.kind === "model" ? "builds" : "writes"} {info.tables.join(", ")}
               {!info.qualified && " (matched on table name only — no schema in the SQL)"}
             </span>
           </li>
-        ))}
+          )
+        })}
       </ul>
-      {upstreams.ambiguous && (
+      {suggestion.ambiguous && (
         <p className="mt-2 text-xs text-amber-600 dark:text-amber-400">
-          More than one pipeline writes the same table, so which one this should follow is
-          your call — nothing is selected for you.
+          A table name in this query matches more than one table, because the SQL names no
+          schema. Which one it reads is your call — nothing is selected for you.
         </p>
       )}
-      {upstreams.unresolved.length > 0 && (
-        <p className="mt-2 text-xs text-zinc-500">
-          No producer found for {upstreams.unresolved.join(", ")}. If this query depends on
-          that table being fresh, pick the pipeline that loads it instead.
+      {suggestion.unresolved.length > 0 && (
+        <p className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
+          No producer found for {suggestion.unresolved.join(", ")}. If this query depends on
+          that table being fresh, pick the pipeline or model that produces it instead.
         </p>
       )}
     </div>
   )
 }
 
-interface TriggerPipeline {
+/** One thing a model can be told to rebuild after: a pipeline, or another model. */
+interface UpstreamOption {
+  kind: "pipeline" | "model"
   id: string
   name: string
 }
+
+/**
+ * Identity of one upstream. The kind is part of it rather than decoration: pipelines
+ * and models are separate tables with independent id spaces, so a set keyed on the id
+ * alone would let a selection in one list cancel one in the other.
+ */
+function upstreamKey(u: { kind: string; id: string }): string {
+  return `${u.kind}:${u.id}`
+}
+
+/**
+ * The picker's two groups, in the order they are offered. Pipelines first: they are the
+ * common case, the thing most models read from.
+ */
+const UPSTREAM_GROUPS: { kind: "pipeline" | "model"; label: string }[] = [
+  { kind: "pipeline", label: "Pipelines" },
+  { kind: "model", label: "Models" },
+]
+
+const UPSTREAM_POLICY_CHOICES: { value: UpstreamPolicy; label: string; hint: string }[] = [
+  {
+    value: "any",
+    label: "Any of them finishes",
+    hint: "Fresh as soon as one lands. The rest may still be behind.",
+  },
+  {
+    value: "all",
+    label: "All of them have finished",
+    hint: "Waits for every one to land again, so it never joins new data with stale.",
+  },
+]
 
 function browserTimezone(): string {
   try {
@@ -425,16 +507,23 @@ export function SavedQueryModelDialog({
   const [everySeconds, setEverySeconds] = useState("3600")
   const [cronExpr, setCronExpr] = useState("0 2 * * *")
   const [timezone, setTimezone] = useState(browserTimezone)
-  const [triggerPipelineId, setTriggerPipelineId] = useState("")
-  const [pipelines, setPipelines] = useState<TriggerPipeline[]>([])
+  // The complete set this model waits on. Held as the wire objects rather than as a set
+  // of keys because an upstream whose producer has since left its list still has to be
+  // sent back on the next Update — dropping it would silently retire a live trigger.
+  const [selectedUpstreams, setSelectedUpstreams] = useState<ScheduleUpstream[]>([])
+  const [upstreamPolicy, setUpstreamPolicy] = useState<UpstreamPolicy>("any")
+  const [pipelines, setPipelines] = useState<UpstreamOption[]>([])
+  const [models, setModels] = useState<UpstreamOption[]>([])
   // Separate from `pipelines.length === 0`, which cannot tell "this workspace has no
   // pipelines" from "the list never arrived". The first is a fair thing to say in the
-  // picker; the second would be a lie.
+  // picker; the second would be a lie. One flag per source, because a picker that
+  // listed every model and silently dropped the pipelines would look complete.
   const [pipelinesError, setPipelinesError] = useState(false)
-  const [loadingPipelines, setLoadingPipelines] = useState(false)
+  const [modelsError, setModelsError] = useState(false)
+  const [loadingProducers, setLoadingProducers] = useState(false)
   // Which pipelines produce the tables this query reads, inferred from its SQL. A hint
   // beside the picker, never a value: see the effect below and `UpstreamHint`.
-  const [upstreams, setUpstreams] = useState<UpstreamSuggestion | null>(null)
+  const [suggestion, setSuggestion] = useState<UpstreamSuggestion | null>(null)
 
   const hours = useMemo(() => Array.from({ length: 24 }, (_, i) => pad2(i)), [])
   const minutes = useMemo(() => Array.from({ length: 60 }, (_, i) => pad2(i)), [])
@@ -479,9 +568,17 @@ export function SavedQueryModelDialog({
 
       // Seed the editor from the live schedule so "Update" starts from what is
       // actually running, not from the defaults.
-      if (data.schedule_type === "after_pipeline") {
-        setCadence("after_pipeline")
-        setTriggerPipelineId(data.trigger_pipeline_id || "")
+      if (data.schedule_type === "after_upstream") {
+        setCadence("after_upstream")
+        // Filtered on the id, not on the whole entry: a payload from a newer server
+        // could carry a kind this build does not know, and an entry with no usable id
+        // is one the next Update would send back as a broken edge.
+        setSelectedUpstreams(
+          (data.upstreams ?? []).filter((u) => u && typeof u.id === "string" && u.id !== "")
+        )
+        // Anything but an explicit "all" is the server's default, so an older server that
+        // sends no policy seeds the behaviour it actually has.
+        setUpstreamPolicy(data.upstream_policy === "all" ? "all" : "any")
       } else if (data.schedule_type === "interval") {
         setCadence("interval")
         setEverySeconds(String(data.schedule_spec.every_seconds ?? 3600))
@@ -510,52 +607,88 @@ export function SavedQueryModelDialog({
     if (open) void loadSchedule()
   }, [open, loadSchedule])
 
-  // Fetched once per open rather than lazily on picking the cadence, so the option is
-  // never offered against a list that has not arrived. Scoped to the caller's active
-  // workspace by the endpoint itself — this dialog does no filtering of its own, and
-  // must not, since the server re-checks the chosen pipeline on save anyway.
+  // Both producer lists, fetched once per open rather than lazily on picking the
+  // cadence, so the option is never offered against a list that has not arrived. Each
+  // endpoint scopes itself to the caller's active workspace; the only filtering done
+  // here is dropping this query itself and the saved queries that do not run, and the
+  // server re-authorizes every chosen upstream on save regardless.
   useEffect(() => {
     if (!open) return
     let cancelled = false
-    setLoadingPipelines(true)
+    setLoadingProducers(true)
     setPipelinesError(false)
+    setModelsError(false)
     void (async () => {
-      try {
-        const res = await authFetch("/api/v1/pipelines", { cache: "no-store" })
-        if (cancelled) return
-        if (!res.ok) {
-          setPipelinesError(true)
-          return
+      // Two independent loads rather than one Promise.all over two throwing calls: a
+      // failure in either must leave the other list usable, and a single catch would
+      // discard whichever half had already arrived.
+      const loadPipelines = async () => {
+        try {
+          const res = await authFetch("/api/v1/pipelines", { cache: "no-store" })
+          if (cancelled) return
+          if (!res.ok) {
+            setPipelinesError(true)
+            return
+          }
+          const data = (await res.json()) as { pipelines?: { id?: string; name?: string }[] }
+          if (cancelled) return
+          setPipelines(
+            (data.pipelines ?? [])
+              .filter((p): p is { id: string; name?: string } => typeof p.id === "string" && p.id !== "")
+              .map((p) => ({ kind: "pipeline" as const, id: p.id, name: p.name?.trim() || p.id }))
+          )
+        } catch {
+          if (!cancelled) setPipelinesError(true)
         }
-        const data = (await res.json()) as { pipelines?: { id?: string; name?: string }[] }
-        if (cancelled) return
-        setPipelines(
-          (data.pipelines ?? [])
-            .filter((p): p is { id: string; name?: string } => typeof p.id === "string" && p.id !== "")
-            .map((p) => ({ id: p.id, name: p.name?.trim() || p.id }))
-        )
-      } catch {
-        if (!cancelled) setPipelinesError(true)
-      } finally {
-        if (!cancelled) setLoadingPipelines(false)
       }
+      const loadModels = async () => {
+        try {
+          const res = await authFetch("/api/v1/explorer/saved", { cache: "no-store" })
+          if (cancelled) return
+          if (!res.ok) {
+            setModelsError(true)
+            return
+          }
+          const data = (await res.json()) as {
+            saved_queries?: { id?: string; name?: string; materialization?: string }[]
+          }
+          if (cancelled) return
+          setModels(
+            (data.saved_queries ?? [])
+              .filter(
+                (q): q is { id: string; name?: string; materialization?: string } =>
+                  typeof q.id === "string" && q.id !== "" && q.id !== savedQueryId
+              )
+              // A saved query that writes nowhere never runs on its own, so it never
+              // finishes, so nothing downstream of it would ever fire. Offering one is
+              // offering a trigger that is silent by construction. Nothing on the server
+              // refuses one, so this filter is the only thing that keeps it off the list.
+              .filter((q) => q.materialization === "table" || q.materialization === "statement")
+              .map((q) => ({ kind: "model" as const, id: q.id, name: q.name?.trim() || q.id }))
+          )
+        } catch {
+          if (!cancelled) setModelsError(true)
+        }
+      }
+      await Promise.all([loadPipelines(), loadModels()])
+      if (!cancelled) setLoadingProducers(false)
     })()
     return () => {
       cancelled = true
     }
-  }, [open])
+  }, [open, savedQueryId])
 
-  // Ask which pipelines produce this query's inputs, but only once the user has said
-  // they want to follow a pipeline. Most schedules are clock schedules, and this parses
-  // SQL and hits pipeline_run_table_stats to answer — no reason to spend that on every
-  // dialog open.
+  // Ask which pipelines and models produce this query's inputs, but only once the user
+  // has said they want to follow one. Most schedules are clock schedules, and this parses
+  // SQL and reads pipeline_run_table_stats and saved_queries to answer — no reason to
+  // spend that on every dialog open.
   //
   // A failure here sets nothing and says nothing. The suggestion is a shortcut past a
   // picker that already works; an error message about a shortcut would be noise in a
   // dialog whose actual job is unaffected.
   useEffect(() => {
-    if (!open || cadence !== "after_pipeline") return
-    if (upstreams) return
+    if (!open || cadence !== "after_upstream") return
+    if (suggestion) return
     let cancelled = false
     void (async () => {
       try {
@@ -565,7 +698,7 @@ export function SavedQueryModelDialog({
         if (cancelled || !res.ok) return
         const data = (await res.json()) as UpstreamSuggestion
         if (cancelled) return
-        setUpstreams({
+        setSuggestion({
           references: data.references ?? [],
           unresolved: data.unresolved ?? [],
           candidates: data.candidates ?? [],
@@ -578,20 +711,29 @@ export function SavedQueryModelDialog({
     return () => {
       cancelled = true
     }
-  }, [open, cadence, savedQueryId, upstreams])
+  }, [open, cadence, savedQueryId, suggestion])
 
   const specForRequest = (): {
     schedule_type: ModelScheduleType
     schedule_spec: ModelScheduleSpec
-    trigger_pipeline_id?: string
+    upstreams?: ScheduleUpstream[]
+    upstream_policy?: UpstreamPolicy
   } => {
-    if (cadence === "after_pipeline") {
+    if (cadence === "after_upstream") {
       // No spec at all: an event trigger has no cadence to describe, and sending a
       // leftover cron would be stored beside a type that never reads it.
+      //
+      // The whole set every time, never a delta — the server replaces what it holds
+      // with what arrives, and this dialog shows the whole set, so the whole set is
+      // what it sends. `name` is dropped on the way out: the id is the edge, and a
+      // stale name riding along is a second source of truth the server has to ignore.
       return {
-        schedule_type: "after_pipeline",
+        schedule_type: "after_upstream",
         schedule_spec: {},
-        trigger_pipeline_id: triggerPipelineId,
+        upstreams: selectedUpstreams.map((u) => ({ kind: u.kind, id: u.id })),
+        // Sent on every save, never left out: the server reads a missing policy as
+        // "any", so an Update that omitted it would quietly undo an "all".
+        upstream_policy: upstreamPolicy,
       }
     }
     if (cadence === "interval") {
@@ -722,19 +864,44 @@ export function SavedQueryModelDialog({
     (mode === "table" && target.trim() !== savedMode.targetTable)
   const shortInterval = cadence === "interval" && Number(everySeconds) > 0 && Number(everySeconds) < 300
 
-  // The list plus whatever the live schedule already points at. Without the union, a
-  // trigger whose pipeline has since left this list — deleted, or moved to another
-  // workspace — renders as an empty picker, which reads as "nothing selected" for a
-  // trigger that is in fact still firing.
-  const pipelineOptions = useMemo<TriggerPipeline[]>(() => {
-    const stored = schedule?.trigger_pipeline_id
-    if (!stored || pipelines.some((p) => p.id === stored)) return pipelines
-    return [...pipelines, { id: stored, name: schedule?.trigger_pipeline_name?.trim() || stored }]
-  }, [pipelines, schedule?.trigger_pipeline_id, schedule?.trigger_pipeline_name])
+  // Both lists plus whatever is already selected but in neither. Without that union, an
+  // upstream whose producer has since left its list — deleted, or moved to another
+  // workspace — has no box at all, which reads as "not selected" for a trigger that is
+  // in fact still firing, and the next Update would silently drop it. Unchecking one of
+  // these removes it from the list as well as from the set: there is no list it can
+  // come back from.
+  const producerOptions = useMemo<UpstreamOption[]>(() => {
+    const listed = [...pipelines, ...models]
+    const seen = new Set(listed.map(upstreamKey))
+    return [
+      ...listed,
+      ...selectedUpstreams
+        .filter((u) => !seen.has(upstreamKey(u)))
+        .map((u) => ({ kind: u.kind, id: u.id, name: u.name?.trim() || u.id })),
+    ]
+  }, [pipelines, models, selectedUpstreams])
 
-  // An event trigger is only a trigger once it names an upstream. Checked here rather
-  // than left to the server's 400 so the button explains itself before the click.
-  const triggerIncomplete = cadence === "after_pipeline" && triggerPipelineId === ""
+  const selectedKeys = useMemo(() => new Set(selectedUpstreams.map(upstreamKey)), [selectedUpstreams])
+  const atUpstreamCap = selectedUpstreams.length >= MAX_SCHEDULE_UPSTREAMS
+
+  const toggleUpstream = useCallback((o: UpstreamOption) => {
+    setSelectedUpstreams((prev) => {
+      const key = upstreamKey(o)
+      if (prev.some((p) => upstreamKey(p) === key)) {
+        return prev.filter((p) => upstreamKey(p) !== key)
+      }
+      // The cap is the server's, restated. The boxes past it are disabled rather than
+      // clickable, so this is only the backstop for a click that got through anyway —
+      // dropping one silently is still better than a request the server will refuse.
+      if (prev.length >= MAX_SCHEDULE_UPSTREAMS) return prev
+      return [...prev, { kind: o.kind, id: o.id, name: o.name }]
+    })
+  }, [])
+
+  // An event trigger is only a trigger once it names at least one upstream. Checked
+  // here rather than left to the server's 400 so the button explains itself before the
+  // click. One is enough: the fan-in fires on any of them, not all.
+  const triggerIncomplete = cadence === "after_upstream" && selectedUpstreams.length === 0
 
   // What a schedule needs before it can be created: the form must describe something
   // for a run to do, whether or not it has been saved yet. The saving is this
@@ -790,7 +957,7 @@ export function SavedQueryModelDialog({
               assertion we cannot yet make. */}
           {readOnly && !roleLoading && (
             <div className="flex items-start gap-2 rounded-md border bg-zinc-50 p-2 dark:bg-zinc-900">
-              <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-500" />
+              <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-500 dark:text-zinc-400" />
               <p className="text-xs text-zinc-600 dark:text-zinc-400">
                 You can see what this query does and when it runs, but changing either needs
                 the Admin or Owner role in this workspace — a scheduled run writes to the
@@ -819,7 +986,7 @@ export function SavedQueryModelDialog({
           <section className="space-y-3">
             <div className="space-y-1">
               <Label>What a run of this query does</Label>
-              <p className="text-xs text-zinc-500">
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
                 This follows from the SQL rather than from a preference: a SELECT has to be
                 given somewhere to land, while a MERGE, UPDATE or INSERT already names its
                 own destination.
@@ -857,7 +1024,7 @@ export function SavedQueryModelDialog({
                         {choice.icon}
                         {choice.label}
                       </div>
-                      <p className="text-xs text-zinc-500">{choice.hint}</p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">{choice.hint}</p>
                     </div>
                   </label>
                 )
@@ -876,7 +1043,7 @@ export function SavedQueryModelDialog({
                   className="font-mono text-sm"
                   disabled={readOnly}
                 />
-                <p className="text-xs text-zinc-500">
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
                   <code>schema.table</code> or <code>table</code>. Letters, digits and underscores
                   only, 52 characters per part.
                 </p>
@@ -950,7 +1117,7 @@ export function SavedQueryModelDialog({
           {/* ---------------- Schedule ---------------- */}
           <section className="space-y-3 border-t pt-4">
             <div className="flex items-center gap-2">
-              <Clock className="h-3.5 w-3.5 text-zinc-500" />
+              <Clock className="h-3.5 w-3.5 text-zinc-500 dark:text-zinc-400" />
               <span className="text-sm font-medium">Schedule</span>
               {schedule && (
                 <Badge variant={schedule.status === "active" ? "default" : "secondary"}>
@@ -965,7 +1132,7 @@ export function SavedQueryModelDialog({
             </div>
 
             {loadingSchedule ? (
-              <div className="flex items-center text-xs text-zinc-500">
+              <div className="flex items-center text-xs text-zinc-500 dark:text-zinc-400">
                 <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" />
                 Loading schedule…
               </div>
@@ -1002,7 +1169,7 @@ export function SavedQueryModelDialog({
 
                 {schedule && (
                   <div className="rounded-md border p-2 text-xs text-zinc-600 dark:text-zinc-400">
-                    {describeSchedule(schedule)}
+                    {describeCadence(schedule)}
                   </div>
                 )}
 
@@ -1024,7 +1191,7 @@ export function SavedQueryModelDialog({
                   </div>
                 )}
                 {schedule?.paused_reason && (
-                  <p className="text-xs text-zinc-500">Paused: {schedule.paused_reason}</p>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">Paused: {schedule.paused_reason}</p>
                 )}
 
                 <div className="grid gap-3">
@@ -1043,58 +1210,147 @@ export function SavedQueryModelDialog({
                         <SelectItem value="week">Every week</SelectItem>
                         <SelectItem value="interval">Fixed interval</SelectItem>
                         <SelectItem value="custom">Custom cron</SelectItem>
-                        <SelectItem value="after_pipeline">After a pipeline runs</SelectItem>
+                        <SelectItem value="after_upstream">
+                          After a pipeline or model runs
+                        </SelectItem>
                       </SelectContent>
                     </Select>
                   </div>
 
-                  {cadence === "after_pipeline" && (
+                  {cadence === "after_upstream" && (
                     <div className="space-y-1.5">
-                      <Label htmlFor="model-trigger-pipeline">Pipeline</Label>
-                      {pipelinesError ? (
-                        <p className="text-xs text-amber-600 dark:text-amber-400">
-                          Could not load this workspace&apos;s pipelines. Close and reopen this
-                          dialog to try again, or pick a clock schedule instead.
-                        </p>
-                      ) : loadingPipelines ? (
-                        <p className="text-xs text-zinc-500">Loading pipelines…</p>
-                      ) : pipelineOptions.length === 0 ? (
-                        <p className="text-xs text-zinc-500">
-                          This workspace has no pipelines yet. A pipeline is what loads the
-                          tables this query reads, so there is nothing for it to follow — pick a
-                          clock schedule instead.
-                        </p>
+                      {/* A group with its own label rather than a <Label htmlFor>: the
+                          control is a set of checkboxes, and htmlFor can only name one. */}
+                      <Label id="model-upstreams-label">Rebuild after</Label>
+                      {loadingProducers ? (
+                        <p className="text-xs text-zinc-500 dark:text-zinc-400">Loading pipelines and models…</p>
                       ) : (
-                        <Select
-                          value={triggerPipelineId}
-                          onValueChange={setTriggerPipelineId}
-                          disabled={readOnly}
-                        >
-                          <SelectTrigger id="model-trigger-pipeline">
-                            <SelectValue placeholder="Choose a pipeline" />
-                          </SelectTrigger>
-                          <SelectContent className="max-h-64">
-                            {pipelineOptions.map((p) => (
-                              <SelectItem key={p.id} value={p.id}>
-                                {p.name}
-                              </SelectItem>
-                            ))}
-                          </SelectContent>
-                        </Select>
+                        <>
+                          {/* One line per failed source, not one for "something failed":
+                              a picker showing every model and no pipelines looks whole,
+                              and nothing else would tell the user half the list is
+                              missing rather than empty. */}
+                          {pipelinesError && (
+                            <p className="text-xs text-amber-600 dark:text-amber-400">
+                              Could not load this workspace&apos;s pipelines. Close and reopen
+                              this dialog to try again.
+                            </p>
+                          )}
+                          {modelsError && (
+                            <p className="text-xs text-amber-600 dark:text-amber-400">
+                              Could not load this workspace&apos;s other models. Close and reopen
+                              this dialog to try again.
+                            </p>
+                          )}
+                          {producerOptions.length === 0
+                            ? !pipelinesError &&
+                              !modelsError && (
+                                <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                                  This workspace has no pipelines, and no other model that runs.
+                                  A pipeline loads the tables this query reads and a model
+                                  rebuilds one, so there is nothing for it to follow — pick a
+                                  clock schedule instead.
+                                </p>
+                              )
+                            : (
+                              <div
+                                role="group"
+                                aria-labelledby="model-upstreams-label"
+                                className="max-h-56 space-y-2 overflow-y-auto rounded-md border p-2"
+                              >
+                                {UPSTREAM_GROUPS.map((group) => {
+                                  const inGroup = producerOptions.filter((o) => o.kind === group.kind)
+                                  if (inGroup.length === 0) return null
+                                  return (
+                                    <div key={group.kind} className="space-y-1">
+                                      <p className="text-[11px] font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
+                                        {group.label}
+                                      </p>
+                                      {inGroup.map((o) => {
+                                        const key = upstreamKey(o)
+                                        const checked = selectedKeys.has(key)
+                                        return (
+                                          <div key={key} className="flex items-center gap-2">
+                                            <Checkbox
+                                              id={`model-upstream-${key}`}
+                                              checked={checked}
+                                              // Disabled at the cap rather than refused
+                                              // on click: a box that ticks and then
+                                              // unticks itself reads as a bug.
+                                              disabled={readOnly || (!checked && atUpstreamCap)}
+                                              onCheckedChange={() => toggleUpstream(o)}
+                                            />
+                                            <Label
+                                              htmlFor={`model-upstream-${key}`}
+                                              className="truncate font-normal"
+                                            >
+                                              {o.name}
+                                            </Label>
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            )}
+                        </>
                       )}
-                      {!pipelinesError && !loadingPipelines && pipelineOptions.length > 0 && (
+                      {atUpstreamCap && (
+                        <p className="text-xs text-amber-600 dark:text-amber-400">
+                          {MAX_SCHEDULE_UPSTREAMS} is the most one model can wait on. A model
+                          reading from more producers than that is worth splitting up — uncheck
+                          one to choose another.
+                        </p>
+                      )}
+                      {!loadingProducers && producerOptions.length > 0 && (
                         <UpstreamHint
-                          upstreams={upstreams}
-                          pipelineOptions={pipelineOptions}
-                          selectedId={triggerPipelineId}
-                          onPick={setTriggerPipelineId}
-                          disabled={readOnly}
+                          suggestion={suggestion}
+                          options={producerOptions}
+                          selectedKeys={selectedKeys}
+                          onPick={toggleUpstream}
+                          disabled={readOnly || atUpstreamCap}
                         />
                       )}
-                      <p className="text-xs text-zinc-500">
-                        The query rebuilds each time that pipeline finishes successfully — so it
-                        reads the data the pipeline just loaded, rather than whatever happened to
-                        be there when a clock struck. A failed pipeline run rebuilds nothing.
+                      {/* Only a choice with two or more: with one upstream "any" and "all"
+                          are the same trigger. The state is still sent either way. */}
+                      {selectedUpstreams.length >= 2 && (
+                        <div className="space-y-1.5 pt-1">
+                          <Label id="model-upstream-policy-label">Rebuild when</Label>
+                          <RadioGroup
+                            aria-labelledby="model-upstream-policy-label"
+                            value={upstreamPolicy}
+                            onValueChange={(v) => setUpstreamPolicy(v === "all" ? "all" : "any")}
+                            disabled={readOnly}
+                          >
+                            {UPSTREAM_POLICY_CHOICES.map((choice) => (
+                              <label
+                                key={choice.value}
+                                htmlFor={`model-upstream-policy-${choice.value}`}
+                                className={`flex items-start gap-3 rounded-md border p-2.5 ${
+                                  upstreamPolicy === choice.value
+                                    ? "border-violet-500/60 bg-violet-500/5"
+                                    : ""
+                                } ${readOnly ? "cursor-not-allowed opacity-70" : "cursor-pointer"}`}
+                              >
+                                <RadioGroupItem
+                                  id={`model-upstream-policy-${choice.value}`}
+                                  value={choice.value}
+                                  className="mt-0.5 shrink-0"
+                                />
+                                <div className="space-y-0.5">
+                                  <div className="text-sm font-medium">{choice.label}</div>
+                                  <p className="text-xs text-zinc-500 dark:text-zinc-400">{choice.hint}</p>
+                                </div>
+                              </label>
+                            ))}
+                          </RadioGroup>
+                        </div>
+                      )}
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                        {upstreamPolicy === "all" && selectedUpstreams.length >= 2
+                          ? "The query rebuilds once every one of these has finished successfully since its last rebuild. Each landing before that is recorded in run history as waiting, naming what it still waits for. A failed upstream run rebuilds nothing."
+                          : "The query rebuilds each time any one of these finishes successfully — so it reads the data that run just produced, rather than whatever happened to be there when a clock struck. Two landing together become one rebuild, and a failed upstream run rebuilds nothing."}
                       </p>
                     </div>
                   )}
@@ -1137,7 +1393,7 @@ export function SavedQueryModelDialog({
                                 ))}
                               </SelectContent>
                             </Select>
-                            <span className="text-sm text-zinc-500">:</span>
+                            <span className="text-sm text-zinc-500 dark:text-zinc-400">:</span>
                           </>
                         )}
                         <Select value={minute} onValueChange={setMinute} disabled={readOnly}>
@@ -1153,7 +1409,7 @@ export function SavedQueryModelDialog({
                           </SelectContent>
                         </Select>
                         {cadence === "hour" && (
-                          <span className="text-sm text-zinc-500">minutes past the hour</span>
+                          <span className="text-sm text-zinc-500 dark:text-zinc-400">minutes past the hour</span>
                         )}
                       </div>
                     </div>
@@ -1195,7 +1451,7 @@ export function SavedQueryModelDialog({
                         </p>
                       )}
                     </div>
-                  ) : cadence === "after_pipeline" ? null : (
+                  ) : cadence === "after_upstream" ? null : (
                     // Not shown for an event trigger: there is no clock to place in a
                     // zone, and offering one would suggest the trigger has a time.
                     <div className="space-y-1.5">
@@ -1220,7 +1476,7 @@ export function SavedQueryModelDialog({
                     which a keyboard user never sees and a touch user cannot hover.
                     State it in the page for the one case that blocks them. */}
                 {!schedule && !canCreateSchedule && !readOnly && !engineBlocked && !triggerIncomplete && (
-                  <p className="text-xs text-zinc-500">
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
                     Choose what a run of this query does above — and name the table, if it
                     writes one. A scheduled query that writes nowhere can only fail. Creating
                     the schedule saves that choice for you.
@@ -1229,9 +1485,9 @@ export function SavedQueryModelDialog({
                 {/* Its own line rather than a second reason folded into the one above:
                     the two block the button for unrelated reasons, and a missing pipeline
                     is not fixed by anything in the "what a run does" section. */}
-                {triggerIncomplete && !readOnly && !engineBlocked && pipelineOptions.length > 0 && (
-                  <p className="text-xs text-zinc-500">
-                    Choose the pipeline this query should follow.
+                {triggerIncomplete && !readOnly && !engineBlocked && producerOptions.length > 0 && (
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Choose at least one pipeline or model this query should follow.
                   </p>
                 )}
 
@@ -1245,7 +1501,7 @@ export function SavedQueryModelDialog({
                           readOnly
                             ? MANAGE_ROLE_HINT
                             : triggerIncomplete
-                              ? "Choose the pipeline this query should follow"
+                              ? "Choose at least one pipeline or model this query should follow"
                               : undefined
                         }
                         onClick={() => void scheduleAction("", "PUT", specForRequest(), "Schedule updated")}
@@ -1302,7 +1558,7 @@ export function SavedQueryModelDialog({
                           : engineBlocked
                             ? ENGINE_HINT
                             : triggerIncomplete
-                              ? "Choose the pipeline this query should follow"
+                              ? "Choose at least one pipeline or model this query should follow"
                               : canCreateSchedule
                                 ? modeDirty || !runnable
                                   ? "Saves what a run does, then creates the schedule"
@@ -1334,7 +1590,7 @@ export function SavedQueryModelDialog({
             <AlertDialogHeader>
               <AlertDialogTitle>Delete this schedule?</AlertDialogTitle>
               <AlertDialogDescription>
-                {schedule ? describeSchedule(schedule) : "This schedule"} will stop running and
+                {schedule ? describeCadence(schedule) : "This schedule"} will stop running and
                 be deregistered. This cannot be undone — recreating it later starts a new
                 schedule. The saved query and the table it built are not affected. To stop it
                 temporarily instead, use Pause.

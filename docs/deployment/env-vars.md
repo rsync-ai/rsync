@@ -11,9 +11,33 @@ Generate secrets with: `openssl rand -base64 32`
 |---|---|---|
 | `ENCRYPTION_KEY` | **Yes** | AES key for encrypting stored connector credentials. **Losing this breaks all saved connections permanently.** |
 | `JWT_SECRET` | **Yes** | Signs JWT authentication tokens |
-| `INTERNAL_SERVICE_SECRET` | **Yes** | Shared secret authenticating service-to-service calls (api-gateway → orchestrator: connection tests, OAuth refresh). Must be non-empty and identical across api-gateway, orchestrator, and frontend — if empty, the orchestrator (`ENVIRONMENT=production`) fails `requirePrincipal` closed and internal calls return 401. Generate with `openssl rand -hex 32`. |
+| `INTERNAL_SERVICE_SECRET` | **Yes** | Shared secret authenticating service-to-service calls (api-gateway → orchestrator: connection tests, OAuth refresh; temporal-adapter → api-gateway: scheduled saved-query runs and the model freshness sweep). Must be non-empty and identical across api-gateway, orchestrator, temporal-adapter and frontend — if empty, the api-gateway answers every `/api/v1/internal/...` call with 503 (401 when it is only spaces), the temporal-adapter's scheduled runs fail on every attempt, and the orchestrator (`ENVIRONMENT=production`) fails `requirePrincipal` closed so internal calls return 401. Each of the four services logs an ERROR at startup when it is empty (see [Startup checks](#startup-checks)). Generate with `openssl rand -hex 32`. |
 
-Store all three in AWS Secrets Manager or equivalent. Rotation of `ENCRYPTION_KEY`/`JWT_SECRET` requires re-encrypting all stored connector credentials; rotating `INTERNAL_SERVICE_SECRET` requires recreating api-gateway, orchestrator, and frontend together (a mismatch 401s in-flight internal calls).
+Store all three in AWS Secrets Manager or equivalent. Rotation of `ENCRYPTION_KEY`/`JWT_SECRET` requires re-encrypting all stored connector credentials; rotating `INTERNAL_SERVICE_SECRET` requires recreating api-gateway, orchestrator, temporal-adapter and frontend together (a mismatch 401s in-flight internal calls).
+
+### Startup checks
+
+api-gateway, orchestrator, temporal-adapter and frontend each check a few settings once at startup. For each missing setting they write one ERROR line that starts with `Startup check:`, names the setting, says what will not work and says what to set. The line never includes a value. **None of these checks stops the service from starting**, because at least one supported way of starting it (the dev compose, the Helm chart, the CI end-to-end overlays) does not provide every setting yet, and the rest of the product works without it. After a start or an upgrade, look for these lines:
+
+```bash
+docker logs rsync-api-gateway 2>&1 | grep "Startup check:"   # likewise orchestrator, temporal-adapter, frontend
+```
+
+| Service | Setting | Logged when | What does not work |
+|---|---|---|---|
+| api-gateway | `INTERNAL_SERVICE_SECRET` | empty or only spaces | every `/api/v1/internal/...` call is refused (503 when empty, 401 when only spaces): scheduled saved-query runs, the model freshness sweep, pipeline re-runs started by the self-healer, pipeline namespace locking, OAuth token refresh requested by the orchestrator |
+| orchestrator | `INTERNAL_SERVICE_SECRET` | empty or only spaces | its calls to other services' internal endpoints are refused (self-healer re-runs, OAuth token refresh, namespace locking — runs go ahead unlocked — and connector deploys in production); with `ENVIRONMENT=production`, internal calls into the orchestrator (the dashboard's pipeline statistics) are refused too |
+| temporal-adapter | `INTERNAL_SERVICE_SECRET` | empty or only spaces | scheduled saved-query runs and the model freshness sweep fail on every attempt, so schedules shown as active never run |
+| temporal-adapter | `ENCRYPTION_KEY` | empty while `ENVIRONMENT` is not `development`/`dev` (unset counts as not development), or shorter than 32 characters | the adapter cannot decrypt stored connection settings, so self-healing cannot look up a connection's OAuth token to refresh it, cannot plan a schema-drift repair and cannot apply the repair to the destination table. These steps read `ENCRYPTION_KEY` only, so `ENCRYPTION_KEYS` alone is not enough. `ENVIRONMENT` must be exactly `development` or `dev` (`Development` does not count) |
+| frontend | `API_GATEWAY_INTERNAL_URL` | empty or only spaces, and `NODE_ENV=production` (the image sets it) | server-side requests to the gateway (explorer queries, SQL generation, sharing, the schema index, the `/api/health` backend check) go to the default `http://localhost:5001`, which fails unless the gateway runs on the same host as the frontend server (in the frontend container it does not) |
+| frontend | `ORCHESTRATOR_INTERNAL_URL` | empty or only spaces, and `NODE_ENV=production` | the dashboard's pipeline statistics are fetched from the default `http://localhost:8081` and stay empty unless the orchestrator runs on the same host as the frontend server |
+| frontend | `INTERNAL_SERVICE_SECRET` | empty or only spaces, and `NODE_ENV=production` | the dashboard's pipeline statistics stay empty whenever the orchestrator runs with `ENVIRONMENT=production` |
+
+Connector generate, deploy and delete (tool-generator and connector-deployer) need `INTERNAL_SERVICE_SECRET` too. With it empty, both answer 503 `internal_secret_not_configured` unless `ENVIRONMENT` is `development` or `dev` (surrounding spaces and letter case are ignored here). An unset `ENVIRONMENT` counts as not development. The shipped compose files set `ENVIRONMENT` for both services. The Helm chart sets it for tool-generator and does not run connector-deployer.
+
+The frontend's `/api/health` also lists the names of missing settings in `checks.environment.missingSettings`. That list leaves out `INTERNAL_SERVICE_SECRET`, because the route needs no login. A missing setting does not change the health status. Under `next dev` (any `NODE_ENV` other than `production`) the frontend checks nothing, because the localhost defaults are what a developer wants.
+
+The settings that already stop a service from starting are unchanged. Examples are `JWT_SECRET` and the encryption key (`ENCRYPTION_KEYS` or `ENCRYPTION_KEY`) in production on the api-gateway and orchestrator, and the `RSYNC_REQUIRE_REMOTE_DB` guards.
 
 ---
 
@@ -85,12 +109,34 @@ services through their own reader. Everything below is unset by default, which m
 | `KAFKA_SECURITY_PROTOCOL` | `PLAINTEXT` | `PLAINTEXT`, `SSL`, `SASL_PLAINTEXT` or `SASL_SSL` |
 | `KAFKA_SASL_MECHANISM` | `PLAIN` when a SASL protocol is set, otherwise none | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`, `AWS_MSK_IAM`, `OAUTHBEARER` (`config.go:57-63`) |
 | `KAFKA_SASL_USERNAME` / `KAFKA_SASL_PASSWORD` | — | SASL credentials. Also serve as the OAuth client id/secret when the dedicated names are unset (`config.go:225-226`) |
-| `KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT` | — | Plus `…_CLIENT_ID`, `…_CLIENT_SECRET`, `…_SCOPE`, `…_EXTENSIONS` for `OAUTHBEARER` (`config.go:92-98`) |
+| `KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT` | — | Plus `…_CLIENT_ID`, `…_CLIENT_SECRET`, `…_SCOPE`, `…_EXTENSIONS` for `OAUTHBEARER` (`config.go:92-98`). **Must be `https://`**, unless the host is loopback — see the note below |
+| `KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT` | `false` | Re-permits a plain-`http://` token endpoint off loopback. **Disposable test rigs only** — see the note below |
 | `KAFKA_AWS_REGION` | falls back to `AWS_REGION`, then `AWS_DEFAULT_REGION` | Region for `AWS_MSK_IAM` signing (`config.go:120-121`). An EKS pod that already exports `AWS_REGION` needs no Kafka-specific duplicate |
 | `KAFKA_SSL_CA_LOCATION` | — | CA bundle path. Alias: `KAFKA_TLS_CA` (`config.go:116`) |
-| `KAFKA_SSL_CERT_LOCATION` / `KAFKA_SSL_KEY_LOCATION` | — | Client cert / key for mTLS. Aliases: `KAFKA_TLS_CERT`, `KAFKA_TLS_KEY` |
-| `KAFKA_SSL_KEYSTORE_LOCATION` | — | The same client keypair in the one shape a JVM can load: a single PEM holding chain **and** key. Not derivable from the two paths above — build it with `cat client.crt client.key > client.pem`. Read by `kafka-init` and by Debezium's schema-history client; inert in the Go and Python services |
+| `KAFKA_SSL_CERT_LOCATION` / `KAFKA_SSL_KEY_LOCATION` | — | Client cert / key for mTLS — both or neither. Aliases: `KAFKA_TLS_CERT`, `KAFKA_TLS_KEY` (Go only). The key must be **unencrypted PKCS#8** (`BEGIN PRIVATE KEY`) for the JVM half (Kafka Connect, `kafka-init`), which refuses PKCS#1/SEC1/encrypted keys at startup; convert once with `openssl pkcs8 -topk8 -nocrypt -in client.key -out client.pk8.key` — Go and Python read the PKCS#8 file unchanged |
+| `KAFKA_SSL_KEYSTORE_LOCATION` | built from the pair above | The same client keypair in the one shape a JVM can load: a single PEM holding chain **and** key. **Optional** — the kafka-connect image (`connect-entrypoint.sh`) and compose `kafka-init` build it from `KAFKA_SSL_CERT_LOCATION` + `KAFKA_SSL_KEY_LOCATION`, and Helm builds it in its Secret. Set it only to supply your own combined file, which then wins. Read by `kafka-init`, the Kafka Connect worker and Debezium's schema-history client; inert in the Go and Python services |
 | `KAFKA_SSL_INSECURE_SKIP_VERIFY` | `false` | Disables server-certificate verification. `KAFKA_SSL_SKIP_VERIFY` is honored as an alias (`config.go:115`) — the two spellings previously reached different halves of the platform, so setting either now reaches both. Do not use outside local testing |
+
+> **The OAuth token endpoint must be `https://`, and that is enforced, not advised.**
+> The client-credentials grant POSTs `KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET` to this URL on
+> *every* token fetch. Over plain http to a remote host that discloses a credential which
+> never expires to anyone on the path — strictly worse than the short-lived bearer token it
+> buys, and nothing the broker can undo, because the broker never sees this hop. So every
+> runtime refuses at start-up: Go (`config.go`), Python (`kafka_security.py`), the Debezium
+> connector, the Kafka Connect image (`connect-entrypoint.sh`), `kafka-init` (compose, chart
+> and `scripts/kafka-init-new-topics.sh`) and the chart at render time (`_helpers.tpl`).
+> It previously warned and connected anyway.
+>
+> **Loopback is exempt** — `localhost`, `*.localhost`, any `127.0.0.0/8` address, `::1`, with
+> or without a trailing dot. A token helper on the same host never puts the secret on a
+> network, and GCP Workload Identity's `http://localhost:14293` is exactly that shape. Hosts
+> that merely *look* like loopback (`127.0.0.1.evil.example.com`, `localhost.evil.example.com`,
+> userinfo such as `http://localhost@evil.example.com/`) are remote and are refused.
+>
+> **Opt-out:** `KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT=true` re-permits it, for
+> a throwaway rig whose IdP secret is a fixture. Do not set it anywhere a real secret is in
+> play; `docker-compose.yml` and `docker-compose.prod.yml` forward the variable but never give
+> it a value, and a test fails if any tracked file but the Kafka security matrix harness does.
 
 > **`AWS_MSK_IAM` is not implemented everywhere.** The Go services sign the token
 > (`kafkaclient/tokenauth/msk.go`); the Python tier raises `KafkaSecurityError` for it
@@ -132,7 +178,8 @@ variables documented above.
 | `kafka.external.saslMechanism` | `KAFKA_SASL_MECHANISM` | `PLAIN` \| `SCRAM-SHA-256` \| `SCRAM-SHA-512` \| `OAUTHBEARER`. Anything else is rejected at render, not at runtime |
 | `kafka.external.saslUsername` | `KAFKA_SASL_USERNAME` | **Not used by `OAUTHBEARER`** — setting it there is a render error rather than a silent no-op, because the value that means "username" on three mechanisms means nothing on the fourth |
 | `kafka.external.saslPassword` | `KAFKA_SASL_PASSWORD` | Or key `KAFKA_SASL_PASSWORD` of `secrets.existingSecret` |
-| `kafka.external.oauth.tokenEndpoint` | `KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT` | Required for `OAUTHBEARER` |
+| `kafka.external.oauth.tokenEndpoint` | `KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT` | Required for `OAUTHBEARER`. **Must be `https://` unless the host is loopback** — a plain-http endpoint is rejected at render, so the chart fails before it deploys rather than after |
+| `kafka.external.oauth.allowInsecureTokenEndpoint` | `KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT` | Default `false`. Re-permits a plain-http endpoint off loopback, for a disposable test rig. The env entry is emitted into every pod **only** when this is true |
 | `kafka.external.oauth.clientId` | `…_CLIENT_ID` | Required for `OAUTHBEARER`. A plain value, not a secret |
 | `kafka.external.oauth.clientSecret` | `…_CLIENT_SECRET` | Or key `KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET` of `secrets.existingSecret` |
 | `kafka.external.oauth.scope` | `…_SCOPE` | Optional. Sent as the `scope` form parameter *and* as a JAAS option |
@@ -195,9 +242,16 @@ Authorization is separate and is not covered by any of the above: see
 
 | Variable | Default | Description |
 |---|---|---|
-| `LLM_PROVIDER` | auto-detect | `openai` · `azure` · `groq` · `ollama`. Unset ⇒ Azure endpoint → `azure`, else `OPENAI_API_KEY` → `openai`, else `ollama`. Groq is opt-in only. |
-| `OPENAI_API_KEY` | — | If set, auto-detect selects OpenAI. Unset ⇒ Ollama. |
-| `LLM_MODEL` | — | Overrides the model for **every** provider. On Azure this is the *deployment* name. |
+| `LLM_PROVIDER` | auto-detect | `openai` · `azure` · `groq` · `ollama`, or `none` (also `disabled`, `off`, `false`, `0`) to run with no LLM. Unset ⇒ Azure endpoint → `azure`, else `OPENAI_API_KEY` → `openai`, else `ollama`. An Ollama reached that way is **not** a configured LLM: the LLM-only features answer `Set up an LLM first` until you set `LLM_PROVIDER=ollama`. Groq is opt-in only. See [Which LLM is used](self-hosting.md#which-llm-is-used). |
+| `OPENAI_API_KEY` | — | Optional. If set, it is preferred: auto-detect selects OpenAI. Unset ⇒ no external LLM, and Ollama is used only if `LLM_PROVIDER=ollama` names it. |
+| `OPENAI_BASE_URL` | OpenAI | Another OpenAI-compatible endpoint (Vertex AI, OpenRouter, a proxy), still with `LLM_PROVIDER=openai`. Set `LLM_MODEL` with it. |
+| `OPENAI_API_KEY_SOURCE` | — (the key is `OPENAI_API_KEY`) | `gcp-metadata`: use an access token for the Google Cloud VM's service account, renewed before it expires, instead of a key. Sent only when `OPENAI_BASE_URL` is an `https://` address on `googleapis.com` (Vertex AI). See [Groq, Azure OpenAI and Vertex AI](self-hosting.md#groq-azure-openai-and-vertex-ai). |
+| `GROQ_API_KEY` | — | Key for `LLM_PROVIDER=groq`. A key alone never selects Groq. |
+| `AZURE_OPENAI_ENDPOINT` | — | `https://<resource>.openai.azure.com`. Set, it makes auto-detect choose `azure`. |
+| `AZURE_OPENAI_API_KEY` | `OPENAI_API_KEY` | Azure OpenAI key |
+| `AZURE_OPENAI_DEPLOYMENT` | `gpt-4o-mini` | Deployment name, used when `LLM_MODEL` is unset |
+| `AZURE_OPENAI_API_VERSION` | `2024-10-21` | Azure OpenAI API version |
+| `LLM_MODEL` | — | Overrides the model for **every** provider. On Azure this is the *deployment* name. Unset ⇒ the provider's default: `gpt-4o-mini` on OpenAI (prompt-registry calls use the prompt's `gpt-4o`), `llama-3.3-70b-versatile` on Groq, `AZURE_OPENAI_DEPLOYMENT` on Azure, `OLLAMA_MODEL` on Ollama. Needed with `OPENAI_BASE_URL`, whose endpoint does not serve OpenAI's model names. |
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | Ollama server URL (wins over `OLLAMA_URL`; `/v1` appended automatically) |
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Default Ollama model for general agents |
 | `EXPLORER_OFFLINE_ONLY` | **`false`** | Forces **only** the Explorer to Ollama. Set `LLM_PROVIDER=ollama` to take the whole stack offline. |
@@ -220,7 +274,7 @@ All of these are optional; unset means "inherit".
 | `EXPLORER_SQL_MODEL_MYSQL` | same as `EXPLORER_SQL_MODEL` | NL→SQL on MySQL/MariaDB |
 | `EXPLORER_SQL_PROVIDER` | inherits the Explorer provider | Provider for NL→SQL only |
 | `EXPLORER_SQL_ALLOW_ONLINE` | `not EXPLORER_OFFLINE_ONLY` | Permits NL→SQL to reach a cloud provider while the rest of the Explorer is offline |
-| `EXPLORER_SQL_OPENAI_MODEL` | prompt-registry model | NL→SQL model, applied only when the SQL provider resolves to `openai` |
+| `EXPLORER_SQL_OPENAI_MODEL` | `LLM_MODEL`, else the prompt-registry model (`gpt-4o`) | NL→SQL model, applied only when the SQL provider resolves to `openai` |
 | `EXPLORER_SQL_FALLBACK_MODELS` | `qwen2.5:7b,llama3:latest,codellama:7b-instruct` | Retry chain when SQL generation fails. Names equal to the primary model are dropped, so on the bundled Ollama — which pins this to the one model it pulled — the chain is empty and the error is raised immediately instead of after three requests for weights nobody downloaded. |
 | `RANK_TABLES_LLM_PROVIDER` | inherits `EXPLORER_LLM_PROVIDER`, then `LLM_PROVIDER` | Provider for `/agents/rank-tables` (table recommendations during pipeline setup) only |
 | `RANK_TABLES_MODEL` | `llama3:latest` offline, `gpt-4o-mini` on OpenAI | Model for `/agents/rank-tables`. Deliberately does **not** follow `LLM_MODEL` — it is a bulk metadata task pinned to a cheap model. |
@@ -321,7 +375,9 @@ JWT_SECRET=<openssl rand -base64 32>
 POSTGRES_PASSWORD=<openssl rand -base64 24>
 REDIS_PASSWORD=<openssl rand -base64 24>
 
-# ── LLM: pick one ─────────────────────────────────────────────────────────────
+# ── LLM: optional — pick one, or none ─────────────────────────────────────────
+# An external key is preferred when present; Ollama only when named; otherwise
+# the LLM features answer "Set up an LLM first".
 # Option A: OpenAI (easiest for demo)
 OPENAI_API_KEY=sk-...
 
@@ -331,11 +387,15 @@ OPENAI_API_KEY=sk-...
 # LLM_PROVIDER=ollama
 #
 # Option C: an Ollama you already run on this VM
+# LLM_PROVIDER=ollama
 # OLLAMA_BASE_URL=http://host-gateway:11434
 # EXPLORER_OFFLINE_ONLY=true
 #   verify: docker logs rsync-llm-service 2>&1 \
 #             | grep -E "explorer (llm|router llm):|rank-tables llm:"
 #           → three lines, all provider=ollama
+#
+# Option D: no LLM for now — pipelines, raw SQL and connectors still work
+# LLM_PROVIDER=none
 
 # ── Admin ─────────────────────────────────────────────────────────────────────
 RSYNC_ADMIN_EMAILS=your@email.com
@@ -375,7 +435,7 @@ KAFKA_BROKERS=<msk-broker-1>:9092,<msk-broker-2>:9092
 # ── Temporal ──────────────────────────────────────────────────────────────────
 TEMPORAL_HOST=<temporal-cloud-or-internal>:7233
 
-# ── LLM ───────────────────────────────────────────────────────────────────────
+# ── LLM (optional; or LLM_PROVIDER=none) ──────────────────────────────────────
 OPENAI_API_KEY=sk-...
 
 # ── OAuth ─────────────────────────────────────────────────────────────────────

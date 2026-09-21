@@ -6,15 +6,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/IBM/sarama"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	kafkaclient "github.com/rsync-ai/shared/kafkaclient"
 	"github.com/rsync-ai/shared/kafkaclient/saramaauth"
 	log "github.com/sirupsen/logrus"
+	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
@@ -25,6 +26,14 @@ import (
 	"github.com/rsync-ai/backend-temporal-adapter/internal/telemetry"
 	"github.com/rsync-ai/backend-temporal-adapter/internal/workflows"
 )
+
+// adapterTaskQueue is the queue this worker polls.
+//
+// A constant because it is now named twice: once by the worker that polls it, and once
+// by the freshness sweep started below. Two literals would be one typo away from a
+// workflow that starts successfully and is never picked up by anything — which presents
+// as a monitor that simply never reports, the failure mode hardest to notice.
+const adapterTaskQueue = "pipeline-workflows"
 
 // localDatabaseHosts are hostnames that only ever point at an in-cluster dev
 // Postgres. A staging or production deployment must use a real managed database
@@ -119,6 +128,63 @@ func requireRealEncryptionKey() {
 	}
 }
 
+// startupSettingProblems returns one message per setting the adapter needs but was
+// not given, each naming the setting and exactly what will not work without it.
+// Messages never contain a value. getenv is os.Getenv in main and a map in tests.
+//
+// These are ERROR lines, not a refusal to start: the start-path census for issue
+// #24 found INTERNAL_SERVICE_SECRET empty on the dev compose, the CI gates, a bare
+// quickstart compose and Helm, and the adapter still runs pipelines without it.
+// The ENCRYPTION_KEY rule mirrors getEncryptionKeyForDecrypt
+// (internal/workflows/nl_pipeline_v2_activities.go), the only reader of that key.
+func startupSettingProblems(getenv func(string) string) []string {
+	var problems []string
+	if strings.TrimSpace(getenv("INTERNAL_SERVICE_SECRET")) == "" {
+		problems = append(problems, "INTERNAL_SERVICE_SECRET is not set, empty or only spaces. "+
+			"Scheduled saved-query runs and the model freshness sweep call the API gateway's "+
+			"internal endpoints and will fail on every attempt, so schedules shown as active "+
+			"never run. Generate one (for example openssl rand -hex 32) and give the same value "+
+			"to api-gateway, orchestrator, temporal-adapter and frontend.")
+	}
+	// Exact, untrimmed match, like the decrypt helper: "Development" is not development.
+	environment := getenv("ENVIRONMENT")
+	isDev := environment == "development" || environment == "dev"
+	key := strings.TrimSpace(getenv("ENCRYPTION_KEY"))
+	switch {
+	case key == "" && !isDev:
+		problems = append(problems, "ENCRYPTION_KEY is not set, empty or only spaces and "+
+			"ENVIRONMENT is not development. "+encryptionKeyConsequence+" (These steps read "+
+			"ENCRYPTION_KEY, not ENCRYPTION_KEYS.) Set ENCRYPTION_KEY to the same value the API "+
+			"gateway and orchestrator use.")
+	case key != "" && len(key) < 32:
+		problems = append(problems, "ENCRYPTION_KEY is shorter than 32 characters. "+
+			encryptionKeyConsequence+" Set ENCRYPTION_KEY to the same value, at least 32 "+
+			"characters long, that the API gateway and orchestrator use.")
+	}
+	return problems
+}
+
+// encryptionKeyConsequence says what stops working when getEncryptionKeyForDecrypt
+// rejects the key. Its callers are the three self-healing activities that read a
+// connection's stored settings: FetchConnectionOAuthTokenIDActivity,
+// PlanSchemaDriftRepairActivity and ApplySchemaDDLActivity.
+const encryptionKeyConsequence = "The adapter cannot decrypt stored connection settings, so " +
+	"self-healing cannot look up a connection's OAuth token to refresh it, cannot plan a " +
+	"schema-drift repair and cannot apply the repair to the destination table."
+
+// startupCheckLogPrefix starts every startup-check line. docs/deployment/env-vars.md
+// tells operators to grep for it, so it is part of the contract.
+const startupCheckLogPrefix = "Startup check: "
+
+// reportStartupSettingProblems runs the startup check against getenv and writes each
+// problem to logger as one ERROR line starting with startupCheckLogPrefix. main passes
+// log.StandardLogger() and os.Getenv; tests pass a hooked logger and a map.
+func reportStartupSettingProblems(logger *log.Logger, getenv func(string) string) {
+	for _, problem := range startupSettingProblems(getenv) {
+		logger.Error(startupCheckLogPrefix + problem)
+	}
+}
+
 func main() {
 	// Structured JSON logging + trace-context hook (log-trace correlation)
 	telemetry.InitLogging("temporal-adapter")
@@ -139,23 +205,22 @@ func main() {
 
 	log.Info("🚀 Starting Temporal Adapter Service...")
 
-	// Prometheus /metrics endpoint (scraped by the OTEL Collector's
-	// `rsync-temporal-adapter` job → the OTLP backend). Internal-only port 8082;
-	// no host mapping. F-Obs-2.
-	metricsAddr := getEnv("METRICS_ADDR", ":8082")
+	// Ops listener: Prometheus /metrics (scraped by an OTEL Collector
+	// or Prometheus, F-Obs-2) and /version (probed by
+	// api-gateway's drift check). Internal-only port 8082; no host mapping.
+	// See ops_server.go.
+	metricsAddr := getEnv("METRICS_ADDR", defaultOpsAddr)
 	go func() {
-		mux := http.NewServeMux()
-		mux.Handle("/metrics", promhttp.Handler())
 		// Explicit timeouts (Slowloris / slow-body hardening — gosec G114).
 		srv := &http.Server{
 			Addr:              metricsAddr,
-			Handler:           mux,
+			Handler:           newOpsMux(),
 			ReadHeaderTimeout: 10 * time.Second,
 			ReadTimeout:       60 * time.Second,
 			WriteTimeout:      120 * time.Second,
 			IdleTimeout:       120 * time.Second,
 		}
-		log.WithField("addr", metricsAddr).Info("📊 Metrics server listening on /metrics")
+		log.WithField("addr", metricsAddr).Info("📊 Ops server listening on /metrics and /version")
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Warnf("metrics server error: %v", err)
 		}
@@ -171,6 +236,11 @@ func main() {
 	// on a real remote-DB deployment — the adapter must share the exact key the rest
 	// of the stack uses to decrypt connection configs. See requireRealEncryptionKey.
 	requireRealEncryptionKey()
+
+	// Settings whose absence does not stop the adapter but silently breaks a
+	// feature: one ERROR line each, naming the setting and what will not work.
+	// Before db.Init and the Temporal client, whose failures can exit the process.
+	reportStartupSettingProblems(log.StandardLogger(), os.Getenv)
 
 	// Initialize Database connection for StateUpdateActivity
 	if err := db.Init(); err != nil {
@@ -234,6 +304,9 @@ func main() {
 	// Initialize activity context (for Kafka producer and DB)
 	workflows.InitActivityContext(kafkaProducer)
 	workflows.SetDB(db.GetDB())
+	// The fan-out's dispatch activity signal-with-starts a model's refresh loop, which
+	// is a client-side operation the workflow API cannot express.
+	workflows.SetTemporalClient(temporalClient)
 
 	// Initialize correlation store for V2 activities (Phase D).
 	// REQUIRED, not optional: every V2 activity (Intent/Connector/Planner/Validator/
@@ -255,50 +328,11 @@ func main() {
 	// Create Temporal worker (registers workflows and activities).
 	// The metrics interceptor records activity/workflow outcome + duration
 	// for every execution without editing each function. F-Obs-2.
-	w := worker.New(temporalClient, "pipeline-workflows", worker.Options{
+	w := worker.New(temporalClient, adapterTaskQueue, worker.Options{
 		Interceptors: []interceptor.WorkerInterceptor{metrics.NewWorkerInterceptor()},
 	})
 
-	// Register workflows - V2 ONLY
-	w.RegisterWorkflow(workflows.NLPipelineWorkflowV2)         // V2 NL-driven workflow (deterministic, state machine)
-	w.RegisterWorkflow(workflows.ScheduledPipelineRunWorkflow) // Scheduled run wrapper (creates execution, starts child)
-	w.RegisterWorkflow(workflows.ScheduledModelRunWorkflow)    // Scheduled saved-query model rebuild (migration 085)
-
-	// Register shared activities (used by all workflows)
-	w.RegisterActivity(workflows.EmitDomainEventActivity)
-	w.RegisterActivity(workflows.SendToPipelineDLQ)
-	w.RegisterActivity(workflows.SendToAgentDLQ)
-	w.RegisterActivity(workflows.StateUpdateActivity)          // Architecture Phase 1: Authoritative state writer
-	w.RegisterActivity(workflows.UpdatePipelineStatusActivity) // Keeps pipelines.status in sync with workflow outcome
-
-	// Register V2 activities (Phase D: Request/Reply pattern)
-	w.RegisterActivity(workflows.IntentActivityV2)
-	w.RegisterActivity(workflows.ConnectorResolverActivityV2)
-	w.RegisterActivity(workflows.ConnectorAvailabilityActivityV2)
-	w.RegisterActivity(workflows.GenerateConnectorActivityV2)
-	w.RegisterActivity(workflows.ConnectionValidationActivityV2)
-	w.RegisterActivity(workflows.ConnectionValidatorActivityV2)
-	w.RegisterActivity(workflows.FetchConnectionOAuthTokenIDActivity)
-	w.RegisterActivity(workflows.RefreshOAuthTokenActivity)
-	w.RegisterActivity(workflows.PlanSchemaDriftRepairActivity)
-	w.RegisterActivity(workflows.ApplySchemaDDLActivity)
-	w.RegisterActivity(workflows.ValidateSchemaRepairActivity)
-	w.RegisterActivity(workflows.PlannerActivityV2)
-	w.RegisterActivity(workflows.ValidatorActivityV2)
-	w.RegisterActivity(workflows.CostEstimatorActivityV2)
-	w.RegisterActivity(workflows.ExecutorActivityV2)
-	w.RegisterActivity(workflows.CleanupPartialDataActivityV2)
-
-	// DAG + HITL activities
-	w.RegisterActivity(workflows.ExecuteGraphNodeActivityV2)
-	w.RegisterActivity(workflows.InterpretNodeInputActivity)
-
-	// Register scheduled run activities
-	w.RegisterActivity(workflows.CheckActiveRunActivity)
-	w.RegisterActivity(workflows.CreateScheduledExecutionActivity)
-	w.RegisterActivity(workflows.FetchPipelineRunContextActivity)
-	w.RegisterActivity(workflows.MarkExecutionFailedActivity)
-	w.RegisterActivity(workflows.RunModelActivity)
+	registerWorkflowsAndActivities(w)
 
 	log.Info("✅ Registered workflows and activities (including scheduled run workflow)")
 
@@ -309,6 +343,12 @@ func main() {
 	defer w.Stop()
 
 	log.Info("✅ Temporal worker started")
+
+	// Started AFTER w.Start(), so the queue already has a poller when the first tick
+	// lands. Started here at all — rather than by whoever first sets a deadline —
+	// because the sweep has to be running before anyone needs it: the models it exists
+	// to catch are the ones nothing else is firing for.
+	startModelFreshnessSweep(temporalClient)
 
 	// Create Kafka adapter (consumes agent.results, signals workflows)
 	kafkaAdapter, err := adapter.NewKafkaAdapter(kafkaBrokers, temporalClient)
@@ -345,6 +385,46 @@ func main() {
 	kafkaAdapter.Stop()
 	w.Stop()
 	log.Info("✅ Temporal Adapter Service stopped")
+}
+
+// startModelFreshnessSweep makes sure the singleton freshness sweep is running.
+//
+// USE_EXISTING is what makes this safe to call at every boot and from every replica: the
+// second caller is handed the running execution rather than an AlreadyStarted error, so
+// there is exactly one sweep no matter how many adapters come up. The alternative —
+// start it once by hand — leaves the monitor off after any environment rebuild, and
+// nothing would report that, because a staleness monitor that is not running looks
+// identical to a workspace where nothing is stale.
+//
+// A failure here is logged, not fatal. The adapter's other work does not depend on the
+// sweep, and refusing to boot the pipeline engine because a monitor could not start
+// would turn a reporting gap into an outage.
+func startModelFreshnessSweep(temporalClient client.Client) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Zero means the workflow uses its own default. Read HERE rather than inside the
+	// workflow because workflow code must be deterministic, and an environment read
+	// would take a different path on replay than it did on the original execution.
+	interval := 0
+	if raw := strings.TrimSpace(os.Getenv("MODEL_FRESHNESS_SWEEP_SECONDS")); raw != "" {
+		if n, err := strconv.Atoi(raw); err == nil && n > 0 {
+			interval = n
+		} else {
+			log.Warnf("⚠️  MODEL_FRESHNESS_SWEEP_SECONDS=%q is not a positive integer; using the default interval", raw)
+		}
+	}
+
+	run, err := temporalClient.ExecuteWorkflow(ctx, client.StartWorkflowOptions{
+		ID:                       workflows.ModelFreshnessWorkflowID,
+		TaskQueue:                adapterTaskQueue,
+		WorkflowIDConflictPolicy: enumspb.WORKFLOW_ID_CONFLICT_POLICY_USE_EXISTING,
+	}, workflows.ModelFreshnessWorkflow, workflows.ModelFreshnessInput{IntervalSeconds: interval})
+	if err != nil {
+		log.WithError(err).Error("⚠️  could not start the model freshness sweep; stale models will not be reported")
+		return
+	}
+	log.Infof("✅ Model freshness sweep running (workflow_id=%s run_id=%s)", run.GetID(), run.GetRunID())
 }
 
 func getEnv(key, defaultValue string) string {
@@ -393,4 +473,58 @@ func createKafkaProducer(brokers string) (sarama.SyncProducer, error) {
 		return nil, err
 	}
 	return sarama.NewSyncProducer(security.Brokers, config)
+}
+
+// registerWorkflowsAndActivities puts every workflow and activity on the worker.
+// A function of its own, taking the registry interface, so a test can run a
+// workflow through exactly this registration: an activity missing here fails only
+// at run time, when a workflow first schedules it.
+func registerWorkflowsAndActivities(r worker.Registry) {
+	// Register workflows - V2 ONLY
+	r.RegisterWorkflow(workflows.NLPipelineWorkflowV2)         // V2 NL-driven workflow (deterministic, state machine)
+	r.RegisterWorkflow(workflows.ScheduledPipelineRunWorkflow) // Scheduled run wrapper (creates execution, starts child)
+	r.RegisterWorkflow(workflows.ScheduledModelRunWorkflow)    // Scheduled saved-query model rebuild (migration 085)
+	r.RegisterWorkflow(workflows.ModelRefreshWorkflow)         // Event-triggered model rebuild, one long-lived run per model
+	r.RegisterWorkflow(workflows.UpstreamFanOutWorkflow)       // One completion -> one child per downstream model
+	r.RegisterWorkflow(workflows.ModelRefreshDispatchWorkflow) // One child: deliver one completion to one model
+	r.RegisterWorkflow(workflows.ModelFreshnessWorkflow)       // Singleton durable timer: notices rebuilds that never came
+
+	// Register shared activities (used by all workflows)
+	r.RegisterActivity(workflows.EmitDomainEventActivity)
+	r.RegisterActivity(workflows.SendToPipelineDLQ)
+	r.RegisterActivity(workflows.SendToAgentDLQ)
+	r.RegisterActivity(workflows.StateUpdateActivity)          // Architecture Phase 1: Authoritative state writer
+	r.RegisterActivity(workflows.UpdatePipelineStatusActivity) // Keeps pipelines.status in sync with workflow outcome
+
+	// Register V2 activities (Phase D: Request/Reply pattern)
+	r.RegisterActivity(workflows.IntentActivityV2)
+	r.RegisterActivity(workflows.ConnectorResolverActivityV2)
+	r.RegisterActivity(workflows.ConnectorAvailabilityActivityV2)
+	r.RegisterActivity(workflows.GenerateConnectorActivityV2)
+	r.RegisterActivity(workflows.ConnectionValidationActivityV2)
+	r.RegisterActivity(workflows.ConnectionValidatorActivityV2)
+	r.RegisterActivity(workflows.FetchConnectionOAuthTokenIDActivity)
+	r.RegisterActivity(workflows.RefreshOAuthTokenActivity)
+	r.RegisterActivity(workflows.PlanSchemaDriftRepairActivity)
+	r.RegisterActivity(workflows.ApplySchemaDDLActivity)
+	r.RegisterActivity(workflows.ValidateSchemaRepairActivity)
+	r.RegisterActivity(workflows.PlannerActivityV2)
+	r.RegisterActivity(workflows.ValidatorActivityV2)
+	r.RegisterActivity(workflows.CostEstimatorActivityV2)
+	r.RegisterActivity(workflows.ExecutorActivityV2)
+	r.RegisterActivity(workflows.CleanupPartialDataActivityV2)
+
+	// DAG + HITL activities
+	r.RegisterActivity(workflows.ExecuteGraphNodeActivityV2)
+	r.RegisterActivity(workflows.InterpretNodeInputActivity)
+
+	// Register scheduled run activities
+	r.RegisterActivity(workflows.CheckActiveRunActivity)
+	r.RegisterActivity(workflows.CreateScheduledExecutionActivity)
+	r.RegisterActivity(workflows.FetchPipelineRunContextActivity)
+	r.RegisterActivity(workflows.MarkExecutionFailedActivity)
+	r.RegisterActivity(workflows.RunModelActivity)
+	r.RegisterActivity(workflows.RecordModelRunFailureActivity) // Records a model run that never reported a result
+	r.RegisterActivity(workflows.SignalModelRefreshActivity)
+	r.RegisterActivity(workflows.SweepModelFreshnessActivity)
 }

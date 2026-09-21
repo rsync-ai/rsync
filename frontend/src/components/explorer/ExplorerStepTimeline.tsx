@@ -292,7 +292,7 @@ function StepNode({ step, isLast, isExpanded, onToggle }: StepNodeProps) {
                 )}
               </div>
               {step.description && (
-                <p className="text-xs text-zinc-500 truncate">{step.description}</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">{step.description}</p>
               )}
               {step.status === "failed" && step.error && (
                 <div className="flex items-center gap-1 text-xs text-red-500 mt-1">
@@ -317,13 +317,13 @@ function StepNode({ step, isLast, isExpanded, onToggle }: StepNodeProps) {
             {/* Inputs */}
             {step.inputs && step.inputs.length > 0 && (
               <div className="space-y-1">
-                <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider">
+                <div className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">
                   Inputs
                 </div>
                 <div className="bg-zinc-50 dark:bg-zinc-900 rounded-md p-2 space-y-1">
                   {step.inputs.map((input, i) => (
                     <div key={i} className="flex items-start gap-2 text-xs">
-                      <span className="text-zinc-500 shrink-0">{input.key}:</span>
+                      <span className="text-zinc-500 dark:text-zinc-400 shrink-0">{input.key}:</span>
                       <span className="font-mono text-zinc-700 dark:text-zinc-300 break-all">
                         {formatValue(input.value)}
                       </span>
@@ -336,13 +336,13 @@ function StepNode({ step, isLast, isExpanded, onToggle }: StepNodeProps) {
             {/* Outputs */}
             {step.outputs && step.outputs.length > 0 && (
               <div className="space-y-1">
-                <div className="text-[10px] font-medium text-zinc-500 uppercase tracking-wider">
+                <div className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400 uppercase tracking-wider">
                   Outputs
                 </div>
                 <div className="bg-zinc-50 dark:bg-zinc-900 rounded-md p-2 space-y-1">
                   {step.outputs.map((output, i) => (
                     <div key={i} className="flex items-start gap-2 text-xs">
-                      <span className="text-zinc-500 shrink-0">{output.key}:</span>
+                      <span className="text-zinc-500 dark:text-zinc-400 shrink-0">{output.key}:</span>
                       <span className="font-mono text-zinc-700 dark:text-zinc-300 break-all">
                         {formatValue(output.value)}
                       </span>
@@ -448,7 +448,7 @@ export function ExplorerStepTimeline({ run, onRetry, className }: ExplorerStepTi
 
       {/* Question */}
       <div className="p-2 bg-zinc-50 dark:bg-zinc-900 rounded-lg">
-        <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Question</div>
+        <div className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-1">Question</div>
         <p className="text-sm text-zinc-700 dark:text-zinc-300">{run.question}</p>
       </div>
 

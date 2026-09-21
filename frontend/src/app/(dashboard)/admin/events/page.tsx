@@ -110,22 +110,22 @@ export default function AdminRawEventsPage() {
       <Card className="p-4 space-y-3">
         <div className="grid gap-3 md:grid-cols-2">
           <div className="space-y-1">
-            <div className="text-sm text-zinc-500">Pipeline ID</div>
+            <div className="text-sm text-zinc-500 dark:text-zinc-400">Pipeline ID</div>
             <Input value={pipelineId} onChange={(e) => setPipelineId(e.target.value)} placeholder="uuid" />
           </div>
           <div className="space-y-1">
-            <div className="text-sm text-zinc-500">Execution ID (optional)</div>
+            <div className="text-sm text-zinc-500 dark:text-zinc-400">Execution ID (optional)</div>
             <Input value={executionId} onChange={(e) => setExecutionId(e.target.value)} placeholder="uuid" />
           </div>
         </div>
 
         <div className="grid gap-3 md:grid-cols-2">
           <div className="space-y-1">
-            <div className="text-sm text-zinc-500">Limit (max 200)</div>
+            <div className="text-sm text-zinc-500 dark:text-zinc-400">Limit (max 200)</div>
             <Input value={limit} onChange={(e) => setLimit(e.target.value)} placeholder="50" />
           </div>
           <div className="space-y-1">
-            <div className="text-sm text-zinc-500">Justification</div>
+            <div className="text-sm text-zinc-500 dark:text-zinc-400">Justification</div>
             <Input
               value={justification}
               onChange={(e) => setJustification(e.target.value)}
@@ -179,7 +179,7 @@ export default function AdminRawEventsPage() {
 
           <div className="mt-4 space-y-2">
             {(data.events || []).length === 0 ? (
-              <div className="text-sm text-zinc-500">No events returned</div>
+              <div className="text-sm text-zinc-500 dark:text-zinc-400">No events returned</div>
             ) : (
               data.events.map((e, idx) => (
                 <details
@@ -188,9 +188,9 @@ export default function AdminRawEventsPage() {
                 >
                   <summary className="cursor-pointer select-none">
                     <span className="font-medium">{e.event_type}</span>{" "}
-                    <span className="ml-2 text-xs text-zinc-500 font-mono">{e.event_id}</span>
+                    <span className="ml-2 text-xs text-zinc-500 dark:text-zinc-400 font-mono">{e.event_id}</span>
                   </summary>
-                  <div className="mt-2 text-xs text-zinc-500">
+                  <div className="mt-2 text-xs text-zinc-500 dark:text-zinc-400">
                     received_at: <span className="font-mono">{e.received_at}</span>
                     {typeof e.seq === "number" ? (
                       <>

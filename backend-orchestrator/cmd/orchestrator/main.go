@@ -103,6 +103,19 @@ func requireRemoteDatabase(host string) {
 	}
 }
 
+// startupCheckLogPrefix starts every startup-check line. docs/deployment/env-vars.md
+// tells operators to grep for it, so it is part of the contract.
+const startupCheckLogPrefix = "Startup check: "
+
+// reportStartupSettingProblems runs config.StartupSettingProblems against getenv and
+// writes each problem to logger as one ERROR line starting with startupCheckLogPrefix.
+// main passes log.StandardLogger() and os.Getenv; tests pass a hooked logger and a map.
+func reportStartupSettingProblems(logger *log.Logger, getenv func(string) string) {
+	for _, problem := range config.StartupSettingProblems(getenv) {
+		logger.Error(startupCheckLogPrefix + problem)
+	}
+}
+
 // cdcControlOutcome maps the status Kafka Connect returned for a CDC control
 // action ("restart" / "pause" / "resume") onto the HTTP status the orchestrator
 // answers with, plus the operator-facing message when Connect refused.
@@ -229,9 +242,30 @@ func setupLogging(cfg *config.Config) {
 // emitCDCStatusMetrics emits a best-effort DATA_PLANE_METRICS event derived from CDC status checks.
 // This gives the UI a real-time stream (via pipeline.domain.events) without requiring connectors to be modified.
 // It now includes CDC lag/freshness metrics computed from Kafka consumer group offsets.
+// cdcStatusMetricsApplyToSyncMode reports whether a pipeline with this persisted
+// sync_mode may receive CDC status metrics. Only an explicit "batch" is excluded:
+// an empty sync_mode is a legacy row whose mode is carried by cdc_mode, and
+// streaming pipelines are fed by the same connector/sink machinery.
+func cdcStatusMetricsApplyToSyncMode(syncMode string) bool {
+	return !strings.EqualFold(strings.TrimSpace(syncMode), "batch")
+}
+
 func emitCDCStatusMetrics(ctx context.Context, kafkaManager *kafka.Manager, db *sql.DB, pipelineID string, connectorName string, resp executor.ExecutorResponse) {
 	if kafkaManager == nil || pipelineID == "" {
 		return
+	}
+	// The status route is polled by any UI that believes the pipeline is CDC, and
+	// it answers a missing connector (404) too. Without this guard every poll of a
+	// BATCH pipeline wrote a "CDC data plane metrics update" row into its run
+	// history (Monitoring -> Trace) and a zero-row DATA_PLANE_METRICS sample into
+	// its overview.
+	if db != nil {
+		var syncMode sql.NullString
+		if err := db.QueryRowContext(ctx, `SELECT sync_mode FROM pipelines WHERE id = $1::uuid`, pipelineID).Scan(&syncMode); err == nil {
+			if !cdcStatusMetricsApplyToSyncMode(syncMode.String) {
+				return
+			}
+		}
 	}
 
 	traceID := telemetry.TraceIDFromContext(ctx)
@@ -270,39 +304,10 @@ func emitCDCStatusMetrics(ctx context.Context, kafkaManager *kafka.Manager, db *
 	// legacy bare name only when no manifest row exists.
 	sinkGroupID := handlers.ResolveSinkConsumerGroup(ctx, db, pipelineID)
 
-	var cdcLagMs *int64
-	var cdcFreshnessMs *int64
-	var rowsProcessed *int64
-	var bytesProcessed *int64
-
 	// Best-effort: fetch consumer group lag
 	lagByTopic, err := kafkaManager.GetConsumerGroupLag(sinkGroupID)
-	if err == nil && len(lagByTopic) > 0 {
-		// Sum lag across all topics (usually just one topic per pipeline)
-		var totalLag int64
-		for _, lag := range lagByTopic {
-			totalLag += lag
-		}
-		// Approximate lag in milliseconds (assume 1 message = 1ms, very rough)
-		// In a real system, you'd compute this from Kafka timestamps.
-		lagMs := totalLag * 10 // Rough heuristic: 10ms per message lag
-		cdcLagMs = &lagMs
-
-		// Freshness: if lag is 0, freshness is ~0; else it's proportional to lag.
-		freshnessMs := lagMs
-		cdcFreshnessMs = &freshnessMs
-
-		// Estimate rows processed from committed offsets (very rough)
-		// In a real system, you'd track this in the sink or via Kafka metrics.
-		estimatedRows := int64(0)
-		for _, lag := range lagByTopic {
-			// If lag is X, assume we've processed (high_water_mark - lag) messages.
-			// This is a placeholder; real implementation would query Kafka offsets.
-			estimatedRows += (lag * 10) // Placeholder multiplier
-		}
-		if estimatedRows > 0 {
-			rowsProcessed = &estimatedRows
-		}
+	if err != nil {
+		lagByTopic = nil
 	}
 
 	event := map[string]interface{}{
@@ -316,18 +321,7 @@ func emitCDCStatusMetrics(ctx context.Context, kafkaManager *kafka.Manager, db *
 		"stage_group":    "executing",
 		"status":         "processing",
 		"message":        "CDC data plane metrics update",
-		"metadata": map[string]interface{}{
-			"source":           "cdc_status_poll",
-			"metrics_schema":   "v2", // Standardized schema version
-			"connector_name":   connectorName,
-			"rows_processed":   rowsProcessed,
-			"bytes_processed":  bytesProcessed,
-			"cdc_lag_ms":       cdcLagMs,
-			"cdc_freshness_ms": cdcFreshnessMs,
-			"health_status":    result["health_status"],
-			"connector_state":  result["connector_state"],
-			"task_states":      result["task_states"],
-		},
+		"metadata":       cdcStatusMetricsMetadata(connectorName, lagByTopic, result),
 	}
 
 	b, err := json.Marshal(event)
@@ -342,6 +336,49 @@ func emitCDCStatusMetrics(ctx context.Context, kafkaManager *kafka.Manager, db *
 		log.WithError(err).
 			WithFields(log.Fields{"pipeline_id": pipelineID, "trace_id": traceID}).
 			Warn("emitCDCStatusMetricsEvent: kafka produce failed")
+	}
+}
+
+// cdcStatusMetricsMetadata builds the metadata of the status poll's DATA_PLANE_METRICS event
+// from the sink consumer group's per-topic lag (nil when it could not be read).
+//
+// It carries no row or byte count. Lag says how far behind the sink is, not how much it
+// wrote, and the lag-times-ten "estimate" this used to send as rows_processed showed as
+// "written 12800" on a pipeline that had applied 72,670 rows. Row counts come from the
+// sink's own counters (pipeline table stats).
+func cdcStatusMetricsMetadata(connectorName string, lagByTopic map[string]int64, result map[string]interface{}) map[string]interface{} {
+	var cdcLagMs *int64
+	var cdcFreshnessMs *int64
+	var sinkLagMessages *int64
+	if len(lagByTopic) > 0 {
+		// Sum lag across all topics (usually just one topic per pipeline)
+		var totalLag int64
+		for _, lag := range lagByTopic {
+			totalLag += lag
+		}
+		// The measured value: changes in Kafka the sink has not read yet. The
+		// Monitoring overview shows this count; cdc_lag_ms below is only an estimate.
+		sinkLagMessages = &totalLag
+		// Approximate lag in milliseconds (assume 1 message = 1ms, very rough)
+		// In a real system, you'd compute this from Kafka timestamps.
+		lagMs := totalLag * 10 // Rough heuristic: 10ms per message lag
+		cdcLagMs = &lagMs
+
+		// Freshness: if lag is 0, freshness is ~0; else it's proportional to lag.
+		freshnessMs := lagMs
+		cdcFreshnessMs = &freshnessMs
+	}
+
+	return map[string]interface{}{
+		"source":            "cdc_status_poll",
+		"metrics_schema":    "v2", // Standardized schema version
+		"connector_name":    connectorName,
+		"cdc_lag_ms":        cdcLagMs,
+		"cdc_freshness_ms":  cdcFreshnessMs,
+		"sink_lag_messages": sinkLagMessages,
+		"health_status":     result["health_status"],
+		"connector_state":   result["connector_state"],
+		"task_states":       result["task_states"],
 	}
 }
 
@@ -405,6 +442,12 @@ func main() {
 	// temporal-adapter so a staging/prod launch that lost --env-file .env.staging
 	// crashes here instead of serving an empty/wrong database.
 	requireRemoteDatabase(cfg.Database.Host)
+
+	// Settings whose absence does not stop the orchestrator but silently breaks a
+	// feature: one ERROR line each, naming the setting and what will not work.
+	// Called here, not in init(), so `go test ./cmd/orchestrator/` never runs it,
+	// and before sql.Open/db.Ping, whose failures exit the process.
+	reportStartupSettingProblems(log.StandardLogger(), os.Getenv)
 
 	// Initialize PostgreSQL database connection using config
 	db, err := sql.Open("postgres", cfg.Database.ConnectionString())
@@ -1353,7 +1396,7 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 
 			envelope, err := executorAgent.DiscoverSchemaEnvelope(c.Request.Context(), req.ConnectorType, req.Config, params)
 			if err != nil {
-				c.JSON(http.StatusServiceUnavailable, gin.H{"error": "schema discovery failed", "details": err.Error()})
+				c.JSON(discoverSchemaErrorResponse(err))
 				return
 			}
 
@@ -1446,6 +1489,40 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			})
 		})
 
+		// list-namespaces: the names one level above a connector's tables
+		// (schemas, databases or datasets, per its metadata.json
+		// namespace_model), from the connector's list_namespaces operation.
+		// Used by the api-gateway's GET /connections/:id/namespaces.
+		api.POST("/agent/list-namespaces", requirePrincipal(db), func(c *gin.Context) {
+			var req struct {
+				ConnectorType string                 `json:"connector_type" binding:"required"`
+				Config        map[string]interface{} `json:"config"`
+				ConnectionID  string                 `json:"connection_id,omitempty"`
+			}
+			if err := c.ShouldBindJSON(&req); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body", "details": err.Error()})
+				return
+			}
+			log.WithFields(log.Fields{
+				"connector_type": req.ConnectorType,
+				"connection_id":  req.ConnectionID,
+				"config_keys":    len(req.Config),
+			}).Info("🗂️  Agent: list_namespaces (HTTP)")
+
+			names, current, err := executorAgent.ListNamespaces(c.Request.Context(), req.ConnectorType, req.Config)
+			if err != nil {
+				c.JSON(http.StatusBadGateway, gin.H{
+					"error":   "list_namespaces failed",
+					"details": err.Error(),
+				})
+				return
+			}
+			c.JSON(http.StatusOK, gin.H{
+				"namespaces": names,
+				"current":    current,
+			})
+		})
+
 		// explorer-query: delegated statement execution for the Data Explorer. Runs a
 		// user's statement through the connector's MCP tool — used for warehouses the
 		// api-gateway has no native driver for (e.g. BigQuery). When write=false it runs
@@ -1515,7 +1592,9 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 				ConnectorType string                 `json:"connector_type" binding:"required"`
 				Config        map[string]interface{} `json:"config"`
 				ConnectionID  string                 `json:"connection_id,omitempty"`
-				Collection    string                 `json:"collection" binding:"required"`
+				// Database picks the database on a server-level connection.
+				Database   string `json:"database,omitempty"`
+				Collection string `json:"collection" binding:"required"`
 				// Raw so a 64-bit integer in a filter reaches the connector as written
 				// (a map[string]interface{} would round it through float64).
 				Filter     json.RawMessage `json:"filter,omitempty"`
@@ -1544,6 +1623,9 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			}).Info("📄 Agent: explorer_find (HTTP)")
 
 			spec := map[string]interface{}{"collection": req.Collection}
+			if req.Database != "" {
+				spec["database"] = req.Database
+			}
 			if len(req.Filter) > 0 {
 				spec["filter"] = req.Filter
 			}
@@ -1813,16 +1895,25 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 					return
 				}
 
+				// Flatten the Kafka Connect payload into the fields the UI and the metrics
+				// emitter read (issue #20: the chip showed "Status unavailable" while RUNNING
+				// because connector_state/healthy were never set).
+				summary := summarizeKafkaConnectStatus(statusPayload)
+
 				// Create an ExecutorResponse-shaped object so emitCDCStatusMetrics can compute lag/freshness.
 				resp := executor.ExecutorResponse{
 					TaskID:     uuid.NewString(),
 					PipelineID: pipelineID,
 					Status:     "running",
 					Result: map[string]interface{}{
-						"connector_name": connectorName,
-						"connect_url":    connectURL,
-						"data":           statusPayload,
-						"status_code":    httpResp.StatusCode,
+						"connector_name":  connectorName,
+						"connect_url":     connectURL,
+						"data":            statusPayload,
+						"status_code":     httpResp.StatusCode,
+						"connector_state": summary.ConnectorState,
+						"task_states":     summary.TaskStates,
+						"healthy":         summary.Healthy,
+						"health_status":   summary.healthStatus(),
 					},
 				}
 				mctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -1837,9 +1928,12 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 					ConnectorName:   connectorName,
 					RecoveryEnabled: recoveryEnabled,
 					Result: map[string]interface{}{
-						"connector_name": connectorName,
-						"status":         statusPayload,
-						"status_code":    httpResp.StatusCode,
+						"connector_name":  connectorName,
+						"status":          statusPayload, // raw payload, kept for compatibility
+						"status_code":     httpResp.StatusCode,
+						"connector_state": summary.ConnectorState,
+						"healthy":         summary.Healthy,
+						"tasks":           summary.Tasks,
 					},
 				})
 			})
@@ -2031,7 +2125,7 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			})
 
 			// DMS-like "reload/backfill" for newly added tables (Debezium ad-hoc snapshot).
-			cdcGrp.POST("/cdc/pipelines/:pipeline_id/backfill", handlers.BackfillCDCTables(db))
+			cdcGrp.POST("/cdc/pipelines/:pipeline_id/backfill", handlers.BackfillCDCTables(db, kafkaManager))
 			// Guarded operator-initiated recovery (FAILED → resnapshot / resume).
 			cdcGrp.POST("/cdc/pipelines/:pipeline_id/recover", handlers.RecoverCDCPipeline(db))
 			// Restart sink worker to pick up newly-added CDC topics.
@@ -2088,13 +2182,17 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 		// One SourceAssessor per supported source type. Adding a new
 		// PostgreSQL-family or MySQL-family source = one line below.
 		assessmentRegistry := assessor.NewRegistry()
+		assessmentMCP := mcp.NewClient(mcpServerManager)
 		assessmentRegistry.Register(assessor.NewPostgresAssessor())
 		assessmentRegistry.Register(assessor.NewMySQLAssessor())
+		// MongoDB: the connector's test_connection plus its CDC-readiness probe
+		// (topology, change stream access, oplog window).
+		assessmentRegistry.Register(assessor.NewMongoDBAssessor(assessmentMCP))
 		// Universal fallback: any source WITHOUT a dedicated deep assessor
 		// (every SaaS/REST/GraphQL/cloud-storage/warehouse connector) is still
 		// pre-flighted via its own MCP test_connection — connectivity, required
 		// config and credential/scope validity. Read-only; never mutates source.
-		assessmentRegistry.SetDefault(assessor.NewConnectorAssessor(mcp.NewClient(mcpServerManager)))
+		assessmentRegistry.SetDefault(assessor.NewConnectorAssessor(assessmentMCP))
 		connMgr := connections.NewManager(db)
 		assessmentHandler := handlers.NewAssessmentHandler(db, connMgr, assessmentRegistry)
 		assessmentHandler.RegisterRoutes(api)

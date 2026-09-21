@@ -129,7 +129,7 @@ function AgentActivityPanelV2({ activity }: { activity: AgentActivity }) {
           {activity.agent}
         </h3>
         <div className="flex items-center gap-2">
-          <span className="text-sm text-zinc-500">{elapsedTime.toFixed(1)}s</span>
+          <span className="text-sm text-zinc-500 dark:text-zinc-400">{elapsedTime.toFixed(1)}s</span>
           <Badge className="bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300">
             <Loader2 className="mr-1 h-3 w-3 animate-spin" />
             Working
@@ -162,7 +162,7 @@ function AgentActivityPanelV2({ activity }: { activity: AgentActivity }) {
               "text-sm",
               step.status === "complete" && "text-zinc-600 dark:text-zinc-400",
               step.status === "running" && "font-medium text-violet-700 dark:text-violet-300",
-              step.status === "pending" && "text-zinc-400 dark:text-zinc-500",
+              step.status === "pending" && "text-zinc-400",
               step.status === "error" && "text-red-600 dark:text-red-400"
             )}>
               {formatStepName(step.name)}

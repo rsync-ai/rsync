@@ -67,6 +67,18 @@ export function stageDurationMs(stage: {
   return null
 }
 
+/**
+ * The one way a stage duration is written: "184ms", "4.2s", "3m 28s". The Steps
+ * graph and the Overview's stage list both use it, so one stage reads the same
+ * in both places.
+ *
+ * The body lived here and was a copy: it still rounded the seconds remainder, so
+ * it printed "2m 60s" for 2m59.6s long after #37 fixed that in the other copy,
+ * and it had no hours branch, so a two-hour stage read "120m". Re-exported from
+ * `@/lib/duration` now — same name, same importers, one implementation.
+ */
+export { formatDuration } from "@/lib/duration"
+
 // Heuristic: anomaly if duration is > 3x the median across same-kind stages.
 // Returns the multiplier (e.g. 4.2) if anomalous, null otherwise.
 export function detectDurationAnomaly(

@@ -285,33 +285,33 @@ func FuzzyMatchConnector(input string, knownConnectors []string, maxDist int) (s
 	return "", false
 }
 
+// connectorAliases maps short user-facing names to the canonical connector id
+// used on disk and in connector_catalog. Every VALUE must name a connector that
+// exists in shared/mcp-connectors -- a connector directory, or a name that
+// connector declares in its own metadata.json `aliases` array. Pinned by
+// TestEveryNormalizerTargetHasAConnector.
+var connectorAliases = map[string]string{
+	"s3":              "aws-s3",
+	"amazon-s3":       "aws-s3",
+	"postgres":        "postgresql",
+	"postgesql":       "postgresql", // common typo
+	"pg":              "postgresql",
+	"mongo":           "mongodb",
+	"gcs":             "google-cloud-storage",
+	"azure-blob":      "azure-blob-storage",
+	"bq":              "bigquery",
+	"mssql":           "sqlserver",
+	"sql-server":      "sqlserver",
+	"oracledb":        "oracle",
+	"oracle-db":       "oracle",
+	"oracle-database": "oracle",
+	"shopify":         "shopify-admin-graphql",
+}
+
 // NormalizeConnectorName normalizes common connector name variations
 func NormalizeConnectorName(name string) string {
 	normalized := strings.ToLower(strings.TrimSpace(name))
-
-	// Common aliases. Short user-facing names map to the canonical connector
-	// id used on disk and in connector_catalog.
-	aliases := map[string]string{
-		"s3":              "aws-s3",
-		"amazon-s3":       "aws-s3",
-		"postgres":        "postgresql",
-		"postgesql":       "postgresql", // common typo
-		"pg":              "postgresql",
-		"mongo":           "mongodb",
-		"gcs":             "google-cloud-storage",
-		"azure-blob":      "azure-blob-storage",
-		"bq":              "bigquery",
-		"elasticsearch":   "elasticsearch",
-		"es":              "elasticsearch",
-		"mssql":           "sqlserver",
-		"sql-server":      "sqlserver",
-		"oracledb":        "oracle",
-		"oracle-db":       "oracle",
-		"oracle-database": "oracle",
-		"shopify":         "shopify-admin-graphql",
-	}
-
-	if alias, ok := aliases[normalized]; ok {
+	if alias, ok := connectorAliases[normalized]; ok {
 		return alias
 	}
 	return normalized

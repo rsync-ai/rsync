@@ -9,6 +9,7 @@ import { Card, CardContent } from "@/components/ui/card"
 import { DataLoadingStrategyCard } from "@/components/pipeline/DataLoadingStrategyCard"
 import { PipelineSchedulePanel } from "@/components/pipeline/PipelineSchedulePanel"
 import { PipelineLiveStatePanel } from "@/components/pipeline/PipelineLiveStatePanel"
+import { PipelineRecentRuns } from "@/components/pipeline/PipelineRecentRuns"
 import { SelfHealingPanel } from "@/components/pipeline/SelfHealingPanel"
 import { PipelineMonitoringPanelNoSSR } from "@/components/pipeline/PipelineMonitoringPanelNoSSR"
 import { ExecutionHistoryTab } from "@/components/pipeline/ExecutionHistoryTab"
@@ -17,8 +18,9 @@ import { PipelineTransformsTab } from "@/components/pipeline/PipelineTransformsT
 import { CDCLagAlertsPanel } from "@/components/pipeline/CDCLagAlertsPanel"
 import { PipelineHealthHeader } from "@/components/pipeline/PipelineHealthHeader"
 import { MonitorTab } from "@/components/pipeline/MonitorTab"
+import { AssessmentTab, AssessmentTabBadge } from "@/components/pipeline/AssessmentTab"
 
-type TabValue = "overview" | "history" | "steps" | "table-stats" | "transforms" | "monitor"
+type TabValue = "overview" | "history" | "steps" | "table-stats" | "transforms" | "monitor" | "assessment"
 
 function normalizeTab(v: unknown): TabValue {
   const s = String(v || "").trim()
@@ -28,7 +30,8 @@ function normalizeTab(v: unknown): TabValue {
     s === "steps" ||
     s === "table-stats" ||
     s === "transforms" ||
-    s === "monitor"
+    s === "monitor" ||
+    s === "assessment"
   )
     return s
   return "overview"
@@ -84,6 +87,12 @@ export function PipelineDetailTabsClient(props: {
               transform-level monitoring that lives inside the Transforms tab. The
               tab value stays "monitor" to keep existing deep links working. */}
           <TabsTrigger value="monitor">Data flow</TabsTrigger>
+          {/* Pre-migration assessment (DMS-style checks). The badge is the newest
+              run's open Critical count, else its High count. */}
+          <TabsTrigger value="assessment">
+            Assessment
+            <AssessmentTabBadge pipelineId={pipelineId} />
+          </TabsTrigger>
         </TabsList>
 
       {/* Overview Tab */}
@@ -99,6 +108,11 @@ export function PipelineDetailTabsClient(props: {
             </CardContent>
           </Card>
         )}
+
+        {/* How the scheduled runs went (batch only — CDC has no discrete runs;
+            the health header covers it). Under the schedule on purpose: when it
+            runs, then how those runs went. */}
+        {pipelineType !== "cdc" && <PipelineRecentRuns pipelineId={pipelineId} />}
 
         {/* Live State */}
         <PipelineLiveStatePanel pipelineId={pipelineId} />
@@ -147,15 +161,27 @@ export function PipelineDetailTabsClient(props: {
       </TabsContent>
 
       {/* Monitor Tab */}
+      {/* Order, top to bottom: lag alert, Monitoring, Throughput, Diagnose,
+          Dependencies. Alerts first; then the card with the run's status and
+          its Pause/Resume/Stop controls; then the numbers. */}
       <TabsContent value="monitor" className="space-y-6">
         {/* CDC Source Lag Alerts (CDC pipelines only) — moved here from Overview. */}
         {pipelineType === "cdc" && (
           <CDCLagAlertsPanel pipelineId={pipelineId} />
         )}
-        <MonitorTab pipelineId={pipelineId} />
-        {/* Rich monitoring (Overview / Trace event history) — moved here from
-            the Overview tab to remove the duplicate monitoring surface. */}
+        {/* Monitoring (Overview / Activity) — moved here from the Overview tab
+            to remove the duplicate monitoring surface. */}
         <PipelineMonitoringPanelNoSSR pipelineId={pipelineId} variant="monitoring" />
+        <MonitorTab pipelineId={pipelineId} />
+      </TabsContent>
+
+      {/* Assessment Tab */}
+      <TabsContent value="assessment">
+        <Card>
+          <CardContent className="pt-6">
+            <AssessmentTab pipelineId={pipelineId} pipelineType={pipelineType} />
+          </CardContent>
+        </Card>
       </TabsContent>
       </Tabs>
     </div>

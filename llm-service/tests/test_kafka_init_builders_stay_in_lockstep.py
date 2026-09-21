@@ -1,8 +1,8 @@
-"""One SASL mechanism -> JAAS login module mapping, written out SEVEN times.
+"""One SASL mechanism -> JAAS login module mapping, written out EIGHT times.
 
 docker-compose.quickstart.yml:309 says the compose kafka-init builder and the
 Helm one are "hand-kept in lockstep". Nothing checked that, and the comment
-undercounts: seven tracked files encode the same mapping, in four different
+undercounts: eight tracked files encode the same mapping, in four different
 syntaxes.
 
   docker-compose.quickstart.yml                      Docker install path
@@ -12,11 +12,13 @@ syntaxes.
   shared/mcp-connectors/.../debezium/connector.py     Debezium schema history client
   scripts/kafka-init-new-topics.sh                    add-a-topic operational script
   deploy/helm/rsync-ai/test/kind/broker-up.sh         kind probe (the drift DETECTOR)
+  shared/internal/infra/kafka-connect/connect-entrypoint.sh
+                                                      Kafka Connect worker + tasks (both installs)
 
 They cannot be factored into one file. install.sh downloads exactly ONE file
 (the quickstart compose), so the compose side can ship no sidecar to source;
 the chart renders rather than executes; the Python tiers ship in images that do
-not contain the shell scripts. Duplication is the design. What was missing is
+not contain the shell scripts; the Connect image carries its own entrypoint. Duplication is the design. What was missing is
 the check that the duplicates agree.
 
 Why drift here is expensive rather than annoying: a Kafka client whose security
@@ -27,12 +29,12 @@ failure both kafka-init builders exist to convert into a message, and the reason
 they write AdminClient timeouts even for PLAINTEXT.
 
 The mapping is pinned as a CANONICAL constant rather than compared pairwise, so
-the test states the truth instead of only detecting disagreement: seven sites
+the test states the truth instead of only detecting disagreement: eight sites
 that had all drifted the same way would pass a pairwise check. Adding a fifth
 mechanism is meant to require editing CANONICAL here -- that is the point, not
 friction.
 
-What this file deliberately does NOT assert: that the seven reject AWS_MSK_IAM
+What this file deliberately does NOT assert: that the eight reject AWS_MSK_IAM
 in the same PLACE. The chart rejects it at RENDER time (_helpers.tpl's `fail`),
 so it can never reach the job; everything else has no render step and must fail
 at runtime. Same outcome, necessarily different mechanism.
@@ -59,6 +61,7 @@ DEBEZIUM = (
 )
 OPS_SCRIPT = REPO / "scripts" / "kafka-init-new-topics.sh"
 KIND_PROBE = REPO / "deploy" / "helm" / "rsync-ai" / "test" / "kind" / "broker-up.sh"
+CONNECT_ENTRYPOINT = REPO / "shared" / "internal" / "infra" / "kafka-connect" / "connect-entrypoint.sh"
 
 PLAIN_MODULE = "org.apache.kafka.common.security.plain.PlainLoginModule"
 SCRAM_MODULE = "org.apache.kafka.common.security.scram.ScramLoginModule"
@@ -173,6 +176,17 @@ SITES = {
     "debezium(connector._JAAS_MODULES)": (DEBEZIUM, _py_dict_modules),
     "scripts(kafka-init-new-topics.sh)": (OPS_SCRIPT, _case_arm_modules),
     "kind(broker-up.sh probe)": (KIND_PROBE, _case_arm_modules),
+    "kafka-connect(image entrypoint)": (CONNECT_ENTRYPOINT, _case_arm_modules),
+}
+
+# Files that name all three login modules without being a client's
+# mechanism -> module mapping. Each entry states why; one that stops naming all
+# three fails as stale, so an exemption cannot outlive its reason.
+NOT_A_CLIENT_MAPPING = {
+    "deploy/helm/rsync-ai/test/kind/kafka-matrix/run.py": (
+        "the test broker's own server.properties, one module per SASL listener; "
+        "a wrong pairing there fails every SASL cell of the matrix itself"
+    ),
 }
 
 
@@ -188,17 +202,17 @@ def test_every_site_encodes_the_canonical_mechanism_mapping(name):
         "The login module is a function of the mechanism. A wrong pairing fails the "
         "handshake with a message naming the MODULE, not the mechanism, so it reads "
         "as a broken broker rather than a config mismatch -- and a MISSING pairing "
-        "does not fail at all, it hangs. There are seven copies of this mapping "
+        "does not fail at all, it hangs. There are eight copies of this mapping "
         "(see the module docstring); a change has to land on all of them."
     )
 
 
-def test_no_eighth_copy_of_the_mapping_appeared_unguarded():
+def test_no_unregistered_copy_of_the_mapping_appeared():
     """Discovery, not a hardcoded list -- the copies outnumbered the comment.
 
     A file that names all three login modules is encoding this mapping. Finding
     them by scanning rather than by memory is what turned "the two builders are
-    hand-kept in lockstep" into seven sites. If someone adds an eighth, this
+    hand-kept in lockstep" into eight sites. If someone adds a ninth, this
     fails and asks them to register it here or factor it out -- otherwise the
     new copy is unguarded and nothing says so.
     """
@@ -220,6 +234,10 @@ def test_no_eighth_copy_of_the_mapping_appeared_unguarded():
         if len(set(re.findall(MODULE_RE, body))) == 3:
             found.add(rel)
 
+    stale = sorted(set(NOT_A_CLIENT_MAPPING) - found)
+    assert not stale, f"NOT_A_CLIENT_MAPPING entries that no longer name all three modules: {stale}"
+    found -= set(NOT_A_CLIENT_MAPPING)
+
     registered = {str(path.relative_to(REPO)) for path, _ in SITES.values()}
     assert found == registered, (
         "the set of files encoding the mechanism->login-module mapping changed.\n"
@@ -235,7 +253,7 @@ def test_ci_runs_this_guard_when_any_site_it_watches_changes():
     ci.yml's `llm` filter gates the job that runs this file, and the filter's
     own comments record two rounds of this bug already: chart guards that were
     dead on chart PRs, and a leak-proof job that would not run when the leak
-    proof itself was edited. Five of the seven sites sit under paths the filter
+    proof itself was edited. Six of the eight sites sit under paths the filter
     already lists; two do not, and one of those is the file install.sh
     downloads. Checking the coverage here rather than by eye is the only way it
     stays true.

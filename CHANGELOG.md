@@ -13,6 +13,63 @@ Everything below is on `main` and has not been published under a release heading
 A version heading opens here when a release is cut; until then this section is the
 whole changelog.
 
+### v0.1.4 — everything since v0.1.3
+
+The `## [0.1.4]` heading opens once the `v0.1.4` tag exists (the changelog guard rejects a
+heading whose tag does not); until then these entries sit under `[Unreleased]`.
+
+#### Kubernetes
+- **One-command installer** (`install-k8s.sh`) that fits the cluster it lands on, waits for a
+  slow image pull instead of failing, and keeps Kafka Connect credentials across a pod
+  restart. The chart's default image tag is multi-arch (`amd64` and `arm64`).
+
+#### Change data capture
+- Auto-pickup: a new source table joins a running "whole database" CDC pipeline.
+- MongoDB: a stalled source now fails loudly instead of reporting healthy; the heartbeat
+  topic is named with the key Debezium reads; editing a pipeline's tables updates
+  `collection.include.list`; a standalone `mongod` is refused before `start_sync`; MongoDB
+  CDC/streaming runs that carry an enabled `mask_pii` are refused.
+- Fixes for wrong row counts, counters that reset on restart, and cooldowns that never blocked.
+- The assessor warns about PostgreSQL tables without a primary key that sit outside a CDC pipeline.
+
+#### Connections and storage
+- A Scope step, server-level MySQL, MongoDB and ClickHouse connections, multi-database CDC and
+  mirror mapping; namespace listing (`GET /connections/:id/namespaces`).
+- Table discovery lists up to 5000 tables with totals.
+- Object-storage layout v2 for GCS, S3 and Azure Blob (no pipeline id in the path).
+- Deleting a pipeline closes six cleanup gaps and no longer un-owns destination data.
+
+#### Security
+- Plain-`http` OAuth token endpoints are refused for Kafka in all four runtimes.
+- The connector deploy gate fails closed when `ENVIRONMENT` is unset; MongoDB URI aliases are masked.
+- Compose Kafka Connect honours `KAFKA_*` security settings.
+
+#### Interface
+- Monitoring Overview shows freshness, backlog, Kafka lag and failures; the pipeline page has an
+  Assessment tab; Activity replaces Trace and Live events; Data flow reads top-down.
+- Explorer: a model page shows its lineage graph, its schedule in words and who runs it.
+- Stage durations come from one formatter, so a single transition no longer reads as a retry.
+
+#### Removed
+- The bundled observability-backend stack. Telemetry still exports over OTLP to whichever
+  collector you configure; the seeded `sentinel_config` keys are now backend-neutral
+  (migration `100`).
+
+### 📚 Documentation
+
+#### Added
+- **Solutions guides** under `docs/solutions/`: self-hosted PostgreSQL CDC, PostgreSQL to
+  MySQL sync, Shopify to PostgreSQL, scheduled SQL models with dependency triggers, and
+  data lineage and pipeline observability. Each states its prerequisites, what is and is
+  not supported, and how far it has been verified.
+- **Public release checklist** (`docs/deployment/public-release-checklist.md`): the manual
+  GitHub steps for a release, and what each download and usage number does and does not
+  measure.
+
+#### Changed
+- README and docs index lead with the same positioning: a self-hosted data platform for
+  batch pipelines, CDC, scheduled data models and lineage.
+
 ### ✅ Authentication & Security
 
 #### Added
@@ -32,6 +89,26 @@ whole changelog.
   - CORS configuration
 
 #### Changed
+- **BREAKING — a plain-`http://` Kafka OAuth token endpoint is now refused at start-up**
+  (it used to log a warning and connect anyway). The client-credentials grant POSTs
+  `KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET` to that URL on *every* token fetch, so one
+  plain-http hop hands a credential that never expires to anyone on the path — worse
+  than the short-lived bearer token it buys, and not repairable by any broker-side
+  setting. Enforced identically by the Go tier, the Python tier, the Debezium
+  connector, the Kafka Connect image, the `kafka-init` scripts and the Helm chart.
+  - **Exception:** a loopback host — `localhost`, `*.localhost`, `127.0.0.0/8`, `::1` —
+    is still allowed, because a token helper on the same host never puts the secret on
+    a network. GCP Workload Identity's `http://localhost:14293` is exactly that case.
+  - **Opt-out, for disposable test rigs only:**
+    `KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT=true`
+    (Helm: `kafka.external.oauth.allowInsecureTokenEndpoint=true`).
+  - **Action required** only if you point `KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT` at a
+    non-loopback `http://` URL: switch the IdP to https. A bundled-broker deployment
+    sets no token endpoint and is unaffected.
+- Kafka connection failures in the Python tier now name the real cause (rejected SASL
+  credentials, untrusted CA, missing client certificate) instead of surfacing only
+  `KafkaTimeoutError: Failed to update metadata after 60.0 secs`, which every one of
+  those causes used to collapse into.
 - Removed all hardcoded user IDs
 - All API calls now use authenticated user's ID
 - Database cleaned to single admin user

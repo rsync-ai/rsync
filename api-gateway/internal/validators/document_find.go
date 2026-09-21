@@ -50,6 +50,7 @@ const (
 	DocumentFindMaxSortKeys         = 5
 	DocumentFindMaxProjectionKeys   = 100
 	DocumentFindMaxCollectionBytes  = 120
+	DocumentFindMaxDatabaseBytes    = 64
 	DocumentFindMaxCursorChars      = 4096
 	documentFindPathKeyMaxRunes     = 64
 	documentFindMaxOperatorEchoRune = 64
@@ -73,6 +74,9 @@ func findErr(code, path, format string, args ...interface{}) *DocumentFindError 
 // Filter/Projection/Sort stay raw JSON so key order (sort) and exact number text
 // (a 64-bit integer in a filter) survive to the connector.
 type DocumentFindRequest struct {
+	// Database is the database a server-level connection (one naming no
+	// database) reads; "" for a connection that names one.
+	Database   string
 	Collection string
 	Filter     json.RawMessage
 	Projection json.RawMessage
@@ -85,6 +89,7 @@ type DocumentFindRequest struct {
 // DocumentFindSpec is a validated find, ready to forward. Sort is always the ordered
 // [field, direction] pair list: a Go map cannot carry sort order.
 type DocumentFindSpec struct {
+	Database   string           `json:"database,omitempty"`
 	Collection string           `json:"collection"`
 	Filter     json.RawMessage  `json:"filter,omitempty"`
 	Projection map[string]int   `json:"projection,omitempty"`
@@ -97,6 +102,10 @@ type DocumentFindSpec struct {
 // ValidateDocumentFind checks a document-mode find against the operator allowlist and
 // limits and returns the normalized spec, or a *DocumentFindError.
 func ValidateDocumentFind(req DocumentFindRequest) (*DocumentFindSpec, *DocumentFindError) {
+	database, ferr := validateFindDatabase(req.Database)
+	if ferr != nil {
+		return nil, ferr
+	}
 	collection, ferr := validateFindCollection(req.Collection)
 	if ferr != nil {
 		return nil, ferr
@@ -139,6 +148,7 @@ func ValidateDocumentFind(req DocumentFindRequest) (*DocumentFindSpec, *Document
 	}
 
 	return &DocumentFindSpec{
+		Database:   database,
 		Collection: collection,
 		Filter:     filter,
 		Projection: projection,
@@ -154,6 +164,22 @@ func findPath(parent, key string) string {
 		key = string([]rune(key)[:documentFindPathKeyMaxRunes])
 	}
 	return parent + "." + key
+}
+
+// validateFindDatabase checks the shape of an optional database name. Whether
+// the connection may read it (it names none, and the name is inside its Scope)
+// is the connector's check, _find_database.
+func validateFindDatabase(raw string) (string, *DocumentFindError) {
+	name := strings.TrimSpace(raw)
+	switch {
+	case name == "":
+		return "", nil
+	case len(name) > DocumentFindMaxDatabaseBytes:
+		return "", findErr("invalid_database", "database", "database name exceeds %d bytes", DocumentFindMaxDatabaseBytes)
+	case strings.ContainsAny(name, "/\\. \"$\x00"):
+		return "", findErr("invalid_database", "database", "database name is not valid")
+	}
+	return name, nil
 }
 
 func validateFindCollection(raw string) (string, *DocumentFindError) {

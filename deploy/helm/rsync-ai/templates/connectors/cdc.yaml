@@ -17,9 +17,46 @@ FileConfigProvider, which is what keeps those credentials out of the Kafka
 config topic (and if that handoff ever fails, provisioning fails with it rather
 than quietly falling back to an inline password — see DEBEZIUM_SECRETS_ENFORCED
 below). Two pods would need a shared writable volume for that handoff —
-ReadWriteMany, which EBS/PD/Azure Disk cannot do. One pod with an emptyDir does
-it with no storage requirement at all, and the credentials never leave the node.
+ReadWriteMany, which EBS/PD/Azure Disk cannot do. One pod can share a volume
+between its two containers, so a plain ReadWriteOnce claim is enough.
+
+That volume must OUTLIVE THE POD. Connect keeps each connector's config in its
+Kafka config topic, and that config only holds a `${file:/connect-secrets/...}`
+reference; the password itself is the file. An emptyDir is wiped on every pod
+restart (node drain, OOM kill, image bump), after which every connector sits in
+RESTARTING with "Could not read properties from file" until someone re-runs the
+pipeline -- and nothing in the platform does that on its own, so the Sentinel
+just retries a connector that cannot come back. Compose uses a named volume for
+the same reason. connectors.cdc.kafkaConnect.secretsPersistence.enabled=false
+falls back to an emptyDir for a cluster with no StorageClass at all, at the
+cost of that restart behaviour.
 */}}
+{{- if .Values.connectors.cdc.kafkaConnect.secretsPersistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ $fullname }}-connect-secrets
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: kafka-connect
+  annotations:
+    {{/*
+      Kept on `helm uninstall`, like the Kafka volume that holds the connector
+      configs which point at these files. Deleting only this half would leave
+      every connector in RESTARTING after a reinstall, and would strand the
+      claim mid-termination under a retry.
+    */}}
+    helm.sh/resource-policy: keep
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- with (default .Values.global.storageClass .Values.connectors.cdc.kafkaConnect.secretsPersistence.storageClass) }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.connectors.cdc.kafkaConnect.secretsPersistence.size | quote }}
+---
+{{- end }}
 apiVersion: v1
 kind: Service
 metadata:
@@ -66,6 +103,7 @@ metadata:
     app.kubernetes.io/component: kafka-connect
 spec:
   replicas: 1
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   # Recreate: Connect workers with the same GROUP_ID rebalance when a second
   # one joins, and a rebalance mid-rollout pauses every running connector. One
   # worker in, one worker out is the cheaper trade at this scale.
@@ -90,113 +128,25 @@ spec:
         - name: kafka-connect
           image: {{ include "rsync-ai.image" (dict "root" . "image" .Values.connectors.cdc.kafkaConnect.image) }}
           imagePullPolicy: {{ .Values.global.image.pullPolicy }}
-          {{- if .Values.kafka.external.saslMechanism }}
           {{- /*
-          Build the JAAS config in the container, because the SASL password has
-          to be escaped and a Helm template cannot do it: the value arrives by
-          kubelet $(VAR) substitution, after rendering.
+          No command override: the image's entrypoint
+          (shared/internal/infra/kafka-connect/connect-entrypoint.sh) builds the
+          SASL JAAS line and the OAuth settings for all three client levels from
+          the KAFKA_* variables below, then runs Debezium's /docker-entrypoint.sh.
+          Compose runs the same script, so the two cannot drift. It used to be an
+          inline prelude here, which compose never had.
 
-          It then crosses TWO grammars, each of which eats a level of backslash:
-
-            1. docker-entrypoint.sh writes every CONNECT_* env var into
-               connect-distributed.properties, a Java .properties file;
-            2. connect-distributed.sh loads that file and Kafka parses
-               sasl.jaas.config with a StreamTokenizer-backed quoted-string
-               grammar.
-
-          So the value is escaped twice. Escaping once corrupts identically to
-          not escaping at all, which is the trap: the site looks guarded and is
-          not. Measured against Kafka's own parser -- reproduce the table with
-          test/kind/jaas-probe/run.sh.
-
-          Overriding the entrypoint is deliberately scoped to the SASL branch:
-          without SASL there is nothing to escape, and the image runs exactly as
-          it did before. The password is never echoed; the entrypoint's own
-          SENSITIVE_PROPERTIES list already covers these three variable names.
+          connectors.cdc.kafkaConnect.entrypoint is deprecated: set it only when
+          `image` is a Connect distribution that is not rsync's, and that image
+          must then configure Kafka security itself. Its old default
+          "/docker-entrypoint.sh start" is treated as unset -- rendering it would
+          skip the script and ship a worker with no JAAS line.
           */}}
+          {{- $ep := .Values.connectors.cdc.kafkaConnect.entrypoint | default "" }}
+          {{- if and $ep (ne $ep "/docker-entrypoint.sh start") }}
           command: ["/bin/bash", "-c"]
           args:
-            - |
-              set -euo pipefail
-              esc() {
-                printf '%s' "$1" |
-                  sed 's/\\/\\\\/g; s/"/\\"/g' |
-                  sed 's/\\/\\\\/g'
-              }
-{{- if include "rsync-ai.kafka.isTokenMechanism" . }}
-              # OAUTHBEARER carries its credentials as JAAS OPTIONS -- there is
-              # no username= or password= on the line at all -- and takes the
-              # token endpoint as a separate property. A credential-less
-              # "LoginModule required;" line, which is what the username/password
-              # shape below degrades to, is refused outright by the JVM with
-              # "The OAuth configuration option clientId value must be non-null".
-              # Measured against kafka-clients 3.7.0: test/kind/jaas-probe/OAuthProbe.java.
-              for v in KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT \
-                       KAFKA_SASL_OAUTHBEARER_CLIENT_ID \
-                       KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET; do
-                if [ -z "${!v:-}" ]; then
-                  echo "FATAL: kafka.external.saslMechanism=OAUTHBEARER but $v is empty." >&2
-                  echo "       Set kafka.external.oauth.{tokenEndpoint,clientId,clientSecret}." >&2
-                  echo "       With secrets.existingSecret, it must carry key" >&2
-                  echo "       KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET." >&2
-                  exit 1
-                fi
-              done
-              OPTS="$(printf ' clientId="%s" clientSecret="%s"' \
-                "$(esc "$KAFKA_SASL_OAUTHBEARER_CLIENT_ID")" \
-                "$(esc "$KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET")")"
-              if [ -n "${KAFKA_SASL_OAUTHBEARER_EXTENSIONS:-}" ]; then
-                OLDIFS=$IFS; IFS=,
-                for kv in $KAFKA_SASL_OAUTHBEARER_EXTENSIONS; do
-                  IFS=$OLDIFS
-                  case "$kv" in
-                    *=*) ;;
-                    *) echo "FATAL: kafka.external.oauth.extensions entry '$kv' has no '=' separator." >&2; exit 1 ;;
-                  esac
-                  EK=${kv%%=*}; EV=${kv#*=}
-                  # 'auth' is the OAUTHBEARER frame's own key; sending it as an
-                  # extension makes a malformed frame the broker rejects without
-                  # naming the extension.
-                  if [ -z "$EK" ] || [ "$EK" = "auth" ]; then
-                    echo "FATAL: kafka.external.oauth.extensions has an empty or reserved name in '$kv'." >&2
-                    exit 1
-                  fi
-                  OPTS="$OPTS$(printf ' extension_%s="%s"' "$EK" "$(esc "$EV")")"
-                  IFS=,
-                done
-                IFS=$OLDIFS
-              fi
-              if [ -n "${KAFKA_SASL_OAUTHBEARER_SCOPE:-}" ]; then
-                OPTS="$OPTS$(printf ' scope="%s"' "$(esc "$KAFKA_SASL_OAUTHBEARER_SCOPE")")"
-              fi
-              JAAS="$(printf '%s required%s;' \
-                '{{ include "rsync-ai.kafka.saslLoginModule" . }}' "$OPTS")"
-              # Without the handler class OAuthBearerLoginModule falls back to
-              # its UNSECURED default and mints a self-signed JWS; the broker
-              # then rejects a token it cannot validate and the error describes
-              # the token, not the missing handler. Set at all three client
-              # levels because Connect's worker, producer and consumer each
-              # build their own login context.
-              for L in "" "PRODUCER_" "CONSUMER_"; do
-                eval "export CONNECT_${L}SASL_JAAS_CONFIG=\"\$JAAS\""
-                eval "export CONNECT_${L}SASL_LOGIN_CALLBACK_HANDLER_CLASS=\"\$KAFKA_SASL_OAUTHBEARER_LOGIN_CALLBACK_HANDLER\""
-                eval "export CONNECT_${L}SASL_OAUTHBEARER_TOKEN_ENDPOINT_URL=\"\$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT\""
-              done
-{{- else }}
-              if [ -z "${KAFKA_SASL_PASSWORD:-}" ]; then
-                echo "FATAL: kafka.external.saslMechanism={{ .Values.kafka.external.saslMechanism }} but KAFKA_SASL_PASSWORD is empty." >&2
-                echo "       Set kafka.external.saslPassword, or provide key KAFKA_SASL_PASSWORD in secrets.existingSecret." >&2
-                exit 1
-              fi
-              JAAS="$(printf '%s required username="%s" password="%s";' \
-                '{{ include "rsync-ai.kafka.saslLoginModule" . }}' \
-                "$(esc "${KAFKA_SASL_USERNAME:-}")" \
-                "$(esc "$KAFKA_SASL_PASSWORD")")"
-              export CONNECT_SASL_JAAS_CONFIG="$JAAS"
-              export CONNECT_PRODUCER_SASL_JAAS_CONFIG="$JAAS"
-              export CONNECT_CONSUMER_SASL_JAAS_CONFIG="$JAAS"
-{{- end }}
-              exec {{ .Values.connectors.cdc.kafkaConnect.entrypoint | default "/docker-entrypoint.sh start" }}
+            - {{ printf "exec %s" $ep | quote }}
           {{- end }}
           securityContext:
             {{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
@@ -271,7 +221,7 @@ spec:
             # FileConfigProvider is how the source-DB password reaches a
             # connector config without being written to the Kafka config topic
             # in cleartext. ALLOWED_PATHS must match debezium-mcp's
-            # DEBEZIUM_SECRETS_DIR exactly — they share the emptyDir below.
+            # DEBEZIUM_SECRETS_DIR exactly — they share the connect-secrets volume below.
             - name: CONNECT_CONFIG_PROVIDERS
               value: "file"
             - name: CONNECT_CONFIG_PROVIDERS_FILE_CLASS
@@ -309,12 +259,13 @@ spec:
             {{- if .Values.kafka.external.saslMechanism }}
             {{- if include "rsync-ai.kafka.isTokenMechanism" . }}
             {{- /*
-            The prelude above assembles the JAAS line from these, exactly as the
-            username/password branch does with KAFKA_SASL_USERNAME/PASSWORD.
-            They are deliberately NOT the CONNECT_-prefixed names: the entrypoint
-            copies CONNECT_* straight into the worker properties, and the JAAS
-            line has to be built from the parts first (the client secret needs
-            the same double-escaping as a password).
+            The image's entrypoint (connect-entrypoint.sh) assembles the JAAS
+            line from these, exactly as it does for SCRAM/PLAIN with
+            KAFKA_SASL_USERNAME/PASSWORD. They are deliberately NOT the
+            CONNECT_-prefixed names: Debezium's entrypoint copies CONNECT_*
+            straight into the worker properties, and the JAAS line has to be
+            built from the parts first (the client secret needs the same
+            double-escaping as a password).
             */}}
             - name: KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT
               value: {{ (.Values.kafka.external.oauth | default dict).tokenEndpoint | quote }}
@@ -330,6 +281,15 @@ spec:
               value: {{ (.Values.kafka.external.oauth | default dict).scope | default "" | quote }}
             - name: KAFKA_SASL_OAUTHBEARER_EXTENSIONS
               value: {{ (.Values.kafka.external.oauth | default dict).extensions | default "" | quote }}
+            {{/*
+            Emitted only when opted in, so the default ships no variable and
+            connect-entrypoint.sh's own refusal stays armed. See
+            _helpers.tpl "rsync-ai.kafka.insecureTokenEndpoint".
+            */}}
+            {{- if (.Values.kafka.external.oauth | default dict).allowInsecureTokenEndpoint }}
+            - name: KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT
+              value: "true"
+            {{- end }}
             - name: KAFKA_SASL_OAUTHBEARER_LOGIN_CALLBACK_HANDLER
               value: {{ include "rsync-ai.kafka.oauthLoginCallbackHandler" . | quote }}
             {{- else }}
@@ -370,8 +330,9 @@ spec:
                                                     authentication failed)
               pa"ss          ->  parse error naming a key called 'ss'
 
-            They are built in the container instead, by the prelude in `args`,
-            which can escape. See the comment there for the two grammars.
+            They are built in the container instead, by the image's entrypoint
+            (shared/internal/infra/kafka-connect/connect-entrypoint.sh), which
+            can escape. See its esc() for the two grammars.
             */}}
             {{- end }}
             {{- if include "rsync-ai.kafka.usesTLS" . }}
@@ -518,11 +479,16 @@ spec:
           resources:
             {{- toYaml .Values.connectors.cdc.debezium.resources | nindent 12 }}
       volumes:
-        # emptyDir, not a PVC: these files are per-connector-config credentials
-        # that debezium-mcp rewrites on every deploy. Persisting them would keep
-        # a stale password readable after the connection was rotated.
+        # A claim, not an emptyDir: see the header comment. debezium-mcp rewrites
+        # a connector's file on every deploy and removes it when the connector
+        # is deleted, so the volume holds only the credentials currently in use.
         - name: connect-secrets
+          {{- if .Values.connectors.cdc.kafkaConnect.secretsPersistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ $fullname }}-connect-secrets
+          {{- else }}
           emptyDir: {}
+          {{- end }}
         {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
 ---
 apiVersion: v1
@@ -551,6 +517,7 @@ metadata:
     app.kubernetes.io/component: kafka-mcp-sink
 spec:
   replicas: {{ .Values.connectors.cdc.sink.replicaCount }}
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   selector:
     matchLabels:
       {{- include "rsync-ai.selectorLabels" . | nindent 6 }}

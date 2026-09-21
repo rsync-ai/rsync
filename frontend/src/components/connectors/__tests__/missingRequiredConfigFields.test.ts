@@ -89,7 +89,9 @@ describe("missingRequiredConfigFields — MongoDB Atlas, on the shipped metadata
     // and its host alias; if either vanished from the shipped file the tests
     // would keep passing while the form went back to being unsaveable.
     expect(mongo.required).toContain("host")
-    expect(mongo.required).toContain("database")
+    // A server-level connection (#31) names no database: it reads every
+    // database the login can see, narrowed by the connection's Scope.
+    expect(mongo.required).not.toContain("database")
     expect(mongo.aliases.host ?? []).toContain("connection_string")
   })
 
@@ -124,10 +126,20 @@ describe("missingRequiredConfigFields — MongoDB Atlas, on the shipped metadata
     ).toEqual(["host"])
   })
 
-  it("a required field with NO alias is unaffected — database is still demanded", () => {
+  it("an Atlas SRV connection with no database saves as a server-level connection", () => {
     expect(
       missingRequiredConfigFields(
         mongo.required,
+        mongo.aliases,
+        filled({ connection_string: "mongodb+srv://u:p@cluster0.abcd.mongodb.net/" }),
+      ),
+    ).toEqual([])
+  })
+
+  it("a required field with NO alias is unaffected by another field's alias", () => {
+    expect(
+      missingRequiredConfigFields(
+        ["host", "database"],
         mongo.aliases,
         filled({ connection_string: "mongodb+srv://u:p@cluster0.abcd.mongodb.net/" }),
       ),

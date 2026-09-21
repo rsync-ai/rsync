@@ -27,6 +27,7 @@ metadata:
 spec:
   {{- if not .Values.apiGateway.autoscaling.enabled }}
   replicas: {{ .Values.apiGateway.replicaCount }}
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   {{- end }}
   selector:
     matchLabels:

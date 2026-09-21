@@ -352,6 +352,11 @@ func main() {
 		requireProdEncryptionKeys()
 	}
 
+	// Settings whose absence does not stop the gateway but silently breaks a
+	// feature: one ERROR line each, naming the setting and what will not work.
+	// Before db.Init, so the lines appear even when the database never comes up.
+	reportStartupSettingProblems(log.StandardLogger(), os.Getenv)
+
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
@@ -570,6 +575,11 @@ func main() {
 	// Assigned before Start(), so no event can arrive between the two and find the
 	// hook nil.
 	eventProjector.OnPipelineCompleted = handlers.FireModelsAfterPipeline
+	// CDC pipelines never complete, so their "run after pipeline" models fire when the
+	// sink reports rows landed, once per window (CDC_AFTER_PIPELINE_INTERVAL_MINUTES,
+	// default 15). The window label stands in for the execution id and keeps the
+	// fan-out idempotent. See projector/cdc_data_landed.go.
+	eventProjector.OnPipelineDataLanded = handlers.FireModelsAfterPipeline
 
 	if err := eventProjector.Start(); err != nil {
 		log.Warnf("⚠️  Failed to start event projector: %v", err)
@@ -612,6 +622,13 @@ func main() {
 		log.Info("✅ Notifier consumer started")
 	}
 
+	// Pipeline Assessment tab: a run that finds a new Critical or High issue
+	// is delivered in-process through the notifier (bell + Slack/email), so it
+	// works even when the Kafka consumer above did not start. Running CDC
+	// pipelines are re-assessed every ASSESSMENT_RECHECK_INTERVAL (default 6h).
+	handlers.SetAssessmentNotifier(notifier.NewEmitter(db.GetDB()))
+	handlers.StartAssessmentScheduler(appCtx, db.GetDB())
+
 	// Initialize OAuth, Schema Registry, and Auth handlers
 	oauthHandler := handlers.NewOAuthHandler(db.GetDB())
 	schemaHandler := handlers.NewSchemaRegistryHandler()
@@ -624,6 +641,15 @@ func main() {
 	handlers.SetTokenRefreshFunc(oauthHandler.RefreshTokenByID)
 	bgTokenRefresher := handlers.NewBackgroundTokenRefresher(db.GetDB(), oauthHandler.RefreshTokenByID)
 	bgTokenRefresher.Start(appCtx)
+
+	// CDC auto-pickup: a pipeline selected as "this whole database" keeps
+	// matching tables created after it was built, instead of freezing at the
+	// list of that day. Nil when CDC_TABLE_AUTOPICKUP_ENABLED is off.
+	if cdcTableWatcher := handlers.NewCDCTableWatcher(db.GetDB()); cdcTableWatcher != nil {
+		cdcTableWatcher.Start(appCtx)
+	} else {
+		log.Info("cdc auto-pickup: disabled (CDC_TABLE_AUTOPICKUP_ENABLED)")
+	}
 
 	// Initialize schema evolution handler with DB + Kafka deps
 	handlers.SetSchemaEvolutionDeps(db.GetDB(), kafkaProducer)
@@ -841,6 +867,7 @@ func main() {
 		// USAGE - Active-workspace consumption vs plan limits (any member, read-only)
 		// ========================================================================
 		api.GET("/usage", handlers.GetWorkspaceUsage)
+		api.GET("/usage/plan", handlers.GetPlanSummary) // plan banner: same meter as the create gate
 
 		// ========================================================================
 		// CHAT - Main Entry Point (NL-Driven Pipeline Flow)
@@ -857,6 +884,8 @@ func main() {
 		api.POST("/pipelines", handlers.CreatePipeline)
 		api.POST("/pipelines/:id/run", handlers.PipelineRunRateLimitMiddleware(), handlers.RunPipeline)
 		api.POST("/pipelines/:id/assess", handlers.AssessPipeline)
+		api.GET("/pipelines/:id/assessments", handlers.ListPipelineAssessments)
+		api.GET("/pipelines/:id/assessments/:run_id", handlers.GetPipelineAssessment)
 		api.POST("/pipelines/:id/stop", handlers.StopPipeline)
 		api.POST("/pipelines/:id/pause", handlers.PausePipeline)
 		api.POST("/pipelines/:id/resume", handlers.ResumePipeline)
@@ -957,6 +986,7 @@ func main() {
 		// ========================================================================
 		// Read-only catalog endpoints — any authed user can browse.
 		api.GET("/connectors", handlers.ListMCPConnectors)
+		api.GET("/connectors/namespace-models", handlers.GetConnectorNamespaceModels)
 		api.GET("/connectors/:name", handlers.GetMCPConnector)
 		api.GET("/connectors/:name/logo", handlers.GetMCPConnectorLogo)
 		api.POST("/connectors/detect-category", handlers.DetectCategory)
@@ -1018,6 +1048,9 @@ func main() {
 		api.GET("/connections/:id/sample", handlers.SampleConnectionData) // Sample data for preview
 		// Schema discovery (tables + columns + counts) via orchestrator agent
 		api.GET("/connections/:id/metadata", handlers.GetConnectionMetadata)
+		// Schemas / databases / datasets one level above the tables, listed by the connector
+		api.GET("/connections/:id/namespaces", handlers.ListConnectionNamespaces)
+		api.POST("/connections/namespaces", handlers.PreviewConnectionNamespaces) // Scope preview before saving
 
 		// Zero-credential try-it path. Both report unavailable unless
 		// RSYNC_DEMO_DESTINATION_DSN is set, which only the quickstart compose
@@ -1077,7 +1110,9 @@ func main() {
 		// ========================================================================
 		// MONITORING - Sentinel Health & Issues (feature-flagged)
 		// ========================================================================
-		api.GET("/monitoring/sentinel/health", handlers.GetSentinelHealth)
+		// Admin only: component ids name Kafka topics and containers across every
+		// workspace, and the table is not workspace-scoped (admin/health renders it).
+		api.GET("/monitoring/sentinel/health", handlers.AdminRoleMiddleware(), handlers.GetSentinelHealth)
 		api.GET("/monitoring/sentinel/issues", handlers.GetSentinelIssues)
 
 		// ========================================================================
@@ -1209,11 +1244,38 @@ func main() {
 		api.POST("/explorer/saved/:id/schedule/pause", handlers.PauseSavedQuerySchedule)
 		api.POST("/explorer/saved/:id/schedule/resume", handlers.ResumeSavedQuerySchedule)
 
-		// Which pipelines produce the tables this model reads. Read-only and
+		// How old this model's table is allowed to get. Admin-gated like every other
+		// mutation on a model's configuration, because widening a deadline is how an
+		// alert gets silenced without anything being fixed.
+		api.PUT("/explorer/saved/:id/freshness", handlers.SetSavedQueryFreshness)
+
+		// The misses. Every other signal in the explorer fires when something happens;
+		// this one is a record of a rebuild that never came, which nothing else in the
+		// product can observe. Viewer-level and workspace-scoped.
+		api.GET("/explorer/freshness", handlers.ListModelFreshness)
+
+		// What the refresh loops are doing right now. The in-flight facts live only in
+		// workflow memory — saved_query_runs cannot hold an unfinished rebuild — so this
+		// is the only surface that can answer "is it running" at all.
+		//
+		// NO :id, deliberately. Temporal knows nothing about this product's tenancy, so
+		// an endpoint taking a workflow id would be an IDOR with extra steps. Every id
+		// queried here is derived from a row the workspace and visibility predicate
+		// already returned.
+		api.GET("/explorer/running", handlers.ListRunningModelWork)
+
+		// Which pipelines and models produce the tables this model reads. Read-only and
 		// viewer-level: it names pipelines writing into the workspace's own warehouse,
-		// which a viewer can already list. Its answer is a suggestion for the
-		// "After a pipeline runs" dialog and is never applied on its own.
+		// which a viewer can already list, and models this user can already see. Its
+		// answer is a suggestion for the "after a pipeline or model runs" picker and is
+		// never applied on its own.
 		api.GET("/explorer/saved/:id/upstreams", handlers.SuggestSavedQueryUpstreams)
+
+		// The same dependency question asked about the whole workspace instead of one
+		// model: every pipeline, the tables they were observed writing, every model,
+		// and which of a model's upstreams actually cause it to refresh. Derivation
+		// only — it writes nothing and triggers nothing.
+		api.GET("/explorer/asset-graph", handlers.GetWorkspaceAssetGraph)
 	}
 
 	// Internal service-to-service endpoints — no user auth, service secret required.
@@ -1233,6 +1295,20 @@ func main() {
 		// sql_text on EVERY tick, and auto-pauses the schedule if either check now
 		// fails. A stored permission would be one that outlives the person.
 		internal.POST("/explorer/models/:id/run", handlers.RunSavedQueryModelInternal)
+
+		// Records a scheduled rebuild whose workflow never got an answer from the route
+		// above (gateway down, request timed out, a 500 before the run started), so it
+		// shows in run history instead of vanishing. Called by
+		// RecordModelRunFailureActivity; deduped on (schedule_id, started_at) so an
+		// activity retry never adds a second row.
+		internal.POST("/explorer/models/:id/run-failed", handlers.RecordSavedQueryModelRunFailureInternal)
+
+		// Checks every model carrying a freshness deadline and records the ones whose
+		// rebuild never came. Called by ModelFreshnessWorkflow's durable timer, which
+		// has no user session and no workspace — and could not have one, because the
+		// models most worth catching are the ones nobody is looking at. Idempotent, so
+		// an activity retry after a timeout that actually succeeded is harmless.
+		internal.POST("/explorer/freshness/sweep", handlers.SweepModelFreshnessInternal)
 
 		// Lets the executor resolve + lock the destination namespace at the WRITE
 		// boundary, once it knows the final table set. Before this existed the

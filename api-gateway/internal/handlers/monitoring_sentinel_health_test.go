@@ -169,3 +169,75 @@ func TestSentinelHealthSurvivesUnusableMetadataWithoutLosingTheComponent(t *test
 		t.Errorf("want the component reported unhealthy despite its metadata; got %+v", got.Components)
 	}
 }
+
+// The route carries AdminRoleMiddleware (main.go; sentinel_health_route_test.go proves
+// the wiring). Served here with the real middleware in front of the real handler: the
+// table names every workspace's topics and containers, so a member of any workspace
+// must be refused before the table is read at all.
+//
+// thenTable sets up what the table query returns; it runs after the session lookup is
+// expected, because sqlmock matches expectations in order.
+func serveSentinelHealthAs(t *testing.T, mock sqlmock.Sqlmock, role string, thenTable func()) *httptest.ResponseRecorder {
+	t.Helper()
+	adminGlobalLimiter = newFixedWindowLimiter(100, time.Minute)
+	expectAdminLookup(mock, "sentinel-tok", "u-1", role+"@example.com", role, "active", nil)
+	if thenTable != nil {
+		thenTable()
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.GET("/api/v1/monitoring/sentinel/health", AdminRoleMiddleware(), GetSentinelHealth)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodGet, "/api/v1/monitoring/sentinel/health", nil)
+	req.Header.Set("Authorization", "Bearer sentinel-tok")
+	r.ServeHTTP(w, req)
+	return w
+}
+
+func TestSentinelHealthRefusesANonAdminBeforeReadingTheTable(t *testing.T) {
+	for _, role := range []string{"user", "power_user"} {
+		t.Run(role, func(t *testing.T) {
+			mock, cleanup := withMockDB(t)
+			defer cleanup()
+
+			// No table expectation: had the handler run, sqlmock would have failed the
+			// unexpected query and the status would be 500, not 403.
+			w := serveSentinelHealthAs(t, mock, role, nil)
+
+			if w.Code != http.StatusForbidden {
+				t.Fatalf("status = %d, want 403; body = %s", w.Code, w.Body.String())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("sql expectations: %v", err)
+			}
+		})
+	}
+}
+
+// The control: the same chain lets an admin through to the rows.
+func TestSentinelHealthServesAnAdmin(t *testing.T) {
+	mock, cleanup := withMockDB(t)
+	defer cleanup()
+
+	w := serveSentinelHealthAs(t, mock, "admin", func() {
+		mock.ExpectQuery(`FROM sentinel_component_health`).WillReturnRows(
+			sqlmock.NewRows(sentinelHealthColumns()).
+				AddRow("kafka_consumer:cdc-sink", "kafka_consumer", "degraded", time.Now(),
+					int64(120), int64(2), int64(4500), "lag rising", []byte("{}"), time.Now()))
+	})
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	var got PaginatedHealthResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(got.Components) != 1 || got.Components[0].ConsumerLag != 4500 {
+		t.Errorf("want the one component with its lag; got %+v", got.Components)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}

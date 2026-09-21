@@ -105,7 +105,7 @@ export function CDCLagAlertsPanel({ pipelineId }: { pipelineId: string }) {
               onClick={() => fetchIssues(true)}
               disabled={refreshing}
               aria-label="Refresh replication lag alerts"
-              className="h-7 px-2 text-xs text-zinc-600 hover:text-zinc-900 dark:hover:text-zinc-200"
+              className="h-7 px-2 text-xs text-zinc-600 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-zinc-200"
             >
               <RefreshCw className={`h-3.5 w-3.5 mr-1 ${refreshing ? "animate-spin" : ""}`} />
               Retry

@@ -1,6 +1,6 @@
 # rsync.ai Documentation
 
-rsync.ai is an agentic data pipeline platform. Users describe what data they want to move in plain English — the AI builds and executes the pipeline.
+rsync.ai is a self-hosted data platform for batch pipelines, CDC, scheduled data models, and lineage. Describe a pipeline in plain English, approve the plan, and see exactly what ran, failed, or became stale.
 
 ---
 
@@ -10,6 +10,7 @@ rsync.ai is an agentic data pipeline platform. Users describe what data they wan
 |------------|-------|
 | **Understand what rsync-ai is + the stack & why** | [ARCHITECTURE.md](../ARCHITECTURE.md) |
 | **Run it locally** | [Quick Start](getting-started/quickstart.md) |
+| **Solve a specific job** (PostgreSQL CDC, PostgreSQL → MySQL, Shopify → PostgreSQL, scheduled models, lineage) | [Solutions](solutions/README.md) |
 | **Build / add a connector** | [Connector developer guide](connectors/developer-guide.md) |
 | **Deploy to production** | [Self-hosting](deployment/self-hosting.md) (Docker Compose) · [Kubernetes](deployment/kubernetes.md) (EKS/GKE/AKS) |
 | **Understand a single service in depth** | [Services HLD/LLD](services/INDEX.md) |

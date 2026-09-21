@@ -16,6 +16,7 @@ import { API_ENDPOINTS } from "@/lib/config/api"
 import { getAuthHeaders } from "@/lib/auth"
 import { extractErrorMessage } from "@/lib/utils/error-handling"
 import { APIRequestError } from "@/lib/errors/api-errors"
+import { isConnectorDeployingResponse } from "@/lib/errors/connector-deploying"
 
 /**
  * Fetch all MCP connectors
@@ -99,7 +100,7 @@ function connectorIdCandidates(name: string): string[] {
 export async function testMCPConnection(
   connectorName: string,
   config: Record<string, unknown>
-): Promise<{ success: boolean; message: string }> {
+): Promise<{ success: boolean; message: string; retryable?: boolean }> {
   try {
     const response = await tracedFetch(API_ENDPOINTS.CONNECTIONS.TEST + "?allow_draft=true", {
     method: "POST",
@@ -155,9 +156,11 @@ export async function testMCPConnection(
     return {
       success: result.success ?? true,
       // Prioritize error over message when failed - error has the actual details
-      message: !result.success && result.error 
-        ? result.error 
+      message: !result.success && result.error
+        ? result.error
         : (result.message || result.error || "Connection successful"),
+      // Connector container still being set up — the caller shows "try again shortly".
+      retryable: isConnectorDeployingResponse(result),
     }
   } catch (error) {
     console.error("Connection test error:", error)

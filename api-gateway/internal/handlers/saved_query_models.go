@@ -14,6 +14,7 @@ import (
 	"api-gateway/internal/security"
 	"api-gateway/internal/validators"
 
+	"github.com/google/uuid"
 	"github.com/rsync-ai/shared/crypto"
 	log "github.com/sirupsen/logrus"
 )
@@ -973,11 +974,13 @@ func runSavedQueryModel(ctx context.Context, database *sql.DB, modelID, actorUse
 
 	rowsAffected, execErr := executeModelPlan(runCtx, dialect, dsn, plan, sweepOnFailure)
 	if execErr != nil {
+		// The raw driver error goes to the log; the stored one drops the source host.
+		log.WithError(execErr).WithField("model_id", modelID).Warn("model run failed")
 		return &modelRunResult{
 			Status:         "failed",
 			StatementClass: string(class),
 			TargetTable:    m.TargetTable,
-			Error:          execErr.Error(),
+			Error:          modelRunErrorMessage(execErr.Error()),
 		}, nil
 	}
 
@@ -1037,6 +1040,93 @@ type modelRunAudit struct {
 	ScheduleID string    // "" for a manual run
 	ActorID    string    // the identity the statement executed as
 	StartedAt  time.Time // when the attempt began, for duration
+
+	// Provenance is empty for a manual or clock run.
+	Provenance runProvenance
+}
+
+// runProvenance is why a triggered rebuild ran: which upstream completion woke it, where
+// in the chain it sits, and how many completions it absorbed (migration 104). Before it,
+// a triggered row said only "triggered", and an owner looking at a model rebuilt at 3am
+// could not tell which of its upstreams had caused that, or whether it was the chain's
+// first hop or its eighth.
+type runProvenance struct {
+	UpstreamKind string // upstreamKindPipeline or upstreamKindModel
+	UpstreamID   string
+	// UpstreamRunID is the upstream model's own saved_query_runs row. Empty for a
+	// pipeline upstream, which has no row there.
+	UpstreamRunID     string
+	OriginExecutionID string // the pipeline execution at the root, when there is one
+	Depth             int    // hops from the root; 1 = woken directly by it
+	Coalesced         int    // upstream completions this one rebuild absorbed
+}
+
+// provenanceFor describes a rebuild woken by src.
+//
+// Depth here is hops from the ROOT, which is not src.Depth. The chain counter starts at 0
+// for a pipeline completion but at 1 for a model completion (nextChainSource increments
+// before firing), so the same model two hops below a pipeline carries src.Depth 1 and two
+// hops below a hand-run model carries src.Depth 2. Recording the counter raw would make
+// the history disagree with itself depending on what started the chain. A model source
+// that carries an execution id is a chain that began at a pipeline, which is the one
+// extra hop the counter did not count.
+func provenanceFor(src modelRefreshSource, coalesced int) runProvenance {
+	hops := src.Depth
+	if src.Kind == upstreamKindPipeline {
+		hops = 1
+	} else if src.ExecutionID != "" {
+		hops++
+	}
+	return runProvenance{
+		UpstreamKind:      src.Kind,
+		UpstreamID:        src.ID,
+		UpstreamRunID:     src.RunID,
+		OriginExecutionID: src.ExecutionID,
+		Depth:             hops,
+		Coalesced:         coalesced,
+	}
+}
+
+// sanitized drops what the columns would refuse. The values arrive from a workflow
+// payload, and one malformed id must cost the provenance, never the run's history row —
+// the INSERT is one statement and a bad cast would take every column down with it.
+func (p runProvenance) sanitized() runProvenance {
+	if p.UpstreamKind != upstreamKindPipeline && p.UpstreamKind != upstreamKindModel {
+		return runProvenance{}
+	}
+	if _, err := uuid.Parse(p.UpstreamID); err != nil {
+		return runProvenance{}
+	}
+	if _, err := uuid.Parse(p.UpstreamRunID); err != nil {
+		p.UpstreamRunID = ""
+	}
+	if p.Depth < 0 {
+		p.Depth = 0
+	}
+	if p.Coalesced < 0 {
+		p.Coalesced = 0
+	}
+	return p
+}
+
+// runProvenanceColumns and runProvenanceValues are the provenance half of both history
+// INSERTs, spelled once so the run row and the skip row cannot disagree about it.
+//
+// upstream_run_id goes through a sub-select rather than a plain cast: the upstream row
+// can be gone (its model deleted between its run and this one), and a dangling id must
+// become NULL rather than a foreign-key failure that loses this row too.
+const runProvenanceColumns = `upstream_kind, upstream_id, upstream_run_id, origin_execution_id, trigger_depth, coalesced_count`
+
+func runProvenanceValues(first int) string {
+	return fmt.Sprintf(`NULLIF($%d, ''), NULLIF($%d, '')::uuid,
+			(SELECT r.run_id FROM saved_query_runs r WHERE r.run_id = NULLIF($%d, '')::uuid),
+			NULLIF($%d, ''), NULLIF($%d::int, 0), NULLIF($%d::int, 0)`,
+		first, first+1, first+2, first+3, first+4, first+5)
+}
+
+func (p runProvenance) args() []interface{} {
+	p = p.sanitized()
+	return []interface{}{p.UpstreamKind, p.UpstreamID, p.UpstreamRunID, p.OriginExecutionID, p.Depth, p.Coalesced}
 }
 
 // stampLastRunOutcome writes the denormalized last_run_* columns the saved-query list
@@ -1052,16 +1142,17 @@ func stampLastRunOutcome(ctx context.Context, ex modelExecer, modelID string, re
 }
 
 // recordModelRunOutcome stamps the result onto the saved query for the list UI and
-// appends the attempt to saved_query_runs (migration 086).
+// appends the attempt to saved_query_runs (migration 086), returning the new row's id so
+// the models this run wakes can point back at it. "" when no row was written.
 //
 // Best-effort by design — losing display bookkeeping must never turn a successful
 // materialization into a reported failure. The two writes share one transaction
 // because they describe the same event: a badge saying "succeeded" with no matching
 // history row is worse than no record at all, since the history panel is what an
 // operator consults precisely when the badge looks wrong.
-func recordModelRunOutcome(ctx context.Context, database *sql.DB, modelID string, res *modelRunResult, audit modelRunAudit) {
+func recordModelRunOutcome(ctx context.Context, database *sql.DB, modelID string, res *modelRunResult, audit modelRunAudit) string {
 	if database == nil || res == nil {
-		return
+		return ""
 	}
 	if audit.StartedAt.IsZero() {
 		audit.StartedAt = time.Now()
@@ -1078,41 +1169,103 @@ func recordModelRunOutcome(ctx context.Context, database *sql.DB, modelID string
 		if err := stampLastRunOutcome(ctx, database, modelID, res); err != nil {
 			log.WithError(err).WithField("model_id", modelID).Warn("model run: failed to record outcome")
 		}
-		return
+		return ""
 	}
 
 	tx, err := database.BeginTx(ctx, &sql.TxOptions{})
 	if err != nil {
 		log.WithError(err).WithField("model_id", modelID).Warn("model run: failed to begin outcome transaction")
-		return
+		return ""
 	}
 	defer func() { _ = tx.Rollback() }() // no-op once Commit has succeeded
 
 	if err := stampLastRunOutcome(ctx, tx, modelID, res); err != nil {
 		log.WithError(err).WithField("model_id", modelID).Warn("model run: failed to record outcome")
-		return
+		return ""
 	}
 
 	// schedule_id and ran_as_user_id are UUID columns, and "" is not a UUID — NULLIF
 	// turns the absent case into NULL instead of a cast error.
-	if _, err := tx.ExecContext(ctx, `
+	//
+	// Provenance is only meaningful to a triggered run; a manual or clock run carries none
+	// even if a caller filled it in.
+	prov := audit.Provenance
+	if audit.Trigger != triggerTriggered {
+		prov = runProvenance{}
+	}
+	// started_at is derived on the DB clock (NOW() minus the elapsed time) so it compares
+	// cleanly with finished_at and with the upstream events the fan-in policy reads, which
+	// are all stamped by Postgres. A gateway clock ahead of the DB would otherwise make a
+	// build look newer than completions that landed after it.
+	elapsedMicros := time.Since(audit.StartedAt).Microseconds()
+	if elapsedMicros < 0 {
+		elapsedMicros = 0
+	}
+	args := append([]interface{}{modelID, audit.ScheduleID, string(audit.Trigger), res.Status,
+		res.StatementClass, res.TargetTable, res.RowsAffected, res.Error,
+		res.AutoPauseReason, audit.ActorID, elapsedMicros}, prov.args()...)
+	var runID string
+	if err := tx.QueryRowContext(ctx, `
 		INSERT INTO saved_query_runs (
 			saved_query_id, schedule_id, trigger_source, status,
 			statement_class, target_table, rows_affected, error,
-			auto_pause_reason, ran_as_user_id, started_at, finished_at
+			auto_pause_reason, ran_as_user_id, started_at, finished_at,
+			`+runProvenanceColumns+`
 		) VALUES (
 			$1, NULLIF($2, '')::uuid, $3, $4,
 			$5, $6, $7, NULLIF($8, ''),
-			NULLIF($9, ''), NULLIF($10, '')::uuid, $11, NOW()
+			NULLIF($9, ''), NULLIF($10, '')::uuid, NOW() - ($11::bigint * interval '1 microsecond'), NOW(),
+			`+runProvenanceValues(12)+`
 		)
-	`, modelID, audit.ScheduleID, string(audit.Trigger), res.Status,
-		res.StatementClass, res.TargetTable, res.RowsAffected, res.Error,
-		res.AutoPauseReason, audit.ActorID, audit.StartedAt); err != nil {
+		RETURNING run_id::text
+	`, args...).Scan(&runID); err != nil {
 		log.WithError(err).WithField("model_id", modelID).Warn("model run: failed to append run history")
-		return
+		return ""
 	}
 
 	if err := tx.Commit(); err != nil {
 		log.WithError(err).WithField("model_id", modelID).Warn("model run: failed to commit run outcome")
+		return ""
 	}
+	return runID
+}
+
+// Skip reasons a model that was deliberately NOT rebuilt records (migration 104).
+const (
+	skipUpstreamFailed     = "upstream_failed"
+	skipUpstreamSkipped    = "upstream_skipped"
+	skipChainDepthExceeded = "chain_depth_exceeded"
+	skipWaitingOnUpstreams = "waiting_on_upstreams"
+)
+
+// recordModelRunSkip appends a 'skipped' history row for a triggered model that did not
+// rebuild, returning its id so a cascade can link the models below it to it.
+//
+// Before this, a model below a failed upstream, or past the chain's depth bound, got no
+// row at all, and its history read exactly like "nothing happened" — the one reading an
+// owner cannot act on. Deliberately does NOT stamp saved_queries.last_run_*: nothing ran,
+// and the badge must keep describing the table the model last actually built.
+func recordModelRunSkip(ctx context.Context, database *sql.DB, modelID, scheduleID, actorID, reason, message string, prov runProvenance) string {
+	if database == nil {
+		return ""
+	}
+	args := append([]interface{}{modelID, scheduleID, reason, message, actorID}, prov.args()...)
+	var runID string
+	if err := database.QueryRowContext(ctx, `
+		INSERT INTO saved_query_runs (
+			saved_query_id, schedule_id, trigger_source, status, skip_reason, error,
+			ran_as_user_id, started_at, finished_at,
+			`+runProvenanceColumns+`
+		) VALUES (
+			$1, NULLIF($2, '')::uuid, 'triggered', 'skipped', $3, NULLIF($4, ''),
+			NULLIF($5, '')::uuid, NOW(), NOW(),
+			`+runProvenanceValues(6)+`
+		)
+		RETURNING run_id::text
+	`, args...).Scan(&runID); err != nil {
+		log.WithError(err).WithFields(log.Fields{"model_id": modelID, "skip_reason": reason}).
+			Warn("model run: failed to record a skipped rebuild")
+		return ""
+	}
+	return runID
 }

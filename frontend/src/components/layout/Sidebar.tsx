@@ -17,6 +17,7 @@ import {
   History,
   Cable,
   Clock,
+  Network,
   Search,
   Zap,
   MessageSquareText,
@@ -29,16 +30,23 @@ import {
 import { RsyncLogo } from "@/components/icons/RsyncLogo"
 import { useUsagePanelState } from "@/config/features"
 
-const navigation = [
+// Four groups, three of them headed. It was eight one- or two-item groups, each
+// with its own heading, which put Settings and Admin below the fold on an
+// ordinary laptop screen (#56).
+const navigation: Array<{
+  title?: string
+  items: Array<{
+    name: string
+    href: string
+    icon: typeof Home
+    highlight?: boolean
+    exact?: boolean
+    adminOnly?: boolean
+  }>
+}> = [
   {
-    title: "Home",
     items: [
       { name: "Home", href: "/", icon: Home },
-    ],
-  },
-  {
-    title: "Create",
-    items: [
       { name: "Data Pipeline", href: "/chat", icon: Sparkles, highlight: true },
     ],
   },
@@ -46,11 +54,6 @@ const navigation = [
     title: "Pipelines",
     items: [
       { name: "All Pipelines", href: "/pipelines", icon: GitBranch },
-    ],
-  },
-  {
-    title: "Overview",
-    items: [
       { name: "Executions", href: "/executions", icon: History },
     ],
   },
@@ -61,26 +64,19 @@ const navigation = [
       // the URL: without it the prefix match lights up both rows at once.
       { name: "Explorer", href: "/explorer", icon: Search, exact: true },
       { name: "Scheduled Queries", href: "/explorer/schedules", icon: Clock },
+      { name: "Lineage", href: "/explorer/lineage", icon: Network },
       { name: "Connections", href: "/connections", icon: Cable },
       { name: "Connectors", href: "/connectors", icon: Zap },
     ],
   },
   {
-    title: "Workspace",
+    title: "Manage",
     items: [
       { name: "Workspace", href: "/workspace/settings", icon: Building2 },
       { name: "Usage", href: "/usage", icon: Gauge },
-    ],
-  },
-  {
-    title: "Settings",
-    items: [
       { name: "Settings", href: "/settings", icon: Settings },
+      { name: "Admin", href: "/admin", icon: Shield, adminOnly: true },
     ],
-  },
-  {
-    title: "Admin",
-    items: [{ name: "Admin", href: "/admin", icon: Shield }],
   },
 ]
 
@@ -110,10 +106,10 @@ export function Sidebar({ role }: SidebarProps) {
 
   const navContent = (isMobile = false) => (
     <ScrollArea className="flex-1 py-4">
-      <nav className="space-y-6 px-2">
-        {navigation.filter((section) => section.title !== "Admin" || isAdmin).map((section) => (
-          <div key={section.title}>
-            {(!collapsed || isMobile) && (
+      <nav className="space-y-5 px-2">
+        {navigation.map((section) => (
+          <div key={section.title ?? section.items[0].href}>
+            {section.title && (!collapsed || isMobile) && (
               <h4 className="mb-2 px-2 text-xs font-semibold uppercase tracking-wider text-zinc-500 dark:text-zinc-400">
                 {section.title}
               </h4>
@@ -126,10 +122,11 @@ export function Sidebar({ role }: SidebarProps) {
                 // withheld until the runtime flags say otherwise -- 'loading' is
                 // deliberately not visible, or a self-host would flash it.
                 if (item.href === "/usage" && usagePanel !== "on") return null
+                if (item.adminOnly && !isAdmin) return null
 
-                const isActive = isActiveLink(item.href, "exact" in item && item.exact)
+                const isActive = isActiveLink(item.href, item.exact)
                 const Icon = item.icon
-                const isHighlighted = 'highlight' in item && item.highlight
+                const isHighlighted = item.highlight
 
                 const linkContent = (
                   <Link

@@ -1,0 +1,106 @@
+[
+  {
+    "_comment": "Strategy card explanation lines. api-gateway dataLoadingStrategySteps (handlers/pipelines.go) sends them as explanation_steps; the frontend's computeStrategySteps (lib/pipeline/dataLoadingStrategy.ts) builds the same lines when a strategy arrives without them. Each case's input uses the frontend DataLoadingStrategy field names. Tests: handlers/data_loading_strategy_golden_test.go, frontend/src/lib/pipeline/__tests__/dataLoadingStrategyGolden.test.ts.",
+    "name": "batch, manual, defaults",
+    "input": { "mode": "batch" },
+    "steps": [
+      "Backfill: Copy selected tables in batch runs (historical snapshot)",
+      "Keep in sync: Runs when you click Run",
+      "Reruns: Default is Resume (continue from last checkpoint)"
+    ]
+  },
+  {
+    "name": "batch, active schedule, reload, dataset",
+    "input": { "mode": "batch", "schedule_status": "active", "rerun_default": "reload", "dataset": "analytics" },
+    "steps": [
+      "Backfill: Copy selected tables in batch runs (historical snapshot)",
+      "Keep in sync: Runs automatically on schedule",
+      "Reruns: Default is Reload (rebuild from scratch)",
+      "Destination layout: Write under dataset \"analytics\""
+    ]
+  },
+  {
+    "name": "batch, paused schedule counts as manual",
+    "input": { "mode": "batch", "schedule_status": "paused", "rerun_default": "resume" },
+    "steps": [
+      "Backfill: Copy selected tables in batch runs (historical snapshot)",
+      "Keep in sync: Runs when you click Run",
+      "Reruns: Default is Resume (continue from last checkpoint)"
+    ]
+  },
+  {
+    "name": "batch, case and spaces in schedule and rerun",
+    "input": { "mode": " Batch ", "schedule_status": " Active", "rerun_default": "RELOAD " },
+    "steps": [
+      "Backfill: Copy selected tables in batch runs (historical snapshot)",
+      "Keep in sync: Runs automatically on schedule",
+      "Reruns: Default is Reload (rebuild from scratch)"
+    ]
+  },
+  {
+    "name": "unknown mode is batch; unknown rerun is resume",
+    "input": { "mode": "hourly", "rerun_default": "rebuild" },
+    "steps": [
+      "Backfill: Copy selected tables in batch runs (historical snapshot)",
+      "Keep in sync: Runs when you click Run",
+      "Reruns: Default is Resume (continue from last checkpoint)"
+    ]
+  },
+  {
+    "name": "cdc, initial snapshot, dataset",
+    "input": { "mode": "cdc", "effective_cdc_mode": "initial", "dataset": "raw" },
+    "steps": [
+      "Backfill: Take an initial snapshot of selected tables",
+      "Keep in sync: Stream INSERT/UPDATE/DELETE continuously (CDC)",
+      "Reruns: CDC is continuous; use Restart CDC to recover if needed",
+      "Destination layout: Write under dataset \"raw\""
+    ]
+  },
+  {
+    "name": "cdc, no cdc mode means snapshot",
+    "input": { "mode": "cdc" },
+    "steps": [
+      "Backfill: Take an initial snapshot of selected tables",
+      "Keep in sync: Stream INSERT/UPDATE/DELETE continuously (CDC)",
+      "Reruns: CDC is continuous; use Restart CDC to recover if needed"
+    ]
+  },
+  {
+    "name": "cdc, streaming only, upper-case mode; schedule and rerun ignored",
+    "input": { "mode": "CDC", "effective_cdc_mode": "Streaming_Only", "schedule_status": "active", "rerun_default": "reload" },
+    "steps": [
+      "Backfill: Skip historical backfill (start streaming new changes only)",
+      "Keep in sync: Stream INSERT/UPDATE/DELETE continuously (CDC)",
+      "Reruns: CDC is continuous; use Restart CDC to recover if needed"
+    ]
+  },
+  {
+    "name": "blank dataset adds no layout line",
+    "input": { "mode": "batch", "dataset": "   " },
+    "steps": [
+      "Backfill: Copy selected tables in batch runs (historical snapshot)",
+      "Keep in sync: Runs when you click Run",
+      "Reruns: Default is Resume (continue from last checkpoint)"
+    ]
+  },
+  {
+    "name": "dataset is trimmed and shown as typed, quotes included",
+    "input": { "mode": "cdc", "dataset": "  sales \"eu\" " },
+    "steps": [
+      "Backfill: Take an initial snapshot of selected tables",
+      "Keep in sync: Stream INSERT/UPDATE/DELETE continuously (CDC)",
+      "Reruns: CDC is continuous; use Restart CDC to recover if needed",
+      "Destination layout: Write under dataset \"sales \"eu\"\""
+    ]
+  },
+  {
+    "name": "dataset with a backslash and non-ASCII is shown as typed",
+    "input": { "mode": "batch", "dataset": "exports\\q3 café" },
+    "steps": [
+      "Backfill: Copy selected tables in batch runs (historical snapshot)",
+      "Keep in sync: Runs when you click Run",
+      "Reruns: Default is Resume (continue from last checkpoint)",
+      "Destination layout: Write under dataset \"exports\\q3 café\""
+    ]
+  }
+]

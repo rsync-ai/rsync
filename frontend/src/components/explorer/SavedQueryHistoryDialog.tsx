@@ -248,14 +248,14 @@ export function SavedQueryHistoryDialog({
         </DialogHeader>
 
         {loading ? (
-          <div className="flex items-center gap-2 py-8 text-sm text-zinc-500">
+          <div className="flex items-center gap-2 py-8 text-sm text-zinc-500 dark:text-zinc-400">
             <Loader2 className="h-4 w-4 animate-spin" />
             Loading history…
           </div>
         ) : loadError ? (
           <div className="flex flex-col items-start gap-2 py-6">
             <p className="text-sm text-red-600 dark:text-red-400">{loadError}</p>
-            <p className="text-xs text-zinc-500">The query itself has not been changed.</p>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">The query itself has not been changed.</p>
             <Button size="sm" variant="outline" onClick={() => void load()}>
               Retry
             </Button>
@@ -267,7 +267,7 @@ export function SavedQueryHistoryDialog({
                 <div className="mb-2 flex flex-wrap items-center gap-2">
                   <Clock className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
                   <h3 className="text-sm font-medium">Waiting for approval</h3>
-                  <span className="text-xs text-zinc-500">
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400">
                     proposed by {describeAuthor(pending.proposed_by)}
                     {pending.proposed_at ? ` · ${formatAbsoluteTime(pending.proposed_at)}` : ""}
                   </span>
@@ -320,7 +320,7 @@ export function SavedQueryHistoryDialog({
                       />
                     </div>
                     {user?.id && pending.proposed_by === user.id && (
-                      <p className="text-xs text-zinc-500">
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
                         This is your own proposal. You can approve it — an admin has to be
                         able to change a query they own — and the record will show you
                         reviewed it yourself.
@@ -360,7 +360,7 @@ export function SavedQueryHistoryDialog({
             )}
 
             {versions.length === 0 ? (
-              <p className="rounded-md border bg-zinc-50 p-3 text-xs text-zinc-500 dark:bg-zinc-900">
+              <p className="rounded-md border bg-zinc-50 p-3 text-xs text-zinc-500 dark:text-zinc-400 dark:bg-zinc-900">
                 This query has not been edited since it was saved, so there is nothing to
                 compare yet. The next edit will keep a copy of what it replaced.
               </p>
@@ -385,7 +385,7 @@ export function SavedQueryHistoryDialog({
 
                 {selectedVersion && current && (
                   <div className="rounded-lg border p-3">
-                    <p className="mb-2 text-xs text-zinc-500">
+                    <p className="mb-2 text-xs text-zinc-500 dark:text-zinc-400">
                       Version {selectedVersion.version} — replaced{" "}
                       {formatAbsoluteTime(selectedVersion.created_at)} by{" "}
                       {describeAuthor(selectedVersion.changed_by)}
@@ -420,7 +420,7 @@ export function SavedQueryHistoryDialog({
                       )}
                       Restore this version
                     </Button>
-                    <p className="mt-1.5 text-xs text-zinc-500">
+                    <p className="mt-1.5 text-xs text-zinc-500 dark:text-zinc-400">
                       Restoring is a normal edit: the text running now is kept as a version
                       too, so this can be undone.
                       {pending ? " It will need approval, like any edit to this query." : ""}

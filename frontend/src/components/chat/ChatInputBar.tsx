@@ -65,9 +65,10 @@ export function ChatInputBar({
         value={input}
         onChange={(e) => onInputChange(e.target.value)}
         placeholder="Describe what data you want to move…"
+        aria-label="Message"
         disabled={inputDisabled}
       />
-      <Button type="submit" disabled={inputDisabled}>
+      <Button type="submit" disabled={inputDisabled || !input.trim()} aria-label="Send message">
         <Send className="h-4 w-4" />
       </Button>
     </div>

@@ -147,7 +147,7 @@ func (a *ConnectorAssessor) Assess(ctx context.Context, in Input) (*Result, erro
 		// a connector quirk or rsync-side hiccup can never become a false block.
 		for _, table := range in.Tables {
 			if t := strings.TrimSpace(table); t != "" {
-				r.Checks = append(r.Checks, a.probeTableRead(connType, version, in.ConnectionConfig, t))
+				r.Checks = append(r.Checks, withObject(a.probeTableRead(connType, version, in.ConnectionConfig, t), t))
 			}
 		}
 		Summarize(r)

@@ -283,7 +283,7 @@ export default function PIIDashboardPage() {
                 <p className="text-sm text-muted-foreground">Stored Policies</p>
                 <p className="text-3xl font-bold">{policies.filter(p => p.enabled).length}</p>
               </div>
-              <Settings className="w-10 h-10 text-slate-500 opacity-50" />
+              <Settings className="w-10 h-10 text-slate-500 dark:text-slate-400 opacity-50" />
             </div>
           </CardContent>
         </Card>

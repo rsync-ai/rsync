@@ -400,28 +400,11 @@ func (w *ExecutorWorker) Execute(ctx context.Context, task Task) TaskResult {
 			"available_tables": response.Result["available_tables"],
 		}).Info("⏸️  Executor Worker: Waiting for table selection")
 
-		// Include connection IDs when available so the UI can perform post-selection
-		// schema fetches (e.g. AI suggestions) without re-running earlier stages.
-		sourceConnID := getStringFromMap(task.Payload, "source_connection_id")
-		destConnID := getStringFromMap(task.Payload, "destination_connection_id")
-
 		// Stop heartbeats
 		stopHeartbeat()
 
 		// Emit PIPELINE_WAITING event with table options
-		details := map[string]interface{}{
-			"request_type":     "table_selection",
-			"available_tables": response.Result["available_tables"],
-			"source_type":      response.Result["source_type"],
-			"action_needed":    "table_selection",
-			"button_text":      "Select Tables",
-		}
-		if sourceConnID != "" {
-			details["source_connection_id"] = sourceConnID
-		}
-		if destConnID != "" {
-			details["destination_connection_id"] = destConnID
-		}
+		details := tableSelectionWaitingDetails(response.Result, task.Payload)
 
 		w.progressEmitter.EmitProgress(ctx, ProgressEvent{
 			EventType:   "PIPELINE_WAITING",
@@ -742,6 +725,52 @@ func getStringFromMap(m map[string]interface{}, key string) string {
 		return v
 	}
 	return ""
+}
+
+// tableSelectionWaitingDetails builds the PIPELINE_WAITING details for a
+// table-selection pause from the executor's Result and the task payload. Only
+// listed keys are forwarded. `source_database` is always present (possibly "")
+// because the gateway merges details into stored metadata, so leaving it out
+// would let the database named by an earlier wait label this one. The
+// connection IDs are read here, not passed in, so they cannot be swapped: the UI
+// uses them for post-selection schema fetches (e.g. AI suggestions) without
+// re-running earlier stages. The discovery totals are always written for the
+// same merge reason: the picker says "N of M tables" when the list was cut.
+func tableSelectionWaitingDetails(result map[string]interface{}, payload map[string]interface{}) map[string]interface{} {
+	sourceConnID := getStringFromMap(payload, "source_connection_id")
+	destConnID := getStringFromMap(payload, "destination_connection_id")
+	truncated, _ := result["tables_truncated"].(bool)
+	details := map[string]interface{}{
+		"request_type":           "table_selection",
+		"available_tables":       result["available_tables"],
+		"source_type":            result["source_type"],
+		"source_database":        strings.TrimSpace(getStringFromMap(result, "source_database")),
+		"total_tables_available": intFromResult(result["total_tables_available"]),
+		"tables_truncated":       truncated,
+		"action_needed":          "table_selection",
+		"button_text":            "Select Tables",
+	}
+	if sourceConnID != "" {
+		details["source_connection_id"] = sourceConnID
+	}
+	if destConnID != "" {
+		details["destination_connection_id"] = destConnID
+	}
+	return details
+}
+
+// intFromResult reads a count that is an int in-process and a float64 after a
+// JSON round trip; anything else is 0 (unknown).
+func intFromResult(v interface{}) int {
+	switch n := v.(type) {
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case float64:
+		return int(n)
+	}
+	return 0
 }
 
 func convertToStringMap(m map[string]interface{}) map[string]string {

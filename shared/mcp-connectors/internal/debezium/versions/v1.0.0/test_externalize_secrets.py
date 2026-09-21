@@ -12,6 +12,7 @@ Run: python3 test_externalize_secrets.py
 import os
 import stat
 import tempfile
+import time
 
 import connector
 
@@ -177,6 +178,92 @@ def test_start_sync_returns_structured_error_not_a_raise():
             assert transient not in blob.lower(), f"error reads as transient ({transient}); healer would retry"
     finally:
         os.environ.pop("DEBEZIUM_SECRETS_DIR", None)
+
+
+# ── Orphan secret-file reaper ────────────────────────────────────────────────
+# cleanup_secret_file only fires on debezium_stop_sync, which the real delete
+# paths never call — the orchestrator deletes connectors straight over Kafka
+# Connect's REST API. Every deleted pipeline therefore left a plaintext password
+# on the shared volume. reap_orphan_secret_files removes files by absence.
+
+
+def _touch_secret(d, connector_name, age_seconds=0.0):
+    """Write a secret file for connector_name and backdate it by age_seconds."""
+    path = connector._secret_file_path(d, connector_name)
+    connector._write_secret_properties(path, {"database.password": "hunter2"})
+    if age_seconds:
+        past = time.time() - age_seconds
+        os.utime(path, (past, past))
+    return path
+
+
+def test_reaper_removes_file_for_deleted_connector():
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["DEBEZIUM_SECRETS_DIR"] = d
+        try:
+            gone = _touch_secret(d, "cdc-deleted", age_seconds=3600)
+            live = _touch_secret(d, "cdc-live", age_seconds=3600)
+            removed = connector.reap_orphan_secret_files(["cdc-live"])
+            assert removed == 1, removed
+            assert not os.path.exists(gone), "deleted connector's credentials survived"
+            assert os.path.exists(live), "reaped a LIVE connector's credentials"
+        finally:
+            os.environ.pop("DEBEZIUM_SECRETS_DIR", None)
+
+
+def test_reaper_removes_everything_when_last_pipeline_is_gone():
+    # A successful empty list is the state right after the last pipeline is
+    # deleted — the exact case the leak was worst in. It must not be mistaken
+    # for "Connect is down"; that case is filtered out by the caller, which only
+    # reaps when GET /connectors actually succeeded.
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["DEBEZIUM_SECRETS_DIR"] = d
+        try:
+            _touch_secret(d, "cdc-a", age_seconds=3600)
+            _touch_secret(d, "cdc-b", age_seconds=3600)
+            assert connector.reap_orphan_secret_files([]) == 2
+            assert os.listdir(d) == []
+        finally:
+            os.environ.pop("DEBEZIUM_SECRETS_DIR", None)
+
+
+def test_reaper_spares_a_file_inside_the_grace_period():
+    # externalize_secrets writes the file BEFORE the connector is POSTed, so a
+    # fresh file with no connector is a provisioning in flight, not an orphan.
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["DEBEZIUM_SECRETS_DIR"] = d
+        try:
+            fresh = _touch_secret(d, "cdc-being-created", age_seconds=0)
+            assert connector.reap_orphan_secret_files([]) == 0
+            assert os.path.exists(fresh), "reaped a connector that was still being created"
+        finally:
+            os.environ.pop("DEBEZIUM_SECRETS_DIR", None)
+
+
+def test_reaper_removes_stale_tmp_debris_but_leaves_other_files():
+    with tempfile.TemporaryDirectory() as d:
+        os.environ["DEBEZIUM_SECRETS_DIR"] = d
+        try:
+            tmp = os.path.join(d, "cdc-crashed.properties.tmp")
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write("database.password=hunter2\n")
+            unrelated = os.path.join(d, "README.txt")
+            with open(unrelated, "w", encoding="utf-8") as fh:
+                fh.write("not ours\n")
+            past = time.time() - 3600
+            os.utime(tmp, (past, past))
+            os.utime(unrelated, (past, past))
+
+            assert connector.reap_orphan_secret_files([]) == 1
+            assert not os.path.exists(tmp)
+            assert os.path.exists(unrelated), "reaper deleted a file it does not own"
+        finally:
+            os.environ.pop("DEBEZIUM_SECRETS_DIR", None)
+
+
+def test_reaper_is_a_no_op_when_externalization_is_off():
+    os.environ.pop("DEBEZIUM_SECRETS_DIR", None)
+    assert connector.reap_orphan_secret_files([]) == 0
 
 
 if __name__ == "__main__":

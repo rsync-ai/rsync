@@ -45,6 +45,8 @@ instances of that shape; nothing enforced the rule. The last test below does.
 import fnmatch
 import glob
 import os
+import re
+import subprocess
 
 import pytest
 import yaml
@@ -97,11 +99,45 @@ ALLOWLIST = {
 }
 
 
+# A compose file at any depth, root included. Anchored on a path separator so
+# `my-docker-compose.yml` does not match, and `[^/]*` keeps the wildcard inside
+# one path segment -- the looseness that let an earlier pattern list look wider
+# than it was.
+_COMPOSE_RE = re.compile(r"(?:^|/)docker-compose[^/]*\.ya?ml$")
+
+
 def _compose_files():
-    return sorted(
-        os.path.basename(p)
-        for p in glob.glob(os.path.join(REPO_ROOT, "docker-compose*.yml"))
-    )
+    """-> every tracked compose file in the tree, repo-relative, sorted.
+
+    Discovery, not a hand-kept pattern list. The list this replaced named three
+    patterns and still missed
+    `shared/internal/infra/kafka-connect/docker-compose.kafka-connect.yml` --
+    the same cover-half-the-tree defect the widening before it was written to
+    fix, one directory further out. That is the shape of the bug: a pattern list
+    has to be edited by whoever puts a compose file somewhere new, nothing fails
+    when they don't, and the census just gets quietly smaller while still
+    reporting PASS.
+
+    `git ls-files` is the oracle because the predicate is "what this repo
+    ships". An untracked compose file in someone's working tree is not shipped;
+    a tracked one is, wherever it sits.
+
+    Discovery also removes the last repo-specific line from this file. A pattern
+    list had to name a path that exists in only one of the two repositories, so
+    the other repo's copy carried either a dead pattern or a divergence. This
+    version is byte-identical in both and correct in both.
+    """
+    listing = subprocess.run(
+        ["git", "-C", REPO_ROOT, "ls-files", "-z"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    names = sorted(p for p in listing.split("\0") if _COMPOSE_RE.search(p))
+    # Loud here rather than vacuous later: this feeds a parametrisation, and an
+    # empty one collects zero cases and reports green.
+    assert names, "git ls-files returned no compose files; the enumeration failed"
+    return names
 
 
 def _load_compose(name):
@@ -190,7 +226,7 @@ def _shipped_third_party():
 
 def test_every_compose_file_parsed():
     files = _compose_files()
-    assert len(files) >= 15, f"expected >=15 compose files at the repo root, found {files}"
+    assert len(files) >= 15, f"expected >=15 tracked compose files, found {files}"
     for name in files:
         doc = _load_compose(name)
         assert isinstance(doc, dict), f"{name} did not parse to a mapping"

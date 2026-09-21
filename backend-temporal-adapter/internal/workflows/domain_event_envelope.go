@@ -42,7 +42,9 @@ import (
 // The projector's content hash is unique by construction and now logs when it
 // fires, so the gap is recorded rather than papered over. Collapsing the genuine
 // duplicates needs a shared logical identity these two producers do not have —
-// see KI-EVENTS-TWO-OBSERVERS-ONE-TRANSITION in CAPABILITIES.md.
+// see KI-EVENTS-DUAL-ID-NAMESPACE-DUPES in CAPABILITIES.md. Until they have one,
+// every reader that counts or times stage transitions must collapse the copies
+// itself (frontend: dedupeStageLifecycleEvents in lib/pipeline/eventNormalizer.ts).
 func emitDomainEvent(ctx workflow.Context, event map[string]interface{}) error {
 	stampDomainEventEnvelope(event, workflow.Now(ctx))
 	return workflow.ExecuteActivity(ctx, EmitDomainEventActivity, event).Get(ctx, nil)

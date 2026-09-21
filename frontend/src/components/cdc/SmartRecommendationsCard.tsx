@@ -145,7 +145,7 @@ function TableGroup({
             <span className={cn("font-medium text-sm", config.color)}>
               {config.label}
             </span>
-            <span className="text-xs text-zinc-500 ml-2">
+            <span className="text-xs text-zinc-500 dark:text-zinc-400 ml-2">
               {tables.length} tables • {formatNumber(totalRows)} rows
             </span>
           </div>
@@ -183,7 +183,7 @@ function TableGroup({
                     )}
                   </div>
                   <div className="flex items-center gap-3">
-                    <span className="text-xs text-zinc-500">
+                    <span className="text-xs text-zinc-500 dark:text-zinc-400">
                       {formatNumber(table.estimated_rows)} rows
                     </span>
                     <span className="text-xs text-zinc-400 max-w-[150px] truncate">
@@ -193,7 +193,7 @@ function TableGroup({
                 </div>
               ))}
               {tables.length > 10 && (
-                <div className="text-center py-2 text-sm text-zinc-500">
+                <div className="text-center py-2 text-sm text-zinc-500 dark:text-zinc-400">
                   +{tables.length - 10} more tables
                 </div>
               )}
@@ -281,12 +281,12 @@ export function SmartRecommendationsCard({
               <SyncIcon className="h-5 w-5 text-violet-600" />
               <div>
                 <p className="text-sm font-medium">{syncModeInfo.label}</p>
-                <p className="text-xs text-zinc-500">{syncModeInfo.description}</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">{syncModeInfo.description}</p>
               </div>
             </div>
             <div className="ml-auto text-right">
               <p className="text-lg font-bold">{formatNumber(totalRows)}</p>
-              <p className="text-xs text-zinc-500">total rows</p>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">total rows</p>
             </div>
           </div>
 
@@ -330,7 +330,7 @@ export function SmartRecommendationsCard({
           {skippedCount > 0 && (
             <div className="flex items-center gap-2 p-3 rounded-lg bg-zinc-100 dark:bg-zinc-800">
               <SkipForward className="h-4 w-4 text-zinc-400" />
-              <span className="text-sm text-zinc-500">
+              <span className="text-sm text-zinc-500 dark:text-zinc-400">
                 <strong>{skippedCount}</strong> tables skipped (empty, system, or audit tables)
               </span>
               {onViewAll && (

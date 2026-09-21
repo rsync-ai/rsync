@@ -188,24 +188,99 @@ dc_mcp() {
   docker compose -p "${MCP_PROJECT}" -f "${ROOT_DIR}/docker-compose.mcp.yml" ${CI_MCP[@]+"${CI_MCP[@]}"} ${oauth[@]+"${oauth[@]}"} ${graphql[@]+"${graphql[@]}"} "$@"
 }
 
-# Warm-runner self-heal for `up -d` dying on a stale compose network: a
-# container from an earlier run can outlive the project network (a teardown /
-# recreate swaps the network while the stopped container still pins the dead
-# id), and the next plain `up -d` then fails with "failed to set up container
-# networking: network <id> not found" before a single test runs (observed on
-# the PR smoke gate: stale `postgres` killed the whole run in 37s). The daemon
-# error names the network, not the container, and the stale container is
-# typically a DEPENDENCY of the requested services — so the retry must
-# recreate the named services AND their dependency closure
-# (--always-recreate-deps), not just re-run the same no-op `up`. Only this
-# exact daemon error triggers the single retry; any other failure propagates
+# The compose project each dc_* wrapper drives (empty for anything else).
+dc_project() {
+  case "$1" in
+    dc_main) printf '%s' "${MAIN_PROJECT}" ;;
+    dc_e2e)  printf '%s' "${E2E_PROJECT}" ;;
+    dc_mcp)  printf '%s' "${MCP_PROJECT}" ;;
+  esac
+}
+
+# Orphans of an interrupted recreate. Compose v2 recreates a container in three
+# steps: create the new one under the temporary name `<old id[:12]>_<name>`,
+# stop and remove the old one, then rename the new one to <name>. A run
+# cancelled between the first and the last step (a cancelled CI run that was
+# rebuilding images) leaves the temporary container behind, still labelled with
+# the project, usually in state "created". The next run's recreate of the same
+# old container picks the same temporary name and dies on "Conflict. The
+# container name "/<old id[:12]>_<name>" is already in use". Only compose makes
+# names of that shape, and the stack lock (_stack_lock.sh) keeps any other
+# compose run on these projects out while the gate runs, so this removes every
+# non-running one in the project. It never touches a running container, a
+# container under its final name, or another project's container. Best effort:
+# a failure here only warns, and the conflict branch below still gets a chance.
+reclaim_orphan_recreate_containers() {
+  local project="$1" re='^[0-9a-f]{12}_' id name state
+  [[ -n "${project}" ]] || return 0
+  while read -r id name state; do
+    [[ -n "${id}" && "${name}" =~ ${re} ]] || continue
+    case "${state}" in
+      created|exited|dead) ;;
+      *) continue ;;
+    esac
+    warn "removing ${name} (${state}): left in project ${project} by an interrupted compose recreate"
+    docker rm -f "${id}" >/dev/null 2>&1 || warn "could not remove ${name}"
+  done <<<"$(docker ps -a --filter "label=com.docker.compose.project=${project}" \
+               --format '{{.ID}} {{.Names}} {{.State}}' 2>/dev/null)"
+  return 0
+}
+
+# Removes the containers a "Conflict. The container name ... is already in use"
+# error names, when the name has compose's temporary-recreate shape and the
+# container carries this project's label. Returns 0 only if it removed one, so
+# the caller retries only when the retry can get further.
+reclaim_conflicting_recreate_containers() {
+  local project="$1" out="$2" name owner removed=1
+  [[ -n "${project}" ]] || return 1
+  while read -r name; do
+    [[ -n "${name}" ]] || continue
+    owner=$(docker inspect -f '{{ index .Config.Labels "com.docker.compose.project" }}' "${name}" 2>/dev/null) || continue
+    if [[ "${owner}" != "${project}" ]]; then
+      warn "name conflict on ${name}, which belongs to project '${owner}', not ${project}; leaving it alone"
+      continue
+    fi
+    warn "removing ${name}: left in project ${project} by an interrupted compose recreate"
+    docker rm -f "${name}" >/dev/null 2>&1 && removed=0
+  done <<<"$(grep -oE 'container name "/?[0-9a-f]{12}_[^"]+" is already in use' <<<"${out}" \
+               | sed -E 's/^container name "\/?//; s/" is already in use$//' | sort -u)"
+  return "${removed}"
+}
+
+# Warm-runner self-heal for `up -d`, for the two ways a shared CI stack is left
+# broken by an earlier run.
+#
+# 1. An interrupted recreate (see reclaim_orphan_recreate_containers). Its
+#    leftovers are removed before every `up`, and a name conflict on a
+#    leftover the sweep did not catch removes it and retries once.
+# 2. A stale compose network: a container from an earlier run can outlive the
+#    project network (a teardown / recreate swaps the network while the stopped
+#    container still pins the dead id), and the next plain `up -d` then fails
+#    with "failed to set up container networking: network <id> not found"
+#    before a single test runs (observed on the PR smoke gate: stale `postgres`
+#    killed the whole run in 37s). The daemon error names the network, not the
+#    container, and the stale container is typically a DEPENDENCY of the
+#    requested services — so the retry must recreate the named services AND
+#    their dependency closure (--always-recreate-deps), not just re-run the
+#    same no-op `up`.
+#
+# Only these exact daemon errors trigger a retry; any other failure propagates
 # unchanged so a real bring-up error still fails the gate loudly.
 compose_up_selfheal() {
   local dc="$1"; shift
-  local out rc
+  local project out rc
+  project=$(dc_project "${dc}")
+  reclaim_orphan_recreate_containers "${project}"
   out=$("$dc" up -d "$@" 2>&1); rc=$?
   [[ -n "${out}" ]] && printf '%s\n' "${out}"
   [[ ${rc} -eq 0 ]] && return 0
+  if grep -qE 'container name "/?[0-9a-f]{12}_[^"]+" is already in use' <<<"${out}" \
+     && reclaim_conflicting_recreate_containers "${project}" "${out}"; then
+    warn "retrying '${dc} up -d $*' after removing an interrupted recreate's leftover"
+    out=$("$dc" up -d "$@" 2>&1); rc=$?
+    [[ -n "${out}" ]] && printf '%s\n' "${out}"
+    [[ ${rc} -eq 0 ]] && return 0
+  fi
   if grep -qE 'failed to set up container networking|network [0-9a-f]{12,} not found' <<<"${out}"; then
     warn "stale compose network on warm stack; retrying '${dc} up -d $*' with --force-recreate --always-recreate-deps"
     "$dc" up -d --force-recreate --always-recreate-deps "$@"
@@ -695,6 +770,7 @@ UNGATED_TESTS=(
   test_db_cdc_to_local_minio.sh                # needs the external-MinIO overlay bring-up
   test_db_cdc_to_emulated_gcs_azure.sh         # needs fake-gcs-server + Azurite emulator overlay
   test_mongodb_multi_collection_to_gcs_batch.py # provisions its own mongod + fake-gcs-server fixtures
+  test_mongodb_cdc_to_gcs.py                   # provisions its own mongod replica set + fake-gcs-server fixtures
   test_pg_bulk_copy_parity.py                  # needs the copytest-pg fixture + a mounted edited connector.py
   test_pg_bulk_copy_merge.py                   # needs the copytest-pg fixture + RSYNC_PG_BULK_COPY overlay
   test_claim_check_gzip.py                     # needs the RSYNC_CLAIM_CHECK_GZIP opt-in overlay

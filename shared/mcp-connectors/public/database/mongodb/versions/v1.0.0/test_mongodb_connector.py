@@ -87,12 +87,14 @@ def test_get_capabilities_accepts_params_and_advertises_pymongo():
     assert caps["capabilities"]["max_batch_size"] == 10000, caps
 
 
-def test_validate_config_requires_host_or_uri_and_database():
+def test_validate_config_requires_host_or_uri_but_not_database():
     s = mg.MongodbMCPServer()
     bad = s.validate_config({"config": {}})
     assert bad["valid"] is False, bad
     assert any("host" in e for e in bad["errors"]), bad
-    assert any("database" in e for e in bad["errors"]), bad
+    # No database is a server-level connection, not an error.
+    assert not any("database" in e for e in bad["errors"]), bad
+    assert s.validate_config({"config": {"host": "h"}})["valid"] is True
     # a connection_string satisfies the host requirement
     ok_uri = s.validate_config({"config": {"connection_string": "mongodb://h/", "database": "d"}})
     assert ok_uri["valid"] is True, ok_uri
@@ -112,6 +114,7 @@ def test_test_connection_replica_set_ok_no_warning():
     out = s.test_connection(CFG)
     assert out["success"] is True, out
     assert out["is_replica_set"] is True and out["replica_set"] == "rs0", out
+    assert out["is_sharded_cluster"] is False, out
     assert "warning" not in out, out
     assert client.closed is True, "client must be closed"
     assert "ping" in client.admin.commands, client.admin.commands
@@ -120,13 +123,147 @@ def test_test_connection_replica_set_ok_no_warning():
 def test_test_connection_standalone_warns_cdc_needs_replica_set():
     """A standalone mongod cannot be a CDC source. test_connection must still
     succeed (batch is fine) but surface the change-streams-need-a-replica-set
-    warning — this is the connector's CDC-readiness gate."""
+    warning — this is the connector's CDC-readiness gate. The orchestrator blocks
+    a CDC start on exactly this pair: both fields present and both False."""
     s, _ = _mongo_fakes.make_connector(mg, set_name=None)
     out = s.test_connection(CFG)
     assert out["success"] is True, out
     assert out["is_replica_set"] is False, out
+    assert out["is_sharded_cluster"] is False, out
     assert "warning" in out and "replica set" in out["warning"].lower(), out
     assert "change stream" in out["warning"].lower(), out
+
+
+def test_test_connection_mongos_is_a_sharded_cluster_not_a_standalone():
+    """A mongos router has no setName, but change streams work through it
+    (Debezium 3.1 streams a sharded cluster, Atlas sharded included). Reading
+    is_replica_set=False as "standalone" would block every sharded CDC pipeline,
+    so a mongos must report is_sharded_cluster=True and carry no warning."""
+    s, _ = _mongo_fakes.make_connector(
+        mg, hello_reply={"isWritablePrimary": True, "msg": "isdbgrid"})
+    out = s.test_connection(CFG)
+    assert out["success"] is True, out
+    assert out["is_replica_set"] is False, out
+    assert out["is_sharded_cluster"] is True, out
+    assert "replica_set" not in out, out
+    assert "warning" not in out, out
+
+
+def test_test_connection_unknown_topology_omits_the_fields():
+    """If hello AND isMaster both fail, the topology is unknown. Reporting
+    is_replica_set=False would make the orchestrator block a CDC start on a
+    guess; the fields must be absent instead, and no standalone warning given."""
+    s, client = _mongo_fakes.make_connector(mg, topology_error=Exception("command not permitted"))
+    out = s.test_connection(CFG)
+    assert out["success"] is True, out
+    assert "is_replica_set" not in out, out
+    assert "is_sharded_cluster" not in out, out
+    assert "warning" not in out, out
+    assert client.admin.commands == ["ping", "hello", "isMaster"], client.admin.commands
+    assert client.closed is True, "client must be closed on the early return too"
+
+
+# ------------------ CDC readiness (pre-migration assessment) ----------------
+
+class _OpFailure(Exception):
+    """Stands in for pymongo.errors.OperationFailure (not installed here):
+    the connector reads only ``.code`` and the message."""
+
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        self.code = code
+
+
+def _cdc(collections):
+    return dict(CFG, cdc_readiness=True, collections=collections)
+
+
+def test_plain_connection_test_never_opens_a_change_stream():
+    s, client = _mongo_fakes.make_connector(mg)
+    out = s.test_connection(CFG)
+    assert client.watch_calls == [], client.watch_calls
+    assert "change_stream_access" not in out and "oplog_window_hours" not in out, out
+
+
+def test_cdc_readiness_probes_the_one_database_every_collection_is_in():
+    s, client = _mongo_fakes.make_connector(mg)
+    out = s.test_connection(_cdc(["appdb.users", "appdb.orders"]))
+    assert out["success"] is True, out
+    assert out["change_stream_access"] == {
+        "scope": "database", "database": "appdb", "status": "ok"}, out
+    assert [c[0] for c in client.watch_calls] == ["appdb"], client.watch_calls
+    assert all(st.closed for st in client.streams), "the probe stream must be closed"
+
+
+def test_cdc_readiness_bare_or_mixed_names_probe_the_deployment():
+    """Same rule as _mongo_capture_scope: a bare name or two databases leave
+    Debezium on deployment scope, so that is the scope to probe."""
+    for colls in (["users"], ["appdb.users", "otherdb.orders"], "appdb.users,orders"):
+        s, client = _mongo_fakes.make_connector(mg)
+        out = s.test_connection(_cdc(colls))
+        assert out["change_stream_access"]["scope"] == "deployment", (colls, out)
+        assert "database" not in out["change_stream_access"], out
+        assert [c[0] for c in client.watch_calls] == [None], (colls, client.watch_calls)
+
+
+def test_cdc_readiness_classifies_change_stream_failures():
+    cases = [
+        (_OpFailure("not authorized on appdb to execute command", code=13), "unauthorized"),
+        (_OpFailure("user is not allowed to do action [changeStream]", code=8000), "unauthorized"),
+        (_OpFailure("The $changeStream stage is only supported on replica sets", code=40573), "unsupported"),
+        (Exception("connection reset by peer"), "error"),
+    ]
+    for err, want in cases:
+        s, _ = _mongo_fakes.make_connector(mg, watch_error=err)
+        out = s.test_connection(_cdc(["appdb.users"]))
+        access = out["change_stream_access"]
+        assert out["success"] is True, "a failed probe must not fail the connection test"
+        assert access["status"] == want, (str(err), access)
+        assert access["message"], access
+
+
+def test_cdc_readiness_reports_the_oplog_window():
+    class _Ts:  # bson.Timestamp exposes the seconds as .time
+        def __init__(self, t):
+            self.time = t
+
+    oplog = [{"ts": _Ts(1_000_000)}, {"ts": _Ts(1_000_000 + 30 * 3600)}]
+
+    class _NaturalOrder:
+        """find() result sorted the way the server sorts on $natural."""
+
+        def __init__(self, docs):
+            self._docs = docs
+
+        def sort(self, key, direction=1):
+            assert key == "$natural", key
+            return _NaturalOrder(self._docs if direction == 1 else self._docs[::-1])
+
+        def limit(self, n):
+            return iter(self._docs[:n])
+
+    s, client = _mongo_fakes.make_connector(mg)
+    client["local"]["oplog.rs"].find = lambda *a, **kw: _NaturalOrder(list(oplog))
+    out = s.test_connection(_cdc(["appdb.users"]))
+    assert out["oplog_window_hours"] == 30.0, out
+
+
+def test_cdc_readiness_omits_an_unreadable_oplog():
+    """A mongos or a managed service that hides local.oplog.rs: unknown, so the
+    field is absent — never reported as a short window."""
+    s, _ = _mongo_fakes.make_connector(mg)
+    out = s.test_connection(_cdc(["appdb.users"]))
+    assert "oplog_window_hours" not in out, out
+
+
+def test_change_stream_database_rejects_invalid_names():
+    f = mg.MongodbMCPServer._change_stream_database
+    assert f(["app db.users"]) is None
+    assert f([".users"]) is None
+    assert f(["appdb."]) is None
+    assert f(None) is None
+    assert f([]) is None
+    assert f(["appdb.a.b"]) == "appdb"  # a dotted collection name is still one db
 
 
 def test_test_connection_ping_failure_reports_error():
@@ -210,6 +347,47 @@ def test_export_non_hex_cursor_compared_raw():
     q = client["appdb"]["nums"].find_calls[-1]["query"]
     assert q == {"_id": {"$gt": 1}}, q                      # raw value, no ObjectId
     assert [r["v"] for r in out["data"]] == [2, 3], out["data"]
+
+
+def test_export_int_id_pages_past_first_page():
+    """Regression: an int64 _id collection stopped after the first full page.
+
+    next_cursor was str(last_id) ("3"), so page 2 queried {"_id": {"$gt": "3"}},
+    which matches no numeric _id. Drive the executor's loop (JSON round-trip of
+    next_cursor into the next call's cursor) until has_more is false and require
+    every document exactly once.
+    """
+    import json
+    from bson.int64 import Int64
+    total, limit = 10, 3
+    docs = [{"_id": Int64(i), "v": i} for i in range(1, total + 1)]
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"msgs": docs}})
+    seen, cursor, pages = [], None, 0
+    while True:
+        params = {**CFG, "table": "msgs", "limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        out = s.export(params)
+        assert out["success"] is True, out
+        pages += 1
+        seen += [r["v"] for r in out["data"]]
+        if not out.get("has_more"):
+            break
+        assert isinstance(out["next_cursor"], int), out["next_cursor"]   # not "3"
+        cursor = json.loads(json.dumps(out["next_cursor"]))                # wire round-trip
+        assert pages < total, "export never finished"
+    assert seen == list(range(1, total + 1)), seen
+    q = client["appdb"]["msgs"].find_calls[1]["query"]
+    assert q == {"_id": {"$gt": 3}}, q
+
+
+def test_export_cursor_keeps_objectid_and_string_ids_as_strings():
+    oid = ObjectId()
+    assert mg._export_cursor(oid) == str(oid)
+    assert mg._export_cursor("user-9") == "user-9"
+    assert mg._export_cursor(7) == 7 and mg._export_cursor(2.5) == 2.5
+    assert mg._export_cursor(True) == "True"
+    assert mg._export_cursor(None) is None
 
 
 def test_export_strips_db_qualifier_from_collection():
@@ -1003,6 +1181,61 @@ def test_find_dispatches_as_mcp_tool_and_is_declared_in_lockstep():
 
 
 # ================================= runner ===================================
+
+def _budget_dbs():
+    return {"appdb": {f"c{i}": [{"_id": ObjectId(), "v": i}] for i in range(4)}}
+
+
+def test_discover_schema_budget_spent_lists_collections_without_sampling():
+    # Thousands of collections cost a sample + a count each; past the budget
+    # they are still listed (selectable) with _id only, and a warning says so.
+    s, _ = _mongo_fakes.make_connector(mg, dbs=_budget_dbs())
+    out = s.discover_schema(dict(CFG, enrich_budget_seconds=0))
+    assert out["overall_status"] == "success", out
+    assert [t["name"] for t in out["tables"]] == ["c0", "c1", "c2", "c3"], out
+    assert out["total_tables_available"] == 4 and out["total_tables_discovered"] == 4, out
+    for t in out["tables"]:
+        assert t["discovery_status"] == "partial", t
+        assert [c["name"] for c in t["columns"]] == ["_id"], t
+        assert t["primary_keys"] == ["_id"] and "row_count" not in t, t
+    assert any("4 of 4 collections" in w for w in out["warnings_messages"]), out
+
+    # Control: the default budget samples and counts every collection.
+    whole = s.discover_schema(CFG)
+    for t in whole["tables"]:
+        assert t["discovery_status"] == "complete" and t["row_count"] == 1, t
+        assert [c["name"] for c in t["columns"]] == ["_id", "v"], t
+    assert not any("collections listed" in w for w in whole["warnings_messages"]), whole
+
+
+def test_discover_schema_budget_runs_out_mid_list():
+    # A clock that advances 1s per read: with a 3.5s budget the first
+    # collections are sampled and the rest are listed partial.
+    ticks = iter(range(10_000))
+    real_time = mg.time
+    mg.time = type("_Clock", (), {"monotonic": staticmethod(lambda: float(next(ticks)))})
+    try:
+        s, _ = _mongo_fakes.make_connector(mg, dbs=_budget_dbs())
+        out = s.discover_schema(dict(CFG, enrich_budget_seconds=3.5))
+    finally:
+        mg.time = real_time
+    status = [t["discovery_status"] for t in out["tables"]]
+    assert status[0] == "complete" and status[-1] == "partial", status
+    assert status == sorted(status), status          # complete ones first, no gaps
+    assert len(out["tables"]) == 4, out
+    partial = status.count("partial")
+    assert any(f"{partial} of 4 collections" in w for w in out["warnings_messages"]), out
+
+
+def test_discover_schema_count_is_bounded_and_falls_back_to_estimate():
+    coll = _mongo_fakes.FakeCollection([{"_id": ObjectId()}, {"_id": ObjectId()}])
+    coll.count_error = RuntimeError("operation exceeded time limit")
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"big": coll}})
+    out = s.discover_schema(CFG)
+    big = out["tables"][0]
+    assert big["row_count"] == 2 and big["is_exact_count"] is False, big
+    assert coll.count_calls and coll.count_calls[0].get("maxTimeMS", 0) > 0, coll.count_calls
+
 
 def _run():
     tests = [v for k, v in sorted(globals().items())

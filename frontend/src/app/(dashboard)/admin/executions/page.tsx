@@ -7,6 +7,7 @@ import { AdminNav } from "@/components/admin/AdminNav"
 import { Card } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Badge } from "@/components/ui/badge"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
@@ -27,6 +28,15 @@ type ExecutionsResponse = {
   limit: number
   offset: number
 }
+
+const ADMIN_EXECUTION_STATUSES = [
+  { value: "running", label: "Running" },
+  { value: "pending", label: "Pending" },
+  { value: "waiting_for_user", label: "Waiting for user" },
+  { value: "success", label: "Success" },
+  { value: "failed", label: "Failed" },
+  { value: "cancelled", label: "Cancelled" },
+]
 
 export default function AdminExecutionsPage() {
   const router = useRouter()
@@ -101,7 +111,7 @@ export default function AdminExecutionsPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader heading="Admin: Executions" description="Executions across all users" />
+      <PageHeader heading="Admin" description="Executions across all users" />
       <AdminNav />
 
       <Card className="p-4">
@@ -114,8 +124,35 @@ export default function AdminExecutionsPage() {
               load()
             }}
           >
-            <Input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by execution id, pipeline id, pipeline name, or email…" />
-            <Input value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)} placeholder="Status (optional)" className="sm:max-w-[200px]" />
+            {/* The long hint was cut off in the box (#53); it stays in the title. */}
+            <Input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search id, pipeline or email…"
+              title="Search by execution id, pipeline id, pipeline name, or email"
+              aria-label="Search executions"
+            />
+            {/* A fixed list, not free text: a typed "success" missed every row stored
+                as "completed" (#53). The gateway maps each value onto its spellings. */}
+            <Select
+              value={statusFilter || "all"}
+              onValueChange={(v) => {
+                setStatusFilter(v === "all" ? "" : v)
+                setOffset(0)
+              }}
+            >
+              <SelectTrigger className="sm:w-[180px]" aria-label="Status">
+                <SelectValue placeholder="All statuses" />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">All statuses</SelectItem>
+                {ADMIN_EXECUTION_STATUSES.map((s) => (
+                  <SelectItem key={s.value} value={s.value}>
+                    {s.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
             <Button type="submit" variant="outline">
               Apply
             </Button>
@@ -166,7 +203,7 @@ export default function AdminExecutionsPage() {
 
           <div className="mt-4 space-y-2">
             {data.data.length === 0 ? (
-              <div className="text-sm text-zinc-500">No executions found</div>
+              <div className="text-sm text-zinc-500 dark:text-zinc-400">No executions found</div>
             ) : (
               data.data.map((e) => (
                 <div
@@ -185,12 +222,12 @@ export default function AdminExecutionsPage() {
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="min-w-0">
-                      <div className="font-mono text-xs text-zinc-500">{e.id}</div>
+                      <div className="font-mono text-xs text-zinc-500 dark:text-zinc-400">{e.id}</div>
                       <div className="mt-1 font-medium text-zinc-900 dark:text-white truncate">
                         {e.pipeline_name || e.pipeline_id}
                       </div>
                       {e.created_by_email ? (
-                        <div className="mt-1 text-xs text-zinc-500">Owner: {e.created_by_email}</div>
+                        <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">Owner: {e.created_by_email}</div>
                       ) : null}
                       {e.error_message ? (
                         <div className="mt-1 text-xs text-red-700 dark:text-red-300">{e.error_message}</div>

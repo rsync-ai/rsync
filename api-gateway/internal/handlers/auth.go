@@ -811,8 +811,8 @@ func (h *AuthHandler) Me(c *gin.Context) {
 	var planExpiresAt sql.NullTime
 	_ = h.db.QueryRow(`SELECT plan_expires_at FROM workspaces WHERE id = $1`, bannerWS).Scan(&planExpiresAt)
 
-	var pipelinesUsed int
-	_ = h.db.QueryRow(`SELECT COUNT(*) FROM pipelines WHERE workspace_id = $1`, bannerWS).Scan(&pipelinesUsed)
+	// Same meter as the create gate (plan_quota.go countWorkspacePipelines).
+	pipelinesUsed, _ := countWorkspacePipelines(c.Request.Context(), h.db, bannerWS)
 
 	resp := gin.H{
 		"user_id":        userID,

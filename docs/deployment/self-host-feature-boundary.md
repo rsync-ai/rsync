@@ -28,7 +28,7 @@ Everything the product is for. These are on by default in
 | The 21-connector catalogue | databases, warehouses, object storage, SaaS APIs — [full table](../connectors/reference.md#catalogue) |
 | Schema drift detection | `RSYNC_SCHEMA_DRIFT_ENABLED`, off by default in both editions |
 | CDC self-heal / sentinel | detection always on; the two autonomy flags default off in both editions |
-| Data explorer + NL→SQL | needs an LLM provider — see section B |
+| Data explorer + NL→SQL | raw SQL needs nothing; NL→SQL needs an LLM provider — see section B |
 | Workspaces, members, roles, invites | **ships and functions.** Not withheld, but self-host is not tested against multi-tenant use — treat it as single-team |
 | Direct SQL queries | unlimited and **not metered** in any edition |
 | Unlimited pipelines | see the quota section below |
@@ -42,7 +42,7 @@ Nothing here is disabled. The stack needs a value only you can provide.
 
 | Capability | You supply | Where |
 |---|---|---|
-| LLM features (explorer, NL→SQL, planner) | an API key, **or** a local model | `LLM_PROVIDER` (default `openai`), `AZURE_OPENAI_ENDPOINT`, or `docker-compose.ollama.yml` for a fully offline stack |
+| LLM features (explorer, NL→SQL, planner) | an API key, **or** a local model — optional: with neither, these features answer `Set up an LLM first` and the rest of the stack works | `LLM_PROVIDER` (default `openai`; `none` to run without one), `AZURE_OPENAI_ENDPOINT`, `GROQ_API_KEY` with `LLM_PROVIDER=groq`, `OPENAI_BASE_URL` for Vertex AI or another OpenAI-compatible endpoint, or `docker-compose.ollama.yml` with `LLM_PROVIDER=ollama` for a fully offline stack. Order: [which LLM is used](self-hosting.md#which-llm-is-used) |
 | OAuth connectors (Google, GitHub, Slack, Salesforce, HubSpot) | **your own** client ID + secret, registered with that vendor | `${GOOGLE_CLIENT_ID:-}` etc. in `docker-compose.quickstart.yml` — all default empty, so the stack starts without them |
 | Outbound email (invites, notifications) | SMTP or Resend credentials | unset in quickstart; invites render a URL but do not send |
 | Object-storage destinations (S3, GCS, Azure Blob) | your bucket + credentials | [cloud-storage-config.md](../connectors/cloud-storage-config.md) |
@@ -63,7 +63,7 @@ service's own operational plumbing.
 | OpenTelemetry export | no `otel-collector` container in quickstart | `docker-compose.quickstart.yml` |
 | Log shipping (`fluent-bit`), Avro `schema-registry`, Temporal web UI + admin tools, MinIO lifecycle init, Docker socket proxy, connector FS init | hosted-only plumbing | 8 services quickstart omits, `otel-collector` included |
 | Internal connectors as pipeline endpoints (MinIO, Debezium, Kafka sink) | blocked by default in **both** editions; the hosted compose opts in with `RSYNC_ALLOW_INTERNAL_CONNECTORS=true` | `connections.go:56-60` |
-| Billing and plan quotas | `RSYNC_BILLING_ENFORCED=false` | `docker-compose.quickstart.yml:1147` |
+| Billing and plan quotas | `RSYNC_BILLING_ENFORCED=false` | `docker-compose.quickstart.yml:1148` |
 | The Usage panel (`/usage`, `/admin/usage`) | it reports plan, quota and trial numbers that a deployment enforcing no plans does not have; the flag defaults to whatever billing does, so it switches itself off | `features.go` → `resolveUsagePanel()`; set `FEATURE_USAGE_PANEL=true` to show it anyway |
 
 ### Connector generation: what exactly is missing
@@ -97,7 +97,7 @@ self-hosted means writing it by hand: see the
 
 **Self-hosted, every quota is off.** Two independent reasons, either sufficient:
 
-1. `RSYNC_BILLING_ENFORCED=false` in `docker-compose.quickstart.yml:1147` →
+1. `RSYNC_BILLING_ENFORCED=false` in `docker-compose.quickstart.yml:1148` →
    `billingEnforced()` returns false → `resolvePlanQuota` returns `unlimitedQuota`
    (`billingEnforced()` at `plan_quota.go:70`, the early return at `:84`).
 2. Even with billing on, `loadPlans` reads the `plans` table; when it is empty the code

@@ -26,7 +26,8 @@ export const metadata: Metadata = {
     default: "Rsync",
     template: "%s | Rsync",
   },
-  description: "AI-powered data synchronization and replication platform",
+  description:
+    "Self-hosted data platform for batch pipelines, CDC, scheduled data models, and lineage. Describe a pipeline in plain English, approve the plan, and see exactly what ran, failed, or became stale.",
   keywords: ["data", "sync", "replication", "CDC", "pipeline", "AI", "automation"],
 }
 

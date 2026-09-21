@@ -63,6 +63,25 @@ describe("readResponseErrorMessage (KI-CDC-CONTROL-502-BODY-NOT-IN-TOAST)", () =
     expect(await readResponseErrorMessage(res, "Pause")).toBe("upstream connect error")
   })
 
+  it("an HTML error page from a proxy falls through to the status line, not markup", async () => {
+    const nginx = new Response(
+      "<html>\r\n<head><title>502 Bad Gateway</title></head>\r\n<body>\r\n<center><h1>502 Bad Gateway</h1></center>\r\n</body>\r\n</html>\r\n",
+      { status: 502, statusText: "Bad Gateway", headers: { "Content-Type": "text/html" } }
+    )
+    expect(await readResponseErrorMessage(nginx, "Pause")).toBe("Pause failed: Bad Gateway (HTTP 502)")
+
+    // HTTP/2 carries no status text: the status code alone still names it.
+    const lb = new Response("<!DOCTYPE html>\n<html lang=en><title>Error 502 (Server Error)</title></html>", {
+      status: 502,
+    })
+    expect(await readResponseErrorMessage(lb, "Pause")).toBe("Pause failed (HTTP 502)")
+  })
+
+  it("control: plain text that merely mentions a tag is still the reason", async () => {
+    const res = new Response("connector returned <nil> config", { status: 502 })
+    expect(await readResponseErrorMessage(res, "Pause")).toBe("connector returned <nil> config")
+  })
+
   it("JSON with no human-readable field falls through to the status line, not a blob", async () => {
     const res = new Response(JSON.stringify({ success: false }), { status: 502 })
     const msg = await readResponseErrorMessage(res, "Pause")

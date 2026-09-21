@@ -118,12 +118,12 @@ function Step({ n, label, active = false }: { n: number; label: string; active?:
         className={
           active
             ? "inline-flex h-5 w-5 items-center justify-center rounded-full bg-violet-600 text-white text-[10px] font-bold"
-            : "inline-flex h-5 w-5 items-center justify-center rounded-full bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700 text-zinc-500 text-[10px] font-bold"
+            : "inline-flex h-5 w-5 items-center justify-center rounded-full bg-white dark:bg-zinc-900 border border-zinc-300 dark:border-zinc-700 text-zinc-500 dark:text-zinc-400 text-[10px] font-bold"
         }
       >
         {n}
       </span>
-      <span className={active ? "text-violet-700 dark:text-violet-300 font-medium" : "text-zinc-500"}>
+      <span className={active ? "text-violet-700 dark:text-violet-300 font-medium" : "text-zinc-500 dark:text-zinc-400"}>
         {label}
       </span>
     </li>

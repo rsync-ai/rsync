@@ -1,0 +1,194 @@
+{
+  "_about": [
+    "One object-storage key contract, shared by three separately compiled copies:",
+    "  kafka-sink-worker   shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/object_layout.go",
+    "  backend-orchestrator backend-orchestrator/internal/storage/layout.go",
+    "  rsync_protocol (v2) shared/mcp-connectors/public/rsync_protocol/object_layout.py",
+    "v1 pins what the sink writes TODAY (partKey, manifestKey, successKey, tablePrefix, cdcObjectKey,",
+    "cdcPipelineRootPrefix in the sink's main.go). Change a v1 expectation only together with the writer.",
+    "v2 is the agreed layout: <conn prefix>/<pipeline prefix>/<db>/[<schema>/]<table>/dt=YYYY-MM-DD/",
+    "LOAD00000001.parquet or <YYYYMMDD-HHMMSSmmm>[-p<n>]-<first offset>.parquet; sidecars under",
+    "<conn prefix>/<pipeline prefix>/_rsync/<db>/[<schema>/]<table>/dt=YYYY-MM-DD/.",
+    "Every case has either \"want\" (the key) or \"error\" (a stable error code). Keys starting with _ are notes.",
+    "v2_destinations lists the destination connector types v2 is built for (they stamp rsync_* object metadata",
+    "and implement get_cdc_offsets). The sink, the orchestrator and the frontend (destinationNamespace.ts) all read it;",
+    "types are matched after lowercase, trim and _ to -. minio stays v1."
+  ],
+  "v1": {
+    "batch_part_key": [
+      {
+        "name": "pipeline id slug is the dataset fallback; schema is stripped from the table",
+        "in": {"dest_config": {"path_prefix": "bronze/", "file_format": "parquet"}, "pipeline_id": "Pipe-1234", "dataset": "", "db_or_schema": "sales", "table": "public.orders", "part_segs": "", "dt": "2026-09-10", "offset": 7, "part_suffix": "", "compression": "none"},
+        "want": "bronze/pipe-1234/sales/orders/dt=2026-09-10/part-000007.parquet"
+      },
+      {
+        "name": "bucket root, dataset override, default db, csv default, gzip, rolling suffix, hive segments",
+        "in": {"dest_config": {}, "pipeline_id": "ignored", "dataset": "Orders Sync!", "db_or_schema": "", "table": "users", "part_segs": "region=eu/", "dt": "2026-09-10", "offset": 1234567, "part_suffix": "0002", "compression": "gzip"},
+        "want": "orders-sync/default/users/region=eu/dt=2026-09-10/part-1234567-0002.csv.gz"
+      },
+      {
+        "name": "path_prefix wins over prefix; parquet keeps its codec inside; dt falls back to now; separators sanitized",
+        "in": {"dest_config": {"prefix": "ignored-second", "path_prefix": "  /lake/raw/ ", "format": "PARQUET"}, "pipeline_id": "P", "dataset": "", "db_or_schema": "a/b..c", "table": "db.schema.tbl\\x", "part_segs": "", "dt": "", "now_ms": 1789041600000, "offset": 0, "part_suffix": "", "compression": "snappy"},
+        "want": "lake/raw/p/a_b_c/tbl_x/dt=2026-09-10/part-000000.parquet"
+      },
+      {
+        "name": "base_path key, ndjson alias, zstd",
+        "in": {"dest_config": {"base_path": "x", "file_format": "ndjson"}, "pipeline_id": "p2", "dataset": "", "db_or_schema": "d", "table": "t", "part_segs": "", "dt": "2026-01-01", "offset": 42, "part_suffix": "", "compression": "zstd"},
+        "want": "x/p2/d/t/dt=2026-01-01/part-000042.jsonl.zst"
+      },
+      {
+        "name": "unknown compression is appended verbatim",
+        "in": {"dest_config": {}, "pipeline_id": "", "dataset": "ds", "db_or_schema": "d", "table": "t", "part_segs": "", "dt": "2026-01-01", "offset": 0, "part_suffix": "", "compression": "brotli"},
+        "want": "ds/d/t/dt=2026-01-01/part-000000.csv.brotli"
+      },
+      {
+        "name": "dataset slug is clamped to 63 characters and re-trimmed",
+        "in": {"dest_config": {}, "pipeline_id": "", "dataset": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-bbbb", "db_or_schema": "d", "table": "t", "part_segs": "", "dt": "2026-01-01", "offset": 1, "part_suffix": "", "compression": ""},
+        "want": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d/t/dt=2026-01-01/part-000001.csv"
+      },
+      {
+        "name": "a 70-character dataset slug keeps exactly 63 characters",
+        "in": {"dest_config": {}, "pipeline_id": "", "dataset": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "db_or_schema": "d", "table": "t", "part_segs": "", "dt": "2026-01-01", "offset": 1, "part_suffix": "", "compression": ""},
+        "want": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/d/t/dt=2026-01-01/part-000001.csv"
+      }
+    ],
+    "batch_manifest_key": [
+      {
+        "name": "manifest sits in the data partition folder, without hive segments",
+        "in": {"dest_config": {"path_prefix": "bronze"}, "pipeline_id": "Pipe-1234", "dataset": "", "db_or_schema": "sales", "table": "public.orders", "dt": "2026-09-10"},
+        "want": "bronze/pipe-1234/sales/orders/dt=2026-09-10/_MANIFEST.json"
+      },
+      {
+        "name": "no prefix and no dataset contribute no segment; dt falls back to now",
+        "in": {"dest_config": {}, "pipeline_id": "", "dataset": "", "db_or_schema": "", "table": "t", "dt": "", "now_ms": 1767225599000},
+        "want": "default/t/dt=2025-12-31/_MANIFEST.json"
+      }
+    ],
+    "batch_success_key": [
+      {
+        "name": "success marker sits next to the manifest",
+        "in": {"dest_config": {"path_prefix": "bronze"}, "pipeline_id": "Pipe-1234", "dataset": "", "db_or_schema": "sales", "table": "public.orders", "dt": "2026-09-10"},
+        "want": "bronze/pipe-1234/sales/orders/dt=2026-09-10/_SUCCESS"
+      },
+      {
+        "name": "bucket root",
+        "in": {"dest_config": {}, "pipeline_id": "", "dataset": "", "db_or_schema": "", "table": "t", "dt": "", "now_ms": 1767225599000},
+        "want": "default/t/dt=2025-12-31/_SUCCESS"
+      }
+    ],
+    "table_prefix": [
+      {
+        "name": "the sink's reload delete_prefix scope",
+        "in": {"dest_config": {"path_prefix": "bronze"}, "pipeline_id": "Pipe-1234", "dataset": "", "db_or_schema": "sales", "table": "public.orders"},
+        "want": "bronze/pipe-1234/sales/orders/"
+      },
+      {
+        "name": "a trailing dot keeps the whole table name",
+        "in": {"dest_config": {}, "pipeline_id": "p", "dataset": "", "db_or_schema": "", "table": "schema."},
+        "want": "p/default/schema./"
+      }
+    ],
+    "cdc_object_key": [
+      {
+        "name": "worker pipeline id wins; schema from the table; plain date folder; parquet ignores gzip",
+        "in": {"dest_config": {"path_prefix": "cdc-root", "file_format": "parquet"}, "worker_pipeline_id": "Pipe-1234", "pipeline_id": "other", "db_or_schema": "", "table": "public.orders", "part_segs": "", "ts_ms": 1789000000123, "partition": 0, "first_offset": 42, "compression": "gzip"},
+        "want": "cdc-root/pipe-1234/public/orders/2026-09-10/20260910-002640123-42.parquet"
+      },
+      {
+        "name": "message pipeline id fallback; jsonl default; day granularity; partition suffix before the offset",
+        "in": {"dest_config": {"partition_time_granularity": "day"}, "worker_pipeline_id": "", "pipeline_id": "Msg Pipe", "db_or_schema": "ns1", "table": "orders", "part_segs": "region=eu/", "ts_ms": 1789041599999, "partition": 3, "first_offset": 9001, "compression": "gzip"},
+        "want": "msg-pipe/ns1/orders/region=eu/dt=2026-09-10/20260910-115959999-p3-9001.jsonl.gz"
+      },
+      {
+        "name": "hour granularity; only gzip changes the CDC extension; default db",
+        "in": {"dest_config": {"key_prefix": "/k/", "format": "csv", "partition_time_granularity": "Hour"}, "worker_pipeline_id": "w", "pipeline_id": "", "db_or_schema": "", "table": "orders", "part_segs": "", "ts_ms": 1789041600000, "partition": 0, "first_offset": 0, "compression": "zstd"},
+        "want": "k/w/default/orders/dt=2026-09-10/hour=12/20260910-120000000-0.csv"
+      },
+      {
+        "name": "month granularity; timestamp falls back to now; no pipeline segment; separators sanitized",
+        "in": {"dest_config": {"path": "p", "file_format": "json", "partition_time_granularity": "month"}, "worker_pipeline_id": "", "pipeline_id": "", "db_or_schema": "a..b", "table": "s.t/x", "part_segs": "", "ts_ms": 0, "now_ms": 1767225599000, "partition": 0, "first_offset": 5, "compression": "none"},
+        "want": "p/a_b/t_x/dt=2025-12/20251231-235959000-5.json"
+      }
+    ],
+    "cdc_pipeline_root_prefix": [
+      {
+        "name": "the get_cdc_offsets listing root",
+        "in": {"dest_config": {"path_prefix": "/cdc-root/"}, "worker_pipeline_id": "Pipe-1234"},
+        "want": "cdc-root/pipe-1234/"
+      },
+      {
+        "name": "bucket root",
+        "in": {"dest_config": {}, "worker_pipeline_id": "Pipe"},
+        "want": "pipe/"
+      },
+      {
+        "name": "no worker pipeline id means no listing root",
+        "in": {"dest_config": {"path_prefix": "cdc-root"}, "worker_pipeline_id": ""},
+        "want": ""
+      }
+    ]
+  },
+  "v2": {
+    "pipeline_root_prefix": [
+      {"name": "connection prefix slashes are trimmed", "in": {"conn_prefix": " /lake/ ", "pipeline_prefix": "sales_prod"}, "want": "lake/sales_prod/"},
+      {"name": "bucket root", "in": {"conn_prefix": "", "pipeline_prefix": "p1"}, "want": "p1/"},
+      {"name": "multi-segment connection prefix", "in": {"conn_prefix": "data/raw", "pipeline_prefix": "crm-2026"}, "want": "data/raw/crm-2026/"},
+      {"name": "63-character pipeline prefix is allowed", "in": {"conn_prefix": "", "pipeline_prefix": "ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"}, "want": "ppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp/"},
+      {"name": "pipeline prefix is required", "in": {"conn_prefix": "lake", "pipeline_prefix": ""}, "error": "pipeline_prefix_invalid"},
+      {"name": "leading underscore would collide with _rsync", "in": {"conn_prefix": "lake", "pipeline_prefix": "_rsync"}, "error": "pipeline_prefix_invalid"},
+      {"name": "upper case is rejected", "in": {"conn_prefix": "lake", "pipeline_prefix": "Sales"}, "error": "pipeline_prefix_invalid"},
+      {"name": "leading hyphen is rejected", "in": {"conn_prefix": "lake", "pipeline_prefix": "-sales"}, "error": "pipeline_prefix_invalid"},
+      {"name": "a slash is rejected", "in": {"conn_prefix": "lake", "pipeline_prefix": "a/b"}, "error": "pipeline_prefix_invalid"},
+      {"name": "64 characters is too long", "in": {"conn_prefix": "", "pipeline_prefix": "pppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppppp"}, "error": "pipeline_prefix_invalid"}
+    ],
+    "table_prefix": [
+      {"name": "postgresql uses db and schema", "in": {"conn_prefix": "/lake/", "pipeline_prefix": "sales_prod", "source_family": "postgresql", "database": "shop", "schema": "public", "table": "orders"}, "want": "lake/sales_prod/shop/public/orders/"},
+      {"name": "sqlserver uses db and schema", "in": {"conn_prefix": "lake", "pipeline_prefix": "erp", "source_family": "sqlserver", "database": "Erp", "schema": "dbo", "table": "Invoices"}, "want": "lake/erp/Erp/dbo/Invoices/"},
+      {"name": "oracle uses db and schema; family is trimmed and lower-cased", "in": {"conn_prefix": "", "pipeline_prefix": "fin", "source_family": " Oracle ", "database": "ORCLPDB1", "schema": "HR", "table": "EMPLOYEES"}, "want": "fin/ORCLPDB1/HR/EMPLOYEES/"},
+      {"name": "mongodb uses db only and ignores a schema", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "ignored", "table": "users"}, "want": "lake/app/app/users/"},
+      {"name": "mysql uses db only", "in": {"conn_prefix": "lake", "pipeline_prefix": "shop", "source_family": "mysql", "database": "shop", "schema": "", "table": "orders"}, "want": "lake/shop/shop/orders/"},
+      {"name": "a non-database source has no db segment", "in": {"conn_prefix": "lake", "pipeline_prefix": "files", "source_family": "", "database": "x", "schema": "y", "table": "events"}, "want": "lake/files/events/"},
+      {"name": "=, %, / and \\ are percent-encoded; a leading _ or . is encoded; case is kept", "in": {"conn_prefix": "lake", "pipeline_prefix": "p", "source_family": "postgresql", "database": ".hidden", "schema": "a/b\\c%d", "table": "_Tmp=1"}, "want": "lake/p/%2Ehidden/a%2Fb%5Cc%25d/%5FTmp%3D1/"},
+      {"name": "control characters are percent-encoded; non-ASCII is kept", "in": {"conn_prefix": "lake", "pipeline_prefix": "p", "source_family": "mysql", "database": "café", "schema": "", "table": "a\tb"}, "want": "lake/p/café/a%09b/"},
+      {"name": "an unknown family fails instead of dropping the db", "in": {"conn_prefix": "lake", "pipeline_prefix": "p", "source_family": "cockroachdb", "database": "d", "schema": "s", "table": "t"}, "error": "source_family_unknown"},
+      {"name": "postgresql without a schema", "in": {"conn_prefix": "lake", "pipeline_prefix": "p", "source_family": "postgresql", "database": "d", "schema": " ", "table": "t"}, "error": "schema_required"},
+      {"name": "mongodb without a database", "in": {"conn_prefix": "lake", "pipeline_prefix": "p", "source_family": "mongodb", "database": "", "schema": "", "table": "t"}, "error": "database_required"},
+      {"name": "a table is required", "in": {"conn_prefix": "lake", "pipeline_prefix": "p", "source_family": "", "database": "", "schema": "", "table": ""}, "error": "table_required"},
+      {"name": "pipeline prefix is checked first", "in": {"conn_prefix": "lake", "pipeline_prefix": "", "source_family": "postgresql", "database": "", "schema": "", "table": ""}, "error": "pipeline_prefix_invalid"}
+    ],
+    "sidecar_table_prefix": [
+      {"name": "sidecars live under _rsync, never in the table folder", "in": {"conn_prefix": "/lake/", "pipeline_prefix": "sales_prod", "source_family": "postgresql", "database": "shop", "schema": "public", "table": "orders"}, "want": "lake/sales_prod/_rsync/shop/public/orders/"},
+      {"name": "mongodb", "in": {"conn_prefix": "", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users"}, "want": "app/_rsync/app/users/"}
+    ],
+    "load_key": [
+      {"name": "first load file", "in": {"conn_prefix": "/lake/", "pipeline_prefix": "sales_prod", "source_family": "postgresql", "database": "shop", "schema": "public", "table": "orders", "dt": "2026-09-10", "load_seq": 1}, "want": "lake/sales_prod/shop/public/orders/dt=2026-09-10/LOAD00000001.parquet"},
+      {"name": "eight-digit sequence", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "dt": "2025-12-31", "load_seq": 99999999}, "want": "lake/app/app/users/dt=2025-12-31/LOAD99999999.parquet"},
+      {"name": "sequence starts at 1", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "dt": "2026-09-10", "load_seq": 0}, "error": "load_seq_out_of_range"},
+      {"name": "nine digits is out of range", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "dt": "2026-09-10", "load_seq": 100000000}, "error": "load_seq_out_of_range"},
+      {"name": "dt must be zero-padded", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "dt": "2026-9-10", "load_seq": 1}, "error": "dt_invalid"},
+      {"name": "dt must be a real date", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "dt": "2026-02-30", "load_seq": 1}, "error": "dt_invalid"},
+      {"name": "year 0000 is rejected", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "dt": "0000-01-01", "load_seq": 1}, "error": "dt_invalid"}
+    ],
+    "cdc_key": [
+      {"name": "dt is the event's UTC day; first offset ends the name", "in": {"conn_prefix": "/lake/", "pipeline_prefix": "sales_prod", "source_family": "postgresql", "database": "shop", "schema": "public", "table": "orders", "ts_ms": 1789000000123, "partition": 0, "first_offset": 42}, "want": "lake/sales_prod/shop/public/orders/dt=2026-09-10/20260910-002640123-42.parquet"},
+      {"name": "a non-zero partition goes before the offset", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "ts_ms": 1767225599000, "partition": 2, "first_offset": 0}, "want": "lake/app/app/users/dt=2025-12-31/20251231-235959000-p2-0.parquet"},
+      {"name": "a timestamp is required", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "ts_ms": 0, "partition": 0, "first_offset": 1}, "error": "ts_invalid"},
+      {"name": "a timestamp in year 10000 or later is rejected", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "ts_ms": 253402300800000, "partition": 0, "first_offset": 1}, "error": "ts_invalid"},
+      {"name": "the last millisecond of year 9999 is accepted", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "ts_ms": 253402300799999, "partition": 0, "first_offset": 1}, "want": "lake/app/app/users/dt=9999-12-31/99991231-235959999-1.parquet"},
+      {"name": "a negative offset is rejected", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "ts_ms": 1789000000123, "partition": 0, "first_offset": -1}, "error": "offset_invalid"},
+      {"name": "a negative partition is rejected", "in": {"conn_prefix": "lake", "pipeline_prefix": "app", "source_family": "mongodb", "database": "app", "schema": "", "table": "users", "ts_ms": 1789000000123, "partition": -1, "first_offset": 1}, "error": "partition_invalid"}
+    ],
+    "manifest_key": [
+      {"name": "manifest under _rsync", "in": {"conn_prefix": "/lake/", "pipeline_prefix": "sales_prod", "source_family": "postgresql", "database": "shop", "schema": "public", "table": "orders", "dt": "2026-09-10"}, "want": "lake/sales_prod/_rsync/shop/public/orders/dt=2026-09-10/_MANIFEST.json"},
+      {"name": "dt is validated", "in": {"conn_prefix": "lake", "pipeline_prefix": "p", "source_family": "", "database": "", "schema": "", "table": "t", "dt": "20260910"}, "error": "dt_invalid"}
+    ],
+    "success_key": [
+      {"name": "success marker under _rsync", "in": {"conn_prefix": "/lake/", "pipeline_prefix": "sales_prod", "source_family": "postgresql", "database": "shop", "schema": "public", "table": "orders", "dt": "2026-09-10"}, "want": "lake/sales_prod/_rsync/shop/public/orders/dt=2026-09-10/_SUCCESS"},
+      {"name": "non-database source", "in": {"conn_prefix": "", "pipeline_prefix": "files", "source_family": "", "database": "", "schema": "", "table": "events", "dt": "2026-09-10"}, "want": "files/_rsync/events/dt=2026-09-10/_SUCCESS"}
+    ]
+  },
+  "v2_destinations": {
+    "eligible": ["gcs", "aws-s3", "azure-blob", "GCS", "AWS_S3", " Azure_Blob ", "aws_s3"],
+    "not_eligible": ["minio", "s3", "MinIO", "postgresql", "bigquery", "", "gcs-legacy"]
+  }
+}

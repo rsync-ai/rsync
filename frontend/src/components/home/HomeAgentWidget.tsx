@@ -18,6 +18,7 @@ import {
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { captureWorkspace, onActiveWorkspaceChange } from "@/lib/workspace/active-workspace"
+import { displayConnectorName } from "@/lib/connector-display"
 
 type CDCConnection = {
   id: string
@@ -40,7 +41,14 @@ type AgentMessage = {
   isLoading?: boolean
 }
 
-const quickPrompts = [
+type QuickPrompt = {
+  label: string
+  prompt: string
+  icon: typeof Database
+}
+
+// Generic chips, shown only once connections have loaded and there are none.
+const genericQuickPrompts: QuickPrompt[] = [
   {
     label: "PostgreSQL → S3",
     prompt: "Create a pipeline from PostgreSQL to S3",
@@ -58,11 +66,99 @@ const quickPrompts = [
   },
 ]
 
+function isSourceConnection(c: CDCConnection): boolean {
+  return c.type === "source" || c.connection_type === "source" || Boolean(c.supports_source)
+}
+
+function isDestinationConnection(c: CDCConnection): boolean {
+  return c.type === "destination" || c.connection_type === "destination" || Boolean(c.supports_destination)
+}
+
+/**
+ * Quick-start chips built from the workspace's real connections (issue #2):
+ * one chip per distinct source-type → destination-type pair, capped at `max`.
+ * Returns [] when no usable pair exists (the caller decides the fallback).
+ *
+ * Sources take turns (#55): filling every pair for the first source before the
+ * next meant a PostgreSQL source that could write to MongoDB, GCS and PostgreSQL
+ * used all three chips, and MongoDB → GCS never showed. Within a source, a
+ * destination-only connection (a bucket, a warehouse) comes first, since that is
+ * what it was added for; a pair between two connections of the same type
+ * (MongoDB → MongoDB) comes last.
+ */
+export function buildQuickPrompts(connections: CDCConnection[], max = 3): QuickPrompt[] {
+  const usable = connections.filter((c) => !c.is_expired && c.connector_type)
+  const sources = usable.filter(isSourceConnection)
+  const destinations = usable.filter(isDestinationConnection)
+
+  // One entry per source type; two connections of one type share it.
+  type Buckets = { sinkOnly: string[]; cross: string[]; same: string[]; seen: Set<string> }
+  const bySourceType = new Map<string, Buckets>()
+  for (const src of sources) {
+    const s = String(src.connector_type)
+    let b = bySourceType.get(s)
+    if (!b) {
+      b = { sinkOnly: [], cross: [], same: [], seen: new Set() }
+      bySourceType.set(s, b)
+    }
+    for (const dst of destinations) {
+      if (src.id === dst.id) continue
+      const d = String(dst.connector_type)
+      if (b.seen.has(d)) continue
+      b.seen.add(d)
+      if (d === s) b.same.push(d)
+      else if (!isSourceConnection(dst)) b.sinkOnly.push(d)
+      else b.cross.push(d)
+    }
+  }
+  const pairsBySource = [...bySourceType.entries()].map(([s, b]) =>
+    [...b.sinkOnly, ...b.cross, ...b.same].map((d): [string, string] => [s, d]),
+  )
+
+  const out: QuickPrompt[] = []
+  const seen = new Set<string>()
+  const longest = Math.max(0, ...pairsBySource.map((p) => p.length))
+  for (let round = 0; round < longest; round++) {
+    for (const pairs of pairsBySource) {
+      const pair = pairs[round]
+      if (!pair) continue
+      const [s, d] = pair
+      const key = `${s}->${d}`
+      if (seen.has(key)) continue
+      seen.add(key)
+      out.push({
+        label: `${displayConnectorName(s)} → ${displayConnectorName(d)}`,
+        // Raw connector ids: the gateway's keyword fallback
+        // (chat_nl_pipeline.go extractConnectorFromMessage) matches "gcs", not
+        // "Google Cloud Storage".
+        prompt: `Create a pipeline from ${s} to ${d}`,
+        icon: Database,
+      })
+      if (out.length >= max) return out
+    }
+  }
+  return out
+}
+
+/**
+ * The "Try:" line under the input. It named PostgreSQL → S3 in a workspace with
+ * no S3 connection (#55); with real pairs it names the first of them.
+ */
+export function exampleRequest(prompts: QuickPrompt[], fromConnections: boolean): string {
+  const first = fromConnections ? prompts[0] : undefined
+  if (!first) return "Sync my orders table from PostgreSQL to S3 in real-time"
+  const [src, dst] = first.label.split(" → ")
+  return `Sync my orders table from ${src} to ${dst} in real-time`
+}
+
 export function HomeAgentWidget() {
   const router = useRouter()
   const [input, setInput] = useState("")
   const [isLoading, setIsLoading] = useState(false)
   const [connections, setConnections] = useState<CDCConnection[]>([])
+  // True until the first connections fetch for the active workspace settles, so
+  // the "No connections configured" warning never flashes while loading (#2).
+  const [connectionsLoading, setConnectionsLoading] = useState(true)
   const [messages, setMessages] = useState<AgentMessage[]>([])
   const [showFullChat, setShowFullChat] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -74,6 +170,7 @@ export function HomeAgentWidget() {
     void fetchConnections()
     return onActiveWorkspaceChange(() => {
       setConnections([])
+      setConnectionsLoading(true)
       void fetchConnections()
     })
   }, [])
@@ -92,6 +189,7 @@ export function HomeAgentWidget() {
     } catch (error) {
       console.error("Failed to fetch connections:", error)
     }
+    if (!isStale()) setConnectionsLoading(false)
   }
 
   const handleSubmit = async (prompt?: string) => {
@@ -140,12 +238,11 @@ export function HomeAgentWidget() {
   }
 
   // Filter connections by type - use generic supports_source/supports_destination flags
-  const sourceConnections = connections.filter(c => 
-    c.type === "source" || c.connection_type === "source" || c.supports_source
-  )
-  const destConnections = connections.filter(c => 
-    c.type === "destination" || c.connection_type === "destination" || c.supports_destination
-  )
+  const sourceConnections = connections.filter(isSourceConnection)
+  const destConnections = connections.filter(isDestinationConnection)
+  const connectionPrompts = buildQuickPrompts(connections)
+  const quickPrompts =
+    connectionPrompts.length > 0 ? connectionPrompts : connectionsLoading ? [] : genericQuickPrompts
 
   if (showFullChat) {
     return (
@@ -178,7 +275,7 @@ export function HomeAgentWidget() {
         </div>
 
         {/* Redirecting indicator */}
-        <div className="flex items-center justify-center gap-2 text-sm text-zinc-500">
+        <div className="flex items-center justify-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
           <Loader2 className="h-4 w-4 animate-spin" />
           <span>Opening pipeline creator...</span>
         </div>
@@ -193,7 +290,13 @@ export function HomeAgentWidget() {
         <p className="text-sm font-medium text-zinc-500 dark:text-zinc-400">
           Quick Start
         </p>
-        <div className="flex flex-wrap gap-2">
+        <div className="flex flex-wrap gap-2" aria-busy={connectionsLoading || undefined}>
+          {connectionsLoading && quickPrompts.length === 0 && (
+            <span className="flex items-center gap-2 text-sm text-zinc-500 dark:text-zinc-400">
+              <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+              Loading your connections…
+            </span>
+          )}
           {quickPrompts.map((item) => (
             <Button
               key={item.label}
@@ -247,7 +350,7 @@ export function HomeAgentWidget() {
       )}
 
       {/* No connections warning */}
-      {connections.length === 0 && (
+      {!connectionsLoading && connections.length === 0 && (
         <div className="flex items-center gap-3 p-4 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900">
           <AlertCircle className="h-5 w-5 text-amber-600" />
           <div className="flex-1">
@@ -297,8 +400,8 @@ export function HomeAgentWidget() {
       </div>
 
       {/* Helper text */}
-      <p className="text-xs text-zinc-400 dark:text-zinc-500 text-center">
-        Try: "Sync my orders table from PostgreSQL to S3 in real-time"
+      <p className="text-xs text-zinc-400 text-center">
+        Try: &ldquo;{exampleRequest(quickPrompts, connectionPrompts.length > 0)}&rdquo;
       </p>
     </div>
   )

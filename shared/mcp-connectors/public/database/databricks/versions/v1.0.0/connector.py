@@ -319,6 +319,19 @@ class DatabricksMCPServer(DestinationLoadMixin, BaseMCPConnector):
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": str(e)}
 
+    # Which tables are user tables: managed and external tables outside
+    # information_schema. discover_schema and list_namespaces both filter by
+    # it, so the schema list and the table list never disagree.
+    _USER_TABLES_WHERE = "table_type IN ('MANAGED', 'EXTERNAL') AND table_schema <> 'information_schema'"
+
+    def _information_schema_tables(self, config: Dict[str, Any]) -> str:
+        """Unity Catalog INFORMATION_SCHEMA is per-catalog; qualify it when a
+        catalog is configured, else rely on the session default catalog."""
+        catalog = config.get("catalog")
+        catalog_safe = self._safe_identifier(catalog) if catalog else None
+        return (f"`{catalog_safe}`.information_schema.tables"
+                if catalog_safe else "information_schema.tables")
+
     def discover_schema(self, params: Dict = None) -> Dict[str, Any]:
         import time
         from datetime import datetime
@@ -326,8 +339,6 @@ class DatabricksMCPServer(DestinationLoadMixin, BaseMCPConnector):
         params = params or {}
         config = self._get_config(params)
         schema = self._safe_identifier(config.get("schema") or "default") or "default"
-        catalog = config.get("catalog")
-        catalog_safe = self._safe_identifier(catalog) if catalog else None
         try:
             max_tables = int(params.get("max_tables", 100))
         except Exception:
@@ -353,27 +364,33 @@ class DatabricksMCPServer(DestinationLoadMixin, BaseMCPConnector):
             conn = self._connect(config)
             try:
                 cur = conn.cursor()
-                # Unity Catalog INFORMATION_SCHEMA is per-catalog; qualify it when a
-                # catalog is configured, else rely on the session default catalog.
-                info = (f"`{catalog_safe}`.information_schema.tables"
-                        if catalog_safe else "information_schema.tables")
+                info = self._information_schema_tables(config)
+                # Every user schema, not only the configured one: a source's tables
+                # are rarely all in one schema. The configured schema comes first,
+                # and each table carries its schema so a pick reaches export as
+                # "schema.table" (_qualify_table takes 2 parts).
                 cur.execute(
-                    f"SELECT table_name FROM {info} "
-                    "WHERE table_schema = ? AND table_type IN ('MANAGED', 'EXTERNAL') "
-                    "ORDER BY table_name",
-                    [schema],
+                    f"SELECT table_schema, table_name FROM {info} "
+                    "WHERE " + self._USER_TABLES_WHERE + " "
+                    "ORDER BY table_schema, table_name"
                 )
                 rows = cur.fetchall()
                 desc = getattr(cur, "description", None)
             finally:
                 self._safe_close(conn)
             dicts = [self._row_to_dict(r, desc) for r in rows]
-            names = [d.get("table_name") or d.get("TABLE_NAME") for d in dicts]
-            names = [n for n in names if n]
-            result["total_tables_available"] = len(names)
+            pairs = []
+            for d in dicts:
+                s = d.get("table_schema") or d.get("TABLE_SCHEMA")
+                n = d.get("table_name") or d.get("TABLE_NAME")
+                if s and n:
+                    pairs.append((str(s), str(n)))
+            default = schema.lower()
+            pairs.sort(key=lambda p: (p[0].lower() != default, p[0], p[1]))
+            result["total_tables_available"] = len(pairs)
             out = [
-                {"name": n, "endpoint": f"{schema}.{n}", "discovery_status": "complete"}
-                for n in names[:max_tables]
+                {"name": n, "schema": s, "endpoint": f"{s}.{n}", "discovery_status": "complete"}
+                for s, n in pairs[:max_tables]
             ]
             result["tables"] = out
             result["total_tables_discovered"] = len(out)
@@ -386,6 +403,38 @@ class DatabricksMCPServer(DestinationLoadMixin, BaseMCPConnector):
             result["warnings_messages"].append(msg)
         result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
         return result
+
+    def list_namespaces(self, params: Dict = None) -> Dict[str, Any]:
+        """List the schemas that hold user tables in the configured catalog:
+        the level metadata.json's namespace_model.table_namespace names.
+        Filtered by _USER_TABLES_WHERE, the filter discover_schema uses, so the
+        two never disagree. "current" is the schema the connection names, ""
+        when it names none.
+        """
+        config = self._get_config(params or {})
+        try:
+            conn = self._connect(config)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    f"SELECT DISTINCT table_schema FROM {self._information_schema_tables(config)} "
+                    "WHERE " + self._USER_TABLES_WHERE + " ORDER BY table_schema"
+                )
+                rows = cur.fetchall()
+                desc = getattr(cur, "description", None)
+            finally:
+                self._safe_close(conn)
+            names = []
+            for r in rows:
+                d = self._row_to_dict(r, desc)
+                names.append(d.get("table_schema") or d.get("TABLE_SCHEMA"))
+            return {
+                "success": True,
+                "namespaces": sorted({str(n) for n in names if n}),
+                "current": str(config.get("schema") or "").strip(),
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": f"Listing namespaces failed: {e}"}
 
     def export(self, params: Dict = None) -> Dict[str, Any]:
         """Optimized paginated read (keyset preferred, offset fallback, verbatim

@@ -223,9 +223,10 @@ In brief:
   and is the column the run reads.
 - **Models** — a saved query with `materialization` set rebuilds a warehouse table
   (`table` mode) or runs its statement as written (`statement` mode).
-- **Schedules** — `cron`, `interval`, or `after_pipeline` (fires when an upstream pipeline
-  completes). One live schedule per query: a model has a clock **or** an upstream, never
-  both.
+- **Schedules** — `cron`, `interval`, or `after_upstream` (fires when a producer completes).
+  A producer is a pipeline **or** another model, and a model can name up to 16 of them; any
+  one of them finishing rebuilds it. One live schedule per query: a model has a clock **or** a
+  set of upstreams, never both.
 
 ---
 
@@ -331,7 +332,11 @@ autocomplete), [schemaTree](../../frontend/src/lib/explorer/schemaTree.ts),
 > target, so moving the caret behind the modal cannot swap the statement out from under it.
 > The classifier lives in [`statementClass.ts`](../../frontend/src/lib/explorer/statementClass.ts)
 > so the gate and the splitter are testable together. **The client gate is UX; the server
-> gate is the boundary.**
+> gate is the boundary.** The two classifiers are pinned to each other by
+> [`shared/explorer_statement_class_golden.json`](../../shared/explorer_statement_class_golden.json),
+> read by a Go test and a vitest test: change a class in the fixture and in both
+> classifiers, or one side goes red. Both strip comments exactly once, keeping the body of
+> a MySQL `/*!…*/` executable comment, before reading the verb.
 
 ---
 
@@ -390,4 +395,4 @@ that defaults to keep-forever — design and the trap to avoid are in
 Deliberately not built — recorded so they aren't re-litigated as oversights:
 `incremental` materialization, a stored dependency graph, an LLM fallback for table
 extraction, two triggers on one model, and enforced second-person approval. Reasons in the
-[deep dive's §12](saved-queries-and-models.md#12-deliberately-not-built).
+[deep dive's §14](saved-queries-and-models.md#14-deliberately-not-built).

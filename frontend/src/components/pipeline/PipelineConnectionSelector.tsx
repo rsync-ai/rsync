@@ -8,7 +8,7 @@ import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { Label } from "@/components/ui/label"
 import { Loader2, Database, ArrowDown, Plus, Check, AlertCircle } from "lucide-react"
 
-import { cn } from "@/lib/utils"
+import { cn, formatDate } from "@/lib/utils"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { resumePipelineConnections } from "@/lib/api/pipelines"
@@ -536,7 +536,7 @@ export function PipelineConnectionSelector({
                 <span className={cn("text-xs px-2 py-0.5 rounded-full", getStatusColor(conn.status))}>{conn.status || "unknown"}</span>
               </div>
               <p className="text-xs text-gray-500 dark:text-gray-400 mt-0.5">
-                {conn.created_at ? `Created: ${new Date(conn.created_at).toLocaleDateString()}` : "No date"}
+                {conn.created_at ? `Created: ${formatDate(conn.created_at)}` : "No date"}
               </p>
             </Label>
             {selectedId === conn.id && <Check className="h-5 w-5 text-violet-600 dark:text-violet-400" />}

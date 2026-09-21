@@ -61,10 +61,24 @@ COPY src/agents/planner/ ./src/agents/planner/
 COPY src/agents/suggestions/ ./src/agents/suggestions/
 COPY src/agents/telemetry/ ./src/agents/telemetry/
 
-# The generation package's __init__ and its moat-free deploy runtime only.
-# NOTHING else under src/agents/tool_generator/ may be added here.
+# The generation package: its __init__, the moat-free deploy runtime, and the
+# deterministic renderer. The renderer turns an OpenAPI document into a connector
+# with no model call and no API key — `python -m agents.tool_generator.scaffold.cli`
+# — which is what lets a self-hosted user add a connector for an API we do not
+# curate. What stays out is the curated intelligence that decides WHAT to build:
+# config/ (vendor_apis.yaml, auth_rules.yaml, capability_rules.yaml,
+# learned_apis.jsonl), agents/, harness/, mock_server/ and their prompts.
+#
+# Adding a subdirectory here is a moat decision, not a packaging one. Check it
+# against oss-strip-list.txt's header before you add a line.
 COPY src/agents/tool_generator/__init__.py ./src/agents/tool_generator/__init__.py
+COPY src/agents/tool_generator/contracts/ ./src/agents/tool_generator/contracts/
 COPY src/agents/tool_generator/deployment/ ./src/agents/tool_generator/deployment/
+COPY src/agents/tool_generator/generator/ ./src/agents/tool_generator/generator/
+COPY src/agents/tool_generator/scaffold/ ./src/agents/tool_generator/scaffold/
+COPY src/agents/tool_generator/schemas/ ./src/agents/tool_generator/schemas/
+COPY src/agents/tool_generator/templates/ ./src/agents/tool_generator/templates/
+COPY src/agents/tool_generator/validation/ ./src/agents/tool_generator/validation/
 
 # prompts/standards + prompts/tool_generator are generation prompts — stripped.
 COPY prompts/chat/ ./prompts/chat/
@@ -78,6 +92,14 @@ RUN chown -R appuser:appuser /app
 USER appuser
 
 ENV PYTHONPATH=/app
+
+# Build info for GET /version, which the admin drift check compares across
+# services. docker-compose.yml passes these as build args (from the caller's env;
+# scripts/deploy-service.sh exports them) and docker-publish.yml passes the
+# release sha. Declared last so a new commit rebuilds only this metadata layer.
+ARG GIT_COMMIT=dev
+ARG BUILD_TIME=unknown
+ENV GIT_COMMIT=${GIT_COMMIT} BUILD_TIME=${BUILD_TIME}
 
 # `llm-service` runs this default; `planner` overrides it with
 # `python -m src.agents.planner.service` in the compose file.

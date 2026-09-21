@@ -16,6 +16,7 @@ import (
 	"api-gateway/internal/telemetry"
 	"api-gateway/internal/validators"
 
+	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 	"github.com/rsync-ai/shared/crypto"
 
 	"github.com/gin-gonic/gin"
@@ -52,6 +53,9 @@ type explorerDocumentFindRequest struct {
 	Limit        int             `json:"limit,omitempty"`
 	Cursor       string          `json:"cursor,omitempty"`
 	Skip         int             `json:"skip,omitempty"`
+	// Database picks the database on a server-level connection (one naming
+	// none); the connector refuses one outside the connection's Scope.
+	Database string `json:"database,omitempty"`
 }
 
 // FindExplorerDocuments handles POST /api/v1/explorer/documents/find.
@@ -71,6 +75,7 @@ func FindExplorerDocuments(c *gin.Context) {
 	}
 
 	spec, ferr := validators.ValidateDocumentFind(validators.DocumentFindRequest{
+		Database:   req.Database,
 		Collection: req.Collection,
 		Filter:     req.Filter,
 		Projection: req.Projection,
@@ -252,6 +257,70 @@ func redactDocument(v interface{}) interface{} {
 	}
 }
 
+// discoveryReasonMaxRunes bounds the connector text carried into an error response.
+const discoveryReasonMaxRunes = 600
+
+// cleanDiscoveryReasons drops the driver's noise from each reason and leaves out
+// the ones with nothing left. The driver appends a raw server reply after
+// ", full error:" and a topology dump after ", Topology Description:"; every
+// reason is cut there, not only the first.
+func cleanDiscoveryReasons(raw []string) []string {
+	out := make([]string, 0, len(raw))
+	for _, p := range raw {
+		for _, noise := range []string{", full error:", ", Topology Description:"} {
+			if cut := strings.Index(p, noise); cut >= 0 {
+				p = p[:cut]
+			}
+		}
+		// The connector's own "Missing 'database' in config" quotes a fixed field
+		// name; unquote it so the scrubber does not mask the one useful word.
+		p = strings.TrimSpace(strings.ReplaceAll(p, "'database'", "database"))
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// discoveryFailureReason turns the connector's failure text into a message that is
+// safe to return to the browser. The warnings are the reason; the envelope's error
+// key is used only when no warning says anything. The result is scrubbed
+// (credentials in URLs, quoted literals, addresses) before it is truncated, so a cut
+// can never split a credential in a way the scrubber no longer recognises.
+func discoveryFailureReason(warnings []interface{}, errText string) string {
+	raw := make([]string, 0, len(warnings))
+	for _, w := range warnings {
+		if s, ok := w.(string); ok {
+			raw = append(raw, s)
+		}
+	}
+	parts := cleanDiscoveryReasons(raw)
+	if len(parts) == 0 {
+		parts = cleanDiscoveryReasons([]string{errText})
+	}
+	if len(parts) == 0 {
+		return "the connector gave no reason"
+	}
+	reason := strings.Join(parts, "; ")
+	return llmscrub.ScrubMax(reason, discoveryReasonMaxRunes)
+}
+
+// discoveryUpstreamError reads the orchestrator's non-200 body, which is
+// {"error": ..., "details": ...}. The fields are taken out of the JSON before
+// scrubbing: the scrubber masks every quoted value after a colon, so scrubbing the
+// raw JSON would keep nothing of the reason.
+func discoveryUpstreamError(body []byte) string {
+	var parsed struct {
+		Error   string `json:"error"`
+		Details string `json:"details"`
+	}
+	text := strings.TrimSpace(string(body))
+	if json.Unmarshal(body, &parsed) == nil && (parsed.Error != "" || parsed.Details != "") {
+		text = strings.Trim(parsed.Error+": "+parsed.Details, ": ")
+	}
+	return discoveryFailureReason([]interface{}{text}, "")
+}
+
 // buildDocumentSchemaIndex lists a document connection's collections (with sampled
 // field names and types) through the connector's discover_schema tool. Row counts are
 // not requested: the connector counts with count_documents({}), a full scan per
@@ -298,15 +367,30 @@ func buildDocumentSchemaIndex(ctx context.Context, connectionID, connectorType, 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("discovery failed: status %d: %s", resp.StatusCode, strings.TrimSpace(string(b)))
+		// Read far past what is kept (discoveryReasonMaxRunes, up to 4 bytes each).
+		// A body cut inside the kept text could end mid-URL, and the scrubber only
+		// masks a credential in a URL that still has its '@'.
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, fmt.Errorf("discovery failed: status %d: %s", resp.StatusCode, discoveryUpstreamError(b))
 	}
 
 	var envelope struct {
-		Tables []TableMetadata `json:"tables"`
+		OverallStatus    string          `json:"overall_status"`
+		WarningsMessages []interface{}   `json:"warnings_messages"`
+		Error            string          `json:"error"`
+		Tables           []TableMetadata `json:"tables"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
 		return nil, fmt.Errorf("parse discovery response: %w", err)
+	}
+	// The connector reports a failed listing (bad credentials, unreachable host, an
+	// address not on the cluster's allowlist) as overall_status "failed" with no
+	// tables, and the orchestrator returns that as a 200. Without this check the
+	// Explorer shows an empty cluster. "partial" (some collections could not be
+	// sampled) and a missing status still build an index.
+	if envelope.OverallStatus == "failed" {
+		return nil, fmt.Errorf("could not list collections: %s",
+			discoveryFailureReason(envelope.WarningsMessages, envelope.Error))
 	}
 
 	tables := make([]cache.ExplorerTableIndex, 0, len(envelope.Tables))

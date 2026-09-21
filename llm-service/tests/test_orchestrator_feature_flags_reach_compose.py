@@ -171,3 +171,45 @@ def test_exempted_flags_are_still_actually_unwired(flag):
         f"{flag} is now passed through by docker-compose.yml -- remove it from "
         "EXEMPT so the guard covers it"
     )
+
+
+# Flags the api-gateway reads only to REPORT what the orchestrator does. The
+# gateway never acts on them, so the only way to get it wrong is for the two
+# services to see different values: the UI would then say "detection is off"
+# while the orchestrator is detecting, or the reverse.
+#   RSYNC_SCHEMA_DRIFT_ENABLED — api-gateway/internal/handlers/schema_evolution.go
+#   schemaDriftDetectorEnabled(), surfaced as detector_enabled on the pipeline's
+#   schema-drift-policy endpoints for the "Schema change alerts" card.
+GATEWAY_MIRRORED_FLAGS = ("RSYNC_SCHEMA_DRIFT_ENABLED",)
+
+
+def _service_environment(name):
+    with open(BASE_COMPOSE, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh) or {}
+    svc = (doc.get("services") or {}).get(name)
+    assert isinstance(svc, dict), f"docker-compose.yml has no `{name}` service"
+    env = svc.get("environment")
+    assert isinstance(env, dict), f"services.{name}.environment is not a mapping"
+    return env
+
+
+@pytest.mark.parametrize("flag", GATEWAY_MIRRORED_FLAGS)
+def test_gateway_mirrors_the_orchestrator_value_exactly(flag):
+    gateway_src = os.path.join(REPO_ROOT, "api-gateway", "internal", "handlers", "schema_evolution.go")
+    with open(gateway_src, encoding="utf-8") as fh:
+        assert f'os.Getenv("{flag}")' in fh.read(), (
+            f"the api-gateway no longer reads {flag}; drop it from GATEWAY_MIRRORED_FLAGS"
+        )
+    orch = _orchestrator_environment()
+    gateway = _service_environment("api-gateway")
+    assert flag in orch, f"{flag} is not passed to the orchestrator"
+    assert flag in gateway, (
+        f"the api-gateway reads {flag} to tell the UI what the orchestrator does, "
+        "but docker-compose.yml does not pass it to the api-gateway, so the UI "
+        "always reports it off"
+    )
+    assert str(gateway[flag]) == str(orch[flag]), (
+        f"{flag} differs between services: orchestrator={orch[flag]!r}, "
+        f"api-gateway={gateway[flag]!r}. They must be byte-identical or the UI "
+        "misreports what the detector is doing."
+    )

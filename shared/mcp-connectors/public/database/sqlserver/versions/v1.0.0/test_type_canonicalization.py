@@ -105,7 +105,8 @@ class FakeCursor:
         elif "index_id IN (0,1)" in s:
             self._result = [("typed", 1)]
         elif "sys.columns c" in s and "sys.types" in s:
-            self._result = list(_COLS)
+            # one query per schema: (table, column...) rows
+            self._result = [("typed",) + c for c in _COLS]
         else:
             self._result = []
 

@@ -65,6 +65,45 @@ func hasSelectionSentinel(tables []string) bool {
 	return false
 }
 
+// selectionRuleTokens returns the sentinel tokens of a selection — the RULE the
+// user expressed ("everything", "everything in public") as opposed to the table
+// names it happened to expand to at that moment. It is what the CDC auto-pickup
+// watcher re-applies later, so a table created after the pipeline was built is
+// picked up by the same rule that selected its siblings.
+//
+// An exact-name selection has no sentinel and therefore no rule: the empty
+// result is the "never auto-add" answer, and persisting it is what turns
+// auto-pickup back OFF when a user narrows a whole-database pipeline to a list.
+// Tokens are returned deduplicated, trimmed and in input order; "<ns>.*" keeps
+// the namespace as the user spelled it (matching is case-insensitive downstream).
+func selectionRuleTokens(tables []string) []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, t := range tables {
+		s := strings.TrimSpace(t)
+		if s == "" {
+			continue
+		}
+		if _, isNS := namespaceWildcard(s); !isNS && s != selectAllTablesToken {
+			continue
+		}
+		k := strings.ToLower(s)
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, s)
+	}
+	// "*" subsumes every "<ns>.*": keep the broader rule alone so the watcher
+	// does one whole-source diff instead of one per namespace.
+	for _, s := range out {
+		if s == selectAllTablesToken {
+			return []string{selectAllTablesToken}
+		}
+	}
+	return out
+}
+
 // resolverDiscoverFunc discovers every table for a connection across all
 // namespaces (schema left blank so PG/Oracle/SQLServer enumerate all schemas per
 // #525/#526/#527). Injected so the resolver is unit-testable without a live
@@ -197,19 +236,33 @@ func resolveSelectionForPipeline(c *gin.Context, sourceConnectionID string, tabl
 
 // discoverConnectionTablesForResolve runs an uncapped, all-namespace schema
 // discovery for a connection, reusing the same orchestrator agent path as
-// GetConnectionMetadata. The connection's `schema` is blanked so PG/Oracle/
-// SQLServer enumerate EVERY namespace (#525/#526/#527), not just the default.
-// It is the production resolverDiscoverFunc; unit tests inject a fake instead.
+// GetConnectionMetadata. It is the production resolverDiscoverFunc for
+// request-scoped callers; unit tests inject a fake instead.
 func discoverConnectionTablesForResolve(c *gin.Context, connectionID string, maxTables int) ([]TableMetadata, error) {
-	database := db.GetDB()
-	if database == nil {
-		return nil, fmt.Errorf("database not available")
-	}
 	wsID := activeWorkspaceID(c)
 	if wsID == "" {
 		return nil, fmt.Errorf("no active workspace")
 	}
 	userID, _ := resolveUserID(c)
+	return discoverConnectionTables(c.Request.Context(), connectionID, wsID, userID, maxTables)
+}
+
+// discoverConnectionTables is discoverConnectionTablesForResolve without a
+// request: the workspace and user are passed explicitly so background workers
+// (the CDC auto-pickup watcher) can discover on a schedule. The connection's
+// `schema` is blanked so PG/Oracle/SQLServer enumerate EVERY namespace
+// (#525/#526/#527), not just the default; the connection's own Scope
+// (namespace_filter_*, #1091) is still applied by the orchestrator, so a
+// background sweep can never see a namespace the user excluded.
+func discoverConnectionTables(ctx context.Context, connectionID, workspaceID, userID string, maxTables int) ([]TableMetadata, error) {
+	database := db.GetDB()
+	if database == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	wsID := strings.TrimSpace(workspaceID)
+	if wsID == "" {
+		return nil, fmt.Errorf("no active workspace")
+	}
 
 	var configJSON, connectorType string
 	if err := database.QueryRow(`
@@ -246,14 +299,14 @@ func discoverConnectionTablesForResolve(c *gin.Context, connectionID string, max
 	if orchestratorURL == "" {
 		orchestratorURL = "http://orchestrator:8080"
 	}
-	ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+	reqCtx, cancel := context.WithTimeout(ctx, 90*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, "POST", orchestratorURL+"/api/v1/agent/discover-schema", bytes.NewBuffer(body))
+	req, err := http.NewRequestWithContext(reqCtx, "POST", orchestratorURL+"/api/v1/agent/discover-schema", bytes.NewBuffer(body))
 	if err != nil {
 		return nil, fmt.Errorf("build discovery request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	for k, v := range telemetry.InjectTraceToHeaders(ctx) {
+	for k, v := range telemetry.InjectTraceToHeaders(reqCtx) {
 		req.Header.Set(k, v)
 	}
 	setInternalServiceSecret(req)
@@ -265,8 +318,8 @@ func discoverConnectionTablesForResolve(c *gin.Context, connectionID string, max
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("discovery failed: status %d: %s", resp.StatusCode, string(b))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, fmt.Errorf("discovery failed: %s", orchestratorErrorDetail(resp.StatusCode, b))
 	}
 
 	var agentResponse struct {

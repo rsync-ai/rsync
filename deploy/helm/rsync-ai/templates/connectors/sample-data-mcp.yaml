@@ -50,6 +50,7 @@ metadata:
     app.kubernetes.io/component: sample-data-mcp
 spec:
   replicas: 1
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   selector:
     matchLabels:
       {{- include "rsync-ai.selectorLabels" . | nindent 6 }}

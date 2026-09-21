@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"bytes"
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -77,6 +78,10 @@ func UpdatePipelineCDCTables(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "tables must be non-empty"})
 		return
 	}
+	// Keep the selection as the user expressed it: resolution below replaces
+	// `tables` with the expansion, and the sentinel is what the auto-pickup
+	// watcher needs to re-apply later.
+	rawTables := append([]string(nil), tables...)
 
 	// Expand any "select entire database" ("*") / "select entire namespace"
 	// ("<ns>.*") sentinel into an explicit list before diffing/persisting so the
@@ -137,6 +142,9 @@ func UpdatePipelineCDCTables(c *gin.Context) {
 				"Failed to save the CDC table selection", err)
 			return
 		}
+		if err := persistTableSelectionRule(database, pipelineID, rawTables); err != nil {
+			log.WithError(err).WithField("pipeline_id", pipelineID).Warn("Failed to persist table_selection_rule (ignored)")
+		}
 		log.WithFields(log.Fields{
 			"pipeline_id": pipelineID,
 			"tables":      len(tables),
@@ -170,33 +178,18 @@ func UpdatePipelineCDCTables(c *gin.Context) {
 	// IMPORTANT: Route updates via orchestrator so it can enforce P0 safety guards
 	// (e.g., hard PK validation for relational destinations).
 	{
-		payload, _ := json.Marshal(gin.H{
-			"pipeline_id": pipelineID,
-			"tables":      tables,
-		})
-		url := fmt.Sprintf("%s/api/v1/cdc/tables", orchestratorBaseURL())
-		httpClient := &http.Client{Timeout: 30 * time.Second}
-		r, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPut, url, bytes.NewReader(payload))
-		if err != nil {
-			respondError(c, http.StatusInternalServerError, "request_build_failed", "Failed to build request", err)
+		status, body, perr := pushCDCTableList(c.Request.Context(), pipelineID, tables)
+		if perr != nil {
+			respondError(c, http.StatusBadGateway, "orchestrator_unreachable", "Orchestrator is unreachable", perr)
 			return
 		}
-		r.Header.Set("Content-Type", "application/json")
-		setInternalServiceSecret(r)
-		resp, err := httpClient.Do(r)
-		if err != nil {
-			respondError(c, http.StatusBadGateway, "orchestrator_unreachable", "Orchestrator is unreachable", err)
-			return
-		}
-		defer resp.Body.Close()
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			body, _ := io.ReadAll(resp.Body)
+		if status < 200 || status >= 300 {
 			log.WithFields(log.Fields{
 				"pipeline_id":    pipelineID,
 				"connector_name": connectorName,
-				"status_code":    resp.StatusCode,
+				"status_code":    status,
 			}).Warn("Orchestrator rejected CDC table update")
-			c.Data(resp.StatusCode, "application/json", body)
+			c.Data(status, "application/json", body)
 			return
 		}
 	}
@@ -205,6 +198,13 @@ func UpdatePipelineCDCTables(c *gin.Context) {
 	// (Non-blocking here: the Debezium update above is the authoritative side-effect.)
 	if err := persistSelectedTables(database, pipelineID, tables); err != nil {
 		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("Failed to persist selected_tables (ignored)")
+	}
+	// Record the RULE behind the selection, not just its expansion, so the CDC
+	// auto-pickup watcher keeps this pipeline current. rawTables is the request
+	// as sent (pre-expansion): an exact list writes an empty rule, which is how
+	// narrowing a whole-database pipeline turns auto-pickup back off.
+	if err := persistTableSelectionRule(database, pipelineID, rawTables); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("Failed to persist table_selection_rule (ignored)")
 	}
 
 	// Optionally trigger backfill for newly added tables.
@@ -215,39 +215,7 @@ func UpdatePipelineCDCTables(c *gin.Context) {
 		"success":   false,
 	}
 	if req.BackfillNewlyAdded && len(newTables) > 0 {
-		mode := strings.TrimSpace(req.BackfillMode)
-		if mode == "" {
-			mode = "incremental"
-		}
-		backfill["mode"] = mode
-
-		payload, _ := json.Marshal(gin.H{
-			"tables": newTables,
-			"mode":   mode,
-		})
-		url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/backfill", orchestratorBaseURL(), pipelineID)
-		httpClient := &http.Client{Timeout: 30 * time.Second}
-		r, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, url, bytes.NewReader(payload))
-		if err == nil {
-			r.Header.Set("Content-Type", "application/json")
-			setInternalServiceSecret(r)
-			resp, err2 := httpClient.Do(r)
-			if err2 == nil && resp != nil {
-				defer resp.Body.Close()
-				body, _ := io.ReadAll(resp.Body)
-				backfill["status_code"] = resp.StatusCode
-				backfill["response"] = json.RawMessage(body)
-				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					backfill["success"] = true
-				} else {
-					backfill["error"] = fmt.Sprintf("orchestrator backfill failed (status %d)", resp.StatusCode)
-				}
-			} else if err2 != nil {
-				backfill["error"] = err2.Error()
-			}
-		} else {
-			backfill["error"] = err.Error()
-		}
+		backfill = requestCDCBackfill(c.Request.Context(), pipelineID, newTables, req.BackfillMode)
 	} else if req.BackfillNewlyAdded && len(newTables) == 0 {
 		// Nothing new to backfill.
 		backfill["success"] = true
@@ -256,35 +224,7 @@ func UpdatePipelineCDCTables(c *gin.Context) {
 	// Best-effort: restart sink worker so newly-added table topics are applied (not just captured).
 	// Without this, the sink consumer group may remain subscribed to the old topic list and
 	// "Applied Inserts" stays at 0 for new tables.
-	sinkRestart := gin.H{
-		"requested": true,
-		"success":   false,
-	}
-	{
-		url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/sink/restart", orchestratorBaseURL(), pipelineID)
-		httpClient := &http.Client{Timeout: 30 * time.Second}
-		r, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
-		if err == nil {
-			r.Header.Set("Content-Type", "application/json")
-			setInternalServiceSecret(r)
-			resp, err2 := httpClient.Do(r)
-			if err2 == nil && resp != nil {
-				defer resp.Body.Close()
-				body, _ := io.ReadAll(resp.Body)
-				sinkRestart["status_code"] = resp.StatusCode
-				sinkRestart["response"] = json.RawMessage(body)
-				if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-					sinkRestart["success"] = true
-				} else {
-					sinkRestart["error"] = fmt.Sprintf("orchestrator sink restart failed (status %d)", resp.StatusCode)
-				}
-			} else if err2 != nil {
-				sinkRestart["error"] = err2.Error()
-			}
-		} else {
-			sinkRestart["error"] = err.Error()
-		}
-	}
+	sinkRestart := restartCDCSink(c.Request.Context(), pipelineID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"success":        true,
@@ -363,4 +303,144 @@ func findDebeziumConnectorName(pipelineID string) (string, error) {
 	}
 
 	return "", errCDCConnectorNotProvisioned
+}
+
+// The three calls below are the side-effects of changing a CDC table list, in
+// the order they must happen: push the list (the orchestrator revalidates and
+// rewrites Debezium's table.include.list), snapshot whatever is newly added,
+// then restart the sink so it subscribes to the new topics. They are extracted
+// because the CDC auto-pickup watcher performs the very same sequence on a
+// schedule; keeping two copies is how a fix lands in one path and not the other.
+
+// pushCDCTableList sends the desired table list to the orchestrator, which owns
+// the P0 safety guards (hard PK validation for relational destinations) before
+// it touches the connector. The orchestrator's status and body are returned
+// verbatim so a caller can forward its error to the user, or read the
+// structured rejection (see cdcMissingPrimaryKeyTables) and react to it.
+func pushCDCTableList(ctx context.Context, pipelineID string, tables []string) (int, []byte, error) {
+	payload, _ := json.Marshal(gin.H{
+		"pipeline_id": pipelineID,
+		"tables":      tables,
+	})
+	url := fmt.Sprintf("%s/api/v1/cdc/tables", orchestratorBaseURL())
+	r, err := http.NewRequestWithContext(ctx, http.MethodPut, url, bytes.NewReader(payload))
+	if err != nil {
+		return 0, nil, err
+	}
+	r.Header.Set("Content-Type", "application/json")
+	setInternalServiceSecret(r)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(r)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	return resp.StatusCode, body, nil
+}
+
+// cdcMissingPrimaryKeyTables reads the orchestrator's structured PK rejection
+// ({"error":"missing_primary_key","tables":[…]}) and returns the offending
+// tables. A rejection in any other shape returns nil: the caller must then treat
+// the failure as opaque rather than guess which table caused it.
+func cdcMissingPrimaryKeyTables(status int, body []byte) []string {
+	if status != http.StatusBadRequest {
+		return nil
+	}
+	var parsed struct {
+		Error  string   `json:"error"`
+		Tables []string `json:"tables"`
+	}
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return nil
+	}
+	if parsed.Error != "missing_primary_key" {
+		return nil
+	}
+	out := make([]string, 0, len(parsed.Tables))
+	for _, t := range parsed.Tables {
+		if s := strings.TrimSpace(t); s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// requestCDCBackfill asks the orchestrator for an ad-hoc Debezium snapshot of
+// the given tables — the "load what is already there, then keep streaming"
+// half of adding a table to a running CDC pipeline. The returned map is the
+// caller's `backfill` report; a failure is described in it rather than
+// returned, because the table list has already been applied by then and the
+// caller must not undo it.
+func requestCDCBackfill(ctx context.Context, pipelineID string, tables []string, mode string) gin.H {
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		mode = "incremental"
+	}
+	result := gin.H{
+		"requested": true,
+		"mode":      mode,
+		"tables":    tables,
+		"success":   false,
+	}
+	payload, _ := json.Marshal(gin.H{
+		"tables": tables,
+		"mode":   mode,
+	})
+	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/backfill", orchestratorBaseURL(), pipelineID)
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
+	if err != nil {
+		result["error"] = err.Error()
+		return result
+	}
+	r.Header.Set("Content-Type", "application/json")
+	setInternalServiceSecret(r)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(r)
+	if err != nil {
+		result["error"] = err.Error()
+		return result
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	result["status_code"] = resp.StatusCode
+	result["response"] = json.RawMessage(body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		result["success"] = true
+	} else {
+		result["error"] = fmt.Sprintf("orchestrator backfill failed (status %d)", resp.StatusCode)
+	}
+	return result
+}
+
+// restartCDCSink restarts the pipeline's sink worker so newly added table
+// topics are actually consumed. Without it the sink's consumer group stays
+// subscribed to the old topic list and "Applied Inserts" sits at 0 for every
+// new table while Debezium happily captures them.
+func restartCDCSink(ctx context.Context, pipelineID string) gin.H {
+	result := gin.H{
+		"requested": true,
+		"success":   false,
+	}
+	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/sink/restart", orchestratorBaseURL(), pipelineID)
+	r, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader([]byte(`{}`)))
+	if err != nil {
+		result["error"] = err.Error()
+		return result
+	}
+	r.Header.Set("Content-Type", "application/json")
+	setInternalServiceSecret(r)
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(r)
+	if err != nil {
+		result["error"] = err.Error()
+		return result
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	result["status_code"] = resp.StatusCode
+	result["response"] = json.RawMessage(body)
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		result["success"] = true
+	} else {
+		result["error"] = fmt.Sprintf("orchestrator sink restart failed (status %d)", resp.StatusCode)
+	}
+	return result
 }

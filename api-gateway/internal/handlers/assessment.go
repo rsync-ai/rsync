@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -81,6 +82,7 @@ const (
 	FindingDestNamespaceWillCreate  = "DEST_NAMESPACE_WILL_CREATE"  // create confirmed — ack required
 	FindingDestNamespaceExists      = "DEST_NAMESPACE_EXISTS"       // namespace present (info)
 	FindingDestNamespaceUnverified  = "DEST_NAMESPACE_UNVERIFIED"   // probe couldn't run (info, non-blocking)
+	FindingDestNamespaceDefault     = "DEST_NAMESPACE_DEFAULT"      // no mapping set; layout follows the source (info)
 )
 
 // AssessmentFinding is one warning/error/info entry attached to a table.
@@ -121,6 +123,12 @@ type AssessmentReport struct {
 	SourceType     string            `json:"source_connector_type,omitempty"`
 	SinkType       string            `json:"destination_connector_type,omitempty"`
 	SinkSupportDDL bool              `json:"destination_supports_ddl"`
+	// Checks is the same assessment as one graded row per check, passes
+	// included, for the pipeline's Assessment tab (assessment_checks.go).
+	Checks []AssessmentCheck `json:"checks"`
+	Counts *AssessmentCounts `json:"counts,omitempty"`
+	// RunID is the pipeline_assessment_runs row this report was saved as.
+	RunID string `json:"run_id,omitempty"`
 }
 
 // assessmentGateOutcome is what the pre-migration gate decided about a run.
@@ -250,6 +258,11 @@ func fetchSourceTables(ctx context.Context, connectionID, connectorType string, 
 		return nil, fmt.Errorf("orchestrator unreachable: %w", err)
 	}
 	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		return nil, fmt.Errorf("%s", orchestratorErrorDetail(resp.StatusCode, body))
+	}
 
 	var envelope struct {
 		Tables []TableMetadata `json:"tables"`
@@ -530,16 +543,14 @@ func pluralise(word string, n int) string {
 // POST /pipelines/:id/assess endpoint returns. Only the fields the
 // gateway needs to render + classify are decoded.
 type orchestratorCheck struct {
-	Code        string `json:"code"`
-	Severity    string `json:"severity"` // info | warning | error
-	Passed      bool   `json:"passed"`
-	Message     string `json:"message"`
-	Remediation *struct {
-		Steps            []string `json:"steps,omitempty"`
-		SQLToRun         []string `json:"sql_to_run,omitempty"`
-		DocURL           string   `json:"doc_url,omitempty"`
-		EstimatedMinutes int      `json:"estimated_minutes,omitempty"`
-	} `json:"remediation,omitempty"`
+	Code     string `json:"code"`
+	Severity string `json:"severity"` // info | warning | error
+	Passed   bool   `json:"passed"`
+	Message  string `json:"message"`
+	// Object is the table or collection a per-object check ran against;
+	// empty for a source-wide check.
+	Object      string                 `json:"object,omitempty"`
+	Remediation *AssessmentRemediation `json:"remediation,omitempty"`
 }
 
 // orchestratorAssessment is the subset of the orchestrator's assessment
@@ -602,12 +613,18 @@ func sourceReadinessTable(a *orchestratorAssessment) (AssessmentTable, bool) {
 			sev = AssessmentWarning // unknown severity → fail cautious
 		}
 		details := map[string]interface{}{}
+		if o := strings.TrimSpace(c.Object); o != "" {
+			details["object"] = o
+		}
 		if c.Remediation != nil {
 			if len(c.Remediation.Steps) > 0 {
 				details["steps"] = c.Remediation.Steps
 			}
 			if len(c.Remediation.SQLToRun) > 0 {
 				details["sql_to_run"] = c.Remediation.SQLToRun
+			}
+			if len(c.Remediation.CommandsToRun) > 0 {
+				details["commands_to_run"] = c.Remediation.CommandsToRun
 			}
 			if c.Remediation.DocURL != "" {
 				details["doc_url"] = c.Remediation.DocURL
@@ -685,8 +702,10 @@ func buildPipelineAssessment(ctx context.Context, database *sql.DB, workspaceID,
 	// the rest of the assessment still renders.
 	var readinessTbl AssessmentTable
 	var hasReadiness bool
-	if ra, rerr := fetchSourceReadiness(ctx, pipelineID); rerr != nil {
+	ra, rerr := fetchSourceReadiness(ctx, pipelineID)
+	if rerr != nil {
 		log.Warnf("source readiness check unavailable pipeline=%s: %v", pipelineID, rerr)
+		ra = nil
 	} else if ra != nil {
 		readinessTbl, hasReadiness = sourceReadinessTable(ra)
 	}
@@ -721,6 +740,7 @@ func buildPipelineAssessment(ctx context.Context, database *sql.DB, workspaceID,
 			report.Tables = append(report.Tables, readinessTbl)
 			report.Summary = summarise(report.Tables)
 		}
+		attachChecks(report, ra)
 		return report, http.StatusOK, nil, nil
 	}
 
@@ -794,6 +814,7 @@ func buildPipelineAssessment(ctx context.Context, database *sql.DB, workspaceID,
 	}
 	report.Blocking = hasBlockingFindings(report.Tables)
 	report.Summary = summarise(report.Tables)
+	attachChecks(report, ra)
 	return report, http.StatusOK, nil, nil
 }
 
@@ -821,6 +842,11 @@ func AssessPipeline(c *gin.Context) {
 	if errResp != nil {
 		c.JSON(status, errResp)
 		return
+	}
+	if runID, err := recordAssessmentRun(ctx, db.GetDB(), id, AssessmentTriggerManual, userID, report); err != nil {
+		log.Warnf("record assessment run pipeline=%s: %v", id, err)
+	} else {
+		report.RunID = runID
 	}
 	c.JSON(http.StatusOK, report)
 }

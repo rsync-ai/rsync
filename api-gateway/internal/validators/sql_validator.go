@@ -279,6 +279,11 @@ func identifyStatementType(sql string) string {
 		{"VACUUM", "VACUUM"},
 		{"ANALYZE", "ANALYZE"},
 		{"EXPLAIN", "EXPLAIN"},
+		// ClassifyStatement blocks these; without them here the full-statement
+		// classifier saw UNKNOWN, which is owner-runnable, not blocked.
+		{"SHOW", "SHOW"},
+		{"DESCRIBE", "DESCRIBE"},
+		{"DESC", "DESC"},
 	}
 
 	for _, t := range types {

@@ -65,10 +65,30 @@ from doclinks import repo_path_targets
 # eleven doc guards run. See _cut_collection.py for why conftest cannot do this.
 from _cut_collection import skip_if_cut
 
-skip_if_cut("CAPABILITIES.md")
+skip_if_cut("CAPABILITIES.md", "CAPABILITIES-ARCHIVE.md")
 
 REPO = Path(__file__).resolve().parents[2]
 DOC = REPO / "CAPABILITIES.md"
+ARCHIVE = REPO / "CAPABILITIES-ARCHIVE.md"
+
+# 2026-09-16: CAPABILITIES.md became a one-line index. Every status-board row and every
+# active Known-issue body it used to carry moved VERBATIM to the tail of the archive,
+# starting at this heading -- the full rows, the active write-ups, the retired stubs and
+# rows, and the table new full rows are appended to. That tail is the text this guard
+# scanned before the split, so it is scanned now; the archive ABOVE the heading is the
+# historical record the scope note below rules out, and stays out.
+MOVED_FROM = "## Active Known issues — full write-ups"
+
+
+def _scanned() -> list[tuple[str, int, str]]:
+    """(file, lineno, line) for CAPABILITIES.md plus the archive tail that left it."""
+    rows = [("CAPABILITIES.md", n, line)
+            for n, line in enumerate(DOC.read_text().split("\n"), start=1)]
+    arc = ARCHIVE.read_text().split("\n")
+    start = arc.index(MOVED_FROM)
+    rows += [("CAPABILITIES-ARCHIVE.md", n, line)
+             for n, line in enumerate(arc[start:], start=start + 1)]
+    return rows
 
 # The claim itself. Lower-cased before matching.
 #
@@ -79,7 +99,9 @@ DOC = REPO / "CAPABILITIES.md"
 # the reader as one claiming it is unmerged -- work still to do -- and goes stale the
 # same way, so it is the same claim and gets the same probe.
 #
-# Scope stays CAPABILITIES.md, and that is now measured rather than asserted.
+# Scope stays CAPABILITIES.md (plus, since the 2026-09-16 split, the archive tail named
+# by MOVED_FROM -- the same rows in a new file), and that is now measured rather than
+# asserted.
 #
 # A 2026-08-30 sweep looked for this claim in every tracked *.md, because a guard
 # scoped to the file you were handed finds a fraction of the class. It found the
@@ -230,25 +252,36 @@ def _is_live_claim(line: str) -> bool:
     return not (_ALREADY_RECONCILED.search(line) or _NAMES_A_PR.search(line))
 
 
-def _live_claims() -> list[tuple[int, str]]:
+def _live_claims() -> list[tuple[str, str]]:
     """Lines asserting something is unmerged, minus already-corrected ones and ones naming a PR.
 
     Deliberately does NOT exempt struck-through rows: a row marked RESOLVED that still
     says its own fix is unmerged is the defect, not the exemption. See _NAMES_A_PR.
     """
     return [
-        (n, line)
-        for n, line in enumerate(DOC.read_text().split("\n"), start=1)
+        (f"{name}:{n}", line)
+        for name, n, line in _scanned()
         if _is_live_claim(line)
     ]
 
 
 def test_the_doc_and_the_link_scanner_both_work():
     """Vacuity floor. A parser that finds nothing would make every other test here green."""
-    text = DOC.read_text()
-    assert len(text.split("\n")) > 800, "CAPABILITIES.md is far shorter than expected -- wrong file?"
-    all_links = [p for line in text.split("\n") for p in _linked_source_paths(line)]
-    assert len(all_links) > 100, (
+    # Measured 2026-09-16, right after the split: 3396 lines and 2207 source-path links
+    # scanned (the pre-split CAPABILITIES.md alone held 2643 and 2260; the ~50 not
+    # carried over are the Avro plan moved to BACKLOG.md and the KIs resolved into the
+    # archive's historical section). CAPABILITIES.md on its own now links only 14
+    # source paths, so a floor on it alone would read the scanner as broken.
+    # Re-measured 2026-09-18, after the index was cut to present capabilities (fixed-bug
+    # rows and resolved Known issues moved to the archive, the KIs above MOVED_FROM):
+    # CAPABILITIES.md 824 lines, 2960 lines scanned.
+    assert len(DOC.read_text().split("\n")) > 600, "CAPABILITIES.md is far shorter than expected -- wrong file?"
+    lines = [line for _, _, line in _scanned()]
+    assert len(lines) > 2500, (
+        f"only {len(lines)} lines scanned; the archive tail at {MOVED_FROM!r} has shrunk or moved"
+    )
+    all_links = [p for line in lines for p in _linked_source_paths(line)]
+    assert len(all_links) > 1000, (
         f"only {len(all_links)} repo-path links found across the whole doc; the link regex "
         "has stopped matching, so an absent claim below would mean nothing"
     )
@@ -296,13 +329,13 @@ def test_a_doc_link_does_not_buy_an_exemption():
 
 
 @pytest.mark.parametrize(
-    "lineno,line",
-    _live_claims() or [pytest.param(0, "", id="no-live-claims")],
-    ids=lambda v: f"L{v}" if isinstance(v, int) else None,
+    "where,line",
+    [pytest.param(where, line, id=where) for where, line in _live_claims()]
+    or [pytest.param("", "", id="no-live-claims")],
 )
-def test_an_unmerged_claim_is_not_contradicted_by_main(lineno: int, line: str):
-    if lineno == 0:
-        pytest.skip("CAPABILITIES.md currently makes no un-reconciled 'not merged' claim")
+def test_an_unmerged_claim_is_not_contradicted_by_main(where: str, line: str):
+    if not where:
+        pytest.skip("the scanned docs currently make no un-reconciled 'not merged' claim")
 
     ref = _main_ref_or_bail()
 
@@ -312,7 +345,7 @@ def test_an_unmerged_claim_is_not_contradicted_by_main(lineno: int, line: str):
 
     present = [p for p in paths if _exists_on_main(ref, p)]
     assert len(present) != len(paths), (
-        f"CAPABILITIES.md:{lineno} says its code is not merged, but all {len(paths)} source "
+        f"{where} says its code is not merged, but all {len(paths)} source "
         f"path(s) it links already exist on {ref}:\n  "
         + "\n  ".join(f"git cat-file -e {ref}:{p}   # exists" for p in present)
         + "\n\nEither the claim is stale (find the landing commit with "

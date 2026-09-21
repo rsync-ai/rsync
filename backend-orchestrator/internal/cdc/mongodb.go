@@ -15,14 +15,17 @@ import (
 // to create — no publication, no replication slot, no capture instance — so
 // ProvisionResources and CleanupResources are deliberate no-ops.
 //
-// The one true source prerequisite (the deployment is a replica set or sharded
-// cluster; a standalone mongod cannot emit change streams) is enforced by
-// Debezium at connector start and surfaced by the healer: "not a replica set"
-// routes to ActionEscalate with an rs.initiate() remediation (see
-// pkg/diagnose). We keep this provider dependency-free (no mongo driver in the
-// orchestrator) rather than open a second connection solely to re-check that.
-// [fast-follow] a driver-based hello() pre-check could move the failure earlier
-// than connector start, at the cost of the mongo-go-driver dependency.
+// Two source prerequisites are NOT enforced here, and Debezium does not enforce
+// them loudly either. Probed on Debezium 3.1 (#19): against a standalone mongod
+// ("$changeStream stage is only supported on replica sets") and with a user that
+// lacks change-stream privileges (Unauthorized), the connector is accepted, the
+// task reports RUNNING, and Debezium retries without limit while writing nothing;
+// the errors appear only in the Kafka Connect worker log. The privilege case is
+// avoided by construction: the debezium MCP connector scopes the change stream to
+// the captured database (capture.scope=database), so `read` on that database is
+// enough. The standalone case is caught before start_sync by the executor, which
+// asks the mongodb MCP connector's test_connection for the topology
+// (executor/mongodb_topology_check.go); this provider stays dependency-free.
 //
 // Destination mapping is the "packed" shape (see the sink's mongo-document
 // decode branch): every collection lands as _id (TEXT PK) + one JSONB/JSON
@@ -80,10 +83,11 @@ func (m *MongoDBManager) CleanupResources(ctx context.Context, pipelineID string
 	return nil
 }
 
-// ValidatePrerequisites defers the replica-set / privilege check to Debezium
-// connector start, where a non-replica-set source fails loudly and the healer
-// converts it to an escalation with an rs.initiate() remediation. Kept
-// dependency-free by design; returns no blocking errors.
+// ValidatePrerequisites returns no blocking errors: it has no connection to the
+// source (see the type comment). It does not catch a standalone mongod — Debezium
+// retries that forever with the task RUNNING rather than failing at start — so the
+// executor checks topology before start_sync instead, through the mongodb
+// connector's test_connection (executor/mongodb_topology_check.go).
 func (m *MongoDBManager) ValidatePrerequisites(ctx context.Context, connectionID string) ([]ValidationError, error) {
 	return []ValidationError{}, nil
 }

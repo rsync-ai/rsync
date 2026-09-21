@@ -4,10 +4,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"math"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"api-gateway/internal/config"
@@ -31,9 +29,6 @@ type MonitoringOverview struct {
 	AgentReasoningError string                 `json:"agent_reasoning_error,omitempty"`
 	DataPlane           *DataPlaneSummary      `json:"data_plane,omitempty"`
 	DataPlaneError      string                 `json:"data_plane_error,omitempty"`
-	Infrastructure      *InfrastructureSummary `json:"infrastructure,omitempty"`
-	InfrastructureError string                 `json:"infrastructure_error,omitempty"`
-	Correlations        []Correlation          `json:"correlations,omitempty"`
 }
 
 // TimeRange represents the query time window
@@ -65,24 +60,18 @@ type AgentDecision struct {
 
 // DataPlaneSummary summarizes pipeline data movement
 type DataPlaneSummary struct {
-	TotalRowsProcessed  int64      `json:"total_rows_processed"`
-	TotalBytesProcessed int64      `json:"total_bytes_processed"`
-	AvgThroughput       float64    `json:"avg_throughput_rows_per_sec,omitempty"`
-	CDCLagMs            *int64     `json:"cdc_lag_ms,omitempty"`
-	ErrorCount          int        `json:"error_count"`
-	LastMetricTime      *time.Time `json:"last_metric_time,omitempty"`
-}
-
-// InfrastructureSummary summarizes system health
-type InfrastructureSummary struct {
-	ComponentsMonitored int               `json:"components_monitored"`
-	HealthyComponents   int               `json:"healthy_components"`
-	DegradedComponents  int               `json:"degraded_components"`
-	UnhealthyComponents int               `json:"unhealthy_components"`
-	ActiveIssues        int               `json:"active_issues"`
-	CriticalIssues      int               `json:"critical_issues"`
-	RecentIssues        []SentinelIssue   `json:"recent_issues,omitempty"`
-	ComponentHealth     []ComponentHealth `json:"component_health,omitempty"`
+	TotalRowsProcessed  int64   `json:"total_rows_processed"`
+	TotalBytesProcessed int64   `json:"total_bytes_processed"`
+	AvgThroughput       float64 `json:"avg_throughput_rows_per_sec,omitempty"`
+	CDCLagMs            *int64  `json:"cdc_lag_ms,omitempty"`
+	// SinkLagMessages is the sink consumer group's Kafka lag in messages from the
+	// newest CDC status poll: changes captured but not yet read by the sink.
+	// CDCLagMs is that count times ten, not a measured time, so a UI should show
+	// this count and LagMeasuredAt instead.
+	SinkLagMessages *int64     `json:"sink_lag_messages,omitempty"`
+	LagMeasuredAt   *time.Time `json:"lag_measured_at,omitempty"`
+	ErrorCount      int        `json:"error_count"`
+	LastMetricTime  *time.Time `json:"last_metric_time,omitempty"`
 }
 
 // ComponentHealth represents health of a single component
@@ -112,14 +101,6 @@ type SentinelIssue struct {
 	OccurrenceCount int                    `json:"occurrence_count"`
 	LastOccurrence  time.Time              `json:"last_occurrence"`
 	Metadata        map[string]interface{} `json:"metadata,omitempty"`
-}
-
-// Correlation links agent decisions to infrastructure events
-type Correlation struct {
-	AgentDecision AgentDecision  `json:"agent_decision"`
-	InfraEvent    *SentinelIssue `json:"infra_event,omitempty"`
-	Confidence    float64        `json:"confidence"`
-	Method        string         `json:"method"` // trace_id_match, time_window_semantic
 }
 
 // PaginatedIssuesResponse wraps paginated Sentinel issues
@@ -195,21 +176,9 @@ func GetPipelineMonitoringOverview(c *gin.Context) {
 		overview.DataPlane = dataPlane
 	}
 
-	// Fetch infrastructure summary (graceful degradation)
-	if infra, err := fetchInfrastructureSummary(database, timeRange); err != nil {
-		overview.InfrastructureError = err.Error()
-		log.Warnf("Failed to fetch infrastructure summary: %v", err)
-	} else {
-		overview.Infrastructure = infra
-	}
-
-	// Compute correlations if we have both agent decisions and infra issues
-	if overview.AgentReasoning != nil && overview.Infrastructure != nil {
-		overview.Correlations = computeCorrelations(
-			overview.AgentReasoning.RecentDecisions,
-			overview.Infrastructure.RecentIssues,
-		)
-	}
+	// No platform-wide infrastructure block here: it counted every component and
+	// open Sentinel issue across all workspaces, with no pipeline filter, and no
+	// page drew it. Platform health lives on admin/health (admin-only).
 
 	c.JSON(http.StatusOK, overview)
 }
@@ -368,8 +337,9 @@ func GetSentinelHealth(c *gin.Context) {
 		return
 	}
 
-	// RBAC: authenticated user (aggregated, non-sensitive)
-	// No additional checks needed
+	// RBAC: admin only, enforced by AdminRoleMiddleware on the route (main.go). The
+	// table is not workspace-scoped and its component ids name Kafka topics and
+	// containers of every workspace, so no workspace role is enough to read it.
 
 	// Parse filters
 	componentType := c.Query("component_type")
@@ -628,7 +598,8 @@ func fetchDataPlaneSummary(database *sql.DB, pipelineID string, timeRange TimeRa
 	var totalRows, totalBytes int64
 	var errorCount int
 	var lastMetricTime *time.Time
-	var cdcLagMs *int64
+	var cdcLagMs, sinkLagMessages *int64
+	var lagMeasuredAt *time.Time
 	throughputSamples := make([]float64, 0)
 
 	for rows.Next() {
@@ -653,8 +624,15 @@ func fetchDataPlaneSummary(database *sql.DB, pipelineID string, timeRange TimeRa
 			// - legacy: payload.{rows_processed,bytes_processed,...}
 			meta, _ := payload["metadata"].(map[string]interface{})
 
+			// A CDC status poll never carried a row count: its rows_processed was the
+			// sink's Kafka lag times ten, so "Rows" showed 12,800 for a pipeline that had
+			// applied 72,670. Those events stay in run history; count no rows from them.
+			statusPoll := meta["source"] == "cdc_status_poll"
+
 			// rows/bytes (prefer explicit counters)
-			if r, ok := meta["rows_processed"].(float64); ok {
+			if statusPoll {
+				// no row counter; its cdc_lag_ms is still read below
+			} else if r, ok := meta["rows_processed"].(float64); ok {
 				if int64(r) > totalRows {
 					totalRows = int64(r)
 				}
@@ -705,13 +683,20 @@ func fetchDataPlaneSummary(database *sql.DB, pipelineID string, timeRange TimeRa
 				throughputSamples = append(throughputSamples, t)
 			}
 
-			// CDC lag (optional)
-			if lag, ok := meta["cdc_lag_ms"].(float64); ok {
-				lagVal := int64(lag)
-				cdcLagMs = &lagVal
-			} else if lag, ok := payload["cdc_lag_ms"].(float64); ok {
-				lagVal := int64(lag)
-				cdcLagMs = &lagVal
+			// CDC lag (optional). Rows arrive newest first, so the first reading is
+			// the current one. This used to overwrite on every row, which reported
+			// the OLDEST reading in the window as the pipeline's lag.
+			if cdcLagMs == nil {
+				if lag, ok := numberField(meta, payload, "cdc_lag_ms"); ok {
+					lagVal := int64(lag)
+					cdcLagMs = &lagVal
+					measuredAt := occurredAt
+					lagMeasuredAt = &measuredAt
+					if n, ok := numberField(meta, payload, "sink_lag_messages"); ok {
+						msgs := int64(n)
+						sinkLagMessages = &msgs
+					}
+				}
 			}
 		}
 	}
@@ -730,130 +715,19 @@ func fetchDataPlaneSummary(database *sql.DB, pipelineID string, timeRange TimeRa
 		TotalBytesProcessed: totalBytes,
 		AvgThroughput:       avgThroughput,
 		CDCLagMs:            cdcLagMs,
+		SinkLagMessages:     sinkLagMessages,
+		LagMeasuredAt:       lagMeasuredAt,
 		ErrorCount:          errorCount,
 		LastMetricTime:      lastMetricTime,
 	}, nil
 }
 
-func fetchInfrastructureSummary(database *sql.DB, timeRange TimeRange) (*InfrastructureSummary, error) {
-	// Count components by status
-	var total, healthy, degraded, unhealthy int
-	err := database.QueryRow(`
-		SELECT 
-			COUNT(*) as total,
-			COUNT(*) FILTER (WHERE status = 'healthy') as healthy,
-			COUNT(*) FILTER (WHERE status = 'degraded') as degraded,
-			COUNT(*) FILTER (WHERE status IN ('unhealthy', 'dead')) as unhealthy
-		FROM sentinel_component_health
-	`).Scan(&total, &healthy, &degraded, &unhealthy)
-	if err != nil && err != sql.ErrNoRows {
-		return nil, err
+// numberField reads a numeric key from an event's metadata, falling back to the
+// top level of its payload (the legacy shape).
+func numberField(meta, payload map[string]interface{}, key string) (float64, bool) {
+	if v, ok := meta[key].(float64); ok {
+		return v, true
 	}
-
-	// Count active issues
-	var activeIssues, criticalIssues int
-	err = database.QueryRow(`
-		SELECT 
-			COUNT(*) as active,
-			COUNT(*) FILTER (WHERE severity = 'critical') as critical
-		FROM sentinel_active_issues
-		WHERE resolved_at IS NULL
-	`).Scan(&activeIssues, &criticalIssues)
-	if err != nil && err != sql.ErrNoRows {
-		// Non-fatal, Sentinel might not be running
-		activeIssues = 0
-		criticalIssues = 0
-	}
-
-	// Fetch recent issues
-	recentIssues := make([]SentinelIssue, 0)
-	rows, err := database.Query(`
-		SELECT 
-			id, type, severity, component_id, component_type,
-			description, detected_at, resolved_at, occurrence_count,
-			last_occurrence, metadata
-		FROM sentinel_active_issues
-		WHERE detected_at >= $1
-		ORDER BY detected_at DESC
-		LIMIT 10
-	`, timeRange.Since)
-
-	if err == nil {
-		defer rows.Close()
-		for rows.Next() {
-			var issue SentinelIssue
-			var resolvedAt sql.NullTime
-			var metadataBytes []byte
-
-			if err := rows.Scan(
-				&issue.ID, &issue.Type, &issue.Severity, &issue.ComponentID, &issue.ComponentType,
-				&issue.Description, &issue.DetectedAt, &resolvedAt, &issue.OccurrenceCount,
-				&issue.LastOccurrence, &metadataBytes,
-			); err == nil {
-				if resolvedAt.Valid {
-					issue.ResolvedAt = &resolvedAt.Time
-				}
-				if len(metadataBytes) > 0 {
-					json.Unmarshal(metadataBytes, &issue.Metadata)
-				}
-				recentIssues = append(recentIssues, issue)
-			}
-		}
-	}
-
-	return &InfrastructureSummary{
-		ComponentsMonitored: total,
-		HealthyComponents:   healthy,
-		DegradedComponents:  degraded,
-		UnhealthyComponents: unhealthy,
-		ActiveIssues:        activeIssues,
-		CriticalIssues:      criticalIssues,
-		RecentIssues:        recentIssues,
-	}, nil
-}
-
-func computeCorrelations(decisions []AgentDecision, issues []SentinelIssue) []Correlation {
-	correlations := make([]Correlation, 0)
-
-	for _, decision := range decisions {
-		for _, issue := range issues {
-			// Strategy 1: Exact trace_id match (confidence 1.0)
-			if decision.TraceID != "" && issue.Metadata != nil {
-				if issueTraceID, ok := issue.Metadata["trace_id"].(string); ok && issueTraceID == decision.TraceID {
-					correlations = append(correlations, Correlation{
-						AgentDecision: decision,
-						InfraEvent:    &issue,
-						Confidence:    1.0,
-						Method:        "trace_id_match",
-					})
-					continue
-				}
-			}
-
-			// Strategy 2: Time window + semantic matching
-			timeDiff := math.Abs(float64(decision.Timestamp.Sub(issue.DetectedAt)))
-			if timeDiff <= float64(60*time.Second) { // ±60s window
-				confidence := 0.7 + (0.2 * (1.0 - timeDiff/float64(60*time.Second)))
-
-				// Boost confidence if decision rationale mentions component
-				if decision.Rationale != "" && strings.Contains(
-					strings.ToLower(decision.Rationale),
-					strings.ToLower(issue.ComponentType),
-				) {
-					confidence += 0.1
-				}
-
-				if confidence >= 0.7 {
-					correlations = append(correlations, Correlation{
-						AgentDecision: decision,
-						InfraEvent:    &issue,
-						Confidence:    confidence,
-						Method:        "time_window_semantic",
-					})
-				}
-			}
-		}
-	}
-
-	return correlations
+	v, ok := payload[key].(float64)
+	return v, ok
 }

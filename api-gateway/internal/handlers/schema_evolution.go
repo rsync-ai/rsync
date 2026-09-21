@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 
@@ -103,6 +104,17 @@ func schemaDriftPolicyFromJSON(raw []byte) SchemaDriftPolicy {
 	return out
 }
 
+// schemaDriftDetectorEnabled reports the installation-wide detector switch. The
+// orchestrator owns the detector and reads the same env var
+// (backend-orchestrator/internal/agents/executor/schema_drift.go
+// schemaDriftEnabled); the gateway only mirrors it so the policy card can say
+// "detection is off for this installation" instead of showing a per-pipeline
+// switch that does nothing. docker-compose.yml passes the identical value to
+// both services, and test_orchestrator_feature_flags_reach_compose.py pins that.
+func schemaDriftDetectorEnabled() bool {
+	return os.Getenv("RSYNC_SCHEMA_DRIFT_ENABLED") == "true"
+}
+
 var schemaEvolutionDB *sql.DB
 var schemaEvolutionKafka KafkaProducer
 
@@ -165,7 +177,8 @@ func ListPipelineSchemaChanges(c *gin.Context) {
 }
 
 // GetPipelineSchemaDriftPolicy returns the pipeline's per-pipeline drift policy,
-// resolved to defaults (all true) when unset.
+// resolved to defaults (all true) when unset, plus detector_enabled: whether the
+// installation runs the detector at all.
 func GetPipelineSchemaDriftPolicy(c *gin.Context) {
 	pipelineID, ok := requireUUIDParam(c, "id", "invalid_pipeline_id", "Invalid pipeline ID format")
 	if !ok {
@@ -189,7 +202,10 @@ func GetPipelineSchemaDriftPolicy(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "database error"})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"schema_drift_policy": schemaDriftPolicyFromJSON([]byte(raw.String))})
+	c.JSON(http.StatusOK, gin.H{
+		"schema_drift_policy": schemaDriftPolicyFromJSON([]byte(raw.String)),
+		"detector_enabled":    schemaDriftDetectorEnabled(),
+	})
 }
 
 // UpdatePipelineSchemaDriftPolicy PUTs the pipeline's drift policy. Absent body
@@ -246,7 +262,7 @@ func UpdatePipelineSchemaDriftPolicy(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"schema_drift_policy": policy})
+	c.JSON(http.StatusOK, gin.H{"schema_drift_policy": policy, "detector_enabled": schemaDriftDetectorEnabled()})
 }
 
 // ApproveSchemaChange marks a schema change as approved and triggers DDL application

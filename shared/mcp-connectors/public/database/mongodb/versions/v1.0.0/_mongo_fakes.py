@@ -268,7 +268,13 @@ class FakeCollection:
         return self
 
     def count_documents(self, flt, **kw):
+        self.count_calls = getattr(self, "count_calls", []) + [kw]
+        if getattr(self, "count_error", None) is not None:
+            raise self.count_error
         return len(_apply_id_gt(self._docs, flt) if flt else self._docs)
+
+    def estimated_document_count(self, **kw):
+        return len(self._docs)
 
     # ----------------------------- writes -------------------------------- #
     def insert_many(self, docs, ordered=True, **kw):
@@ -332,9 +338,20 @@ class FakeCollection:
         return list(self._docs)
 
 
+class FakeChangeStream:
+    """What ``watch()`` returns: opened and closed, never iterated."""
+
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
 class FakeDatabase:
     def __init__(self, colls: Dict[str, Any], name: str = "testdb"):
         self.name = name                 # db.name — used by _ensure_key_index cache key
+        self.watch_hook = None           # set by FakeMongoClient: records + raises
         self._colls: Dict[str, FakeCollection] = {}
         for cname, c in colls.items():
             coll = c if isinstance(c, FakeCollection) else FakeCollection(c)
@@ -353,17 +370,29 @@ class FakeDatabase:
         self._colls.pop(name, None)
         return {"ok": 1}
 
+    def watch(self, **kwargs):
+        if self.watch_hook is not None:
+            return self.watch_hook(self.name, kwargs)
+        return FakeChangeStream()
+
 
 class FakeAdmin:
     """Models ``client.admin.command(...)`` for the connectivity probe.
 
     ``ping`` returns ``{}`` (liveness). ``hello``/``isMaster`` return ``setName``
     so the connector can decide replica-set-ness (the CDC-readiness gate).
+    ``hello_reply`` replaces that reply outright (e.g. a mongos's
+    ``{"msg": "isdbgrid"}``); ``topology_error`` makes both ``hello`` and
+    ``isMaster`` raise, the "topology unknown" case.
     """
 
-    def __init__(self, set_name: Optional[str] = "rs0", ping_error: Optional[Exception] = None):
+    def __init__(self, set_name: Optional[str] = "rs0", ping_error: Optional[Exception] = None,
+                 hello_reply: Optional[Dict[str, Any]] = None,
+                 topology_error: Optional[Exception] = None):
         self.set_name = set_name
         self.ping_error = ping_error
+        self.hello_reply = hello_reply
+        self.topology_error = topology_error
         self.commands: List[str] = []
 
     def command(self, name, *args, **kwargs):
@@ -373,37 +402,68 @@ class FakeAdmin:
                 raise self.ping_error
             return {"ok": 1}
         if name in ("hello", "isMaster"):
+            if self.topology_error is not None:
+                raise self.topology_error
+            if self.hello_reply is not None:
+                return dict(self.hello_reply)
             return {"setName": self.set_name} if self.set_name else {}
         return {}
 
 
 class FakeMongoClient:
-    def __init__(self, dbs=None, set_name="rs0", version="7.0.0", ping_error=None):
+    """``watch_error`` makes every ``watch()`` (client or database) raise it;
+    ``watch_calls`` records each as ``(database or None, kwargs)``."""
+
+    def __init__(self, dbs=None, set_name="rs0", version="7.0.0", ping_error=None,
+                 hello_reply=None, topology_error=None, watch_error=None):
         self._dbs: Dict[str, FakeDatabase] = {
             name: (d if isinstance(d, FakeDatabase) else FakeDatabase(d, name=name))
             for name, d in (dbs or {}).items()
         }
-        self.admin = FakeAdmin(set_name=set_name, ping_error=ping_error)
+        for d in self._dbs.values():
+            d.watch_hook = self._watch
+        self.admin = FakeAdmin(set_name=set_name, ping_error=ping_error,
+                               hello_reply=hello_reply, topology_error=topology_error)
         self._version = version
         self.closed = False
+        self.watch_error = watch_error
+        self.watch_calls: List[Any] = []
+        self.streams: List[FakeChangeStream] = []
+
+    def _watch(self, database, kwargs):
+        self.watch_calls.append((database, kwargs))
+        if self.watch_error is not None:
+            raise self.watch_error
+        stream = FakeChangeStream()
+        self.streams.append(stream)
+        return stream
+
+    def watch(self, **kwargs):
+        return self._watch(None, kwargs)
 
     def __getitem__(self, name):
         if name not in self._dbs:
             self._dbs[name] = FakeDatabase({}, name=name)
+            self._dbs[name].watch_hook = self._watch
         return self._dbs[name]
 
     def server_info(self):
         return {"version": self._version}
+
+    def list_database_names(self):
+        return list(self._dbs)
 
     def close(self):
         self.closed = True
 
 
 def make_connector(connector_module, *, dbs=None, set_name="rs0", version="7.0.0",
-                   ping_error=None):
+                   ping_error=None, hello_reply=None, topology_error=None,
+                   watch_error=None):
     """Build a MongodbMCPServer wired to a FakeMongoClient (the _get_client seam)."""
     server = connector_module.MongodbMCPServer()
     client = FakeMongoClient(dbs=dbs, set_name=set_name, version=version,
-                             ping_error=ping_error)
+                             ping_error=ping_error, hello_reply=hello_reply,
+                             topology_error=topology_error, watch_error=watch_error)
     server._get_client = lambda config: client  # type: ignore[assignment]
     return server, client

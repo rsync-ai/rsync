@@ -59,6 +59,7 @@ metadata:
     app.kubernetes.io/component: temporal
 spec:
   replicas: 1
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   {{/*
     Recreate, not RollingUpdate. auto-setup runs schema migrations at boot, and
     two of them against one database is a race with no upside on a single replica.

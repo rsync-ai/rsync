@@ -48,6 +48,8 @@ from src.utils.openai_client import (  # noqa: E402
     resolve_explorer_provider as _resolve_explorer_provider,
     resolve_provider as _resolve_provider,
     _ollama_base_url,
+    llm_configured as _llm_configured,
+    explorer_llm_configured as _explorer_llm_configured,
 )
 
 
@@ -162,10 +164,12 @@ async def rank_tables(request: RankTablesRequest) -> List[RankedTable]:
         # The model has to move with the provider. Keeping the globally-resolved
         # RANK_TABLES_MODEL here would send e.g. "gpt-4o-mini" to Ollama.
         model = _rank_tables_default_model(provider)
+        llm_ready = _llm_configured(request.provider)
     else:
         provider = RANK_TABLES_PROVIDER
         client = _client
         model = RANK_TABLES_MODEL
+        llm_ready = _explorer_llm_configured("RANK_TABLES_LLM_PROVIDER")
 
     # Build a compact table summary for the prompt (no row data)
     table_summaries = []
@@ -196,8 +200,9 @@ Each element must have exactly these fields:
 
 Return ONLY the JSON array, no other text."""
 
-    if USE_MOCK or client is None:
-        # Offline fallback: return tables sorted by name with low confidence
+    if USE_MOCK or client is None or not llm_ready:
+        # Offline fallback, also used when no LLM is set up: table selection
+        # must keep working without one.
         return [
             RankedTable(
                 name=t.name,

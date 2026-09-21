@@ -9,16 +9,58 @@ import { API_ENDPOINTS } from "@/lib/config/api"
 // Keep in sync with the Go struct — this is the canonical "what is this
 // pipeline doing right now" shape that replaces UI-side state derivation
 // (looksLikeCDC / normalizedState / getDisplayProgress / ...).
+//
+// waiting_for_data (issue #20): a CDC stream that finished setting up but has not
+// delivered a single row past the grace period (cdcLivenessPhase). It is not
+// terminal — the next poll can turn it into streaming — so it must keep polling.
 export type RuntimePhase =
   | "initializing"
   | "planning"
   | "validating"
   | "syncing"
   | "streaming"
+  | "waiting_for_data"
   | "idle"
   | "completed"
   | "failed"
   | "paused"
+
+export type PhasePolling = "keep" | "stop" | "stop-unless-cdc"
+
+// Whether a phase ends polling. A Record over RuntimePhase rather than a list of
+// terminal phases, so a new phase fails `tsc` here until someone decides — a
+// phase that silently stopped polling would freeze the header on it forever.
+// For CDC, "failed" means a dependency is unhealthy right now, which can recover;
+// a batch run latches on it.
+// Exported so a type-level test can hold this table to every RuntimePhase: the
+// Record annotation is the whole safety net, and nothing else would notice it
+// being loosened.
+export const RUNTIME_PHASE_POLLING: Record<RuntimePhase, PhasePolling> = {
+  initializing: "keep",
+  planning: "keep",
+  validating: "keep",
+  syncing: "keep",
+  streaming: "keep",
+  waiting_for_data: "keep",
+  idle: "keep",
+  completed: "stop",
+  failed: "stop-unless-cdc",
+  paused: "keep",
+}
+
+/**
+ * runtimePhaseEndsPolling is true when no further /runtime update is expected.
+ * A phase this client does not know (a newer gateway) keeps polling: guessing
+ * "terminal" would freeze the page, guessing "live" costs one request per tick.
+ */
+export function runtimePhaseEndsPolling(phase: string, mode: "batch" | "cdc"): boolean {
+  const rule: PhasePolling | undefined = Object.prototype.hasOwnProperty.call(RUNTIME_PHASE_POLLING, phase)
+    ? RUNTIME_PHASE_POLLING[phase as RuntimePhase]
+    : undefined
+  if (rule === "stop") return true
+  if (rule === "stop-unless-cdc") return mode !== "cdc"
+  return false
+}
 
 export type RuntimeHealth = "healthy" | "degraded" | "unhealthy" | "unknown"
 
@@ -32,6 +74,11 @@ export interface RuntimeLiveness {
   last_event_at?: string
   last_healthy_at?: string
   stale_seconds?: number
+  // Captured-minus-applied across the pipeline's CDC tables: changes the source
+  // recorded that the destination has not written yet. The gateway always sends
+  // it (no omitempty), so 0 means "nothing waiting"; it is optional here only for
+  // an older gateway that predates the field.
+  pending_events?: number
 }
 
 export interface RuntimeBlocker {
@@ -80,6 +127,27 @@ export function usePipelineRuntime(pipelineId: string | null | undefined, opts: 
   // terminal phase — avoids hammering the runtime endpoint forever on a finished pipeline.
   const disabledRef = useRef(false)
 
+  // The pipeline this state describes. `/pipelines/[id]` is one route segment,
+  // so React keeps this hook's state across a navigation from one pipeline to
+  // the next, and every consumer then renders the PREVIOUS pipeline's answer
+  // until the new one arrives. On prod (2026-09-20) that read as a flap: a
+  // healthy stream showed "Failed · last event 2d ago" and "Unhealthy — no MCP
+  // server registered with orchestrator" for about a second, both of them the
+  // pipeline the user had come from.
+  //
+  // Adjusted during render, not in an effect: an effect runs after the commit,
+  // so the stale frame would still be painted once.
+  //
+  // This is a different question from a failed poll, which deliberately keeps
+  // the last good answer — a missed tick is still the same pipeline.
+  const [subject, setSubject] = useState(pipelineId)
+  if (pipelineId !== subject) {
+    setSubject(pipelineId)
+    setRuntime(null)
+    setError(null)
+    setLoading(Boolean(enabled && pipelineId))
+  }
+
   useEffect(() => {
     if (!enabled || !pipelineId) {
       setRuntime(null)
@@ -114,14 +182,9 @@ export function usePipelineRuntime(pipelineId: string | null | undefined, opts: 
           setRuntime(data)
           setError(null)
           // Stop polling once the run reaches a stable terminal phase — no further updates
-          // are expected. For CDC, "failed" means a dependency (Debezium/MCP/sink) is
-          // currently unhealthy, which can recover, so we keep polling to self-correct;
-          // "streaming"/"idle" are likewise non-terminal. Only "completed" ends a stream.
-          // Batch runs latch on both "completed" and "failed".
-          const terminalForMode =
-            data.phase === "completed" ||
-            (data.phase === "failed" && data.mode !== "cdc")
-          if (terminalForMode) {
+          // are expected. See RUNTIME_PHASE_POLLING for which phases those are. The
+          // mode matters: a CDC "failed" can recover, so it must not latch.
+          if (runtimePhaseEndsPolling(data.phase, data.mode)) {
             disabledRef.current = true
           }
         }

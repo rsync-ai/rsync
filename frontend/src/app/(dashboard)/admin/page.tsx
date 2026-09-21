@@ -86,7 +86,7 @@ export default function AdminOverviewPage() {
 
   return (
     <div className="space-y-6">
-      <PageHeader heading="Platform admin" description="Operator-wide overview (beta)" />
+      <PageHeader heading="Admin" description="Operator-wide overview (beta)" />
       <AdminNav />
 
       {/* These counts come from /admin/overview, which aggregates the WHOLE platform
@@ -119,19 +119,19 @@ export default function AdminOverviewPage() {
         <div className="space-y-6">
           <div className="grid gap-4 md:grid-cols-4">
             <Card className="p-4">
-              <div className="text-sm text-zinc-500">Users</div>
+              <div className="text-sm text-zinc-500 dark:text-zinc-400">Users</div>
               <div className="text-2xl font-semibold">{data.counts.users}</div>
             </Card>
             <Card className="p-4">
-              <div className="text-sm text-zinc-500">Pipelines</div>
+              <div className="text-sm text-zinc-500 dark:text-zinc-400">Pipelines</div>
               <div className="text-2xl font-semibold">{data.counts.pipelines}</div>
             </Card>
             <Card className="p-4">
-              <div className="text-sm text-zinc-500">Executions</div>
+              <div className="text-sm text-zinc-500 dark:text-zinc-400">Executions</div>
               <div className="text-2xl font-semibold">{data.counts.executions}</div>
             </Card>
             <Card className="p-4">
-              <div className="text-sm text-zinc-500">Connections</div>
+              <div className="text-sm text-zinc-500 dark:text-zinc-400">Connections</div>
               <div className="text-2xl font-semibold">{data.counts.connections}</div>
             </Card>
           </div>
@@ -140,7 +140,7 @@ export default function AdminOverviewPage() {
             <div className="flex items-center justify-between gap-4">
               <div>
                 <div className="font-semibold text-zinc-900 dark:text-white">Recent failures (24h)</div>
-                <div className="text-sm text-zinc-500">Last 20 failed/error executions</div>
+                <div className="text-sm text-zinc-500 dark:text-zinc-400">Last 20 failed/error executions</div>
               </div>
               <Button variant="outline" onClick={load}>
                 Refresh
@@ -149,7 +149,7 @@ export default function AdminOverviewPage() {
 
             <div className="mt-4 space-y-2">
               {data.recent_failed_executions.length === 0 ? (
-                <div className="text-sm text-zinc-500">No recent failures</div>
+                <div className="text-sm text-zinc-500 dark:text-zinc-400">No recent failures</div>
               ) : (
                 data.recent_failed_executions.map((e) => (
                   <div
@@ -157,13 +157,13 @@ export default function AdminOverviewPage() {
                     className="rounded-md border border-zinc-200 bg-white p-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
                   >
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="font-mono text-xs text-zinc-500">{e.id}</div>
+                      <div className="font-mono text-xs text-zinc-500 dark:text-zinc-400">{e.id}</div>
                       <Badge variant="outline">{e.status}</Badge>
                     </div>
                     <div className="mt-1">
                       <span className="font-medium">{e.pipeline_name || e.pipeline_id}</span>
                       {e.created_by_email ? (
-                        <span className="ml-2 text-xs text-zinc-500">({e.created_by_email})</span>
+                        <span className="ml-2 text-xs text-zinc-500 dark:text-zinc-400">({e.created_by_email})</span>
                       ) : null}
                     </div>
                     {e.error_message ? (

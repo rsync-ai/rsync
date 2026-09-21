@@ -292,10 +292,29 @@ func validateConfig(t CanonicalTransform) error {
 		}
 		return nil
 	case "mask_pii":
+		// Nested targets use their own keys (config.deep / config.path(s)): a dot
+		// in config.column is a table qualifier, never a nested path.
+		if v, ok := cfg["deep"]; ok && v != nil {
+			if _, isBool := v.(bool); !isBool {
+				return fmt.Errorf("mask_pii config.deep must be a boolean")
+			}
+		}
+		// Same parsing as the engine (parseMaskSpec): a path string is one path.
+		paths := parseMaskStrings(cfg["paths"])
+		if len(paths) == 0 {
+			paths = parseMaskStrings(cfg["path"])
+		}
+		for _, p := range paths {
+			for _, seg := range strings.Split(p, ".") {
+				if strings.TrimSpace(seg) == "" {
+					return fmt.Errorf("mask_pii config.path %q has an empty segment", p)
+				}
+			}
+		}
 		col, _ := cfg["column"].(string)
 		if strings.TrimSpace(col) == "" {
 			cols, ok := asStringSlice(cfg["columns"])
-			if !ok || len(cols) == 0 {
+			if (!ok || len(cols) == 0) && len(paths) == 0 {
 				return fmt.Errorf("mask_pii requires config.column or config.columns (non-empty)")
 			}
 		}

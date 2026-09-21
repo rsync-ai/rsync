@@ -8,6 +8,8 @@
 //  5. POSTGRES_REPLICATION_PRIVILEGE     — user has REPLICATION role attribute
 //  6. POSTGRES_SCHEMA_VISIBLE            — user can see the configured schema
 //  7. POSTGRES_TABLE_PRIMARY_KEYS        — every selected table has a PK (if Tables provided)
+//  8. POSTGRES_UNSELECTED_TABLE_MISSING_PRIMARY_KEY — CDC: keyless tables outside the
+//     pipeline, whose UPDATE/DELETE the FOR ALL TABLES publication breaks
 //
 // Each check returns a Check struct. Failed checks include a Remediation
 // with copy-pasteable SQL the user can run with admin privileges to fix.
@@ -90,6 +92,7 @@ func (a *PostgresAssessor) Assess(ctx context.Context, in Input) (*Result, error
 		r.Checks = append(r.Checks, checkPostgresMaxReplicationSlots(ctx, db))
 		r.Checks = append(r.Checks, checkPostgresMaxWALSenders(ctx, db))
 		r.Checks = append(r.Checks, checkPostgresReplicationPrivilege(ctx, db, in.ConnectionConfig))
+		r.Checks = append(r.Checks, postgresCDCHealthChecks(ctx, db, in.PipelineID)...)
 	}
 
 	// Per-table primary-key check. Required for CDC (Debezium keys every change
@@ -100,6 +103,12 @@ func (a *PostgresAssessor) Assess(ctx context.Context, in Input) (*Result, error
 	// batch load to a file/SaaS destination, which appends rather than upserts.
 	if len(in.Tables) > 0 && in.RequiresTablePrimaryKeys() {
 		r.Checks = append(r.Checks, checkPostgresTablePrimaryKeys(ctx, db, in.ConnectionConfig, in.Tables, in.IsCDC(), in.CDCBlocksWithoutPrimaryKey(), in.NominatedKeys)...)
+	}
+
+	// The publication covers every table in the database, so a keyless table
+	// the pipeline does not copy starts rejecting UPDATE/DELETE once CDC runs.
+	if in.IsCDC() {
+		r.Checks = append(r.Checks, checkPostgresKeylessTablesOutsidePipeline(ctx, db, in.ConnectionConfig, in.Tables)...)
 	}
 
 	Summarize(r)
@@ -363,7 +372,7 @@ func checkPostgresTablePrimaryKeys(ctx context.Context, db *sql.DB, cfg map[stri
 			schemaName = defaultSchema
 			tableName = strings.Trim(t, `"`)
 		}
-		out = append(out, oneTablePKCheck(ctx, db, schemaName, tableName, cdcMode, cdcBlocks, nominatedColsFor(nominated, schemaName, tableName)))
+		out = append(out, withObject(oneTablePKCheck(ctx, db, schemaName, tableName, cdcMode, cdcBlocks, nominatedColsFor(nominated, schemaName, tableName)), schemaName+"."+tableName))
 	}
 	return out
 }

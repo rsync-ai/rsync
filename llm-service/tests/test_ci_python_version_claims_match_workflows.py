@@ -42,10 +42,29 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 
-# Explicit, not a glob. CAPABILITIES-ARCHIVE.md is deliberately absent: an archived
-# entry is allowed -- required, even -- to quote the retired wording verbatim, and
-# that file is the one place the dead literals belong.
+# Explicit, not a glob. The head of CAPABILITIES-ARCHIVE.md is deliberately absent: an
+# archived entry is allowed -- required, even -- to quote the retired wording verbatim,
+# and that is the one place the dead literals belong.
 SCANNED = ("CAPABILITIES.md", "docs/runbook.md")
+
+# Everything from this heading on is text the index split moved out of CAPABILITIES.md
+# (active Known issue write-ups, full status rows). It was scanned before the move, so
+# it still is; only the archive's older head is exempt.
+ARCHIVE = "CAPABILITIES-ARCHIVE.md"
+ARCHIVE_TAIL = "## Active Known issues — full write-ups"
+
+
+def _scanned_lines():
+    """(file, line number, line) for every line this guard checks."""
+    for rel in SCANNED:
+        for lineno, line in enumerate((REPO / rel).read_text(encoding="utf-8").splitlines(), 1):
+            yield rel, lineno, line
+    path = REPO / ARCHIVE
+    if path.is_file():
+        lines = path.read_text(encoding="utf-8").splitlines()
+        start = lines.index(ARCHIVE_TAIL)  # ValueError, not a silent skip, if it is renamed
+        for lineno, line in enumerate(lines[start:], start + 1):
+            yield ARCHIVE, lineno, line
 
 if not any((REPO / rel).is_file() for rel in SCANNED):
     pytest.skip(
@@ -103,12 +122,10 @@ def test_the_scan_set_is_non_empty():
 def test_a_documented_ci_python_version_exists_in_the_workflows():
     workflows_text = _workflows_text()
     offenders = []
-    for rel in SCANNED:
-        path = REPO / rel
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            for version in PYTHON_VERSION.findall(line):
-                if version not in workflows_text:
-                    offenders.append(f"{rel}:{lineno} claims Python {version}")
+    for rel, lineno, line in _scanned_lines():
+        for version in PYTHON_VERSION.findall(line):
+            if version not in workflows_text:
+                offenders.append(f"{rel}:{lineno} claims Python {version}")
     assert not offenders, (
         "documentation names a Python version that appears in no workflow under "
         ".github/workflows:\n  " + "\n  ".join(offenders)
@@ -119,11 +136,9 @@ def test_docs_do_not_describe_a_setup_python_step_that_no_workflow_runs():
     if SETUP_PYTHON_USE.search(_workflows_text()):
         return  # The action is in use; describing it is correct.
     offenders = []
-    for rel in SCANNED:
-        path = REPO / rel
-        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
-            if "setup-python" in line:
-                offenders.append(f"{rel}:{lineno}")
+    for rel, lineno, line in _scanned_lines():
+        if "setup-python" in line:
+            offenders.append(f"{rel}:{lineno}")
     assert not offenders, (
         "no workflow uses actions/setup-python, but these lines still describe a "
         "setup-python step:\n  " + "\n  ".join(offenders) + "\n\n"

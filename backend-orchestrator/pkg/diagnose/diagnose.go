@@ -149,7 +149,7 @@ func New() *RuleBasedDiagnoser { return &RuleBasedDiagnoser{} }
 // error whose underlying cause is "connection reset by peer"); source order
 // alone decides the winner, so the ordering is load-bearing and safety-
 // critical. In particular the higher-priority rules must stay above the
-// lower-priority ones: silent-drop → auth → rate-limit → lost-stream-position
+// lower-priority ones: silent-drop → mongo-cdc-mask block (escalate) → auth → rate-limit → lost-stream-position
 // (re-snapshot) → CDC provisioning (escalate) → mask-column (user-config) →
 // schema-drift → workflow-gone (orchestration) → swept-zombie (orchestration)
 // → non-retryable (escalate) → transient network (backoff-retry) →
@@ -201,6 +201,21 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 			SuggestedAction: ActionEscalate,
 			Confidence:      0.55,
 			Rationale:       "silent drop detected without clear cause; needs human inspection",
+		}
+	}
+
+	// MongoDB CDC/streaming refused because the pipeline carries an enabled mask
+	// (executor mongoCDCMaskBlockError, KI-MONGO-CDC-MASK-SILENT-NOOP). A privacy
+	// block: a retry refuses identically, and only a human can drop the mask or
+	// switch the pipeline to batch. Checked ahead of the keyword rules because the
+	// message carries user-named columns, which must not steer it to auth or
+	// transient retry.
+	if strings.Contains(low, "ki-mongo-cdc-mask-silent-noop") {
+		return Diagnosis{
+			Category:        CategoryUserConfig,
+			SuggestedAction: ActionEscalate,
+			Confidence:      0.9,
+			Rationale:       "MongoDB CDC run refused: an enabled mask transform cannot be applied to MongoDB CDC yet, so the run would land unmasked PII — a human must remove the mask or switch the pipeline to batch",
 		}
 	}
 

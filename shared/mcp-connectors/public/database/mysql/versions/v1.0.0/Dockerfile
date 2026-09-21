@@ -41,6 +41,10 @@ COPY . /app/
 # lives in this version dir.
 COPY --from=shared canonical_types.py /app/canonical_types.py
 
+# Scope filter for server-level connections (no database named), from the same
+# `shared` named context.
+COPY --from=shared namespace_filter.py /app/namespace_filter.py
+
 # Copy base_connector to shared location if present
 RUN if [ -f /app/base_connector.py ]; then \
     cp /app/base_connector.py /app/shared/mcp-connectors/; \

@@ -5,8 +5,8 @@
 #
 #   llm-service-oss     <- Dockerfile.community   the /chat gateway. This is the
 #                                                 image every OSS/self-host user
-#                                                 actually pulls, and it has the
-#                                                 LARGER surface (15+ COPY lines).
+#                                                 actually pulls, and it has by
+#                                                 far the LARGER COPY surface.
 #   connector-lifecycle <- Dockerfile.oss         the connector deploy runtime. A
 #                                                 strict subset: may ship less
 #                                                 than the community image, never
@@ -94,12 +94,20 @@ if [ "${#STRIP[@]}" -ne "$DECLARED" ]; then
   exit 1
 fi
 
-# The second is the absolute floor, and it is 15 to match the guard on the same
+# The second is the absolute floor, and it is 10 to match the guard on the same
 # file in llm-service/tests/test_oss_image_boundary.py -- one list, one floor.
 # Deliberately below the current count: this number exists to catch the list
 # being gutted, not to notice that one entry left.
-if [ "${#STRIP[@]}" -lt 15 ]; then
-  echo "FATAL: $STRIP_LIST yielded only ${#STRIP[@]} paths; expected the moat list (>=15)."
+#
+# The two floors are the same fact written in two languages, so lowering one and
+# not the other is a live defect, not a tidiness issue: that is exactly what
+# happened when six subtrees were promoted out of the strip list and this file
+# kept 15 against a list of 14, aborting the job before it built anything.
+# test_the_strip_list_floor_is_the_same_number_everywhere_it_is_written, in
+# llm-service/tests/test_oss_image_boundary.py, parses this line, the message
+# below and its own floor, and fails if any of the three drifts.
+if [ "${#STRIP[@]}" -lt 10 ]; then
+  echo "FATAL: $STRIP_LIST yielded only ${#STRIP[@]} paths; expected the moat list (>=10)."
   echo "       Refusing to run: a gutted list makes check B pass by testing almost nothing."
   exit 1
 fi
@@ -128,9 +136,11 @@ if [ -n "$MISSING_MOAT" ]; then
   #       precisely so it keeps running after the flip.
   #
   # The discriminator is the whole cut, not this one directory: (b) means EVERY
-  # one of the >=20 strip paths is untracked. Deleting just config/ by accident
-  # leaves the other 19 tracked and still lands in (a). That is what keeps this
-  # branch from becoming a way to make the script pass by deleting things.
+  # path in the strip list is untracked. Deleting just config/ by accident leaves
+  # all the others tracked and still lands in (a). That is what keeps this branch
+  # from becoming a way to make the script pass by deleting things. No count is
+  # written here on purpose -- the list is read above, and a number copied into
+  # this comment is a number that goes stale at the next promotion.
   #
   # Note it does not skip the run. Checks A and B interrogate the built IMAGES,
   # not the source tree, so both stay meaningful -- and load-bearing -- once the
@@ -259,25 +269,83 @@ $(docker run --rm --user root --entrypoint sh "$img" -c '
   else
     ok "all expected packages present (checks A–C were not vacuous)"
   fi
+
+  say "G: the deterministic renderer actually renders, offline, in this image"
+  # Check F proves the renderer's FILES are present; this proves it RUNS.
+  #
+  # The three libraries the renderer needs -- jinja2 (templates), packaging
+  # (schemas/versioning) and pyyaml (YAML specs) -- are all reached through
+  # imports inside a request handler, not at module scope. So check D's
+  # `import <entry>` succeeds with every one of them missing: the service boots,
+  # reports healthy, and 500s on the first POST /v1/generate. Rendering a real
+  # connector here is the only check in this script that can fail for a missing
+  # renderer dependency.
+  #
+  # Offline by construction: the pipeline makes no outbound call -- an OpenAPI
+  # document in, a connector out. A render that starts reaching the network is
+  # itself the finding.
+  local render
+  render=$(docker run --rm -i --entrypoint sh "$img" -c 'cd /app && python -' <<'RENDERPROBE' 2>&1
+import yaml
+from src.agents.tool_generator.scaffold.openapi_to_spec import openapi_to_connector_spec
+from src.agents.tool_generator.schemas.spec import ConnectorSpec
+from src.agents.tool_generator.generator.builder import ConnectorBuilder
+
+DOC = "\n".join([
+    "openapi: 3.0.0",
+    "info: {title: Leaktest API, version: '1.0'}",
+    "servers: [{url: 'https://api.example.com'}]",
+    "paths:",
+    "  /widgets:",
+    "    get: {operationId: listWidgets, responses: {'200': {description: ok}}}",
+    "  /widgets/{widgetId}:",
+    "    get: {operationId: getWidget, responses: {'200': {description: ok}}}",
+])
+
+report = openapi_to_connector_spec(yaml.safe_load(DOC), name="leaktest_api", category="api_saas")
+spec = ConnectorSpec(**report.spec)
+generated = ConnectorBuilder().build(spec)
+assert generated.is_valid, generated.validation_errors
+assert spec.class_name == "LeaktestApiConnector", spec.class_name
+assert ("class %s" % spec.class_name) in generated.code, "rendered code has no connector class"
+assert report.resource_count >= 1, report.resource_count
+print("RENDER_OK", spec.class_name, report.resource_count, len(generated.code))
+RENDERPROBE
+)
+  if echo "$render" | grep -q '^RENDER_OK '; then
+    ok "rendered a connector offline: $(echo "$render" | grep '^RENDER_OK ')"
+  else
+    bad "the shipped renderer could not render — /v1/generate is dead in this image"
+    echo "$render" | tail -15
+  fi
 }
 
 # community image: ships the gateway + planner; must NOT have buildx.
 run_image Dockerfile.community community src.gateway.main absent \
   '' \
-  'src/gateway src/agents/planner src/agents/tool_generator/deployment src/utils prompts/chat'
+  'src/gateway src/agents/planner src/agents/tool_generator/deployment src/utils prompts/chat
+   src/agents/tool_generator/contracts src/agents/tool_generator/generator
+   src/agents/tool_generator/scaffold src/agents/tool_generator/schemas
+   src/agents/tool_generator/templates src/agents/tool_generator/validation'
 
 # lifecycle image: strict subset — the gateway, planner and prompts tree that the
-# community image legitimately ships must NOT be here; buildx must be.
+# community image legitimately ships must NOT be here; buildx must be. The renderer
+# subtrees are listed because POST /v1/generate is served from this image; leaving
+# them out would let check B pass for the boring reason that almost nothing shipped.
 run_image Dockerfile.oss lifecycle src.lifecycle.main present \
   'src/gateway src/agents/planner prompts' \
-  'src/lifecycle src/agents/tool_generator/deployment src/utils/connector_paths.py'
+  'src/lifecycle src/agents/tool_generator/deployment src/utils/connector_paths.py
+   src/agents/tool_generator/contracts src/agents/tool_generator/generator
+   src/agents/tool_generator/scaffold src/agents/tool_generator/schemas
+   src/agents/tool_generator/templates src/agents/tool_generator/validation'
 
 say "RESULT"
 if [ "$FAIL" = 0 ]; then
-  echo "  ✅ PASS — both published OSS images are moat-free, non-empty, and carry the"
-  echo "     build tooling they each intend."
-  echo "     (Presence only — this does NOT POST /v1/deploy. For the actual runtime deploy"
-  echo "      proof, run scripts/oss-deploy-smoke.sh.)"
+  echo "  ✅ PASS — both published OSS images are moat-free, non-empty, carry the"
+  echo "     build tooling they each intend, and render a connector offline."
+  echo "     (Check G runs the renderer; every other check is presence only. Nothing here"
+  echo "      POSTs /v1/deploy or /v1/generate over HTTP — for the runtime deploy proof,"
+  echo "      run scripts/oss-deploy-smoke.sh.)"
 else
   echo "  ❌ FAIL — see above"
 fi

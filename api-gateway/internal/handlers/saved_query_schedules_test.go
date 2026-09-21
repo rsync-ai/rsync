@@ -2,14 +2,19 @@ package handlers
 
 import (
 	"database/sql"
+	"database/sql/driver"
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	sqlmock "github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"api-gateway/internal/db"
 )
 
 // nextScheduleRun reproduces Temporal's tick arithmetic locally instead of asking
@@ -155,7 +160,7 @@ func TestModelRunTriggerValuesMatchTheCheckConstraint(t *testing.T) {
 }
 
 // ============================================================================
-// after_pipeline (migration 095)
+// after_upstream (migration 095, widened by 100)
 // ============================================================================
 
 // The boundary this whole design rests on. validateScheduleSpec is shared with pipeline
@@ -165,51 +170,76 @@ func TestModelRunTriggerValuesMatchTheCheckConstraint(t *testing.T) {
 // client.ScheduleSpec and return success, leaving a pipeline schedule that never fires and
 // never says why.
 //
-// So: teaching the SHARED validator about after_pipeline is the bug, and this test is
+// So: teaching the SHARED validator about after_upstream is the bug, and this test is
 // what fails when someone does it.
-func TestSharedScheduleValidatorStillRejectsAfterPipeline(t *testing.T) {
-	if err := validateScheduleSpec(scheduleAfterPipeline, ScheduleSpec{}); err == nil {
-		t.Fatal("validateScheduleSpec accepted after_pipeline. Every caller of it builds a " +
+func TestSharedScheduleValidatorStillRejectsAfterUpstream(t *testing.T) {
+	if err := validateScheduleSpec(scheduleAfterUpstream, ScheduleSpec{}); err == nil {
+		t.Fatal("validateScheduleSpec accepted after_upstream. Every caller of it builds a " +
 			"Temporal schedule from the result, and createTemporalSchedule has no case for a " +
 			"non-cadence type — it would silently register a schedule that never fires. " +
-			"after_pipeline belongs in validateModelScheduleSpec only.")
+			"after_upstream belongs in validateModelScheduleSpec only.")
 	}
 }
 
-func TestValidateModelScheduleSpec_AfterPipelineNeedsAPipeline(t *testing.T) {
+// Migration 100 moved the upstream out of a column and into a child table, and a parent
+// row cannot be constrained by what does or does not reference it. So the CHECK that used
+// to refuse an event schedule with no trigger is gone, and this validator is what replaced
+// it: every rule below was a column constraint before and is now only Go.
+func TestValidateModelScheduleSpec_AfterUpstreamNeedsAtLeastOneUpstream(t *testing.T) {
 	pipelineID := "8f14e45f-ceea-467a-9f52-f5b3a1f2c7d9"
+	modelID := "0d3d5f2c-1c8e-4b1a-9a2e-51c0b7a6d4f1"
+	pipe := func(id string) scheduleUpstream { return scheduleUpstream{Kind: upstreamKindPipeline, ID: id} }
+	model := func(id string) scheduleUpstream { return scheduleUpstream{Kind: upstreamKindModel, ID: id} }
+
+	many := make([]scheduleUpstream, 0, maxScheduleUpstreams+1)
+	for i := 0; i <= maxScheduleUpstreams; i++ {
+		many = append(many, pipe(fmt.Sprintf("8f14e45f-ceea-467a-9f52-f5b3a1f2c%03d", i)))
+	}
 
 	cases := []struct {
 		name         string
 		scheduleType string
 		spec         ScheduleSpec
-		trigger      string
+		upstreams    []scheduleUpstream
 		wantErr      bool
 	}{
-		{"valid trigger", scheduleAfterPipeline, ScheduleSpec{}, pipelineID, false},
-		{"trigger with surrounding space", scheduleAfterPipeline, ScheduleSpec{}, "  " + pipelineID + "  ", false},
-		{"trigger with no pipeline", scheduleAfterPipeline, ScheduleSpec{}, "", true},
-		{"trigger with blank pipeline", scheduleAfterPipeline, ScheduleSpec{}, "   ", true},
-		{"trigger with a non-uuid pipeline", scheduleAfterPipeline, ScheduleSpec{}, "the-nightly-load", true},
+		{"one pipeline", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{pipe(pipelineID)}, false},
+		{"one model", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{model(modelID)}, false},
+		{"fan-in across both kinds", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{pipe(pipelineID), model(modelID)}, false},
+		{"surrounding space", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{pipe("  " + pipelineID + "  ")}, false},
+		// The same id under two kinds is two different producers, so it is not a duplicate.
+		{"same id, different kinds", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{pipe(pipelineID), model(pipelineID)}, false},
+
+		{"no upstream at all", scheduleAfterUpstream, ScheduleSpec{}, nil, true},
+		{"empty upstream list", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{}, true},
+		{"blank id", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{pipe("   ")}, true},
+		{"non-uuid id", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{pipe("the-nightly-load")}, true},
+		{"unknown kind", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{{Kind: "connection", ID: pipelineID}}, true},
+		{"missing kind", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{{ID: pipelineID}}, true},
+		// Refused rather than deduplicated: collapsing them would hide that the caller and
+		// the handler disagree about what the set is.
+		{"the same producer twice", scheduleAfterUpstream, ScheduleSpec{}, []scheduleUpstream{pipe(pipelineID), pipe(pipelineID)}, true},
+		{"more upstreams than the cap", scheduleAfterUpstream, ScheduleSpec{}, many, true},
+
 		// A cadence is still validated by the shared rules, unchanged.
-		{"cron still valid", "cron", ScheduleSpec{Cron: "0 2 * * *"}, "", false},
-		{"interval still valid", "interval", ScheduleSpec{EverySeconds: 3600}, "", false},
-		{"bad cron still rejected", "cron", ScheduleSpec{Cron: "not a cron"}, "", true},
-		// Both halves set has two readings and no safe one. Migration 095's CHECK would
-		// reject the row anyway; catching it here makes the message a sentence rather
-		// than a constraint name.
-		{"cron carrying a pipeline", "cron", ScheduleSpec{Cron: "0 2 * * *"}, pipelineID, true},
-		{"interval carrying a pipeline", "interval", ScheduleSpec{EverySeconds: 3600}, pipelineID, true},
+		{"cron still valid", "cron", ScheduleSpec{Cron: "0 2 * * *"}, nil, false},
+		{"interval still valid", "interval", ScheduleSpec{EverySeconds: 3600}, nil, false},
+		{"bad cron still rejected", "cron", ScheduleSpec{Cron: "not a cron"}, nil, true},
+		// Both halves set has two readings and no safe one. Since 100 nothing at the column
+		// level refuses it — a cadence row simply has no upstream rows — so this check is
+		// the whole of the rule rather than a readable copy of a constraint.
+		{"cron carrying an upstream", "cron", ScheduleSpec{Cron: "0 2 * * *"}, []scheduleUpstream{pipe(pipelineID)}, true},
+		{"interval carrying an upstream", "interval", ScheduleSpec{EverySeconds: 3600}, []scheduleUpstream{pipe(pipelineID)}, true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateModelScheduleSpec(tc.scheduleType, tc.spec, tc.trigger)
+			err := validateModelScheduleSpec(tc.scheduleType, tc.spec, tc.upstreams)
 			if tc.wantErr && err == nil {
-				t.Errorf("expected an error for %s/%q, got none", tc.scheduleType, tc.trigger)
+				t.Errorf("expected an error for %s/%v, got none", tc.scheduleType, tc.upstreams)
 			}
 			if !tc.wantErr && err != nil {
-				t.Errorf("unexpected error for %s/%q: %v", tc.scheduleType, tc.trigger, err)
+				t.Errorf("unexpected error for %s/%v: %v", tc.scheduleType, tc.upstreams, err)
 			}
 		})
 	}
@@ -219,16 +249,16 @@ func TestValidateModelScheduleSpec_AfterPipelineNeedsAPipeline(t *testing.T) {
 // than as a time. nextScheduleRun returning nil for an unknown type already does this —
 // this pins it so a later "helpful" default (now? last run + a guess?) has to fail here
 // first. A timestamp in that cell is a promise the platform cannot keep: nothing is
-// scheduled, and the model rebuilds if and only if the upstream pipeline finishes.
-func TestNextScheduleRun_AfterPipelineHasNoNextRun(t *testing.T) {
+// scheduled, and the model rebuilds if and only if an upstream of it finishes.
+func TestNextScheduleRun_AfterUpstreamHasNoNextRun(t *testing.T) {
 	from := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
-	if got := nextScheduleRun(scheduleAfterPipeline, ScheduleSpec{}, from); got != nil {
-		t.Errorf("after_pipeline next run = %s, want nil — an event trigger has no clock", got)
+	if got := nextScheduleRun(scheduleAfterUpstream, ScheduleSpec{}, from); got != nil {
+		t.Errorf("after_upstream next run = %s, want nil — an event trigger has no clock", got)
 	}
 	// Even if a stale cron were left in the spec by a converted schedule, the TYPE is
 	// what decides. Otherwise a converted schedule would keep advertising its old cadence.
-	if got := nextScheduleRun(scheduleAfterPipeline, ScheduleSpec{Cron: "0 2 * * *"}, from); got != nil {
-		t.Errorf("after_pipeline with a leftover cron in the spec = %s, want nil", got)
+	if got := nextScheduleRun(scheduleAfterUpstream, ScheduleSpec{Cron: "0 2 * * *"}, from); got != nil {
+		t.Errorf("after_upstream with a leftover cron in the spec = %s, want nil", got)
 	}
 }
 
@@ -236,7 +266,7 @@ func TestNextScheduleRun_AfterPipelineHasNoNextRun(t *testing.T) {
 // between an event trigger and a nil-pointer path through the Temporal client.
 func TestSavedQuerySchedule_EventDriven(t *testing.T) {
 	cases := map[string]bool{
-		scheduleAfterPipeline: true,
+		scheduleAfterUpstream: true,
 		"cron":                false,
 		"interval":            false,
 		"":                    false,
@@ -256,12 +286,62 @@ var scheduledSummaryColumns = []string{
 	"schedule_id", "saved_query_id", "name", "description",
 	"connection_id", "connection_name", "connector_type",
 	"schedule_type", "schedule_spec", "status",
-	"trigger_pipeline_id", "trigger_pipeline_name",
 	"materialization", "target_table", "statement_class",
 	"last_run_at", "last_run_status", "last_run_error",
 	"created_by", "created_at", "updated_at",
 	"paused_at", "paused_reason",
 	"auto_paused_at", "auto_paused_reason",
+	"upstream_policy",
+}
+
+// The list is where a fan-in's cadence is read ("After all of orders, customers run"),
+// and the policy is the half of that sentence the client cannot work out for itself. It
+// used to be absent from this payload while present on the single-schedule route, so
+// the edit dialog showed "all" and the list and the model page said "any" about the
+// same schedule. Two rows with different policies, so a hard-coded value fails too.
+func TestListSavedQuerySchedules_CarriesTheUpstreamPolicy(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	const waits, eager = "b2c3d4e5-1111-2222-3333-000000000001", "b2c3d4e5-1111-2222-3333-000000000002"
+	row := func(scheduleID, name, policy string) []driver.Value {
+		return []driver.Value{scheduleID, savedQueryID, name, "",
+			savedQueryConn, "warehouse", "postgresql",
+			scheduleAfterUpstream, []byte(`{"timezone":"UTC"}`), "active",
+			"table", "public." + name, "read",
+			nil, "", "",
+			wsScopeUser, time.Now(), time.Now(),
+			nil, "",
+			nil, "",
+			policy}
+	}
+	mock.ExpectQuery(`FROM saved_query_schedules s[\s\S]+WHERE sq\.workspace_id = \$1`).
+		WithArgs(wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows(scheduledSummaryColumns).
+			AddRow(row(waits, "fanin_all", upstreamPolicyAll)...).
+			AddRow(row(eager, "fanin_any", upstreamPolicyAny)...))
+	mock.ExpectQuery(`FROM saved_query_schedule_upstreams u`).
+		WithArgs(wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"schedule_id", "upstream_kind", "upstream_id", "name"}))
+
+	r := savedQueryRouter(http.MethodGet, "/explorer/schedules", "viewer", ListSavedQuerySchedules)
+	w := doJSON(r, http.MethodGet, "/explorer/schedules", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Schedules []map[string]any `json:"schedules"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode schedules response: %v", err)
+	}
+	got := map[string]any{}
+	for _, s := range body.Schedules {
+		got[s["schedule_id"].(string)] = s["upstream_policy"]
+	}
+	if got[waits] != upstreamPolicyAll || got[eager] != upstreamPolicyAny {
+		t.Errorf("upstream_policy per schedule = %v, want %s=all and %s=any", got, waits, eager)
+	}
 }
 
 // The Scheduled Queries page offers an edit affordance that opens the same model dialog
@@ -281,12 +361,19 @@ func TestListSavedQuerySchedules_ReportsMaterializationSupportFromTheConnector(t
 					AddRow("b2c3d4e5-1111-2222-3333-444455556666", savedQueryID, "Daily MRR", "",
 						savedQueryConn, "warehouse", connectorType,
 						"cron", []byte(`{"cron":"0 2 * * *","timezone":"UTC"}`), "active",
-						"", "",
 						"table", "public.daily_mrr", "read",
 						nil, "", "",
 						wsScopeUser, time.Now(), time.Now(),
 						nil, "",
-						nil, ""))
+						nil, "",
+						upstreamPolicyAny))
+			// Since migration 100 the upstreams are a second workspace-scoped query rather
+			// than a join, so the list handler is two round trips and this expectation is
+			// what fails if someone folds them back into one.
+			mock.ExpectQuery(`FROM saved_query_schedule_upstreams u`).
+				WithArgs(wsScopeWS, wsScopeUser).
+				WillReturnRows(sqlmock.NewRows([]string{"schedule_id", "upstream_kind", "upstream_id", "name"}).
+					AddRow("b2c3d4e5-1111-2222-3333-444455556666", upstreamKindPipeline, schedTriggerPipeline, "Nightly ingest"))
 
 			r := savedQueryRouter(http.MethodGet, "/explorer/schedules", "viewer", ListSavedQuerySchedules)
 			w := doJSON(r, http.MethodGet, "/explorer/schedules", nil)
@@ -336,7 +423,7 @@ func TestListSavedQuerySchedules_ReportsMaterializationSupportFromTheConnector(t
 // it reaches the transaction: the saved-query role gate, the upstream pipeline's
 // own role gate, the model load, and the run-as authorization.
 //
-// after_pipeline rather than a cron on purpose — an event trigger registers
+// after_upstream rather than a cron on purpose — an event trigger registers
 // nothing with Temporal, so this exercises the insert path without a Temporal
 // client standing in the way.
 func expectSchedulePreamble(mock sqlmock.Sqlmock) {
@@ -348,7 +435,7 @@ func expectSchedulePreamble(mock sqlmock.Sqlmock) {
 	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
 		WithArgs(savedQueryID, wsScopeWS, wsScopeUser).
 		WillReturnRows(sqlmock.NewRows([]string{"visible"}).AddRow(1))
-	// The trigger pipeline takes the role gate alone: no per-member visibility there.
+	// A pipeline upstream takes the role gate alone: no per-member visibility there.
 	mock.ExpectQuery(`FROM pipelines r\s+JOIN workspace_members`).
 		WithArgs(schedTriggerPipeline, wsScopeUser, wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
@@ -367,9 +454,11 @@ const schedTriggerPipeline = "66666666-6666-6666-6666-666666666666"
 
 func createScheduleBody() map[string]any {
 	return map[string]any{
-		"schedule_type":       scheduleAfterPipeline,
-		"schedule_spec":       map[string]any{"timezone": "UTC"},
-		"trigger_pipeline_id": schedTriggerPipeline,
+		"schedule_type": scheduleAfterUpstream,
+		"schedule_spec": map[string]any{"timezone": "UTC"},
+		"upstreams": []map[string]any{
+			{"kind": upstreamKindPipeline, "id": schedTriggerPipeline},
+		},
 	}
 }
 
@@ -395,6 +484,11 @@ func TestCreateSavedQuerySchedule_LocksTheSavedQueryInTheInsertTransaction(t *te
 		WillReturnRows(sqlmock.NewRows([]string{"id"}).AddRow(savedQueryID))
 	mock.ExpectExec(`INSERT INTO saved_query_schedules`).
 		WillReturnResult(sqlmock.NewResult(1, 1))
+	// The upstreams are a child table since 100, and they are written inside the SAME
+	// transaction as the parent. Committing the schedule without them would leave an
+	// event trigger that is active, listed, and impossible for any producer to fire.
+	mock.ExpectExec(`INSERT INTO saved_query_schedule_upstreams`).
+		WillReturnResult(sqlmock.NewResult(1, 1))
 	mock.ExpectCommit()
 
 	// Read back for the response. Its presence here is also the proof that the
@@ -406,12 +500,16 @@ func TestCreateSavedQuerySchedule_LocksTheSavedQueryInTheInsertTransaction(t *te
 		WillReturnRows(sqlmock.NewRows([]string{
 			"schedule_id", "saved_query_id", "schedule_type", "schedule_spec", "temporal_schedule_id",
 			"status", "run_as_user_id", "created_by", "created_at", "updated_at",
-			"paused_at", "paused_reason", "auto_paused_at", "auto_paused_reason",
-			"trigger_pipeline_id", "name",
-		}).AddRow("77777777-7777-7777-7777-777777777777", savedQueryID, scheduleAfterPipeline,
+			"paused_at", "paused_reason", "auto_paused_at", "auto_paused_reason", "upstream_policy",
+		}).AddRow("77777777-7777-7777-7777-777777777777", savedQueryID, scheduleAfterUpstream,
 			[]byte(`{"timezone":"UTC"}`), nil,
 			"active", wsScopeUser, wsScopeUser, time.Now(), time.Now(),
-			nil, nil, nil, nil, schedTriggerPipeline, "Nightly ingest"))
+			nil, nil, nil, nil, upstreamPolicyAny))
+	// The upstreams come back in their own query since 100 — a join here would return one
+	// copy of the schedule per upstream to a caller that scans exactly one row.
+	mock.ExpectQuery(`FROM saved_query_schedule_upstreams u`).
+		WillReturnRows(sqlmock.NewRows([]string{"schedule_id", "upstream_kind", "upstream_id", "name"}).
+			AddRow("77777777-7777-7777-7777-777777777777", upstreamKindPipeline, schedTriggerPipeline, "Nightly ingest"))
 
 	r := savedQueryRouter(http.MethodPost, "/explorer/saved/:id/schedule", "admin", CreateSavedQuerySchedule)
 	w := doJSON(r, http.MethodPost, "/explorer/saved/"+savedQueryID+"/schedule", createScheduleBody())
@@ -483,34 +581,304 @@ func TestCreateSavedQuerySchedule_SecondScheduleIsAConflictNotAServerError(t *te
 }
 
 // ============================================================================
+// Rings, refused at write time
+// ============================================================================
+// checkUpstreamCycle is the only place a person is ever told they drew a loop. The
+// depth bound in the fire path stops one that gets stored, but silently and forever:
+// every completion of every model in the ring walks it again up to the bound. So the
+// three outcomes below each have to hold on their own — the named one-hop case, the
+// recursive case, and what happens when the graph query itself fails.
+
+// A model naming itself. Refused by name, and refused before the recursive query runs:
+// sqlmock has no expectation queued after the preamble, so a handler that falls through
+// to the graph walk gets an unexpected-query error and answers 500 instead of 400.
+func TestCreateSavedQuerySchedule_AModelNamingItselfIsRefusedBeforeAnyGraphQuery(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	// The path's own gate — role then visibility — and then the same pair again as the
+	// upstream being authorized: authorizeUpstreams checks every entry as a resource in
+	// its own right and does not special-case the model doing the naming.
+	mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+		WithArgs(savedQueryID, wsScopeUser, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+		WithArgs(savedQueryID, wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"visible"}).AddRow(1))
+	mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+		WithArgs(savedQueryID, wsScopeUser, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	// The visibility half of the upstream gate, returning a row: this model is the
+	// caller's own, so it is visible. This expectation is also the positive control for
+	// the two refusal tests below — it is what proves they fail on visibility rather
+	// than on the gate refusing every model it is shown.
+	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+		WithArgs(savedQueryID, wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"visible"}).AddRow(1))
+	mock.ExpectQuery(`FROM saved_queries sq\s+JOIN connections c`).
+		WithArgs(savedQueryID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"id", "workspace_id", "connection_id", "name", "sql_text",
+			"materialization", "target_table", "target_owned", "connector_type", "config",
+		}).AddRow(savedQueryID, wsScopeWS, savedQueryConn, "Daily MRR", "SELECT 1",
+			matTable, "public.daily_mrr", true, "postgresql", "{}"))
+	mock.ExpectQuery(`SELECT role FROM workspace_members`).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+
+	body := map[string]any{
+		"schedule_type": scheduleAfterUpstream,
+		"schedule_spec": map[string]any{"timezone": "UTC"},
+		"upstreams": []map[string]any{
+			{"kind": upstreamKindModel, "id": savedQueryID},
+		},
+	}
+	r := savedQueryRouter(http.MethodPost, "/explorer/saved/:id/schedule", "admin", CreateSavedQuerySchedule)
+	w := doJSON(r, http.MethodPost, "/explorer/saved/"+savedQueryID+"/schedule", body)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	// The message matters as much as the status. "would create a cycle" on a one-hop
+	// self-reference is the answer an operator is least able to act on.
+	if got := scheduleErrorBody(t, w.Body.Bytes()); got != "a model cannot wait on itself" {
+		t.Errorf("error = %q, want the self-reference message", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+// ============================================================================
+// Whose models a member may wait on
+// ============================================================================
+// requireResourceRole proves membership and role, and says so itself: there is no
+// created_by fallback in it. Visibility is a separate column (migration 084), so
+// membership alone let a member name ANOTHER member's private model as an upstream of
+// their own schedule — an id that answers 404 on every direct read, whose name then came
+// back through the upstream list's join, and whose completion fired that member's
+// schedule. Both write paths are covered because both call authorizeUpstreams, and an
+// edit is a fresh request from a caller whose access may have changed.
+//
+// The refusal must be 404 "not found" — what loadSavedQuery answers for a row the caller
+// may not see, and what a nonexistent id answers — so the two cannot be told apart and
+// private ids cannot be probed. These tests live in the default suite on purpose: CI runs
+// `go test ./...` with no -tags, so an integration_pg guard would never run there.
+
+const otherMembersPrivateModel = "77777777-7777-7777-7777-777777777777"
+
+// CREATE. The role gate passes — the caller really is a member of the workspace holding
+// that model — and the visibility query is what refuses.
+func TestCreateSavedQuerySchedule_AnotherMembersPrivateModelCannotBeNamedAsAnUpstream(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+		WithArgs(savedQueryID, wsScopeUser, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	// The path's own visibility half: the caller may see the model they are scheduling.
+	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+		WithArgs(savedQueryID, wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"visible"}).AddRow(1))
+	// The upstream's own role gate: membership is real, which is exactly why it is not
+	// enough on its own.
+	mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+		WithArgs(otherMembersPrivateModel, wsScopeUser, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	// Private, written by someone else: the predicate matches nothing.
+	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+		WithArgs(otherMembersPrivateModel, wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"visible"}))
+
+	body := map[string]any{
+		"schedule_type": scheduleAfterUpstream,
+		"schedule_spec": map[string]any{"timezone": "UTC"},
+		"upstreams": []map[string]any{
+			{"kind": upstreamKindModel, "id": otherMembersPrivateModel},
+		},
+	}
+	r := savedQueryRouter(http.MethodPost, "/explorer/saved/:id/schedule", "admin", CreateSavedQuerySchedule)
+	w := doJSON(r, http.MethodPost, "/explorer/saved/"+savedQueryID+"/schedule", body)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+	// 403 would confirm the id exists, which is the thing being withheld.
+	if got := scheduleErrorBody(t, w.Body.Bytes()); got != "not found" {
+		t.Errorf("error = %q, want the same %q loadSavedQuery gives a hidden row", got, "not found")
+	}
+	// Nothing after the refusal ran: no insert, and no query that could return the
+	// hidden model's name.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+// UPDATE. The same refusal on the edit path, where the caller already owns a schedule and
+// is swapping in an upstream they cannot see.
+func TestUpdateSavedQuerySchedule_AnotherMembersPrivateModelCannotBeNamedAsAnUpstream(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	const scheduleID = "ba6fc134-0ed4-4210-8180-5fb0ad8660f3"
+
+	mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+		WithArgs(savedQueryID, wsScopeUser, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	// mutableSavedQuerySchedule's visibility half, before it reads the schedule at all.
+	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+		WithArgs(savedQueryID, wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"visible"}).AddRow(1))
+	// Paused, so loadSavedQuerySchedule skips the blocked-connection check; the status is
+	// irrelevant to the gate under test and every extra expectation is a way for this
+	// test to fail for a reason that is not the one it is about.
+	mock.ExpectQuery(`FROM saved_query_schedules s\s+WHERE s.saved_query_id = \$1`).
+		WithArgs(savedQueryID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"schedule_id", "saved_query_id", "schedule_type", "schedule_spec", "temporal_schedule_id",
+			"status", "run_as_user_id", "created_by", "created_at", "updated_at",
+			"paused_at", "paused_reason", "auto_paused_at", "auto_paused_reason", "upstream_policy",
+		}).AddRow(scheduleID, savedQueryID, scheduleAfterUpstream, []byte(`{"timezone":"UTC"}`), nil,
+			"paused", wsScopeUser, wsScopeUser, time.Now(), time.Now(),
+			nil, nil, nil, nil, upstreamPolicyAny))
+	mock.ExpectQuery(`FROM saved_query_schedule_upstreams u`).
+		WithArgs(scheduleID).
+		WillReturnRows(sqlmock.NewRows([]string{"schedule_id", "upstream_kind", "id", "name"}))
+	mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+		WithArgs(otherMembersPrivateModel, wsScopeUser, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("admin"))
+	mock.ExpectQuery(`FROM saved_queries\s+WHERE id = \$1 AND workspace_id = \$2`).
+		WithArgs(otherMembersPrivateModel, wsScopeWS, wsScopeUser).
+		WillReturnRows(sqlmock.NewRows([]string{"visible"}))
+
+	body := map[string]any{
+		"schedule_type": scheduleAfterUpstream,
+		"schedule_spec": map[string]any{"timezone": "UTC"},
+		"upstreams": []map[string]any{
+			{"kind": upstreamKindModel, "id": otherMembersPrivateModel},
+		},
+	}
+	r := savedQueryRouter(http.MethodPut, "/explorer/saved/:id/schedule", "admin", UpdateSavedQuerySchedule)
+	w := doJSON(r, http.MethodPut, "/explorer/saved/"+savedQueryID+"/schedule", body)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := scheduleErrorBody(t, w.Body.Bytes()); got != "not found" {
+		t.Errorf("error = %q, want the same %q loadSavedQuery gives a hidden row", got, "not found")
+	}
+	// The cycle walk sits right after this gate on the edit path. No expectation is
+	// queued for it, so a handler that refused later than it should would hit an
+	// unexpected query and fail here rather than pass quietly.
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+// The recursive case: the proposed upstream already reaches back to this model through
+// some number of hops. The walk goes UP from the upstream, so the row it returns is the
+// answer to "does this producer already depend on me".
+func TestCheckUpstreamCycle_AnUpstreamThatAlreadyReachesBackIsRefused(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	other := "55555555-5555-5555-5555-555555555555"
+	mock.ExpectQuery(`WITH RECURSIVE ancestors`).
+		WithArgs(other, savedQueryID).
+		WillReturnRows(sqlmock.NewRows([]string{"exists"}).AddRow(true))
+
+	c, w := cycleTestContext()
+	ok := checkUpstreamCycle(c, db.DB, savedQueryID, []scheduleUpstream{{Kind: upstreamKindModel, ID: other}})
+
+	if ok {
+		t.Fatal("a ring was allowed")
+	}
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+// A pipeline upstream cannot close a model ring — pipelines have no upstreams of their
+// own in this table. Walking one would be a query per entry for an answer that is
+// always false, and it must not be mistaken for a self-reference either.
+func TestCheckUpstreamCycle_APipelineUpstreamIsNotWalked(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	c, _ := cycleTestContext()
+	if !checkUpstreamCycle(c, db.DB, savedQueryID, []scheduleUpstream{
+		{Kind: upstreamKindPipeline, ID: savedQueryID},
+	}) {
+		t.Fatal("a pipeline upstream was refused")
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("a pipeline upstream must not reach the graph query: %v", err)
+	}
+}
+
+// The graph query failed, so whether this set closes a ring is unknown. Unknown has to
+// refuse: the check cannot be re-run after the write, and a ring that gets stored walks
+// itself to the depth bound on every completion of every model in it, forever.
+func TestCheckUpstreamCycle_AFailedGraphQueryRefusesRatherThanAllows(t *testing.T) {
+	mock, cleanup := wsScopeMockDB(t)
+	defer cleanup()
+
+	other := "55555555-5555-5555-5555-555555555555"
+	mock.ExpectQuery(`WITH RECURSIVE ancestors`).
+		WillReturnError(fmt.Errorf("connection reset"))
+
+	c, w := cycleTestContext()
+	ok := checkUpstreamCycle(c, db.DB, savedQueryID, []scheduleUpstream{{Kind: upstreamKindModel, ID: other}})
+
+	if ok {
+		t.Fatal("the set was allowed after the cycle check could not be completed")
+	}
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected 500, got %d: %s", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("sql expectations: %v", err)
+	}
+}
+
+// cycleTestContext is the minimum checkUpstreamCycle reads off a request: a context to
+// carry the deadline and a recorder to write the refusal into.
+func cycleTestContext() (*gin.Context, *httptest.ResponseRecorder) {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/explorer/saved/"+savedQueryID+"/schedule", nil)
+	return c, w
+}
+
+func scheduleErrorBody(t *testing.T, raw []byte) string {
+	t.Helper()
+	var out struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("response was not JSON: %v (%s)", err, raw)
+	}
+	return out.Error
+}
+
+// ============================================================================
 // Whose models a member may reach by id
 // ============================================================================
-// Every per-id model endpoint gated on requireResourceRole ALONE, and that gate is
-// membership plus role by design — it joins workspace_members and carries no visibility
-// predicate. loadSavedQuerySchedule then filters on saved_query_id only, so a member
-// could read, pause, retarget, run and delete another member's PRIVATE model and its
-// schedule: ids that answer 404 on GET /explorer/saved/:id. The list endpoint was never
-// affected; it carries the visibility predicate in its own query, which is what made the
-// gap easy to miss.
+// The upstream gap above had a sibling on the primary resource. Every per-id model
+// endpoint gated on requireResourceRole ALONE, and that gate is membership plus role by
+// design. loadSavedQuerySchedule then filters on saved_query_id only — its own comment
+// used to say a "role gate" was enough — so a member could read, pause, retarget, run
+// and delete another member's PRIVATE model and its schedule: ids that answer 404 on
+// GET /explorer/saved/:id. The list endpoint was never affected; it carries the
+// visibility predicate in its own query, which is what made the gap easy to miss.
 //
 // The refusal is 404 "not found" everywhere, identical to a nonexistent id. Before the
 // fix the responses were distinguishable — a live id answered "no schedule for this
 // saved query" or 200 where a nonexistent one answered "not found" — which is an
 // existence oracle on its own, needing no schedule to exist at all.
-
-// Another member's private model, in the same workspace the caller belongs to.
-const otherMembersPrivateModel = "77777777-7777-7777-7777-777777777777"
-
-func perIDErrorBody(t *testing.T, raw []byte) string {
-	t.Helper()
-	var body struct {
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal(raw, &body); err != nil {
-		t.Fatalf("response is not JSON: %v (%s)", err, raw)
-	}
-	return body.Error
-}
 
 // Every per-id entry point, one table. A new route that gates on the role half alone
 // belongs here; leaving it out is how the next one of these ships.
@@ -521,14 +889,23 @@ func TestPerIDModelEndpoints_AnotherMembersPrivateModelIsNotFound(t *testing.T) 
 		route  string
 		path   string
 		h      gin.HandlerFunc
+		body   any
 	}{
-		{"read the schedule", http.MethodGet, "/explorer/saved/:id/schedule", "/schedule", GetSavedQuerySchedule},
-		{"read the run history", http.MethodGet, "/explorer/saved/:id/runs", "/runs", ListSavedQueryRuns},
-		{"create a schedule", http.MethodPost, "/explorer/saved/:id/schedule", "/schedule", CreateSavedQuerySchedule},
-		{"pause the schedule", http.MethodPost, "/explorer/saved/:id/schedule/pause", "/schedule/pause", PauseSavedQuerySchedule},
-		{"delete the schedule", http.MethodDelete, "/explorer/saved/:id/schedule", "/schedule", DeleteSavedQuerySchedule},
-		{"retarget the materialization", http.MethodPut, "/explorer/saved/:id/materialization", "/materialization", SetSavedQueryMaterialization},
-		{"run it by hand", http.MethodPost, "/explorer/saved/:id/run", "/run", RunSavedQueryModel},
+		{"read the schedule", http.MethodGet, "/explorer/saved/:id/schedule", "/schedule", GetSavedQuerySchedule, nil},
+		{"read the run history", http.MethodGet, "/explorer/saved/:id/runs", "/runs", ListSavedQueryRuns, nil},
+		{"create a schedule", http.MethodPost, "/explorer/saved/:id/schedule", "/schedule", CreateSavedQuerySchedule,
+			map[string]any{"schedule_type": scheduleAfterUpstream, "schedule_spec": map[string]any{"timezone": "UTC"}}},
+		{"pause the schedule", http.MethodPost, "/explorer/saved/:id/schedule/pause", "/schedule/pause", PauseSavedQuerySchedule, nil},
+		{"delete the schedule", http.MethodDelete, "/explorer/saved/:id/schedule", "/schedule", DeleteSavedQuerySchedule, nil},
+		{"retarget the materialization", http.MethodPut, "/explorer/saved/:id/materialization", "/materialization",
+			SetSavedQueryMaterialization, map[string]any{"materialization": "table", "target_table": "attacker.pwned"}},
+		{"run it by hand", http.MethodPost, "/explorer/saved/:id/run", "/run", RunSavedQueryModel, nil},
+		// Lives in saved_query_freshness.go, and is the reason this table is a table:
+		// it shipped with the same role-only gate months after the ones above, because
+		// nothing made the omission visible. Widening a deadline silences the breach
+		// alert on a model the caller cannot even read.
+		{"widen the freshness deadline", http.MethodPut, "/explorer/saved/:id/freshness", "/freshness",
+			SetSavedQueryFreshness, map[string]any{"deadline_seconds": 31536000}},
 	}
 
 	for _, tc := range cases {
@@ -547,13 +924,13 @@ func TestPerIDModelEndpoints_AnotherMembersPrivateModelIsNotFound(t *testing.T) 
 				WillReturnRows(sqlmock.NewRows([]string{"visible"}))
 
 			r := savedQueryRouter(tc.method, tc.route, "admin", tc.h)
-			w := doJSON(r, tc.method, "/explorer/saved/"+otherMembersPrivateModel+tc.path, nil)
+			w := doJSON(r, tc.method, "/explorer/saved/"+otherMembersPrivateModel+tc.path, tc.body)
 
 			if w.Code != http.StatusNotFound {
 				t.Fatalf("expected 404, got %d: %s", w.Code, w.Body.String())
 			}
 			// 403, or any message naming the schedule, would confirm the id is real.
-			if got := perIDErrorBody(t, w.Body.Bytes()); got != "not found" {
+			if got := scheduleErrorBody(t, w.Body.Bytes()); got != "not found" {
 				t.Errorf("error = %q, want the same %q a nonexistent id gives", got, "not found")
 			}
 			// No expectation is queued past the refusal, so a handler that read the
@@ -580,7 +957,7 @@ func TestPerIDModelEndpoints_AVisibleModelStillReachesTheHandler(t *testing.T) {
 		WithArgs(savedQueryID, wsScopeWS, wsScopeUser).
 		WillReturnRows(sqlmock.NewRows([]string{"visible"}).AddRow(1))
 	// Past the gate: the handler's own read runs, and finds no schedule.
-	mock.ExpectQuery(`FROM saved_query_schedules s[\s\S]+WHERE s.saved_query_id = \$1`).
+	mock.ExpectQuery(`FROM saved_query_schedules s\s+WHERE s.saved_query_id = \$1`).
 		WithArgs(savedQueryID).
 		WillReturnRows(sqlmock.NewRows([]string{"schedule_id"}))
 
@@ -593,7 +970,7 @@ func TestPerIDModelEndpoints_AVisibleModelStillReachesTheHandler(t *testing.T) {
 	// A DIFFERENT 404: this one is the handler's own answer, which only a caller who
 	// passed the gate can see. Getting "not found" here would mean the control proved
 	// nothing, because the gate would have refused a model the caller may see.
-	if got := perIDErrorBody(t, w.Body.Bytes()); got != "no schedule for this saved query" {
+	if got := scheduleErrorBody(t, w.Body.Bytes()); got != "no schedule for this saved query" {
 		t.Fatalf("error = %q, want the handler's own answer past the gate", got)
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {

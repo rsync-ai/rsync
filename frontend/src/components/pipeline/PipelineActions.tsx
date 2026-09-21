@@ -384,7 +384,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
             <AlertDialogAction
               onClick={handleReloadConfirmed}
               disabled={isRunning}
-              className="bg-amber-600 hover:bg-amber-700 text-white font-medium"
+              className="bg-amber-700 hover:bg-amber-800 text-white font-medium"
             >
               <RefreshCw className="h-4 w-4 mr-2" />
               Reload
@@ -403,6 +403,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
           }
         }}
         report={assessmentReport}
+        assessmentTabHref={`/pipelines/${pipelineId}?tab=assessment`}
         submitting={submittingProceed}
         onProceed={async (nominatedKeys) => {
           if (!pendingRunMode) return

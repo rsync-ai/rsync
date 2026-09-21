@@ -180,7 +180,9 @@ MIIEowIBAAKCAQEAx7Vn0Qk2bYpLmNqRsTuVwXyZaBcDeFgHiJkLmNoPqRsTuVwX
 # AKIA…EXAMPLE by default; a stopword kills another), which is indistinguishable from
 # a broken config. So the same plant goes into a file no allowlist names, and if THAT
 # is not reported the run is void rather than green.
-CONTROL=$(git ls-files 'api-gateway/internal/handlers/*.go' | grep -v '_test\.go$' | head -1)
+# `sed -n 1p`, not `head -1`: head exits after one line, the still-writing grep gets EPIPE and
+# exits 2, and `pipefail` turns that into a red run on a runner whose grep reports the error.
+CONTROL=$(git ls-files 'api-gateway/internal/handlers/*.go' | grep -v '_test\.go$' | sed -n 1p)
 [ -n "$CONTROL" ] || { echo "FATAL: found no non-exempt control file" >&2; exit 2; }
 
 for f in $CONTROL $PROBE_FILES; do

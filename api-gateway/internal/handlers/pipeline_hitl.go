@@ -495,6 +495,10 @@ func ResumePipelineTables(c *gin.Context) {
 	}
 
 	tables := normalizeSelectedTables(req.SelectedTables)
+	// The selection as the user confirmed it, captured before expansion: a
+	// first run confirmed as "this whole database" must keep matching tables
+	// created later, which is what the CDC auto-pickup watcher re-applies.
+	rawTables := append([]string(nil), tables...)
 
 	// Resolve the pipeline's source connection up front — needed to expand any
 	// "select entire database" ("*") / "select entire namespace" ("<ns>.*")
@@ -770,6 +774,11 @@ func ResumePipelineTables(c *gin.Context) {
 		`, string(b), pipelineID); err != nil {
 			log.WithError(err).WithField("pipeline_id", pipelineID).Warn("ResumeTables: failed to persist selected_tables (ignored)")
 		}
+	}
+	// …and the rule behind it, so a whole-database first run keeps picking up
+	// new tables (an exact list writes an empty rule: never auto-add).
+	if err := persistTableSelectionRule(database, pipelineID, rawTables); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("ResumeTables: failed to persist table_selection_rule (ignored)")
 	}
 
 	// Persist the user's confirmed destination mapping (PR-C) in the same step.

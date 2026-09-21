@@ -23,21 +23,35 @@ a green tick and no subject -- the vacuous pass this suite exists to prevent.
 
 THE DISCRIMINATOR. A cut tree is not a broken tree, and the difference is visible:
 the cut removes things from BOTH lists. ``scripts/flip`` goes with
-``excludes.txt``; ``src/agents/tool_generator/generator`` goes with
-``oss-strip-list.txt:32``. Both gone means the cut ran and there is nothing left to
+``excludes.txt``; the moat half of ``src/agents/tool_generator/`` goes with
+``oss-strip-list.txt``. Both gone means the cut ran and there is nothing left to
 check. Both present means this is the private repo and the guards must run. One of
 each is a repo in a state no procedure produces -- a rename, a bad merge, a partial
 delete -- and that fails loudly rather than skipping, which is the whole point.
+
+WHICH PATH WITNESSES THE STRIP LIST. Not one named here. This file used to hard-code
+``src/agents/tool_generator/generator`` as the moat witness, and then that package
+was promoted OUT of the moat and into the community image. The line still named a
+real directory, so nothing in the private repo went red -- but in the public repo
+the witness was present while ``excludes.txt`` was gone, which is precisely the
+"one of each" case, so every guard importing this module would have failed with
+``half-cut tree`` on the first CI run. The witness is now whatever
+``oss-strip-list.txt`` currently names (``_cut_collection.tree_is_intact``), so
+promoting a subtree cannot leave a stale witness behind.
 """
 
 import os
+import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# One witness from each half of the cut. Neither is incidental: excludes.txt is what
-# the flip reads to know what to remove, and the generator package is the moat.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _cut_collection import tree_is_intact  # noqa: E402
+
+# One witness from each half of the cut. excludes.txt is what the flip reads to know
+# what to remove; the other half is derived, see the docstring.
 _FROM_EXCLUDES = os.path.join("scripts", "flip", "excludes.txt")
-_FROM_STRIP_LIST = os.path.join("llm-service", "src", "agents", "tool_generator", "generator")
+_FROM_STRIP_LIST = "the paths llm-service/oss-strip-list.txt removes"
 
 
 def _present(rel):
@@ -55,7 +69,7 @@ def is_a_pre_cut_tree():
     """
     import pytest
 
-    excludes, moat = _present(_FROM_EXCLUDES), _present(_FROM_STRIP_LIST)
+    excludes, moat = _present(_FROM_EXCLUDES), tree_is_intact()
     if excludes and moat:
         return True
     if not excludes and not moat:

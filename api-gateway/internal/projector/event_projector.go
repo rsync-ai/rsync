@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/rsync-ai/shared/kafkaclient"
@@ -13,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	rsynckafka "api-gateway/internal/kafka"
@@ -47,6 +49,22 @@ type EventProjector struct {
 	// redeliver the event, because redelivery would re-run every model attached to the
 	// pipeline. See the call site.
 	OnPipelineCompleted func(ctx context.Context, pipelineID, executionID string)
+
+	// OnPipelineDataLanded is the CDC counterpart of OnPipelineCompleted: a CDC pipeline
+	// never completes, so "run after pipeline" fires when the sink reports that rows
+	// landed, at most once per pipeline per window. occurrence names the window and takes
+	// the place of an execution id. Same nil contract and same no-redelivery rule as
+	// OnPipelineCompleted. See cdc_data_landed.go.
+	OnPipelineDataLanded func(ctx context.Context, pipelineID, occurrence string)
+
+	// dataLandedInterval is the OnPipelineDataLanded window; zero means the default.
+	dataLandedInterval time.Duration
+	landedMu           sync.Mutex
+	landedWindow       map[string]int64 // pipeline_id -> last window fired
+
+	// Per-reason counts of TABLE_STATS events dropped before projection. See
+	// table_stats_skip.go.
+	tableStatsSkips [numTableStatsSkipReasons]atomic.Uint64
 
 	// One log line per (producer, event_type, field) the first time this projector
 	// has to invent an envelope field. See noteEnvelopeGap.
@@ -95,11 +113,13 @@ type BlockingReason struct {
 func NewEventProjector(db *sql.DB, brokers []string) *EventProjector {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &EventProjector{
-		db:      db,
-		brokers: brokers,
-		ctx:     ctx,
-		cancel:  cancel,
-		lastSeq: make(map[string]int64),
+		db:                 db,
+		brokers:            brokers,
+		ctx:                ctx,
+		cancel:             cancel,
+		lastSeq:            make(map[string]int64),
+		dataLandedInterval: cdcAfterPipelineIntervalFromEnv(),
+		landedWindow:       make(map[string]int64),
 	}
 }
 
@@ -218,14 +238,24 @@ func (p *EventProjector) projectEvent(msg kafka.Message) error {
 		}
 	}
 	if eventType == "TABLE_STATS" {
-		if err := p.upsertTableStats(raw); err != nil {
+		progress, err := p.upsertTableStatsProgress(raw)
+		if err != nil {
 			log.Printf("Event Projector: Failed to upsert table stats: %v", err)
+		} else if stored {
+			// CDC "run after pipeline". Gated on `stored` for the same reason as the
+			// completion hook above — a replayed TABLE_STATS must not rebuild anything —
+			// and on a committed upsert, so the applied count it compared against is the
+			// one now in the table. Throttled and deduped per window inside.
+			p.maybeFireDataLanded(progress)
 		}
 	}
 
 	// Best-effort: infer CDC mode for "streaming" runs and persist onto the pipeline record.
 	// This unblocks CDC telemetry agents (cdcstats/sentinel) that rely on pipelines.sync_mode.
 	p.maybePersistStreamingSyncMode(raw)
+
+	// Best-effort: record the connections the workflow resolved on its own.
+	p.maybePersistConnectionIDs(raw)
 
 	// Then parse into the progress struct for pipeline_progress projection (subset of events).
 	var event ProgressEvent
@@ -329,20 +359,12 @@ func (p *EventProjector) projectEvent(msg kafka.Message) error {
 		return err
 	}
 
-	// Guard: don't let late heartbeats/progress events overwrite a terminal status for the same execution.
-	// This can happen when a stage heartbeat tick races with a terminal event.
-	if err == nil && existingStatus.Valid && existingExecID.Valid {
-		es := strings.ToLower(strings.TrimSpace(existingStatus.String))
-		ee := strings.TrimSpace(existingExecID.String)
-		ie := strings.TrimSpace(event.ExecutionID)
-		isTerminal := es == "completed" || es == "failed" || es == "cancelled"
-		incomingTerminal := strings.EqualFold(strings.TrimSpace(event.Status), "completed") ||
-			strings.EqualFold(strings.TrimSpace(event.Status), "failed") ||
-			strings.EqualFold(strings.TrimSpace(event.Status), "cancelled")
-		if isTerminal && ee != "" && ie != "" && ee == ie && !incomingTerminal {
-			// Best-effort: ignore non-terminal events for a finished execution.
-			return nil
-		}
+	// Guard: don't let late heartbeats/progress events overwrite a terminal status, or a
+	// streaming run's 'running', for the same execution. See lateEventWouldRegressStatus.
+	if err == nil && existingStatus.Valid && existingExecID.Valid &&
+		lateEventWouldRegressStatus(existingStatus.String, existingExecID.String, event.Status, event.ExecutionID) {
+		// Best-effort: ignore the late event; the stored row is already further along.
+		return nil
 	}
 
 	newVersion := currentVersion + 1
@@ -507,6 +529,40 @@ func (p *EventProjector) projectEvent(msg kafka.Message) error {
 	return nil
 }
 
+// lateEventWouldRegressStatus reports whether a progress event that arrives for the
+// SAME execution as the stored pipeline_progress row must be dropped because applying
+// it would move the row backwards. Events for a different (or unknown) execution are
+// never dropped: a new run must always be able to take the row over.
+//
+//  1. Terminal: a finished execution (completed/failed/cancelled) is not reopened by
+//     a non-terminal heartbeat or progress tick that raced the terminal write.
+//  2. Streaming hand-off: 'running' is written only when a streaming (CDC) run has
+//     started (adapter StateUpdateActivity + the streaming_active reconcile, and the
+//     executor worker's STAGE_COMPLETED). The events that race it all say
+//     "processing": the adapter's own executor STAGE_COMPLETED domain event, a final
+//     executor heartbeat tick, and any legacy event whose status was left empty and
+//     defaulted to "processing" above. Letting one land after 'running' turned a
+//     healthy stream back into a batch-looking run with a heartbeat that never
+//     advances again, which /state then reported as stale and offered to stop.
+//     Terminal and other statuses (failed, completed, cancelled, waiting_for_user)
+//     still apply over 'running'.
+func lateEventWouldRegressStatus(existingStatus, existingExecID, incomingStatus, incomingExecID string) bool {
+	ee := strings.TrimSpace(existingExecID)
+	ie := strings.TrimSpace(incomingExecID)
+	if ee == "" || ie == "" || ee != ie {
+		return false
+	}
+	es := strings.ToLower(strings.TrimSpace(existingStatus))
+	is := strings.ToLower(strings.TrimSpace(incomingStatus))
+	switch es {
+	case "completed", "failed", "cancelled":
+		return is != "completed" && is != "failed" && is != "cancelled"
+	case "running":
+		return is == "processing"
+	}
+	return false
+}
+
 // maybePersistStreamingSyncMode updates pipelines.sync_mode/cdc_mode when the workflow indicates a streaming run.
 // Some NL-created pipelines don't persist sync_mode at creation time, which prevents CDC telemetry agents from attaching.
 func (p *EventProjector) maybePersistStreamingSyncMode(raw map[string]interface{}) {
@@ -567,6 +623,77 @@ func (p *EventProjector) maybePersistStreamingSyncMode(raw map[string]interface{
 	`, pipelineID); err != nil {
 		log.Printf("⚠️ [EventProjector] failed to backfill CDC mode fields (ignored) pipeline_id=%s: %v", pipelineID, err)
 	}
+}
+
+// persistConnectionIDsQuery fills a pipeline's missing connection ids.
+//
+// Only NULL columns are filled, so a connection the user picked (the HITL validator
+// writes both ids) is never overwritten, and a replayed event is a no-op. The id must
+// name a connection in the pipeline's own workspace: the event carries ids from Kafka,
+// not from a request the gateway authorized. A connection deleted since the event was
+// emitted matches nothing, so a replay cannot relink it.
+const persistConnectionIDsQuery = `
+	UPDATE pipelines p
+	SET source_connection_id = COALESCE(p.source_connection_id,
+	        (SELECT c.id FROM connections c WHERE c.id = $2::uuid AND c.workspace_id = p.workspace_id)),
+	    destination_connection_id = COALESCE(p.destination_connection_id,
+	        (SELECT c.id FROM connections c WHERE c.id = $3::uuid AND c.workspace_id = p.workspace_id)),
+	    updated_at = NOW()
+	WHERE p.id = $1::uuid
+	  AND ((p.source_connection_id IS NULL AND EXISTS (
+	            SELECT 1 FROM connections c WHERE c.id = $2::uuid AND c.workspace_id = p.workspace_id))
+	    OR (p.destination_connection_id IS NULL AND EXISTS (
+	            SELECT 1 FROM connections c WHERE c.id = $3::uuid AND c.workspace_id = p.workspace_id)))
+`
+
+// maybePersistConnectionIDs records the connection ids the workflow resolved in its
+// connection_validation stage.
+//
+// When the workflow finds a pipeline's connections by connector type, it keeps them in
+// its own state and never writes them to the pipelines row; only the HITL path does.
+// The pipeline list reads the row, so a pipeline that ran end to end still showed
+// "— → —". The STAGE_COMPLETED event for that stage carries both ids.
+func (p *EventProjector) maybePersistConnectionIDs(raw map[string]interface{}) {
+	if p.db == nil || raw == nil {
+		return
+	}
+	if eventType, _ := raw["event_type"].(string); eventType != "STAGE_COMPLETED" {
+		return
+	}
+	if stage, _ := raw["stage"].(string); strings.ToLower(strings.TrimSpace(stage)) != "connection_validation" {
+		return
+	}
+	pipelineID, _ := raw["pipeline_id"].(string)
+	pid, err := uuid.Parse(strings.TrimSpace(pipelineID))
+	if err != nil {
+		return
+	}
+	meta, _ := raw["metadata"].(map[string]interface{})
+	sourceID := connectionIDArg(meta["source_connection_id"])
+	destID := connectionIDArg(meta["destination_connection_id"])
+	if sourceID == nil && destID == nil {
+		return
+	}
+	res, err := p.db.Exec(persistConnectionIDsQuery, pid.String(), sourceID, destID)
+	if err != nil {
+		log.Printf("⚠️ [EventProjector] failed to persist resolved connection ids (ignored) pipeline_id=%s: %v", pipelineID, err)
+		return
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		log.Printf("[EventProjector] recorded resolved connection ids pipeline_id=%s", pipelineID)
+	}
+}
+
+// connectionIDArg binds a connection id from event metadata, or NULL when the value is
+// absent or not a UUID — a malformed id would otherwise fail the whole statement and
+// lose the other side with it.
+func connectionIDArg(v interface{}) interface{} {
+	s, _ := v.(string)
+	id, err := uuid.Parse(strings.TrimSpace(s))
+	if err != nil {
+		return nil
+	}
+	return id.String()
 }
 
 // storeRunEvent appends one event to the replayable run-event store.
@@ -756,20 +883,31 @@ func (p *EventProjector) noteEnvelopeGap(raw map[string]interface{}, field strin
 // upsertTableStats projects TABLE_STATS domain events into pipeline_run_table_stats.
 // Counters are cumulative; we use GREATEST() to handle out-of-order delivery.
 func (p *EventProjector) upsertTableStats(raw map[string]interface{}) error {
+	_, err := p.upsertTableStatsProgress(raw)
+	return err
+}
+
+// upsertTableStatsProgress is upsertTableStats, also reporting whether a sink-sourced CDC
+// event advanced the table's applied counter (for OnPipelineDataLanded). A dropped event
+// returns nil and is counted and logged by skipTableStats.
+func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (appliedProgress, error) {
 	pipelineID, _ := raw["pipeline_id"].(string)
 	executionID, _ := raw["execution_id"].(string)
 	if pipelineID == "" {
-		return nil // skip events with no pipeline_id
+		return appliedProgress{}, p.skipTableStats(tableStatsSkipMissingPipelineID, raw, nil)
 	}
 
 	meta, _ := raw["metadata"].(map[string]interface{})
 	if meta == nil {
-		return nil
+		return appliedProgress{}, p.skipTableStats(tableStatsSkipMissingMetadata, raw, nil)
 	}
 
 	mode, _ := meta["mode"].(string)
+	if mode == "" {
+		return appliedProgress{}, p.skipTableStats(tableStatsSkipMissingMode, raw, meta)
+	}
 	if mode != "batch" && mode != "cdc" {
-		return nil // skip unsupported modes
+		return appliedProgress{}, p.skipTableStats(tableStatsSkipUnsupportedMode, raw, meta)
 	}
 	// For CDC table stats we normalize execution_id to pipeline_id so the DB can enforce
 	// uniqueness and ON CONFLICT can work with a regular unique index.
@@ -800,7 +938,7 @@ func (p *EventProjector) upsertTableStats(raw map[string]interface{}) error {
 
 	tableObj, _ := meta["table"].(map[string]interface{})
 	if tableObj == nil {
-		return nil
+		return appliedProgress{}, p.skipTableStats(tableStatsSkipMissingTable, raw, meta)
 	}
 
 	schemaName, _ := tableObj["schema"].(string)
@@ -810,7 +948,7 @@ func (p *EventProjector) upsertTableStats(raw map[string]interface{}) error {
 		qualifiedName = tableName
 	}
 	if tableName == "" {
-		return nil
+		return appliedProgress{}, p.skipTableStats(tableStatsSkipEmptyTableName, raw, meta)
 	}
 
 	// Where the rows LANDED, which schema_name/qualified_name above do not say: for CDC
@@ -1015,7 +1153,7 @@ func (p *EventProjector) upsertTableStats(raw map[string]interface{}) error {
 	// the run-events guard above). FK stays strict.
 	tx, err := p.db.Begin()
 	if err != nil {
-		return err
+		return appliedProgress{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
 
@@ -1028,6 +1166,34 @@ func (p *EventProjector) upsertTableStats(raw map[string]interface{}) error {
 		 WHERE pipeline_id = $1::uuid AND execution_id = $2::uuid AND qualified_name = $3`,
 		pipelineID, executionID, qualifiedName,
 	).Scan(&oldBytes)
+
+	// OnPipelineDataLanded: read the applied high-water mark BEFORE the GREATEST-upsert,
+	// for the same ordering reason as oldBytes above. Only for the sink's applied
+	// counters, and only when something is listening, so every other event — cdcstats'
+	// captured counters, the batch lane, every projector without the hook — issues
+	// exactly the statements it did before. A failed read means "unknown", never
+	// "increased": it cannot fire the trigger.
+	landedSource, _ := meta["source"].(string)
+	trackLanded := p.OnPipelineDataLanded != nil && mode == "cdc" && appliedTotalEvents.Valid &&
+		strings.ToLower(strings.TrimSpace(landedSource)) == "kafka_mcp_sink"
+	var priorApplied int64
+	priorAppliedKnown := false
+	if trackLanded {
+		err := tx.QueryRow(
+			`SELECT COALESCE(applied_total_events, 0) FROM pipeline_run_table_stats
+			 WHERE pipeline_id = $1::uuid AND execution_id = $2::uuid AND qualified_name = $3`,
+			pipelineID, executionID, qualifiedName,
+		).Scan(&priorApplied)
+		switch {
+		case err == nil:
+			priorAppliedKnown = true
+		case errors.Is(err, sql.ErrNoRows):
+			priorApplied, priorAppliedKnown = 0, true
+		default:
+			log.WithError(err).WithField("pipeline_id", pipelineID).
+				Warn("Event Projector: could not read the prior applied count; not firing after-pipeline models for this TABLE_STATS event")
+		}
+	}
 
 	if _, err := tx.Exec(`
 		INSERT INTO pipeline_run_table_stats (
@@ -1116,7 +1282,7 @@ func (p *EventProjector) upsertTableStats(raw map[string]interface{}) error {
 		startedAt, completedAt, bytesCommitted, dlqRows,
 		destSchema, destQualifiedName, orchestrationExecutionID,
 	); err != nil {
-		return err
+		return appliedProgress{}, err
 	}
 
 	// Append the positive committed-byte delta to the append-only billing ledger and
@@ -1135,9 +1301,17 @@ func (p *EventProjector) upsertTableStats(raw map[string]interface{}) error {
 			)
 			SELECT charge_workspace_bytes(workspace_id, bytes) FROM ledger
 		`, pipelineID, executionID, qualifiedName, mode, bytesCommitted.Int64-oldBytes); err != nil {
-			return err
+			return appliedProgress{}, err
 		}
 	}
 
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return appliedProgress{}, err
+	}
+	progress := appliedProgress{pipelineID: pipelineID}
+	if trackLanded && priorAppliedKnown {
+		progress.increased = appliedTotalEvents.Int64 > priorApplied
+		progress.appliedAt = lastAppliedTs.String
+	}
+	return progress, nil
 }

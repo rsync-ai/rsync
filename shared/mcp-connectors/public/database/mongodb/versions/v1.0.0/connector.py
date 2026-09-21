@@ -30,7 +30,7 @@ import json
 import logging
 import time
 from datetime import datetime, date, timedelta, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 # Resolve the shared base_connector (see Dockerfile: it is copied to
 # /app/shared/mcp-connectors and that dir is on PYTHONPATH). Fall back to the
@@ -41,6 +41,16 @@ try:
 except ImportError:  # pragma: no cover - local dev fallback
     sys.path.insert(0, os.path.dirname(__file__))
     from base_connector import BaseMCPConnector
+
+# Scope filter for server-level connections, shipped into the image via
+# `COPY --from=shared namespace_filter.py` (see Dockerfile). Dev/test resolves
+# it from the public/ root.
+try:
+    import namespace_filter  # noqa: E402
+except ImportError:  # pragma: no cover - dev/test path
+    sys.path.insert(0, os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "..", "..", "..")))
+    import namespace_filter  # noqa: E402
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -134,6 +144,7 @@ FIND_MAX_FILTER_BYTES = 64 * 1024
 FIND_MAX_SORT_KEYS = 5
 FIND_MAX_PROJECTION_KEYS = 100
 FIND_MAX_COLLECTION_BYTES = 120
+FIND_MAX_DATABASE_BYTES = 64  # MongoDB database names are shorter than 64 bytes
 FIND_MAX_CURSOR_CHARS = 4096
 FIND_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 
@@ -178,6 +189,33 @@ def _validate_find_collection(raw: Any) -> str:
     if name.startswith("system."):
         raise FindRequestError("invalid_collection", "system collections cannot be browsed", "collection")
     return name
+
+
+def _find_database(connector: Any, config: Dict[str, Any], requested: Any) -> str:
+    """The database a find reads.
+
+    A connection that names a database reads only it; a request naming another
+    one is refused rather than silently redirected. A server-level connection
+    (no database) needs the request's ``database``, which must pass the
+    connection's scope filter.
+    """
+    configured = connector._database_name(config)
+    wanted = requested.strip() if isinstance(requested, str) else ""
+    if configured:
+        if wanted and wanted != configured:
+            raise FindRequestError("invalid_database", "database is outside this connection's scope", "database")
+        return configured
+    if not wanted:
+        raise FindRequestError(
+            "invalid_database", "This connection names no database: pick a database", "database")
+    if (len(wanted.encode("utf-8")) > FIND_MAX_DATABASE_BYTES
+            or any(ch in wanted for ch in '/\\. "$\x00')):
+        raise FindRequestError("invalid_database", "database name is not valid", "database")
+    try:
+        connector._check_in_scope(config, wanted)
+    except ValueError as e:
+        raise FindRequestError("invalid_database", str(e), "database")
+    return wanted
 
 
 def _walk_find_filter(node: Any, path: str, depth: int) -> None:
@@ -345,6 +383,22 @@ def _find_int(value: Any, default: int, path: str) -> int:
     if isinstance(value, float) and value != number:
         raise FindRequestError(f"invalid_{path}", f"{path} must be an integer", path)
     return number
+
+
+def _export_cursor(last_id: Any) -> Any:
+    """Keyset cursor export() hands back for the last _id of a page.
+
+    A numeric _id (int / Int64 / float) stays a JSON number. str() would turn it
+    into "10000", and {"_id": {"$gt": "10000"}} matches no numeric _id (BSON
+    compares a string above every number), so paging silently stopped after the
+    first page. Anything else (ObjectId, string, ...) keeps the str() form the
+    executor already checkpoints; a 24-hex string resumes as an ObjectId.
+    """
+    if last_id is None:
+        return None
+    if isinstance(last_id, (int, float)) and not isinstance(last_id, bool):
+        return last_id
+    return str(last_id)
 
 
 def _encode_find_cursor(last_id: Any) -> str:
@@ -572,7 +626,51 @@ class MongodbMCPServer(BaseMCPConnector):
             ns = str(params.get("namespace") or params.get("db_or_schema") or "").strip()
         if self._is_real_namespace(ns):
             return ns
-        return self._database_name(config)
+        db = self._database_name(config)
+        if not db:
+            # A server-level connection (no database) has nowhere to write unless
+            # the pipeline names one: pymongo's own error for client[""] does not
+            # say what to change.
+            raise ValueError(
+                "This connection names no database and the pipeline sent no destination "
+                "namespace: set a destination database on the pipeline")
+        return db
+
+    def _check_in_scope(self, config: Dict[str, Any], db: str) -> None:
+        """Raise ValueError unless ``db`` passes the connection's scope filter.
+
+        Only server-level connections (no database named) carry a scope: the
+        filter picks which databases discovery lists, and a read must not reach
+        a database discovery would have hidden. MongoDB's own databases (admin,
+        config, local) are always out of scope.
+        """
+        try:
+            scope = namespace_filter.parse(config)
+        except namespace_filter.NamespaceFilterError as e:
+            raise ValueError(str(e))
+        if not namespace_filter.allowed(db, scope, self._SYSTEM_DATABASES):
+            raise ValueError("That database is outside this connection's scope")
+
+    def _source_target(self, config: Dict[str, Any], name: str) -> Tuple[str, str]:
+        """(database, collection) a SOURCE read of ``name`` targets.
+
+        A connection that names a database reads only that database, and a
+        db-qualified name keeps its last segment (the historical behaviour). A
+        server-level connection reads ``<database>.<collection>``, split at the
+        FIRST dot: a database name cannot contain a dot, a collection name can.
+        Raises ValueError with a message safe to return to the caller.
+        """
+        name = (name or "").strip()
+        configured = self._database_name(config)
+        if configured:
+            return configured, (name.split(".")[-1] if "." in name else name)
+        db, sep, coll = name.partition(".")
+        if not sep or not db.strip() or not coll.strip():
+            raise ValueError(
+                "This connection names no database: pass the collection as <database>.<collection>")
+        db = db.strip()
+        self._check_in_scope(config, db)
+        return db, coll.strip()
 
     def _prepared_with_namespace(self, prepared: Dict, params: Dict) -> Dict:
         """Carry the destination namespace across ``prepare_import_data``.
@@ -645,45 +743,61 @@ class MongodbMCPServer(BaseMCPConnector):
     # Core operations                                                     #
     # ------------------------------------------------------------------ #
     def test_connection(self, params: Dict = None) -> Dict[str, Any]:
-        """Ping the deployment and report whether it is a replica set.
+        """Ping the deployment and report its topology.
 
         Change streams (and therefore CDC) require a replica set or sharded
         cluster; a standalone mongod cannot be a CDC source. We surface that as a
         warning here (non-fatal for a batch connection test) so the failure is
         visible before a CDC pipeline is started.
+
+        Topology comes from the ``hello`` reply (it needs no privileges), using the
+        driver SDAM rules: ``setName`` means a replica-set member, ``msg ==
+        "isdbgrid"`` means a mongos router. A mongos has no ``setName`` but streams
+        fine, so ``is_replica_set`` alone must not be read as "standalone" — the
+        orchestrator blocks a CDC start only when BOTH fields are explicitly false.
+        When neither ``hello`` nor ``isMaster`` answers, both fields are omitted:
+        the topology is unknown, and unknown must not block.
+
+        With ``params["cdc_readiness"]`` set (the orchestrator's pre-migration
+        assessment of a CDC pipeline) the reply also carries
+        ``change_stream_access`` and, when the oplog is readable,
+        ``oplog_window_hours`` — see :meth:`_cdc_readiness`. A plain connection
+        test never opens a change stream.
         """
         config = self._get_config(params)
         client = None
         try:
             client = self._get_client(config)
             client.admin.command("ping")
-            is_replica_set = False
-            set_name = None
+            reply = None
             try:
-                hello = client.admin.command("hello")
-                set_name = hello.get("setName")
-                is_replica_set = bool(set_name)
+                reply = client.admin.command("hello")
             except Exception:
                 # Older servers: fall back to isMaster.
                 try:
-                    im = client.admin.command("isMaster")
-                    set_name = im.get("setName")
-                    is_replica_set = bool(set_name)
+                    reply = client.admin.command("isMaster")
                 except Exception:
                     pass
             result = {
                 "success": True,
                 "message": "Connection successful",
-                "is_replica_set": is_replica_set,
             }
-            if set_name:
-                result["replica_set"] = set_name
-            if not is_replica_set:
-                result["warning"] = (
-                    "Connected, but this deployment is not a replica set. CDC "
-                    "(change streams) requires a replica set or sharded cluster; "
-                    "run rs.initiate() before starting a CDC pipeline."
-                )
+            if isinstance(reply, dict):
+                set_name = reply.get("setName")
+                is_replica_set = bool(set_name)
+                is_sharded_cluster = reply.get("msg") == "isdbgrid"
+                result["is_replica_set"] = is_replica_set
+                result["is_sharded_cluster"] = is_sharded_cluster
+                if set_name:
+                    result["replica_set"] = set_name
+                if not is_replica_set and not is_sharded_cluster:
+                    result["warning"] = (
+                        "Connected, but this deployment is not a replica set. CDC "
+                        "(change streams) requires a replica set or sharded cluster; "
+                        "run rs.initiate() before starting a CDC pipeline."
+                    )
+            if (params or {}).get("cdc_readiness"):
+                result.update(self._cdc_readiness(client, (params or {}).get("collections")))
             return result
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -693,6 +807,101 @@ class MongodbMCPServer(BaseMCPConnector):
                     client.close()
                 except Exception:
                     pass
+
+    # Characters that cannot appear in a MongoDB database name.
+    _FORBIDDEN_DB_CHARS = frozenset('/\\. "$*<>:|?')
+
+    @classmethod
+    def _change_stream_database(cls, collections: Any) -> Optional[str]:
+        """The one database a CDC pipeline's change stream is scoped to, or None
+        for a deployment-wide stream.
+
+        Mirrors the llm-service ``_mongo_capture_scope`` rule that sets
+        Debezium's ``capture.scope``: the stream is scoped to a database only
+        when every selected collection is qualified ``db.collection`` with the
+        same database. Any bare name, or two databases, means deployment scope —
+        and a deployment-wide stream needs more privileges than a database one,
+        so probing the wrong scope would report the wrong answer.
+        """
+        if isinstance(collections, str):
+            entries = collections.split(",")
+        elif isinstance(collections, (list, tuple)):
+            entries = [str(e) for e in collections]
+        else:
+            return None
+        dbs: List[str] = []
+        for entry in (e.strip() for e in entries):
+            if not entry:
+                continue
+            db, sep, coll = entry.partition(".")
+            if not sep or not db or not coll or set(db) & cls._FORBIDDEN_DB_CHARS:
+                return None
+            if db not in dbs:
+                dbs.append(db)
+        return dbs[0] if len(dbs) == 1 else None
+
+    def _cdc_readiness(self, client, collections: Any) -> Dict[str, Any]:
+        """Read-only CDC checks for the pre-migration assessment.
+
+        ``change_stream_access`` opens (and at once closes) a change stream at
+        the scope Debezium will use, so a missing privilege shows up before the
+        pipeline starts instead of as a failing connector. ``status`` is one of
+        ok · unauthorized (code 13) · unsupported (40573, not a replica set) ·
+        error (anything else, e.g. a network drop — never read as a verdict).
+
+        ``oplog_window_hours`` is the time span of the oplog: how long CDC can
+        be paused before its resume point is overwritten and it must re-snapshot.
+        It is omitted when ``local.oplog.rs`` is not readable (a mongos, or a
+        managed service that hides it) — unknown is not reported as short.
+        """
+        out: Dict[str, Any] = {}
+        database = self._change_stream_database(collections)
+        scope = "database" if database else "deployment"
+        access: Dict[str, Any] = {"scope": scope}
+        if database:
+            access["database"] = database
+        try:
+            target = client[database] if database else client
+            stream = target.watch(max_await_time_ms=1000)
+            try:
+                access["status"] = "ok"
+            finally:
+                stream.close()
+        except Exception as e:  # pymongo OperationFailure carries .code
+            code = getattr(e, "code", None)
+            text = str(e)
+            lowered = text.lower()
+            if code == 13 or "not authorized" in lowered or "not allowed to do action" in lowered:
+                access["status"] = "unauthorized"
+            elif code == 40573 or "only supported on replica sets" in lowered:
+                access["status"] = "unsupported"
+            else:
+                access["status"] = "error"
+            if code is not None:
+                access["error_code"] = code
+            access["message"] = text[:300]
+        out["change_stream_access"] = access
+        hours = self._oplog_window_hours(client)
+        if hours is not None:
+            out["oplog_window_hours"] = hours
+        return out
+
+    @staticmethod
+    def _oplog_window_hours(client) -> Optional[float]:
+        """Hours between the oldest and newest oplog entries, or None."""
+        try:
+            oplog = client["local"]["oplog.rs"]
+            first = next(iter(oplog.find({}, {"ts": 1}).sort("$natural", 1).limit(1)), None)
+            last = next(iter(oplog.find({}, {"ts": 1}).sort("$natural", -1).limit(1)), None)
+            if not first or not last:
+                return None
+            start = getattr(first.get("ts"), "time", None)
+            end = getattr(last.get("ts"), "time", None)
+            if start is None or end is None:
+                return None
+            return round(max(0, end - start) / 3600.0, 1)
+        except Exception:
+            return None
 
     def validate_config(self, params: Dict = None) -> Dict[str, Any]:
         """Validate a config shape without connecting."""
@@ -705,17 +914,33 @@ class MongodbMCPServer(BaseMCPConnector):
         )
         if not has_uri and not config.get("host"):
             errors.append("Missing required field: host (or connection_string)")
+        # No database is a server-level connection: every database the login can
+        # see, narrowed by the scope filter. A named database ignores the filter.
         if not self._database_name(config):
-            errors.append("Missing required field: database")
+            try:
+                namespace_filter.parse(config)
+            except namespace_filter.NamespaceFilterError as e:
+                errors.append(str(e))
         return {"valid": len(errors) == 0, "errors": errors, "warnings": []}
 
     def discover_schema(self, params: Dict = None) -> Dict[str, Any]:
-        """List collections in the configured database as selectable 'tables'.
+        """List collections as selectable 'tables'.
 
-        Each collection is a table whose 'schema' is the MongoDB database name and
+        A connection that names a database lists that database. A server-level
+        connection (no database) lists every database the login can see, minus
+        MongoDB's own (admin, config, local), narrowed by the scope filter
+        (namespace_filter_mode / namespace_filter_patterns). An invalid filter
+        fails discovery; a filter that matches nothing is a warning.
+
+        Each collection is a table whose 'schema' is its MongoDB database name and
         whose primary key is always _id. Columns are inferred from a small sample
         of documents (union of top-level field names). Row counts are exact
         (countDocuments) when requested.
+
+        Sampling and counting cost a round trip or two per collection, so they
+        share a time budget (params.enrich_budget_seconds, default 15s) that keeps
+        discovery inside the orchestrator's 30s call timeout. Collections past
+        the budget are still listed, with only _id and discovery_status "partial".
         """
         params = params or {}
         config = self._get_config(params)
@@ -741,36 +966,78 @@ class MongodbMCPServer(BaseMCPConnector):
         include_row_counts = params.get("include_row_counts", True)
         max_tables = int(params.get("max_tables", 100))
         sample_size = int(params.get("sample_size", 20))
+        try:
+            budget_s = float(params.get("enrich_budget_seconds", 15))
+        except (TypeError, ValueError):
+            budget_s = 15.0
+
+        scope = None
+        if not db_name:
+            try:
+                scope = namespace_filter.parse(config)
+            except namespace_filter.NamespaceFilterError as e:
+                result["overall_status"] = "failed"
+                result["warnings_messages"].append(str(e))
+                return result
 
         client = None
         try:
             client = self._get_client(config)
-            if not db_name:
-                result["overall_status"] = "failed"
-                result["warnings_messages"].append("Missing 'database' in config")
-                return result
             try:
                 result["database_version"] = client.server_info().get("version")
             except Exception:
                 pass
 
-            db = client[db_name]
-            names = [n for n in db.list_collection_names() if not n.startswith("system.")]
-            names.sort()
-            result["total_tables_available"] = len(names)
+            # (database, collection) pairs, sorted by database then collection.
+            pairs: List[Tuple[str, str]] = []
+            if db_name:
+                names = [n for n in client[db_name].list_collection_names() if not n.startswith("system.")]
+                pairs = [(db_name, n) for n in sorted(names)]
+            else:
+                applied = namespace_filter.apply(
+                    sorted(str(n) for n in client.list_database_names() if n),
+                    scope, self._SYSTEM_DATABASES)
+                if applied.warning:
+                    result["warnings_messages"].append(applied.warning)
+                for dbn in applied.kept:
+                    try:
+                        names = client[dbn].list_collection_names()
+                    except Exception as e:
+                        result["warnings_messages"].append(f"{dbn}: listing collections failed: {e}")
+                        continue
+                    pairs.extend((dbn, n) for n in sorted(names) if not n.startswith("system."))
+            result["total_tables_available"] = len(pairs)
 
-            for coll_name in names[:max_tables]:
-                coll = db[coll_name]
+            deadline = time.monotonic() + budget_s
+            unenriched = 0
+            for table_db, coll_name in pairs[:max_tables]:
+                # Warnings name the collection alone when the connection names its
+                # database (the historical text), qualified when it spans several.
+                label = coll_name if db_name else f"{table_db}.{coll_name}"
+                left_ms = int((deadline - time.monotonic()) * 1000)
+                if left_ms <= 0:
+                    unenriched += 1
+                    result["tables"].append({
+                        "name": coll_name,
+                        "schema": table_db,
+                        "discovery_status": "partial",
+                        "columns": ([{"name": "_id", "type": "string", "nullable": False}]
+                                    if include_columns else []),
+                        "primary_keys": ["_id"],
+                        "primary_key": ["_id"],
+                    })
+                    continue
+                coll = client[table_db][coll_name]
                 columns: List[Dict[str, Any]] = []
                 if include_columns:
                     seen: Dict[str, str] = {}
                     try:
-                        for doc in coll.find(limit=sample_size):
+                        for doc in coll.find(limit=sample_size, max_time_ms=left_ms):
                             for key, val in doc.items():
                                 if key not in seen:
                                     seen[key] = _infer_type(val)
                     except Exception as e:
-                        result["warnings_messages"].append(f"{coll_name}: sample failed: {e}")
+                        result["warnings_messages"].append(f"{label}: sample failed: {e}")
                     # _id first, then the rest in first-seen order.
                     if "_id" not in seen:
                         seen = {"_id": "string", **seen}
@@ -779,21 +1046,31 @@ class MongodbMCPServer(BaseMCPConnector):
 
                 table_obj: Dict[str, Any] = {
                     "name": coll_name,
-                    "schema": db_name,
+                    "schema": table_db,
                     "discovery_status": "complete",
                     "columns": columns,
                     "primary_keys": ["_id"],
                     "primary_key": ["_id"],
                 }
                 if include_row_counts:
+                    # An exact count scans the collection; bound it by the budget
+                    # and fall back to the metadata estimate.
+                    left_ms = max(1, int((deadline - time.monotonic()) * 1000))
                     try:
-                        table_obj["row_count"] = coll.count_documents({})
+                        table_obj["row_count"] = coll.count_documents({}, maxTimeMS=left_ms)
                         table_obj["is_exact_count"] = True
                     except Exception:
-                        table_obj["row_count"] = None
+                        try:
+                            table_obj["row_count"] = coll.estimated_document_count()
+                        except Exception:
+                            table_obj["row_count"] = None
                         table_obj["is_exact_count"] = False
                 result["tables"].append(table_obj)
 
+            if unenriched:
+                result["warnings_messages"].append(
+                    f"{unenriched} of {len(result['tables'])} collections listed without "
+                    f"sampled fields or counts (discovery budget {budget_s:g}s)")
             result["total_tables_discovered"] = len(result["tables"])
             result["discovery_duration_ms"] = int((datetime.utcnow() - start).total_seconds() * 1000)
             return result
@@ -807,6 +1084,31 @@ class MongodbMCPServer(BaseMCPConnector):
                     client.close()
                 except Exception:
                     pass
+
+    # Databases MongoDB keeps for itself; never user data.
+    _SYSTEM_DATABASES = frozenset({"admin", "config", "local"})
+
+    def list_namespaces(self, params: Dict = None) -> Dict[str, Any]:
+        """List the databases this login can see, without MongoDB's own (admin,
+        config, local): the level metadata.json's namespace_model.table_namespace
+        names. A login without the listDatabases privilege gets the databases it
+        has privileges on (MongoDB 4.0.5+). "current" is the database the
+        connection names, "" when it names none.
+        """
+        config = self._get_config(params or {})
+        client = None
+        try:
+            client = self._get_client(config)
+            names = [n for n in client.list_database_names() if n not in self._SYSTEM_DATABASES]
+            return {
+                "success": True,
+                "namespaces": sorted({str(n) for n in names if n}),
+                "current": self._database_name(config),
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": f"Listing namespaces failed: {e}"}
+        finally:
+            self._close_client(client)
 
     def get_primary_key(self, params: Dict = None) -> Dict[str, Any]:
         """MongoDB's primary key is always _id."""
@@ -869,7 +1171,9 @@ class MongodbMCPServer(BaseMCPConnector):
         """Export documents from a collection using stable _id keyset paging.
 
         The collection may arrive as `collection`, `table`, or a db-qualified
-        `db.collection`; the last segment is the collection. Documents are
+        `db.collection`. With a database named on the connection the last segment
+        is the collection; on a server-level connection the name must be
+        `<database>.<collection>` (see _source_target). Documents are
         returned JSON-safe (ObjectId/date/Decimal128 coerced). Paging is by
         ascending _id (`cursor` = last _id seen) which is stable under concurrent
         writes, unlike skip/limit.
@@ -889,9 +1193,12 @@ class MongodbMCPServer(BaseMCPConnector):
             or params.get("table")
             or ""
         )
-        collection = str(raw_coll).strip()
-        if "." in collection:
-            collection = collection.split(".")[-1]  # strip db-qualifier
+        if not str(raw_coll).strip():
+            return {"success": False, "error": "Missing 'collection'/'table' parameter"}
+        try:
+            db_name, collection = self._source_target(config, str(raw_coll))
+        except ValueError as e:
+            return {"success": False, "error": str(e)}
         if not collection:
             return {"success": False, "error": "Missing 'collection'/'table' parameter"}
 
@@ -902,17 +1209,17 @@ class MongodbMCPServer(BaseMCPConnector):
         limit = max(1, min(limit, self.max_batch_size))
         cursor_val = prepared.get("cursor", params.get("cursor"))
 
-        db_name = self._database_name(config)
         client = None
         try:
             client = self._get_client(config)
-            db = client[db_name]
-            coll = db[collection]
+            coll = client[db_name][collection]
 
             query: Dict[str, Any] = {}
             if cursor_val not in (None, ""):
                 # Resume after the last _id. Prefer ObjectId comparison when the
                 # cursor is a 24-hex string; otherwise compare as the raw value.
+                # A numeric _id arrives as a JSON number (see _export_cursor), so
+                # it compares against int/long/double _ids, not as a string.
                 oid = None
                 try:
                     from bson import ObjectId
@@ -927,7 +1234,7 @@ class MongodbMCPServer(BaseMCPConnector):
             next_cursor = None
             if docs:
                 last_id = docs[-1].get("_id")
-                next_cursor = str(last_id) if last_id is not None else None
+                next_cursor = _export_cursor(last_id)
 
             rows = [_json_safe(d) for d in docs]
 
@@ -992,9 +1299,7 @@ class MongodbMCPServer(BaseMCPConnector):
                 except ValueError:
                     raise FindRequestError("invalid_config", "config is not valid JSON", "config")
             config = self._get_config({"config": raw_config})
-            db_name = self._database_name(config)
-            if not db_name:
-                raise FindRequestError("invalid_config", "Missing 'database' in config", "config.database")
+            db_name = _find_database(self, config, params.get("database"))
             read_preference = _find_read_preference(config)
 
             collection = _validate_find_collection(params.get("collection") or params.get("table"))

@@ -14,12 +14,15 @@ MCP JSON-RPC:
 """
 
 import hashlib
+import ipaddress
 import json
 import logging
 import os
 import re
 import sys
+import threading
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
@@ -102,6 +105,38 @@ def _qualify_topic(name: str) -> str:
     return prefix + name
 
 
+# Retry bounds for a Debezium SOURCE task. See the base config in
+# _build_config for why an unbounded retry loop is the bug these close.
+#
+# Both properties below are Debezium's own (group "Connector" in the plugin's
+# ConfigDef) and govern the SAME loop. Do not reach for the similarly-named
+# errors.retry.* family instead: those belong to Kafka Connect's
+# RetryWithToleranceOperator, a different mechanism that is switched off by default
+# (errors.retry.timeout = 0, "no retries will be attempted"), so setting them would
+# look like a retry bound while changing nothing.
+_DEFAULT_MAX_RETRIES = "30"
+_DEFAULT_RETRIABLE_RESTART_WAIT_MS = "10000"
+
+# How often a MongoDB source emits a heartbeat, and the namespace its heartbeat topic
+# lives in. See the mongodb branch of _build_config.
+_DEFAULT_HEARTBEAT_INTERVAL_MS = "300000"  # 5 minutes
+_DEFAULT_HEARTBEAT_TOPICS_PREFIX = "heartbeat"
+
+
+def _env_or(name: str, default: str) -> str:
+    """An operator override from the environment, else the shipped default."""
+    raw = (os.getenv(name) or "").strip()
+    return raw or default
+
+
+def _default_max_retries() -> str:
+    return _env_or("CDC_CONNECTOR_MAX_RETRIES", _DEFAULT_MAX_RETRIES)
+
+
+def _default_retriable_restart_wait_ms() -> str:
+    return _env_or("CDC_CONNECTOR_RETRY_WAIT_MS", _DEFAULT_RETRIABLE_RESTART_WAIT_MS)
+
+
 def _parse_tables(args: Dict[str, Any]) -> List[str]:
     # Accept "tables" (list) or "table" (string)
     tables: List[str] = []
@@ -117,6 +152,50 @@ def _parse_tables(args: Dict[str, Any]) -> List[str]:
         if isinstance(t, str) and t.strip():
             tables = [t.strip()]
     return tables
+
+
+# Characters MongoDB forbids in a database name. An include entry whose database
+# part contains one is a regex or a malformed name, not a database to scope to.
+_MONGO_DB_NAME_FORBIDDEN = set('/\\. "$*<>:|?')
+
+
+def mongo_capture_databases(include_list: str) -> List[str]:
+    """The distinct databases a MongoDB collection.include.list captures from.
+
+    Entries are db.collection; a database name cannot contain a dot, so everything
+    before the first dot is the database (a collection name may contain dots).
+    Returns [] when any entry is unqualified or its database part is not a plain
+    database name, so the caller never scopes a change stream to a guess.
+    """
+    dbs: List[str] = []
+    for entry in (e.strip() for e in (include_list or "").split(",")):
+        if not entry:
+            continue
+        db, sep, coll = entry.partition(".")
+        if not sep or not db or not coll or set(db) & _MONGO_DB_NAME_FORBIDDEN:
+            return []
+        if db not in dbs:
+            dbs.append(db)
+    return dbs
+
+
+def mysql_capture_databases(include_list: str) -> List[str]:
+    """The distinct databases a MySQL table.include.list captures from, in order.
+
+    Entries are db.table and a MySQL database name cannot contain a dot, so the
+    database is everything before the first dot. Returns [] when any entry is
+    unqualified, so the caller falls back to the connection's database.
+    """
+    dbs: List[str] = []
+    for entry in (e.strip() for e in (include_list or "").split(",")):
+        if not entry:
+            continue
+        db, sep, table = entry.partition(".")
+        if not sep or not db or not table:
+            return []
+        if db not in dbs:
+            dbs.append(db)
+    return dbs
 
 
 def _split_qualified(name: str) -> Tuple[Optional[str], Optional[str], str]:
@@ -315,6 +394,142 @@ def cleanup_secret_file(connector_name: str) -> None:
         _LOG.warning("could not remove secret file for %s: %s", connector_name, e)
 
 
+def _orphan_secret_grace_seconds() -> float:
+    """How long a secret file must have gone unclaimed before the reaper removes it.
+
+    A file is written moments BEFORE the connector is POSTed to Kafka Connect, so a
+    brand-new file legitimately has no connector yet. The grace period is what keeps
+    the reaper from deleting the credentials of a connector that is still being
+    created (including by a concurrent provisioning call)."""
+    raw = os.getenv("DEBEZIUM_SECRETS_ORPHAN_GRACE_SECONDS", "").strip()
+    try:
+        v = float(raw)
+        if v >= 0:
+            return v
+    except ValueError:
+        pass
+    return 900.0  # 15 minutes
+
+
+def reap_orphan_secret_files(live_connector_names: List[str]) -> int:
+    """Remove externalized secret files whose connector no longer exists.
+
+    cleanup_secret_file only fires on debezium_stop_sync, and the real delete paths
+    never call it: the orchestrator deletes connectors straight over the Kafka
+    Connect REST API (handlers/cdc.go deleteDebeziumConnector, and the CDC
+    reconciler's orphan sweep), as does anyone with curl. So every pipeline deleted
+    the normal way left a .properties file holding a plaintext database password or
+    a MongoDB connection string on the shared volume, readable by the kafka-connect
+    worker, forever. Reaping by absence covers ALL of those routes instead of
+    patching one caller.
+
+    Two guards, both required, because deleting a LIVE connector's secret file makes
+    its next task restart fail to resolve ${file:...}:
+      1. The caller must pass a list that came back from a SUCCESSFUL GET /connectors.
+         A wedged or still-starting Connect answers with an error or a connection
+         refusal, not an empty 200, so a successful empty list really does mean "no
+         connectors" — which is exactly the state after the last pipeline is deleted.
+      2. The file must be older than the grace period, so a file written seconds ago
+         for a connector not yet POSTed is never touched.
+
+    Returns the number of files removed. Best-effort throughout: never raises.
+    """
+    secrets_dir = _secrets_dir()
+    if not secrets_dir or not os.path.isdir(secrets_dir):
+        return 0
+
+    keep = {_secret_file_path(secrets_dir, n) for n in live_connector_names if str(n).strip()}
+    grace = _orphan_secret_grace_seconds()
+    now = time.time()
+    removed = 0
+    try:
+        entries = os.listdir(secrets_dir)
+    except Exception as e:  # noqa: BLE001
+        _LOG.warning("orphan secret reaper: could not list %s: %s", secrets_dir, e)
+        return 0
+
+    for entry in entries:
+        # .properties.tmp is _write_secret_properties' atomic-replace staging file; a
+        # leftover one is debris from a crash mid-write and is reaped on the same terms.
+        if not (entry.endswith(".properties") or entry.endswith(".properties.tmp")):
+            continue
+        path = os.path.join(secrets_dir, entry)
+        if path in keep:
+            continue
+        try:
+            if now - os.path.getmtime(path) < grace:
+                continue
+            os.remove(path)
+            removed += 1
+        except FileNotFoundError:
+            continue  # raced with another reaper / stop_sync — already the desired state
+        except Exception as e:  # noqa: BLE001 — never carries a config value
+            _LOG.warning("orphan secret reaper: could not remove %s: %s", entry, e)
+
+    if removed:
+        _LOG.info("orphan secret reaper: removed %d externalized secret file(s)", removed)
+    return removed
+
+
+def sweep_orphan_secret_files(server: "DebeziumConnector") -> int:
+    """List the live connectors, then reap secret files for the ones that are gone.
+
+    The list MUST come back successfully: reap_orphan_secret_files treats an empty
+    list as "no connectors exist", which is only true when Connect actually answered.
+    Any failure here returns 0 and leaves every file in place — a leaked secret file
+    is bad, but deleting a live connector's credentials is worse."""
+    if not _secrets_dir():
+        return 0
+    try:
+        url = server._connect_url_from_args({})
+        with server._client() as client:
+            r = client.get(f"{url}/connectors")
+            r.raise_for_status()
+            names = r.json()
+        if not isinstance(names, list):
+            return 0
+    except Exception as e:  # noqa: BLE001
+        _LOG.debug("orphan secret reaper: connector list unavailable (%s); skipping sweep", e)
+        return 0
+    return reap_orphan_secret_files([str(n) for n in names])
+
+
+def _orphan_secret_sweep_interval() -> float:
+    """Sweep period for the background reaper; 0 disables it."""
+    raw = os.getenv("DEBEZIUM_SECRETS_SWEEP_SECONDS", "").strip()
+    try:
+        v = float(raw)
+        if v >= 0:
+            return v
+    except ValueError:
+        pass
+    return 600.0  # 10 minutes
+
+
+def start_orphan_secret_reaper(server: "DebeziumConnector") -> None:
+    """Run sweep_orphan_secret_files on a daemon thread.
+
+    It has to be periodic rather than request-triggered: the connectors are deleted
+    over Kafka Connect's REST API without this process being involved at all, and
+    after the LAST pipeline is deleted nothing calls any tool here again — so a
+    hook on start_sync/list_connectors would never fire in exactly the case where
+    a plaintext credential file is left sitting on the shared volume."""
+    interval = _orphan_secret_sweep_interval()
+    if not _secrets_dir() or interval <= 0:
+        return
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval)
+            try:
+                sweep_orphan_secret_files(server)
+            except Exception as e:  # noqa: BLE001 — a reaper must never kill the server
+                _LOG.warning("orphan secret reaper: sweep failed: %s", e)
+
+    threading.Thread(target=_loop, name="debezium-secret-reaper", daemon=True).start()
+    _LOG.info("orphan secret reaper: sweeping every %.0fs", interval)
+
+
 _JAAS_MODULES = {
     "PLAIN": "org.apache.kafka.common.security.plain.PlainLoginModule",
     "SCRAM-SHA-256": "org.apache.kafka.common.security.scram.ScramLoginModule",
@@ -336,6 +551,13 @@ _TOKEN_MECHANISMS = {"OAUTHBEARER"}
 OAUTHBEARER_LOGIN_CALLBACK_HANDLER = (
     "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginCallbackHandler"
 )
+
+# The combined mTLS keystore the kafka-connect image's entrypoint builds from
+# KAFKA_SSL_CERT_LOCATION + KAFKA_SSL_KEY_LOCATION (RSYNC_CLIENT_PEM in
+# shared/internal/infra/kafka-connect/connect-entrypoint.sh). A path in the
+# Connect container, where the schema-history client runs. Same constant as
+# llm-service's CONNECT_IMAGE_CLIENT_PEM; the parity test pins all three.
+CONNECT_IMAGE_CLIENT_PEM = "/kafka/rsync-tls/client.pem"
 
 
 def _parse_sasl_extensions(raw: Optional[str]) -> Dict[str, str]:
@@ -372,13 +594,63 @@ def _parse_sasl_extensions(raw: Optional[str]) -> Dict[str, str]:
     return out
 
 
+def _is_loopback_host(host: str) -> bool:
+    """True for a host that cannot leave this machine.
+
+    Mirrors ``_is_loopback_host`` in llm-service/src/utils/kafka_security.py:
+    RFC 6761 reserves ``localhost`` and ``*.localhost`` for loopback, and a
+    literal address is loopback when the IP says so (127.0.0.0/8, ::1) rather
+    than when it string-matches "127.0.0.1".
+    """
+    host = host.strip().rstrip(".").lower()
+    if host == "localhost" or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _token_endpoint_is_insecure(raw: str) -> bool:
+    """True when fetching a token from ``raw`` would leak the client secret."""
+    parts = urllib.parse.urlsplit(raw.strip())
+    if parts.scheme.lower() == "https" or not parts.hostname:
+        return False
+    return not _is_loopback_host(parts.hostname)
+
+
 def _oauth_settings() -> Tuple[str, str, str, str, Dict[str, str]]:
-    """Resolve OIDC client-credentials settings for the history client."""
+    """Resolve OIDC client-credentials settings for the history client.
+
+    Refuses an http endpoint off loopback for the reason the Go and Python
+    halves do: the client-credentials grant POSTs the client secret on every
+    token fetch, so an unencrypted hop hands a non-expiring credential to
+    anyone on the path. The opt-out exists for a throwaway test IdP.
+    """
     endpoint = _env("KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT")
     if not endpoint:
         raise ValueError(
             "KAFKA_SASL_MECHANISM=OAUTHBEARER requires "
             "KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT"
+        )
+    scheme = urllib.parse.urlsplit(endpoint).scheme.lower()
+    if scheme not in ("https", "http"):
+        raise ValueError(
+            f"KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT={endpoint!r} has scheme "
+            f"{scheme!r}; the client-credentials grant is an HTTP POST "
+            "(want https://issuer/oauth2/token)"
+        )
+    allow_insecure = _env(
+        "KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT"
+    ).lower() in ("1", "true", "yes", "on")
+    if not allow_insecure and _token_endpoint_is_insecure(endpoint):
+        raise ValueError(
+            f"KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT={endpoint!r} is http and "
+            "its host is not loopback, so "
+            "KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET would be sent in the clear "
+            "on every token fetch; use https, a loopback address, or set "
+            "KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT=true for a "
+            "disposable test rig"
         )
     client_id = _env("KAFKA_SASL_OAUTHBEARER_CLIENT_ID") or _env("KAFKA_SASL_USERNAME")
     client_secret = os.getenv("KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET") or os.getenv(
@@ -487,6 +759,16 @@ def _schema_history_security() -> Dict[str, str]:
 
     ca = _env("KAFKA_SSL_CA_LOCATION")
     keystore = _env("KAFKA_SSL_KEYSTORE_LOCATION")
+    if protocol.endswith("SSL"):
+        cert = _env("KAFKA_SSL_CERT_LOCATION")
+        key = _env("KAFKA_SSL_KEY_LOCATION")
+        if bool(cert) != bool(key):
+            raise ValueError(
+                "KAFKA_SSL_CERT_LOCATION and KAFKA_SSL_KEY_LOCATION must be set "
+                "together (mTLS needs both halves of the keypair)"
+            )
+        if cert and not keystore:
+            keystore = CONNECT_IMAGE_CLIENT_PEM
     skip_verify = _env("KAFKA_SSL_SKIP_VERIFY").lower() in ("1", "true", "yes", "on")
     for role in ("producer", "consumer"):
         prefix = f"schema.history.internal.{role}."
@@ -510,7 +792,9 @@ def _schema_history_security() -> Dict[str, str]:
                 props[prefix + "ssl.truststore.location"] = ca
             # mTLS. A JVM PEM keystore is ONE file holding the chain and the key,
             # so KAFKA_SSL_CERT_LOCATION/KAFKA_SSL_KEY_LOCATION -- the two paths
-            # the Go and Python clients read -- cannot be used here.
+            # the Go and Python clients read -- cannot be used here directly.
+            # An explicit KAFKA_SSL_KEYSTORE_LOCATION wins; with only the pair,
+            # `keystore` above is the file the Connect image built from it.
             if keystore:
                 props[prefix + "ssl.keystore.type"] = "PEM"
                 props[prefix + "ssl.keystore.location"] = keystore
@@ -715,6 +999,34 @@ class DebeziumConnector:
             # schema history (safe default for relational connectors)
             "schema.history.internal.kafka.bootstrap.servers": kafka_bootstrap,
             "schema.history.internal.kafka.topic": schema_history_topic,
+            # Bound the retry loop so a PERMANENT error becomes visible.
+            #
+            # Debezium's default for errors.max.retries is -1: retry a retriable error
+            # forever. A permanently-broken source then keeps a task in RUNNING while it
+            # fails on a loop, Connect's /status stays fully green (it reports task state,
+            # and a retrying task is not FAILED), and nothing in rsync ever sees the
+            # error: the Sentinel harvests a task trace, the diagnoser classifies it, and
+            # the notifier raises it — but all three hang off a task reaching FAILED.
+            # A MongoDB pipeline whose resume token aged out of the oplog therefore
+            # reported "healthy" for three days while moving zero rows
+            # (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL).
+            #
+            # A bound turns that into a FAILED task, which is what makes the diagnosis
+            # rsync already knows how to produce (diagnose.go -> ActionReSnapshot ->
+            # MONGODB_RESUME_TOKEN_INVALID) reachable at all.
+            #
+            # The default pair is deliberately generous. retriable.restart.connector.wait.ms
+            # is the delay Debezium waits before restarting after a retriable exception
+            # (its own default is already 10s; it is pinned here so the retry budget is
+            # legible from the config and does not move if that default changes), and
+            # errors.max.retries caps how many of those restarts happen. 30 x 10s is on
+            # the order of five minutes of retrying — enough to ride out a source restart
+            # or a network blip, short enough that a permanent error surfaces in minutes
+            # instead of never.
+            #
+            # Set CDC_CONNECTOR_MAX_RETRIES=-1 to restore the old infinite-retry behavior.
+            "errors.max.retries": _default_max_retries(),
+            "retriable.restart.connector.wait.ms": _default_retriable_restart_wait_ms(),
         }
         # Applied before the caller's overrides so an explicit override still wins.
         cfg.update(_schema_history_security())
@@ -763,7 +1075,11 @@ class DebeziumConnector:
                     "database.server.id": self._stable_server_id(connector_name),
                     "database.allowPublicKeyRetrieval": "true",
                     "database.ssl.mode": mysql_ssl_mode,
-                    "database.include.list": effective_mysql_db,
+                    # Every database the tables come from: a server-level
+                    # connection (no database named) captures from several, and
+                    # naming only the first would drop the others' changes.
+                    "database.include.list": ",".join(
+                        mysql_capture_databases(mysql_include_list)) or effective_mysql_db,
                     "table.include.list": mysql_include_list,
                 }
             )
@@ -871,8 +1187,84 @@ class DebeziumConnector:
                     "collection.include.list": mongo_include,
                 }
             )
-            if mongo_db:
-                cfg["database.include.list"] = mongo_db
+
+            # --- Heartbeats: keep the stored resume token younger than the oplog ---
+            #
+            # Debezium only commits a FRESH resume token when it emits an event from a
+            # captured collection. On a source with no writes, an up-and-healthy
+            # connector therefore keeps committing the SAME token, which ages while the
+            # oplog rolls forward. When the connector next reconnects, MongoDB rejects
+            # the token with ChangeStreamHistoryLost (server error 286,
+            # NonResumableChangeStreamError) and the stream position is gone for good.
+            #
+            # The trigger is IDLENESS, not downtime: a pipeline that is never stopped
+            # still dies if the source is quiet for longer than the oplog window. That is
+            # why a bigger oplog only widens the window and does not close the hole —
+            # heartbeats do, by committing a fresh token on a timer whether or not the
+            # source is writing. They also give the freshness watchdog
+            # (cdc_source_freshness.go) a liveness beacon, so "idle but alive" stops
+            # looking like "dead".
+            #
+            # MongoDB-only on purpose. A PostgreSQL replication slot pins WAL on the
+            # server, so an idle Postgres source cannot lose its position the way a
+            # capped oplog does. MySQL's time-based binlog expiry is the same class of
+            # risk and is tracked separately in BACKLOG.md rather than changed blind here.
+            #
+            # The topic is <prefix>.<topic.prefix> — prefix FIRST, the opposite of what
+            # the key name suggests — and the prefix is product-namespaced so the topic
+            # lands inside the `rsync.*` grant that a BYO-Kafka cluster gives us. An
+            # unqualified `__debezium-heartbeat.*` topic falls outside that grant and is
+            # exactly the KI-KAFKA-DATAPLANE-AUTOCREATE-ONLY failure mode; with
+            # errors.tolerance=none the refused write fails the task. The orchestrator
+            # pre-creates it (executor.go heartbeatTopicFor) for the same reason it
+            # pre-creates the schema-history topic: nothing else would, and relying on
+            # broker auto-create is a setting this platform does not own.
+            #
+            # TWO KEYS, AND ONLY ONE OF THEM NAMES THE TOPIC. `heartbeat.topics.prefix`
+            # is a live, non-deprecated ConfigDef entry (io/debezium/heartbeat/Heartbeat
+            # .java), which is why setting only it looks correct and validates cleanly —
+            # but the name is built by the topic-naming strategy
+            # (io/debezium/schema/AbstractTopicNamingStrategy.java) from
+            # `topic.heartbeat.prefix`, default `__debezium-heartbeat`. #1098 set only
+            # the first key, so heartbeats fired on schedule and landed on
+            # `__debezium-heartbeat.<topic.prefix>` while the pre-created, ACL-granted
+            # `rsync.heartbeat.<topic.prefix>` stayed at offset 0 forever
+            # (KI-CDC-HEARTBEAT-TOPIC-PREFIX-KEY-IGNORED, observed live 2026-09-20).
+            # Set BOTH to the same qualified value: the naming key is what actually
+            # decides the topic, and keeping the legacy key costs nothing and stays
+            # correct if a future Debezium reverses which one wins.
+            cfg.setdefault(
+                "heartbeat.interval.ms",
+                str(args.get("heartbeat_interval_ms") or "").strip()
+                or _env_or("CDC_MONGO_HEARTBEAT_INTERVAL_MS", _DEFAULT_HEARTBEAT_INTERVAL_MS),
+            )
+            _hb_prefix = _qualify_topic(
+                str(args.get("heartbeat_topics_prefix") or "").strip()
+                or _DEFAULT_HEARTBEAT_TOPICS_PREFIX
+            )
+            # The key Debezium's topic-naming strategy actually reads.
+            cfg.setdefault("topic.heartbeat.prefix", _hb_prefix)
+            # The legacy key, kept in lockstep so the two can never disagree.
+            cfg.setdefault("heartbeat.topics.prefix", _hb_prefix)
+            # Every database the collections come from (a server-level
+            # connection spans several); the connection's database otherwise.
+            mongo_dbs = mongo_capture_databases(mongo_include)
+            if mongo_dbs or mongo_db:
+                cfg["database.include.list"] = ",".join(mongo_dbs) or mongo_db
+            # Debezium 3.x opens a CLUSTER-WIDE change stream by default
+            # (capture.scope=deployment: $changeStream {allChangesForCluster: true} on
+            # admin), which needs changeStream+find on every database. A user granted
+            # read on only the source database — the usual Atlas setup — gets
+            # Unauthorized, and Debezium retries that forever while Kafka Connect shows
+            # the task RUNNING: no topic, no rows, no error anywhere a user looks (#19).
+            # When every captured collection is in one database, watch just that
+            # database, which plain `read` on it allows. Probed on Debezium 3.1 with a
+            # read-on-one-database user: deployment scope created no topic and logged
+            # Unauthorized retries; database scope delivered the snapshot and live
+            # inserts. Collections spread over several databases keep the default.
+            if len(mongo_dbs) == 1:
+                cfg["capture.scope"] = "database"
+                cfg["capture.target"] = mongo_dbs[0]
             # MongoDB has no relational schema history or DDL change stream; these
             # relational-only base keys make the MongoDB connector fail validation.
             # Prefix match, not a fixed list: the security properties above add
@@ -1094,9 +1486,11 @@ class DebeziumConnector:
             r = client.delete(f"{url}/connectors/{connector_name}")
             if r.status_code in (200, 202, 204):
                 cleanup_secret_file(connector_name)
+                sweep_orphan_secret_files(self)
                 return {"success": True, "connector_name": connector_name, "message": "deleted"}
             if r.status_code == 404:
                 cleanup_secret_file(connector_name)
+                sweep_orphan_secret_files(self)
                 return {"success": True, "connector_name": connector_name, "message": "already absent"}
             return {"success": False, "connector_name": connector_name, "error": f"delete failed: HTTP {r.status_code}", "body": r.text[:2000]}
 
@@ -1223,6 +1617,7 @@ def create_http_app():
 
     app = FastAPI(title="Debezium MCP Connector", version="v1.0.0")
     server = DebeziumConnector()
+    start_orphan_secret_reaper(server)
 
     @app.get("/health")
     async def health():

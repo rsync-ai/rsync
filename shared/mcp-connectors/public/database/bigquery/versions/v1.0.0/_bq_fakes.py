@@ -12,6 +12,7 @@ so tests can assert the SQL text, the load-job config, and the routing decision.
 
 from __future__ import annotations
 
+import types
 from typing import Any, Dict, List, Optional
 
 
@@ -124,6 +125,9 @@ class FakeClient:
         self.inserted: List[Dict[str, Any]] = []      # {fq, rows}
         self.created_tables: List[Any] = []
         self.deleted_tables: List[str] = []
+        # list_datasets answers with these ids; the projects asked are logged.
+        self.datasets: List[str] = []
+        self.listed_projects: List[str] = []
 
     # -- query path --
     def query(self, sql, job_config=None):
@@ -178,6 +182,10 @@ class FakeClient:
 
     def list_tables(self, dataset):
         return []
+
+    def list_datasets(self, project=None):
+        self.listed_projects.append(project)
+        return [types.SimpleNamespace(dataset_id=d) for d in self.datasets]
 
 
 def make_adapter(warehouse_adapters, *, query_rows=None, load_job_raises=None,

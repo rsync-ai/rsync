@@ -10,15 +10,21 @@ import { AlertTriangle, ExternalLink, Loader2, RefreshCw, StopCircle, Activity }
 import { toast } from "sonner"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch, authFetchOrThrow } from "@/lib/api/auth-fetch"
+import { truncatedTableTotal } from "@/lib/api/connections"
 import { classifyError } from "@/lib/utils/error-handling"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
 import { StageTimeline } from "@/components/pipeline/StageTimeline"
+import { stageDurationMs } from "@/components/pipeline/dagHelpers"
+import { stageTiming, type StageTransitionPoint } from "@/lib/duration"
+import { dedupeStageLifecycleEvents } from "@/lib/pipeline/eventNormalizer"
 import type { HITLState, StageExecution, StageStatus } from "@/lib/pipeline/stageDefinitions"
-import { stageRegistry } from "@/lib/pipeline/stageDefinitions"
+import { AGENT_STAGE_ORDER, passedOverAgentStages, stageRegistry } from "@/lib/pipeline/stageDefinitions"
 import {
   isTerminalPipelineStatus,
+  isWaitingForFirstData,
   normalizePipelineStatus,
   reconcilePipelineStatus,
+  WAITING_FOR_FIRST_DATA_LABEL,
 } from "@/lib/pipeline/statusNormalization"
 import { HITLPanel } from "@/components/pipeline/HITLPanel"
 import { PipelineTableSelector, normalizeSuggestedTables } from "@/components/pipeline/PipelineTableSelector"
@@ -60,19 +66,6 @@ type PipelineRunEvent = {
   payload?: Record<string, unknown>
 }
 
-const AGENT_STAGE_ORDER = [
-  "intent",
-  "capability_resolver",
-  "connector_check",
-  "connector_generation",
-  "connection_validation",
-  "connection_validator",
-  "planner",
-  "validator",
-  "infra_preflight",
-  "executor",
-] as const
-
 const DAG_STAGE_GROUPS = new Set(["extracting", "transforming", "loading"])
 
 function parseTs(s?: string): number | undefined {
@@ -87,7 +80,7 @@ function isProbablyDagNodeStageId(stageId?: string): boolean {
   return /^(source|dest|transform|notify)_[0-9]+$/.test(id)
 }
 
-function buildAgenticStagesFromEvents(
+export function buildAgenticStagesFromEvents(
   rawEvents: PipelineRunEvent[],
   state: PipelineStateResponse | null
 ): StageExecution[] {
@@ -111,6 +104,17 @@ function buildAgenticStagesFromEvents(
   })
 
   if (events.length === 0) return []
+
+  // Collapse the two producers' copies of one transition BEFORE anything is
+  // counted or timed. Every STAGE_STARTED/STAGE_COMPLETED reaches this panel
+  // twice — once from the workflow envelope (`evt-<pipeline>-<seq>`, whole-second
+  // `occurred_at`) and once from the gateway projector (`sha256:…`, microsecond
+  // `occurred_at`, seconds later). Undeduped, `stageTiming` reads the second
+  // START as a second attempt and closes the first one at it, so a stage that
+  // ran once for 11.9s rendered as "5s · Retry 2/2" here while the Activity
+  // feed — which deduped — said 11.9s. Same formatter, different input: the
+  // half of the two-panels-one-fact bug that #1108 did not reach.
+  events = dedupeStageLifecycleEvents(events)
 
   // Normalize ordering (events API returns newest-first)
   const sorted = [...events].sort((a, b) => {
@@ -152,9 +156,18 @@ function buildAgenticStagesFromEvents(
     currentAttempt: number
     maxAttempts: number
     lastEventAt?: number
+    /** Every transition this stage reported, for `stageTiming` below. */
+    points: StageTransitionPoint[]
   }
 
   const byStage = new Map<string, Agg>()
+  // The clock a still-running stage is measured against. The newest event, not
+  // `Date.now()`: this reduction runs on the server too, and the Activity feed's
+  // own reduction uses the same reference, so a running stage reads the same in
+  // both panels instead of drifting apart by a render.
+  let latestEventAt: number | undefined
+  // Stages the run actually reported on (events, or the state's active stage).
+  const reported = new Set<string>()
 
   const ensure = (stageKey: string) => {
     if (!byStage.has(stageKey)) {
@@ -163,6 +176,7 @@ function buildAgenticStagesFromEvents(
         status: "pending",
         currentAttempt: 1,
         maxAttempts: 1,
+        points: [],
       })
     }
     return byStage.get(stageKey)!
@@ -173,8 +187,13 @@ function buildAgenticStagesFromEvents(
     if (!stageKey) continue
 
     const agg = ensure(stageKey)
+    reported.add(stageKey)
     const at = parseTs(e.occurred_at || e.received_at)
     agg.lastEventAt = at ?? agg.lastEventAt
+    if (at !== undefined) {
+      agg.points.push({ type: String(e.event_type || ""), at })
+      if (latestEventAt === undefined || at > latestEventAt) latestEventAt = at
+    }
 
     const p = (e.payload && typeof e.payload === "object" ? e.payload : {}) as Record<string, any>
     const attempt = Number(p.attempt ?? p.current_attempt ?? 1)
@@ -290,6 +309,7 @@ function buildAgenticStagesFromEvents(
   if (pipelineStatus === "waiting_for_user") {
     const waitingStage = statusStageKey || "executor"
     ensure(waitingStage)
+    reported.add(waitingStage)
     inferLinearStatuses(waitingStage, "waiting")
   }
 
@@ -323,7 +343,10 @@ function buildAgenticStagesFromEvents(
   // Prefer failing exactly the backend-reported stage, and make later stages pending.
   if (pipelineStatus === "failed") {
     const failedStage = statusStageKey || AGENT_STAGE_ORDER.find((k) => byStage.get(k)?.status === "failed") || ""
-    if (failedStage) ensure(String(failedStage))
+    if (failedStage) {
+      ensure(String(failedStage))
+      reported.add(String(failedStage))
+    }
     inferLinearStatuses(String(failedStage), "failed")
   }
 
@@ -335,14 +358,48 @@ function buildAgenticStagesFromEvents(
     .filter((k) => !(AGENT_STAGE_ORDER as unknown as string[]).includes(k))
     .sort((a, b) => (byStage.get(a)?.startedAt ?? 0) - (byStage.get(b)?.startedAt ?? 0))
 
+  // Leave out the stages the run passed over. Kept, they sat "pending" forever
+  // and a live stream read "Step 8/10". The Steps graph drops the same ones.
+  const passedOver = passedOverAgentStages(reported)
+  const agentStages = AGENT_STAGE_ORDER.filter((k) => !passedOver.has(k))
+
   const ordered = [
-    ...AGENT_STAGE_ORDER,
+    ...agentStages,
     ...extras,
   ]
+
+  // The Steps graph names and times a stage from the execution plan, so the
+  // Overview reads the same two facts from the same place when the plan has the
+  // stage: its display_name, and the duration the adapter measured. The prod
+  // retest (2026-09-18) found "Checking Capabilities" / "0s" here against
+  // "Resolving Connectors" / "184ms" in the graph for one stage of one run.
+  const planStages = new Map(
+    (state?.execution_plan?.stages || [])
+      .filter((s) => (s?.id || "").trim() !== "")
+      .map((s) => [String(s.id).trim(), s] as const)
+  )
 
   return ordered.map((stageKey) => {
     const agg = byStage.get(stageKey)!
     const base = stageRegistry.get(stageKey)
+    const planStage = planStages.get(stageKey)
+    // Working time, summed across attempts — the same reduction the Activity
+    // feed runs (`eventNormalizer.stageState`). This used to be first-start to
+    // last-end, which billed a retried stage for the idle gap between its
+    // attempts: `infra_preflight` ran 17s and then 15s a quarter of an hour
+    // later, and this panel called it "15m 26s" while the feed said "15.0s".
+    const timing = stageTiming(agg.points, latestEventAt ?? agg.lastEventAt ?? 0)
+    const measuredMs = planStage ? stageDurationMs(planStage) : null
+    // The adapter's own measurement is the better number for a stage that ran
+    // once. It records a single execution, so on a retried stage it is one
+    // attempt of several — there the events are the fuller account.
+    const durationMs =
+      measuredMs !== null && timing.attempts <= 1
+        ? measuredMs
+        : (timing.activeMs ??
+          (agg.startedAt !== undefined && agg.completedAt !== undefined
+            ? agg.completedAt - agg.startedAt
+            : undefined))
     const startedAt = agg.startedAt ?? parseTs(state?.created_at) ?? 0
     const attempt = {
       attemptNumber: agg.currentAttempt,
@@ -356,15 +413,16 @@ function buildAgenticStagesFromEvents(
 
     return {
       stage: stageKey,
-      label: base.label,
-      description: base.description,
+      label: planStage?.display_name?.trim() || base.label,
+      description: planStage?.description?.trim() || base.description,
       icon: base.icon,
       status: agg.status,
-      currentAttempt: agg.currentAttempt,
-      maxAttempts: agg.maxAttempts,
+      currentAttempt: Math.max(agg.currentAttempt, timing.attempts || 1),
+      maxAttempts: Math.max(agg.maxAttempts, timing.attempts || 1),
       attempts: [attempt],
       startedAt: agg.startedAt,
       completedAt: agg.completedAt,
+      durationMs,
       progress: agg.progress,
       estimatedDuration: base.estimatedDuration,
       metadata: base.metadata,
@@ -423,6 +481,35 @@ function resolveCurrentStageKey(state: PipelineStateResponse | null): string | u
   const plan = state?.execution_plan?.stages || []
   const running = plan.find((s) => mapPlanStageStatus(s.status) === "running")
   return running?.id
+}
+
+export type StepInfo = { current_step: number; total_steps: number; stage_key: string }
+
+/**
+ * "Step n of m" read off the stage timeline: the current stage's position, or
+ * the completed count when no stage is current.
+ */
+export function deriveStepInfo(stages: StageExecution[], currentStageKey?: string): StepInfo | null {
+  if (!stages || stages.length === 0) return null
+  const key =
+    (currentStageKey || "").trim() ||
+    stages.find((s) => s.status === "running" || s.status === "retrying" || s.status === "waiting")?.stage ||
+    ""
+  const idx = key ? stages.findIndex((s) => s.stage === key) : -1
+  const current_step = idx >= 0 ? idx + 1 : Math.max(1, stages.filter((s) => s.status === "completed").length)
+  return { current_step, total_steps: stages.length, stage_key: key }
+}
+
+/**
+ * The step the Overview's stage timeline shows, from the run's events and
+ * state, for a header that has no timeline of its own. The Monitoring header
+ * read `state.progress` instead and said "Step 1/1" beside an Overview that
+ * said "Step 2/2".
+ */
+export function stepInfoFromEvents(events: PipelineRunEvent[], state: PipelineStateResponse | null): StepInfo | null {
+  const agentic = buildAgenticStagesFromEvents(events, state)
+  const stages = agentic.length > 0 ? agentic : buildStagesFromExecutionPlan(state)
+  return deriveStepInfo(stages, resolveCurrentStageKey(state))
 }
 
 /** A reported count is usable only when it is a finite positive integer. */
@@ -489,6 +576,7 @@ export function buildStagesFromExecutionPlan(state: PipelineStateResponse | null
         attempts: [attempt],
         startedAt,
         completedAt,
+        durationMs: stageDurationMs(s) ?? (startedAt !== undefined && completedAt !== undefined ? completedAt - startedAt : undefined),
         progress,
       } satisfies StageExecution
     })
@@ -535,6 +623,9 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     try {
       const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, {
         cache: "no-store",
+        // Bounded so a stalled request surfaces as an error the retry poll below
+        // can recover from, instead of pinning "No active execution yet · 0%".
+        timeoutMs: 15_000,
       })
       if (!res.ok) {
         const text = await res.text().catch(() => "")
@@ -671,7 +762,14 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
   // while actively processing, back off for the slower waiting/pending states.
   useEffect(() => {
     const status = state?.status
-    if (!status) return
+    if (!status) {
+      // No state yet because the first fetch failed or timed out. Nothing else
+      // re-fetches a finished run (no more websocket events arrive), so without
+      // this the panel stayed on "No active execution yet · 0%" until a reload.
+      if (!error) return
+      const retry = setInterval(() => void fetchState(), 5000)
+      return () => clearInterval(retry)
+    }
     if (!["processing", "waiting_for_user", "pending"].includes(status)) return
     const pollIntervalMs = status === "processing" ? 2500 : 5000
     const t = setInterval(() => {
@@ -679,7 +777,7 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
       void fetchEvents()
     }, pollIntervalMs)
     return () => clearInterval(t)
-  }, [state?.status, fetchState, fetchEvents])
+  }, [state?.status, error, fetchState, fetchEvents])
 
   const stagesFromExecutionPlan: StageExecution[] = useMemo(
     () => buildStagesFromExecutionPlan(state),
@@ -716,6 +814,10 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     [pipelineTerminal.status, pipelineRuntime?.phase]
   )
   const statusEscalated = reconciledStatus !== pipelineTerminal.status
+  // Issue #20: /state says "running" with "Streaming pipeline active" the moment a CDC
+  // stream is handed off, whether or not anything ever reaches the destination.
+  // /runtime's waiting_for_data is the honest answer once the grace has passed.
+  const waitingForFirstData = isWaitingForFirstData(reconciledStatus, pipelineRuntime?.phase)
 
   // The backend uses a terminal pseudo-stage like "completed" as current_stage/progress.stage.
   // If that key isn't present in the stage list (which often only contains agent stages like "executor"),
@@ -796,16 +898,7 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
   // timeline builder so both agree on which stage the top-level fields describe.
   const currentStageKey = useMemo(() => resolveCurrentStageKey(state), [state])
 
-  const derivedStepInfo = useMemo(() => {
-    if (!stages || stages.length === 0) return null
-    const key =
-      (currentStageKey || "").trim() ||
-      stages.find((s) => s.status === "running" || s.status === "retrying" || s.status === "waiting")?.stage ||
-      ""
-    const idx = key ? stages.findIndex((s) => s.stage === key) : -1
-    const current_step = idx >= 0 ? idx + 1 : Math.max(1, stages.filter((s) => s.status === "completed").length)
-    return { current_step, total_steps: stages.length, stage_key: key }
-  }, [stages, currentStageKey])
+  const derivedStepInfo = useMemo(() => deriveStepInfo(stages, currentStageKey), [stages, currentStageKey])
 
   const currentStageLabel = useMemo(() => {
     const key = (derivedStepInfo?.stage_key || currentStageKey || state?.current_stage || state?.progress?.stage || "").trim()
@@ -1152,6 +1245,12 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
   const percent = Math.max(0, Math.min(100, Number(state?.progress?.percent ?? 0)))
   const isStale = !!state?.is_stale
   const cancelRecommended = !!state?.cancel_recommended
+  // /state sets `streaming` for a CDC pipeline past the streaming hand-off (gateway
+  // applyStreamingLiveness). A stream that has no new source changes sends no heartbeats,
+  // so it must never read as a destructive "Stale" with a red Stop (issue #7). Its
+  // is_stale/stale_reason come from stream liveness instead and are shown as a plain notice;
+  // the header's regular Stop stays the way to end a stream on purpose.
+  const isStreamingCdc = (state as (PipelineStateResponse & { streaming?: boolean }) | null)?.streaming === true
 
   // CDC pipelines can be continuous (streaming) and will not "complete".
   // In that case, backend percent (e.g., 88%) is just "setup progress" and is misleading.
@@ -1169,6 +1268,9 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     if (pipelineRuntime && (pipelineRuntime.phase === "failed" || pipelineRuntime.phase === "idle")) {
       return false
     }
+    // Nor is a stream that has never delivered a row (issue #20): "LIVE" at 100% is
+    // exactly the false signal that let an empty stream look healthy.
+    if (waitingForFirstData) return false
 
     const cm =
       String(pipelineInfo?.data_loading_strategy?.effective_cdc_mode || pipelineInfo?.cdc_mode || "")
@@ -1181,7 +1283,7 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
       (state?.status || "").toLowerCase() === "running" &&
       (cm === "streaming_only" || msg.includes("streaming pipeline started") || msg.includes("streaming"))
     )
-  }, [pipelineInfo, state?.message, state?.summary, state?.status, pipelineRuntime?.phase])
+  }, [pipelineInfo, state?.message, state?.summary, state?.status, pipelineRuntime?.phase, waitingForFirstData])
 
   async function stopPipeline() {
     try {
@@ -1205,7 +1307,7 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
         <div className="flex items-start justify-between gap-3">
           <div>
             <CardTitle className="flex items-center gap-2">
-              <Activity className="h-5 w-5 text-zinc-500" />
+              <Activity className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
               Live Execution
             </CardTitle>
             <CardDescription>
@@ -1216,6 +1318,8 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
                     {state.execution_id.slice(0, 8)}
                   </Link>
                 </>
+              ) : loading && !state ? (
+                "Loading execution…"
               ) : (
                 "No active execution yet"
               )}
@@ -1255,12 +1359,19 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
               <AlertTriangle className="h-3 w-3" />
               Failed
             </Badge>
+          ) : waitingForFirstData ? (
+            <Badge
+              variant="outline"
+              className="border-amber-300 text-amber-800 dark:border-amber-800 dark:text-amber-300"
+            >
+              {WAITING_FOR_FIRST_DATA_LABEL}
+            </Badge>
           ) : (
             <Badge variant="outline">
               {statusEscalated ? reconciledStatus : state?.status || (loading ? "loading" : "unknown")}
             </Badge>
           )}
-          {isStale ? (
+          {isStale && !isStreamingCdc ? (
             <Badge variant="destructive" className="gap-1">
               <AlertTriangle className="h-3 w-3" />
               Stale
@@ -1428,9 +1539,11 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
               .toString()
               .toLowerCase()
             const isSyncStall = /sync|stream|cdc|transfer|execut|load/.test(stageKey)
-            const heading = isSyncStall
-              ? "Data sync is taking longer than expected"
-              : "This pipeline looks stuck"
+            const heading = isStreamingCdc
+              ? "This stream may not be delivering changes"
+              : isSyncStall
+                ? "Data sync is taking longer than expected"
+                : "This pipeline looks stuck"
             const hint = state?.stale_reason
               ? state.stale_reason
               : isSyncStall
@@ -1441,7 +1554,8 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
             <div className="font-medium">{heading}.</div>
             <div className="mt-1">
               {hint}
-              {typeof state?.stale_elapsed_seconds === "number" ? ` (idle ${state.stale_elapsed_seconds}s)` : ""}
+              {/* A stream's reason already says how long nothing has arrived, in plain units. */}
+              {typeof state?.stale_elapsed_seconds === "number" && !isStreamingCdc ? ` (idle ${state.stale_elapsed_seconds}s)` : ""}
             </div>
             <div className="mt-2 flex gap-2">
               <Button
@@ -1455,7 +1569,7 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
               >
                 Refresh Status
               </Button>
-              {cancelRecommended ? (
+              {cancelRecommended && !isStreamingCdc ? (
                 <Button size="sm" variant="destructive" onClick={stopPipeline}>
                   Stop Pipeline
                 </Button>
@@ -1515,6 +1629,8 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
                 ? `${pipelineTerminal.status === "failed" ? "Failed during" : "Stopped during"}: ${currentStageLabel}`
                 : isLiveStreaming
                   ? "Current stage: Streaming (CDC)"
+                  : waitingForFirstData
+                    ? "Current stage: Streaming (CDC), no data yet"
                   : currentStageLabel
                     ? `Current stage: ${currentStageLabel}`
                   : state?.current_stage
@@ -1525,12 +1641,24 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
               <Badge variant="secondary" className="text-xs">
                 LIVE
               </Badge>
-            ) : (
+            ) : waitingForFirstData ? null : (
               <span className="font-medium">{percent}%</span>
             )}
           </div>
-          <Progress value={isLiveStreaming ? 100 : percent} />
-          {state?.message ? <div className="text-sm text-zinc-600 dark:text-zinc-400">{state.message}</div> : null}
+          {waitingForFirstData ? null : <Progress value={isLiveStreaming ? 100 : percent} />}
+          {waitingForFirstData ? (
+            <div className="text-sm text-zinc-600 dark:text-zinc-400">
+              {pipelineRuntime?.message || "Streaming is set up, but no data has reached the destination yet"}
+            </div>
+          ) : state?.message ? (
+            <div className="text-sm text-zinc-600 dark:text-zinc-400">{state.message}</div>
+          ) : null}
+          {waitingForFirstData ? (
+            <div className="text-xs text-zinc-500 dark:text-zinc-400">
+              Rows appear once the source records a change. If it already has, open diagnostics to check the
+              connector and the sink.
+            </div>
+          ) : null}
           {isLiveStreaming ? (
             <div className="text-xs text-zinc-500 dark:text-zinc-400">
               Streaming runs continuously and won’t reach “100% complete”. Use Stop/Pause when you want to end it.
@@ -1545,11 +1673,11 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
             currentStageKey={timelineCurrentStageKey}
           />
         ) : (
-          <div className="text-sm text-zinc-500">Stage timeline will appear once execution starts.</div>
+          <div className="text-sm text-zinc-500 dark:text-zinc-400">Stage timeline will appear once execution starts.</div>
         )}
 
         {eventsError ? (
-          <div className="text-xs text-zinc-500">
+          <div className="text-xs text-zinc-500 dark:text-zinc-400">
             Unable to load event timeline: {eventsError}
           </div>
         ) : null}
@@ -1582,6 +1710,9 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
           pipelineId={pipelineId}
           executionId={state?.execution_id}
           sourceType={state?.blocking_reason?.details?.source_type}
+          sourceDatabase={blockingDetails?.source_database}
+          sourceServerLevel={blockingDetails?.source_server_level === true}
+          truncatedTotal={availableTables.length > 0 ? truncatedTableTotal(blockingDetails) : undefined}
           availableTables={availableTables.length > 0 ? availableTables : schemaIndexTables}
           suggestedTables={suggestedTables}
           initialSelectedTables={persistedSelectedTables}

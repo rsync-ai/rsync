@@ -6,7 +6,9 @@
     "mysql",
     "mysql",
     "MySQL",
-    "mysql"
+    "mysql",
+    "mariadb",
+    "aurora-mysql"
   ],
   "version": "1.0.0",
   "description": "Connector for MySQL relational database.",
@@ -21,6 +23,11 @@
   "supports_source": true,
   "supports_destination": true,
   "supports_cdc": true,
+  "namespace_model": {
+    "table_namespace": "database",
+    "destination_namespace": "database",
+    "destination_default": "default"
+  },
   "supports_ddl": true,
   "auto_create_destination_tables": true,
   "spec_version": "1.0",
@@ -63,11 +70,12 @@
   "required_config": [
     "host",
     "port",
-    "database",
     "user",
     "password"
   ],
-  "optional_config": [],
+  "optional_config": [
+    "database"
+  ],
   "configuration_schema": {
     "type": "object",
     "properties": {
@@ -81,7 +89,8 @@
       },
       "database": {
         "type": "string",
-        "description": "Database name"
+        "description": "Database to connect to. Leave empty for a server-level connection: every database the login can see (except the MySQL system schemas), narrowed by Scope.",
+        "ui_tier": "basic"
       },
       "user": {
         "type": "string",
@@ -96,7 +105,6 @@
     "required": [
       "host",
       "port",
-      "database",
       "user",
       "password"
     ]
@@ -114,7 +122,8 @@
       },
       "database": {
         "type": "string",
-        "description": "Database name"
+        "description": "Database to connect to. Leave empty for a server-level connection: every database the login can see (except the MySQL system schemas), narrowed by Scope.",
+        "ui_tier": "basic"
       },
       "user": {
         "type": "string",
@@ -129,7 +138,6 @@
     "required": [
       "host",
       "port",
-      "database",
       "user",
       "password"
     ]

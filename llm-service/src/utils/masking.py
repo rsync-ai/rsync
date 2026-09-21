@@ -9,7 +9,9 @@ import re
 from typing import Any, Dict, Optional, Union
 import copy
 
-# List of keys that should be masked in logs
+# List of keys that should be masked in logs: the credential group of
+# shared/sensitive_keys_golden.json, which the two Go SensitiveKeys lists also follow
+# (tests/test_sensitive_keys_golden.py). No PII keys here -- see that test's docstring.
 SENSITIVE_KEYS = {
     "password",
     "secret",

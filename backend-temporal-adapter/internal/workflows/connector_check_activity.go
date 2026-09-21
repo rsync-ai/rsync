@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/http"
 	"os"
@@ -16,6 +18,8 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"go.temporal.io/sdk/activity"
+	"go.temporal.io/sdk/temporal"
+	"go.temporal.io/sdk/workflow"
 )
 
 // ConnectorAvailabilityActivityV2 checks if required MCP connectors exist
@@ -77,24 +81,31 @@ func ConnectorAvailabilityActivityV2(ctx context.Context, req ConnectorCheckRequ
 	return result, nil
 }
 
+// defaultConnectorRoots are the directories the adapter container searches for
+// installed connectors.
+// New layout support:
+// - /app/shared/mcp-connectors/public/<category>/<id>/connector.py
+// - /app/shared/mcp-connectors/internal/<id>/connector.py
+// Backward compatible:
+// - /app/shared/mcp-connectors/<id>/connector.py
+// - /app/tools/<id>/connector.py
+var defaultConnectorRoots = []string{
+	"/app/shared/mcp-connectors/public",
+	"/app/shared/mcp-connectors/internal",
+	"/app/shared/mcp-connectors",
+	"/app/tools",
+}
+
 // checkConnectorExists verifies if connector exists in file system
 func checkConnectorExists(connectorType string) bool {
+	return checkConnectorExistsIn(connectorType, defaultConnectorRoots)
+}
+
+// checkConnectorExistsIn is checkConnectorExists over the given roots.
+func checkConnectorExistsIn(connectorType string, roots []string) bool {
 	connectorType = strings.TrimSpace(strings.ToLower(connectorType))
 	if connectorType == "" {
 		return false
-	}
-
-	// New layout support:
-	// - /app/shared/mcp-connectors/public/<category>/<id>/connector.py
-	// - /app/shared/mcp-connectors/internal/<id>/connector.py
-	// Backward compatible:
-	// - /app/shared/mcp-connectors/<id>/connector.py
-	// - /app/tools/<id>/connector.py
-	roots := []string{
-		"/app/shared/mcp-connectors/public",
-		"/app/shared/mcp-connectors/internal",
-		"/app/shared/mcp-connectors",
-		"/app/tools",
 	}
 
 	wantKey := normalizeConnectorKey(connectorType)
@@ -139,6 +150,7 @@ func checkConnectorExists(connectorType string) bool {
 		if _, err := os.Stat(root); err != nil {
 			continue
 		}
+		found := false
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
 				return nil
@@ -156,11 +168,15 @@ func checkConnectorExists(connectorType string) bool {
 			// If directory name matches the connector key, resolve its versioned connector.py
 			if normalizeConnectorKey(d.Name()) == wantKey {
 				if tryDir(path) {
-					return filepath.SkipDir
+					found = true
+					return fs.SkipAll
 				}
 			}
 			return nil
 		})
+		if found {
+			return true
+		}
 	}
 
 	return false
@@ -389,6 +405,145 @@ func canGenerateConnector(connectorType string) bool {
 	return false
 }
 
+// llmNotConfiguredErrType is the ApplicationError type GenerateConnectorActivityV2
+// fails with when the generator says no LLM is set up. The generate-connector
+// retry policy lists it as non-retryable, and the workflow shows its message to
+// the user as the reason the pipeline stopped.
+const llmNotConfiguredErrType = "llm_not_configured"
+
+const llmNotConfiguredFallbackMessage = "Set up an LLM first: add OPENAI_API_KEY (or another provider's key) to .env, " +
+	"or set LLM_PROVIDER=ollama for a local model, then restart rsync."
+
+// llmNotConfiguredMessage returns the sentence to show the user when a generator
+// response says no LLM is set up. The generator answers
+// 503 {"error":"llm_not_configured","message":"Set up an LLM first: ..."}
+// (llm-service/src/utils/llm_gate.py), or the same payload nested under "detail"
+// when the route has no handler registered. ok is false for every other
+// response, including a plain 503 from a busy or starting service.
+func llmNotConfiguredMessage(status int, body []byte) (string, bool) {
+	if status != http.StatusServiceUnavailable {
+		return "", false
+	}
+	type gate struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	var flat struct {
+		gate
+		Detail json.RawMessage `json:"detail"`
+	}
+	if err := json.Unmarshal(body, &flat); err != nil {
+		return "", false
+	}
+	found := flat.gate
+	if found.Error != llmNotConfiguredErrType && len(flat.Detail) > 0 {
+		var nested gate
+		if json.Unmarshal(flat.Detail, &nested) == nil {
+			found = nested
+		}
+	}
+	if found.Error != llmNotConfiguredErrType {
+		return "", false
+	}
+	msg := strings.TrimSpace(found.Message)
+	if msg == "" {
+		msg = llmNotConfiguredFallbackMessage
+	}
+	return msg, true
+}
+
+// generatorRefusedErrType is the ApplicationError type GenerateConnectorActivityV2
+// fails with when the generator refuses the request outright. The same request
+// gets the same answer on every attempt, so the generate-connector retry policy
+// lists it as non-retryable, and the workflow shows its message to the user.
+const generatorRefusedErrType = "connector_generation_refused"
+
+// generatorAuthRefusedMessage is shown for a 401. The generator's body there is
+// an internal code (invalid_internal_secret), not a sentence.
+const generatorAuthRefusedMessage = "The connector generator did not accept this service's internal secret. " +
+	"Set the same INTERNAL_SERVICE_SECRET for temporal-adapter and tool-generator, then restart both."
+
+// generatorRefusalMaxRunes caps how much of a refusal reaches the chat.
+const generatorRefusalMaxRunes = 1000
+
+func generatorRefusedFallbackMessage(connectorType string) string {
+	return fmt.Sprintf("The connector generator refused to build a connector for %s and gave no reason. "+
+		"Check the tool-generator logs, then try again.", connectorType)
+}
+
+// generatorRefusalMessage returns the sentence to show the user when the
+// generator refuses to build a connector: a 401 (the internal secret does not
+// match), or a 400/422 refusal such as the spec-required gate
+// (llm-service agents/integration.py) or the community scaffold's refusal
+// (lifecycle/scaffold_routes.py). Those answers do not change on retry. ok is
+// false for every other status, so 404, 408, 409, 429 and 5xx stay retryable.
+func generatorRefusalMessage(connectorType string, status int, body []byte) (string, bool) {
+	switch status {
+	case http.StatusUnauthorized:
+		return generatorAuthRefusedMessage, true
+	case http.StatusBadRequest, http.StatusUnprocessableEntity:
+	default:
+		return "", false
+	}
+	var payload struct {
+		ErrorMessage json.RawMessage `json:"error_message"`
+		Detail       json.RawMessage `json:"detail"`
+		Error        json.RawMessage `json:"error"`
+		Message      json.RawMessage `json:"message"`
+	}
+	if json.Unmarshal(body, &payload) == nil {
+		for _, raw := range []json.RawMessage{payload.ErrorMessage, payload.Detail, payload.Error, payload.Message} {
+			var text string
+			if len(raw) == 0 || json.Unmarshal(raw, &text) != nil {
+				continue
+			}
+			if msg := strings.Join(strings.Fields(text), " "); msg != "" {
+				if runes := []rune(msg); len(runes) > generatorRefusalMaxRunes {
+					msg = string(runes[:generatorRefusalMaxRunes]) + "..."
+				}
+				return msg, true
+			}
+		}
+	}
+	return generatorRefusedFallbackMessage(connectorType), true
+}
+
+// connectorGenReasonVersion gates NLPipelineWorkflowV2 showing why
+// GenerateConnectorActivityV2 gave up (no LLM set up, or the generator refused
+// the request) in place of "Connector generation failed for <type>". The new
+// text changes the recorded stage-event and pipeline-status inputs, so a replay
+// of a history recorded before this change keeps the old messages. Never rename
+// it: histories that carry the marker replay by this exact string.
+const connectorGenReasonVersion = "connector-gen-user-facing-reason"
+
+// connectorGenFailureReason returns the sentence to show the user when genErr is
+// GenerateConnectorActivityV2 failing for a reason retrying cannot fix. It is
+// called from workflow code only, and consults the version gate only for those
+// error types, so every other failure records no version marker.
+func connectorGenFailureReason(ctx workflow.Context, genErr error, connectorType string) (string, bool) {
+	var appErr *temporal.ApplicationError
+	if genErr == nil || !errors.As(genErr, &appErr) {
+		return "", false
+	}
+	var fallback string
+	switch appErr.Type() {
+	case llmNotConfiguredErrType:
+		fallback = llmNotConfiguredFallbackMessage
+	case generatorRefusedErrType:
+		fallback = generatorRefusedFallbackMessage(connectorType)
+	default:
+		return "", false
+	}
+	if workflow.GetVersion(ctx, connectorGenReasonVersion, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+		return "", false
+	}
+	msg := strings.TrimSpace(appErr.Message())
+	if msg == "" {
+		msg = fallback
+	}
+	return msg, true
+}
+
 // GenerateConnectorActivityV2 auto-generates missing connectors
 func GenerateConnectorActivityV2(ctx context.Context, req GenerateConnectorRequest) (*GenerateConnectorResult, error) {
 
@@ -408,13 +563,22 @@ func GenerateConnectorActivityV2(ctx context.Context, req GenerateConnectorReque
 
 	reqBody, _ := json.Marshal(generatorReq)
 
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, toolGeneratorBaseURL()+"/v1/generate", bytes.NewReader(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to build generator request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	// tool-generator guards /v1/generate with X-Internal-Secret whenever
+	// INTERNAL_SERVICE_SECRET is set (llm-service deployment/routes.py
+	// require_internal_secret, checked before the LLM gate). Without it every
+	// call is a 401. Same header api-gateway's GenerateConnector sends.
+	if secret := strings.TrimSpace(os.Getenv("INTERNAL_SERVICE_SECRET")); secret != "" {
+		httpReq.Header.Set("X-Internal-Secret", secret)
+	}
+
 	// Generation can take a while (agentic pipeline + docker build).
 	client := &http.Client{Timeout: 170 * time.Second}
-	resp, err := client.Post(
-		toolGeneratorBaseURL()+"/v1/generate",
-		"application/json",
-		bytes.NewBuffer(reqBody),
-	)
+	resp, err := client.Do(httpReq)
 
 	if err != nil {
 		logger.Error("Failed to call generator", "error", err)
@@ -423,6 +587,18 @@ func GenerateConnectorActivityV2(ctx context.Context, req GenerateConnectorReque
 	defer resp.Body.Close()
 
 	if resp.StatusCode != 200 {
+		// No LLM set up is not transient: retrying cannot succeed until the
+		// operator adds one, so fail once with the sentence that says how.
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		if msg, ok := llmNotConfiguredMessage(resp.StatusCode, body); ok {
+			logger.Warn("Connector generation needs an LLM", "connector_type", req.ConnectorType)
+			return nil, temporal.NewNonRetryableApplicationError(msg, llmNotConfiguredErrType, nil)
+		}
+		// A refusal gets the same answer on every attempt: fail once with it.
+		if msg, ok := generatorRefusalMessage(req.ConnectorType, resp.StatusCode, body); ok {
+			logger.Warn("Connector generator refused the request", "connector_type", req.ConnectorType, "status", resp.StatusCode)
+			return nil, temporal.NewNonRetryableApplicationError(msg, generatorRefusedErrType, nil)
+		}
 		logger.Error("Generator failed", "status", resp.StatusCode)
 		return nil, fmt.Errorf("generator failed with status: %d", resp.StatusCode)
 	}

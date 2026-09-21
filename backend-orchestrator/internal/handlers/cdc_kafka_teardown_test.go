@@ -1,10 +1,12 @@
 package handlers
 
 import (
+	"context"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"strconv"
+	"strings"
 	"testing"
 
 	kafkaclient "github.com/rsync-ai/shared/kafkaclient"
@@ -33,6 +35,9 @@ func TestOwnsTopic(t *testing.T) {
 		"cdc-" + testPipelineID8 + ".inventory.orders.dlq",
 		// Debezium schema history.
 		"schemahistory.cdc-" + testPipelineID8,
+		// Incremental-snapshot signal channel (executor name and connector fallback).
+		"signals." + testPipelineID8,
+		"signals.cdc-" + testPipelineID8,
 		// Batch backfill.
 		"pipeline." + testPipelineID8 + ".data",
 		"pipeline." + testPipelineID8 + ".data.dlq",
@@ -55,6 +60,9 @@ func TestOwnsTopic(t *testing.T) {
 		"cdc-" + testPipelineID8 + "e.inventory.orders",
 		"schemahistory.cdc-" + testPipelineID8 + "e",
 		"pipeline." + testPipelineID8 + "e.data",
+		"signals." + testPipelineID8 + "e",
+		"signals.cdc-" + testPipelineID8 + "e",
+		"signals." + otherPipelineID8,
 		// Missing the "." terminator entirely.
 		"pipeline." + testPipelineID8,
 		// Shared cluster infrastructure — never ours to delete.
@@ -81,6 +89,7 @@ func TestOwnsGroup(t *testing.T) {
 		"sink-" + testPipelineID8 + "-1a2b3c4d", // per-execution sink (streaming_only/never)
 		"cdc-schema-changes-" + testPipelineUUID,
 		"cdc-table-stats-" + testPipelineUUID,
+		"cdc-" + testPipelineID8 + "-signal", // Debezium incremental-snapshot signal consumer
 	}
 	for _, group := range owned {
 		if !n.ownsGroup(group) {
@@ -98,6 +107,8 @@ func TestOwnsGroup(t *testing.T) {
 		// The cdcstats groups key on the FULL uuid, not the id8 prefix.
 		"cdc-table-stats-" + testPipelineID8,
 		"cdc-schema-changes-" + testPipelineID8,
+		"cdc-" + otherPipelineID8 + "-signal",
+		"cdc-" + testPipelineID8 + "e-signal",
 	}
 	for _, group := range notOwned {
 		if n.ownsGroup(group) {
@@ -106,15 +117,26 @@ func TestOwnsGroup(t *testing.T) {
 	}
 }
 
-// A nil TopologyManager (broker unreachable at startup) must still yield the two
+// A nil TopologyManager (broker unreachable at startup) must still yield the
 // long-lived sink groups, so the streaming worker is stopped even when the
-// broker cannot be listed.
+// broker cannot be listed. The qualified names are the ones the executor mints
+// under the default namespace; the bare ones are where a pipeline created
+// before the namespace still runs its worker. Either alone leaves a worker
+// running for one of the two kinds of pipeline.
 func TestDiscoverSinkGroupsFallsBackWithoutTopologyManager(t *testing.T) {
+	t.Setenv("KAFKA_TOPIC_PREFIX", "rsync.")
 	got := discoverSinkGroups(t.Context(), nil, testNames())
 
 	want := map[string]bool{
-		"sink-" + testPipelineID8:            false,
-		"sink-" + testPipelineID8 + "-batch": false,
+		"rsync.sink-" + testPipelineID8:             false,
+		"rsync.sink-" + testPipelineID8 + "-batch":  false,
+		"rsync.sink-" + testPipelineID8 + "-stream": false,
+		"sink-" + testPipelineID8:                   false,
+		"sink-" + testPipelineID8 + "-batch":        false,
+		"sink-" + testPipelineID8 + "-stream":       false,
+	}
+	if len(got) != len(want) {
+		t.Errorf("discoverSinkGroups returned %d groups %v, want %d (no repeats)", len(got), got, len(want))
 	}
 	for _, g := range got {
 		if _, ok := want[g]; !ok {
@@ -155,6 +177,8 @@ func TestOwnsMatchesNamespaceQualifiedNames(t *testing.T) {
 		"rsync.schemahistory.cdc-" + testPipelineID8,
 		"rsync.pipeline." + testPipelineID8 + ".data",
 		"rsync.pipeline." + testPipelineID8 + ".data.dlq",
+		"rsync.signals." + testPipelineID8,
+		"rsync.signals.cdc-" + testPipelineID8,
 	}
 	for _, topic := range ownedTopics {
 		if !n.ownsTopic(topic) {
@@ -169,6 +193,7 @@ func TestOwnsMatchesNamespaceQualifiedNames(t *testing.T) {
 		"rsync.sink-" + testPipelineID8 + "-1a2b3c4d",
 		"rsync.cdc-schema-changes-" + testPipelineUUID,
 		"rsync.cdc-table-stats-" + testPipelineUUID,
+		"rsync.cdc-" + testPipelineID8 + "-signal",
 	}
 	for _, group := range ownedGroups {
 		if !n.ownsGroup(group) {
@@ -351,4 +376,109 @@ func constFromSource(t *testing.T, path, name string) string {
 	t.Fatalf("const %s not found in %s -- it was renamed or moved, and the teardown "+
 		"sweep must be updated to match before this test can mean anything", name, path)
 	return ""
+}
+
+// The worker sweep is what actually stops kafka-mcp-sink on delete. It must pick
+// out this pipeline's sink groups in the qualified spelling -- the only one a
+// current executor produces -- and must not hand stop_sink the in-process stats
+// groups (no worker behind them) or a sibling pipeline's groups.
+func TestFilterSinkGroupsKeepsQualifiedWorkersOnly(t *testing.T) {
+	t.Setenv("KAFKA_TOPIC_PREFIX", "rsync.")
+	listed := []string{
+		"rsync.sink-" + testPipelineID8,
+		"rsync.sink-" + testPipelineID8 + "-batch",
+		"rsync.sink-" + testPipelineID8 + "-1a2b3c4d",
+		"sink-" + testPipelineID8, // pre-namespace worker still alive
+		"rsync.cdc-table-stats-" + testPipelineUUID,
+		"rsync.sink-" + testPipelineID8 + "e",
+		"rsync.sink-00000000",
+		"connect-cdc-" + testPipelineID8,
+	}
+	got := filterSinkGroups(listed, testNames())
+	want := []string{
+		"rsync.sink-" + testPipelineID8,
+		"rsync.sink-" + testPipelineID8 + "-batch",
+		"rsync.sink-" + testPipelineID8 + "-1a2b3c4d",
+		"sink-" + testPipelineID8,
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("filterSinkGroups =\n  %v\nwant\n  %v", got, want)
+	}
+}
+
+// forEachOwned is the teardown's iteration contract: delete what this pipeline
+// owns, stop when the caller's budget is gone, and report exactly how much was
+// left on the cluster. That number is what an operator cleans up by hand, so
+// these drive the real helper rather than a re-implementation of its loop.
+//
+// The trap: a cluster listing interleaves other pipelines' names, so "owned
+// items processed so far" and "position in the list" diverge. Counting the
+// remainder from the former re-counts entries already deleted. On an all-owned
+// listing the two agree — which is exactly the listing a first test reaches for,
+// and why the wrong arithmetic survives it.
+func TestForEachOwnedReportsExactRemainder(t *testing.T) {
+	n := testNames()
+
+	// Interleaved on purpose: the two counters diverge from index 1 on.
+	listed := []string{
+		"rsync.sink-" + testPipelineID8,            // owned #1
+		"rsync.sink-" + otherPipelineID8,           // someone else's
+		"rsync.sink-" + testPipelineID8 + "-batch", // owned #2
+		"connect-cdc-" + otherPipelineID8,          // someone else's
+		"rsync.sink-" + testPipelineID8 + "-1a2b",  // owned #3
+	}
+	const total = 3
+
+	for budget := 0; budget <= total; budget++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		var deleted []string
+		left := forEachOwned(ctx, listed, n.ownsGroup, func(g string) {
+			deleted = append(deleted, g)
+			if len(deleted) == budget {
+				cancel() // the deadline lands after `budget` broker round-trips
+			}
+		})
+		if budget == 0 {
+			cancel()
+			// Re-run with an already-dead budget: nothing may be deleted.
+			deleted = nil
+			left = forEachOwned(ctx, listed, n.ownsGroup, func(g string) {
+				deleted = append(deleted, g)
+			})
+		}
+		cancel()
+
+		if want := total - budget; left != want {
+			t.Errorf("budget for %d delete(s): reported %d left behind, want %d", budget, left, want)
+		}
+		if len(deleted) != budget {
+			t.Errorf("budget for %d delete(s): actually deleted %d (%v)", budget, len(deleted), deleted)
+		}
+	}
+}
+
+// A budget that never expires must report 0 left behind — not "0 because we
+// stopped early", but because the whole listing was walked.
+func TestForEachOwnedDeletesEverythingItOwns(t *testing.T) {
+	n := testNames()
+	listed := []string{
+		"cdc-" + testPipelineID8 + ".inventory.orders",
+		"cdc-" + otherPipelineID8 + ".inventory.orders",
+		"cdc-" + testPipelineID8 + ".inventory.items",
+	}
+
+	var deleted []string
+	left := forEachOwned(context.Background(), listed, n.ownsTopic, func(topic string) {
+		deleted = append(deleted, topic)
+	})
+	if left != 0 {
+		t.Errorf("left behind = %d, want 0", left)
+	}
+	want := []string{
+		"cdc-" + testPipelineID8 + ".inventory.orders",
+		"cdc-" + testPipelineID8 + ".inventory.items",
+	}
+	if strings.Join(deleted, ",") != strings.Join(want, ",") {
+		t.Errorf("deleted\n  %v\nwant\n  %v — another pipeline's topic was in range", deleted, want)
+	}
 }

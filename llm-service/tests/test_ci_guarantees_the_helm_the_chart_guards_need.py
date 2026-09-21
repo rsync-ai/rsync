@@ -1,19 +1,22 @@
 """Every CI job that collects a helm-gated chart case must guarantee helm.
 
-Eight cases across six suites are `skipif(shutil.which("helm") is None)`. They
-render the chart: the documented `helm install` blocks, the four cloud overlays,
-the external-Postgres TLS wiring, the three docker-host feature gates, and what
-`helm package` actually ships. Every one of them is the *executable* half of a
-guard whose other half is a text parse -- so when one skips, the pair silently
+The chart suites gate their cases on `skipif(shutil.which("helm") is None)`.
+They render the chart: the documented `helm install` blocks, the four cloud
+overlays, the external-Postgres TLS wiring, the three docker-host feature gates,
+what `helm package` actually ships, and which databases the pre-install hook
+creates when Postgres is external. Most are the *executable* half of a guard
+whose other half is a text parse -- so when one skips, the pair silently
 degrades to "the YAML says the right words", which is the failure mode those
-render layers exist to close.
+render layers exist to close. The db-init suite has no text half to degrade to:
+it skips to nothing at all.
 
-Nothing in this repo installs helm by default, and the jobs that collect these
-cases run on `ubuntu-latest`, whose image makes no promise to carry one. So
-presence has to be arranged by the workflow rather than inherited from the
-runner -- and when it is not arranged, nothing goes red: pytest prints one
-summary line whether a case ran or was skipped, so eight render assertions
-would stop running and every check would stay green.
+Nothing in this repo installs helm. It was present in CI because every job in
+`ci.yml` and `doc-links.yml` runs on `[self-hosted, macOS, ARM64]` developer
+Macs that already had it. That is an inherited property of somebody's laptop,
+not a promise the repo makes, and it dies the day the runners move to
+GitHub-hosted -- which the public flip plans. When it dies, nothing goes red:
+pytest prints one summary line whether a case ran or was skipped, so eight
+render assertions would stop running and every check would stay green.
 
 The repo already reasons this way about a different binary, one job over.
 `doc-links.yml`'s pytest step says of `bash`: it is "guaranteed on these macOS
@@ -36,9 +39,10 @@ they are about the *mechanism* rather than about what anybody wrote down:
      claim about a runner the test cannot see, and it was false.
 
 The fourth check is about prose, and it exists because the false version of (3)
-did real damage: "CI has NO helm binary" was written down repeatedly, and in
-every one of those places it was the stated *reason* a chart guard stayed
-text-only. The decisions were right; the reason was not. A text parse needs no binary and holds
+did real damage: "CI has NO helm binary" appeared in thirteen places across nine
+files, and in every one of them it was the stated *reason* a chart guard stayed
+text-only -- including the load-bearing justification in INVENTORY.md. The
+decisions were right; the reason was not. A text parse needs no binary and holds
 on any checkout, which is a better argument and does not expire.
 
 That check has to survive being written about. Retracting a false claim means
@@ -74,12 +78,45 @@ yaml = pytest.importorskip("yaml")
 _HELM_WHICH = re.compile(r"""which\(\s*['"]helm['"]\s*\)""")
 
 
+def _module_pytestmark_gates_on_helm(tree: ast.Module, src: str) -> bool:
+    """True when a module-level `pytestmark` skips the whole file on helm.
+
+    Only module scope counts: a `pytestmark` assigned inside a class applies to
+    that class alone, and one inside a function is a local variable pytest never
+    reads. The name takes either a single mark or a list of them, and both forms
+    appear in the wild, so both are unpacked here.
+    """
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+        elif isinstance(node, ast.AnnAssign):
+            targets = [node.target]
+        else:
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "pytestmark" for t in targets):
+            continue
+        if node.value is None:
+            continue
+        marks = (node.value.elts
+                 if isinstance(node.value, (ast.List, ast.Tuple))
+                 else [node.value])
+        for mark in marks:
+            segment = ast.get_source_segment(src, mark) or ""
+            if "skipif" in segment and _HELM_WHICH.search(segment):
+                return True
+    return False
+
+
 def _helm_gated_cases() -> dict[Path, list[str]]:
     """Map each test file to the case names gated on a helm binary.
 
     Parsed from the AST rather than grepped, so a decorator spanning lines or
     written with `not __import__("shutil").which("helm")` is found the same way
-    as the plain form -- both spellings are in the tree today.
+    as the plain form. The third spelling is a module-level `pytestmark`, which
+    gates every case in a file at once and hangs no decorator on any of them --
+    the walk read only `decorator_list` and so found none, and the floor below
+    caught that as "the walk is broken", which is exactly what it was. All three
+    spellings are in the tree today.
     """
     found: dict[Path, list[str]] = {}
     me = Path(__file__).resolve()
@@ -101,6 +138,15 @@ def _helm_gated_cases() -> dict[Path, list[str]]:
             if "skipif" in (ast.get_source_segment(src, dec) or "")
             and _HELM_WHICH.search(ast.get_source_segment(src, dec) or "")
         ]
+        if _module_pytestmark_gates_on_helm(tree, src):
+            # pytest applies a module-level mark to every test in the file, so
+            # every case here is gated whether or not it carries a decorator.
+            names = sorted({*names, *(
+                node.name
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name.startswith("test_")
+            )})
         # A file that mentions which("helm") but yields no parsed case means the
         # walk above is broken, not that the file is clean. Record it as an
         # empty list so the floor below can tell the two apart.
@@ -246,10 +292,10 @@ def test_every_job_collecting_a_helm_gated_case_guarantees_helm(test_file: Path)
     """The load-bearing check: presence must be asserted, not inherited.
 
     A job that collects one of these files and does not guarantee helm is green
-    only for as long as the runner image happens to carry one. Take that away
-    and the render cases stop running, with nothing red to say so. The remedy is
-    one line either way: a `helm version --short` step, or
-    `uses: azure/setup-helm@<pinned sha>` as docker-publish.yml already does.
+    today only because the runner happens to be a Mac with helm on it. Move that
+    job to `ubuntu-latest` and the render cases stop running, with nothing red
+    to say so. The remedy is one line either way: a `helm version --short` step,
+    or `uses: azure/setup-helm@<pinned sha>` as docker-publish.yml already does.
     """
     collecting = _jobs_collecting(test_file)
     assert collecting, (
@@ -398,9 +444,9 @@ def test_no_shipped_text_asserts_that_ci_has_no_helm():
                 )
     assert scanned > 200, f"only {scanned} text files scanned; denominator too small"
     assert not violations, (
-        "this says CI has no helm binary. Nothing here installs one by default, "
-        "but every job that runs the chart guards now sets helm up explicitly "
-        "and asserts `helm version` before pytest. If you "
+        "this says CI has no helm binary. It does not install one, but every job "
+        "that runs the chart guards is on a self-hosted Mac that already had it, "
+        "and both of those workflows now assert `helm version` outright. If you "
         "are quoting the old claim in order to retract it, put the retraction "
         f"marker before the quote: {violations}"
     )

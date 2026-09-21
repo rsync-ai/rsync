@@ -95,7 +95,7 @@ export function DiagnosisCard({ data }: { data: DiagnosisData }) {
             )}
 
           {data.execution_id && (
-            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-500">
+            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
               Execution: <span className="font-mono">{data.execution_id.slice(0, 8)}…</span>
             </div>
           )}
@@ -117,7 +117,7 @@ export function DiagnosisCard({ data }: { data: DiagnosisData }) {
               </Link>
             )}
             {!showButton && action === "escalate_to_human" && (
-              <span className="text-xs text-zinc-500">
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">
                 No automatic action — this needs a human.
               </span>
             )}

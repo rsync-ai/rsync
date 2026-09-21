@@ -3573,30 +3573,6 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
         explicit_owner = str(config.get("owner") or config.get("schema") or "").strip()
         explicit_owner = explicit_owner.upper() if explicit_owner else ""
 
-        # Oracle-maintained / internal owners we never surface as user data.
-        # Under-filtering is safe (the user still picks the tables to sync);
-        # over-filtering would hide a real schema, so this list stays
-        # conservative + explicit and matches on exact name or a known prefix.
-        system_owners = frozenset({
-            "SYS", "SYSTEM", "XDB", "OUTLN", "DBSNMP", "APPQOSSYS",
-            "GSMADMIN_INTERNAL", "GSMCATUSER", "GSMUSER", "GSMROOTUSER",
-            "CTXSYS", "MDSYS", "MDDATA", "ORDSYS", "ORDDATA", "ORDPLUGINS",
-            "OLAPSYS", "WMSYS", "EXFSYS", "AUDSYS", "LBACSYS", "DVSYS", "DVF",
-            "DBSFWUSER", "GGSYS", "ANONYMOUS", "REMOTE_SCHEDULER_AGENT",
-            "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC", "SYS$UMF", "OJVMSYS",
-            "SI_INFORMTN_SCHEMA", "SPATIAL_CSW_ADMIN_USR",
-            "SPATIAL_WFS_ADMIN_USR", "FLOWS_FILES", "APEX_PUBLIC_USER",
-            "ORACLE_OCM", "XS$NULL", "PDBADMIN", "DGPDB_INT", "DIP",
-            "VECSYS", "GGSHAREDCAP",
-        })
-
-        def _is_system_owner(o):
-            ou = str(o).upper()
-            return (ou in system_owners
-                    or ou.startswith("APEX_")
-                    or ou.startswith("FLOWS_")
-                    or ou.startswith("SYS$"))
-
         def _q(ident):
             # Double-quote an Oracle identifier ( " -> "" ), preserving case.
             return '"' + str(ident).replace('"', '""') + '"'
@@ -3611,49 +3587,13 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
         tables = []
 
         try:
-            # Resolve the owner(s) to scan.
+            # Resolve the owner(s) to scan: an explicit owner/schema pins it,
+            # otherwise every owner that is not Oracle's own
+            # (_oracle_user_owners, shared with list_namespaces).
             if explicit_owner:
                 owners = [explicit_owner]
             else:
-                # Prefer the Oracle-sanctioned all_users.oracle_maintained flag
-                # (present since 12.1): it excludes EVERY Oracle-internal schema,
-                # including ones no static list would know (e.g. 23ai's VECSYS /
-                # GGSHAREDCAP). The explicit denylist below is a belt-and-braces
-                # secondary filter and the fallback for older Oracle that lacks
-                # the column.
-                owners = []
-                try:
-                    cursor.execute(
-                        "SELECT DISTINCT t.owner FROM all_tables t "
-                        "JOIN all_users u ON u.username = t.owner "
-                        "WHERE u.oracle_maintained = 'N' ORDER BY t.owner"
-                    )
-                    owners = [
-                        row[0] for row in (cursor.fetchall() or [])
-                        if row and row[0] and not _is_system_owner(row[0])
-                    ]
-                except Exception:
-                    owners = []
-                if not owners:
-                    # oracle_maintained unavailable / nothing matched -> plain
-                    # owner scan filtered by the explicit system-owner denylist.
-                    try:
-                        cursor.execute("SELECT DISTINCT owner FROM all_tables ORDER BY owner")
-                        owners = [
-                            row[0] for row in (cursor.fetchall() or [])
-                            if row and row[0] and not _is_system_owner(row[0])
-                        ]
-                    except Exception:
-                        owners = []
-                if not owners:
-                    # Last resort: the connection's current schema, so a normal
-                    # single-schema login never regresses to zero tables.
-                    try:
-                        cursor.execute("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")
-                        cur_schema = (cursor.fetchone() or [None])[0]
-                        owners = [cur_schema] if cur_schema else []
-                    except Exception:
-                        owners = []
+                owners = self._oracle_user_owners(cursor)
 
             if not owners:
                 result["tables"] = []
@@ -3915,6 +3855,191 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
         
         return {"success": False, "error": "Schema discovery not supported for this NoSQL database"}
     
+    # =========================================================================
+    # BEGIN list_namespaces block
+    # The same text sits in the postgresql, mysql, oracle and sqlserver
+    # connectors and in connector_database.py.j2;
+    # llm-service/tests/test_list_namespaces_block_in_lockstep.py fails when one
+    # copy changes alone. discover_schema resolves schemas through the same
+    # helpers, so the list and discovery never disagree about what is a system
+    # namespace.
+    # =========================================================================
+
+    # Databases MySQL and MongoDB keep for themselves; never user data.
+    _MYSQL_SYSTEM_DATABASES = frozenset({"information_schema", "mysql", "performance_schema", "sys"})
+    _MONGO_SYSTEM_DATABASES = frozenset({"admin", "config", "local"})
+
+    # Oracle-maintained / internal owners we never surface as user data.
+    # Under-filtering is safe (the user still picks the tables to sync);
+    # over-filtering would hide a real schema, so this list stays
+    # conservative + explicit and matches on exact name or a known prefix.
+    _ORACLE_SYSTEM_OWNERS = frozenset({
+        "SYS", "SYSTEM", "XDB", "OUTLN", "DBSNMP", "APPQOSSYS",
+        "GSMADMIN_INTERNAL", "GSMCATUSER", "GSMUSER", "GSMROOTUSER",
+        "CTXSYS", "MDSYS", "MDDATA", "ORDSYS", "ORDDATA", "ORDPLUGINS",
+        "OLAPSYS", "WMSYS", "EXFSYS", "AUDSYS", "LBACSYS", "DVSYS", "DVF",
+        "DBSFWUSER", "GGSYS", "ANONYMOUS", "REMOTE_SCHEDULER_AGENT",
+        "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC", "SYS$UMF", "OJVMSYS",
+        "SI_INFORMTN_SCHEMA", "SPATIAL_CSW_ADMIN_USR",
+        "SPATIAL_WFS_ADMIN_USR", "FLOWS_FILES", "APEX_PUBLIC_USER",
+        "ORACLE_OCM", "XS$NULL", "PDBADMIN", "DGPDB_INT", "DIP",
+        "VECSYS", "GGSHAREDCAP",
+    })
+
+    @classmethod
+    def _is_oracle_system_owner(cls, owner) -> bool:
+        ou = str(owner).upper()
+        return (ou in cls._ORACLE_SYSTEM_OWNERS
+                or ou.startswith("APEX_")
+                or ou.startswith("FLOWS_")
+                or ou.startswith("SYS$"))
+
+    def _postgres_user_schemas(self, cursor) -> List[str]:
+        """Every PostgreSQL schema except the catalogs and the temp/toast schemas."""
+        cursor.execute(
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE schema_name NOT IN ('pg_catalog', 'information_schema') "
+            "AND schema_name NOT LIKE 'pg_temp%' "
+            "AND schema_name NOT LIKE 'pg_toast%' "
+            "ORDER BY schema_name"
+        )
+        return [row[0] for row in (cursor.fetchall() or []) if row and row[0]]
+
+    def _sqlserver_user_schemas(self, cursor) -> List[str]:
+        """sys.schemas minus the built-in system schemas (sys,
+        INFORMATION_SCHEMA, guest) and the fixed database-role schemas
+        (db_owner, db_datareader, ...). dbo IS a user schema and is kept; a user
+        schema like "db_custom" is kept too (an explicit NOT IN list avoids a
+        `db_%` LIKE that would also strip dbo). Names are SQL Server built-ins.
+        """
+        cursor.execute(
+            "SELECT name FROM sys.schemas "
+            "WHERE name NOT IN ("
+            "'sys', 'INFORMATION_SCHEMA', 'guest', "
+            "'db_owner', 'db_accessadmin', 'db_securityadmin', "
+            "'db_ddladmin', 'db_backupoperator', 'db_datareader', "
+            "'db_datawriter', 'db_denydatareader', 'db_denydatawriter') "
+            "ORDER BY name"
+        )
+        return [row[0] for row in (cursor.fetchall() or []) if row and row[0]]
+
+    def _oracle_user_owners(self, cursor) -> List[str]:
+        """Every Oracle owner with tables that is not Oracle's own.
+
+        Prefers the Oracle-sanctioned all_users.oracle_maintained flag (present
+        since 12.1): it excludes EVERY Oracle-internal schema, including ones no
+        static list would know (e.g. 23ai's VECSYS / GGSHAREDCAP). The explicit
+        denylist is a belt-and-braces secondary filter and the fallback for
+        older Oracle that lacks the column. Last resort is the connection's
+        current schema, so a normal single-schema login never regresses to
+        zero tables.
+        """
+        owners = []
+        try:
+            cursor.execute(
+                "SELECT DISTINCT t.owner FROM all_tables t "
+                "JOIN all_users u ON u.username = t.owner "
+                "WHERE u.oracle_maintained = 'N' ORDER BY t.owner"
+            )
+            owners = [
+                row[0] for row in (cursor.fetchall() or [])
+                if row and row[0] and not self._is_oracle_system_owner(row[0])
+            ]
+        except Exception:
+            owners = []
+        if not owners:
+            try:
+                cursor.execute("SELECT DISTINCT owner FROM all_tables ORDER BY owner")
+                owners = [
+                    row[0] for row in (cursor.fetchall() or [])
+                    if row and row[0] and not self._is_oracle_system_owner(row[0])
+                ]
+            except Exception:
+                owners = []
+        if not owners:
+            try:
+                cursor.execute("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")
+                cur_schema = (cursor.fetchone() or [None])[0]
+                owners = [cur_schema] if cur_schema else []
+            except Exception:
+                owners = []
+        return owners
+
+    def _mysql_user_databases(self, cursor) -> List[str]:
+        """Every MySQL database the login can see, minus MySQL's own."""
+        cursor.execute("SELECT schema_name FROM information_schema.schemata ORDER BY schema_name")
+        return [
+            row[0] for row in (cursor.fetchall() or [])
+            if row and row[0] and str(row[0]).lower() not in self._MYSQL_SYSTEM_DATABASES
+        ]
+
+    def list_namespaces(self, params: Dict = None) -> Dict[str, Any]:
+        """List the names one level above a table: the level metadata.json's
+        namespace_model.table_namespace names. Schemas on PostgreSQL and SQL
+        Server, owners on Oracle, databases on MySQL and MongoDB, datasets on a
+        warehouse adapter. System namespaces are left out.
+
+        Returns {"success": True, "namespaces": [sorted names], "current": the
+        namespace the connection itself names, or "" when it names none}, or
+        {"success": False, "error": ...}.
+        """
+        params = params or {}
+        config = self._get_config(params)
+        adapter = getattr(self, "_warehouse_adapter", None)
+        if adapter is not None:
+            if not hasattr(adapter, "list_namespaces"):
+                return {"success": False, "error": "Listing namespaces is not supported by this warehouse adapter"}
+            return adapter.list_namespaces(config)
+        pattern = self.driver_pattern
+        module = pattern.get("module") or ""
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            if pattern.get("is_nosql"):
+                if "mongo" not in module:
+                    return {"success": False, "error": f"Listing namespaces is not supported for {module}"}
+                names = [n for n in conn.list_database_names() if n not in self._MONGO_SYSTEM_DATABASES]
+                current = config.get("database")
+            elif "sqlite" in module:
+                names, current = ["main"], "main"
+            else:
+                cursor = self._get_cursor(conn, as_dict=False)
+                try:
+                    if "mysql" in module:
+                        names = self._mysql_user_databases(cursor)
+                        current = config.get("database")
+                    elif "psycopg2" in module:
+                        names = self._postgres_user_schemas(cursor)
+                        current = config.get("schema")
+                    elif "pyodbc" in module:
+                        names = self._sqlserver_user_schemas(cursor)
+                        current = config.get("schema")
+                    elif "oracledb" in module:
+                        names = self._oracle_user_owners(cursor)
+                        current = str(config.get("owner") or config.get("schema") or "").upper()
+                    else:
+                        return {"success": False, "error": f"Listing namespaces is not supported for {module or 'this driver'}"}
+                finally:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+            return {
+                "success": True,
+                "namespaces": sorted({str(n) for n in names if n}),
+                "current": str(current or "").strip(),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Listing namespaces failed: {e}"}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # END list_namespaces block
+
     # =========================================================================
     # SOURCE OPERATIONS
     # =========================================================================

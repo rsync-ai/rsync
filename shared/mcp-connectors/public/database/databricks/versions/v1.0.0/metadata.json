@@ -19,6 +19,11 @@
   "supports_source": true,
   "supports_destination": true,
   "supports_cdc": false,
+  "namespace_model": {
+    "table_namespace": "schema",
+    "destination_namespace": "schema",
+    "destination_default": "default"
+  },
   "spec_version": "2.0",
   "status": "active",
   "production_verified": true,

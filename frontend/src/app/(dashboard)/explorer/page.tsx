@@ -99,7 +99,9 @@ import {
 import { groupTablesByDatabase } from "@/lib/explorer/schemaTree"
 import { handleExplorerRunShortcut } from "@/lib/explorer/runShortcut"
 import { DocumentExplorer } from "@/components/explorer/DocumentExplorer"
+import { SuggestTablesCard } from "@/components/explorer/SuggestTablesCard"
 import { isInternalExplorerTable } from "@/lib/explorer/internalTables"
+import { llmNotConfiguredError } from "@/lib/explorer/llmNotConfigured"
 
 // Types
 interface Connection {
@@ -142,7 +144,7 @@ interface ForeignKeyMetadata {
 }
 
 interface ExplorerError {
-  code: string   // "auth" | "llm_offline" | "db_error" | "table_resolve_failed" | "sql_gen_failed" | "network" | "validation" | "schema_failed" | "unknown"
+  code: string   // "auth" | "llm_offline" | "llm_not_configured" | "db_error" | "table_resolve_failed" | "sql_gen_failed" | "network" | "validation" | "schema_failed" | "unknown"
   title: string  // shown as the error heading
   message: string // raw server message or fallback
   hint?: string  // actionable suggestion shown below
@@ -299,6 +301,12 @@ export default function ExplorerPage() {
   const [selectedConnection, setSelectedConnection] = useState<string>("")
   // Document connections (explorer_mode "document") browse one collection at a time.
   const [documentCollection, setDocumentCollection] = useState<string>("")
+  // The picked collection's database: a server-level connection lists several.
+  const [documentDatabase, setDocumentDatabase] = useState<string | undefined>(undefined)
+  const pickDocumentCollection = useCallback((name: string, database?: string) => {
+    setDocumentCollection(name)
+    setDocumentDatabase(database)
+  }, [])
   const [loadingConnections, setLoadingConnections] = useState(true)
 
   // Schema state
@@ -597,6 +605,8 @@ export default function ExplorerPage() {
       const cached = schemaCacheRef.current.get(cacheKey)
       const isFresh = cached && Date.now() - cached.cachedAt < SCHEMA_CACHE_TTL_MS
       if (!opts?.force && cached && isFresh) {
+        // A previous connection's failure must not stay on screen over this one's tables.
+        setSchemaError(null)
         setTables(cached.tables || [])
         setForeignKeys(cached.foreignKeys || [])
         setSchemaFromCache(true)
@@ -683,6 +693,7 @@ export default function ExplorerPage() {
       setForeignKeys([])
       setSelectedTables([])
       setSchemaFromCache(false)
+      setSchemaError(null)
     }
   }, [selectedConnection, loadSchema])
 
@@ -690,8 +701,8 @@ export default function ExplorerPage() {
   // MySQL-only, per-connection choice and shouldn't leak across connections.
   useEffect(() => {
     setAllDatabases(false)
-    setDocumentCollection("")
-  }, [selectedConnection])
+    pickDocumentCollection("")
+  }, [selectedConnection, pickDocumentCollection])
 
   // When the user focuses NL/SQL inputs, pause step updates and flush them on blur.
   const editorInteractingRef = useRef(false)
@@ -1510,12 +1521,9 @@ export default function ExplorerPage() {
         setQueryHistory(prev => [historyEntry, ...prev.slice(0, 19)])
         // Make history visible
         setShowHistory(true)
+        // No success toast: the Results header already says the rows (or rows
+        // affected) and the time, and the toast sat on top of it (#54).
         if (isWriteResult(statementType)) {
-          toast.success(
-            rowsAffected !== undefined
-              ? `${statementType} succeeded — ${pluralizeRows(rowsAffected)} affected`
-              : `${statementType} executed successfully`
-          )
           // The write just invalidated the schema we're showing. Row counts, and
           // the table list itself after a CREATE/DROP, are both wrong now — the
           // sidebar kept a row count of 3 for a table that had grown to 8 and
@@ -1527,8 +1535,6 @@ export default function ExplorerPage() {
             tableIndexCacheRef.current.delete(selectedConnection)
             void loadSchema({ force: true })
           }
-        } else {
-          toast.success(`Query executed in ${executionTimeMs}ms`)
         }
       }
     } catch (err) {
@@ -1823,13 +1829,22 @@ export default function ExplorerPage() {
               <div className="space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <Label className="text-xs capitalize">
-                      {databaseCount} {namespaceLabel} · {visibleTables.length} {isDocumentConn ? "collections" : "tables"}
+                    {/* A failed or in-flight schema load has no tables yet; a count
+                        here would read "0 databases" as if the cluster were empty. */}
+                    <Label
+                      className={cn("text-xs", schemaError && !loadingSchema && "text-red-600 dark:text-red-400")}
+                      data-testid="schema-count-label"
+                    >
+                      {loadingSchema
+                        ? `Loading ${namespaceLabel}…`
+                        : schemaError
+                        ? `Could not load ${namespaceLabel}`
+                        : <span className="capitalize">{databaseCount} {namespaceLabel} · {visibleTables.length} {isDocumentConn ? "collections" : "tables"}</span>}
                     </Label>
                     {schemaFromCache && visibleTables.length > 0 && (
                       <Badge
                         variant="outline"
-                        className="text-[9px] py-0 h-4 px-1.5 text-zinc-500 border-zinc-300 dark:border-zinc-700"
+                        className="text-[9px] py-0 h-4 px-1.5 text-zinc-500 dark:text-zinc-400 border-zinc-300 dark:border-zinc-700"
                         title="Schema and row counts are from a local cache (≤10 min old) and do not reflect changes made outside this tab. Click refresh to re-fetch from the database."
                       >
                         {schemaCacheAgeLabel ? `Cached · ${schemaCacheAgeLabel}` : "Cached"}
@@ -1879,7 +1894,7 @@ export default function ExplorerPage() {
                 <div className="flex flex-col items-center justify-center py-8 px-4 gap-2 text-center">
                   <AlertCircle className="h-5 w-5 text-red-400 shrink-0" />
                   <div className="text-xs font-semibold text-red-600 dark:text-red-400">{schemaError.title}</div>
-                  <div className="text-xs text-zinc-500 break-words">{schemaError.message}</div>
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400 break-words">{schemaError.message}</div>
                   {schemaError.hint && (
                     <div className="text-[11px] text-zinc-400 italic">{schemaError.hint}</div>
                   )}
@@ -1905,13 +1920,14 @@ export default function ExplorerPage() {
                     isDocumentConn
                       ? (qualified) => {
                           const t = visibleTables.find((x) => tableKeyFromMeta(x) === qualified || x.name === qualified)
-                          if (t) setDocumentCollection(t.name)
+                          if (t) pickDocumentCollection(t.name, t.schema || undefined)
                         }
                       : insertIntoEditor
                   }
                   onInsertColumn={isDocumentConn ? undefined : insertIntoEditor}
                   itemLabel={isDocumentConn ? "collections" : "tables"}
                   insertTitle={isDocumentConn ? "Open collection" : "Add to SQL"}
+                  namespaceLabel={namespaceLabel === "schemas" ? "Schema" : "Database"}
                   emptyHint={
                     selectedConnection
                       ? isDocumentConn ? "No collections found" : "No tables found"
@@ -1924,7 +1940,7 @@ export default function ExplorerPage() {
 
             {selectedTables.length > 0 && (
               <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs text-zinc-500">Selected:</span>
+                <span className="text-xs text-zinc-500 dark:text-zinc-400">Selected:</span>
                 {selectedTables.map(t => (
                   <Badge key={t} variant="secondary" className="text-[10px] gap-1">
                     {formatTableKeyForDisplay(t)}
@@ -1950,7 +1966,7 @@ export default function ExplorerPage() {
             >
               <PanelLeftOpen className="h-4 w-4 text-violet-500" />
             </Button>
-            <span className="text-[10px] font-medium text-zinc-500 [writing-mode:vertical-rl]">
+            <span className="text-[10px] font-medium text-zinc-500 dark:text-zinc-400 [writing-mode:vertical-rl]">
               Schema
             </span>
           </div>
@@ -1964,8 +1980,11 @@ export default function ExplorerPage() {
               connectionId={selectedConnection}
               collections={visibleTables}
               collection={documentCollection}
-              onCollectionChange={setDocumentCollection}
+              database={documentDatabase}
+              onCollectionChange={pickDocumentCollection}
               loadingCollections={loadingSchema}
+              collectionsError={schemaError}
+              onRetryCollections={() => loadSchema({ force: true })}
             />
           ) : (
           <>
@@ -2114,7 +2133,7 @@ export default function ExplorerPage() {
 
               {/* Actions */}
               <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2 text-xs text-zinc-500">
+                <div className="flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
                   <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">⌘</kbd>
                   <span>+</span>
                   <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">Enter</kbd>
@@ -2229,7 +2248,7 @@ export default function ExplorerPage() {
                     Results
                   </CardTitle>
                   <div className="flex items-center gap-4">
-                    <div className="flex items-center gap-4 text-xs text-zinc-500">
+                    <div className="flex items-center gap-4 text-xs text-zinc-500 dark:text-zinc-400">
                       {isWriteResult(queryResult.statement_type) ? (
                         <span>
                           {queryResult.statement_type}
@@ -2296,7 +2315,7 @@ export default function ExplorerPage() {
                     <div className="mt-3 text-sm font-medium text-zinc-800 dark:text-zinc-100">
                       {queryResult.statement_type} statement executed
                     </div>
-                    <div className="mt-1 text-xs text-zinc-500 max-w-md mx-auto">
+                    <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
                       {queryResult.rows_affected !== undefined
                         ? `${pluralizeRows(queryResult.rows_affected)} affected.`
                         : "The statement completed successfully."}
@@ -2312,7 +2331,7 @@ export default function ExplorerPage() {
                     <div className="mt-3 text-sm font-medium text-zinc-700 dark:text-zinc-200">
                       Query ran successfully — no rows matched
                     </div>
-                    <div className="mt-1 text-xs text-zinc-500 max-w-md mx-auto">
+                    <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
                       {queryResult.columns.length > 0
                         ? `The result set has ${queryResult.columns.length} column${queryResult.columns.length === 1 ? "" : "s"} but zero rows. Loosen your WHERE clause, or pick a different time range, then run again.`
                         : "The query returned zero rows. Loosen your WHERE clause or pick a different time range, then run again."}
@@ -2376,6 +2395,22 @@ export default function ExplorerPage() {
             </Card>
           )}
 
+          {/* Empty state: suggest where to start. Kept mounted (hidden) once the user has a
+              query, so the suggestions are still there if they clear the editor; keyed by
+              connection so switching connections starts over. */}
+          {selectedConnection && (
+            <div hidden={Boolean(queryResult || queryError || sqlQuery.trim())}>
+              <SuggestTablesCard
+                key={selectedConnection}
+                connectionId={selectedConnection}
+                selectedTables={selectedTables}
+                tableKey={tableKeyFromMeta}
+                onToggleTable={toggleTableSelection}
+                onStartQuery={insertIntoEditor}
+              />
+            </div>
+          )}
+
           {/* Exploration Details (below results) */}
           {/* explorationPanelRef target — Steps/History buttons scroll here */}
           <Card ref={explorationPanelRef}>
@@ -2420,7 +2455,7 @@ export default function ExplorerPage() {
               ) : (
                 <div className="h-[400px] overflow-auto rounded-md border p-1">
                   {queryHistory.length === 0 ? (
-                    <div className="text-sm text-zinc-500 py-6 text-center">
+                    <div className="text-sm text-zinc-500 dark:text-zinc-400 py-6 text-center">
                       No history yet. Run a query to populate this list.
                     </div>
                   ) : (
@@ -2500,7 +2535,7 @@ export default function ExplorerPage() {
                     )}
                   >
                     <span className="text-sm font-medium leading-tight">{tool.name}</span>
-                    <span className="text-[10px] text-zinc-500 leading-tight">{tool.description}</span>
+                    <span className="text-[10px] text-zinc-500 dark:text-zinc-400 leading-tight">{tool.description}</span>
                     {!tool.implemented && (
                       <span className="absolute top-1.5 right-1.5 text-[9px] font-medium text-zinc-400 bg-zinc-100 dark:bg-zinc-800 px-1 rounded">
                         soon
@@ -2531,7 +2566,7 @@ export default function ExplorerPage() {
               />
             </div>
             <div className="p-3 bg-zinc-50 dark:bg-zinc-900 rounded-lg">
-              <div className="text-xs text-zinc-500 mb-1">SQL Query</div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400 mb-1">SQL Query</div>
               <div className="font-mono text-xs text-zinc-600 dark:text-zinc-400 truncate">
                 {sqlQuery.slice(0, 120)}{sqlQuery.length > 120 ? "…" : ""}
               </div>
@@ -2767,6 +2802,11 @@ function classifyApiError(
   const serverHint: string | undefined =
     data && typeof data === "object" && typeof data.hint === "string" ? data.hint.trim() : undefined
 
+  // Checked before the status branches: its body's "error" is a code, not a
+  // sentence, and the generic 503 hint would blame a service that is healthy.
+  const noLlm = llmNotConfiguredError(data)
+  if (noLlm) return noLlm
+
   // Plan quota (Ship 3 Phase 2): a 402 from /sql/generate means the workspace is
   // over its monthly NL→SQL allowance. Direct SQL stays unlimited, so point there too.
   if (status === 402) {
@@ -2842,7 +2882,12 @@ function classifyApiError(
     }
   }
 
-  if (lower.includes("llm") || lower.includes("ollama") || lower.includes("chat completion") || lower.includes("model not")) {
+  // A schema load never calls the AI service, and its error carries database host
+  // names, where "llm" is an ordinary substring (a host named smallmart.example.net).
+  if (
+    context !== "schema" &&
+    (lower.includes("llm") || lower.includes("ollama") || lower.includes("chat completion") || lower.includes("model not"))
+  ) {
     return {
       code: "llm_error",
       title: "AI service error",
@@ -2908,11 +2953,28 @@ function classifyApiError(
     // module for why the one-marker test missed most real outages.
     const isDnsFailure = isNameResolutionFailure(lower)
     const isConnRefused = lower.includes("connection refused") || lower.includes("connect: refused")
+    // Rejected logins, across engines: MongoDB "bad auth : authentication failed" /
+    // "not authorized", Postgres "password authentication failed", MySQL "access denied for user".
+    const isAuthFailure =
+      lower.includes("authentication failed") || lower.includes("bad auth") ||
+      lower.includes("not authorized") || lower.includes("access denied for user")
+    // No answer at all: usually the host is wrong, or the database only accepts
+    // listed addresses (MongoDB "no reachable servers" / server selection timeouts).
+    // The Python driver ends every server selection timeout with "Timeout: 30s", also
+    // when the rest reads "No replica set members found yet".
+    const isNoAnswer =
+      lower.includes("timed out") || lower.includes("no reachable servers") ||
+      lower.includes("server selection") || lower.includes("i/o timeout") ||
+      lower.includes("timeout:")
     const hint = isDnsFailure
       ? "The database hostname could not be resolved. If running locally, check that the database Docker container is running (`docker compose up -d`)."
       : isConnRefused
       ? "The database server is unreachable. Check that it is running and the host/port are correct."
-      : "Check that the database connection is active, then click the refresh button to try again."
+      : isAuthFailure
+      ? "The database rejected the login. Check the username and password saved on this connection, and that the user can read this database, then retry."
+      : isNoAnswer
+      ? "The database did not answer. Check the host and port, and that the database accepts connections from this server's IP address (network access / IP allowlist), then retry."
+      : "Check the username and password saved on this connection, and that the database accepts connections from this server's IP address (network access / IP allowlist), then retry."
     return {
       code: "schema_failed",
       title: "Failed to load schema",

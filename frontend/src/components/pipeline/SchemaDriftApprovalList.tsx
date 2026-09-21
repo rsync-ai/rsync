@@ -147,7 +147,7 @@ export function SchemaDriftApprovalList({ pipelineId, destConnectorType, isCDC =
   const resolved = changes.filter((c) => c.status !== "pending")
 
   if (loading) {
-    return <div className="text-sm text-zinc-500">Loading schema changes…</div>
+    return <div className="text-sm text-zinc-500 dark:text-zinc-400">Loading schema changes…</div>
   }
 
   return (
@@ -238,7 +238,7 @@ export function SchemaDriftApprovalList({ pipelineId, destConnectorType, isCDC =
         <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-zinc-200 dark:border-zinc-800 py-12 text-center">
           <Check className="h-6 w-6 text-emerald-500" />
           <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300">You&apos;re all caught up</div>
-          <div className="text-xs text-zinc-500">
+          <div className="text-xs text-zinc-500 dark:text-zinc-400">
             {isCDC
               ? "New columns are applied as they stream in and are listed below once they arrive; drops and type changes appear here for you to review."
               : "No schema-drift changes are waiting for approval."}
@@ -301,7 +301,7 @@ function PendingCard({
         </span>
         <div className="min-w-0">
           <div className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate">{change.table_name}</div>
-          {change.user_message && <div className="text-xs text-zinc-500 truncate">{change.user_message}</div>}
+          {change.user_message && <div className="text-xs text-zinc-500 dark:text-zinc-400 truncate">{change.user_message}</div>}
         </div>
       </div>
 
@@ -416,7 +416,7 @@ function PendingCard({
           type="button"
           onClick={onApprove}
           disabled={approveDisabled}
-          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded bg-emerald-600 hover:bg-emerald-700 text-white disabled:opacity-40 disabled:cursor-not-allowed"
+          className="inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded bg-emerald-700 hover:bg-emerald-800 text-white disabled:opacity-40 disabled:cursor-not-allowed"
         >
           <Check className="h-3.5 w-3.5" />
           {advisory ? "Acknowledge" : manualApply ? "Approve (manual apply)" : "Approve"}
@@ -434,7 +434,7 @@ function ResolvedRow({ change }: { change: SchemaChange }) {
     <div className="rounded-md border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-900 px-3 py-2">
       <div className="flex items-center gap-2 text-xs">
         <span className={cn("font-semibold uppercase px-1.5 py-0.5 rounded", statusClass)}>{change.status}</span>
-        <span className="text-zinc-500">{label}</span>
+        <span className="text-zinc-500 dark:text-zinc-400">{label}</span>
         <span className="font-medium text-zinc-800 dark:text-zinc-200 truncate">{change.table_name}</span>
       </div>
       {change.status === "approved" && isManualApply(change) && (

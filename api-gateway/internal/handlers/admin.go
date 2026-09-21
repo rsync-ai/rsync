@@ -243,10 +243,18 @@ func AdminListExecutions(c *gin.Context) {
 	where := "WHERE e.id <> e.pipeline_id"
 	argIdx := 1
 
+	// Filter on the status the row reports (executionStatusSQL), the same one the
+	// workspace Executions page shows, so a live CDC stream reads 'running' here too.
 	if status != "" {
-		where += " AND e.status = $" + strconv.Itoa(argIdx)
-		args = append(args, status)
-		argIdx++
+		// The UI offers one "Success" and one "Failed"; rows store either spelling.
+		values := adminExecutionStatusValues(status)
+		placeholders := make([]string, len(values))
+		for i, v := range values {
+			placeholders[i] = "$" + strconv.Itoa(argIdx)
+			args = append(args, v)
+			argIdx++
+		}
+		where += " AND (" + executionStatusSQL + ") IN (" + strings.Join(placeholders, ", ") + ")"
 	}
 	if q != "" {
 		where += " AND (e.id::text ILIKE $" + strconv.Itoa(argIdx) + " OR e.pipeline_id::text ILIKE $" + strconv.Itoa(argIdx) + " OR COALESCE(p.name,'') ILIKE $" + strconv.Itoa(argIdx) + " OR COALESCE(u.email,'') ILIKE $" + strconv.Itoa(argIdx) + ")"
@@ -257,8 +265,7 @@ func AdminListExecutions(c *gin.Context) {
 	var total int64
 	countQuery := `
 		SELECT COUNT(*)
-		FROM executions e
-		LEFT JOIN pipelines p ON p.id = e.pipeline_id
+	` + executionFromSQL + `
 		LEFT JOIN users u ON u.id = p.created_by
 	` + "\n" + where
 	if err := database.QueryRow(countQuery, args...).Scan(&total); err != nil {
@@ -277,12 +284,11 @@ func AdminListExecutions(c *gin.Context) {
 			COALESCE(e.pipeline_id::text, '') AS pipeline_id,
 			COALESCE(p.name, '') AS pipeline_name,
 			COALESCE(u.email, '') AS created_by_email,
-			e.status,
+			` + executionStatusSQL + ` AS status,
 			e.start_time,
-			e.end_time,
+			` + executionEndTimeSQL + ` AS end_time,
 			e.error_message
-		FROM executions e
-		LEFT JOIN pipelines p ON p.id = e.pipeline_id
+	` + executionFromSQL + `
 		LEFT JOIN users u ON u.id = p.created_by
 	` + "\n" + where + "\n" +
 		"ORDER BY e.start_time DESC " +
@@ -478,4 +484,20 @@ func AdminGetPipelineEventsRaw(c *gin.Context) {
 		"events":       out,
 		"limit":        limit,
 	})
+}
+
+// adminExecutionStatusValues maps the Admin → Executions status filter onto the
+// spellings executionStatusSQL can return for it (#53: the filter was free text,
+// so "success" missed every row stored as "completed").
+func adminExecutionStatusValues(status string) []string {
+	switch strings.ToLower(status) {
+	case "success", "completed":
+		return []string{"success", "completed"}
+	case "failed", "error":
+		return []string{"failed", "error", "credential_check_failed", "silent_drop_detected", "silent_partial_drop_detected"}
+	case "cancelled", "canceled":
+		return []string{"cancelled", "canceled"}
+	default:
+		return []string{strings.ToLower(status)}
+	}
 }

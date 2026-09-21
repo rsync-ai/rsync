@@ -118,6 +118,10 @@ func TestDeletePipeline_MemberCanDeleteSharedPipeline(t *testing.T) {
 	mock.ExpectExec(`DELETE FROM executions`).
 		WithArgs(wsScopePipeline, wsScopeWS).
 		WillReturnResult(sqlmock.NewResult(0, 0))
+	// Model schedules left with no upstream are paused inside the same transaction.
+	mock.ExpectExec(`UPDATE saved_query_schedules s`).
+		WithArgs(wsScopePipeline).
+		WillReturnResult(sqlmock.NewResult(0, 0))
 	// Pipeline delete is workspace-scoped; one row affected → 200.
 	mock.ExpectExec(`DELETE FROM pipelines WHERE id=\$1 AND workspace_id=\$2`).
 		WithArgs(wsScopePipeline, wsScopeWS).

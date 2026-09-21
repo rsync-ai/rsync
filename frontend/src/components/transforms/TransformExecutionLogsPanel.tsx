@@ -55,7 +55,7 @@ export function TransformExecutionLogsPanel(props: {
   }, [logs])
 
   if (!logs || logs.length === 0) {
-    return <div className={cn("text-sm text-zinc-500", className)}>{emptyLabel || "No transform execution logs yet."}</div>
+    return <div className={cn("text-sm text-zinc-500 dark:text-zinc-400", className)}>{emptyLabel || "No transform execution logs yet."}</div>
   }
 
   return (
@@ -64,7 +64,7 @@ export function TransformExecutionLogsPanel(props: {
         <div key={table} className="space-y-2">
           <div className="flex items-center justify-between">
             <div className="font-semibold text-zinc-900 dark:text-white">{table}</div>
-            <div className="text-xs text-zinc-500">{arr.length} transforms</div>
+            <div className="text-xs text-zinc-500 dark:text-zinc-400">{arr.length} transforms</div>
           </div>
 
           <div className="space-y-2">
@@ -100,7 +100,7 @@ function TransformLogRow({ log }: { log: TransformExecutionLog }) {
             <div className="font-medium text-zinc-900 dark:text-white truncate">{log.transform_type}</div>
             <Badge variant={statusBadgeVariant(log.status)}>{String(log.status || "unknown")}</Badge>
           </div>
-          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-zinc-500">
+          <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
             <span>
               Rows: {formatCount(log.input_rows)} <span aria-hidden="true">→</span> {formatCount(log.output_rows)} • Duration: {durLabel}
             </span>

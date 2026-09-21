@@ -25,12 +25,14 @@ Two layers, because CI and a laptop can check different things:
      asserts exit 0. It skips without helm -- and a skip is not a pass, which is
      exactly why layer 1 does not depend on it.
 
-This used to say CI "has NO helm binary", and that was the wrong reason for a
-right decision. Layer 1 is load-bearing because it needs nothing installed, not
-because of what any runner happens to carry -- and what a runner carries is not
-something to inherit either way. ci.yml's llm-service-unit job now arranges helm
-itself, `azure/setup-helm` followed by an explicit `helm version`, so a runner
-without it reds the job instead of quietly skipping eight cases.
+This used to say CI "has NO helm binary", and that was false. ci.yml installs
+none, but all thirteen of its jobs run on self-hosted developer Macs that
+already have it, so the render layer has been running in CI all along: in run
+33992967900, test_every_documented_install_block_renders reports PASSED, not
+SKIPPED, on rahul-mac-m2. The distinction the two layers draw is still worth
+keeping, because helm's presence there was an accident of somebody's laptop --
+which is why ci.yml's llm-service-unit job now asserts `helm version` outright,
+so a runner without it reds the job instead of quietly skipping eight cases.
 
 Scope, stated so the next reader does not think it is broader than it is: only
 blocks that set secrets INLINE are checked. Blocks of the shape

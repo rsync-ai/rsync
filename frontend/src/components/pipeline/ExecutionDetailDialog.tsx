@@ -93,7 +93,7 @@ export function statusPresentation(status: string) {
     completed: { icon: CheckCircle2, color: "text-green-600", label: "Completed" },
     failed: { icon: XCircle, color: "text-red-600", label: "Failed" },
     cancelled: { icon: XCircle, color: "text-zinc-400", label: "Cancelled" },
-    pending: { icon: Clock, color: "text-zinc-500", label: "Pending" },
+    pending: { icon: Clock, color: "text-zinc-500 dark:text-zinc-400", label: "Pending" },
   }
   return configs[status] || configs.pending
 }
@@ -415,16 +415,16 @@ export function ExecutionDetailDialog({
           {/* Facts that need no derivation. */}
           <div className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
             <div>
-              <div className="text-xs text-zinc-500">Started</div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">Started</div>
               <div className="text-sm font-medium">
                 {formatRelativeTime(new Date(run.start_time))}
               </div>
-              <div className="text-xs text-zinc-500">
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">
                 {formatDateTime(new Date(run.start_time))}
               </div>
             </div>
             <div>
-              <div className="text-xs text-zinc-500">Wall clock</div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">Wall clock</div>
               <div className="text-sm font-medium">
                 {timeline.totalMs !== null
                   ? formatDuration(timeline.totalMs)
@@ -434,7 +434,7 @@ export function ExecutionDetailDialog({
               </div>
             </div>
             <div>
-              <div className="text-xs text-zinc-500">Tables</div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">Tables</div>
               <div className="text-sm font-medium">
                 {rollup ? rollup.tableCount.toLocaleString() : "—"}
                 {rollup && rollup.failedTables > 0 && (
@@ -443,7 +443,7 @@ export function ExecutionDetailDialog({
               </div>
             </div>
             <div>
-              <div className="text-xs text-zinc-500">Dropped (DLQ)</div>
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">Dropped (DLQ)</div>
               <div
                 className={`text-sm font-medium ${
                   rollup && rollup.dlqRows > 0 ? "text-red-600" : ""
@@ -484,7 +484,7 @@ export function ExecutionDetailDialog({
                     </span>
                   </span>
                 )}
-                <span className="font-mono text-zinc-500">
+                <span className="font-mono text-zinc-500 dark:text-zinc-400">
                   vs {delta.previousId.slice(0, 8)}
                 </span>
               </div>
@@ -499,7 +499,7 @@ export function ExecutionDetailDialog({
             ) : timeline.phases.some((p) => p.ms !== null) ? (
               <TimeBreakdown timeline={timeline} />
             ) : (
-              <div className="text-xs text-zinc-500">
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">
                 {!coreLoaded
                   ? "Loading…"
                   : "No stage timings were recorded for this run, so the wall clock cannot be broken down."}
@@ -548,7 +548,7 @@ export function ExecutionDetailDialog({
                                 one; stay silent rather than guess when it did not. */}
                             {t.destination_qualified_name &&
                               t.destination_qualified_name !== t.qualified_name && (
-                                <span className="block text-[10px] font-normal text-zinc-500">
+                                <span className="block text-[10px] font-normal text-zinc-500 dark:text-zinc-400">
                                   → {t.destination_qualified_name}
                                 </span>
                               )}
@@ -574,7 +574,7 @@ export function ExecutionDetailDialog({
                 </Table>
               </div>
             ) : (
-              <div className="text-xs text-zinc-500">
+              <div className="text-xs text-zinc-500 dark:text-zinc-400">
                 {!coreLoaded ? "Loading…" : "No per-table statistics were recorded for this run."}
               </div>
             )}
@@ -597,7 +597,7 @@ export function ExecutionDetailDialog({
               once the sections above have resolved. Say so, rather than letting a
               verdict panel appear from nowhere a second later. */}
           {diagnosing && !diagnosis && (
-            <div className="rounded-md border border-zinc-200 bg-zinc-50 p-4 text-xs text-zinc-500 dark:border-zinc-800 dark:bg-zinc-900/40">
+            <div className="rounded-md border border-zinc-200 bg-zinc-50 p-4 text-xs text-zinc-500 dark:text-zinc-400 dark:border-zinc-800 dark:bg-zinc-900/40">
               Looking for a diagnosis…
             </div>
           )}
@@ -609,7 +609,7 @@ export function ExecutionDetailDialog({
                 <Badge variant="outline" className="font-normal">
                   {diagnosis.category || "unknown"}
                 </Badge>
-                <span className="text-xs font-normal text-zinc-500">
+                <span className="text-xs font-normal text-zinc-500 dark:text-zinc-400">
                   confidence {(diagnosis.confidence * 100).toFixed(0)}%
                 </span>
               </div>

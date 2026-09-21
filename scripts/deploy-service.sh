@@ -29,6 +29,13 @@ cd "$REPO_DIR"
 echo "=== git pull ==="
 git pull origin main
 
+# Build info for GET /version and the admin drift check (docker-compose.yml's
+# x-build-info build args). Set after the pull so it names the code being built.
+GIT_COMMIT="$(git rev-parse HEAD)"
+BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+export GIT_COMMIT BUILD_TIME
+echo "=== building commit $GIT_COMMIT ==="
+
 for SERVICE in "$@"; do
   echo ""
   echo "=== building $SERVICE ==="

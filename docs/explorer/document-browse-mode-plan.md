@@ -184,7 +184,6 @@ precedent in `latest.json`'s changelog.
   - Byte cap.
   - Timeout mapping.
   - No write method reachable from `find`.
-- Run offline: `PYTHONPATH=…; cd <connector dir> && pytest -q`.
 
 ### PR 2 — Orchestrator + gateway (size: M)
 
@@ -250,12 +249,10 @@ Also observed in the GUI: Load more 50 → 100 with 0 duplicate `_id`s; `{"$wher
 Offline: connector pytest 63/63 (+ mutation run, 11/12 killed, survivor equivalent), live connector 19/19 vs mongo:7, gateway + orchestrator `go test` green, frontend vitest + `tsc` clean.
 Not yet run live: items 6 (cross-workspace 404 — covered by handler test only), 8 (real `maxTimeMS` via the gateway) and 9 (gateway-allowlist mutation end to end).
 
-## 8. Definition of done
+## 8. Documentation and connector housekeeping
 
-- Tests and the §7 evidence above.
-- `docs/explorer/saved-queries-and-models.md`: replace "deferred" with a link to this doc.
-- The §9 items are tracked as follow-ups.
-- Connector: no template sync (hand-curated) and no Patch Sync Ledger entry. The change is a new tool, not a bug fix.
+- The Explorer guide ([saved-queries-and-models.md](saved-queries-and-models.md)) links here where it previously said document browsing was deferred.
+- Connector: no template sync (hand-curated) and no patch-sync-ledger entry. The change is a new tool, not a bug fix.
 
 ## 9. Follow-ups (not in these PRs)
 

@@ -28,7 +28,7 @@ internal RPC. The security property lives in `internal/spec` (allow-by-construct
 Every `/v1/*` request must carry `X-Internal-Secret: <INTERNAL_SERVICE_SECRET>`.
 Mirror `tool_generator/deployment/routes.py::require_internal_secret`:
 - secret set + header matches ⇒ allow; mismatch/absent ⇒ `401`.
-- secret **unset**: `ENVIRONMENT` prod ⇒ `503 internal_secret_not_configured` (fail-closed); dev ⇒ allow (log a warning).
+- secret **unset**: allow (log a warning) only when `ENVIRONMENT` is exactly `development` or `dev` (trimmed, any case); every other value, unset included ⇒ `503 internal_secret_not_configured`.
 
 ## POST /v1/deploy — build-if-missing + run (the JIT connector spawn)
 

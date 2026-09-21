@@ -94,8 +94,9 @@ func TestPipelineReadEndpoints_ForeignActiveWorkspace_Return404(t *testing.T) {
 			if err != nil {
 				t.Fatalf("sqlmock: %v", err)
 			}
-			defer sqlDB.Close()
+			prev := db.DB
 			db.DB = sqlDB
+			t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 
 			// The pipeline exists and the caller is a member of its owning
 			// workspace — but that workspace is not the ACTIVE one, so the
@@ -130,8 +131,9 @@ func TestListPipelineSchedules_ActiveWorkspaceOwnsPipeline_Allowed(t *testing.T)
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	defer sqlDB.Close()
+	prev := db.DB
 	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 
 	// A VIEWER in the active workspace that owns the pipeline: reads are allowed,
 	// so the tightened gate must not have turned a read endpoint into a

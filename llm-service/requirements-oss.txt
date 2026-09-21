@@ -1,8 +1,9 @@
 # OSS connector-lifecycle image dependencies.
 #
-# Deliberately minimal: the community image serves only /health + /v1/deploy. It
-# carries NONE of the generation / NLP / LLM libraries (spaCy, presidio, openai,
-# anthropic, ...) — smaller image, smaller attack surface, and no path to the moat.
+# Deliberately minimal: the community image serves /health, /v1/deploy and the
+# deterministic /v1/generate. It carries NONE of the NLP / LLM libraries (spaCy,
+# presidio, openai, anthropic, ...) — smaller image, smaller attack surface, and no
+# path to the moat. Nothing here reaches a model or a paid API.
 #
 # The `docker` Python SDK IS required: deployment/docker_builder.py orchestrates every
 # JIT connector build/start through it (docker.from_env(); client.images.build/get;
@@ -20,3 +21,21 @@ uvicorn[standard]>=0.52.4
 httpx>=0.28.1
 pydantic>=2.13.5
 docker>=7.2.0
+
+# The deterministic renderer behind /v1/generate:
+#
+#   jinja2    generator/builder.py renders connector.py from templates/*.j2
+#   packaging schemas/versioning.py parses spec versions; schemas/__init__ imports it
+#   pyyaml    the scaffolder reads YAML OpenAPI documents, and most published specs are
+#             YAML. uvicorn[standard] already pulls it in transitively; declared here
+#             because the community image now DEPENDS on it, and an undeclared
+#             dependency disappears the day that extra drops it.
+#
+# All three are reached LAZILY — the render imports happen inside the request handler,
+# not at module scope — so `import src.lifecycle.main` succeeds with every one of them
+# missing and the service boots, healthy, and then 500s on the first generate. An
+# import-closure check therefore cannot cover this list. scripts/oss-leak-proof-test.sh
+# renders a real connector inside the built image instead (check G).
+jinja2>=3.1.6
+packaging>=26.3
+pyyaml>=6.0.3

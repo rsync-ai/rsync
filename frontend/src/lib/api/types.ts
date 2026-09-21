@@ -295,6 +295,14 @@ export interface BlockingReasonDetails {
   source_connection_id?: string
   destination_connection_id?: string
   source_type?: string
+  // The database a table-selection pause lists (#14); "" when the tables span several.
+  source_database?: string
+  // The source connection names no database (a server-level MySQL/MongoDB/
+  // ClickHouse connection): its databases are mirrored at the destination.
+  source_server_level?: boolean
+  // Discovery totals: the source's table count, and whether available_tables is only part of it.
+  total_tables_available?: number
+  tables_truncated?: boolean
   destination_type?: string
   node_id?: string
   user_request?: string
@@ -360,6 +368,10 @@ export interface PipelineStateResponse {
       progress?: number
       started_at?: string
       completed_at?: string
+      /** Milliseconds the adapter timed the stage at; read via `stageDurationMs()`. */
+      actual_duration_ms?: number
+      /** Legacy whole seconds, for plans persisted before `actual_duration_ms`. */
+      actual_duration?: number
     }>
   }
 }

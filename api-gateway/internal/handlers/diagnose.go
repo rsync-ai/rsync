@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -68,6 +69,14 @@ func DiagnosePipeline(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	verdict, status, err := callDiagnoseLLM(ctx, pipelineID, evidence)
+	var notSetUp *llmNotConfiguredError
+	if errors.As(err, &notSetUp) {
+		// No model to explain it; the evidence still helps on-call.
+		body := notSetUp.Body()
+		body["evidence"] = evidence
+		c.JSON(http.StatusServiceUnavailable, body)
+		return
+	}
 	if err != nil {
 		// Even if the LLM call fails we still return the evidence — that's
 		// useful by itself for on-call.
@@ -309,6 +318,9 @@ func callDiagnoseLLM(ctx context.Context, pipelineID string, evidence map[string
 	}
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
+	if h, ok := llmNotConfiguredBody(resp.StatusCode, respBody); ok {
+		return nil, resp.StatusCode, &llmNotConfiguredError{body: h}
+	}
 	if resp.StatusCode >= 400 {
 		return nil, resp.StatusCode, fmt.Errorf("llm-service returned %d: %s", resp.StatusCode, truncate(string(respBody), 300))
 	}

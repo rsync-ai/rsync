@@ -255,6 +255,19 @@ var catalog = map[string]Entry{
 		Severity:    severityWarning,
 	},
 
+	// ── Pre-migration assessment ────────────────────────────────────────────
+	// Raised by the gateway itself (handlers/assessment_checks.go) when an
+	// assessment run — manual, the run gate, or the periodic re-check of a
+	// running CDC pipeline — finds a Critical or High issue the previous run
+	// did not have. The body lists the checks and tables. No Severity override:
+	// the event says critical when a new issue blocks the start, warning when
+	// the new issues are all High.
+	"PRE_MIGRATION_ASSESSMENT_ISSUE": {
+		Title:       "The assessment found a new issue in {source}",
+		Impact:      "Open the Assessment tab to see which check changed and how to fix it.",
+		ActionLabel: "View assessment",
+	},
+
 	// ── Unclassified. These two are why the bell used to read
 	//    "LEGACY_UNCLASSIFIED": both are placeholders meaning "we couldn't
 	//    classify this", which is meaningless to a customer. The raw failure

@@ -27,7 +27,6 @@ import { DashboardStatsRefresher } from "@/components/dashboard/DashboardStatsRe
 import { API_GATEWAY_URL, API_GATEWAY_URL_INTERNAL } from "@/lib/config/api"
 import { formatRelativeTime } from "@/lib/utils"
 import { cookies } from "next/headers"
-import { ORCHESTRATOR_URL, ORCHESTRATOR_URL_INTERNAL } from "@/lib/config/api"
 
 export const dynamic = "force-dynamic"
 
@@ -66,28 +65,13 @@ async function fetchGatewayJSON(path: string) {
   return null
 }
 
-async function fetchOrchestratorJSON(path: string) {
-  const baseUrls = [ORCHESTRATOR_URL_INTERNAL, ORCHESTRATOR_URL].filter(Boolean)
-  // This runs server-side (RSC). The orchestrator's CDC endpoints now require a
-  // principal (they are no longer anonymously reachable over /orchestrator), so
-  // present the shared internal-service secret. INTERNAL_SERVICE_SECRET is a
-  // server-only env var — it must NOT be exposed as NEXT_PUBLIC_*.
-  const internalSecret = process.env.INTERNAL_SERVICE_SECRET
-  const headers: Record<string, string> = {}
-  if (internalSecret) headers["X-Internal-Secret"] = internalSecret
-  for (const baseUrl of baseUrls) {
-    try {
-      const res = await fetch(`${baseUrl}${path}`, {
-        cache: "no-store",
-        headers,
-      }).catch(() => null)
-      if (!res || !res.ok) continue
-      return await res.json()
-    } catch {
-      // try next baseUrl
-    }
-  }
-  return null
+// The pipelines list API returns `derived_status` (running|passed|failed|stopped|
+// paused|scheduled|idle): the same answer the Pipelines page badges. The raw
+// `status` column says "active" for a streaming CDC pipeline, which is how Home
+// read "0 running" while the pipeline page said Running.
+type PipelineStatusFields = { derived_status?: string | null; pipeline_status?: string | null; status?: string | null }
+function pipelineStatusOf(p: PipelineStatusFields | null | undefined): string {
+  return String(p?.derived_status || p?.pipeline_status || p?.status || "")
 }
 
 // Fetch stats from backend orchestrator API
@@ -95,12 +79,15 @@ async function getStats() {
   try {
     // Fetch generic endpoints instead of CDC-specific ones.
     // Important: these endpoints are user-scoped, so we must forward cookies from the incoming request.
-    const [pipelinesDataRaw, sourcesDataRaw, destinationsDataRaw, executionsDataRaw, cdcPipelinesRaw, usageDataRaw] = await Promise.all([
+    // CDC pipelines are rows of the same workspace-scoped pipelines list. They were
+    // also fetched from the orchestrator's /cdc/data-pipelines, which (called with
+    // the internal secret and no user) returned EVERY tenant's CDC pipelines: they
+    // were counted twice and other workspaces' pipelines showed under "Recent".
+    const [pipelinesDataRaw, sourcesDataRaw, destinationsDataRaw, executionsDataRaw, usageDataRaw] = await Promise.all([
       fetchGatewayJSON("/api/v1/pipelines"),
       fetchGatewayJSON("/api/v1/connections?type=source"),
       fetchGatewayJSON("/api/v1/connections?type=destination"),
       fetchGatewayJSON("/api/v1/executions"),
-      fetchOrchestratorJSON("/api/v1/cdc/data-pipelines"),
       fetchGatewayJSON("/api/v1/usage"),
     ])
 
@@ -114,8 +101,6 @@ async function getStats() {
     const sources = sourcesData.connections || []
     const destinations = destinationsData.connections || []
     const executions = executionsData.executions || []
-
-    const cdcPipelines = Array.isArray(cdcPipelinesRaw) ? cdcPipelinesRaw : []
 
     // Build connection lookup by id to enrich pipelines list.
     const connectionById = new Map<string, any>()
@@ -140,27 +125,12 @@ async function getStats() {
       }
     })
 
-    const mappedCdcPipelines = cdcPipelines.map((p: any) => ({
-      id: p.id,
-      name: p.name || `CDC Pipeline ${String(p.id || "").slice(0, 8)}`,
-      status: p.status || "running",
-      source_type: p.source_type || "source",
-      destination_type: p.destination_type || "destination",
-      created_at: p.started_at || p.created_at || null,
-      updated_at: p.last_record_at || p.updated_at || p.started_at || null,
-      __kind: "cdc",
-    }))
-
     // Count pipeline statuses (if not provided by API)
     const pipelineStats = {
-      total: (pipelinesData.total || pipelines.length) + mappedCdcPipelines.length,
-      running:
-        pipelines.filter((p: any) => p.status === "running").length +
-        mappedCdcPipelines.filter((p: any) => p.status === "running").length,
-      completed: pipelines.filter((p: any) => p.status === "active" || p.status === "completed").length,
-      failed:
-        pipelines.filter((p: any) => p.status === "failed").length +
-        mappedCdcPipelines.filter((p: any) => p.status === "failed").length,
+      total: pipelinesData.total || pipelines.length,
+      running: pipelines.filter((p: PipelineStatusFields) => pipelineStatusOf(p) === "running").length,
+      completed: pipelines.filter((p: PipelineStatusFields) => ["passed", "completed"].includes(pipelineStatusOf(p))).length,
+      failed: pipelines.filter((p: PipelineStatusFields) => pipelineStatusOf(p) === "failed").length,
     }
 
     // Use execution stats from API if available, otherwise calculate
@@ -173,7 +143,7 @@ async function getStats() {
     // Ensure total is set if missing in stats
     if (!executionStats.total) executionStats.total = executionsData.total || executions.length
 
-    const recentPipelines = [...mappedCdcPipelines, ...enrichedRegularPipelines]
+    const recentPipelines = [...enrichedRegularPipelines]
       .sort((a: any, b: any) => {
         const at = a.updated_at || a.created_at || 0
         const bt = b.updated_at || b.created_at || 0
@@ -226,7 +196,7 @@ function StatCard({ title, value, icon: Icon, color, bgColor, subtitle, href }: 
           {value}
         </p>
         {subtitle && (
-          <p className="text-xs text-zinc-400 dark:text-zinc-500">{subtitle}</p>
+          <p className="text-xs text-zinc-400">{subtitle}</p>
         )}
       </div>
       <div className={`rounded-full p-3 ${bgColor}`}>
@@ -276,11 +246,9 @@ function RecentPipelines({ pipelines }: { pipelines: any[] }) {
     )
   }
 
-  // The pipelines list API returns `derived_status` (running|passed|failed|stopped|
-  // paused|scheduled|idle); CDC pipelines carry `status`. Reading `pipeline.status`
-  // alone left every card on the default Clock icon (ISSUE-003).
-  const pipeStatus = (p: any): string =>
-    String(p?.derived_status || p?.pipeline_status || p?.status || '')
+  // Reading `pipeline.status` alone left every card on the default Clock icon
+  // (ISSUE-003); see pipelineStatusOf.
+  const pipeStatus = pipelineStatusOf
 
   const getStatusIcon = (status: string) => {
     switch (status) {
@@ -332,7 +300,7 @@ function RecentPipelines({ pipelines }: { pipelines: any[] }) {
                 {pipeline.name || `Pipeline ${pipeline.id?.slice(0, 8)}`}
               </p>
               {/* Fallback to generic text if connection details aren't populated yet */}
-              <p className="text-sm text-zinc-500">
+              <p className="text-sm text-zinc-500 dark:text-zinc-400">
                 {(pipeline.source_connection?.name || pipeline.source_connection?.connector_type || pipeline.source_type || "Source")}{" "}
                 →{" "}
                 {(pipeline.destination_connection?.name || pipeline.destination_connection?.connector_type || pipeline.destination_type || "Destination")}
@@ -381,7 +349,7 @@ function RecentExecutions({ executions }: { executions: any[] }) {
       case 'failed':
         return <XCircle className="h-4 w-4 text-red-600" />
       case 'cancelled':
-        return <XCircle className="h-4 w-4 text-zinc-500" />
+        return <XCircle className="h-4 w-4 text-zinc-500 dark:text-zinc-400" />
       default:
         return <Clock className="h-4 w-4 text-zinc-400" />
     }
@@ -400,7 +368,7 @@ function RecentExecutions({ executions }: { executions: any[] }) {
             <p className="text-sm font-medium text-zinc-900 dark:text-zinc-100 truncate group-hover:text-violet-600 transition-colors">
               {execution.pipeline_name || execution.pipeline?.name || `Execution ${execution.id?.slice(0, 8)}`}
             </p>
-            <p className="text-xs text-zinc-500">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
               {execution.start_time || execution.startedAt ? formatRelativeTime(execution.start_time || execution.startedAt) : 'Pending'}
             </p>
           </div>
@@ -545,7 +513,7 @@ export default async function HomePage() {
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <div>
               <CardTitle className="flex items-center gap-2 text-base">
-                <GitBranch className="h-5 w-5 text-zinc-500" />
+                <GitBranch className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
                 Your Pipelines
               </CardTitle>
               <CardDescription>
@@ -570,7 +538,7 @@ export default async function HomePage() {
           <CardHeader className="flex flex-row items-center justify-between pb-2">
             <div>
               <CardTitle className="flex items-center gap-2 text-base">
-                <History className="h-5 w-5 text-zinc-500" />
+                <History className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
                 Recent Runs
               </CardTitle>
               <CardDescription>

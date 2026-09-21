@@ -26,7 +26,11 @@ import {
   SelectValue,
 } from "@/components/ui/select"
 import { Loader2, Clock, RefreshCw, Eye, RotateCcw } from "lucide-react"
-import { formatRelativeTime, formatDateTime } from "@/lib/utils"
+import { formatRelativeTime } from "@/lib/utils"
+// Was a local copy that floored to whole seconds, so this tab and the pipeline
+// list disagreed about the same execution ("0s" vs "500ms").
+import { formatDurationBetween as formatDuration } from "@/lib/duration"
+import { LocalDateTime } from "@/components/ui/local-date-time"
 import { listExecutionsResponse } from "@/lib/api/executions"
 import {
   executePipelineWithRunMode,
@@ -43,24 +47,6 @@ import { toast } from "sonner"
 
 interface ExecutionHistoryTabProps {
   pipelineId: string
-}
-
-function formatDuration(startTime: string, endTime?: string | null): string {
-  const start = new Date(startTime).getTime()
-  const end = endTime ? new Date(endTime).getTime() : Date.now()
-  const durationMs = end - start
-  
-  const seconds = Math.floor(durationMs / 1000)
-  const minutes = Math.floor(seconds / 60)
-  const hours = Math.floor(minutes / 60)
-  
-  if (hours > 0) {
-    return `${hours}h ${minutes % 60}m`
-  }
-  if (minutes > 0) {
-    return `${minutes}m ${seconds % 60}s`
-  }
-  return `${seconds}s`
 }
 
 export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
@@ -255,8 +241,9 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
                       <div className="text-sm">
                         {formatRelativeTime(new Date(execution.start_time))}
                       </div>
-                      <div className="text-xs text-zinc-500">
-                        {formatDateTime(new Date(execution.start_time))}
+                      <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                        {/* Names its zone (#56 retest: the bare "18 Sep, 04:30" gave none). */}
+                        <LocalDateTime value={execution.start_time} fallback="—" />
                       </div>
                     </TableCell>
 
@@ -390,6 +377,7 @@ export function ExecutionHistoryTab({ pipelineId }: ExecutionHistoryTabProps) {
           }
         }}
         report={assessmentReport}
+        assessmentTabHref={`/pipelines/${pipelineId}?tab=assessment`}
         submitting={submittingProceed}
         onProceed={async (nominatedKeys) => {
           if (!pendingRunMode) return

@@ -5,7 +5,8 @@ import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { Card, CardContent } from "@/components/ui/card"
 import { ArrowLeft, MessageSquare } from "lucide-react"
-import { formatDateTime, formatRelativeTime } from "@/lib/utils"
+import { formatRelativeTime } from "@/lib/utils"
+import { LocalDateTime } from "@/components/ui/local-date-time"
 import { PipelineActions } from "@/components/pipeline/PipelineActions"
 import { CDCPipelineActions } from "@/components/pipeline/CDCPipelineActions"
 import { PipelineExecutionStatusBadge } from "@/components/pipeline/PipelineExecutionStatusBadge"
@@ -15,6 +16,7 @@ import { PipelineHeaderOverflowMenu } from "@/components/pipeline/PipelineHeader
 import { PipelineCreateScheduleButton } from "@/components/pipeline/PipelineCreateScheduleButton"
 import { PipelineDetailTabsClient } from "@/components/pipeline/PipelineDetailTabsClient"
 import { API_ENDPOINTS, API_GATEWAY_URL_INTERNAL } from "@/lib/config/api"
+import { connectionIsCDC, pipelineIsCDC } from "@/lib/pipeline/syncMode"
 import { cookies } from "next/headers"
 import { activeWorkspaceCookieHeader } from "@/lib/workspace/server-workspace"
 
@@ -49,12 +51,17 @@ async function getRegularPipeline(id: string) {
     const rawPipeline = await res.json()
     if (!rawPipeline) return null
 
-    let inferredType =
-      rawPipeline?.sync_mode === "cdc" || rawPipeline?.cdc_mode ? ("cdc" as const) : ("etl" as const)
+    // An explicit sync_mode wins; cdc_mode alone is not a CDC signal (see
+    // lib/pipeline/syncMode.ts). The old `sync_mode === "cdc" || cdc_mode` test
+    // badged batch pipelines "CDC" because they carry the connection's
+    // cdc_mode='initial' column default.
+    const pipelineMode = pipelineIsCDC(rawPipeline)
+    let inferredType = pipelineMode ? ("cdc" as const) : ("etl" as const)
 
-    // If the pipeline didn't persist sync_mode yet, fall back to the source connection default.
-    // This prevents CDC pipelines from ever showing scheduler UI.
-    if (inferredType !== "cdc" && rawPipeline?.source_connection_id) {
+    // Only when the pipeline persisted no mode at all, fall back to the source
+    // connection's sync_mode. This prevents legacy CDC pipelines from showing
+    // scheduler UI without overriding an explicit sync_mode="batch".
+    if (pipelineMode === null && rawPipeline?.source_connection_id) {
       try {
         const connRes = await fetch(`${API_GATEWAY_URL_INTERNAL}/api/v1/connections/${rawPipeline.source_connection_id}`, {
           cache: "no-store",
@@ -63,7 +70,7 @@ async function getRegularPipeline(id: string) {
         })
         if (connRes.ok) {
           const conn = await connRes.json()
-          if (conn?.sync_mode === "cdc" || conn?.cdc_mode) {
+          if (connectionIsCDC(conn)) {
             inferredType = "cdc"
           }
         }
@@ -91,6 +98,7 @@ async function getRegularPipeline(id: string) {
       updatedAt: rawPipeline.updated_at ? new Date(rawPipeline.updated_at) : null,
       sourceConnection: rawPipeline.source_connection as { id: string; name: string; connector_type: string; status: string } | null ?? null,
       destinationConnection: rawPipeline.destination_connection as { id: string; name: string; connector_type: string; status: string } | null ?? null,
+      lastExecutionId: (rawPipeline.last_execution?.id as string | undefined) ?? null,
     }
   } catch (error) {
     return null
@@ -101,8 +109,8 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
   const { id } = await params
   const { from, tab } = await searchParams
   const isFromChat = from === "chat"
-  const tabValue = ["overview", "history", "steps", "monitor", "table-stats", "transforms"].includes(String(tab || ""))
-    ? (String(tab) as "overview" | "history" | "steps" | "monitor" | "table-stats" | "transforms")
+  const tabValue = ["overview", "history", "steps", "monitor", "table-stats", "transforms", "assessment"].includes(String(tab || ""))
+    ? (String(tab) as "overview" | "history" | "steps" | "monitor" | "table-stats" | "transforms" | "assessment")
     : "overview"
   
   // Always use API Gateway as the source of truth (auth + consistent shape).
@@ -190,6 +198,7 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
             pipelineName={pipeline.name}
             pipelineType={pipeline.type}
             status={pipeline.status}
+            lastExecutionId={pipeline.lastExecutionId}
           />
         </div>
       </div>
@@ -220,7 +229,13 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
       <Suspense fallback={
         <div className="h-10 w-full rounded-lg bg-zinc-100 dark:bg-zinc-800 animate-pulse" />
       }>
-        <PipelineDetailTabsClient pipelineId={pipeline.id} pipelineType={pipeline.type} initialTab={tabValue} />
+        {/* key={pipeline.id}: every panel below fetches its own data, and going
+            from one pipeline to another stays inside this route segment, so
+            without a key React reuses their state and each panel renders the
+            pipeline the user just left until its own request comes back. The
+            two hooks that produced the reported flap reset themselves as well;
+            this covers the dozen other panels that would flap the same way. */}
+        <PipelineDetailTabsClient key={pipeline.id} pipelineId={pipeline.id} pipelineType={pipeline.type} initialTab={tabValue} />
       </Suspense>
 
           {/* Metadata */}
@@ -228,15 +243,15 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
             <CardContent className="pt-6">
               <div className="grid md:grid-cols-3 gap-4 text-sm">
                 <div>
-                  <p className="text-zinc-500 mb-1">Pipeline ID</p>
+                  <p className="text-zinc-500 dark:text-zinc-400 mb-1">Pipeline ID</p>
               <code className="bg-zinc-100 dark:bg-zinc-800 px-2 py-1 rounded text-xs">{pipeline.id}</code>
                 </div>
                 <div>
-                  <p className="text-zinc-500 mb-1">Created</p>
-                  <p>{pipeline.createdAt ? formatDateTime(pipeline.createdAt) : "Unknown"}</p>
+                  <p className="text-zinc-500 dark:text-zinc-400 mb-1">Created</p>
+                  <p><LocalDateTime value={pipeline.createdAt} fallback="Unknown" /></p>
                 </div>
                 <div>
-                  <p className="text-zinc-500 mb-1">Last Updated</p>
+                  <p className="text-zinc-500 dark:text-zinc-400 mb-1">Last Updated</p>
                   <p>{pipeline.updatedAt ? formatRelativeTime(pipeline.updatedAt) : "Unknown"}</p>
                 </div>
               </div>
