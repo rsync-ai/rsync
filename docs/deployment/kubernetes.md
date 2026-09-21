@@ -122,7 +122,7 @@ chart and the images it points at can never skew:
 
 ```bash
 helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
-  --version 0.1.3 \
+  --version 0.1.4 \
   --namespace rsync --create-namespace \
   -f my-values.yaml
 ```
@@ -146,20 +146,20 @@ is no local file to name, and the two halves of the documentation do not compose
 
 ```bash
 helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
-  --version 0.1.3 \
+  --version 0.1.4 \
   --namespace rsync --create-namespace \
-  -f https://raw.githubusercontent.com/rsync-ai/rsync/v0.1.3/deploy/helm/rsync-ai/values-gke.yaml \
+  -f https://raw.githubusercontent.com/rsync-ai/rsync/v0.1.4/deploy/helm/rsync-ai/values-gke.yaml \
   -f my-values.yaml
 ```
 
-Keep the two versions equal. The URL carries the tag `v0.1.3` and `--version`
-carries `0.1.3` — the same release, spelled the two different ways the tag and
+Keep the two versions equal. The URL carries the tag `v0.1.4` and `--version`
+carries `0.1.4` — the same release, spelled the two different ways the tag and
 the chart version use. If you would rather not fetch over the network at install
 time, unpack the chart and use the copy that shipped with it, which cannot skew
 from the chart at all:
 
 ```bash
-helm pull oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.3 --untar
+helm pull oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.4 --untar
 helm install rsync ./rsync-ai \
   --namespace rsync --create-namespace \
   -f ./rsync-ai/values-gke.yaml \
@@ -178,9 +178,9 @@ helm install rsync ./deploy/helm/rsync-ai \
 ```
 
 The chart resolves its image tag to `.Chart.AppVersion`, so this pulls the
-**0.1.3** images. Every `ghcr.io/rsync-ai` image the chart names is published at that tag: the
-`v0.1.3` release run built 36 of 36 jobs, and all 34 packages answer an
-anonymous pull. They are built for both `amd64` and `arm64` (checked 2026-09-21 by manifest
+**0.1.4** images. Every `ghcr.io/rsync-ai` image the chart names is published at that tag: the
+`v0.1.4` release run built 36 of 36 jobs (one connector build was retried after a transient
+registry write error), and all 34 packages answer an anonymous pull. They are built for both `amd64` and `arm64` (checked 2026-09-21 by manifest
 fetch); `0.1.2` and older are `amd64` only and fail on Apple Silicon, Graviton, Axion or Ampere
 nodes with `no match for platform in manifest`.
 
