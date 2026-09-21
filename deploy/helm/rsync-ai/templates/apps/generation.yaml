@@ -50,6 +50,7 @@ metadata:
     app.kubernetes.io/component: {{ $svc.name }}
 spec:
   replicas: {{ $svc.cfg.replicaCount }}
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   selector:
     matchLabels:
       {{- include "rsync-ai.selectorLabels" $root | nindent 6 }}

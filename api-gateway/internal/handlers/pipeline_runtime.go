@@ -24,7 +24,7 @@ type PipelineRuntime struct {
 	PipelineID  string           `json:"pipeline_id"`
 	ExecutionID string           `json:"execution_id,omitempty"`
 	Mode        string           `json:"mode"`   // batch | cdc
-	Phase       string           `json:"phase"`  // initializing | planning | validating | syncing | streaming | idle | completed | failed | paused
+	Phase       string           `json:"phase"`  // initializing | planning | validating | syncing | streaming | waiting_for_data | idle | completed | failed | paused
 	Health      string           `json:"health"` // healthy | degraded | unhealthy | unknown
 	Message     string           `json:"message,omitempty"`
 	Progress    *RuntimeProgress `json:"progress,omitempty"`
@@ -175,7 +175,18 @@ func GetPipelineRuntime(c *gin.Context) {
 		}
 	}
 
-	rt.Phase = computeRuntimePhase(mode, pStatus.String, currentStage.String, depAggregate, rt.Liveness, rt.Blocker)
+	// A CDC pipeline that has never delivered a row has no liveness at all, which
+	// cdcLivenessPhase used to read as "streaming" forever (issue #20). Only look up
+	// the handoff when the phase can actually reach cdcLivenessPhase.
+	var firstDataWaitSince time.Time
+	if mode == "cdc" && rt.Liveness == nil && execID.Valid && execID.String != "" {
+		switch strings.ToLower(strings.TrimSpace(pStatus.String)) {
+		case "running", "processing", "completed", "succeeded":
+			firstDataWaitSince = loadCDCFirstDataWait(database, pipelineID, execID.String)
+		}
+	}
+
+	rt.Phase = computeRuntimePhase(mode, pStatus.String, currentStage.String, depAggregate, rt.Liveness, rt.Blocker, firstDataWaitSince)
 	// Pause writes pipelines.status only, so message is still the last pre-pause
 	// progress tick — the banner read "Streaming pipeline active" next to a correct
 	// "Paused" pill (KI-CDC-PAUSE-STALE-PROGRESS-MESSAGE). See runtimeMessage.
@@ -217,11 +228,67 @@ func GetPipelineRuntime(c *gin.Context) {
 // computeRuntimePhase, so a blocker description is never masked; and 'stopped' (which also
 // maps to phase "paused") is left alone because StopPipeline already reconciles
 // pipeline_progress.message to the more specific 'Cancelled by user' (pipelines.go:3241).
+//
+// waiting_for_data is derived the same way (from the absence of any delivered row, not from
+// a progress tick), and the tick it would otherwise carry is the handoff's 'Streaming
+// pipeline active' — the exact text issue #20 reported beside a stream that had moved
+// nothing for 15+ minutes.
 func runtimeMessage(phase, rawStatus, message string) string {
 	if phase == "paused" && strings.ToLower(strings.TrimSpace(rawStatus)) == "paused" {
 		return "Pipeline paused"
 	}
+	if phase == "waiting_for_data" {
+		return cdcWaitingForDataMessage
+	}
 	return message
+}
+
+// cdcWaitingForDataMessage is the /runtime message for phase waiting_for_data.
+const cdcWaitingForDataMessage = "Streaming is set up, but no data has reached the destination yet"
+
+// cdcFirstDataGrace is how long after the streaming handoff a CDC pipeline may go without
+// delivering its first row before /runtime stops calling it "streaming". Debezium needs to
+// register, snapshot-or-skip, and the sink needs to subscribe and apply a first batch; the
+// staleness bound in cdcLivenessPhase uses the same 5 minutes.
+const cdcFirstDataGrace = 5 * time.Minute
+
+// loadCDCFirstDataWait returns when a CDC pipeline started waiting for its FIRST row — the
+// streaming handoff, i.e. the end_time the temporal-adapter stamps when it closes the
+// snapshot execution as 'completed' (pipeline_status_activity.go "streaming_active") — or
+// the zero time when the pipeline is not known to be waiting:
+//
+//   - any pipeline_run_table_stats row for it shows delivered data (a destination apply, a
+//     written row in either mode, or an applied CDC event). A stream that has delivered
+//     anything and then gone quiet is cdcLivenessPhase's staleness question, not this one;
+//     in particular a snapshot written by the batch executor counts as delivered data;
+//   - the execution was not closed successfully (no handoff has happened, e.g. a long
+//     initial load still in the executor stage — calling that "waiting" would be wrong);
+//   - the query fails (unknown degrades to the previous "streaming" answer, never to a
+//     scarier one).
+func loadCDCFirstDataWait(database *sql.DB, pipelineID, executionID string) time.Time {
+	var handoffAt sql.NullTime
+	var delivered bool
+	if err := database.QueryRow(`
+		SELECT e.end_time,
+		       EXISTS (
+		         SELECT 1 FROM pipeline_run_table_stats s
+		         WHERE s.pipeline_id = $1
+		           AND (s.last_applied_ts IS NOT NULL
+		                OR COALESCE(s.inserted_rows, 0) > 0
+		                OR COALESCE(s.applied_total_events, 0) > 0)
+		       )
+		FROM executions e
+		WHERE e.id = $2 AND e.pipeline_id = $1 AND e.status IN ('completed', 'success')
+	`, pipelineID, executionID).Scan(&handoffAt, &delivered); err != nil {
+		if err != sql.ErrNoRows {
+			log.Debugf("runtime: cdc first-data query failed (treating as unknown): %v", err)
+		}
+		return time.Time{}
+	}
+	if delivered || !handoffAt.Valid {
+		return time.Time{}
+	}
+	return handoffAt.Time
 }
 
 // loadCDCLiveness returns the newest DESTINATION-APPLY time for a pipeline, used to compute
@@ -267,6 +334,24 @@ func loadCDCLiveness(database *sql.DB, pipelineID string) (sql.NullTime, int64) 
 //   - "healthy"    if all checked deps are healthy
 //   - "degraded"   if at least one dep is degraded but none are unhealthy
 //   - "unhealthy"  if any dep is unhealthy
+//
+// runtimeDepsCurrentRunSQL scopes the rows to the run pipeline_progress names once
+// that run has registered any dependency. Without it, DISTINCT ON surfaced every
+// kind any past run ever registered (e.g. a "CDC task" on a batch pipeline) and,
+// before the batch sink registered the current run's rows, the previous run's
+// never-probed rows — so the panel read "Unknown" across the board. Rows with a
+// NULL execution_id apply to every run (migration 049). When the current run has
+// no rows yet, or there is no progress row, it falls back to all rows as before.
+const runtimeDepsCurrentRunSQL = `(
+		    d.execution_id IS NULL
+		    OR NOT EXISTS (
+		      SELECT 1 FROM pipeline_dependencies cur
+		      JOIN pipeline_progress pp ON pp.pipeline_id = cur.pipeline_id AND pp.execution_id = cur.execution_id
+		      WHERE cur.pipeline_id = $1
+		    )
+		    OR d.execution_id = (SELECT pp.execution_id FROM pipeline_progress pp WHERE pp.pipeline_id = $1)
+		  )`
+
 func loadRuntimeDeps(database *sql.DB, pipelineID string) ([]RuntimeDep, string) {
 	// DISTINCT ON (kind, identifier) collapses the one-row-per-execution manifest
 	// (UNIQUE(pipeline_id, execution_id, kind, identifier), migration 049 — nothing ever
@@ -284,6 +369,7 @@ func loadRuntimeDeps(database *sql.DB, pipelineID string) ([]RuntimeDep, string)
 		FROM pipeline_dependencies d
 		LEFT JOIN pipeline_dependency_health h ON h.dependency_id = d.id
 		WHERE d.pipeline_id = $1
+		  AND `+runtimeDepsCurrentRunSQL+`
 		ORDER BY d.kind, d.identifier, d.created_at DESC
 	`, pipelineID)
 	if err != nil {
@@ -345,7 +431,10 @@ func loadRuntimeDeps(database *sql.DB, pipelineID string) ([]RuntimeDep, string)
 // computeRuntimePhase folds raw status + dep health + liveness into the canonical
 // phase enum. This is the ONLY place CDC vs batch semantics diverge — UI never
 // needs to know.
-func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, liveness *RuntimeLiveness, blocker *RuntimeBlocker) string {
+//
+// firstDataWaitSince is loadCDCFirstDataWait's answer (zero = not known to be waiting); it
+// only matters on the CDC paths that reach cdcLivenessPhase.
+func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, liveness *RuntimeLiveness, blocker *RuntimeBlocker, firstDataWaitSince time.Time) string {
 	status := strings.ToLower(strings.TrimSpace(rawStatus))
 
 	// Terminal failure wins over everything else: a failed run must read "failed" even if a
@@ -374,11 +463,11 @@ func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, livene
 		case "running", "processing":
 			// Setup phase before stream starts. If we're past the executor stage we treat as streaming.
 			if strings.Contains(strings.ToLower(currentStage), "executor") || strings.Contains(strings.ToLower(currentStage), "stream") {
-				return cdcLivenessPhase(depHealth, liveness)
+				return cdcLivenessPhase(depHealth, liveness, firstDataWaitSince)
 			}
 			return "syncing"
 		case "completed", "succeeded":
-			return cdcLivenessPhase(depHealth, liveness)
+			return cdcLivenessPhase(depHealth, liveness, firstDataWaitSince)
 		}
 	}
 
@@ -427,9 +516,21 @@ func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, livene
 // freeze together, so the backlog reads zero for the wrong reason. Requiring "healthy"
 // keeps that repro reporting idle. The same clause holds "unknown" (legacy pipelines with
 // no dependency manifest) at the old conservative answer rather than silently upgrading it.
-func cdcLivenessPhase(depHealth string, liveness *RuntimeLiveness) string {
+//
+// No liveness at all is a third case (issue #20). It used to fall through to "streaming",
+// so a stream that had delivered NOTHING read "Running · Streaming pipeline active"
+// indefinitely. firstDataWaitSince (loadCDCFirstDataWait) is non-zero only when the
+// streaming handoff has happened AND no row has ever been delivered; once
+// cdcFirstDataGrace has passed since then, the phase is waiting_for_data. Inside the
+// grace, or when the wait is unknown (zero), the old "streaming" answer stands — and a
+// stream that has delivered data always carries liveness (or a delivered row), so a
+// healthy quiet stream is never relabelled by this branch. A dead dependency still wins.
+func cdcLivenessPhase(depHealth string, liveness *RuntimeLiveness, firstDataWaitSince time.Time) string {
 	if depHealth == "unhealthy" {
 		return "failed" // a required dep is dead — surface as failure, not "still streaming"
+	}
+	if liveness == nil && !firstDataWaitSince.IsZero() && time.Since(firstDataWaitSince) >= cdcFirstDataGrace {
+		return "waiting_for_data"
 	}
 	if liveness != nil && liveness.StaleSeconds > 300 {
 		if liveness.PendingEvents == 0 && depHealth == "healthy" {

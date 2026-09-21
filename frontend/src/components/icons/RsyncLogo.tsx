@@ -10,9 +10,11 @@ const CROP = { x: 100, y: 245, w: 640, h: 470, svgW: 901, svgH: 1163 }
 interface LogoIconProps {
   size?: number
   className?: string
+  /** Empty when the "rsync.ai" wordmark is beside it, so it isn't read twice. */
+  alt?: string
 }
 
-function LogoIcon({ size = 40, className }: LogoIconProps) {
+function LogoIcon({ size = 40, className, alt = "rsync.ai" }: LogoIconProps) {
   const displayH = size * (CROP.h / CROP.w)
   return (
     <div
@@ -21,7 +23,7 @@ function LogoIcon({ size = 40, className }: LogoIconProps) {
     >
       <img
         src="/logo.svg"
-        alt="rsync.ai"
+        alt={alt}
         draggable={false}
         style={{
           position: "absolute",
@@ -49,9 +51,10 @@ export function RsyncLogo({ className, size = "md", showText }: RsyncLogoProps) 
   const px = iconSizes[size]
   return (
     <div className={cn("flex items-center gap-2", className)}>
-      <LogoIcon size={px} />
+      <LogoIcon size={px} alt={showText ? "" : "rsync.ai"} />
       {showText && (
-        <span className="font-bold tracking-tight text-slate-800 text-xl">
+        // No dark variant made the wordmark 1.36:1 on the dark sidebar (#48).
+        <span className="font-bold tracking-tight text-slate-800 dark:text-zinc-100 text-xl">
           rsync.ai
         </span>
       )}

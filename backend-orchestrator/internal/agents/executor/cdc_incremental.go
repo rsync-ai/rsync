@@ -75,7 +75,7 @@ func computeCDCSnapshotStrategy(sourceType string, totalRowEstimate, thresholdRo
 	if !allTablesHavePK || totalRowEstimate < thresholdRows {
 		return snapshotStrategyBlocking
 	}
-	if hybridIsPostgresFamily(sourceType) {
+	if isPostgresFamily(sourceType) {
 		return snapshotStrategyIncremental
 	}
 	return snapshotStrategyBlocking
@@ -129,7 +129,7 @@ func (a *Agent) shouldAutoUseBatchInitialLoad(ctx context.Context, task Executor
 	}
 	// Only route to batch when the hybrid path can actually run it: PG-family source and a
 	// non-append-only destination (append-only would duplicate the replayed overlap window).
-	if !hybridIsPostgresFamily(task.Source.Type) || hybridDestAppendOnly(task) {
+	if !isPostgresFamily(task.Source.Type) || hybridDestAppendOnly(task) {
 		return false
 	}
 	est := a.estimateCDCSourceSize(ctx, task, selected)

@@ -18,7 +18,9 @@ import {
   Square,
 } from 'lucide-react'
 import type { StageExecution, StageStatus } from '@/lib/pipeline/stageDefinitions'
+import { formatDuration } from '@/components/pipeline/dagHelpers'
 import { cn } from '@/lib/utils'
+import { LocalDateTime } from '@/components/ui/local-date-time'
 
 export interface StageTimelineProps {
   stages: StageExecution[]
@@ -34,7 +36,7 @@ const statusIcons: Record<StageStatus, React.ReactNode> = {
   'retrying': <RefreshCw className="h-4 w-4 animate-spin text-yellow-600" />,
   'completed': <CheckCircle2 className="h-4 w-4 text-green-600" />,
   'failed': <XCircle className="h-4 w-4 text-red-600" />,
-  'cancelled': <Square className="h-4 w-4 text-zinc-500" />,
+  'cancelled': <Square className="h-4 w-4 text-zinc-500 dark:text-zinc-400" />,
 }
 
 const statusColors: Record<StageStatus, string> = {
@@ -47,21 +49,6 @@ const statusColors: Record<StageStatus, string> = {
   'cancelled': 'bg-zinc-50 text-zinc-700 border-zinc-200 dark:bg-zinc-900/40 dark:text-zinc-300',
 }
 
-function formatTimestamp(timestamp?: number): string {
-  if (!timestamp) return ''
-  const date = new Date(timestamp)
-  // Avoid locale-dependent formatting during SSR/hydration.
-  // Use a deterministic UTC time string (HH:MM:SS).
-  return date.toISOString().slice(11, 19)
-}
-
-function formatDuration(start?: number, end?: number): string {
-  if (!start) return ''
-  const endTime = end || Date.now()
-  const seconds = Math.floor((endTime - start) / 1000)
-  if (seconds < 60) return `${seconds}s`
-  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`
-}
 
 export function StageTimeline({ stages, currentStageKey, className, title }: StageTimelineProps) {
   if (stages.length === 0) {
@@ -132,13 +119,21 @@ export function StageTimeline({ stages, currentStageKey, className, title }: Sta
                       </div>
 
                       {/* Timestamp and Duration */}
-                      <div className="text-xs text-zinc-500 text-right whitespace-nowrap">
-                        {stage.startedAt && (
-                          <div>{formatTimestamp(stage.startedAt)}</div>
-                        )}
-                        {stage.startedAt && stage.completedAt && (
+                      <div className="text-xs text-zinc-500 dark:text-zinc-400 text-right whitespace-nowrap">
+                        {/* Was toISOString().slice(11, 19): a bare UTC clock time, which
+                            a viewer outside UTC reads as their own. LocalDateTime shows
+                            the viewer's zone, names it, and stays hydration-safe. */}
+                        {stage.startedAt ? (
+                          <div>
+                            <LocalDateTime value={new Date(stage.startedAt)} fallback="" />
+                          </div>
+                        ) : null}
+                        {/* Same number, same format as the Steps graph: this used to
+                            floor an event-timestamp delta to whole seconds, so a
+                            184ms stage read "0s" here and "184ms" there. */}
+                        {stage.durationMs !== undefined && stage.durationMs > 0 && (
                           <div className="font-medium">
-                            {formatDuration(stage.startedAt, stage.completedAt)}
+                            {formatDuration(stage.durationMs)}
                           </div>
                         )}
                       </div>

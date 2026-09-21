@@ -3,13 +3,18 @@
 # the file as conflicted. Combined with the append-only convention in
 # CAPABILITIES.md, this means concurrent PRs that each add new rows will
 # merge cleanly into a file containing both new rows — no manual conflict
-# resolution required.
+# resolution required. Since 2026-09-16 a new feature is TWO appends: a one-line
+# row in CAPABILITIES.md and its full row at the end of CAPABILITIES-ARCHIVE.md,
+# so both files carry the driver. The flip side of union: two PRs that EDIT the
+# same row keep both versions — llm-service/tests/test_capabilities_stays_an_index.py
+# fails on the resulting duplicate status row.
 #
 # Use this driver only for files where line order is not semantically
 # significant beyond chronology (changelogs, capability tables, finding
 # inventories). Do NOT add code files here — union-merging Python or Go
 # silently produces broken syntax.
 CAPABILITIES.md merge=union
+CAPABILITIES-ARCHIVE.md merge=union
 
 # Driver+Reviewer evidence journals are append-only by definition.
 .test-evidence/*.md merge=union

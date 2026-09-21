@@ -214,3 +214,152 @@ describe("F-285 — an unpopulated metric is not reported as a measured zero", (
     expect(cellUnder("Written")).toBe("0")
   })
 })
+
+/**
+ * Issue #21 — a selected CDC table with no stats row read "Running" with every
+ * counter at 0. The API now marks it `waiting_for_data` and omits its counters;
+ * the panel must say "No data yet" in the status badge and the count cells, and
+ * must not print a measured 0 for any of them.
+ */
+const WAITING_ROW = {
+  qualified_name: "public.audit",
+  table_name: "audit",
+  schema_name: "public",
+  mode: "cdc",
+  status: "waiting_for_data",
+  // No counters: the backend never measured any. dlq_rows is always sent.
+  dlq_rows: 0,
+  updated_at: "2026-08-05T10:00:00Z",
+}
+
+const CDC_COUNT_HEADINGS = [
+  "Captured I",
+  "Captured U",
+  "Captured D",
+  "Captured Total",
+  "Applied I",
+  "Applied U",
+  "Applied D",
+  "Applied Total",
+]
+
+/** Value shown under a summary-card label (the grid of summary figures). */
+function summaryValue(label: string): string {
+  const grid = document.querySelector("div.grid")
+  if (!grid) throw new Error("no summary grid")
+  const labels = Array.from(grid.querySelectorAll(":scope > div > div:first-child")).filter(
+    (el) => (el.textContent || "").trim() === label,
+  )
+  if (labels.length !== 1) throw new Error(`want one summary label "${label}", found ${labels.length}`)
+  return (labels[0].nextElementSibling?.textContent || "").trim()
+}
+
+describe("#21 — a CDC table with nothing captured reads 'No data yet', not Running and 0", () => {
+  it("labels the waiting row and its count cells 'No data yet', beside a live row that keeps its numbers", async () => {
+    authFetch.mockResolvedValue(
+      ok({
+        summary: {
+          mode: "cdc",
+          total_tables: 2,
+          tables_completed: 0,
+          tables_failed: 0,
+          tables_running: 1,
+          tables_waiting_for_data: 1,
+          total_inserts: 40,
+          total_updates: 5,
+          total_deletes: 1,
+          total_applied_inserts: 40,
+          total_applied_updates: 5,
+          total_applied_deletes: 1,
+        },
+        tables: [CDC_ROW, WAITING_ROW],
+        total: 2,
+      }),
+    )
+
+    render(<TableStatisticsPanel pipelineId="p1" />)
+    await waitFor(() => expect(screen.getByText(/audit/)).toBeInTheDocument())
+
+    // The waiting row (index 1).
+    expect(cellUnder("Status", 1)).toBe("No data yet")
+    for (const heading of CDC_COUNT_HEADINGS) {
+      expect(cellUnder(heading, 1)).toBe("No data yet")
+    }
+    expect(cellUnder("Dropped", 1)).toBe("No data yet")
+
+    // Control: the live row (index 0) still reports what it measured.
+    expect(cellUnder("Status", 0)).toBe("Running")
+    expect(cellUnder("Captured I", 0)).toBe("40")
+    expect(cellUnder("Applied Total", 0)).toBe("46")
+    expect(cellUnder("Dropped", 0)).toBe("0")
+
+    // Summary: the waiting table is counted as such, and the totals are real.
+    expect(summaryValue("Running")).toBe("1")
+    expect(summaryValue("No data yet")).toBe("1")
+    expect(summaryValue("Captured Inserts")).toBe("40")
+
+    // F-281 still holds with the new cells.
+    const { headerCells, bodyRowCells } = columnCounts()
+    for (const n of bodyRowCells) expect(n).toBe(headerCells)
+  })
+
+  it("does not show 0 for the CDC totals when no table has reported anything", async () => {
+    authFetch.mockResolvedValue(
+      ok({
+        summary: {
+          mode: "cdc",
+          total_tables: 1,
+          tables_completed: 0,
+          tables_failed: 0,
+          tables_running: 0,
+          tables_waiting_for_data: 1,
+          total_inserts: 0,
+          total_updates: 0,
+          total_deletes: 0,
+          total_applied_inserts: 0,
+          total_applied_updates: 0,
+          total_applied_deletes: 0,
+        },
+        tables: [WAITING_ROW],
+        total: 1,
+      }),
+    )
+
+    render(<TableStatisticsPanel pipelineId="p1" />)
+    await waitFor(() => expect(screen.getByText(/audit/)).toBeInTheDocument())
+
+    for (const label of [
+      "Captured Inserts",
+      "Captured Updates",
+      "Captured Deletes",
+      "Applied Inserts",
+      "Applied Updates",
+      "Applied Deletes",
+    ]) {
+      expect(summaryValue(label)).toBe("No data yet")
+    }
+    expect(summaryValue("Running")).toBe("0")
+    expect(cellUnder("Status")).toBe("No data yet")
+  })
+
+  // THE BOUND: "No data yet" is for a table that reported nothing, not for any
+  // missing counter. A running row that omits one still shows the dash.
+  it("keeps the dash for a missing counter on a table that is running", async () => {
+    const { inserts: _omit, ...runningWithoutInserts } = CDC_ROW
+    authFetch.mockResolvedValue(
+      ok({
+        summary: { mode: "cdc", total_tables: 1, tables_running: 1 },
+        tables: [runningWithoutInserts],
+        total: 1,
+      }),
+    )
+
+    render(<TableStatisticsPanel pipelineId="p1" />)
+    await waitFor(() => expect(screen.getByText(/events/)).toBeInTheDocument())
+
+    expect(cellUnder("Captured I")).toBe("—")
+    expect(cellUnder("Captured U")).toBe("5")
+    expect(cellUnder("Status")).toBe("Running")
+    expect(screen.queryByText("No data yet")).toBeNull()
+  })
+})

@@ -21,7 +21,7 @@ from typing import Dict, Any, List, Optional
 from kafka import KafkaConsumer, KafkaProducer
 from kafka.errors import KafkaError
 
-from src.utils.kafka_security import kafka_security_kwargs
+from src.utils.kafka_security import explain_failure, kafka_security_kwargs
 
 # Import Avro utilities
 try:
@@ -330,7 +330,9 @@ class PlannerKafkaConsumer:
                 return True
                 
             except Exception as e:
-                logger.warning(f"⚠️  Kafka connection attempt {attempt + 1} failed: {e}")
+                # explain_failure, not e: kafka-python reports a wrong password, an
+                # untrusted CA and a down broker with the same KafkaTimeoutError.
+                logger.warning(f"⚠️  Kafka connection attempt {attempt + 1} failed: {explain_failure(e)}")
                 if attempt < max_retries - 1:
                     time.sleep(5)
                 else:

@@ -11,6 +11,7 @@ func rawJSON(s string) json.RawMessage { return json.RawMessage(s) }
 
 func TestValidateDocumentFind_Accepts(t *testing.T) {
 	spec, ferr := ValidateDocumentFind(DocumentFindRequest{
+		Database:   " crm ",
 		Collection: "  orders ",
 		Filter: rawJSON(`{"status":"paid","n":{"$gte":9007199254740993},"$or":[{"a":1},{"tags":{"$all":["x"]}}],
 			"_id":{"$oid":"65f000000000000000000001"},"created":{"$gte":{"$date":"2026-01-01T00:00:00Z"}},
@@ -25,6 +26,9 @@ func TestValidateDocumentFind_Accepts(t *testing.T) {
 	}
 	if spec.Collection != "orders" {
 		t.Errorf("collection not trimmed: %q", spec.Collection)
+	}
+	if spec.Database != "crm" {
+		t.Errorf("database not trimmed: %q", spec.Database)
 	}
 	if spec.Limit != DocumentFindMaxLimit {
 		t.Errorf("limit not clamped: %d", spec.Limit)
@@ -103,6 +107,9 @@ func TestValidateDocumentFind_Rejects(t *testing.T) {
 		{"skip with keyset", DocumentFindRequest{Collection: "c", Skip: 10}, "invalid_skip", "skip"},
 		{"cursor with custom sort", DocumentFindRequest{Collection: "c", Sort: rawJSON(`{"a":1}`), Cursor: "x"}, "invalid_cursor", "cursor"},
 		{"cursor too long", DocumentFindRequest{Collection: "c", Cursor: strings.Repeat("x", DocumentFindMaxCursorChars+1)}, "invalid_cursor", "cursor"},
+		{"database too long", DocumentFindRequest{Database: strings.Repeat("d", DocumentFindMaxDatabaseBytes+1), Collection: "c"}, "invalid_database", "database"},
+		{"database with a dot", DocumentFindRequest{Database: "a.b", Collection: "c"}, "invalid_database", "database"},
+		{"database with $", DocumentFindRequest{Database: "$x", Collection: "c"}, "invalid_database", "database"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

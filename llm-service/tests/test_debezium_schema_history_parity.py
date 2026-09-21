@@ -27,6 +27,7 @@ error -- see test_kafka_jaas_escaping.py for the measured behaviour.
 
 import importlib.util
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -82,6 +83,16 @@ SHAPES = {
         "KAFKA_SSL_CERT_LOCATION": "/etc/rsync-ai/kafka-tls/tls.crt",
         "KAFKA_SSL_KEY_LOCATION": "/etc/rsync-ai/kafka-tls/tls.key",
         "KAFKA_SSL_KEYSTORE_LOCATION": "/etc/rsync-ai/kafka-tls/client.pem",
+    },
+    # The two-path pair and nothing else -- what the Go and Python services are
+    # configured with, and what compose and a GCP mTLS client certificate give
+    # you. Both copies must fall back to the file the Connect image builds; the
+    # shape above only proves an explicit keystore is passed through.
+    "mtls_certkey_only": {
+        "KAFKA_SECURITY_PROTOCOL": "SSL",
+        "KAFKA_SSL_CA_LOCATION": "/etc/rsync-ai/kafka-tls/ca.crt",
+        "KAFKA_SSL_CERT_LOCATION": "/etc/rsync-ai/kafka-tls/tls.crt",
+        "KAFKA_SSL_KEY_LOCATION": "/etc/rsync-ai/kafka-tls/tls.key",
     },
     "sasl_ssl_skip_verify": {
         "KAFKA_SECURITY_PROTOCOL": "SASL_SSL",
@@ -240,3 +251,76 @@ def test_both_implementations_refuse_a_credential_less_token_line():
             with pytest.raises((KafkaSecurityError, ValueError)) as excinfo:
                 build("OAUTHBEARER", "", "", options)
             assert "clientId" in str(excinfo.value)
+
+
+_CONNECT_ENTRYPOINT = (
+    Path(__file__).resolve().parents[2]
+    / "shared" / "internal" / "infra" / "kafka-connect" / "connect-entrypoint.sh"
+)
+
+
+def _entrypoint_client_pem() -> str:
+    """The combined-keystore path, as the Connect image's entrypoint spells it."""
+    text = _CONNECT_ENTRYPOINT.read_text()
+    tls_dir = re.search(r"^RSYNC_TLS_DIR=(\S+)$", text, re.M)
+    pem = re.search(r"^RSYNC_CLIENT_PEM=\$RSYNC_TLS_DIR(/\S+)$", text, re.M)
+    assert tls_dir and pem, (
+        f"{_CONNECT_ENTRYPOINT} no longer defines RSYNC_TLS_DIR / "
+        "RSYNC_CLIENT_PEM in the shape this test reads"
+    )
+    return tls_dir.group(1) + pem.group(1)
+
+
+def test_a_cert_key_pair_points_at_the_file_the_connect_image_builds(clean_kafka_env):
+    """Three copies of one path: the script writes it, two Python copies read it.
+
+    The script builds the file in the Connect container; the history client's
+    config is generated elsewhere and only names it. A rename on one side is
+    silent -- the connector starts, snapshots, and fails its first history write
+    with a handshake alert -- so the path is compared, not assumed.
+    """
+    from src.utils import kafka_security
+
+    connector = _load_connector()
+    built = _entrypoint_client_pem()
+    assert kafka_security.CONNECT_IMAGE_CLIENT_PEM == built
+    assert connector.CONNECT_IMAGE_CLIENT_PEM == built
+
+    for key, value in SHAPES["mtls_certkey_only"].items():
+        clean_kafka_env.setenv(key, value)
+    for props in (
+        kafka_security.debezium_schema_history_security(),
+        connector._schema_history_security(),
+    ):
+        for role in ("producer", "consumer"):
+            prefix = f"schema.history.internal.{role}."
+            assert props[prefix + "ssl.keystore.type"] == "PEM"
+            assert props[prefix + "ssl.keystore.location"] == built
+
+    # An explicit combined file still wins over the derived one.
+    clean_kafka_env.setenv("KAFKA_SSL_KEYSTORE_LOCATION", "/etc/rsync-ai/kafka-tls/client.pem")
+    assert kafka_security.debezium_schema_history_security()[
+        "schema.history.internal.consumer.ssl.keystore.location"
+    ] == "/etc/rsync-ai/kafka-tls/client.pem"
+
+
+@pytest.mark.parametrize("present", ["KAFKA_SSL_CERT_LOCATION", "KAFKA_SSL_KEY_LOCATION"])
+def test_both_implementations_refuse_half_a_keypair(present, clean_kafka_env):
+    """Half a pair is a config error, not "no mTLS".
+
+    Silently dropping it would configure a history client with no certificate,
+    which the broker rejects with an alert that names neither variable. The
+    Connect image's entrypoint refuses the same input at container start.
+    """
+    from src.utils.kafka_security import (
+        KafkaSecurityError,
+        debezium_schema_history_security,
+    )
+
+    clean_kafka_env.setenv("KAFKA_SECURITY_PROTOCOL", "SSL")
+    clean_kafka_env.setenv(present, "/etc/rsync-ai/kafka-tls/half")
+    connector = _load_connector()
+    for build in (debezium_schema_history_security, connector._schema_history_security):
+        with pytest.raises((KafkaSecurityError, ValueError)) as excinfo:
+            build()
+        assert "KAFKA_SSL_CERT_LOCATION" in str(excinfo.value)

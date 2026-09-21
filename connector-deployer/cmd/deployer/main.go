@@ -71,7 +71,7 @@ func main() {
 		log.Info("connector-deployer listening",
 			"addr", httpSrv.Addr, "environment", cfg.Environment,
 			"network", cfg.Network, "tools_dir", cfg.ToolsDir,
-			"auth_enforced", cfg.InternalSecret != "" || cfg.IsProd(),
+			"auth_enforced", cfg.InternalSecret != "" || !cfg.IsDev(),
 			"build_backend", buildBackendLabel(cfg))
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Error("http server error", "err", err.Error())

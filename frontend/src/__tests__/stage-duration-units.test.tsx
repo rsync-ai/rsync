@@ -81,8 +81,10 @@ describe("StageDetailPanel renders the duration in the unit the backend meant", 
       />
     )
 
-    // Before the fix this rendered "42ms".
-    expect(screen.getByText("42.0s")).toBeInTheDocument()
+    // Before the fix this rendered "42ms". ("42.0s" until the shared formatter
+    // dropped the trailing zero — the discriminating part is the unit, and the
+    // two failure modes still read "42ms" and "11h 40m".)
+    expect(screen.getByText("42s")).toBeInTheDocument()
     expect(screen.queryByText("42ms")).not.toBeInTheDocument()
   })
 

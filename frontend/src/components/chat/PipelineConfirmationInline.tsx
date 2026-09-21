@@ -130,7 +130,7 @@ export function PipelineConfirmationInline({
                     <p className="text-sm font-medium text-zinc-900 dark:text-white">
                       {step.description || `${step.method} on ${step.tool}`}
                     </p>
-                    <p className="text-xs text-zinc-500">
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
                       {step.tool} • {step.method}
                     </p>
                   </div>

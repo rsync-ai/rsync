@@ -34,8 +34,14 @@ directory holding only the compose file and a generated .env -- where
 `docker compose up --dry-run` 401s on api-gateway, mcp-minio, temporal-adapter,
 orchestrator and frontend alike.
 
-A profile-gated service is exempt: `--profile cdc` / `--profile generate` are
-opt-in, so an unpublished image there does not break the default install.
+A profile gate is not an exemption, and `cdc` is why the wording here changed.
+It was opt-in when this file was written, so an unpublished image behind it
+could not break a default install. `install.sh` now passes `--profile cdc` on
+every run, which makes those three images as load-bearing as any ungated one --
+and `generate`, still opt-in, was never safe either, because a documented
+profile is a profile somebody runs. Both halves are covered by
+test_no_quickstart_image_is_absent_from_the_publish_matrix, which asks the
+question of every ghcr image the file names and reads no profile key at all.
 """
 
 import os
@@ -1224,11 +1230,25 @@ REF_TO_IMAGE_TAG = [
 ]
 
 
+def _release_tag_function():
+    """install.sh's ref_is_release_tag(), brace to brace."""
+    with open(INSTALL_SH) as fh:
+        m = re.search(r"^ref_is_release_tag\(\) \{\n.*?^\}$", fh.read(), re.S | re.M)
+    return m.group(0) if m else None
+
+
 def _derivation_block():
-    """install.sh's RSYNC_VERSION derivation, extracted for execution."""
+    """install.sh's RSYNC_VERSION derivation, extracted for execution.
+
+    Starts at ref_is_release_tag(), not at the `if` -- the `if` calls it, so
+    lifting the `if` alone yields a script that cannot run. Which is worth
+    saying out loud: when the function was extracted, this regex matched
+    nothing and every case below failed loudly rather than passing on a block
+    it had silently stopped finding.
+    """
     with open(INSTALL_SH) as fh:
         text = fh.read()
-    m = re.search(r'^if \[\[ "\$\{RSYNC_REF\}".*?^fi$', text, re.S | re.M)
+    m = re.search(r'^ref_is_release_tag\(\) \{.*?^fi$', text, re.S | re.M)
     return m.group(0) if m else None
 
 
@@ -1334,8 +1354,25 @@ def _default_ref():
 
 
 def _is_release_ref(ref):
-    """install.sh's own test for a release ref, so the two cannot disagree."""
-    return bool(re.match(r"^v[0-9]+\.[0-9]+\.[0-9]+", ref or ""))
+    """install.sh's own test for a release ref, EXECUTED rather than restated.
+
+    This was a copy of the installer's regex, described in this same docstring
+    as making the two unable to disagree -- which a copy cannot do. It can only
+    agree with itself. The installer's copy is the one that decides what a
+    user's images are tagged and, since the moving-ref fix, whether a re-run
+    trusts the compose file already on disk; so ask it.
+    """
+    body = _release_tag_function()
+    assert body is not None, (
+        "install.sh no longer defines ref_is_release_tag(), so nothing here can "
+        "ask the installer what it treats as a release ref."
+    )
+    out = subprocess.run(
+        ["bash", "-c", f'{body}\nref_is_release_tag {(ref or "")!r}'],
+        capture_output=True,
+        text=True,
+    )
+    return out.returncode == 0
 
 
 def _push_branches():

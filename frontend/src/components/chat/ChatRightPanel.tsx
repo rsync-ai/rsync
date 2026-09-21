@@ -160,6 +160,7 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                 size="sm"
                 onClick={fetchPipelineData}
                 className="h-7 w-7 p-0"
+                aria-label="Refresh pipeline status"
               >
                 <RefreshCw className="h-3.5 w-3.5" />
               </Button>
@@ -168,6 +169,7 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                 size="sm"
                 onClick={onClose}
                 className="h-7 w-7 p-0"
+                aria-label="Close panel"
               >
                 <X className="h-3.5 w-3.5" />
               </Button>
@@ -205,12 +207,12 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                       <Card>
                         <CardContent className="p-3 space-y-3">
                           <div className="flex items-center justify-between">
-                            <span className="text-xs text-zinc-500">Status</span>
+                            <span className="text-xs text-zinc-500 dark:text-zinc-400">Status</span>
                             {getStatusBadge(pipelineState?.status || "")}
                           </div>
                           {pipelineState?.current_stage && (
                             <div className="flex items-center justify-between">
-                              <span className="text-xs text-zinc-500">Current Stage</span>
+                              <span className="text-xs text-zinc-500 dark:text-zinc-400">Current Stage</span>
                               <span className="text-xs font-medium text-zinc-900 dark:text-white">
                                 {pipelineState.current_stage}
                               </span>
@@ -218,7 +220,7 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                           )}
                           {pipelineState?.started_at && (
                             <div className="flex items-center justify-between">
-                              <span className="text-xs text-zinc-500">Started</span>
+                              <span className="text-xs text-zinc-500 dark:text-zinc-400">Started</span>
                               <span className="text-xs text-zinc-600 dark:text-zinc-400">
                                 {formatRelativeTime(new Date(pipelineState.started_at))}
                               </span>
@@ -230,7 +232,7 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                       {/* Quick Stages Overview */}
                       {executionPlan?.stages && executionPlan.stages.length > 0 && (
                         <div>
-                          <h4 className="text-xs font-medium text-zinc-500 mb-2">Stages</h4>
+                          <h4 className="text-xs font-medium text-zinc-500 dark:text-zinc-400 mb-2">Stages</h4>
                           <div className="space-y-1">
                             {executionPlan.stages.slice(0, 5).map((stage) => (
                               <button
@@ -248,7 +250,7 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                               </button>
                             ))}
                             {executionPlan.stages.length > 5 && (
-                              <div className="text-xs text-zinc-500 text-center py-1">
+                              <div className="text-xs text-zinc-500 dark:text-zinc-400 text-center py-1">
                                 +{executionPlan.stages.length - 5} more stages
                               </div>
                             )}
@@ -298,7 +300,7 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                   ) : (
                     <div className="flex flex-col items-center justify-center py-8 text-center">
                       <GitBranch className="h-8 w-8 text-zinc-300 mb-2" />
-                      <p className="text-xs text-zinc-500">No DAG available yet</p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">No DAG available yet</p>
                     </div>
                   )}
                 </div>
@@ -323,7 +325,7 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                   ) : (
                     <div className="flex flex-col items-center justify-center py-8 text-center">
                       <Clock className="h-8 w-8 text-zinc-300 mb-2" />
-                      <p className="text-xs text-zinc-500">No timeline available yet</p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">No timeline available yet</p>
                     </div>
                   )}
                 </div>

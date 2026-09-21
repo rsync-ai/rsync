@@ -135,7 +135,7 @@ function RecentPipelines({ pipelines }: { pipelines: any[] }) {
         <p className="text-sm text-zinc-500 dark:text-zinc-400">
           No CDC pipelines yet
         </p>
-        <p className="text-xs text-zinc-400 dark:text-zinc-500 mt-2">
+        <p className="text-xs text-zinc-400 mt-2">
           Create a pipeline to start syncing data
         </p>
       </div>
@@ -175,7 +175,7 @@ function RecentPipelines({ pipelines }: { pipelines: any[] }) {
                   default but a wrong answer: it rendered for every row regardless
                   of where the pipeline wrote, and the two fields it fell back from
                   are never present in this payload, so it always fired. */}
-              <p className="text-sm text-zinc-500">
+              <p className="text-sm text-zinc-500 dark:text-zinc-400">
                 {(pipeline.source_connection?.name || pipeline.source_connection?.connector_type || pipeline.source_type || 'Source')}{" "}
                 →{" "}
                 {(pipeline.destination_connection?.name || pipeline.destination_connection?.connector_type || pipeline.destination_type || 'Destination')}
@@ -267,7 +267,7 @@ export default async function DashboardPage() {
         <Card className="lg:col-span-2">
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Clock className="h-5 w-5 text-zinc-500" />
+              <Clock className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
               Recent Pipelines
             </CardTitle>
             <CardDescription>
@@ -285,7 +285,7 @@ export default async function DashboardPage() {
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <Zap className="h-5 w-5 text-zinc-500" />
+              <Zap className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
               Quick Actions
             </CardTitle>
             <CardDescription>

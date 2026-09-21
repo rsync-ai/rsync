@@ -38,3 +38,25 @@ describe("Sidebar — workspace nav", () => {
     expect(screen.getByRole("link", { name: /^admin$/i })).toBeInTheDocument()
   })
 })
+
+describe("Sidebar — fits above the fold (#56)", () => {
+  it("groups the links under three headings instead of eight", () => {
+    render(<Sidebar role="admin" />)
+    const headings = screen.getAllByRole("heading", { level: 4 }).map((h) => h.textContent)
+    expect(headings).toEqual(["Pipelines", "Data", "Manage"])
+  })
+
+  it("keeps every destination, Settings and Admin in the same group as Workspace", () => {
+    render(<Sidebar role="admin" />)
+    const names = screen.getAllByRole("link").map((a) => a.getAttribute("aria-label")).filter(Boolean)
+    expect(names).toEqual(
+      expect.arrayContaining([
+        "Home", "Data Pipeline", "All Pipelines", "Executions", "Explorer",
+        "Scheduled Queries", "Connections", "Connectors", "Workspace", "Settings", "Admin",
+      ]),
+    )
+    const manage = screen.getByRole("heading", { name: "Manage" }).parentElement as HTMLElement
+    const inManage = Array.from(manage.querySelectorAll("a")).map((a) => a.getAttribute("aria-label"))
+    expect(inManage).toEqual(expect.arrayContaining(["Workspace", "Settings", "Admin"]))
+  })
+})

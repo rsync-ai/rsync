@@ -15,19 +15,30 @@ import {
   Clock,
   Zap
 } from "lucide-react"
-import { EventNormalizer, type PipelineRunEvent, type StageGroup } from "@/lib/pipeline/eventNormalizer"
+import {
+  EventNormalizer,
+  type NormalizedRunEvent,
+  type PipelineRunEvent,
+  type StageGroup,
+} from "@/lib/pipeline/eventNormalizer"
+import { LocalDateTime } from "@/components/ui/local-date-time"
+// Floors to "21h 2m"; the local one printed a long stage as "1262.1m".
+import { formatStageDuration } from "@/lib/duration"
+import {
+  eventDetail,
+  eventLabel,
+  eventStageLabel,
+  isNoiseEvent,
+  type DisplayEvent,
+} from "@/components/pipeline/eventDisplay"
 
 type Props = {
   events: PipelineRunEvent[]
+  // Stage transitions fetched apart from the paged feed; they decide each
+  // group's badge and duration (EventNormalizer.groupByStage).
+  statusEvents?: PipelineRunEvent[]
   loading?: boolean
   emptyMessage?: string
-}
-
-function formatDuration(ms?: number): string {
-  if (!ms) return ""
-  if (ms < 1000) return `${ms}ms`
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
-  return `${(ms / 60000).toFixed(1)}m`
 }
 
 function SeverityIcon({ severity }: { severity: string }) {
@@ -41,27 +52,50 @@ function SeverityIcon({ severity }: { severity: string }) {
   }
 }
 
+function toDisplayEvent(e: NormalizedRunEvent): DisplayEvent {
+  return { event_type: e.type, stage_id: e.stage, severity: e.severity, payload: e.metadata }
+}
+
+/**
+ * What a row says, in words. The event code, sequence number, stage id, group
+ * and trace id are for whoever is debugging the producer; they live behind the
+ * row's Details toggle rather than on every line.
+ */
+type RowText = { label: string; stage: string; detail: string; extra: string; routine: boolean }
+
+function rowText(e: NormalizedRunEvent): RowText {
+  const d = toDisplayEvent(e)
+  const detail = eventDetail(d)
+  const extra = e.description && e.description.trim() !== detail ? e.description.trim() : ""
+  return { label: eventLabel(d), stage: eventStageLabel(d), detail, extra, routine: isNoiseEvent(d) }
+}
+
 function StageStatusBadge({ status }: { status: StageGroup["status"] }) {
   type BadgeVariant = "default" | "secondary" | "outline" | "destructive"
-  const variants: Record<StageGroup["status"], { variant: BadgeVariant; label: string }> = {
-    pending: { variant: "secondary", label: "Pending" },
+  const variants: Record<Exclude<StageGroup["status"], "unknown">, { variant: BadgeVariant; label: string }> = {
     running: { variant: "default", label: "Running" },
     completed: { variant: "outline", label: "Completed" },
     failed: { variant: "destructive", label: "Failed" },
   }
-  const config = variants[status] || variants.pending
+  // No transition for this stage is known, so there is nothing true to badge.
+  if (status === "unknown") return null
+  const config = variants[status]
+  if (!config) return null
   return <Badge variant={config.variant}>{config.label}</Badge>
 }
 
-export function ReasoningTimeline({ events, loading, emptyMessage }: Props) {
+export function ReasoningTimeline({ events, statusEvents, loading, emptyMessage }: Props) {
   const [searchQuery, setSearchQuery] = useState("")
   const [severityFilter, setSeverityFilter] = useState<string[]>([])
   const [collapsedStages, setCollapsedStages] = useState<Set<string>>(new Set())
   const [expandedEvents, setExpandedEvents] = useState<Set<string>>(new Set())
+  // Routine rows (heartbeats, throughput and per-batch table-stat ticks) are
+  // hidden by default and counted, never dropped: the toggle hands them back.
+  const [showRoutine, setShowRoutine] = useState(false)
 
   const stageGroups = useMemo(() => {
-    return EventNormalizer.groupByStage(events)
-  }, [events])
+    return EventNormalizer.groupByStage(events, statusEvents)
+  }, [events, statusEvents])
 
   const decisions = useMemo(() => {
     return EventNormalizer.extractDecisions(events)
@@ -71,19 +105,27 @@ export function ReasoningTimeline({ events, loading, emptyMessage }: Props) {
     return EventNormalizer.extractSelfHeals(events)
   }, [events])
 
-  const filteredGroups = useMemo(() => {
-    return stageGroups.map((group) => {
+  const textById = useMemo(() => {
+    const m = new Map<string, RowText>()
+    for (const g of stageGroups) for (const e of g.events) m.set(e.id, rowText(e))
+    return m
+  }, [stageGroups])
+
+  const filtersActive = searchQuery.trim() !== "" || severityFilter.length > 0
+
+  const { filteredGroups, routineCount } = useMemo(() => {
+    const query = searchQuery.trim().toLowerCase()
+    const counted = stageGroups.map((group) => {
       let filteredEvents = group.events
 
-      // Apply search filter
-      if (searchQuery.trim()) {
-        const query = searchQuery.toLowerCase()
-        filteredEvents = filteredEvents.filter(
-          (e) =>
-            e.title.toLowerCase().includes(query) ||
-            e.description?.toLowerCase().includes(query) ||
-            e.type.toLowerCase().includes(query)
-        )
+      // Apply search filter: the words on the row, plus the event code so a
+      // search for a type someone pasted from a log still finds it.
+      if (query) {
+        filteredEvents = filteredEvents.filter((e) => {
+          const t = textById.get(e.id)
+          return [t?.label, t?.stage, t?.detail, t?.extra, e.title, e.type]
+            .some((s) => s?.toLowerCase().includes(query))
+        })
       }
 
       // Apply severity filter
@@ -91,9 +133,19 @@ export function ReasoningTimeline({ events, loading, emptyMessage }: Props) {
         filteredEvents = filteredEvents.filter((e) => severityFilter.includes(e.severity))
       }
 
-      return { ...group, events: filteredEvents }
-    }).filter((group) => group.events.length > 0) // Hide empty groups
-  }, [stageGroups, searchQuery, severityFilter])
+      // Count routine rows among what the filters kept, so the toggle's number
+      // is exactly how many rows it would add.
+      const kept = filteredEvents.filter((e) => !textById.get(e.id)?.routine)
+      const routine = filteredEvents.length - kept.length
+      if (!showRoutine) filteredEvents = kept
+
+      return { group: { ...group, events: filteredEvents }, routine }
+    })
+    return {
+      filteredGroups: counted.map((c) => c.group).filter((group) => group.events.length > 0), // Hide empty groups
+      routineCount: counted.reduce((n, c) => n + c.routine, 0),
+    }
+  }, [stageGroups, textById, searchQuery, severityFilter, showRoutine])
 
   const toggleStage = (id: string) => {
     setCollapsedStages((prev) => {
@@ -162,6 +214,25 @@ export function ReasoningTimeline({ events, loading, emptyMessage }: Props) {
         </div>
       </div>
 
+      {routineCount > 0 && (
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
+          <span>
+            {showRoutine
+              ? "Routine progress updates are shown."
+              : "Routine progress updates (heartbeats, throughput and table-stat ticks) are hidden."}
+          </span>
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-7 px-2 text-xs"
+            onClick={() => setShowRoutine((v) => !v)}
+          >
+            {showRoutine ? "Hide" : "Show"} {routineCount} routine progress update{routineCount === 1 ? "" : "s"}
+          </Button>
+        </div>
+      )}
+
       {/* Self-heal summary */}
       {selfHeals.length > 0 && (
         <Card className="border-purple-200 bg-purple-50 dark:border-purple-900 dark:bg-purple-950/30">
@@ -209,31 +280,74 @@ export function ReasoningTimeline({ events, loading, emptyMessage }: Props) {
                   {isCollapsed ? <ChevronRight className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
                   <div className="text-sm font-medium">{group.name}</div>
                   <StageStatusBadge status={group.status} />
-                  {group.duration && (
+                  {/* "32s · 2 attempts", not "32s": the figure is working time
+                      summed across attempts, so on a retried stage it is much
+                      shorter than the wall clock between the lane's first and
+                      last event. Saying how many attempts there were is what
+                      makes the two numbers reconcilable. */}
+                  {group.duration ? (
                     <Badge variant="outline" className="text-xs">
                       <Clock className="h-3 w-3 mr-1" />
-                      {formatDuration(group.duration)}
+                      {formatStageDuration({
+                        activeMs: group.duration,
+                        attempts: group.attempts ?? 1,
+                        running: group.status === "running",
+                      })}
                     </Badge>
-                  )}
+                  ) : null}
                 </div>
-                <div className="text-xs text-muted-foreground">{group.events.length} events</div>
+                <div className="text-xs text-muted-foreground">{group.events.length} {group.events.length === 1 ? "event" : "events"}</div>
               </div>
 
               {!isCollapsed && (
                 <CardContent className="px-3 pb-3 space-y-2 border-t border-zinc-100 dark:border-zinc-800">
-                  {group.events.map((event) => (
-                    <div
-                      key={event.id}
-                      className="rounded border border-zinc-200 p-2 text-sm dark:border-zinc-700"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="flex items-start gap-2 flex-1">
-                          <SeverityIcon severity={event.severity} />
-                          <div className="flex-1 space-y-1">
-                            <div className="font-medium">{event.title}</div>
-                            {event.description && (
-                              <div className="text-xs text-muted-foreground">{event.description}</div>
-                            )}
+                  {group.events.map((event) => {
+                    const t = textById.get(event.id) ?? rowText(event)
+                    const open = expandedEvents.has(event.id)
+                    const hasPayload = !!event.metadata && Object.keys(event.metadata).length > 0
+                    return (
+                      <div
+                        key={event.id}
+                        data-testid="activity-row"
+                        className="rounded border border-zinc-200 p-2 text-sm dark:border-zinc-700"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="flex items-start gap-2 flex-1 min-w-0">
+                            <SeverityIcon severity={event.severity} />
+                            <div className="flex-1 min-w-0 space-y-1">
+                              <div>
+                                <span className="font-medium">{t.label}</span>
+                                {t.stage ? (
+                                  <span className="text-xs text-muted-foreground"> · {t.stage}</span>
+                                ) : null}
+                              </div>
+                              {t.detail ? <div className="text-xs break-words">{t.detail}</div> : null}
+                              {t.extra ? (
+                                <div className="text-xs text-muted-foreground break-words">{t.extra}</div>
+                              ) : null}
+                            </div>
+                          </div>
+                          <div className="flex flex-col items-end gap-1 text-xs text-muted-foreground whitespace-nowrap">
+                            {/* Was new Date(ts).toISOString().slice(11, 19): unlabelled UTC,
+                                and a RangeError that took the whole timeline down when an
+                                event carried an unparseable timestamp. */}
+                            <LocalDateTime value={event.timestamp} fallback="Time unknown" />
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="sm"
+                              className="h-6 px-2 text-xs"
+                              aria-expanded={open}
+                              onClick={() => toggleEvent(event.id)}
+                            >
+                              {open ? "Hide details" : "Details"}
+                            </Button>
+                          </div>
+                        </div>
+
+                        {/* Internal codes and the raw payload, for debugging a producer. */}
+                        {open ? (
+                          <div className="mt-2 space-y-2">
                             <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                               <span className="font-mono">{event.type}</span>
                               {typeof event.seq === "number" ? (
@@ -245,37 +359,20 @@ export function ReasoningTimeline({ events, loading, emptyMessage }: Props) {
                               {event.stageGroup ? (
                                 <span className="font-mono">group: {event.stageGroup}</span>
                               ) : null}
-                              {event.traceId && (
-                                <span className="font-mono">trace: {event.traceId.slice(0, 8)}</span>
-                              )}
+                              {event.traceId ? (
+                                <span className="font-mono">trace: {event.traceId}</span>
+                              ) : null}
                             </div>
+                            {hasPayload ? (
+                              <pre className="max-h-72 overflow-auto rounded bg-zinc-50 p-2 text-[11px] text-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
+                                {JSON.stringify(event.metadata, null, 2)}
+                              </pre>
+                            ) : null}
                           </div>
-                        </div>
-                        <div className="text-xs text-muted-foreground whitespace-nowrap">
-                          {new Date(event.timestamp).toISOString().slice(11, 19)}
-                        </div>
+                        ) : null}
                       </div>
-
-                      {/* Raw payload (prod-debug friendly) */}
-                      {event.metadata ? (
-                        <div className="mt-2">
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="sm"
-                            onClick={() => toggleEvent(event.id)}
-                          >
-                            {expandedEvents.has(event.id) ? "Hide raw" : "Show raw"}
-                          </Button>
-                          {expandedEvents.has(event.id) ? (
-                            <pre className="mt-2 max-h-72 overflow-auto rounded bg-zinc-50 p-2 text-[11px] text-zinc-800 dark:bg-zinc-900 dark:text-zinc-200">
-                              {JSON.stringify(event.metadata, null, 2)}
-                            </pre>
-                          ) : null}
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
+                    )
+                  })}
                 </CardContent>
               )}
             </Card>
@@ -285,7 +382,10 @@ export function ReasoningTimeline({ events, loading, emptyMessage }: Props) {
 
       {filteredGroups.length === 0 && (
         <div className="text-sm text-muted-foreground text-center py-8">
-          No events match your filters.
+          {/* "No events" would be false here: there were events, all routine. */}
+          {!filtersActive && routineCount > 0
+            ? "Only routine progress updates so far — nothing that needs your attention."
+            : "No events match your filters."}
         </div>
       )}
     </div>

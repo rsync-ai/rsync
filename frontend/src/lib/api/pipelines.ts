@@ -66,8 +66,8 @@ export interface CreatePipelineRequest {
 /**
  * Get a pipeline by ID
  */
-export async function getPipeline(id: string): Promise<Pipeline> {
-  const response = await authFetch(API_ENDPOINTS.PIPELINES.GET(id))
+export async function getPipeline(id: string, options: { timeoutMs?: number } = {}): Promise<Pipeline> {
+  const response = await authFetch(API_ENDPOINTS.PIPELINES.GET(id), { timeoutMs: options.timeoutMs })
 
   if (!response.ok) {
     throw new Error(extractErrorMessage(await response.text().catch(() => "")) || "Pipeline not found")
@@ -139,41 +139,6 @@ export async function updatePipeline(id: string, data: Partial<CreatePipelineReq
 }
 
 /**
- * Delete a pipeline
- */
-export async function deletePipeline(id: string): Promise<void> {
-  const response = await authFetch(API_ENDPOINTS.PIPELINES.DELETE(id), {
-    method: "DELETE",
-  })
-
-  if (!response.ok) {
-    throw new Error(extractErrorMessage(await response.text().catch(() => "")) || "Failed to delete pipeline")
-  }
-}
-
-/**
- * Execute a pipeline immediately
- */
-export async function executePipeline(id: string): Promise<{ execution_id: string }> {
-  const response = await authFetch(API_ENDPOINTS.PIPELINES.RUN(id), {
-    method: "POST",
-  })
-
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ error: "Execution failed" }))
-    if (response.status === 402) {
-      const errCode = (body as PlanLimitPayload).error
-      if (errCode === "pipeline_limit_reached" || errCode === "trial_expired" || errCode === "gb_limit_reached") {
-        throw new PlanLimitError(body as PlanLimitPayload)
-      }
-    }
-    throw new Error(extractErrorMessage(body) || "Execution failed")
-  }
-
-  return response.json()
-}
-
-/**
  * Pre-migration assessment payload. Mirrors the api-gateway's
  * `AssessmentReport` Go struct. Surfaces structured warnings the user
  * must acknowledge before the run starts — PK-less tables, JSON
@@ -204,6 +169,47 @@ export interface AssessmentTable {
   nominated_keys?: string[]
 }
 
+/**
+ * The Assessment tab's graded view of the same report (api-gateway
+ * assessment_checks.go): one row per check, passes included. Only a
+ * "critical" row blocks the start; everything else is advisory.
+ */
+export type AssessmentLevel = "critical" | "high" | "medium" | "low"
+export type AssessmentCheckResult = "passed" | "failed" | "warning" | "info"
+export type AssessmentCheckCategory = "source" | "tables" | "destination"
+
+export interface AssessmentRemediation {
+  steps?: string[]
+  sql_to_run?: string[]
+  commands_to_run?: string[]
+  doc_url?: string
+  estimated_minutes?: number
+}
+
+export interface AssessmentCheckObject {
+  name: string
+  message?: string
+}
+
+export interface AssessmentCheck {
+  code: string
+  title: string
+  category: AssessmentCheckCategory
+  level: AssessmentLevel
+  result: AssessmentCheckResult
+  message: string
+  objects?: AssessmentCheckObject[]
+  remediation?: AssessmentRemediation
+}
+
+export interface AssessmentCounts {
+  critical: number
+  high: number
+  medium: number
+  low: number
+  passed: number
+}
+
 export interface AssessmentReport {
   blocking: boolean
   summary: string
@@ -212,6 +218,23 @@ export interface AssessmentReport {
   source_connector_type?: string
   destination_connector_type?: string
   destination_supports_ddl: boolean
+  // Graded checks + counts for the Assessment tab. Absent on reports saved
+  // before the tab existed.
+  checks?: AssessmentCheck[] | null
+  counts?: AssessmentCounts
+  // The pipeline_assessment_runs row this report was saved as.
+  run_id?: string
+}
+
+export type AssessmentTrigger = "manual" | "run_gate" | "scheduled"
+
+export interface AssessmentRunSummary {
+  id: string
+  trigger: AssessmentTrigger
+  triggered_by?: string
+  blocking: boolean
+  counts: AssessmentCounts
+  created_at: string
 }
 
 /**
@@ -284,6 +307,46 @@ export async function assessPipeline(id: string): Promise<AssessmentReport> {
 }
 
 /**
+ * The pipeline's saved assessment runs, newest first (manual, run gate and
+ * the 6-hourly re-check of running CDC pipelines).
+ */
+export async function listPipelineAssessments(
+  id: string,
+  limit = 20,
+): Promise<AssessmentRunSummary[]> {
+  const response = await authFetch(
+    `${API_ENDPOINTS.PIPELINES.GET(id)}/assessments?limit=${encodeURIComponent(String(limit))}`,
+    { cache: "no-store" },
+  )
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: "Failed to load assessment history" }))
+    throw new Error(extractErrorMessage(error) || "Failed to load assessment history")
+  }
+  const body = (await response.json()) as { runs?: AssessmentRunSummary[] | null }
+  return body.runs ?? []
+}
+
+/**
+ * One saved assessment run with its full report. `runId` "latest" reads the
+ * newest run; returns null when the pipeline has never been assessed.
+ */
+export async function getPipelineAssessment(
+  id: string,
+  runId: string = "latest",
+): Promise<{ run: AssessmentRunSummary; report: AssessmentReport } | null> {
+  const response = await authFetch(
+    `${API_ENDPOINTS.PIPELINES.GET(id)}/assessments/${encodeURIComponent(runId)}`,
+    { cache: "no-store" },
+  )
+  if (response.status === 404) return null
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({ error: "Failed to load assessment" }))
+    throw new Error(extractErrorMessage(error) || "Failed to load assessment")
+  }
+  return response.json()
+}
+
+/**
  * Execute a pipeline with an explicit run_mode override.
  * - resume: continue from checkpoints (default)
  * - reload: rebuild from scratch (best-effort destination cleanup, etc.)
@@ -325,7 +388,12 @@ export async function executePipelineWithRunMode(
       }
     }
     if (response.status === 422) {
-      if (body?.error === "pre_migration_assessment" && body?.assessment) {
+      // "…_blocked" = a Critical check failed; the modal shows it with the
+      // proceed button disabled instead of a bare error toast.
+      if (
+        (body?.error === "pre_migration_assessment" || body?.error === "pre_migration_assessment_blocked") &&
+        body?.assessment
+      ) {
         throw new AssessmentRequiredError(body.assessment as AssessmentReport)
       }
     }

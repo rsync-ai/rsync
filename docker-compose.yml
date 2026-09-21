@@ -28,6 +28,19 @@ x-kafka-security: &kafka-security
   KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT: ${KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT:-}
   KAFKA_SASL_OAUTHBEARER_SCOPE: ${KAFKA_SASL_OAUTHBEARER_SCOPE:-}
   KAFKA_SASL_OAUTHBEARER_EXTENSIONS: ${KAFKA_SASL_OAUTHBEARER_EXTENSIONS:-}
+  # Re-permits a plain-http token endpoint off loopback, which every runtime
+  # otherwise refuses at start-up (the client-credentials grant POSTs
+  # CLIENT_SECRET on every fetch). Carried here for ONE reason: kafka-connect
+  # and the kafka-init job read their whole security profile from this anchor,
+  # so without a passthrough a rig with a throwaway http IdP can configure the
+  # Go and Python services but not the JVM ones -- the same image behaving
+  # differently under compose than under the chart, which does make it
+  # reachable. The default is empty, i.e. unset, i.e. the refusal stays armed;
+  # a passthrough is not a setting. Never give it a value in this file or in
+  # docker-compose.prod.yml --
+  # llm-service/tests/test_insecure_token_endpoint_rule_is_one_rule.py fails if
+  # any file but the Kafka security matrix harness sets it to true.
+  KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT: ${KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT:-}
   # JVM-only; in this file only kafka-connect has a JVM. Carried anyway because
   # Debezium's schema-history client is configured from the connector
   # container's environment, so the name has to survive the trip.
@@ -43,9 +56,10 @@ x-kafka-security: &kafka-security
   KAFKA_SSL_CERT_LOCATION: ${KAFKA_SSL_CERT_LOCATION:-}
   KAFKA_SSL_KEY_LOCATION: ${KAFKA_SSL_KEY_LOCATION:-}
   # The SAME keypair in the shape a JVM can load: ONE file holding chain + key.
-  # A JVM PEM keystore cannot take the cert and the key as two paths, so this is
-  # not derivable from the pair above -- `cat tls.crt tls.key > client.pem`.
-  # Inert in the Go and Python services; kafka-init and kafka-connect need it.
+  # Optional -- kafka-init and kafka-connect build that file from the pair above
+  # when this is unset (the connect image's connect-entrypoint.sh). Set it only
+  # to use a combined file you already have; it then wins over the pair. Inert
+  # in the Go and Python services.
   KAFKA_SSL_KEYSTORE_LOCATION: ${KAFKA_SSL_KEYSTORE_LOCATION:-}
   # Disables certificate verification, and is logged unconditionally when set: a
   # self-signed lab, not prod.
@@ -66,6 +80,19 @@ x-kafka-security: &kafka-security
   # which llm-service/tests/test_compose_kafka_security_env.py asserts.
   KAFKA_SSL_SKIP_VERIFY: ${KAFKA_SSL_SKIP_VERIFY:-${KAFKA_SSL_INSECURE_SKIP_VERIFY:-}}
   KAFKA_SSL_INSECURE_SKIP_VERIFY: ${KAFKA_SSL_INSECURE_SKIP_VERIFY:-${KAFKA_SSL_SKIP_VERIFY:-}}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Build info baked into the api-gateway, orchestrator, temporal-adapter and
+# llm-service images: each serves it on GET /version, and the admin drift check
+# (GET /api/v1/admin/drift) compares the commits. Compose cannot run git, so the
+# caller exports these -- scripts/deploy-service.sh does, and so do the upgrade
+# steps in docs/deployment/self-hosting.md. A build without them bakes in
+# "dev"/"unknown", which the drift check reports as "commit unknown".
+# Published images get the release sha from .github/workflows/docker-publish.yml.
+# ─────────────────────────────────────────────────────────────────────────────
+x-build-info: &build-info
+  GIT_COMMIT: ${GIT_COMMIT:-dev}
+  BUILD_TIME: ${BUILD_TIME:-unknown}
 
 services:
   # ============================================
@@ -408,6 +435,7 @@ services:
       # and orchestrator, which already build from the repo root.
       context: .
       dockerfile: backend-temporal-adapter/Dockerfile
+      args: *build-info
     container_name: rsync-ai-temporal-adapter
     depends_on:
       temporal:
@@ -554,6 +582,17 @@ services:
       # prefix while BOOTSTRAP_SERVERS/GROUP_ID/*_STORAGE_TOPIC above deliberately
       # do not (those few are re-exported as CONNECT_* by the entrypoint itself).
       #
+      # The KAFKA_* contract every other service reads (x-kafka-security at the
+      # top of this file) still arrives here, because this image runs its own
+      # entrypoint first (shared/internal/infra/kafka-connect/connect-entrypoint.sh,
+      # the same code Helm runs) and it derives the CONNECT_* lines from it:
+      #   * KAFKA_SASL_USERNAME/PASSWORD, or the KAFKA_SASL_OAUTHBEARER_* set,
+      #     become the JAAS line for the mechanism;
+      #   * KAFKA_SSL_CERT_LOCATION + KAFKA_SSL_KEY_LOCATION become the one-file
+      #     PEM keystore a JVM needs (KAFKA_SSL_KEYSTORE_LOCATION, if set, wins).
+      # Mount the certificate files into this container too, at the same paths.
+      <<: *kafka-security
+      #
       # Connect needs this in THREE places. The worker's own coordination/admin
       # client is a different client from the producer each source task writes
       # with and the consumer each sink task reads with, and the task-level ones
@@ -572,15 +611,11 @@ services:
       CONNECT_CONSUMER_SECURITY_PROTOCOL: "${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}"
       CONNECT_CONSUMER_SASL_MECHANISM: "${KAFKA_SASL_MECHANISM:-PLAIN}"
       #
-      # The JAAS line is its own variable rather than being built from
-      # KAFKA_SASL_USERNAME/KAFKA_SASL_PASSWORD (which the Go and Python clients
-      # take separately) because a Java client wants one string whose login module
-      # class depends on the mechanism -- PlainLoginModule for PLAIN,
-      # ScramLoginModule for SCRAM-SHA-*. Compose interpolation cannot choose
-      # between them, and guessing wrong yields an unhelpful handshake failure.
-      # Set it to e.g.
-      #   org.apache.kafka.common.security.scram.ScramLoginModule required \
-      #     username="…" password="…";
+      # An OVERRIDE, normally left unset: the entrypoint builds the JAAS line from
+      # KAFKA_SASL_USERNAME/PASSWORD (or the OAuth set), choosing the login module
+      # the mechanism needs and escaping the values for the two grammars they
+      # cross. Set KAFKA_SASL_JAAS_CONFIG only for a login module it has no arm
+      # for; a non-empty value is used as-is and nothing is built.
       CONNECT_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"
       CONNECT_PRODUCER_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"
       CONNECT_CONSUMER_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"
@@ -1013,6 +1048,7 @@ services:
     build:
       context: .
       dockerfile: backend-orchestrator/Dockerfile
+      args: *build-info
     container_name: rsync-ai-orchestrator
     restart: unless-stopped
     deploy:
@@ -1091,6 +1127,10 @@ services:
       MINIO_BUCKET: "${MINIO_BUCKET:-pipeline-data}"
       MINIO_PREFIX: "${MINIO_PREFIX:-staging}"
       JWT_SECRET: "dev_secret_key_change_in_prod"
+      # S2S secret the gateway's internal routes check (namespace lock, heal,
+      # OAuth refresh) and requirePrincipal accepts. Same value as api-gateway, or
+      # every one of those calls is refused 401/503 and only logged as a warning.
+      INTERNAL_SERVICE_SECRET: "${INTERNAL_SERVICE_SECRET:-}"
       # Guarded operator endpoint for recovering FAILED Debezium connectors.
       # Default off for safety. Enable explicitly with CDC_RECOVERY_ENABLED=true.
       CDC_RECOVERY_ENABLED: "${CDC_RECOVERY_ENABLED:-false}"
@@ -1223,6 +1263,7 @@ services:
     build:
       context: .
       dockerfile: api-gateway/Dockerfile
+      args: *build-info
     container_name: rsync-ai-api-gateway
     # main() exits when the database is unreachable at boot (db.Init has already
     # retried for DB_CONNECT_TIMEOUT). The restart is what turns that exit into a
@@ -1256,6 +1297,14 @@ services:
       # Admin panel access (beta). Comma-separated allowlist of emails.
       # Example: RSYNC_ADMIN_EMAILS=alice@company.com,bob@company.com
       RSYNC_ADMIN_EMAILS: "${RSYNC_ADMIN_EMAILS:-}"
+      # CDC auto-pickup: a pipeline selected as "this whole database/schema"
+      # keeps that meaning — the api-gateway re-expands the selection rule on
+      # this interval and adds source tables created since. Default ON; set
+      # false to freeze every CDC pipeline at its current table list. The
+      # interval is floored at 60s (discovery runs once per CDC pipeline
+      # per tick).
+      CDC_TABLE_AUTOPICKUP_ENABLED: "${CDC_TABLE_AUTOPICKUP_ENABLED:-true}"
+      CDC_TABLE_WATCH_INTERVAL_SECONDS: "${CDC_TABLE_WATCH_INTERVAL_SECONDS:-300}"
       # Temporal is required for the agentic pipeline stage-by-stage execution + progress events.
       # Without this, the gateway falls back to legacy direct-Kafka which doesn't drive the V2 UI timeline.
       TEMPORAL_ADDRESS: "temporal:7233"
@@ -1273,6 +1322,11 @@ services:
       # Verifies X-Internal-Secret on internal S2S endpoints (e.g. the scheduled
       # model-run endpoint the temporal-adapter calls). Unset → those endpoints 503.
       INTERNAL_SERVICE_SECRET: "${INTERNAL_SERVICE_SECRET:-}"
+      # Read-only mirror of the orchestrator's schema-drift switch, so the pipeline's
+      # "Schema change alerts" card can say when detection is off for the whole
+      # installation (schema_evolution.go schemaDriftDetectorEnabled). Must stay
+      # byte-identical to the orchestrator line; a census test pins it.
+      RSYNC_SCHEMA_DRIFT_ENABLED: "${RSYNC_SCHEMA_DRIFT_ENABLED:-false}"
       # Serialization (Demo-2 default: JSON; Schema Registry is optional behind a profile)
       KAFKA_USE_AVRO: "false"
       SCHEMA_REGISTRY_URL: "http://schema-registry:8080"
@@ -1386,6 +1440,7 @@ services:
     build:
       context: ./llm-service
       dockerfile: Dockerfile
+      args: *build-info
     container_name: rsync-ai-llm-service
     env_file:
       # Gitignored local override. `required: false` so `docker compose config`
@@ -1705,6 +1760,9 @@ services:
       OTEL_ENABLED: "true"
       OTEL_TRACES_EXPORTER: "otlp"
       OTEL_METRICS_EXPORTER: "otlp"
+      # Sent to the orchestrator's /api/v1/topology (strategies.py), which
+      # requirePrincipal gates; without it plan-time topic creation gets 401.
+      INTERNAL_SERVICE_SECRET: "${INTERNAL_SERVICE_SECRET:-}"
     volumes:
       # JIT Integration: Shared volume for connector existence checks
       - ./shared/mcp-connectors:/app/shared/mcp-connectors:ro
@@ -1754,6 +1812,9 @@ services:
       # Internal URLs for server-side fetches (within Docker network)
       - API_GATEWAY_INTERNAL_URL=http://api-gateway:8080
       - ORCHESTRATOR_INTERNAL_URL=http://orchestrator:8080
+      # Server-only (NOT NEXT_PUBLIC): the RSC dashboard authenticates its
+      # server-side call to the orchestrator with it (instrumentation.ts warns if unset).
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:-}
       # Public URLs for client-side fetches (from browser via host)
       - NEXT_PUBLIC_API_URL=http://localhost:5001
       - NEXT_PUBLIC_BACKEND_ORCHESTRATOR_URL=http://localhost:8080
@@ -1867,7 +1928,7 @@ services:
     volumes:
       - ./deploy/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
     ports:
-      - "127.0.0.1:${RSYNC_HP_OTEL_GRPC:-14317}:4317"  # OTLP gRPC receiver (host-port shifted to avoid a collision)
+      - "127.0.0.1:${RSYNC_HP_OTEL_GRPC:-14317}:4317"  # OTLP gRPC receiver (avoid conflict with a local collector)
       - "127.0.0.1:${RSYNC_HP_OTEL_HTTP:-14318}:4318"  # OTLP HTTP receiver  
       - "127.0.0.1:${RSYNC_HP_OTEL_FLUENTFWD:-8006}:8006"   # Fluentforward receiver
       - "127.0.0.1:${RSYNC_HP_OTEL_HEALTH:-13133}:13133" # Health check

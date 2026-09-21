@@ -39,10 +39,10 @@ func TestGetExecution_ScopedToActiveWorkspace(t *testing.T) {
 	mock.ExpectQuery(`FROM executions e`).
 		WithArgs(wsScopeExecution, wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "pipeline_id", "status", "trigger_source", "schedule_id",
+			"id", "pipeline_id", "status", "live_stream", "trigger_source", "schedule_id",
 			"scheduled_time", "start_time", "end_time", "error_message", "pipeline_name",
 			"records_processed",
-		}).AddRow(wsScopeExecution, wsScopePipeline, "completed", "manual", nil, nil, nil, nil, nil, "Shared Pipe", int64(0)))
+		}).AddRow(wsScopeExecution, wsScopePipeline, "completed", false, "manual", nil, nil, nil, nil, nil, "Shared Pipe", int64(0)))
 
 	r := wsScopeRouterAsRole(http.MethodGet, "/executions/:id", GetExecution, "viewer")
 	w := httptest.NewRecorder()

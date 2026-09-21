@@ -79,6 +79,11 @@ except ImportError:  # pragma: no cover - dev/test path
         os.path.dirname(__file__), "..", "..", "..", "..")))
     from canonical_types import canonical_to_ddl, canonicalize_type  # noqa: E402
 
+# Scope filter for a server-level connection (no database named), shipped next
+# to canonical_types (`COPY --from=shared namespace_filter.py`); the import above
+# already put the public/ root on sys.path for dev/test.
+import namespace_filter  # noqa: E402
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -250,11 +255,26 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
             errors.append("Missing required field: host")
         if not config.get("user"):
             errors.append("Missing required field: user")
-        if not config.get("database"):
-            warnings.append("No database specified; defaulting to 'default'")
+        if self._server_level(params):
+            # Server-level: reads span every database the login can see,
+            # narrowed by the Scope filter — which must parse.
+            try:
+                namespace_filter.parse(config)
+            except namespace_filter.NamespaceFilterError as e:
+                errors.append(str(e))
         if config.get("password") in (None, ""):
             warnings.append("No password provided; assuming a password-less ClickHouse user")
         return {"valid": len(errors) == 0, "errors": errors, "warnings": warnings}
+
+    @staticmethod
+    def _server_level(params: Dict = None) -> bool:
+        """True when neither the connection nor CLICKHOUSE_DATABASE names a
+        database. _get_config fills in "default" for the driver, so this reads
+        the raw params: discovery and export then span every database in scope
+        instead of just "default"; writes still land in "default"."""
+        raw = (params or {}).get("config", params) if params else {}
+        return (str((raw or {}).get("database") or "").strip() == ""
+                and str(os.getenv("CLICKHOUSE_DATABASE") or "").strip() == "")
 
     # =========================================================================
     # DRIVER SEAM (the only place clickhouse_connect is touched)
@@ -321,6 +341,24 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
         if not s_db or not s_tbl:
             raise ValueError(f"Unsafe table identifier: {table}")
         return s_db, s_tbl
+
+    def _server_level_read_error(self, config: Dict[str, Any], table: str) -> Optional[str]:
+        """Why a table read on a server-level connection is refused, or None.
+
+        The table must name its database (``db.table``) — a bare name would
+        silently read from "default" — and that database must pass the Scope
+        filter."""
+        raw = (table or "").strip().strip("`")
+        if "." not in raw:
+            return "This connection names no database: pass the table as <database>.<table>"
+        db = raw.split(".", 1)[0].strip("`")
+        try:
+            scope = namespace_filter.parse(config)
+        except namespace_filter.NamespaceFilterError as e:
+            return str(e)
+        if not namespace_filter.allowed(db, scope, self._SYSTEM_DATABASES):
+            return "That database is outside this connection's scope"
+        return None
 
     def _qualify(self, db: str, table: str) -> str:
         return f"`{db}`.`{table}`"
@@ -417,6 +455,7 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
         params = params or {}
         config = self._get_config(params)
         db = self._safe_identifier(config.get("database") or "default") or "default"
+        server_level = self._server_level(params)
         include_columns = bool(params.get("include_columns", True))
         include_row_counts = bool(params.get("include_row_counts", True))
         try:
@@ -449,6 +488,19 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
             if severity == "error":
                 result["overall_status"] = "partial_success"
 
+        # Server-level (no database named): a scope that does not parse fails
+        # closed before anything is listed — an unreadable filter must not
+        # widen to every database.
+        scope = None
+        if server_level:
+            try:
+                scope = namespace_filter.parse(config)
+            except namespace_filter.NamespaceFilterError as e:
+                add_warning("config_invalid", "error", str(e))
+                result["overall_status"] = "failed"
+                result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
+                return result
+
         client = None
         try:
             client = self._connect(config)
@@ -460,38 +512,71 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
                             f"Could not retrieve database version: {e}")
 
             # Table list with estimated row counts (system.tables is cheap; total_rows
-            # is exact for MergeTree). Exclude views/dictionaries.
-            tbl_rows = client.query(
-                "SELECT name, coalesce(total_rows, 0) AS row_estimate "
-                "FROM system.tables "
-                "WHERE database = {db:String} AND engine NOT LIKE '%View' "
-                "AND engine NOT LIKE '%Dictionary%' "
-                "ORDER BY name",
-                parameters={"db": db},
-            ).result_rows
-            all_names = [str(r[0]) for r in tbl_rows if r and r[0]]
-            row_est = {str(r[0]): int(r[1] or 0) for r in tbl_rows}
-            result["total_tables_available"] = len(all_names)
-            names = all_names[:max_tables]
-
-            # One query for ALL columns of ALL tables (batch, not per-table).
-            cols_by_table: Dict[str, List[Dict[str, Any]]] = {n: [] for n in names}
-            pks_by_table: Dict[str, List[str]] = {n: [] for n in names}
-            if include_columns and names:
-                col_rows = client.query(
-                    "SELECT table, name, type, is_in_primary_key "
-                    "FROM system.columns "
-                    "WHERE database = {db:String} "
-                    "ORDER BY table, position",
+            # is exact for MergeTree). Exclude views/dictionaries. Keyed by
+            # (database, table) so a server-level listing keeps same-named
+            # tables in different databases apart.
+            if server_level:
+                db_rows = client.query(
+                    "SELECT name FROM system.databases ORDER BY name").result_rows
+                picked = namespace_filter.apply(
+                    sorted(str(r[0]) for r in db_rows if r and r[0]),
+                    scope, self._SYSTEM_DATABASES)
+                if picked.warning:
+                    add_warning("scope_empty", "warning", picked.warning)
+                dbs = list(picked.kept)
+                tbl_rows = client.query(
+                    "SELECT database, name, coalesce(total_rows, 0) AS row_estimate "
+                    "FROM system.tables "
+                    "WHERE database IN {dbs:Array(String)} AND engine NOT LIKE '%View' "
+                    "AND engine NOT LIKE '%Dictionary%' "
+                    "ORDER BY database, name",
+                    parameters={"dbs": dbs},
+                ).result_rows if dbs else []
+                listed = [((str(r[0]), str(r[1])), int(r[2] or 0))
+                          for r in tbl_rows if r and r[0] and r[1]]
+            else:
+                dbs = [db]
+                tbl_rows = client.query(
+                    "SELECT name, coalesce(total_rows, 0) AS row_estimate "
+                    "FROM system.tables "
+                    "WHERE database = {db:String} AND engine NOT LIKE '%View' "
+                    "AND engine NOT LIKE '%Dictionary%' "
+                    "ORDER BY name",
                     parameters={"db": db},
                 ).result_rows
-                for cr in col_rows:
-                    tname = str(cr[0])
-                    if tname not in cols_by_table:
+                listed = [((db, str(r[0])), int(r[1] or 0)) for r in tbl_rows if r and r[0]]
+            row_est = dict(listed)
+            result["total_tables_available"] = len(listed)
+            keys = [k for k, _ in listed[:max_tables]]
+
+            # One query for ALL columns of ALL tables (batch, not per-table).
+            cols_by_table: Dict[Tuple[str, str], List[Dict[str, Any]]] = {k: [] for k in keys}
+            pks_by_table: Dict[Tuple[str, str], List[str]] = {k: [] for k in keys}
+            if include_columns and keys:
+                if server_level:
+                    col_rows = [
+                        ((str(cr[0]), str(cr[1])), cr[2:]) for cr in client.query(
+                            "SELECT database, table, name, type, is_in_primary_key "
+                            "FROM system.columns "
+                            "WHERE database IN {dbs:Array(String)} "
+                            "ORDER BY database, table, position",
+                            parameters={"dbs": sorted({k[0] for k in keys})},
+                        ).result_rows]
+                else:
+                    col_rows = [
+                        ((db, str(cr[0])), cr[1:]) for cr in client.query(
+                            "SELECT table, name, type, is_in_primary_key "
+                            "FROM system.columns "
+                            "WHERE database = {db:String} "
+                            "ORDER BY table, position",
+                            parameters={"db": db},
+                        ).result_rows]
+                for key, cr in col_rows:
+                    if key not in cols_by_table:
                         continue
-                    cname = str(cr[1])
-                    ch_type = str(cr[2])
-                    is_pk = bool(cr[3])
+                    cname = str(cr[0])
+                    ch_type = str(cr[1])
+                    is_pk = bool(cr[2])
                     col_obj = {
                         "name": cname,
                         "type": self._canonical_from_ch(ch_type),
@@ -499,18 +584,18 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
                         "nullable": ch_type.strip().startswith("Nullable("),
                         "is_primary_key": is_pk,
                     }
-                    cols_by_table[tname].append(col_obj)
+                    cols_by_table[key].append(col_obj)
                     if is_pk:
-                        pks_by_table[tname].append(cname)
+                        pks_by_table[key].append(cname)
 
             tables = []
-            for n in names:
-                obj = {"name": n, "schema": db, "discovery_status": "complete"}
+            for key in keys:
+                obj = {"name": key[1], "schema": key[0], "discovery_status": "complete"}
                 if include_columns:
-                    obj["columns"] = cols_by_table.get(n, [])
-                    obj["primary_keys"] = pks_by_table.get(n, [])
+                    obj["columns"] = cols_by_table.get(key, [])
+                    obj["primary_keys"] = pks_by_table.get(key, [])
                 if include_row_counts:
-                    obj["row_count"] = row_est.get(n, 0)
+                    obj["row_count"] = row_est.get(key, 0)
                 tables.append(obj)
             result["tables"] = tables
             result["total_tables_discovered"] = len(tables)
@@ -521,6 +606,32 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
             self._safe_close(client)
         result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
         return result
+
+    # Databases ClickHouse keeps for itself (compared lower-cased).
+    _SYSTEM_DATABASES = frozenset({"system", "information_schema"})
+
+    def list_namespaces(self, params: Dict = None) -> Dict[str, Any]:
+        """List the databases this login can see, without ClickHouse's own:
+        the level metadata.json's namespace_model.table_namespace names.
+        "current" is the database the connection uses ("default" when the
+        config names none, as _connect does).
+        """
+        config = self._get_config(params or {})
+        client = None
+        try:
+            client = self._connect(config)
+            rows = client.query("SELECT name FROM system.databases ORDER BY name").result_rows
+            names = [r[0] for r in rows
+                     if r and r[0] and str(r[0]).lower() not in self._SYSTEM_DATABASES]
+            return {
+                "success": True,
+                "namespaces": sorted({str(n) for n in names}),
+                "current": str(config.get("database") or "default").strip(),
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": f"Listing namespaces failed: {e}"}
+        finally:
+            self._safe_close(client)
 
     def export(self, params: Dict = None) -> Dict[str, Any]:
         """Optimized paginated read (offset default, keyset when cursor_column is
@@ -547,6 +658,10 @@ class ClickHouseMCPServer(DestinationLoadMixin, BaseMCPConnector):
 
         if not table and not raw_query:
             return {"success": False, "error": "Missing 'table' (or 'query') parameter"}
+        if table and not raw_query and self._server_level(params):
+            scope_error = self._server_level_read_error(config, table)
+            if scope_error:
+                return {"success": False, "error": scope_error}
 
         offset = 0
         if raw_query:

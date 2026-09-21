@@ -3,7 +3,7 @@
 import { forwardRef, useImperativeHandle, useMemo, useRef } from "react"
 import CodeMirror, { EditorView, keymap, type ReactCodeMirrorRef } from "@uiw/react-codemirror"
 import { sql, PostgreSQL, MySQL, StandardSQL, type SQLDialect } from "@codemirror/lang-sql"
-import { autocompletion } from "@codemirror/autocomplete"
+import { autocompletion, closeCompletion } from "@codemirror/autocomplete"
 import { Prec } from "@codemirror/state"
 import { oneDark } from "@codemirror/theme-one-dark"
 import { useTheme } from "next-themes"
@@ -82,6 +82,17 @@ export interface SqlEditorHandle {
   /** Current caret/selection as document offsets, or null when the view is not
    *  mounted. `from === to` means a bare caret with no selection. */
   getSelection: () => { from: number; to: number } | null
+}
+
+/**
+ * Cmd/Ctrl+Enter. The editor keeps focus on a keyboard Run, so an open suggestion
+ * list stayed on top of the results (#54); close it first. A click on Run blurs the
+ * editor, which already closes it.
+ */
+export function runFromEditor(view: EditorView, onSubmit?: () => void): boolean {
+  closeCompletion(view)
+  onSubmit?.()
+  return true
 }
 
 /**
@@ -254,10 +265,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
             {
               key: "Mod-Enter",
               preventDefault: true,
-              run: () => {
-                onSubmit?.()
-                return true
-              },
+              run: (view) => runFromEditor(view, onSubmit),
             },
             {
               key: "Mod-.",

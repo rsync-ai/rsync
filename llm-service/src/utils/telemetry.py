@@ -230,10 +230,10 @@ def otel_enabled() -> bool:
     no connection, so it never raises, and the service logs the green
     "OpenTelemetry initialized" line while nothing is listening.
 
-    Cloud runs a collector and a backend behind it, so the default is enabled --
-    the cloud behaviour, per the OSS/cloud split rule in CLAUDE.md. Only
-    docker-compose.quickstart.yml turns it off, because that bundle ships no
-    collector and its observability story is ``docker logs``.
+    Cloud runs an OTLP collector, so the default is enabled -- the cloud behaviour, per the
+    OSS/cloud split rule in CLAUDE.md. Only docker-compose.quickstart.yml turns it
+    off, because that bundle ships no collector and its observability story is
+    ``docker logs``.
     """
     return env_bool("OTEL_ENABLED", True)
 

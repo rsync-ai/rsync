@@ -64,12 +64,23 @@ func extractDestinationConfigFromConfigJSON(configJSON []byte) *pipelineDestinat
 // assessDestinationNamespace builds the "(destination)" assessment table for the
 // destination-mapping HITL. It always validates the name; for relational
 // destinations it additionally probes existence + CREATE privilege live.
-// Returns (table, true) when there is anything to report, (zero, false) when the
-// pipeline has no destination mapping (legacy — nothing to assess).
+// A pipeline with no destination mapping still gets one informational row: the
+// executor then derives the layout from the source (resolveDestinationNamespace's
+// empty case), and returning nothing left the Destination category at 0 checks,
+// which read as "not assessed" (Mongo→GCS pipelines are created without a mapping).
 func assessDestinationNamespace(ctx context.Context, database *sql.DB, workspaceID, destConnID, destType string, configJSON []byte) (AssessmentTable, bool) {
 	dc := extractDestinationConfigFromConfigJSON(configJSON)
 	if dc == nil {
-		return AssessmentTable{}, false
+		kind := namespaceKindForConnector(destType)
+		return AssessmentTable{
+			Name: "(destination namespace)",
+			Findings: []AssessmentFinding{{
+				Code:     FindingDestNamespaceDefault,
+				Severity: AssessmentInfo,
+				Message:  fmt.Sprintf("No destination %s is set, so the destination layout follows the source's schema or database names.", kind),
+				Details:  map[string]interface{}{"namespace_kind": kind},
+			}},
+		}, true
 	}
 	namespace := strings.TrimSpace(dc.Namespace)
 	kind := strings.TrimSpace(dc.NamespaceKind)
@@ -301,6 +312,15 @@ func destTableProbeSet(selectedTables []string, destCfg map[string]interface{}) 
 type namespaceProbe struct {
 	CollidingTables []string
 	OwnerPipelineID string
+	// OwnerDeleted marks an owner that is a TOMBSTONE — the pipeline is gone, its
+	// data is not. It changes only what the user is told, never whether we
+	// relocate: a deleted pipeline's tables are protected exactly as a live one's
+	// are, because the rows in them are equally real.
+	OwnerDeleted bool
+	// OwnerName is the deleted pipeline's name at delete time, so the notice can
+	// say whose data is there instead of quoting a UUID. Empty for live owners
+	// (their name is one join away) and for unnamed pipelines.
+	OwnerName string
 }
 
 // isCollision reports whether the namespace belongs to somebody else and has to
@@ -416,8 +436,155 @@ func probeNamespaceCollision(ctx context.Context, database *sql.DB, workspaceID,
 	if err != nil {
 		return out, fmt.Errorf("ownership lookup: %w", err)
 	}
-	out.OwnerPipelineID = owner
+	if owner != "" {
+		out.OwnerPipelineID = owner
+		return out, nil
+	}
+
+	// No LIVE pipeline owns these tables — but "the pipeline that wrote them was
+	// deleted" is not the same as "these tables are the user's own", and before
+	// the tombstone those two were indistinguishable. Deleting a pipeline leaves
+	// its destination data in place (by design; the data is the customer's), so
+	// adopting that schema means a later reload drops somebody else's rows.
+	deadID, deadName := namespaceTombstoneOwner(qCtx, database, workspaceID, destConnID, pipelineID, namespace, cfg, want)
+	if deadID != "" {
+		out.OwnerPipelineID = deadID
+		out.OwnerName = deadName
+		out.OwnerDeleted = true
+	}
 	return out, nil
+}
+
+// pipelineNamespaceExpr is the ONE place the "which namespace does this pipeline
+// write to" expression is spelled, because three queries have to agree on it: the
+// live-ownership lookup, the tombstone write, and anything that joins them. The
+// chain is not cosmetic — `destination_config.namespace` is what the wizard
+// writes and `destination_namespace` is what the first-run lock writes, and a
+// pipeline can have either. A copy of this that drifted by one fallback would
+// tombstone a namespace nobody ever looks up, which fails silently and looks
+// exactly like no bug at all.
+const pipelineNamespaceExpr = `COALESCE(
+		        NULLIF(p.config->'destination_config'->>'namespace', ''),
+		        p.config->>'destination_namespace',
+		        '')`
+
+// writeDestinationNamespaceTombstone records, inside the delete transaction, that
+// this pipeline owned its destination namespace — so ownership survives the row.
+//
+// Nothing on the destination is dropped by a delete, and this does not change
+// that. What it changes is the ANSWER to "does another pipeline already write
+// this table here?", which namespaceTableOwner reads from `pipelines`. Without a
+// tombstone that answer flips to "nobody" the instant the row is deleted, and the
+// next pipeline pointed at the same connection + namespace locks the dead
+// pipeline's schema, adopts its tables, and a later run_mode=reload drops them
+// with the customer's data in them.
+//
+// Written from `pipelines` in a single INSERT … SELECT so the tombstone cannot
+// disagree with the row it describes, and in the caller's transaction so it is
+// exactly as durable as the delete.
+//
+// The SAVEPOINT is load-bearing, not defensive habit. In Postgres a failed
+// statement aborts the WHOLE transaction — every statement after it fails with
+// "current transaction is aborted" — so an INSERT that is merely ignored on error
+// would take the pipeline delete down with it on any gateway running ahead of
+// migration 110. Rolling back to the savepoint puts the transaction back in a
+// usable state and lets the delete proceed without its tombstone.
+func writeDestinationNamespaceTombstone(ctx context.Context, tx *sql.Tx, pipelineID, workspaceID string) {
+	if tx == nil {
+		return
+	}
+	if _, err := tx.ExecContext(ctx, `SAVEPOINT ns_tombstone`); err != nil {
+		log.WithContext(ctx).WithError(err).WithField("pipeline_id", pipelineID).
+			Warn("namespace tombstone: savepoint failed; skipping tombstone")
+		return
+	}
+
+	// ON CONFLICT rather than a plain INSERT: deleting a pipeline id that was
+	// already tombstoned (a delete retried after a partial failure) must refresh
+	// the row, not raise — and raising here would cost the savepoint round-trip
+	// for nothing.
+	_, err := tx.ExecContext(ctx, `
+		INSERT INTO destination_namespace_tombstones
+			(workspace_id, pipeline_id, pipeline_name, destination_connection_id, namespace, tables)
+		SELECT p.workspace_id, p.id, COALESCE(p.name, ''), p.destination_connection_id,
+		       `+pipelineNamespaceExpr+`,
+		       COALESCE(p.config->'selected_tables', '[]'::jsonb)
+		FROM pipelines p
+		WHERE p.id::text = $1
+		  AND p.workspace_id::text = $2
+		  AND p.destination_connection_id IS NOT NULL
+		  AND `+pipelineNamespaceExpr+` <> ''
+		ON CONFLICT (pipeline_id, destination_connection_id, namespace) DO UPDATE
+		SET pipeline_name = EXCLUDED.pipeline_name,
+		    tables        = EXCLUDED.tables,
+		    deleted_at    = NOW()
+	`, pipelineID, workspaceID)
+	if err != nil {
+		log.WithContext(ctx).WithError(err).WithField("pipeline_id", pipelineID).
+			Warn("namespace tombstone: write failed; destination namespace ownership not preserved")
+		if _, rbErr := tx.ExecContext(ctx, `ROLLBACK TO SAVEPOINT ns_tombstone`); rbErr != nil {
+			log.WithContext(ctx).WithError(rbErr).WithField("pipeline_id", pipelineID).
+				Error("namespace tombstone: rollback to savepoint failed; the delete transaction is now unusable")
+		}
+		return
+	}
+	_, _ = tx.ExecContext(ctx, `RELEASE SAVEPOINT ns_tombstone`)
+}
+
+// namespaceTombstoneOwner is namespaceTableOwner's answer for pipelines that no
+// longer exist: it reports the deleted pipeline whose tables still occupy this
+// namespace, or a zero value when none does.
+//
+// Split out rather than folded into namespaceTableOwner's query for one reason —
+// the failure modes differ. A broken `pipelines` query means the ownership check
+// itself is unreliable and the caller should fail soft on the whole probe. A
+// broken tombstone query (most likely: the table does not exist yet on a gateway
+// that has not run migration 110) must NOT degrade the live-ownership answer that
+// shipped before it. So this returns "no owner" on error and logs, and the live
+// path is unaffected.
+//
+// The table-matching is deliberately the SAME code as the live path —
+// destTableProbeSet over the recorded selected_tables with this destination's
+// config — because a tombstone is a frozen copy of exactly the fields the live
+// query reads. A tombstone with no recorded tables claims nothing, matching the
+// live rule that a pipeline whose selected_tables were never recorded owns
+// nothing.
+func namespaceTombstoneOwner(ctx context.Context, database *sql.DB, workspaceID, destConnID, pipelineID, namespace string, destCfg map[string]interface{}, want map[string]struct{}) (string, string) {
+	if database == nil || len(want) == 0 {
+		return "", ""
+	}
+	rows, err := database.QueryContext(ctx, `
+		SELECT t.pipeline_id::text, t.pipeline_name, t.tables::text
+		FROM destination_namespace_tombstones t
+		WHERE t.workspace_id::text = $1
+		  AND t.destination_connection_id::text = $2
+		  AND t.namespace = $3
+		  AND t.pipeline_id::text <> $4
+		ORDER BY t.deleted_at DESC
+	`, workspaceID, destConnID, namespace, strings.TrimSpace(pipelineID))
+	if err != nil {
+		log.WithContext(ctx).WithError(err).WithField("namespace", namespace).
+			Warn("namespace tombstone lookup failed; treating namespace as unowned by deleted pipelines")
+		return "", ""
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var deadID, deadName, rawTables string
+		if err := rows.Scan(&deadID, &deadName, &rawTables); err != nil {
+			return "", ""
+		}
+		var selected []string
+		if err := json.Unmarshal([]byte(rawTables), &selected); err != nil {
+			continue
+		}
+		for name := range destTableProbeSet(selected, destCfg) {
+			if _, ok := want[name]; ok {
+				return deadID, strings.TrimSpace(deadName)
+			}
+		}
+	}
+	return "", ""
 }
 
 // namespaceTableOwner returns the id of a DIFFERENT pipeline that writes one of
@@ -461,10 +628,7 @@ func namespaceTableOwner(ctx context.Context, database *sql.DB, workspaceID, des
 		WHERE p.id::text <> $1
 		  AND p.workspace_id::text = $2
 		  AND p.destination_connection_id::text = $3
-		  AND COALESCE(
-		        NULLIF(p.config->'destination_config'->>'namespace', ''),
-		        p.config->>'destination_namespace',
-		        '') = $4
+		  AND `+pipelineNamespaceExpr+` = $4
 		ORDER BY p.id
 	`, pipelineID, workspaceID, destConnID, namespace)
 	if err != nil {
@@ -502,6 +666,13 @@ type namespaceRelocation struct {
 	Resolved        string
 	CollidingTables []string
 	OwnerPipelineID string
+	// Carried through from namespaceProbe so the notice can distinguish "another
+	// pipeline writes here" from "a DELETED pipeline's data is still here" — two
+	// very different things for a user to act on, and only the second one has a
+	// fix the user can carry out (drop the leftover tables, or keep the new
+	// namespace).
+	OwnerDeleted bool
+	OwnerName    string
 }
 
 // resolveFirstRunNamespace picks the destination namespace a pipeline will OWN,
@@ -523,10 +694,18 @@ type namespaceRelocation struct {
 // works identically for a PG schema and a MySQL database.
 //
 // Fail-soft: a probe infrastructure error means "cannot verify collision" — we
-// return the user's chosen namespace unchanged rather than block the run (a real
-// collision then surfaces, loudly, at write time, via the connector's ownership
-// gate). A non-nil second return means the pipeline was relocated and the user
-// needs to be told where its data actually went.
+// return the user's chosen namespace unchanged rather than block the run. Note
+// what that costs: there is NO write-time backstop. The pipeline_id-equality
+// refusal in the connectors' drop_table was removed deliberately in PR #121, and
+// two in-tree retractions (namespace_lock.go, pipeline_hitl.go) record that no
+// replacement was ever added. This probe IS the gate, so a probe that could not
+// run means the run proceeds unguarded — which is the right trade against
+// blocking every run whenever a destination is briefly unreachable, but it is a
+// trade, not a safety net.
+//
+// A non-nil second return means the pipeline was relocated and the user needs to
+// be told where its data actually went. The owner it routes around may be a
+// deleted pipeline: its rows outlive it, so they are protected the same way.
 func resolveFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID, destConnID, destType, pipelineID, chosen string, selectedTables []string) (string, *namespaceRelocation) {
 	chosen = strings.TrimSpace(chosen)
 	if chosen == "" || !isDBConnector(destType) {
@@ -568,12 +747,14 @@ func resolveFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID
 			return prefixed, &namespaceRelocation{
 				Chosen: chosen, Resolved: prefixed,
 				CollidingTables: probe.CollidingTables, OwnerPipelineID: probe.OwnerPipelineID,
+				OwnerDeleted: probe.OwnerDeleted, OwnerName: probe.OwnerName,
 			}
 		}
 		if !probe2.isCollision() {
 			rel := &namespaceRelocation{
 				Chosen: chosen, Resolved: prefixed,
 				CollidingTables: probe.CollidingTables, OwnerPipelineID: probe.OwnerPipelineID,
+				OwnerDeleted: probe.OwnerDeleted, OwnerName: probe.OwnerName,
 			}
 			log.WithContext(ctx).WithFields(map[string]interface{}{
 				"pipeline_id":       pipelineID,
@@ -603,6 +784,7 @@ func resolveFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID
 	return resolved, &namespaceRelocation{
 		Chosen: chosen, Resolved: resolved,
 		CollidingTables: probe.CollidingTables, OwnerPipelineID: probe.OwnerPipelineID,
+		OwnerDeleted: probe.OwnerDeleted, OwnerName: probe.OwnerName,
 	}
 }
 
@@ -640,20 +822,39 @@ func notifyNamespaceRelocation(ctx context.Context, database *sql.DB, pipelineID
 		"resolved_namespace": rel.Resolved,
 		"colliding_tables":   rel.CollidingTables,
 		"owner_pipeline_id":  rel.OwnerPipelineID,
+		"owner_deleted":      rel.OwnerDeleted,
 		"impact":             fmt.Sprintf("Rows land in %q, not %q.", rel.Resolved, rel.Chosen),
 		"action_label":       "View pipeline",
 	})
+	// A deleted owner needs its own copy. "Owned by pipeline <uuid>" is useless
+	// advice when that pipeline cannot be opened, and it reads as a bug; the user
+	// needs to know the data is LEFTOVER and that they can reclaim the namespace
+	// by dropping it themselves.
 	message := fmt.Sprintf(
 		"This pipeline was set up to write to %q, but %s already written there by pipeline %s. To avoid overwriting its data, this pipeline writes to %q instead — look for your data there.",
 		rel.Chosen, describeCollidingTables(rel.CollidingTables), rel.OwnerPipelineID, rel.Resolved,
 	)
+	title := "Destination changed to avoid another pipeline's data"
+	if rel.OwnerDeleted {
+		owner := strings.TrimSpace(rel.OwnerName)
+		if owner == "" {
+			owner = "a pipeline that has since been deleted"
+		} else {
+			owner = fmt.Sprintf("the deleted pipeline %q", owner)
+		}
+		title = "Destination changed to avoid a deleted pipeline's data"
+		message = fmt.Sprintf(
+			"This pipeline was set up to write to %q, but %s already written there by %s. Deleting a pipeline never removes its data from the destination, so those tables are still there. To avoid overwriting them, this pipeline writes to %q instead — look for your data there. If that leftover data is no longer wanted, drop it on the destination and the next new pipeline can use %q normally.",
+			rel.Chosen, describeCollidingTables(rel.CollidingTables), owner, rel.Resolved, rel.Chosen,
+		)
+	}
 	if _, err := database.ExecContext(ctx, `
 		INSERT INTO pipeline_notifications
 			(pipeline_id, user_id, type, severity, title, message, action_url, metadata, delivery_status, dedup_key, created_at)
 		VALUES ($1::uuid, $2::uuid, 'destination_namespace_relocated', 'warning', $3, $4, $5, $6, 'pending', $7, NOW())
 	`,
 		pipelineID, strings.TrimSpace(userID.String),
-		"Destination changed to avoid another pipeline's data",
+		title,
 		message,
 		"/pipelines/"+pipelineID,
 		meta,

@@ -150,6 +150,28 @@ if [ -n "$_kafka_sec_any" ]; then
     # the user rather than the escaping -- which reads like a wrong password.
     esc() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed 's/\\/\\\\/g'; }
 
+    # True when fetching a token from $1 would put the client secret on a wire.
+    # Loopback is exempt because the request never leaves the host: Google's
+    # Workload Identity token server is http://localhost:14293. Mirrors
+    # _token_endpoint_is_insecure in llm-service/src/utils/kafka_security.py.
+    _insecure_token_endpoint() {
+        case "$1" in https://*|HTTPS://*) return 1 ;; esac
+        _h=${1#*://}; _h=${_h%%/*}; _h=${_h%%\?*}; _h=${_h##*@}
+        case "$_h" in
+            \[*) _h=${_h#\[}; _h=${_h%%]*} ;;
+            *) _h=${_h%%:*} ;;
+        esac
+        _h=$(printf '%s' "$_h" | tr '[:upper:]' '[:lower:]'); _h=${_h%.}
+        [ -n "$_h" ] || return 1
+        case "$_h" in
+            localhost|*.localhost|::1|0:0:0:0:0:0:0:1) return 1 ;;
+            # 127.0.0.0/8, but not a name that merely starts with it
+            # (127.0.0.1.evil.example.com resolves wherever its owner says).
+            127.*) case "$_h" in *[!0-9.]*) return 0 ;; *) return 1 ;; esac ;;
+        esac
+        return 0
+    }
+
     if [ -n "$KAFKA_SASL_MECHANISM" ]; then
         case "$KAFKA_SASL_MECHANISM" in
             SCRAM-SHA-256|SCRAM-SHA-512)
@@ -181,6 +203,25 @@ if [ -n "$_kafka_sec_any" ]; then
                     exit 1
                 fi
             done
+            # The client-credentials grant POSTs the client secret to the token
+            # endpoint on every fetch, so http off loopback hands a credential
+            # that never expires to anyone on the path. Same rule, same opt-out
+            # and same loopback exemption as the Go, Python and Connect halves.
+            if [ "${KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT:-}" != "true" ] &&
+                _insecure_token_endpoint "$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT"; then
+                echo "❌ FATAL: KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT=$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT is http and its host is not loopback."
+                echo "         KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET would be sent in the clear on every token fetch."
+                echo "         Use https, a loopback address, or set"
+                echo "         KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT=true for a disposable test rig."
+                exit 1
+            fi
+            # kafka-clients 3.9.2 gates the token endpoint on a JVM system
+            # property, and UNSET MEANS ALLOW ANY URL. Pin it to the endpoint
+            # this job was configured with.
+            case "${KAFKA_OPTS:-}" in
+                *org.apache.kafka.sasl.oauthbearer.allowed.urls*) ;;
+                *) export KAFKA_OPTS="${KAFKA_OPTS:+$KAFKA_OPTS }-Dorg.apache.kafka.sasl.oauthbearer.allowed.urls=$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT" ;;
+            esac
             _jaas="$_jaas_module required"
             _jaas="$_jaas clientId=\"$(esc "$KAFKA_SASL_OAUTHBEARER_CLIENT_ID")\""
             _jaas="$_jaas clientSecret=\"$(esc "$KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET")\""
@@ -236,22 +277,48 @@ if [ -n "$_kafka_sec_any" ]; then
         } >> "$KAFKA_CLIENT_CONFIG"
     fi
 
-    # mTLS. KAFKA_SSL_KEYSTORE_LOCATION, NOT KAFKA_SSL_CERT_LOCATION: a JVM PEM
-    # keystore is ONE file holding chain + key, and it cannot take the two paths
-    # the Go and Python clients read. Pointing it at the cert half alone yields
-    # "Failed to load PEM keystore" -- a message that names the file, so it reads
-    # like a bad certificate rather than a missing key.
-    if [ -n "$KAFKA_SSL_KEYSTORE_LOCATION" ]; then
+    # mTLS. A JVM PEM keystore is ONE file holding chain + key; it cannot take
+    # the two paths the Go and Python clients read, and pointing it at the cert
+    # half alone yields "Failed to load PEM keystore" -- a message naming the
+    # file, so it reads like a bad certificate rather than a missing key. An
+    # explicit KAFKA_SSL_KEYSTORE_LOCATION wins; otherwise the file is built
+    # here from the pair, with the same checks the kafka-connect image's
+    # entrypoint (connect-entrypoint.sh) makes on the same input.
+    _ks="$KAFKA_SSL_KEYSTORE_LOCATION"
+    if [ -z "$_ks" ] && [ -n "$KAFKA_SSL_CERT_LOCATION$KAFKA_SSL_KEY_LOCATION" ]; then
+        # Half a pair is a config error, not "no mTLS": the broker would reject
+        # the handshake anyway, with an alert naming neither variable.
+        if [ -z "$KAFKA_SSL_CERT_LOCATION" ] || [ -z "$KAFKA_SSL_KEY_LOCATION" ]; then
+            echo "❌ FATAL: KAFKA_SSL_CERT_LOCATION and KAFKA_SSL_KEY_LOCATION must be set together (mTLS needs both halves of the keypair)."
+            exit 1
+        fi
+        for _f in "$KAFKA_SSL_CERT_LOCATION" "$KAFKA_SSL_KEY_LOCATION"; do
+            if [ ! -r "$_f" ]; then
+                echo "❌ FATAL: $_f (from KAFKA_SSL_CERT_LOCATION / KAFKA_SSL_KEY_LOCATION) is not a readable file in this container."
+                exit 1
+            fi
+        done
+        if ! grep -q -- '-----BEGIN CERTIFICATE-----' "$KAFKA_SSL_CERT_LOCATION"; then
+            echo "❌ FATAL: KAFKA_SSL_CERT_LOCATION=$KAFKA_SSL_CERT_LOCATION holds no PEM certificate (-----BEGIN CERTIFICATE-----)."
+            exit 1
+        fi
+        # No trailing dashes: header + later "KEY-----" reads as a key to gitleaks.
+        if ! grep -q -- '-----BEGIN PRIVATE KEY' "$KAFKA_SSL_KEY_LOCATION"; then
+            echo "❌ FATAL: KAFKA_SSL_KEY_LOCATION=$KAFKA_SSL_KEY_LOCATION must be an unencrypted PKCS#8 key (BEGIN PRIVATE KEY)."
+            echo "         The Kafka CLI is a JVM and cannot load PKCS#1, SEC1 or encrypted keys. Convert once:"
+            echo "           openssl pkcs8 -topk8 -nocrypt -in client.key -out client.pk8.key"
+            echo "         The Go and Python services read the PKCS#8 file unchanged."
+            exit 1
+        fi
+        # umask 077 above: owner-only, like the properties file beside it.
+        _ks=/tmp/kafka-client.pem
+        { cat "$KAFKA_SSL_CERT_LOCATION"; echo; cat "$KAFKA_SSL_KEY_LOCATION"; } > "$_ks"
+    fi
+    if [ -n "$_ks" ]; then
         {
             echo "ssl.keystore.type=PEM"
-            echo "ssl.keystore.location=$KAFKA_SSL_KEYSTORE_LOCATION"
+            echo "ssl.keystore.location=$_ks"
         } >> "$KAFKA_CLIENT_CONFIG"
-    elif [ -n "$KAFKA_SSL_CERT_LOCATION" ]; then
-        echo "❌ FATAL: KAFKA_SSL_CERT_LOCATION is set but KAFKA_SSL_KEYSTORE_LOCATION is not."
-        echo "         The Kafka CLI is a JVM and needs the keypair as ONE PEM file:"
-        echo "           cat \$KAFKA_SSL_CERT_LOCATION \$KAFKA_SSL_KEY_LOCATION > /certs/client.pem"
-        echo "         then set KAFKA_SSL_KEYSTORE_LOCATION=/certs/client.pem."
-        exit 1
     fi
 
     if [ "$KAFKA_SSL_SKIP_VERIFY" = "true" ]; then

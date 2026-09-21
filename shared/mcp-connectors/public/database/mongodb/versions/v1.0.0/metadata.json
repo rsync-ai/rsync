@@ -22,6 +22,11 @@
   "supports_source": true,
   "supports_destination": true,
   "supports_cdc": true,
+  "namespace_model": {
+    "table_namespace": "database",
+    "destination_namespace": "database",
+    "destination_default": ""
+  },
   "supports_ddl": false,
   "auto_create_destination_tables": true,
   "spec_version": "1.0",
@@ -64,10 +69,10 @@
     }
   ],
   "required_config": [
-    "host",
-    "database"
+    "host"
   ],
   "optional_config": [
+    "database",
     "port",
     "user",
     "password",
@@ -97,7 +102,8 @@
       },
       "database": {
         "type": "string",
-        "description": "Database name whose collections are discovered/captured."
+        "description": "Database to connect to. Leave empty for a server-level connection: every database the login can see (except admin, config and local), narrowed by Scope.",
+        "ui_tier": "basic"
       },
       "user": {
         "type": "string",
@@ -126,8 +132,7 @@
       }
     },
     "required": [
-      "host",
-      "database"
+      "host"
     ]
   },
   "config_schema": {
@@ -143,7 +148,8 @@
       },
       "database": {
         "type": "string",
-        "description": "Database name"
+        "description": "Database to connect to. Leave empty for a server-level connection: every database the login can see (except admin, config and local), narrowed by Scope.",
+        "ui_tier": "basic"
       },
       "user": {
         "type": "string",
@@ -164,8 +170,7 @@
       }
     },
     "required": [
-      "host",
-      "database"
+      "host"
     ]
   },
   "capabilities": {

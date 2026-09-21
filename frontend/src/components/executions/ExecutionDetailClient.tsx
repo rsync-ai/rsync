@@ -25,6 +25,10 @@ interface Props {
     id: string
     status: string
     pipelineId: string
+    // A CDC run past its backfill that is still streaming. The API reports it as
+    // running, but there is no run to cancel (the stream belongs to the pipeline)
+    // and re-running would start a second stream beside the live one.
+    liveStream?: boolean
   }
 }
 
@@ -91,8 +95,9 @@ export function ExecutionDetailClient({ execution }: Props) {
     }
   }
 
-  const isRunning = execution.status === "running" || execution.status === "pending"
-  const isComplete = execution.status === "success" || execution.status === "failed" || execution.status === "cancelled"
+  const liveStream = execution.liveStream === true
+  const isRunning = !liveStream && (execution.status === "running" || execution.status === "pending")
+  const isComplete = !liveStream && (execution.status === "success" || execution.status === "failed" || execution.status === "cancelled")
 
   return (
     <>
@@ -109,6 +114,12 @@ export function ExecutionDetailClient({ execution }: Props) {
           </div>
           
           <div className="flex items-center gap-2">
+            {liveStream && (
+              <p className="text-sm text-zinc-600 dark:text-zinc-300">
+                Streaming changes. Stop or pause the stream from the pipeline page.
+              </p>
+            )}
+
             {isRunning && (
               <Button
                 variant="destructive"
@@ -172,6 +183,7 @@ export function ExecutionDetailClient({ execution }: Props) {
         }
       }}
       report={assessmentReport}
+      assessmentTabHref={`/pipelines/${execution.pipelineId}?tab=assessment`}
       submitting={submittingProceed}
       onProceed={async (nominatedKeys) => {
         if (!pendingRunMode) return

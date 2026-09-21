@@ -53,7 +53,7 @@ export function PageErrorBoundary({
 
           {showDebug && (
             <details className="mt-8 text-left">
-              <summary className="cursor-pointer text-sm text-zinc-500">Debug Info</summary>
+              <summary className="cursor-pointer text-sm text-zinc-500 dark:text-zinc-400">Debug Info</summary>
               <pre className="mt-3 overflow-auto rounded-lg bg-zinc-950 p-4 text-xs text-emerald-300">
                 {error.stack || "No stack trace available"}
               </pre>

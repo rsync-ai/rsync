@@ -62,14 +62,14 @@ func TestBuildDebeziumMySQLOffsetRecord(t *testing.T) {
 func TestHybridIsPostgresFamily(t *testing.T) {
 	pg := []string{"postgresql", "postgres", "PostgreSQL", "aurora_postgresql", "alloydb", "neon", "supabase", "cockroachdb", "cockroach-db"}
 	for _, s := range pg {
-		if !hybridIsPostgresFamily(s) {
-			t.Errorf("hybridIsPostgresFamily(%q) = false, want true", s)
+		if !isPostgresFamily(s) {
+			t.Errorf("isPostgresFamily(%q) = false, want true", s)
 		}
 	}
 	notPG := []string{"mysql", "mariadb", "mongodb", "oracle", "sqlserver", ""}
 	for _, s := range notPG {
-		if hybridIsPostgresFamily(s) {
-			t.Errorf("hybridIsPostgresFamily(%q) = true, want false", s)
+		if isPostgresFamily(s) {
+			t.Errorf("isPostgresFamily(%q) = true, want false", s)
 		}
 	}
 }
@@ -83,8 +83,8 @@ func TestHybridNormalizeDBType(t *testing.T) {
 		"my-sql":   "my_sql",
 	}
 	for in, want := range cases {
-		if got := hybridNormalizeDBType(in); got != want {
-			t.Errorf("hybridNormalizeDBType(%q) = %q, want %q", in, got, want)
+		if got := normalizeDBType(in); got != want {
+			t.Errorf("normalizeDBType(%q) = %q, want %q", in, got, want)
 		}
 	}
 }

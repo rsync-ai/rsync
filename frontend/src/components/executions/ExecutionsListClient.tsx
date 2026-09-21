@@ -33,7 +33,8 @@ import {
   CalendarDays,
   Hand
 } from "lucide-react"
-import { formatDateTime, cn } from "@/lib/utils"
+import { cn, formatElapsed } from "@/lib/utils"
+import { LocalDateTime, useHydrated } from "@/components/ui/local-date-time"
 import { cancelExecution, listExecutionsResponse } from "@/lib/api/executions"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
@@ -80,6 +81,9 @@ interface ExecutionWithPipeline {
   scheduledTime?: Date | null
   startedAt: Date
   finishedAt: Date | null
+  // A CDC run whose backfill finished and which is still streaming. It shows as
+  // running but has nothing to cancel here: the stream is stopped from the pipeline.
+  liveStream?: boolean
   error: string | null
   nodeResults: unknown
   inputData: unknown
@@ -150,6 +154,7 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
         scheduledTime: (e.scheduledTime || e.scheduled_time) ? new Date(e.scheduledTime || e.scheduled_time) : null,
         startedAt: new Date(e.startedAt || e.start_time),
         finishedAt: (e.finishedAt || e.end_time) ? new Date(e.finishedAt || e.end_time) : null,
+        liveStream: Boolean(e.live_stream),
         error: e.error || e.error_message || null,
         nodeResults: e.nodeResults || e.node_results,
         inputData: e.inputData || e.input_data,
@@ -283,15 +288,14 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
     setTimeout(() => setIsRefreshing(false), 500)
   }
 
+  // An open run's duration runs to "now", which differs between the server render
+  // and the browser's first render (a hydration mismatch, React #418), so it is
+  // only computed once hydrated.
+  const hydrated = useHydrated()
   const calculateDuration = (startedAt: Date, finishedAt: Date | null) => {
-    const start = new Date(startedAt)
+    if (!finishedAt && !hydrated) return "—"
     const end = finishedAt ? new Date(finishedAt) : new Date()
-    const diffMs = end.getTime() - start.getTime()
-    
-    if (diffMs < 1000) return `${diffMs}ms`
-    if (diffMs < 60000) return `${Math.round(diffMs / 1000)}s`
-    if (diffMs < 3600000) return `${Math.round(diffMs / 60000)}m ${Math.round((diffMs % 60000) / 1000)}s`
-    return `${Math.round(diffMs / 3600000)}h ${Math.round((diffMs % 3600000) / 60000)}m`
+    return formatElapsed(end.getTime() - new Date(startedAt).getTime())
   }
 
   return (
@@ -351,7 +355,7 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="outline" className="gap-2 bg-white dark:bg-zinc-900">
-                <Filter className="h-4 w-4 text-zinc-500" />
+                <Filter className="h-4 w-4 text-zinc-500 dark:text-zinc-400" />
                 <span className="text-zinc-700 dark:text-zinc-300">
                   {statusFilter ? statusConfig[statusFilter as keyof typeof statusConfig]?.label : "All Status"}
                 </span>
@@ -377,7 +381,7 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
               <Button variant="outline" className="gap-2 bg-white dark:bg-zinc-900">
-                <GitBranch className="h-4 w-4 text-zinc-500" />
+                <GitBranch className="h-4 w-4 text-zinc-500 dark:text-zinc-400" />
                 <span className="text-zinc-700 dark:text-zinc-300">
                   {pipelineFilter 
                     ? pipelineOptions.find(p => p.id === pipelineFilter)?.name || "Pipeline"
@@ -407,7 +411,7 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
             className="bg-white dark:bg-zinc-900"
             aria-label="Refresh executions"
           >
-            <RotateCcw className={cn("h-4 w-4 text-zinc-500", isRefreshing && "animate-spin")} />
+            <RotateCcw className={cn("h-4 w-4 text-zinc-500 dark:text-zinc-400", isRefreshing && "animate-spin")} />
           </Button>
         </div>
       </div>
@@ -505,10 +509,10 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
                           )}
                         </div>
                         
-                        <div className="flex items-center flex-wrap gap-x-4 gap-y-2 text-xs text-zinc-500">
+                        <div className="flex items-center flex-wrap gap-x-4 gap-y-2 text-xs text-zinc-500 dark:text-zinc-400">
                           <span className="flex items-center gap-1.5" title="Start time">
                             <Clock className="h-3.5 w-3.5" />
-                            {formatDateTime(execution.startedAt)}
+                            <LocalDateTime value={execution.startedAt} />
                           </span>
                           <span className="flex items-center gap-1.5" title="Duration">
                             <Timer className="h-3.5 w-3.5" />
@@ -532,7 +536,7 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
                     </div>
                     
                     <div className="flex items-center gap-2 ml-4">
-                      {(execution.status === "running" || execution.status === "pending") && (
+                      {(execution.status === "running" || execution.status === "pending") && !execution.liveStream && (
                         <Button
                           variant="outline"
                           size="sm"
@@ -545,7 +549,7 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
                       )}
                       
                       <Link href={`/executions/${execution.id}`}>
-                        <Button variant="ghost" size="sm" className="text-zinc-600 hover:text-zinc-900 h-9 group-hover:bg-zinc-100 dark:group-hover:bg-zinc-800">
+                        <Button variant="ghost" size="sm" className="text-zinc-600 hover:text-zinc-900 dark:text-zinc-300 dark:hover:text-zinc-100 h-9 group-hover:bg-zinc-100 dark:group-hover:bg-zinc-800">
                           Details
                           <ArrowRight className="h-4 w-4 ml-1.5 opacity-50 group-hover:opacity-100 transition-opacity" />
                         </Button>
@@ -572,7 +576,7 @@ function StatsCard({ icon: Icon, label, value, className, iconClass, textClass, 
           </div>
           <div>
             <p className={cn("text-2xl font-bold", textClass || "text-zinc-900 dark:text-white")}>{value}</p>
-            <p className={cn("text-xs", textClass ? "opacity-80" : "text-zinc-500")}>{label}</p>
+            <p className={cn("text-xs", textClass ? "opacity-80" : "text-zinc-500 dark:text-zinc-400")}>{label}</p>
           </div>
         </div>
       </CardContent>

@@ -314,19 +314,7 @@ func normalizeSnapshotMode(v string) string {
 }
 
 func parseTableIncludeList(connCfg map[string]interface{}) []string {
-	raw := strings.TrimSpace(fmt.Sprint(connCfg["table.include.list"]))
-	if raw == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		t := strings.TrimSpace(p)
-		if t != "" {
-			out = append(out, t)
-		}
-	}
-	return out
+	return connectorIncludeList(connCfg)
 }
 
 func getConnectorStatus(ctx context.Context, connectURL, connectorName string) (*connectorStatusPayload, int, error) {

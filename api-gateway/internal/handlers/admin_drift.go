@@ -35,25 +35,28 @@ type DriftServiceResult struct {
 }
 
 type DriftReport struct {
-	GatheredAt    string                `json:"gathered_at"`
-	AllAgree      bool                  `json:"all_agree"`
-	UniqueCommits []string              `json:"unique_commits"`
-	Suspicions    []string              `json:"suspicions"`
-	Services      []DriftServiceResult  `json:"services"`
+	GatheredAt    string               `json:"gathered_at"`
+	AllAgree      bool                 `json:"all_agree"`
+	UniqueCommits []string             `json:"unique_commits"`
+	Suspicions    []string             `json:"suspicions"`
+	Services      []DriftServiceResult `json:"services"`
 }
 
 // driftTargets is the canonical list of "what should agree on a commit."
 // Mirrors config/services.yaml. Hardcoded here intentionally — services
 // that need a config-file loader can read the YAML; this endpoint is
 // itself part of the deployment-drift detector and must work even if
-// the YAML is wrong.
+// the YAML is wrong. admin_drift_test.go fails if the two disagree, or if a
+// URL names a host, port or path its service does not serve.
 var driftTargets = []struct {
 	Name string
 	URL  string
 }{
 	{"api-gateway", "http://api-gateway:8080/version"},
 	{"backend-orchestrator", "http://orchestrator:8080/version"},
-	{"backend-temporal-adapter", "http://temporal-adapter:8080/version"},
+	// The adapter's only HTTP listener is its ops port 8082 (/metrics +
+	// /version, cmd/adapter/ops_server.go). Nothing listens on 8080.
+	{"backend-temporal-adapter", "http://temporal-adapter:8082/version"},
 	{"llm-service", "http://llm-service:5000/version"},
 }
 

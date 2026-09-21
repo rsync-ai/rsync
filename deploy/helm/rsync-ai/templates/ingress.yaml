@@ -3,7 +3,7 @@
 {{/*
 Two hosts, not one host with a /api path prefix.
 
-The API is called from the BROWSER using NEXT_PUBLIC_API_URL, and the gateway's
+The API is called from the BROWSER using frontend.apiUrl (PUBLIC_URL in the pod), and the gateway's
 CORS middleware fails closed with no wildcard branch. A path-prefix layout would
 also require the gateway to be mounted under a base path it does not implement,
 so requests would 404 with a correct-looking ingress. Two hostnames keeps both

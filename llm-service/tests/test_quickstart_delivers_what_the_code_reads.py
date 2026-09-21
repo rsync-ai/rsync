@@ -21,6 +21,12 @@ block. Four defects of exactly this shape shipped at once:
   LLM_SERVICE_TIMEOUT_SECONDS  absent, leaving the 10s code default against CPU
                       Ollama, where a first token takes 60-100s.
 
+A fifth came later: GROQ_API_KEY and AZURE_OPENAI_* were never listed, so
+``LLM_PROVIDER=groq`` or ``=azure`` in .env resolved to the Ollama fallback on every
+install. The LLM check no longer names OPENAI_BASE_URL alone; it reads the variable
+names out of the functions that pick the provider, key and model and build the
+client, so a provider added there is required here without an edit.
+
 The guard does not hold a list of which services need which variable -- a list is a
 claim that goes stale the first time someone moves an import. It derives the answer
 from the code: for each Python service it resolves the module named in the compose
@@ -235,18 +241,97 @@ def test_a_service_that_rate_limits_gets_a_redis_to_rate_limit_with(name):
     )
 
 
+# The functions a service calls to choose its provider, key and model and to build
+# its client. Everything they read -- directly or through a helper in the same
+# module -- is a setting an operator can put in .env and expect to take effect.
+LLM_CLIENT_ENTRYPOINTS = (
+    "resolve_provider",
+    "llm_configured",
+    "get_default_model",
+    "openai_api_key",
+    "make_sync_client",
+    "make_async_client",
+)
+# Callables whose string arguments are environment variable names.
+_ENV_READERS_FIRST_ARG = {"getenv", "get", "env_bool", "_env_bool"}
+_ENV_READERS_ALL_ARGS = {"_credential", "_set_credential"}
+_ENV_NAME = re.compile(r"[A-Z][A-Z0-9_]+")
+
+
+@functools.lru_cache(maxsize=None)
+def _llm_client_env_vars() -> frozenset[str]:
+    path = _module_path(OPENAI_CLIENT_MODULE)
+    tree = ast.parse(path.read_text())
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    names: set[str] = set()
+    seen: set[str] = set()
+    queue = list(LLM_CLIENT_ENTRYPOINTS)
+    while queue:
+        current = queue.pop()
+        if current in seen or current not in functions:
+            continue
+        seen.add(current)
+        for node in ast.walk(functions[current]):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            called = func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+            if isinstance(func, ast.Name) and func.id in functions:
+                queue.append(func.id)
+            if called in _ENV_READERS_ALL_ARGS:
+                args = node.args
+            elif called in _ENV_READERS_FIRST_ARG:
+                args = node.args[:1]
+            else:
+                continue
+            for arg in args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str) and _ENV_NAME.fullmatch(arg.value):
+                    names.add(arg.value)
+    return frozenset(names)
+
+
+def test_the_llm_variable_census_is_not_vacuous():
+    found = _llm_client_env_vars()
+    # One per provider and one per way of reaching it. If the walk stops following
+    # helpers, the credential names (read inside _credential calls two hops down)
+    # are the first to disappear.
+    for anchor in (
+        "LLM_PROVIDER",
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_KEY_SOURCE",
+        "GROQ_API_KEY",
+        "AZURE_OPENAI_ENDPOINT",
+        "AZURE_OPENAI_API_KEY",
+        "LLM_MODEL",
+        "OLLAMA_URL",
+    ):
+        assert anchor in found, f"census of {OPENAI_CLIENT_MODULE} lost {anchor}: {sorted(found)}"
+    reaching = [
+        n for n, svc in _python_services().items()
+        if OPENAI_CLIENT_MODULE in _reachable(_entrypoint_module(svc))
+    ]
+    assert reaching, f"no quickstart service reaches {OPENAI_CLIENT_MODULE}"
+
+
 @pytest.mark.parametrize("name", sorted(_python_services()))
 def test_a_service_that_calls_an_llm_can_be_pointed_at_one(name):
     svc = _python_services()[name]
     if OPENAI_CLIENT_MODULE not in _reachable(_entrypoint_module(svc)):
         pytest.skip(f"{name} does not reach {OPENAI_CLIENT_MODULE}")
     env = _env(svc)
-    assert "OPENAI_BASE_URL" in env, (
-        f"{name} builds an OpenAI-protocol client but docker-compose.quickstart.yml "
-        f"never delivers OPENAI_BASE_URL, so it can only ever reach api.openai.com. "
-        f"LLM_PROVIDER=openai names the wire protocol, not the vendor."
+    missing = sorted(_llm_client_env_vars() - set(env))
+    assert not missing, (
+        f"{name} builds its LLM client with {OPENAI_CLIENT_MODULE}, which reads "
+        f"{missing}, but docker-compose.quickstart.yml never delivers them. No service "
+        f"here has an env_file, so a value an operator sets in .env for these never "
+        f"reaches the container: LLM_PROVIDER=groq without GROQ_API_KEY, for one, "
+        f"falls back to Ollama."
     )
-    assert "OPENAI_API_KEY" in env, f"{name} has OPENAI_BASE_URL but no OPENAI_API_KEY"
 
 
 @pytest.mark.parametrize("name", sorted(_python_services()))
@@ -457,4 +542,141 @@ def test_the_chat_deadline_is_delivered_and_fits_under_the_write_timeout():
     assert seconds < ceiling, (
         f"{TIMEOUT_VAR}={seconds}s is not under the server's {ceiling}s WriteTimeout; "
         f"raise both together or the response is cut anyway."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Internal plumbing: the shared secret and in-network hostnames. Both fail the same
+# silent way -- scheduled model runs, the dashboard's orchestrator cards, the object
+# storage blob lane and plan-time topic sizing each logged a 401 or a DNS miss while
+# every container reported healthy.
+# ---------------------------------------------------------------------------
+SECRET_VAR = "INTERNAL_SERVICE_SECRET"
+# Browser-facing and host-reachable names; everything else must be a compose host.
+_NON_COMPOSE_HOSTS = {"localhost", "host.docker.internal"}
+# Code defaults naming a sidecar this bundle deliberately does not ship. Each feature
+# stays off here: Avro is pinned false, OTEL is pinned false, and the MCP container
+# listing only uses the proxy when MCP_DOCKER_API_URL is set.
+_OPTIONAL_SIDECARS = {"schema-registry", "otel-collector", "docker-socket-proxy"}
+_URL_HOST = re.compile(r'"(?:https?|grpc)://([A-Za-z0-9_-]+):\d+')
+
+
+def _quickstart_hosts() -> set[str]:
+    services = _services(QUICKSTART)
+    return set(services) | {(svc or {}).get("container_name") for svc in services.values()} - {None}
+
+
+def _reads(root: pathlib.Path, suffixes: tuple[str, ...], needle: str) -> bool:
+    for path in root.rglob("*"):
+        if path.suffix not in suffixes or path.name.endswith("_test.go") or "node_modules" in path.parts:
+            continue
+        if needle in path.read_text(errors="ignore"):
+            return True
+    return False
+
+
+# Every stack that is actually run, as the file list compose merges in order. The
+# quickstart is standalone; prod is an overlay on the dev base and staging on both, so
+# a service the base never passes the secret to stays without it in the cloud unless
+# the overlay adds it -- the planner shipped that way, ENVIRONMENT=production and no
+# secret, so plan-time topic creation got 401 from the orchestrator.
+SECRET_STACKS = {
+    "quickstart": ("docker-compose.quickstart.yml",),
+    "dev": ("docker-compose.yml",),
+    "prod": ("docker-compose.yml", "docker-compose.prod.yml"),
+    "staging": ("docker-compose.yml", "docker-compose.prod.yml", "docker-compose.staging.yml"),
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _secret_readers() -> frozenset[str]:
+    readers = set()
+    for service, tree in _go_service_trees().items():
+        if _reads(REPO / tree, (".go",), SECRET_VAR):
+            readers.add(service)
+    for service, svc in _python_services().items():
+        module = _entrypoint_module(svc)
+        if any(SECRET_VAR in (_module_path(m).read_text(errors="ignore")) for m in _reachable(module)):
+            readers.add(service)
+    if _reads(REPO / "frontend" / "src", (".ts", ".tsx"), SECRET_VAR):
+        readers.add("frontend")
+    return frozenset(readers)
+
+
+def _merged_env(files: tuple[str, ...]) -> dict[str, dict]:
+    """service -> environment after compose merges ``files`` (later keys win)."""
+    merged: dict[str, dict] = {}
+    for filename in files:
+        for name, svc in _services(REPO / filename).items():
+            merged.setdefault(name, {}).update(_env(svc or {}))
+    return merged
+
+
+@pytest.mark.parametrize("stack", sorted(SECRET_STACKS))
+def test_every_service_that_sends_the_internal_secret_is_given_it(stack):
+    files = SECRET_STACKS[stack]
+    for filename in files:
+        if not (REPO / filename).is_file():
+            pytest.skip(f"{filename} is not present")
+    env = _merged_env(files)
+    expected = sorted(s for s in _secret_readers() if s in env)
+    assert {"api-gateway", "orchestrator", "temporal-adapter", "planner", "frontend"} <= set(expected), (
+        f"the census found only {expected} in the {stack} stack; a reader moved or the "
+        f"derivation broke"
+    )
+    missing = [s for s in expected if SECRET_VAR not in env[s]]
+    assert not missing, (
+        f"{missing} read {SECRET_VAR} but the {stack} stack ({' + '.join(files)}) never "
+        f"passes it; every call they make to an internal route is refused with 401 on a "
+        f"production ENVIRONMENT (503 on the gateway when its own copy is empty), and "
+        f"nothing surfaces it."
+    )
+
+
+def test_every_in_network_url_names_a_quickstart_host():
+    hosts = _quickstart_hosts()
+    checked, offenders = 0, []
+    for name, svc in _services(QUICKSTART).items():
+        for var, raw in _env(svc or {}).items():
+            value = re.sub(r"\$\{[A-Z0-9_]+:?-([^}]*)\}", r"\1", raw)
+            for match in re.finditer(r"\b[a-z]+://(?:[^@/\s]*@)?([A-Za-z0-9_.-]+)", value):
+                host = match.group(1)
+                if "." in host or host in _NON_COMPOSE_HOSTS:
+                    continue
+                checked += 1
+                if host not in hosts:
+                    offenders.append(f"{name}.{var} -> {host}")
+    assert checked > 10, f"only {checked} in-network URLs parsed; the scan is not reading the file"
+    assert not offenders, f"these point at hosts this compose does not define: {offenders}"
+
+
+def test_a_code_default_host_this_bundle_lacks_is_overridden():
+    """The orchestrator's blob lane defaulted to ``rsync-ai-minio``, the dev compose's
+    container; the quickstart's MinIO is ``minio``/``rsync-minio``, so every
+    object-storage load died at DNS until MINIO_ENDPOINT_URL was passed."""
+    hosts = _quickstart_hosts()
+    quickstart = _services(QUICKSTART)
+    found, offenders = 0, []
+    for service, tree in _go_service_trees().items():
+        if service not in quickstart:
+            continue
+        env = _env(quickstart[service] or {})
+        for path in (REPO / tree).rglob("*.go"):
+            if path.name.endswith("_test.go"):
+                continue
+            text = path.read_text(errors="ignore")
+            code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("//"))
+            foreign = {h for h in _URL_HOST.findall(code) if h not in hosts and h not in _NON_COMPOSE_HOSTS}
+            if not foreign:
+                continue
+            found += len(foreign)
+            if foreign <= _OPTIONAL_SIDECARS:
+                continue
+            read = set(re.findall(r'"([A-Z][A-Z0-9_]*(?:URL|ENDPOINT))"', text))
+            if not read & set(env):
+                offenders.append(f"{service}: {path.relative_to(REPO)} defaults to {sorted(foreign)}")
+    assert found, "no foreign default hosts found at all -- the known rsync-ai-minio default should be one"
+    assert not offenders, (
+        f"code falls back to a host docker-compose.quickstart.yml does not define, and the "
+        f"service is not given the variable that overrides it: {offenders}"
     )

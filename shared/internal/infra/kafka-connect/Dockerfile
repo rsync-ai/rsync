@@ -133,6 +133,13 @@ RUN set -eu; \
       echo "$left"; \
       exit 1; }
 
+# Kafka client security from rsync's KAFKA_* contract (SASL JAAS line, OAuth,
+# combined mTLS keystore), then the base /docker-entrypoint.sh. Compose and Helm
+# both rely on it -- neither overrides the entrypoint. See the script's header.
+COPY --chmod=0755 connect-entrypoint.sh /opt/rsync/connect-entrypoint.sh
+ENTRYPOINT ["/opt/rsync/connect-entrypoint.sh"]
+CMD ["start"]
+
 # Switch back to the non-root kafka user
 USER kafka
 

@@ -5,6 +5,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { ArrowDown, ArrowUp, Minus } from "lucide-react"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { formatDuration } from "@/lib/duration"
 
 interface Props {
   pipelineId: string
@@ -38,6 +39,29 @@ interface CompareResponse {
   }
 }
 
+type TrendRun = { execution_id: string; status?: string }
+
+const FINISHED = new Set(["completed", "success", "failed"])
+
+/**
+ * The run to compare this one against: the newest finished run older than it
+ * (or, when it is not in the window, the newest finished run). The CDC stream's
+ * id is the pipeline id, and a run still in flight has no duration or outcome;
+ * comparing against either rendered "— → —".
+ */
+export function pickPreviousRun(recent: TrendRun[], executionId: string, pipelineId: string): TrendRun | undefined {
+  const idx = recent.findIndex((e) => e?.execution_id === executionId)
+  return recent
+    .slice(idx + 1)
+    .find(
+      (e) =>
+        e?.execution_id &&
+        e.execution_id !== executionId &&
+        e.execution_id !== pipelineId &&
+        FINISHED.has(String(e.status || "").toLowerCase()),
+    )
+}
+
 /**
  * Renders a side-by-side comparison of THIS execution vs the PREVIOUS run
  * of the same pipeline. Uses the backend's existing
@@ -66,13 +90,9 @@ export function ExecutionComparison({ pipelineId, executionId }: Props) {
         )
         if (!trendsRes.ok || cancelled) return
         const trends = await trendsRes.json()
-        const recent: Array<{ execution_id: string }> = Array.isArray(trends?.recent_executions)
-          ? trends.recent_executions
-          : []
-        const idx = recent.findIndex((e) => e?.execution_id === executionId)
-        const prev = idx >= 0 ? recent[idx + 1] : recent[0]
-        if (!prev || prev.execution_id === executionId) return
-        if (cancelled) return
+        const recent: TrendRun[] = Array.isArray(trends?.recent_executions) ? trends.recent_executions : []
+        const prev = pickPreviousRun(recent, executionId, pipelineId)
+        if (!prev || cancelled) return
         setPreviousId(prev.execution_id)
 
         const cmpRes = await authFetch(
@@ -95,12 +115,10 @@ export function ExecutionComparison({ pipelineId, executionId }: Props) {
 
   if (!data || !previousId) return null
 
-  const fmtMs = (ms?: number | null) => {
-    if (ms == null) return "—"
-    if (ms < 1000) return `${ms}ms`
-    if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
-    return `${(ms / 60_000).toFixed(1)}m`
-  }
+  // This panel compares two executions of the same pipeline against the numbers
+  // the execution pages show. Its own formatter stopped at minutes, so a 75-minute
+  // run read "75.0m" here and "1h 15m" there — the same run, two numbers.
+  const fmtMs = (ms?: number | null) => (ms == null ? "—" : formatDuration(ms))
   const fmtNum = (n?: number | null) => (n == null ? "—" : n.toLocaleString())
   const deltaIcon = (n: number | null | undefined, invert = false) => {
     if (n == null || n === 0) return <Minus className="h-3 w-3 text-zinc-400" />
@@ -116,7 +134,7 @@ export function ExecutionComparison({ pipelineId, executionId }: Props) {
     <Card>
       <CardHeader>
         <CardTitle className="text-base">Comparison with previous run</CardTitle>
-        <div className="text-[11px] text-zinc-500 font-mono">{previousId.slice(0, 8)} → {executionId.slice(0, 8)}</div>
+        <div className="text-[11px] text-zinc-500 dark:text-zinc-400 font-mono">{previousId.slice(0, 8)} → {executionId.slice(0, 8)}</div>
       </CardHeader>
       <CardContent>
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -173,7 +191,7 @@ function Metric({
 }) {
   return (
     <div className="rounded-md border border-zinc-200 dark:border-zinc-800 px-3 py-2">
-      <div className="text-[10px] uppercase tracking-wide text-zinc-500">{label}</div>
+      <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400">{label}</div>
       <div className="text-sm text-zinc-700 dark:text-zinc-300 font-mono">
         {a} → {b}
       </div>

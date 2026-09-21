@@ -26,15 +26,26 @@ type kafkaBrokerProbe interface {
 	Ping() error
 }
 
+// kafkaConsumerLagSource is the part of *kafka.Manager the consumer check needs: whether
+// this process's consumer for a topic is running, and how far its group is behind. Narrow
+// for the same reason as kafkaBrokerProbe.
+type kafkaConsumerLagSource interface {
+	IsConsumerActive(topic string) bool
+	GetConsumerGroupLag(groupID string) (map[string]int64, error)
+}
+
 // HealthMonitor monitors the health of all system components
 type HealthMonitor struct {
 	kafkaManager *kafka.Manager
-	// kafkaProbe is kafkaManager again, narrowed. Nil when this process has no manager —
-	// see NewHealthMonitor for why it is not simply assigned.
-	kafkaProbe kafkaBrokerProbe
-	db         *sql.DB
-	config     *SentinelConfig
-	logger     *AuditLogger
+	// kafkaProbe and consumerLag are kafkaManager again, narrowed, and consumerGroupBase is
+	// its Config.GroupID. All three stay unset when this process has no manager — see
+	// NewHealthMonitor for why they are not simply assigned.
+	kafkaProbe        kafkaBrokerProbe
+	consumerLag       kafkaConsumerLagSource
+	consumerGroupBase string
+	db                *sql.DB
+	config            *SentinelConfig
+	logger            *AuditLogger
 
 	// Component tracking
 	componentHealth map[string]*ComponentHealth
@@ -66,6 +77,8 @@ func NewHealthMonitor(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelC
 	// would pass and the check would call Ping() on a nil receiver.
 	if kafkaManager != nil {
 		h.kafkaProbe = kafkaManager
+		h.consumerLag = kafkaManager
+		h.consumerGroupBase = kafkaManager.Config.GroupID
 	}
 	return h
 }
@@ -213,6 +226,9 @@ func (h *HealthMonitor) recordInfraHealth(componentID string, status HealthStatu
 // on the old route, which is why health_monitor_persist_census_test.go now enforces the
 // rule against the source rather than trusting the next reader to notice.
 //
+// The two consumer callers have since moved to recordConsumerHealth, which rewrites each
+// consumer's row on every tick rather than only when something is wrong.
+//
 // The argument is copied rather than stored. performHealthCheck passes a *ComponentHealth
 // owned by the Sentinel agent's own map and guarded by the agent's mutex; storing that
 // pointer here published one struct into two maps under two different locks. Copying also
@@ -232,8 +248,8 @@ func (h *HealthMonitor) RecordHealthChange(componentID string, health *Component
 	if snapshot.UpdatedAt.IsZero() {
 		snapshot.UpdatedAt = time.Now()
 	}
-	// last_heartbeat is NOT NULL (migration 011). The two consumer call sites never set it,
-	// so persisting them unmodified would record a component that last reported in year 1.
+	// last_heartbeat is NOT NULL (migration 011). A caller that never sets it (the consumer
+	// check used to be two) would otherwise record a component that last reported in year 1.
 	// Only the zero value is filled in: on the heartbeat-timeout path the stale timestamp
 	// IS the evidence, and overwriting it would erase the reason the component was
 	// declared dead.
@@ -253,6 +269,64 @@ func (h *HealthMonitor) RecordHealthChange(componentID string, health *Component
 	}).Info("Component health changed")
 
 	h.persistHealthToDB(&snapshot)
+}
+
+// recordConsumerHealth stores one consumed topic's verdict and publishes it. It is called
+// for every topic on every tick of checkKafkaConsumerLag.
+//
+// Every tick is the point. The check used to write only when something was wrong (a closed
+// group, or lag above zero), so a consumer that recovered or drained its lag was never
+// written again: its sentinel_component_health row kept "unhealthy / Consumer group closed"
+// or a lag of 4500 indefinitely, and GET /api/v1/monitoring/sentinel/health served it as
+// current. Rewriting the row each time, as recordInfraHealth and checkMCPConnectorHealth
+// do, keeps it current and its updated_at fresh.
+//
+// It is not RecordHealthChange because that logs "Component health changed" at Info on
+// every call, and this runs for each consumed topic every 30s. The same line is logged here
+// only when a topic's status differs from the last one this process recorded for it.
+//
+// The entry is replaced, not merged: a recovered consumer must not keep the
+// issue_type "consumer_group_closed" its closed verdict carried. The persist is synchronous,
+// as in recordInfraHealth.
+func (h *HealthMonitor) recordConsumerHealth(topic string, status HealthStatus, lag int64, lastErr string, metadata map[string]interface{}) {
+	now := time.Now()
+	health := ComponentHealth{
+		ComponentID:   topic,
+		ComponentType: ComponentTypeKafkaConsumer,
+		Status:        status,
+		// The check is these components' heartbeat; nothing else reports for them, and
+		// last_heartbeat is NOT NULL.
+		LastHeartbeat: now,
+		ConsumerLag:   lag,
+		// Assigned every time, empty string included, so a recovered consumer stops
+		// reporting the failure it came back from.
+		LastError: lastErr,
+		Metadata:  make(map[string]interface{}, len(metadata)),
+		UpdatedAt: now,
+	}
+	for k, v := range metadata {
+		health.Metadata[k] = v
+	}
+
+	stored := health
+	h.mu.Lock()
+	previous, seen := h.componentHealth[topic]
+	changed := !seen || previous.Status != status
+	h.componentHealth[topic] = &stored
+	h.mu.Unlock()
+
+	entry := log.WithFields(log.Fields{
+		"component_id": topic,
+		"status":       status,
+		"consumer_lag": lag,
+	})
+	if changed {
+		entry.Info("Component health changed")
+	} else {
+		entry.Debug("Consumer health recorded")
+	}
+
+	h.persistHealthToDB(&health)
 }
 
 // monitorKafkaConsumers monitors Kafka consumer health and lag
@@ -312,6 +386,11 @@ var orchestratorConsumedTopics = []string{
 // consumer topic-name mismatch (the failure mode that left 2892 messages
 // stranded on agent.control.commands before the publishAgentCommand fix).
 func (h *HealthMonitor) checkKafkaConsumerLag() {
+	// No manager, no consumers to ask about.
+	if h.consumerLag == nil {
+		return
+	}
+
 	ctx, span := sentinelTracer.Start(h.ctx, "check_consumer_lag")
 	defer span.End()
 
@@ -323,31 +402,24 @@ func (h *HealthMonitor) checkKafkaConsumerLag() {
 
 	// One lag fetch per topic — manager scopes the consumer-group name as
 	// "<base-group>-<topic>", matching how ConsumeWithContext registers them.
-	baseGroup := h.kafkaManager.Config.GroupID
+	baseGroup := h.consumerGroupBase
 
 	for _, topic := range agentTopics {
-		isActive := h.kafkaManager.IsConsumerActive(topic)
+		isActive := h.consumerLag.IsConsumerActive(topic)
 
 		if !isActive {
 			log.WithField("topic", topic).Warn("⚠️  Consumer group is closed or inactive")
 
-			h.RecordHealthChange(topic, &ComponentHealth{
-				ComponentID:   topic,
-				ComponentType: ComponentTypeKafkaConsumer,
-				Status:        HealthStatusUnhealthy,
-				LastError:     "Consumer group closed",
-				UpdatedAt:     time.Now(),
-				Metadata: map[string]interface{}{
-					"topic":      topic,
-					"is_active":  false,
-					"issue_type": "consumer_group_closed",
-				},
+			h.recordConsumerHealth(topic, HealthStatusUnhealthy, 0, "Consumer group closed", map[string]interface{}{
+				"topic":      topic,
+				"is_active":  false,
+				"issue_type": "consumer_group_closed",
 			})
 			continue
 		}
 
 		topicGroup := fmt.Sprintf("%s-%s", baseGroup, topic)
-		lag, err := h.kafkaManager.GetConsumerGroupLag(topicGroup)
+		lag, err := h.consumerLag.GetConsumerGroupLag(topicGroup)
 		if err != nil {
 			log.WithError(err).WithField("topic", topic).Debug("Could not get consumer lag")
 			continue
@@ -369,15 +441,15 @@ func (h *HealthMonitor) checkKafkaConsumerLag() {
 				"group": topicGroup,
 				"lag":   topicLag,
 			}).Debug("Consumer lag detected")
-
-			h.RecordHealthChange(topic, &ComponentHealth{
-				ComponentID:   topic,
-				ComponentType: ComponentTypeKafkaConsumer,
-				Status:        HealthStatusHealthy,
-				ConsumerLag:   topicLag,
-				UpdatedAt:     time.Now(),
-			})
 		}
+
+		// Written at zero lag too. Writing only when lag > 0 left a consumer that
+		// recovered, or drained its backlog, on its last bad row indefinitely.
+		h.recordConsumerHealth(topic, HealthStatusHealthy, topicLag, "", map[string]interface{}{
+			"topic":          topic,
+			"is_active":      true,
+			"consumer_group": topicGroup,
+		})
 	}
 
 	span.SetAttributes(attribute.Int("topics_checked", len(agentTopics)))

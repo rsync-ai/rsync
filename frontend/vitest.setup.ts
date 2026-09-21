@@ -1,6 +1,15 @@
 import "@testing-library/jest-dom/vitest"
 import { afterEach, vi } from "vitest"
-import { cleanup } from "@testing-library/react"
+import { cleanup, configure } from "@testing-library/react"
+
+// Testing Library's findBy* and waitFor give up after 1s. CI runs these tests on the
+// shared self-hosted Mac that vitest.config.ts measured at >13x local, where a page that
+// renders its runs table in 59ms here missed that second and failed as "Unable to find
+// role=table". A wait still returns the moment its element appears, so a passing test is
+// no slower; only a test that is going to fail takes longer to say so. The cost: a test
+// that has already run for ~20s on CI and then fails a wait reports testTimeout's
+// "Test timed out in 30000ms" rather than which element it could not find.
+configure({ asyncUtilTimeout: 10_000 })
 
 // jsdom does not implement scrollIntoView; components that auto-scroll (e.g.
 // PipelineAccordionView's cardRef.current?.scrollIntoView) would throw an

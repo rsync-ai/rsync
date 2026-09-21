@@ -22,14 +22,21 @@ type userOAuthApp struct {
 }
 
 // oauthCallbackBase returns the external OAuth callback base URL (no provider
-// suffix). Mirrors the inline fallback used by Authorize/exchangeToken so all
-// three agree on the redirect base.
+// suffix). Authorize, exchangeToken and the BYO redirect URI all call it, so the
+// three cannot disagree on the redirect base.
+//
+// Without OAUTH_CALLBACK_URL it derives the base from PUBLIC_URL, the address
+// install.sh writes for a server install. The old fixed localhost fallback sent
+// every provider's redirect back to the browser's own machine on any host that
+// was not the operator's laptop.
 func oauthCallbackBase() string {
-	base := os.Getenv("OAUTH_CALLBACK_URL")
-	if base == "" {
-		base = "http://localhost:5001/oauth/callback"
+	if base := strings.TrimSpace(os.Getenv("OAUTH_CALLBACK_URL")); base != "" {
+		return base
 	}
-	return base
+	if public := strings.TrimRight(strings.TrimSpace(os.Getenv("PUBLIC_URL")), "/"); public != "" {
+		return public + "/oauth/callback"
+	}
+	return "http://localhost:5001/oauth/callback"
 }
 
 // oauthRedirectURI returns the full redirect/callback URL for a provider — the

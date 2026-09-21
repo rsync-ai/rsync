@@ -58,8 +58,13 @@ DOCS = ("CAPABILITIES.md", "CAPABILITIES-ARCHIVE.md", "INVENTORY.md", "ARCHITECT
 # de-linking pass (scripts/flip/delink-docs.sh strips links whose target it deletes).
 # Each floor is far below the real count and far above zero: enough to catch a parser
 # that stopped matching, loose enough that ordinary editing never trips it.
+#
+# Re-measured 2026-09-16, when CAPABILITIES.md became a one-line index and its full rows
+# moved to the archive: 87 relative links left in CAPABILITIES.md (mostly PR links and
+# `CAPABILITIES-ARCHIVE.md#…` pointers), 5000+ in the archive. The CAPABILITIES.md floor
+# drops to 40 for the reason above -- the index is short by design now, not broken.
 MIN_LINKS = {
-    "CAPABILITIES.md": 100,
+    "CAPABILITIES.md": 40,
     "CAPABILITIES-ARCHIVE.md": 100,
     "INVENTORY.md": 100,
     "ARCHITECTURE.md": 5,

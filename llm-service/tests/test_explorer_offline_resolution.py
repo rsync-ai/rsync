@@ -29,6 +29,7 @@ from src.utils.openai_client import (
     env_bool,
     explorer_default_model,
     explorer_default_sql_model,
+    get_default_model,
     make_async_client,
     rank_tables_default_model,
     resolve_explorer_provider,
@@ -54,6 +55,7 @@ _ENV_KEYS = [
     # a constructed client points. Cleared here or section 5 tests what the
     # developer's shell happens to say.
     "OPENAI_BASE_URL",
+    "OPENAI_API_KEY_SOURCE",
     "OLLAMA_BASE_URL",
     "OLLAMA_URL",
 ]
@@ -606,3 +608,106 @@ def test_egress_host_reports_azure_without_leaking_the_resource_name(monkeypatch
 def test_egress_host_of_a_mock_deployment_is_not_a_crash(monkeypatch):
     """USE_MOCK_LLM leaves the clients as None and the startup log still runs."""
     assert client_egress_host(None) == "-"
+
+
+# ── 6. One Ollama, one model: the four call sites must agree ─────────────────
+#
+# `docker-compose.ollama.yml` bundles an Ollama and downloads exactly ONE model
+# into it. Four functions in openai_client pick a model to ask that server for,
+# and before OLLAMA_MODEL was honoured everywhere only get_default_model read
+# the operator's configuration at all: the Explorer chat and rank-tables paths
+# returned the literal "llama3:latest" and text-to-SQL "sqlcoder:latest". A
+# single-model deployment therefore came up with a working /chat beside a Data
+# Explorer whose every request 404s on a model that is not in the volume.
+#
+# The offline path still refuses LLM_MODEL — a cloud model name must not leak
+# into it — and these tests pin both halves: refusal on LLM_MODEL, obedience on
+# OLLAMA_MODEL, which is an Ollama-side name by construction.
+
+_OLLAMA_RESOLVERS = (
+    ("explorer chat", explorer_default_model),
+    ("explorer text-to-SQL", explorer_default_sql_model),
+    ("rank-tables", rank_tables_default_model),
+    ("main client", get_default_model),
+)
+
+
+def test_every_ollama_call_site_asks_for_the_model_that_was_pulled(monkeypatch):
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    disagreeing = {
+        name: fn("ollama") for name, fn in _OLLAMA_RESOLVERS if fn("ollama") != "qwen2.5:7b"
+    }
+    assert not disagreeing, (
+        "these Ollama call sites ask for a model the deployment never pulled: "
+        f"{disagreeing}"
+    )
+
+
+def test_a_cloud_llm_model_still_cannot_leak_into_the_offline_path(monkeypatch):
+    """The guarantee OLLAMA_MODEL must not weaken: LLM_MODEL is the cloud knob,
+    and an OpenAI model name is never something Ollama can serve."""
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o")
+    for name, fn in _OLLAMA_RESOLVERS:
+        if fn is get_default_model:
+            continue  # get_default_model reads LLM_MODEL by design — asserted below
+        assert fn("ollama") != "gpt-4o", f"{name} leaked a cloud model name into Ollama"
+
+
+def test_ollama_model_wins_over_a_cloud_llm_model_on_the_offline_path(monkeypatch):
+    """Both set is the shape a mixed .env has: LLM_MODEL left at a cloud name
+    from an earlier OpenAI install, OLLAMA_MODEL written by the overlay."""
+    monkeypatch.setenv("LLM_MODEL", "gpt-4o")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    assert explorer_default_model("ollama") == "qwen2.5:7b"
+    assert explorer_default_sql_model("ollama") == "qwen2.5:7b"
+    assert rank_tables_default_model("ollama") == "qwen2.5:7b"
+
+
+def test_the_main_client_still_puts_llm_model_first(monkeypatch):
+    """The compose anchor pulls whatever THIS function would ask for, so its
+    precedence is the one the overlay mirrors. Changing it here without changing
+    x-ollama-model there downloads a model the stack will not request."""
+    monkeypatch.setenv("LLM_MODEL", "llama3")
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    assert get_default_model("ollama") == "llama3"
+
+
+def test_rank_tables_override_still_beats_ollama_model(monkeypatch):
+    """RANK_TABLES_MODEL exists to pin the bulk metadata path to something
+    cheaper; a stack-wide OLLAMA_MODEL must not silently override the operator."""
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    monkeypatch.setenv("RANK_TABLES_MODEL", "llama3.2:1b")
+    assert rank_tables_default_model("ollama") == "llama3.2:1b"
+
+
+def test_ollama_model_does_not_disturb_the_cloud_providers(monkeypatch):
+    monkeypatch.setenv("OLLAMA_MODEL", "qwen2.5:7b")
+    monkeypatch.setenv("AZURE_OPENAI_DEPLOYMENT", "prod-dep")
+    assert explorer_default_model("openai") == "gpt-4o-mini"
+    assert explorer_default_model("azure") == "prod-dep"
+    assert rank_tables_default_model("openai") == "gpt-4o-mini"
+
+
+def test_ollama_model_is_deliverable_to_every_service_that_resolves_one():
+    """A model name the code reads is only real if the compose that ships the
+    bundled Ollama passes it through — the same delivery argument section 3
+    makes for EXPLORER_OFFLINE_ONLY, applied to the knob that decides which
+    model the pull step downloads."""
+    spec = yaml.load(
+        (REPO_ROOT / "docker-compose.ollama.yml").read_text(), Loader=_ComposeLoader
+    )
+    services = spec["services"]
+    values = {}
+    for name in ("ollama-pull", "llm-service", "tool-generator", "planner"):
+        env = services[name].get("environment") or {}
+        assert "OLLAMA_MODEL" in env, (
+            f"{name} decides an Ollama model but receives no OLLAMA_MODEL; it would "
+            "fall back to a literal the pull step never downloaded"
+        )
+        values[name] = env["OLLAMA_MODEL"]
+    # One anchor, not four hand-copied literals: the puller and the three askers
+    # have to name the same model or the download is for nothing.
+    assert len(set(values.values())) == 1, f"services disagree on the model: {values}"
+    # And that one value has to follow get_default_model's precedence, which
+    # test_the_main_client_still_puts_llm_model_first pins on the code side.
+    assert values["ollama-pull"] == "${LLM_MODEL:-${OLLAMA_MODEL:-qwen2.5:7b}}"

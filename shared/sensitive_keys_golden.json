@@ -1,0 +1,38 @@
+{
+  "_comment": "Key names masked in logs. api-gateway and backend-orchestrator SensitiveKeys must equal credential_keys + pii_keys; llm-service SENSITIVE_KEYS must equal credential_keys alone (it masks connector configs, where PII substrings such as 'address' would hide host_address). Tests: api-gateway/internal/security/masking_golden_test.go, backend-orchestrator/internal/security/masking_golden_test.go, llm-service/tests/test_sensitive_keys_golden.py.",
+  "credential_keys": [
+    "password",
+    "secret",
+    "secret_key",
+    "secret_access_key",
+    "api_key",
+    "apikey",
+    "token",
+    "access_key",
+    "access_key_id",
+    "refresh_token",
+    "access_token",
+    "bearer",
+    "authorization",
+    "credentials",
+    "credentials_json",
+    "private_key",
+    "client_secret",
+    "aws_secret_access_key",
+    "aws_access_key_id",
+    "connection_string",
+    "conn_str",
+    "db_password"
+  ],
+  "pii_keys": [
+    "email",
+    "phone",
+    "phone_number",
+    "address",
+    "ssn",
+    "social_security",
+    "credit_card",
+    "user_id",
+    "customer_id"
+  ]
+}

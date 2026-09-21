@@ -64,6 +64,13 @@ const (
 	// steadily and the numbers never move. The two are mutually exclusive by
 	// construction (runningBatchRowCountsQuery excludes timestamp-stalled runs).
 	IssueTypeNoRowMovement IssueType = "no_row_movement"
+	// IssueTypeSourceStreamStalled — a CDC source connector that Kafka Connect reports
+	// as RUNNING has stopped advancing its committed position in the source's change
+	// stream. Distinct from IssueTypeConnectorDown, which needs Connect to admit the
+	// connector failed: this one exists precisely because Debezium retries a permanent
+	// error forever without leaving RUNNING, so /status stays green while the pipeline
+	// moves nothing (cdc_source_freshness.go).
+	IssueTypeSourceStreamStalled IssueType = "source_stream_stalled"
 )
 
 // IssueSeverity represents the severity of an issue

@@ -26,9 +26,8 @@ Two layers, matching test_documented_install_commands_render.py:
 
 The static layer is the load-bearing one because it needs nothing installed, not
 because "CI cannot run the other" -- that was this file's stated reason and it
-was false. ci.yml sets helm up for the job that collects this suite and asserts
-it before pytest, so the render layer runs there too. See the `helm is present`
-step in .github/workflows/ci.yml.
+was false. ci.yml installs no helm, but every job runs on a self-hosted Mac that
+has one, so the render layer has been running in CI all along. the `helm is present` step in .github/workflows/ci.yml carries the correction.
 """
 
 import pathlib

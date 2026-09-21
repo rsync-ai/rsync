@@ -27,6 +27,9 @@ export interface SchemaBrowserProps {
   itemLabel?: string
   /** Tooltip for the per-table insert button. */
   insertTitle?: string
+  /** Label for the namespace dropdown. A Postgres namespace is a schema under one
+   *  database, so "Database" over "public" named the wrong thing (#54). */
+  namespaceLabel?: string
   className?: string
 }
 
@@ -56,6 +59,7 @@ export function SchemaBrowser({
   onInsertColumn,
   itemLabel = "tables",
   insertTitle = "Add to SQL",
+  namespaceLabel = "Database",
   className,
 }: SchemaBrowserProps) {
   const [selectedDb, setSelectedDb] = useState("")
@@ -111,7 +115,7 @@ export function SchemaBrowser({
       {/* Database selector — pick one namespace; its tables list below. */}
       <div className="flex flex-col gap-1">
         <label htmlFor="schema-database" className="text-xs font-medium text-muted-foreground">
-          Database
+          {namespaceLabel}
         </label>
         <select
           id="schema-database"

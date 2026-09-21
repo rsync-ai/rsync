@@ -64,9 +64,14 @@ LIVE_CLAIM_PATTERNS = (
 # Files whose job is to record history, or to hold the correction itself.
 EXEMPT = {
     STATUS_DOC,
-    "CAPABILITIES-ARCHIVE.md",
     "llm-service/tests/test_no_doc_claims_a_live_prod_environment.py",
 }
+
+# CAPABILITIES-ARCHIVE.md is exempt only above this heading. Below it is text the index
+# split moved out of CAPABILITIES.md (active write-ups, full status rows), which this
+# sweep checked before the move.
+ARCHIVE = "CAPABILITIES-ARCHIVE.md"
+ARCHIVE_TAIL = "## Active Known issues — full write-ups"
 
 
 # The sweep's floor. 171 tracked `*.md` in the private repo, 110 after the public cut
@@ -170,7 +175,8 @@ def test_no_doc_asserts_a_live_prod_environment(pattern: str) -> None:
             lines = path.read_text(encoding="utf-8").splitlines()
         except UnicodeDecodeError:  # pragma: no cover - defensive
             continue
-        for n, line in enumerate(lines, 1):
+        first = lines.index(ARCHIVE_TAIL) + 1 if path == REPO / ARCHIVE else 1
+        for n, line in enumerate(lines[first - 1 :], first):
             hit = rx.search(line)
             if not hit:
                 continue

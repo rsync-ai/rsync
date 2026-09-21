@@ -45,7 +45,12 @@ never reused for a different meaning; if the meaning changes, a new code is mint
 [postgres-slot-conflict](#postgres-slot-conflict) ·
 [postgres-user-replication](#postgres-user-replication) ·
 [postgres-max-replication-slots](#postgres-max-replication-slots) ·
-[postgres-max-wal-senders](#postgres-max-wal-senders)
+[postgres-max-wal-senders](#postgres-max-wal-senders) ·
+[postgres-max-slot-wal-keep-size](#postgres-max-slot-wal-keep-size) ·
+[postgres-wal-sender-timeout](#postgres-wal-sender-timeout) ·
+[postgres-logical-decoding-work-mem](#postgres-logical-decoding-work-mem) ·
+[postgres-publication-privilege](#postgres-publication-privilege) ·
+[postgres-keyless-tables-outside-pipeline](#postgres-keyless-tables-outside-pipeline)
 
 **MySQL CDC** — [mysql-log-bin](#mysql-log-bin) ·
 [mysql-binlog-format](#mysql-binlog-format) ·
@@ -59,7 +64,9 @@ never reused for a different meaning; if the meaning changes, a new code is mint
 [sqlserver-capture-instance](#sqlserver-capture-instance)
 
 **MongoDB CDC** — [mongodb-not-replica-set](#mongodb-not-replica-set) ·
-[mongodb-resume-token-invalid](#mongodb-resume-token-invalid)
+[mongodb-resume-token-invalid](#mongodb-resume-token-invalid) ·
+[mongodb-change-stream-access](#mongodb-change-stream-access) ·
+[mongodb-oplog-window-short](#mongodb-oplog-window-short)
 
 **Pipeline, destination and rsync-side** — [user-config-invalid](#user-config-invalid) ·
 [dest-capacity](#dest-capacity) ·
@@ -377,6 +384,18 @@ starts refusing new pipelines once the existing ones have claimed theirs.
 ALTER SYSTEM SET max_replication_slots = 10;
 ```
 
+**Code:** `POSTGRES_REPLICATION_SLOTS_EXHAUSTED` · blocking · ~10 minutes.
+
+Every replication slot is already taken and none belongs to this pipeline, so it cannot
+create its own and CDC cannot start. Find a slot nothing uses any more and drop it, or
+raise `max_replication_slots` as above. Dropping a slot discards the changes it has not
+yet delivered — only drop one no pipeline or tool still reads from.
+
+```sql
+SELECT slot_name, plugin, active, restart_lsn FROM pg_replication_slots ORDER BY active, slot_name;
+SELECT pg_drop_replication_slot('<slot_name>');
+```
+
 ## postgres-max-wal-senders
 
 **Code:** `POSTGRES_MAX_WAL_SENDERS_LOW` · warning · ~10 minutes.
@@ -391,6 +410,105 @@ once, so it constrains concurrent CDC pipelines the same way slots do.
 
 ```sql
 ALTER SYSTEM SET max_wal_senders = 10;
+```
+
+## postgres-max-slot-wal-keep-size
+
+**Code:** `POSTGRES_MAX_SLOT_WAL_KEEP_SIZE_UNLIMITED` · advisory · ~10 minutes.
+
+`max_slot_wal_keep_size` is `-1` (unlimited). A replication slot holds WAL until its
+reader confirms it, so a pipeline that stops reading — paused, failing, or deleted without
+its slot — keeps WAL on the source without limit until the disk fills. A limit caps that:
+past it PostgreSQL invalidates the slot instead, and the pipeline re-snapshots.
+
+**Fix**
+
+1. As a superuser, run the SQL below (PostgreSQL 13+). No restart is needed.
+2. On Cloud SQL, RDS or Azure, set the `max_slot_wal_keep_size` flag or parameter instead.
+
+```sql
+ALTER SYSTEM SET max_slot_wal_keep_size = '50GB';
+SELECT pg_reload_conf();
+```
+
+## postgres-wal-sender-timeout
+
+**Code:** `POSTGRES_WAL_SENDER_TIMEOUT_LOW` · advisory · ~5 minutes.
+
+`wal_sender_timeout` is under 10 seconds. The server drops a replication connection that
+has not answered within it, so a slow write or a long snapshot can cut the CDC stream and
+restart it.
+
+**Fix**
+
+1. As a superuser, run the SQL below. No restart is needed.
+2. On Cloud SQL, RDS or Azure, set the `wal_sender_timeout` flag or parameter instead.
+
+```sql
+ALTER SYSTEM SET wal_sender_timeout = '60s';
+SELECT pg_reload_conf();
+```
+
+## postgres-logical-decoding-work-mem
+
+**Code:** `POSTGRES_LOGICAL_DECODING_WORK_MEM_LOW` · advisory · ~5 minutes.
+
+`logical_decoding_work_mem` is below the 64 MB default. A transaction larger than it spills
+to disk on the source while it is decoded, which slows CDC.
+
+**Fix**
+
+1. As a superuser, run the SQL below. No restart is needed.
+2. On Cloud SQL, RDS or Azure, set the `logical_decoding_work_mem` flag or parameter instead.
+
+```sql
+ALTER SYSTEM SET logical_decoding_work_mem = '64MB';
+SELECT pg_reload_conf();
+```
+
+## postgres-publication-privilege
+
+**Code:** `POSTGRES_PUBLICATION_PRIVILEGE` · advisory · ~5 minutes.
+
+rsync creates each pipeline's publication with `CREATE PUBLICATION … FOR ALL TABLES`, which
+PostgreSQL allows only to a superuser — or, on a managed service, to a member of its admin
+role. The connection's user is neither. This is advisory: some platforms grant the right in
+ways the catalog does not show, so the pipeline may still start.
+
+**Fix**
+
+If the pipeline fails to start, grant the role for your platform:
+
+```sql
+GRANT cloudsqlsuperuser TO "<user>";  -- Cloud SQL
+GRANT rds_superuser TO "<user>";      -- Amazon RDS / Aurora
+ALTER USER "<user>" WITH SUPERUSER;   -- self-managed
+```
+
+## postgres-keyless-tables-outside-pipeline
+
+**Code:** `POSTGRES_UNSELECTED_TABLE_MISSING_PRIMARY_KEY` · warning · ~5 minutes per table.
+
+rsync's publication covers every table in the database (`FOR ALL TABLES`), and PostgreSQL
+requires every table in a publication to have a replica identity before it accepts UPDATE or
+DELETE on it. A table with no primary key has none, so once the pipeline starts, your
+application's UPDATE and DELETE on that table fail, even though the pipeline does not copy it:
+
+```
+ERROR: cannot update table "<table>" because it does not have a replica identity and publishes updates
+```
+
+Tables the pipeline copies are not affected: rsync sets `REPLICA IDENTITY FULL` on them.
+rsync does not change your other tables; the assessment lists them, and the scheduled recheck
+of a running pipeline reports new ones.
+
+**Fix**
+
+Add a primary key to each listed table before starting the pipeline. Replace `id` with the
+column(s) that identify a row:
+
+```sql
+ALTER TABLE "<schema>"."<table>" ADD PRIMARY KEY (id);
 ```
 
 ---
@@ -566,8 +684,8 @@ for a third.
 **Code:** `MONGODB_NOT_REPLICA_SET` · config error · ~10 minutes.
 
 MongoDB CDC requires a replica set (or a sharded cluster). Debezium reads the change stream,
-and a standalone `mongod` does not expose one. MongoDB's own pre-flight defers these checks
-to Debezium, so this surfaces once streaming starts rather than at pipeline creation.
+and a standalone `mongod` does not expose one. The pre-migration assessment reports this
+before the pipeline runs, and a run on a standalone source fails before CDC starts.
 
 A single-node replica set is enough — you do not need extra members.
 
@@ -605,6 +723,53 @@ data is lost, but the snapshot re-reads them.
    ```
 
 3. Re-run or resume this pipeline.
+
+## mongodb-change-stream-access
+
+**Code:** `MONGODB_CHANGE_STREAM_UNAUTHORIZED` · blocking when every collection is in one
+database, a warning otherwise · ~5 minutes.
+
+The assessment opened a change stream where CDC will watch — the one database every
+selected collection is in, or the whole deployment when they span databases — and MongoDB
+refused it. Opening a change stream needs the `changeStream` and `find` actions, which the
+built-in `read` role carries.
+
+**Fix**
+
+1. Grant the connection's user `read` on the database (Atlas: Database Access → edit the
+   user → add the role):
+
+   ```javascript
+   db.getSiblingDB("admin").grantRolesToUser("<user>", [{ role: "read", db: "<database>" }])
+   ```
+
+2. For collections in more than one database, grant `readAnyDatabase` instead — or select
+   the collections as `<database>.<collection>` from a single database:
+
+   ```javascript
+   db.getSiblingDB("admin").grantRolesToUser("<user>", [{ role: "readAnyDatabase", db: "admin" }])
+   ```
+
+3. Re-run the assessment.
+
+## mongodb-oplog-window-short
+
+**Code:** `MONGODB_OPLOG_WINDOW_SHORT` · advisory · ~10 minutes.
+
+The oplog holds less than 24 hours of changes. CDC resumes from a position in the oplog, so
+a pipeline stopped or behind for longer than the window finds that position overwritten
+and must re-snapshot (see [mongodb-resume-token-invalid](#mongodb-resume-token-invalid)).
+
+**Fix**
+
+1. Keep at least a day of oplog. On MongoDB 4.4+, run on each replica set member:
+
+   ```javascript
+   db.adminCommand({ replSetResizeOplog: 1, minRetentionHours: 48 })
+   ```
+
+2. On Atlas, edit the cluster → Additional Settings → set a minimum oplog window.
+3. Re-run the assessment.
 
 ---
 

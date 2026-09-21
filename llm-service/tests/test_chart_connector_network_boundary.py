@@ -32,9 +32,9 @@ Three things have to stay true, and each is one test below:
      rename with no other visible effect.
 
 Text-only because parsing the templates needs no `helm` binary and no render, so it holds on any checkout -- not
-because "CI has no helm binary", which is what this said and was false as a
-reason: ci.yml sets helm up for the job that collects this suite and asserts it
-before pytest. See the `helm is present` step in .github/workflows/ci.yml.
+because "CI has no helm binary", which is what this said and was false: nothing
+in ci.yml installs helm, but every one of its jobs runs on a self-hosted Mac
+that has it. the `helm is present` step in .github/workflows/ci.yml carries the correction.
 """
 
 import os

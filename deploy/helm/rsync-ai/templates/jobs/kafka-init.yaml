@@ -165,6 +165,26 @@ spec:
                     sed 's/\\/\\\\/g; s/"/\\"/g' |
                     sed 's/\\/\\\\/g'
                 }
+                # True when fetching a token from $1 would put the client
+                # secret on a wire. Loopback is exempt because the request
+                # never leaves the pod. Mirrors _insecure_token_endpoint in
+                # scripts/kafka-init-new-topics.sh and _ins_tok in
+                # docker-compose.quickstart.yml -- change all three.
+                insecure_token_endpoint() {
+                  case "$1" in https://*|HTTPS://*) return 1 ;; esac
+                  H=${1#*://}; H=${H%%/*}; H=${H%%\?*}; H=${H##*@}
+                  case "$H" in
+                    \[*) H=${H#\[}; H=${H%%]*} ;;
+                    *) H=${H%%:*} ;;
+                  esac
+                  H=$(printf '%s' "$H" | tr '[:upper:]' '[:lower:]'); H=${H%.}
+                  [ -n "$H" ] || return 1
+                  case "$H" in
+                    localhost|*.localhost|::1|0:0:0:0:0:0:0:1) return 1 ;;
+                    127.*) case "$H" in *[!0-9.]*) return 0 ;; *) return 1 ;; esac ;;
+                  esac
+                  return 0
+                }
                 if [ "$KAFKA_SASL_MECHANISM" = "OAUTHBEARER" ]; then
                   # OAUTHBEARER splits its settings across two places, and the
                   # split is not guessable from the other mechanisms:
@@ -190,6 +210,26 @@ spec:
                       exit 1
                     fi
                   done
+                  # The client-credentials grant POSTs the client secret to the
+                  # token endpoint on every fetch, so http off loopback hands a
+                  # credential that never expires to anyone on the path.
+                  # validate.yaml refuses this at render time too; this is the
+                  # backstop for an endpoint injected through existingSecret or
+                  # extraEnv, which no template ever sees.
+                  if [ "${KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT:-}" != "true" ] &&
+                     insecure_token_endpoint "$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT"; then
+                    echo "FATAL: KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT=$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT is http and its host is not loopback." >&2
+                    echo "       KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET would be sent in the clear on every token fetch." >&2
+                    echo "       Use https, a loopback address, or set" >&2
+                    echo "       kafka.external.oauth.allowInsecureTokenEndpoint=true for a disposable test rig." >&2
+                    exit 1
+                  fi
+                  # kafka-clients 3.9.2 gates the token endpoint on a JVM system
+                  # property, and UNSET MEANS ALLOW ANY URL.
+                  case "${KAFKA_OPTS:-}" in
+                    *org.apache.kafka.sasl.oauthbearer.allowed.urls*) ;;
+                    *) export KAFKA_OPTS="${KAFKA_OPTS:+$KAFKA_OPTS }-Dorg.apache.kafka.sasl.oauthbearer.allowed.urls=$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT" ;;
+                  esac
                   # Order matches what the Python builder emits (sorted), so a
                   # config dumped from here and one from llm-service diff cleanly
                   # while debugging a handshake. The JVM itself does not care.

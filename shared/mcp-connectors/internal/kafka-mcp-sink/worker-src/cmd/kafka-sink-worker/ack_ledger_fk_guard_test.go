@@ -32,8 +32,14 @@ import (
 	"github.com/segmentio/kafka-go"
 )
 
-// ackFKConn records every ExecContext query in order. Implementing
-// driver.ExecerContext routes db.ExecContext straight here, bypassing Prepare.
+// ackFKConn records every query in order. Implementing driver.ExecerContext and
+// driver.QueryerContext routes db.ExecContext / db.QueryContext straight here,
+// bypassing Prepare.
+//
+// It also stands in for the ledger's unique key: an ack INSERT adds only keys it
+// has not seen, and RETURNING / RowsAffected report just those, the way
+// ON CONFLICT DO NOTHING does in Postgres (including a key repeated inside one
+// statement, which is added once).
 type ackFKConn struct {
 	mu      sync.Mutex
 	queries []string
@@ -41,20 +47,117 @@ type ackFKConn struct {
 	// violation used to, so a test can prove the guard still runs first and the
 	// error is still returned (non-fatal at the call site).
 	failAcks error
+	// ledger holds the acked keys and each one's cdc_op.
+	ledger map[cdcAckKey]string
+	// strayKey, when set, is returned by every batch ack INSERT on top of the
+	// rows it really added.
+	strayKey *cdcAckKey
+	// seedRows, when set, answers the counter seed query instead of the ledger.
+	seedRows [][]driver.Value
+	// failSeed fails the seed query; seedRowsErr fails it after its rows were read.
+	failSeed    error
+	seedRowsErr error
+	seedArgs    []driver.NamedValue
 }
 
 func (c *ackFKConn) Prepare(string) (driver.Stmt, error) { return nil, io.EOF }
 func (c *ackFKConn) Close() error                        { return nil }
 func (c *ackFKConn) Begin() (driver.Tx, error)           { return nil, io.EOF }
 
-func (c *ackFKConn) ExecContext(_ context.Context, q string, _ []driver.NamedValue) (driver.Result, error) {
+func (c *ackFKConn) ExecContext(_ context.Context, q string, args []driver.NamedValue) (driver.Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.queries = append(c.queries, q)
-	if c.failAcks != nil && strings.Contains(q, "pipeline_batch_acks") {
+	if !strings.Contains(q, "pipeline_batch_acks") {
+		return driver.RowsAffected(1), nil
+	}
+	if c.failAcks != nil {
 		return nil, c.failAcks
 	}
-	return driver.RowsAffected(1), nil
+	return driver.RowsAffected(int64(len(c.addAcksLocked(args)))), nil
+}
+
+func (c *ackFKConn) QueryContext(_ context.Context, q string, args []driver.NamedValue) (driver.Rows, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.queries = append(c.queries, q)
+	switch {
+	case strings.Contains(q, "INSERT INTO pipeline_batch_acks"):
+		if c.failAcks != nil {
+			return nil, c.failAcks
+		}
+		added := c.addAcksLocked(args)
+		if c.strayKey != nil {
+			added = append(added, *c.strayKey)
+		}
+		rows := &ackFKRows{cols: []string{"table_name", "kafka_topic", "kafka_partition", "kafka_offset"}}
+		for _, k := range added {
+			rows.vals = append(rows.vals, []driver.Value{k.table, k.topic, k.partition, k.offset})
+		}
+		return rows, nil
+	case strings.Contains(q, "FROM pipeline_batch_acks"):
+		c.seedArgs = args
+		if c.failSeed != nil {
+			return nil, c.failSeed
+		}
+		rows := &ackFKRows{cols: []string{"table_name", "op", "count"}, vals: c.seedRows, err: c.seedRowsErr}
+		if rows.vals == nil {
+			counts := map[[2]string]int64{}
+			for k, op := range c.ledger {
+				counts[[2]string{k.table, op}]++
+			}
+			for tk, n := range counts {
+				rows.vals = append(rows.vals, []driver.Value{tk[0], tk[1], n})
+			}
+		}
+		return rows, nil
+	}
+	return nil, io.EOF
+}
+
+// addAcksLocked applies an ack INSERT's rows (16 bind args each, the column order
+// of buildCDCAckInserts and persistCDCAckToPostgres) and returns the keys it added.
+func (c *ackFKConn) addAcksLocked(args []driver.NamedValue) []cdcAckKey {
+	if c.ledger == nil {
+		c.ledger = map[cdcAckKey]string{}
+	}
+	var added []cdcAckKey
+	for base := 0; base+pgAckLedgerCols <= len(args); base += pgAckLedgerCols {
+		k := cdcAckKey{
+			table:     args[base+2].Value.(string),
+			topic:     args[base+8].Value.(string),
+			partition: args[base+9].Value.(int64),
+			offset:    args[base+10].Value.(int64),
+		}
+		if _, seen := c.ledger[k]; seen {
+			continue
+		}
+		op, _ := args[base+11].Value.(string)
+		c.ledger[k] = strings.ToLower(strings.TrimSpace(op))
+		added = append(added, k)
+	}
+	return added
+}
+
+type ackFKRows struct {
+	cols []string
+	vals [][]driver.Value
+	err  error // returned once vals are exhausted, in place of io.EOF
+	i    int
+}
+
+func (r *ackFKRows) Columns() []string { return r.cols }
+func (r *ackFKRows) Close() error      { return nil }
+func (r *ackFKRows) Next(dest []driver.Value) error {
+	if r.i >= len(r.vals) {
+		if r.err != nil {
+			return r.err
+		}
+		return io.EOF
+	}
+	copy(dest, r.vals[r.i])
+	r.i++
+	return nil
 }
 
 func (c *ackFKConn) recorded() []string {
@@ -107,6 +210,7 @@ func ackFKMessages(t *testing.T, n int) ([]*SinkMessage, []kafka.Message) {
 			StorageType: "cdc",
 			BatchOffset: int64(i),
 			RowCount:    1,
+			CDCOp:       "c",
 		}
 		msgs[i] = kafka.Message{Topic: "cdc.public.orders", Partition: i % 3, Offset: int64(i)}
 	}
@@ -133,7 +237,7 @@ func TestPersistCDCAcksBatch_EnsuresExecutionRowBeforeAckInsert(t *testing.T) {
 	defer db.Close()
 
 	sms, msgs := ackFKMessages(t, 3)
-	if err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest"); err != nil {
+	if _, err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest"); err != nil {
 		t.Fatalf("persistCDCAcksBatch: %v", err)
 	}
 
@@ -175,7 +279,7 @@ func TestPersistCDCAcksBatch_EnsuresExecutionRowOncePerFlush(t *testing.T) {
 	defer db.Close()
 
 	sms, msgs := ackFKMessages(t, 25)
-	if err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest"); err != nil {
+	if _, err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest"); err != nil {
 		t.Fatalf("persistCDCAcksBatch: %v", err)
 	}
 
@@ -245,9 +349,15 @@ func TestPersistCDCAcksBatch_StaysBestEffortWhenAcksStillFail(t *testing.T) {
 	defer db.Close()
 
 	sms, msgs := ackFKMessages(t, 2)
-	err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest")
+	counted, err := persistCDCAcksBatch(context.Background(), db, sms, msgs, "dest")
 	if err == nil {
 		t.Fatal("expected the ack insert error to be returned so the caller can log it")
+	}
+	// The ledger could not say which rows were new, so every row still counts.
+	for i, ok := range counted {
+		if !ok {
+			t.Fatalf("message %d not counted after a failed ack write; counters must keep moving: %v", i, counted)
+		}
 	}
 	if got := countMatching(conn.recorded(), "INSERT INTO executions"); got != 1 {
 		t.Fatalf("guard must run even when the ack write fails, got %d executions inserts", got)
@@ -263,7 +373,7 @@ func TestPersistCDCAcksBatch_NoMessagesIsANoOp(t *testing.T) {
 	db := newAckFKDB(t, conn)
 	defer db.Close()
 
-	if err := persistCDCAcksBatch(context.Background(), db, nil, nil, "dest"); err != nil {
+	if _, err := persistCDCAcksBatch(context.Background(), db, nil, nil, "dest"); err != nil {
 		t.Fatalf("persistCDCAcksBatch(nil): %v", err)
 	}
 	if got := conn.recorded(); len(got) != 0 {

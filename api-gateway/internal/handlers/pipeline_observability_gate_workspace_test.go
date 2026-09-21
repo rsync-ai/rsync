@@ -107,8 +107,9 @@ func TestPipelineObservabilityEndpoints_ForeignActiveWorkspace_Return404(t *test
 			if err != nil {
 				t.Fatalf("sqlmock: %v", err)
 			}
-			defer sqlDB.Close()
+			prev := db.DB
 			db.DB = sqlDB
+			t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 
 			// The pipeline exists and the caller even created it — but its
 			// workspace is not the ACTIVE one, so the three-way join finds
@@ -144,8 +145,9 @@ func TestGetPipelineEventsRaw_ForeignActiveWorkspace_404BeforeRBAC(t *testing.T)
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	defer sqlDB.Close()
+	prev := db.DB
 	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 
 	mock.ExpectQuery(gateRoleQuery).
 		WithArgs(gatePipeID, gateUserID, activeWS).
@@ -177,8 +179,9 @@ func TestGetPipelineEvents_TeammateInOwningWorkspace_ServedWithoutCreatorFilter(
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	defer sqlDB.Close()
+	prev := db.DB
 	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 
 	mock.ExpectQuery(gateRoleQuery).
 		WithArgs(gatePipeID, gateUserID, activeWS).
@@ -213,8 +216,9 @@ func TestGetPipelineCheckpoints_TeammateInOwningWorkspace_Served(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	defer sqlDB.Close()
+	prev := db.DB
 	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 
 	mock.ExpectQuery(gateRoleQuery).
 		WithArgs(gatePipeID, gateUserID, activeWS).

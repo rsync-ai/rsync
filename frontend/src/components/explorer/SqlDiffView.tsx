@@ -47,12 +47,12 @@ export function SqlDiffView({
   return (
     <div className={className}>
       <div className="mb-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-xs">
-        <span className="text-zinc-500">
+        <span className="text-zinc-500 dark:text-zinc-400">
           {baseLabel} <span aria-hidden="true">→</span>
           <span className="sr-only">compared with</span> {nextLabel}
         </span>
         {diff.added === 0 && diff.removed === 0 ? (
-          <span className="text-zinc-500">identical</span>
+          <span className="text-zinc-500 dark:text-zinc-400">identical</span>
         ) : (
           <>
             <span className="font-medium text-emerald-700 dark:text-emerald-400">
@@ -77,7 +77,7 @@ export function SqlDiffView({
       )}
 
       {hunks.length === 0 ? (
-        <p className="rounded-md border bg-zinc-50 p-3 text-xs text-zinc-500 dark:bg-zinc-900">
+        <p className="rounded-md border bg-zinc-50 p-3 text-xs text-zinc-500 dark:text-zinc-400 dark:bg-zinc-900">
           The SQL is character-for-character the same in both.
         </p>
       ) : (
@@ -115,7 +115,7 @@ function HunkRows({
         <tr>
           <td
             colSpan={4}
-            className="border-y bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-500 dark:bg-zinc-800"
+            className="border-y bg-zinc-100 px-2 py-0.5 text-[10px] text-zinc-500 dark:text-zinc-400 dark:bg-zinc-800"
           >
             @@ −{hunk.baseStart},{hunk.baseCount} +{hunk.nextStart},{hunk.nextCount} @@
           </td>

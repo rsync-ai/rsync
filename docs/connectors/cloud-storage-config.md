@@ -162,10 +162,22 @@ Sink=Go `kafka-mcp-sink`. v1 = in scope for this workstream; **defer** = Phase 5
 > wrapper codec but **not** a parquet codec, so `parquet` + `bzip2` is rejected outright rather
 > than producing a file no reader accepts.
 >
-> **`none` means none.** The form seeds each field from this schema `default` and persists what it
-> seeds, so whatever the default says is both what the connection modal displays and what the
-> writer does. A writer that substituted a codec the stored config doesn't name would make the two
-> disagree silently — the reason the preference lives here and not in the writer.
+> **`none` means none; a missing value means the schema default.** The form seeds each field from
+> this schema `default` at create and persists what it seeds, so a connection made in the form
+> always stores a codec, and a stored value, `none` included, is always what the writer uses. A
+> connection that never stored one (created through the API, imported, or saved by a build before
+> the default was `gzip`) used to write **uncompressed**, because the sink read a missing key as
+> `none` while the schema said `gzip`. Two connections to the same bucket could then write different
+> codecs for no visible reason. The sink now reads a missing or blank value as the connector's own
+> schema default, in one place (`objectStorageCompression`, kafka-sink-worker `main.go`) shared by
+> the batch write, the CDC write and the CDC batcher. The same value names the object, so the
+> `.gz` suffix and the bytes always agree. `minio` has no compression setting and keeps writing
+> uncompressed. `compression_default_test.go` fails if the sink's defaults stop matching these
+> schemas.
+>
+> **Existing connections that stored `none` still write uncompressed.** That is a real choice and
+> cannot be told apart from the old default, so nothing rewrites it. To compress, open the
+> connection, set Compression to `gzip` and save. Files already written keep their codec and name.
 
 ### Group C — Destination partitioning (Sink-enforced)
 
@@ -175,17 +187,21 @@ CDC bronze objects land in a layout that reads like an AWS DMS S3 target with da
 folder partitioning (sink `cdcObjectKey`):
 
 ```
-CDC:    <prefix>/<db_or_schema>/<table>/<col=val/…><time-bucket>/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<offset>.<ext>
+CDC:    <prefix>/<dataset>/<db_or_schema>/<table>/<col=val/…><time-bucket>/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<offset>.<ext>
         where <time-bucket> = YYYY-MM-DD                 when partition_time_granularity is unset/none
                             = dt=YYYY-MM-DD[/hour=HH]    when it is day/hour (month → dt=YYYY-MM)
 batch:  <prefix>/<dataset>/<db_or_schema>/<table>/<col=val/…>dt=<YYYY-MM-DD>/part-<offset:06d>[-<chunk>].<ext>
 ```
 
-- `<prefix>` (`path_prefix`) is the pipeline namespace — the DMS "bucketFolder" model.
-  There is deliberately **no** pipeline-id / dataset segment, so two pipelines writing the
-  same `schema.table` must use distinct `path_prefix` values (as with DMS endpoints).
-- `<db_or_schema>` / `<table>` come from the source schema/table (`cdcObjectPath` splits
-  `sm.Table`). With `partition_time_granularity` unset (or `none`, the default) the date
+- `<prefix>` is the connection's `path_prefix`; `<dataset>` is the slugified pipeline id
+  (`cdcPipelineSegment`), the same segment batch writes. Two pipelines writing the same
+  `schema.table` into one bucket/prefix therefore land in separate trees (#14 — this replaced
+  the earlier no-pipeline-segment layout, under which they collided on the same folder).
+- `<db_or_schema>` is the pipeline's destination **namespace** when one is set (the value the
+  orchestrator logs as `resolved=`); a blank or placeholder (`default`) namespace falls back to
+  the source schema/database. `<table>` comes from the source table (`cdcObjectPath` splits
+  `sm.Table`). CDC and batch share the resolved folder, so the backfill and the change
+  stream for one table sit side by side. Objects written under the old layout are not moved. With `partition_time_granularity` unset (or `none`, the default) the date
   folder is **plain** (`2026-06-30`, no `dt=`) — DMS-style. Setting a granularity opts into
   the **Hive** layout (`dt=2026-06-30[/hour=14]`) instead, which is what a partitioned
   external table needs: BigQuery's `hive_partitioning_mode` and Athena's partition
@@ -209,6 +225,47 @@ batch:  <prefix>/<dataset>/<db_or_schema>/<table>/<col=val/…>dt=<YYYY-MM-DD>/p
 > orchestrator `keybuilder.go` reload-delete + the `_MANIFEST.json`/`_SUCCESS` markers, so it
 > is tracked separately.
 
+#### Layout v2 (GCS, S3, Azure Blob): no pipeline id in the path
+
+A `gcs`, `aws-s3` or `azure-blob` pipeline created after migration 108 writes **layout v2**
+instead of the layout above (executor `object_layout_v2.go`, sink `object_layout_v2_write.go`,
+keys and the destination list pinned by `shared/object_layout_golden.json`, `v2_destinations`):
+
+```
+data:      <prefix>/<pipeline prefix>/<db>/[<schema>/]<table>/dt=YYYY-MM-DD/LOAD00000001.parquet
+CDC:       <prefix>/<pipeline prefix>/<db>/[<schema>/]<table>/dt=YYYY-MM-DD/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<first offset>.parquet
+sidecars:  <prefix>/<pipeline prefix>/_rsync/<db>/[<schema>/]<table>/dt=YYYY-MM-DD/_MANIFEST.json, _SUCCESS
+```
+
+- `<pipeline prefix>` is the path prefix entered when the tables are picked (the pipeline's
+  `destination_namespace`). For these three it is **required** in the UI: lowercase letters, digits and
+  underscores, starting with a letter, at most 63 characters, not `default` or a reserved
+  word. It replaces the pipeline id segment, so each pipeline on one connection needs its own.
+- `<db>` is the source database; PostgreSQL-family, SQL Server and Oracle sources add the
+  `<schema>` folder, MongoDB and MySQL do not. Batch, initial-load, reload and CDC-snapshot rows
+  are `LOAD%08d.parquet` files, numbered per table in `object_load_counters`; a redelivered
+  message rewrites the same file. `-p<n>` appears only for Kafka partition > 0.
+- The `_MANIFEST.json`/`_SUCCESS` sidecars sit under `_rsync/`, outside the table folder, so a
+  BigQuery hive external table over `<table>/*` reads only Parquet.
+- Parquet only: a `bzip2` connection writes snappy Parquet. `partition_by` and
+  `partition_time_granularity` do not apply (the only partition folder is `dt=`); file rolling
+  (`max_file_rows`/`max_file_mb`) still splits a batch, one LOAD file per chunk. A source column
+  named `dt` is written as `dt_source`.
+- A table folder is emptied before its first write and on every reload, so a new pipeline that
+  reuses an old prefix replaces the files there.
+- **Who gets v2.** `pipelines.storage_layout_version` is `0` (undecided) for a new pipeline.
+  When its first sink starts, a GCS, S3 or Azure Blob destination with a valid prefix, a destination connection
+  and a known database source (PostgreSQL family, MySQL, SQL Server, Oracle, MongoDB) records
+  `2`; anything else records `1` and keeps the layout above. A prefix already used by another
+  v2 pipeline on the same connection records `1`. A pipeline created before migration 108 stays
+  on `1` until a **batch reload**, which moves an eligible one to `2`; a CDC sink restart never
+  changes the version. A v2 pipeline that can no longer build its keys fails to start (restart
+  answers 409) instead of writing v1 keys next to its v2 folders.
+- Old `<prefix>/<pipeline id>/…` folders are not moved or deleted; remove them by hand.
+- The internal `minio` staging store (and any other object store) keeps the layout above, and
+  its path prefix stays optional. An S3 or Azure Blob pipeline whose sink first started before
+  S3/Azure support was added has already recorded `1`, so it stays v1 until a batch reload.
+
 **`partition_by` validation:** a configured partition column that is absent from the row
 schema (e.g. the `partition_by=event_timestamp` misconfig on a table with no such column) is
 now **dropped with a one-time warning** rather than silently bucketing every row into
@@ -222,6 +279,7 @@ now **dropped with a one-time warning** rather than silently bucketing every row
 | `partition_time_granularity` | string | select | `none` | D | **Sink** | ✅ CDC (4c) | `none,hour,day,month` → time-bucketed prefix (`dt=…[/hour=…]`); honored by `cdcObjectKey` from each event's `source_ts_ms`. **CDC only — batch stays day-level by design** (batch messages carry no per-row event ts, and the `_MANIFEST.json`/`_SUCCESS` markers anchor at the day root; finer buckets would fabricate a landing-time hour) |
 | `max_file_rows` | integer | — | `0` (off) | D | **Sink** | ✅ CDC + batch (4e) | roll a new part-file every N rows (0 = off); CDC → `maxEvents`, batch → row chunker |
 | `max_file_mb` | integer | — | `0` (off) | D | **Sink** | ✅ CDC + batch (4e) | roll a new part-file at ~N MB pre-compression (0 = off); CDC → `maxBytes`, batch → byte chunker |
+| `max_file_interval_seconds` | integer | — | unset (30 s) | D | **Sink** | 🔬 CDC (unit-tested only) | longest time CDC changes wait in the sink before they are written as a file; CDC → `flushInterval` (`objectFlushIntervalOverride`). Whole seconds from 1 to 240 (why 240: see the CDC path notes below). Any other value is refused, never clamped: `start_sink` returns `status: invalid_config` with the reason, and the worker refuses it again at startup. The value is checked for every destination, so a bad value stops a relational sink too, but only object storage uses it. Batch writes are not affected. Set it on the storage connection form (advanced settings): all three connectors declare it in `metadata.json` with no default, so a blank box saves no key and the 30 s default applies. The orchestrator copies every connection key into the sink's `destination_config`, so the value applies to every CDC pipeline writing to that connection. Guard: `test_kafka_sink_flush_interval.py` (declared in both schema blocks, no default, description states the enforced bounds) |
 
 #### File rolling (`max_file_rows` / `max_file_mb`) — Phase 4e (implemented)
 
@@ -242,12 +300,45 @@ well-sized files (too small → many-files overhead; too large → poor read par
 is the warehouse sweet spot.
 
 **Maps to our two write paths (as built in 4e):**
-- **CDC path.** `cdcObjectBatcher` already rolls a new object on `maxEvents` (1000) **or**
-  `maxBytes` (10 MB) **or** `flushInterval` (30 s) — rows+bytes+time, whichever first.
-  `newCDCObjectBatcher` now lets the **destination config** `max_file_rows`/`max_file_mb`
-  override `maxEvents`/`maxBytes` (via `objectFileRollLimits`) on top of the
-  `cfg.KafkaSinkWorker.CDCBatching` defaults. The interval stays governed by
-  `cdc_batching.flush_interval_seconds` (the AWS DMS `CdcMaxBatchInterval` analog).
+- **CDC path.** `cdcObjectBatcher` rolls a new object on `maxEvents` (2000) **or**
+  `maxBytes` (24 MB) **or** `flushInterval` (30 s) — rows+bytes+time, whichever first
+  (defaults in `resolveCDCBatchingParams`). `newCDCObjectBatcher` lets the **destination
+  config** override all three: `max_file_rows`/`max_file_mb` → `maxEvents`/`maxBytes` (via
+  `objectFileRollLimits`) and `max_file_interval_seconds` → `flushInterval` (via
+  `objectFlushIntervalOverride`, 1–240 s). The destination keys win over
+  `kafka_sink_worker.cdc_batching`; no start path (connector, orchestrator start or restart)
+  sends `kafka_sink_worker` today, so in practice the destination keys are the only way to
+  change these.
+  - The timer is checked after every message and on the consumer's 1 s idle poll, so a file
+    on a quiet topic is written about one interval after its first change arrived.
+  - Offsets are committed only after the file is written. File names come from the table,
+    time bucket, partition and offset range of the batch, not from when the flush ran or
+    which interval triggered it, so retrying a failed write rewrites the same object.
+  - The consumer stall watchdog (`RSYNC_SINK_STALL_WATCHDOG_SECONDS`, default 60 s) counts
+    buffered, uncommitted changes as records still waiting. Its window is therefore raised to
+    at least interval + 30 s (`stallWindowCoveringFlush`), so a quiet topic holding a partly
+    filled file is not restarted as stalled. With the 30 s default this is the same 60 s; at
+    the 240 s ceiling it is 270 s.
+  - Why the ceiling is 240 s: for object storage the pipeline's "last applied" time moves
+    only when a file is written. The pipeline page shows a pipeline as idle once that time is
+    more than 300 s old while changes are waiting (`cdcLivenessPhase`), and the CDC sentinel
+    uses the same 5-minute bound (`CDC_SINK_STALE_BOUND`) for its opt-in sink restart
+    (`CDC_SINK_AUTORESTART_ENABLED`, off by default). 240 s keeps a busy pipeline's writes
+    inside that bound, with about a minute to spare for the 1 s poll and the write itself.
+  - What a longer interval still shows:
+    - Changes waiting for the timer are not yet committed, so they count as sink consumer
+      lag. If more than `CDC_SINK_KAFKA_LAG_ALERT` (default 1000) are waiting, the sentinel
+      raises a `sink_lag` issue, which clears after the file is written.
+    - After a quiet spell of more than five minutes, the first new changes wait up to one
+      interval before they are written, so the pipeline page can read idle for up to that
+      long. If the sink restart is turned on and the lag alert is also over its threshold,
+      the sentinel can restart the sink once during that wait. Nothing is lost: the changes
+      are read again and written within one interval, before the restart cooldown (`CDC_SENTINEL_RESTART_COOLDOWN`, 5 min by default)
+      allows another attempt.
+  - Trade-offs: a short interval writes many small files; a long one holds more changes in
+    the sink's memory and replays more from the topic after a restart.
+  - Relational destinations keep their own 5 s default (`newCDCDBBatcher`) and do not use
+    `max_file_interval_seconds`, although a bad value is still refused at start.
 - **Batch path.** One Kafka batch message used to map to one `part-NNNNNN` file (bounded only
   by the producer's `EXPORT_CHUNK_SIZE`). The consumer loop now splits each partition group
   via `chunkRowsForFileRolling(rows, max_file_rows, max_file_mb)` → `part-NNNNNN-MMMM` (one
@@ -282,6 +373,55 @@ explicitly wanted.
 > **`cdc_include_op` + `cdc_partition_by_op` together:** with both on, the in-file `op` column
 > duplicates the `op=` partition column when the bronze path is registered as a Hive/Athena table;
 > set `cdc_include_op=false` if you partition by op.
+
+#### Reading a MongoDB CDC row out of bronze
+
+A MongoDB CDC row is **not** a flat column-per-field record. The sink packs the whole document
+into one field, so a bronze row looks like:
+
+```json
+{"_id": "5251", "document": {"_id": 5251, "name": "…", "started_at": {"$date": 1758…}}, "op": "u", "kafka_offset": 41}
+```
+
+Two things trip up every first query against it:
+
+1. **`_id` appears twice with different types.** The top-level `_id` is the *key* — always a
+   **string** (`"5251"`), because Kafka keys are stringified. `document._id` is the value as it
+   exists in MongoDB (here the **int** `5251`). Join on the wrong one and you get zero rows, not
+   an error.
+2. **Dates stay in Extended JSON.** A MongoDB date is `{"$date": <millis>}`, an object — so
+   `JSON_VALUE(document, '$.started_at')` returns **NULL silently** in BigQuery (`JSON_VALUE`
+   only extracts scalars). The `$` in the key must also be quoted.
+
+Correct forms:
+
+```sql
+JSON_VALUE(document, '$.name')                       -- a scalar field
+JSON_VALUE(document, '$.started_at."$date"')         -- a date: reach inside $date, quote the key
+JSON_QUERY(document, '$.address')                    -- a nested object, kept as JSON
+```
+
+Implementation: `shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go:7482-7489`
+(the `{_id, document}` packing) and `:7505-7570` (Extended JSON passthrough).
+
+> The same packing is why a column mask cannot match a MongoDB CDC field
+> (`KI-MONGO-CDC-MASK-SILENT-NOOP`).
+
+#### CDC output has no completeness marker — and should not grow one inside the partition
+
+A batch load writes a manifest; a **CDC** load writes none. There is no per-partition file that
+says "this `dt=` partition is complete", so a reader cannot distinguish "no changes today" from
+"the pipeline stopped". This is a **limitation, documented deliberately**, not a defect queued
+for a fix (`main.go:3946`, `:6454-6462`).
+
+The obvious fix is the wrong one. Writing `_MANIFEST.json` into a `dt=` partition **breaks the
+BigQuery external table over that folder**: in a Hive-partitioned external table an underscore
+prefix does **not** exclude a file, and the *last* file read sets the schema — so one manifest
+makes `<table>/*` unqueryable. The v2 layout already moves sidecars out to
+`…/<prefix>/_rsync/<db>/<table>/dt=…/` for exactly this reason.
+
+So any completeness marker must live **outside the partition tree** the external table reads —
+the `_rsync/` sidecar path, or pipeline metadata — never beside the data files.
 
 ### Group E — Source: discovery & selection (Py) — v1
 

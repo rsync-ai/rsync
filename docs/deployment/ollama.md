@@ -17,24 +17,35 @@ There are two provider settings, and confusing them is the most common misconfig
 
 | Switch | Controls | Default |
 |---|---|---|
-| `LLM_PROVIDER` | Every agent: planner, tool-generator, chat, healer | auto-detect |
+| `LLM_PROVIDER` | Every agent: planner, tool-generator, chat, healer | auto-detect; the quickstart and prod compose files pass `openai` |
 | `EXPLORER_OFFLINE_ONLY` | Forces **only** the Data Explorer to Ollama | **`false`** |
 
-`LLM_PROVIDER` accepts `openai` · `azure` · `groq` · `ollama`. When unset, `resolve_provider()`
+`LLM_PROVIDER` accepts `openai` · `azure` · `groq` · `ollama`, plus `none` (or `disabled`, `off`,
+`false`, `0`) for an install with no LLM. When unset, `resolve_provider()`
 auto-detects: Azure endpoint → `azure`, else `OPENAI_API_KEY` → `openai`, **else `ollama`**
-([openai_client.py:79-117](../../llm-service/src/utils/openai_client.py#L79)). Two safety
+([openai_client.py:294-365](../../llm-service/src/utils/openai_client.py#L294)). Two safety
 properties worth quoting to a security reviewer:
 
 - **Fail-closed.** `LLM_PROVIDER=openai` with no key resolves to `ollama`, not to an error and not
-  to a silent unauthenticated call (`:103-105`).
+  to a silent unauthenticated call, and it logs one warning naming the missing key (`:334-339`).
 - **Groq is never auto-selected.** A stray `GROQ_API_KEY` cannot silently route prompts to an
-  undisclosed external LLM; Groq requires an explicit `LLM_PROVIDER=groq` (`:100-101`, `:115-117`).
+  undisclosed external LLM; Groq requires an explicit `LLM_PROVIDER=groq` (`:328-332`, `:363-365`).
+
+**Routing to Ollama is not the same as having one.** `llm_configured()`
+([:368-394](../../llm-service/src/utils/openai_client.py#L368)) counts Ollama only when the
+operator named it — `LLM_PROVIDER=ollama`, or `EXPLORER_OFFLINE_ONLY=true` for the Explorer
+([`explorer_llm_configured()`, :397-410](../../llm-service/src/utils/openai_client.py#L397)). An
+Ollama reached by the fallback above is **not configured**: the LLM-only features answer HTTP 503
+`Set up an LLM first` ([llm_gate.py](../../llm-service/src/utils/llm_gate.py)) instead of calling
+a server nobody started. So the order is: an external LLM when credentials are present, Ollama
+only when you choose it, otherwise none — see
+[Which LLM is used](self-hosting.md#which-llm-is-used).
 
 The Explorer inherits `LLM_PROVIDER` unless `EXPLORER_LLM_PROVIDER` overrides it
-([resolve_explorer_provider()](../../llm-service/src/utils/openai_client.py#L141), called by
-[main.py:852](../../llm-service/src/gateway/main.py#L852),
-[explorer/api.py:122](../../llm-service/src/agents/explorer/api.py#L122) and
-[explorer/rank_tables.py:76](../../llm-service/src/agents/explorer/rank_tables.py#L76) — one rule,
+([resolve_explorer_provider()](../../llm-service/src/utils/openai_client.py#L434), called by
+[main.py:859](../../llm-service/src/gateway/main.py#L859),
+[explorer/api.py:79](../../llm-service/src/agents/explorer/api.py#L79) and
+[explorer/rank_tables.py:78](../../llm-service/src/agents/explorer/rank_tables.py#L78) — one rule,
 three entry points, no way for them to disagree).
 
 > ⚠️ **`EXPLORER_OFFLINE_ONLY` defaults to `false`, not `true`.** Older copies of this doc said
@@ -90,9 +101,9 @@ Three lines are expected, one per entry point:
 
 | Log line | Emitted by | Covers |
 |---|---|---|
-| `explorer llm:` | [main.py:878](../../llm-service/src/gateway/main.py#L878) | Query-spec assembly, NL→SQL |
-| `explorer router llm:` | [explorer/api.py:132](../../llm-service/src/agents/explorer/api.py#L132) | Table linking, column linking, next steps |
-| `rank-tables llm:` | [explorer/rank_tables.py:84](../../llm-service/src/agents/explorer/rank_tables.py#L84) | Table recommendations during pipeline setup |
+| `explorer llm:` | [main.py:889](../../llm-service/src/gateway/main.py#L889) | Query-spec assembly, NL→SQL |
+| `explorer router llm:` | [explorer/api.py:91](../../llm-service/src/agents/explorer/api.py#L91) | Table linking, column linking, next steps |
+| `rank-tables llm:` | [explorer/rank_tables.py:86](../../llm-service/src/agents/explorer/rank_tables.py#L86) | Table recommendations during pipeline setup |
 
 They read the same resolver, so they must agree; if they ever don't, that is a bug worth filing.
 `rank-tables llm:` is the newest of the three and was added because that endpoint *didn't* read the
@@ -116,14 +127,14 @@ Two separate model pools. The Explorer does not use the general default.
 
 | Setting | Default | Source |
 |---|---|---|
-| `LLM_MODEL` | unset — **overrides everything when set** | [openai_client.py:127](../../llm-service/src/utils/openai_client.py#L127) |
-| `OLLAMA_MODEL` | `qwen2.5:7b` | `:132` |
+| `LLM_MODEL` | unset — **overrides everything when set** | [openai_client.py:420](../../llm-service/src/utils/openai_client.py#L420) |
+| `OLLAMA_MODEL` | `qwen2.5:7b` | `:425` |
 
 ### Data Explorer
 
 Set only when `EXPLORER_LLM_PROVIDER` resolves to `ollama`; on OpenAI/Azure these fall back to
 `LLM_MODEL`, then the Azure deployment name, then `gpt-4o-mini`
-([explorer_default_model()](../../llm-service/src/utils/openai_client.py#L164)). On Azure the model
+([explorer_default_model()](../../llm-service/src/utils/openai_client.py#L457)). On Azure the model
 argument **is** the deployment name, so leaving both `LLM_MODEL` and `AZURE_OPENAI_DEPLOYMENT` unset
 gives you a 404 `DeploymentNotFound` rather than a wrong-model answer.
 
@@ -135,19 +146,20 @@ gives you a 404 `DeploymentNotFound` rather than a wrong-model answer.
 | `EXPLORER_NEXT_STEPS_MODEL` | `OLLAMA_MODEL` or `llama3:latest` | Follow-up suggestions |
 | `EXPLORER_SQL_MODEL` | `OLLAMA_MODEL` or `sqlcoder:latest` | NL→SQL |
 | `EXPLORER_SQL_MODEL_MYSQL` | same | NL→SQL on MySQL/MariaDB |
-| `EXPLORER_SQL_FALLBACK_MODELS` | `qwen2.5:7b,llama3:latest,codellama:7b-instruct`; the bundled overlay pins it to the pulled model | Retry chain when SQL generation fails ([main.py:2756-2782](../../llm-service/src/gateway/main.py#L2756)) |
-| `RANK_TABLES_MODEL` | `llama3:latest` | Table recommendations during pipeline setup ([rank_tables_default_model()](../../llm-service/src/utils/openai_client.py#L210)) |
+| `EXPLORER_SQL_FALLBACK_MODELS` | `qwen2.5:7b,llama3:latest,codellama:7b-instruct`; the bundled overlay pins it to the pulled model | Retry chain when SQL generation fails ([main.py:2810-2836](../../llm-service/src/gateway/main.py#L2810)) |
+| `RANK_TABLES_MODEL` | `OLLAMA_MODEL` or `llama3:latest` | Table recommendations during pipeline setup ([rank_tables_default_model()](../../llm-service/src/utils/openai_client.py#L517)) |
 
 `RANK_TABLES_MODEL` deliberately does **not** follow `LLM_MODEL` on OpenAI — ranking is a bulk
 metadata task pinned to the cheap `gpt-4o-mini`, and inheriting a stack-wide upgrade to `gpt-4o`
-would multiply its cost silently ([`:214-220`](../../llm-service/src/utils/openai_client.py#L214)).
+would multiply its cost silently ([`:521-523`](../../llm-service/src/utils/openai_client.py#L521)).
 Set `RANK_TABLES_MODEL` explicitly if you want it moved.
 
-Offline that pinning has the opposite effect, and the bundled overlay overrides it for exactly that
-reason. A cost pin is meaningless against a model you host yourself, while the *name* it pins is a
-model nobody downloaded — so on a bundled install `docker-compose.ollama.yml` sets
-`RANK_TABLES_MODEL` to the same model `ollama-pull` fetched. Option A below needs no
-`RANK_TABLES_MODEL` of its own.
+Offline that pinning is beside the point, and the bundled overlay overrides it anyway. A cost pin
+is meaningless against a model you host yourself; the offline branch already follows `OLLAMA_MODEL`
+down to the model the deployment was actually given
+([`:545-546`](../../llm-service/src/utils/openai_client.py#L545)), and `docker-compose.ollama.yml`
+sets `RANK_TABLES_MODEL` to that same model outright, so neither route can ask for weights nobody
+pulled. Option A below needs no `RANK_TABLES_MODEL` of its own.
 
 ### What to actually pull
 
@@ -156,6 +168,7 @@ starts; skip to Deployment. This section is for Options B and C, where you own t
 
 Those two options address the model pools separately, so they want three models:
 
+<!-- manual-step-ok: operator-ollama -->
 ```bash
 ollama pull llama3:latest      # Explorer table/column linking
 ollama pull sqlcoder:latest    # NL→SQL
@@ -180,6 +193,13 @@ Run the installer and choose provider **2) Ollama**. That is the whole procedure
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
+```
+
+With no terminal to answer the prompt, name it on the `bash` side of the pipe. The installer no
+longer bundles Ollama when nothing is set — it installs without an LLM instead:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=ollama bash
 ```
 
 There is no model to pull by hand and no API key to find. The installer layers
@@ -262,10 +282,44 @@ Keep port 11434 reachable only from the app subnet — same VPC/VNet private sub
 rule scoped to the app SG. Ollama has no authentication of its own; the network boundary *is* the
 access control.
 
+### On Kubernetes
+
+The Helm chart carries the same two shapes, under different names. `ollama.enabled=true`
+renders a single-replica StatefulSet with its own PVC and a post-install hook Job that
+downloads `ollama.model` into it — the analogue of the `ollama-pull` service above, and
+there for the same reason: a server with no model in it starts healthy and answers every
+prompt with `model not found`.
+
+```bash
+helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
+  --set ollama.enabled=true \
+  --set generation.llm.provider=ollama \
+  --wait --timeout 30m
+```
+
+`--wait --timeout 30m` is not optional decoration. Helm runs post-install hooks only
+after the main resources are Ready and does not return until they finish, so `--wait` is
+what makes the first install block on the download the way compose's first `up` does; the
+default 5-minute timeout is shorter than a 4.7 GB pull on most connections.
+
+| Value | Docker equivalent |
+|---|---|
+| `ollama.enabled` | including `docker-compose.ollama.yml` at all |
+| `ollama.model` | `OLLAMA_MODEL` — read on *both* sides of `enabled` |
+| `generation.llm.provider` | `LLM_PROVIDER` |
+| `generation.llm.ollamaUrl` | `OLLAMA_URL`, for Options B and C above |
+| `ollama.persistence.size` | the `ollama_models` volume — 20 Gi by default |
+
+`generation.llm.provider=ollama` with neither `ollama.enabled` nor
+`generation.llm.ollamaUrl` is refused at render time, because the client's own fallback is
+`http://host.docker.internal:11434` and no pod resolves that name. The server requests
+1 CPU and 6 Gi and deliberately carries no memory limit. Full reference:
+[the chart README](../../deploy/helm/rsync-ai/README.md#internal-llm).
+
 ### Base URL resolution
 
 `OLLAMA_BASE_URL` → `OLLAMA_URL` → `http://host.docker.internal:11434`, and `/v1` is appended
-automatically ([openai_client.py:67-76](../../llm-service/src/utils/openai_client.py#L67)). Set the
+automatically ([openai_client.py:81-90](../../llm-service/src/utils/openai_client.py#L81)). Set the
 host and port only; do not append `/v1` yourself. `OLLAMA_BASE_URL` wins when both are present.
 
 Both names now have a passthrough on llm-service in `docker-compose.prod.yml`
@@ -277,7 +331,7 @@ that has no delivery path in the compose file that ships it.
 
 The neighbouring service is worth knowing about for the same reason. tool-generator carries a
 hard-coded `OLLAMA_BASE_URL=http://host.docker.internal:11434/v1` in both
-[`docker-compose.yml:1583`](../../docker-compose.yml#L1583) and
+[`docker-compose.yml:1585`](../../docker-compose.yml#L1585) and
 [`docker-compose.prod.yml:789`](../../docker-compose.prod.yml#L789) — no interpolation, so nothing
 you put in an env file changes it. `docker-compose.ollama.yml` overrides that key directly; point
 that service at a different Ollama and you have to override it directly too.
@@ -288,8 +342,8 @@ that service at a different Ollama and you have to override it directly too.
 
 The api-gateway gives the Explorer's LLM step a **hard 30-second timeout**
 ([explorer.go:3395](../../api-gateway/internal/handlers/explorer.go#L3395)); the Python clients
-allow 45 s sync / 120 s async ([openai_client.py:236](../../llm-service/src/utils/openai_client.py#L236),
-[`:283`](../../llm-service/src/utils/openai_client.py#L283)). The gateway's 30 s is the binding
+allow 45 s sync / 120 s async ([openai_client.py:560](../../llm-service/src/utils/openai_client.py#L560),
+[`:607`](../../llm-service/src/utils/openai_client.py#L607)). The gateway's 30 s is the binding
 constraint.
 
 CPU inference for a 7B model runs on the order of tens of seconds per request. That does not fit
@@ -354,9 +408,9 @@ variable; earlier revisions of this doc invented both.
 | `EXPLORER_SQL_MODEL` | NL→SQL | `OLLAMA_MODEL` or `sqlcoder:latest` |
 | `EXPLORER_SQL_MODEL_MYSQL` | NL→SQL on MySQL/MariaDB | same |
 | `EXPLORER_SQL_FALLBACK_MODELS` | SQL retry chain; the bundled overlay pins it to the pulled model | `qwen2.5:7b,llama3:latest,codellama:7b-instruct` |
-| `EXPLORER_SQL_OPENAI_MODEL` | NL→SQL model, applied only when the SQL provider resolves to `openai` ([main.py:2633](../../llm-service/src/gateway/main.py#L2633)) | prompt-registry `model`, else `EXPLORER_SQL_MODEL` |
+| `EXPLORER_SQL_OPENAI_MODEL` | NL→SQL model, applied only when the SQL provider resolves to `openai` ([main.py:2684-2687](../../llm-service/src/gateway/main.py#L2684)) | `LLM_MODEL`, else the prompt-registry `model` (`gpt-4o`) |
 | `RANK_TABLES_LLM_PROVIDER` | Provider for `/agents/rank-tables` only | inherits `EXPLORER_LLM_PROVIDER`, then `LLM_PROVIDER` |
-| `RANK_TABLES_MODEL` | Model for `/agents/rank-tables` | `llama3:latest` offline, `gpt-4o-mini` on OpenAI |
+| `RANK_TABLES_MODEL` | Model for `/agents/rank-tables` | `OLLAMA_MODEL`, else `llama3:latest` (offline), `gpt-4o-mini` on OpenAI |
 | `OPENAI_API_KEY` | Present ⇒ auto-detect picks `openai` | unset |
 
 Every row above reaches llm-service on `docker-compose.yml` (via `env_file:`),

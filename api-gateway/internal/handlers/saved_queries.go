@@ -103,6 +103,19 @@ type SavedQuery struct {
 	// "scheduled for WHEN?" — computed from the joined spec on the same row. nil for
 	// an unscheduled or paused query, and for a spec too broken to read.
 	NextRunAt *time.Time `json:"next_run_at,omitempty"`
+
+	// FreshnessDeadlineSeconds is the promise SetSavedQueryFreshness stores: the sweep
+	// opens a breach when the last successful rebuild is older than this. nil = no
+	// deadline. Read here so the model page can show the current value it edits.
+	FreshnessDeadlineSeconds *int `json:"freshness_deadline_seconds,omitempty"`
+}
+
+// setFreshness copies a scanned freshness_deadline_seconds onto the row.
+func (q *SavedQuery) setFreshness(v sql.NullInt64) {
+	if v.Valid {
+		n := int(v.Int64)
+		q.FreshnessDeadlineSeconds = &n
+	}
 }
 
 // applyModelCapability fills the connector-derived fields from the Explorer capability
@@ -244,7 +257,8 @@ func ListSavedQueries(c *gin.Context) {
 		       sq.materialization, COALESCE(sq.target_table, ''),
 		       COALESCE(sq.last_run_status, ''), COALESCE(sq.last_run_error, ''),
 		       COALESCE(s.status, ''), COALESCE(s.schedule_type, ''), s.schedule_spec,
-		       COALESCE(cn.connector_type, '')
+		       COALESCE(cn.connector_type, ''),
+		       sq.freshness_deadline_seconds
 		FROM saved_queries sq
 		LEFT JOIN saved_query_schedules s
 		  ON s.saved_query_id = sq.id AND s.status != 'deleted'
@@ -273,11 +287,12 @@ func ListSavedQueries(c *gin.Context) {
 		var scheduleType string
 		var specJSON []byte
 		var connectorType string
+		var freshness sql.NullInt64
 		if err := rows.Scan(&q.ID, &q.WorkspaceID, &q.ConnectionID, &q.Name, &q.Description,
 			&q.SQLText, &q.NLPrompt, &q.StatementClass, &q.Visibility,
 			&q.CreatedBy, &q.UpdatedBy, &q.CreatedAt, &q.UpdatedAt, &lastRun,
 			&q.Materialization, &q.TargetTable, &q.LastRunStatus, &q.LastRunError,
-			&q.ScheduleStatus, &scheduleType, &specJSON, &connectorType); err != nil {
+			&q.ScheduleStatus, &scheduleType, &specJSON, &connectorType, &freshness); err != nil {
 			log.WithError(err).Error("scan saved query")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list saved queries"})
 			return
@@ -286,7 +301,9 @@ func ListSavedQueries(c *gin.Context) {
 			v := lastRun.String
 			q.LastRunAt = &v
 		}
+		q.LastRunError = storedRunErrorForDisplay(q.LastRunError)
 		q.applyModelCapability(connectorType)
+		q.setFreshness(freshness)
 		q.NextRunAt = savedQueryNextRun(q.ScheduleStatus, scheduleType, specJSON, now)
 		out = append(out, q)
 	}
@@ -421,6 +438,7 @@ func loadSavedQuery(c *gin.Context, id, userID string) (*SavedQuery, bool) {
 	var scheduleType string
 	var specJSON []byte
 	var connectorType string
+	var freshness sql.NullInt64
 	err := database.QueryRow(`
 		SELECT sq.id, sq.workspace_id, sq.connection_id, sq.name, COALESCE(sq.description, ''),
 		       sq.sql_text, COALESCE(sq.nl_prompt, ''), sq.statement_class, sq.visibility,
@@ -429,7 +447,8 @@ func loadSavedQuery(c *gin.Context, id, userID string) (*SavedQuery, bool) {
 		       sq.materialization, COALESCE(sq.target_table, ''),
 		       COALESCE(sq.last_run_status, ''), COALESCE(sq.last_run_error, ''),
 		       COALESCE(s.status, ''), COALESCE(s.schedule_type, ''), s.schedule_spec,
-		       COALESCE(cn.connector_type, '')
+		       COALESCE(cn.connector_type, ''),
+		       sq.freshness_deadline_seconds
 		FROM saved_queries sq
 		LEFT JOIN saved_query_schedules s
 		  ON s.saved_query_id = sq.id AND s.status != 'deleted'
@@ -439,7 +458,7 @@ func loadSavedQuery(c *gin.Context, id, userID string) (*SavedQuery, bool) {
 		&q.SQLText, &q.NLPrompt, &q.StatementClass, &q.Visibility,
 		&q.CreatedBy, &q.UpdatedBy, &q.CreatedAt, &q.UpdatedAt, &lastRun,
 		&q.Materialization, &q.TargetTable, &q.LastRunStatus, &q.LastRunError,
-		&q.ScheduleStatus, &scheduleType, &specJSON, &connectorType)
+		&q.ScheduleStatus, &scheduleType, &specJSON, &connectorType, &freshness)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 		return nil, false
@@ -457,7 +476,9 @@ func loadSavedQuery(c *gin.Context, id, userID string) (*SavedQuery, bool) {
 		v := lastRun.String
 		q.LastRunAt = &v
 	}
+	q.LastRunError = storedRunErrorForDisplay(q.LastRunError)
 	q.applyModelCapability(connectorType)
+	q.setFreshness(freshness)
 	q.NextRunAt = savedQueryNextRun(q.ScheduleStatus, scheduleType, specJSON, time.Now())
 	return &q, true
 }
@@ -867,7 +888,9 @@ func DeleteSavedQuery(c *gin.Context) {
 	// Collect the ids BEFORE the delete, while the rows still exist.
 	var temporalScheduleIDs []string
 	if rows, qErr := database.Query(
-		`SELECT temporal_schedule_id FROM saved_query_schedules WHERE saved_query_id = $1`, id); qErr != nil {
+		// IS NOT NULL: an event trigger has no Temporal schedule, and scanning its NULL into
+		// a string failed the row rather than skipping it on purpose.
+		`SELECT temporal_schedule_id FROM saved_query_schedules WHERE saved_query_id = $1 AND temporal_schedule_id IS NOT NULL`, id); qErr != nil {
 		log.WithError(qErr).WithField("saved_query_id", id).
 			Warn("could not list Temporal schedules before deleting saved query; one may be left orphaned")
 	} else {
@@ -880,8 +903,28 @@ func DeleteSavedQuery(c *gin.Context) {
 		rows.Close()
 	}
 
-	if _, err := database.Exec(`DELETE FROM saved_queries WHERE id = $1`, id); err != nil {
+	// One transaction with the pause of every trigger this delete orphans: a delete that
+	// failed must not leave downstream schedules paused for an upstream that still exists.
+	tx, err := database.BeginTx(c.Request.Context(), nil)
+	if err != nil {
+		log.WithError(err).Error("delete saved query: begin")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete saved query"})
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	orphaned, err := pauseTriggersOrphanedBy(c.Request.Context(), tx, upstreamKindModel, id)
+	if err != nil {
+		log.WithError(err).Error("delete saved query: pause orphaned downstream schedules")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete saved query"})
+		return
+	}
+	if _, err := tx.ExecContext(c.Request.Context(), `DELETE FROM saved_queries WHERE id = $1`, id); err != nil {
 		log.WithError(err).Error("delete saved query")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete saved query"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		log.WithError(err).Error("delete saved query: commit")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to delete saved query"})
 		return
 	}
@@ -889,10 +932,11 @@ func DeleteSavedQuery(c *gin.Context) {
 	deleteTemporalSchedulesBestEffort(c.Request.Context(), temporalScheduleIDs)
 
 	logAudit(c, "saved_query.delete", "saved_query", id, map[string]interface{}{
-		"name": existing.Name,
+		"name":                        existing.Name,
+		"paused_downstream_schedules": orphaned,
 	})
 
-	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id})
+	c.JSON(http.StatusOK, gin.H{"deleted": true, "id": id, "paused_downstream_schedules": orphaned})
 }
 
 // ListSavedQueryVersions returns the edit history, newest first.

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strings"
 	"testing"
 
 	"api-gateway/internal/db"
@@ -616,4 +617,85 @@ func TestSchemaDriftPolicyFromJSON(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The policy card needs to know whether the installation runs the detector at
+// all: with RSYNC_SCHEMA_DRIFT_ENABLED unset, a per-pipeline "On" switch does
+// nothing, and the card must say so rather than pretend. Both the GET and the
+// PUT response carry it, so the card never shows a stale answer after a save.
+func TestSchemaDriftPolicy_ReportsDetectorEnabled(t *testing.T) {
+	newRouter := func() *gin.Engine {
+		gin.SetMode(gin.TestMode)
+		r := gin.New()
+		wire := func(h gin.HandlerFunc) gin.HandlerFunc {
+			return func(c *gin.Context) {
+				c.Set("user_id", "user-A")
+				c.Set(ctxWorkspaceID, schemaEvoTestWS)
+				c.Set(ctxWorkspaceRole, "owner")
+				h(c)
+			}
+		}
+		r.GET("/api/v1/pipelines/:id/schema-drift-policy", wire(GetPipelineSchemaDriftPolicy))
+		r.PUT("/api/v1/pipelines/:id/schema-drift-policy", wire(UpdatePipelineSchemaDriftPolicy))
+		return r
+	}
+	type resp struct {
+		Policy          SchemaDriftPolicy `json:"schema_drift_policy"`
+		DetectorEnabled *bool             `json:"detector_enabled"`
+	}
+	url := "/api/v1/pipelines/" + schemaEvoTestPipelineUUID + "/schema-drift-policy"
+
+	for _, tc := range []struct {
+		env  string
+		want bool
+	}{{"true", true}, {"", false}, {"false", false}, {"TRUE", false}} {
+		t.Run("GET env="+tc.env, func(t *testing.T) {
+			t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", tc.env)
+			withSchemaEvolutionDeps(t, func(mock sqlmock.Sqlmock, _ *fakeKafka) {
+				expectOwnerCheck(mock, schemaEvoTestPipelineUUID, "user-A")
+				mock.ExpectQuery(`SELECT COALESCE\(config->'schema_drift_policy'`).
+					WithArgs(schemaEvoTestPipelineUUID).
+					WillReturnRows(sqlmock.NewRows([]string{"p"}).AddRow(`{"notify_on_drop":false}`))
+				w := httptest.NewRecorder()
+				newRouter().ServeHTTP(w, httptest.NewRequest("GET", url, nil))
+				if w.Code != http.StatusOK {
+					t.Fatalf("GET = %d: %s", w.Code, w.Body.String())
+				}
+				var got resp
+				if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+					t.Fatalf("decode: %v", err)
+				}
+				if got.DetectorEnabled == nil || *got.DetectorEnabled != tc.want {
+					t.Fatalf("detector_enabled = %v, want %v (body %s)", got.DetectorEnabled, tc.want, w.Body.String())
+				}
+				if got.Policy != (SchemaDriftPolicy{Enabled: true, NotifyOnAdd: true, NotifyOnDrop: false}) {
+					t.Fatalf("policy = %+v", got.Policy)
+				}
+			})
+		})
+	}
+
+	t.Run("PUT echoes it too", func(t *testing.T) {
+		t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", "true")
+		withSchemaEvolutionDeps(t, func(mock sqlmock.Sqlmock, _ *fakeKafka) {
+			expectOwnerCheck(mock, schemaEvoTestPipelineUUID, "user-A")
+			mock.ExpectExec(regexp.QuoteMeta(`UPDATE pipelines`)).
+				WithArgs(schemaEvoTestPipelineUUID, `{"enabled":true,"notify_on_add":false,"notify_on_drop":true}`).
+				WillReturnResult(sqlmock.NewResult(0, 1))
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("PUT", url, strings.NewReader(`{"enabled":true,"notify_on_add":false,"notify_on_drop":true}`))
+			req.Header.Set("Content-Type", "application/json")
+			newRouter().ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("PUT = %d: %s", w.Code, w.Body.String())
+			}
+			var got resp
+			if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			if got.DetectorEnabled == nil || !*got.DetectorEnabled {
+				t.Fatalf("detector_enabled = %v, want true", got.DetectorEnabled)
+			}
+		})
+	})
 }

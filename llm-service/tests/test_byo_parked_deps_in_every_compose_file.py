@@ -114,6 +114,24 @@ def parked_services():
     return parked
 
 
+def added_services(overlay_basename, stack_files):
+    """{service} the overlay DEFINES that no file in the stack already defines.
+
+    Derived from the two sides rather than hand-listed. An overlay that parks a
+    bundled service usually has to replace what that service provided -- the
+    byo-postgres overlay parks the container AND adds the `db-init` one-shot that
+    creates the databases the container's initdb used to -- so "an overlay adds
+    nothing" was never the rule. The rule is that it adds exactly what it declares.
+    Reachability of an added service, and the `required: false` trap on the gate
+    that reaches it, are checked in test_byo_overlays_are_complete.py.
+    """
+    base = set()
+    for fname in stack_files:
+        base |= set(_services(os.path.join(REPO_ROOT, fname)))
+    own = set(_services(os.path.join(REPO_ROOT, overlay_basename)))
+    return own - base
+
+
 def _depends_on_entries():
     """Yield (file, service, dep, options) for every depends_on entry in every file.
 
@@ -244,7 +262,15 @@ def test_stack_still_renders_with_each_overlay(tmp_path, stack_name, overlay):
     """
     files = STACKS[stack_name]
     env_file = tmp_path / "env"
-    env_file.write_text("".join(f"{k}={v}\n" for k, v in _required_env(files).items()))
+    # The overlay is part of what gets rendered, so it is part of what has to be
+    # satisfied. Deriving from the stack alone was safe only while no byo-*
+    # overlay introduced a `${VAR:?}` of its own; the first one that did --
+    # db-init's POSTGRES_PASSWORD -- aborted interpolation for the WHOLE merged
+    # project, and the test read that as the overlay breaking the stack. The
+    # control render is given the same superset, which costs it nothing.
+    env_file.write_text(
+        "".join(f"{k}={v}\n" for k, v in _required_env(list(files) + [overlay]).items())
+    )
 
     def render(*extra):
         cmd = ["docker", "compose", "--env-file", str(env_file)]
@@ -271,4 +297,8 @@ def test_stack_still_renders_with_each_overlay(tmp_path, stack_name, overlay):
     for svc, ov in parked_services().items():
         if ov == overlay:
             assert svc not in got, f"{overlay} was layered but {svc} is still in the project"
-    assert got - control == set(), f"{overlay} unexpectedly ADDED {got - control}"
+    introduced = added_services(overlay, files)
+    assert got - control == introduced, (
+        f"{overlay} should add exactly the services it declares "
+        f"({sorted(introduced)}); the render added {sorted(got - control)}"
+    )

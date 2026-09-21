@@ -39,13 +39,13 @@ func statsExpectations(t *testing.T, mock sqlmock.Sqlmock, running int) {
 
 	// The executions roll-up must NOT carry a 'running' FILTER any more, and it
 	// must exclude synthetic CDC audit rows (id = pipeline_id).
-	mock.ExpectQuery(`COUNT\(\*\) FILTER \(WHERE e\.status = 'completed'\)[\s\S]*e\.id <> e\.pipeline_id`).
+	mock.ExpectQuery(`COUNT\(\*\) FILTER \(WHERE \(CASE WHEN ls\.live_stream THEN 'running'[\s\S]*IN \('completed', 'success'\)\)[\s\S]*e\.id <> e\.pipeline_id`).
 		WithArgs(wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{"completed", "failed", "total"}).AddRow(7, 1, 8))
 
 	// The running card is a COUNT over pipelines, gated on the list's
 	// derived_status predicates — including the CDC branch.
-	mock.ExpectQuery(`SELECT COUNT\(\*\)[\s\S]*FROM pipelines p[\s\S]*p\.sync_mode = 'cdc'`).
+	mock.ExpectQuery(`SELECT COUNT\(\*\)[\s\S]*FROM pipelines p[\s\S]*LOWER\(COALESCE\(TRIM\(p\.sync_mode\), ''\)\) = 'cdc'`).
 		WithArgs(wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{"running"}).AddRow(running))
 

@@ -33,7 +33,8 @@ Deploy rsync-ai on your own infrastructure with production-grade security, TLS, 
 | RAM       | 8 GB    | 16+ GB      |
 | Disk      | 40 GB SSD | 100+ GB SSD |
 
-Add 8 GB RAM if you run an LLM locally — the bundled Ollama overlay or your own server.
+Add 8 GB RAM if you run an LLM locally — the bundled Ollama overlay or your own server. A cloud
+LLM, or none, adds nothing.
 
 ### Software
 
@@ -68,9 +69,10 @@ Get rsync-ai running locally in under 5 minutes for evaluation. This uses dev de
 git clone https://github.com/rsync-ai/rsync.git
 cd rsync
 
-# 2. Set up LLM provider (minimum: OpenAI API key)
+# 2. Set up an LLM provider (optional — see "LLM Provider Configuration")
 cp llm-service/.env.example llm-service/.env
-# Edit llm-service/.env and set OPENAI_API_KEY=sk-...
+# Edit llm-service/.env: set OPENAI_API_KEY=sk-..., or set LLM_PROVIDER=none to
+# run without an LLM (the example file ships a placeholder key, which is not one)
 
 # 3. Start the stack
 docker compose up -d
@@ -128,7 +130,11 @@ Set `DATABASE_URL` in `.env.prod` to point to your managed DB instead of the bun
 ```env
 DATABASE_URL=postgresql://<user>:<password>@<host>:5432/pipeline_db?sslmode=require
 ```
-Create the database first if it doesn't exist:
+Create the database first if it doesn't exist. The production overlay defines no
+`db-init` service — that one lives in `docker-compose.byo-postgres.yml`, which
+this stack does not include — so nothing creates it for you here:
+
+<!-- manual-step-ok: prod-compose -->
 ```bash
 psql "postgresql://<user>:<password>@<host>:5432/postgres?sslmode=require" \
   -c "CREATE DATABASE pipeline_db;"
@@ -158,6 +164,14 @@ LLM_PROVIDER=openai
 OPENAI_API_KEY=sk-...
 LLM_MODEL=gpt-4o-mini
 ```
+
+**Option C — no LLM for now:**
+```env
+LLM_PROVIDER=none
+```
+
+The template ships a placeholder `OPENAI_API_KEY`, which is not a key: replace it, or set
+`LLM_PROVIDER=none`. See [Which LLM is used](#which-llm-is-used).
 
 ### 4. Configure Frontend Environment
 
@@ -315,7 +329,38 @@ NEXTAUTH_URL=http://localhost:3000
 
 ## LLM Provider Configuration
 
-rsync-ai uses an OpenAI-compatible API interface. You can use OpenAI directly or run models locally with Ollama.
+rsync-ai uses an OpenAI-compatible API interface. You can use OpenAI directly, run models locally with Ollama, or run with no LLM at all.
+
+### Which LLM is used
+
+1. **An external LLM, when you give it credentials.** `OPENAI_API_KEY` — for OpenAI, or for any
+   OpenAI-compatible endpoint you name with `OPENAI_BASE_URL` — an Azure OpenAI endpoint, Groq, or
+   Vertex AI on a Google Cloud VM. This is the preferred choice; see
+   [Groq, Azure OpenAI and Vertex AI](#groq-azure-openai-and-vertex-ai) for the last three.
+2. **Ollama, only when you name it.** `LLM_PROVIDER=ollama` in `.env`, or provider **2) Ollama** at
+   the installer prompt. It is never picked for you.
+3. **None.** Supported. `LLM_PROVIDER=none` (`disabled`, `off`, `false` and `0` mean the same), or
+   provider **3) None** at the installer prompt. An explicit `none` wins over any key still in `.env`.
+
+**Without an LLM, these work as normal:** creating a pipeline from chat with the plain phrasing
+(`sync <source> to <destination>` — a rule-based parser reads it, no model), raw SQL in the Data
+Explorer, the shipped connectors, and running pipelines and CDC.
+
+**These need an LLM** and answer `Set up an LLM first` (HTTP 503, `"error": "llm_not_configured"`)
+until one is set: free-form chat beyond pipeline commands, natural-language → SQL, LLM table and
+column resolution in the Explorer, AI pipeline diagnosis, and generating a new connector. Explorer
+next-step suggestions fall back to rules, and table ranking to a non-LLM order.
+
+How rule 2 holds: with `LLM_PROVIDER=openai` (the compose default) and no key, the client still
+routes to Ollama rather than making an unauthenticated call
+([`resolve_provider`, openai_client.py:294-365](../../llm-service/src/utils/openai_client.py#L294)). The same holds for
+`LLM_PROVIDER=groq` without `GROQ_API_KEY` and `LLM_PROVIDER=azure` without its endpoint or key.
+None of these is silent: llm-service logs one warning naming the setting that is missing, and one
+for a provider name it does not know (without repeating the name, in case a key was pasted there).
+But [`llm_configured()` (:368-394)](../../llm-service/src/utils/openai_client.py#L368) does not
+count an Ollama reached that way, so the LLM-only features refuse up front instead of timing out
+against a server nobody started. llm-service's `/health` response carries the result as
+`llm_configured`.
 
 ### Option A: OpenAI API (Default)
 
@@ -325,6 +370,63 @@ The simplest setup. Edit `llm-service/.env`:
 OPENAI_API_KEY=sk-proj-...
 LLM_PROVIDER=openai
 LLM_MODEL=gpt-4o-mini
+```
+
+`LLM_PROVIDER=openai` names the wire protocol, not the vendor: add `OPENAI_BASE_URL` to point it at
+another OpenAI-compatible endpoint, with that endpoint's key in `OPENAI_API_KEY`. Set `LLM_MODEL`
+with it: left unset, requests name OpenAI models, which another endpoint does not serve under those
+names. `install.sh` asks for the model when `OPENAI_BASE_URL` is set, and stops if there is no
+terminal to ask on.
+
+#### Groq, Azure OpenAI and Vertex AI
+
+Each is chosen by name and needs its own settings. Without them llm-service logs which setting is
+missing and runs as if no LLM were set up. In the install directory's `.env` (or `llm-service/.env`):
+
+```env
+# Groq. Leave LLM_MODEL unset for llama-3.3-70b-versatile.
+LLM_PROVIDER=groq
+GROQ_API_KEY=gsk_...
+
+# Azure OpenAI
+LLM_PROVIDER=azure
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_DEPLOYMENT=<deployment>
+```
+
+Groq is never chosen from a `GROQ_API_KEY` alone; it takes `LLM_PROVIDER=groq`. On Azure the model
+is a deployment you created, so name it in `AZURE_OPENAI_DEPLOYMENT` (or `LLM_MODEL`); left unset,
+requests go to a deployment called `gpt-4o-mini`. `AZURE_OPENAI_API_KEY` falls back to
+`OPENAI_API_KEY`.
+
+**Vertex AI** speaks the OpenAI protocol, so it is `LLM_PROVIDER=openai` with Vertex's endpoint. On
+a Google Cloud VM there is no key to paste: llm-service takes an access token for the VM's service
+account from the metadata server, and fetches a new one before the hour-long token expires
+([gcp_access_token.py](../../llm-service/src/utils/gcp_access_token.py)).
+
+```env
+LLM_PROVIDER=openai
+OPENAI_API_KEY_SOURCE=gcp-metadata
+OPENAI_BASE_URL=https://<LOCATION>-aiplatform.googleapis.com/v1/projects/<PROJECT>/locations/<LOCATION>/endpoints/openapi
+LLM_MODEL=google/gemini-2.5-flash
+```
+
+- The VM's service account needs the Vertex AI User role (`roles/aiplatform.user`), and the VM
+  needs the `cloud-platform` access scope.
+- The token works on every Google API that service account can reach, so it is sent only when
+  `OPENAI_BASE_URL` is an `https://` address on `googleapis.com`. Any other address gets no token,
+  and llm-service logs why.
+- The renewal is covered by unit tests only; it has not yet been run against a live Vertex AI
+  endpoint.
+
+`install.sh` sets up all three. With a terminal it asks for what is missing; without one it stops
+and prints the settings it needs, instead of installing a different provider or none:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=groq GROQ_API_KEY=gsk_... bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=azure AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com AZURE_OPENAI_API_KEY=... AZURE_OPENAI_DEPLOYMENT=<deployment> bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | OPENAI_API_KEY_SOURCE=gcp-metadata OPENAI_BASE_URL=https://<LOCATION>-aiplatform.googleapis.com/v1/projects/<PROJECT>/locations/<LOCATION>/endpoints/openapi LLM_MODEL=google/gemini-2.5-flash bash
 ```
 
 ### Option B: Ollama, bundled with the stack (no API key, no manual pull)
@@ -351,7 +453,8 @@ Then set the provider in `llm-service/.env`:
 LLM_PROVIDER=ollama
 ```
 
-That line is the only one that is yours to write. The overlay sets both address
+That line is the only one that is yours to write, and it is required: the overlay does not set
+the provider, and an Ollama that is only a fallback does not count as a configured LLM. The overlay sets both address
 variables — `OLLAMA_URL` and the `OLLAMA_BASE_URL` the client reads first — on every
 service it extends, and a value in a compose `environment:` block beats one loaded from
 `env_file:`, so an address written here would be ignored while the overlay is in play.
@@ -369,6 +472,36 @@ Sizing, GPU, timeouts and the external-server variants are in
 network — means giving `OLLAMA_URL` that address and pulling the models yourself. Do not
 add the overlay in that case; see [Ollama deployment](ollama.md) for which models each
 part of the stack asks for.
+
+### Option C: No LLM (set one up later)
+
+Set the provider to `none` — in `llm-service/.env` for the evaluation stack, or in the
+install directory's `.env` for an `install.sh` install:
+
+```env
+LLM_PROVIDER=none
+```
+
+`install.sh` writes that, with `OPENAI_API_KEY`, `LLM_MODEL` and `OLLAMA_URL` left empty,
+when you choose provider **3) None**. It also installs without an LLM when it runs with no
+terminal and neither `OPENAI_API_KEY` nor `LLM_PROVIDER` is set, and warns
+`No terminal and no OPENAI_API_KEY, so rsync was installed without an LLM.` (It used to
+bundle Ollama in that case.) To choose unattended, put the setting on the `bash` side of
+the pipe:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | OPENAI_API_KEY=sk-... bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=ollama bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=none bash
+```
+
+What works without an LLM, and what answers `Set up an LLM first`, is listed under
+[Which LLM is used](#which-llm-is-used).
+
+**Adding an LLM later.** In the install directory's `.env`, set `LLM_PROVIDER=openai` and
+`OPENAI_API_KEY=sk-...` — or `LLM_PROVIDER=ollama` — and re-run the installer. It reuses the
+existing `.env`, and with `LLM_PROVIDER=ollama` and an empty `OLLAMA_URL` it adds the bundled
+Ollama overlay and pulls the model.
 
 ### Explorer Feature
 
@@ -515,6 +648,23 @@ KAFKA_SASL_OAUTHBEARER_EXTENSIONS=logicalCluster=lkc-00000,identityPoolId=pool-0
 is JVM-only (Kafka Connect and Debezium's schema-history client) and should stay
 empty unless your broker's Kafka version needs a specific handler class.
 
+> **The token endpoint must be `https://`, and every service refuses to start
+> otherwise.** The grant above POSTs `CLIENT_SECRET` to that URL on *every* token
+> fetch, so a single plain-http hop discloses a credential that never expires to
+> anyone on the path — worse than the short-lived token it buys, and not something
+> the broker can undo, since the broker never sees this hop. Earlier releases
+> logged a warning and connected anyway.
+>
+> A **loopback** host is the one exception — `localhost`, `*.localhost`,
+> `127.0.0.0/8`, `::1` — because a token helper on the same host never puts the
+> secret on a network. That is what makes GCP Workload Identity's
+> `http://localhost:14293` sidecar usable. A host that only resembles loopback
+> (`localhost.example.com`) is remote and is refused.
+>
+> For a throwaway rig whose IdP secret is a fixture, set
+> `KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT=true`. Never set it where
+> the secret is real.
+
 ### 5. Mounting the TLS material
 
 **`KAFKA_SSL_CA_LOCATION`, `KAFKA_SSL_CERT_LOCATION`, `KAFKA_SSL_KEY_LOCATION`
@@ -547,9 +697,9 @@ services:
     volumes: *kafka-certs
   llm-service:
     volumes: *kafka-certs
-  # The three below belong to the `cdc` profile. The installer activates it, so a
-  # default install runs them; a compose command you type yourself carries no
-  # profile flag, which is what the `--profile cdc` below is for.
+  # The three below belong to the `cdc` profile. The installer activates it, and
+  # the compose.sh it writes carries the flag; a compose command you type yourself
+  # does not, so the `--profile cdc` below is what keeps these three in the project.
   debezium-mcp:
     volumes: *kafka-certs
   kafka-mcp-sink-mcp:
@@ -565,9 +715,9 @@ docker compose -f docker-compose.quickstart.yml \
                -f docker-compose.kafka-certs.yml --profile cdc up -d
 ```
 
-> The installer writes `COMPOSE_PROFILES` into the `.env` beside the compose file, so
-> a command run from the install directory picks the profile up from there and the flag
-> is redundant. Spell it out when you are working somewhere else.
+> `./compose.sh up -d` in the install directory does the same thing without the
+> flags — the installer bakes its own `-f` set and `--profile` set into that helper.
+> Spell them out only when you are not using it.
 
 Confirm the mount reached every service before you restart anything —
 `config` is read-only and needs no daemon-side changes:
@@ -588,18 +738,29 @@ KAFKA_SSL_CERT_LOCATION=/etc/rsync/kafka/client.crt
 KAFKA_SSL_KEY_LOCATION=/etc/rsync/kafka/client.key
 ```
 
-`KAFKA_SSL_KEYSTORE_LOCATION` is **the same keypair in the one shape a JVM can
-load: a single file holding the chain and the key.** It is not derivable from
-the two paths above, so build it explicitly and set it *in addition* whenever
-you run `kafka-init` or the CDC profile against an mTLS cluster:
+The JVM half of the stack (`kafka-init`, Kafka Connect and Debezium's
+schema-history client) needs the keypair as **one file holding the chain and
+the key**. You do not build it: the kafka-connect image's entrypoint
+(`connect-entrypoint.sh`) and `kafka-init` concatenate the two paths above at
+startup, and the Helm chart builds it in its Secret. The key must be an
+**unencrypted PKCS#8** key (`-----BEGIN PRIVATE KEY-----`) — the JVM cannot load
+PKCS#1, SEC1 or encrypted keys, so both refuse to start with the conversion
+command rather than fail at the first handshake:
 
 ```bash
-cat client.crt client.key > /etc/rsync/kafka-certs/client.pem
+openssl pkcs8 -topk8 -nocrypt -in client.key -out client.pk8.key
 ```
 
-```bash
-KAFKA_SSL_KEYSTORE_LOCATION=/etc/rsync/kafka/client.pem
-```
+The Go and Python services read the PKCS#8 file unchanged, so point
+`KAFKA_SSL_KEY_LOCATION` at it for every service. `KAFKA_SSL_KEYSTORE_LOCATION`
+is now only an override — set it to supply your own combined file, and it wins.
+
+SASL works the same way: Kafka Connect builds its JAAS line from
+`KAFKA_SASL_MECHANISM` + `KAFKA_SASL_USERNAME`/`KAFKA_SASL_PASSWORD` (or the
+`KAFKA_SASL_OAUTHBEARER_*` variables), so no Connect-specific credential is
+needed. A full JAAS line in `KAFKA_SASL_JAAS_CONFIG` (compose passes it through as
+`CONNECT_SASL_JAAS_CONFIG`) is now only an override, and still wins. `AWS_MSK_IAM` is
+refused at startup — the image ships no IAM login module.
 
 > **Certificate verification has two spellings for one setting.**
 > `KAFKA_SSL_SKIP_VERIFY` is the documented name and the only one the Python
@@ -658,44 +819,48 @@ POSTGRES_SSLMODE=require
 POSTGRES_TLS_ENABLED=true
 ```
 
-**2. Create the database and a role that can create tables in it.** Three
-components bootstrap themselves on first boot and each needs DDL:
+**2. Create the role.** That is the only DDL left to you. The overlay's
+`db-init` service creates `POSTGRES_DB`, Temporal's `temporal` and
+`temporal_visibility`, and the two extensions the migrations need, before any
+service that reads them starts — and it authenticates *as* this role, so it
+cannot create it:
 
-| Component | What it creates |
+```sql
+CREATE ROLE rsync LOGIN PASSWORD '<your password>' CREATEDB;
+```
+
+`CREATEDB` is what lets `db-init` issue those three `CREATE DATABASE`
+statements. Without it the job exits 1 with `permission denied to create
+database` and prints the `ALTER ROLE` that fixes it, rather than treating a
+refusal and an already-existing database as the same outcome. If your instance
+will not give the application role `CREATEDB`, create the three databases as an
+admin instead — `db-init` finds them and moves on. It is idempotent either way,
+so a later `up` is a no-op.
+
+Three components bootstrap themselves on first boot and each needs DDL:
+
+| Component | What it needs |
 |---|---|
 | `api-gateway` | its own tables in `POSTGRES_DB`, via migrations at startup |
 | `orchestrator` | its own tables in `POSTGRES_DB`, via migrations at startup |
 | `temporal` | the **separate** `temporal` and `temporal_visibility` databases |
 
-```sql
-CREATE ROLE rsync LOGIN PASSWORD '<your password>';
-CREATE DATABASE pipeline_db OWNER rsync;
-```
-
-You must create Temporal's two databases yourself. This is **not** a
-managed-instance caveat — it applies to every external database:
-
-```sql
-CREATE DATABASE temporal OWNER rsync;
-CREATE DATABASE temporal_visibility OWNER rsync;
-```
-
-`docker-compose.byo-postgres.yml` sets `SKIP_DB_CREATE=true`, so auto-setup will
-not create them for you, and the two halves go together. Leave the create
+`docker-compose.byo-postgres.yml` sets `SKIP_DB_CREATE=true`, so Temporal's own
+auto-setup does not try, and the two halves go together. Leave that create
 enabled and it runs whether or not the databases exist — its only guard is the
 name test `${DBNAME} != ${POSTGRES_USER}` — so it fails with `pq: permission
 denied to create database` on any role without `CREATEDB`, which is what a
 managed instance normally hands you. Pre-creating does not help there, because
-the create is still attempted. Skip it without creating them and the next step
-fails instead, with `pq: database "temporal" does not exist`.
+the create is still attempted. And the container does not degrade, it dies: the
+image entrypoint is `auto-setup.sh && start-temporal.sh` under `set -e`, so the
+server is never reached, the container restart-loops, and every pipeline hangs
+with no workflow engine. `db-init` is what covers the gap `SKIP_DB_CREATE`
+opens.
 
-Either way the container does not degrade, it dies: the image entrypoint is
-`auto-setup.sh && start-temporal.sh` under `set -e`, so the server is never
-reached, the pod crash-loops, and every pipeline hangs with no workflow engine.
-
-**2b. Make sure the two extensions exist.** The api-gateway migrations issue
+**2b. The extensions, and why they can still stop the install.** `db-init`
+creates both in `POSTGRES_DB`. It has to: the api-gateway migrations issue
 `CREATE EXTENSION` at startup, and on a locked-down managed instance the
-application role is usually not allowed to:
+application role is usually not allowed to.
 
 | Extension | Created by | Needed for |
 |---|---|---|
@@ -706,21 +871,12 @@ application role is usually not allowed to:
 the extension is *already installed*; when it is absent and your role lacks the
 privilege, it still raises — `permission denied to create extension "uuid-ossp"`
 on RDS/Cloud SQL, or `extension "uuid-ossp" is not allow-listed` on Azure.
+`db-init` hits that same wall, and treats it as fatal rather than best-effort:
+it exits 1 with the provider hint and the stack never starts against a database
+it cannot finish preparing.
 
-The most portable fix is to **pre-create both as an admin**, which turns the
-migrations' statements into the no-op that `IF NOT EXISTS` is meant to be. Run
-this once against `POSTGRES_DB`, as your instance's superuser-equivalent
-(`rds_superuser` on RDS/Aurora, `azure_pg_admin` on Azure, `postgres` on Cloud
-SQL):
-
-```sql
-\c pipeline_db
-CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-CREATE EXTENSION IF NOT EXISTS pg_trgm;
-```
-
-Granting the privilege instead also works, and on PostgreSQL 13+ both of these
-are *trusted* extensions, so `CREATE` on the database is enough — no superuser:
+On PostgreSQL 13+ both are *trusted* extensions, so `CREATE` on the database is
+enough for the application role — no superuser:
 
 ```sql
 GRANT CREATE ON DATABASE pipeline_db TO rsync;
@@ -737,18 +893,18 @@ Provider caveats, because the grant alone is not always sufficient:
   database. Confirm the version is 13+; on 12 and older both need
   `rds_superuser`.
 
-> **This failure is silent, so check for it rather than waiting to notice.**
-> The migration runner stops at the first failing file
+> **Why `db-init` treats that as fatal.** Left to the migrations, the same
+> failure is silent. The migration runner stops at the first failing file
 > (`api-gateway/internal/db/migrate.go:127-129`), and `001_init_schema.sql` is
 > the first file — so a privilege error there means **no** migration applies at
 > all. `main.go:311-313` then logs `❌ Database migration failed` and **starts
 > serving anyway** (there is no `return`), and the container healthcheck hits
 > `/health`, which is an unconditional `200` that never touches the database
-> (`main.go:614-621`). The result is a stack that comes up "healthy" against an
-> empty schema, and every request fails with `relation "..." does not exist`.
+> (`main.go:614-621`). The result would be a stack that comes up "healthy"
+> against an empty schema, every request failing `relation "..." does not exist`.
 >
-> Verify explicitly after the first boot — `/ready` is the endpoint that knows,
-> and it is not what the healthcheck uses:
+> Verify explicitly after the first boot anyway — `/ready` is the endpoint that
+> knows, and it is not what the healthcheck uses:
 >
 > ```bash
 > docker compose exec api-gateway curl -sf localhost:8080/ready
@@ -983,13 +1139,13 @@ behaviour are documented in [deploy/TELEMETRY.md](../../deploy/TELEMETRY.md).
 
 The admin panel provides operator-level access to pipeline management, system health, and configuration.
 
-Configure admin access by setting `RSYNC_ADMIN_EMAILS` in `.env.prod`:
+Access is decided by the account's role, not by an email list. The first account that signs up on a new install is given the `admin` role; every later signup gets the `user` role unless an invitation sets another one. Only accounts with the `admin` role can open the admin panel.
 
-```env
-RSYNC_ADMIN_EMAILS=alice@company.com,bob@company.com
-```
+To make someone else an admin, sign in as an existing admin, open the admin panel's user list and change that user's role to `admin`. An admin cannot change their own role, so a second admin is needed before the first one can be demoted.
 
-Only authenticated users whose email matches this allowlist will see the admin panel.
+Create the first account as soon as the stack is up, especially on a server reachable from the internet: until an account exists, whoever signs up first becomes the admin.
+
+`RSYNC_ADMIN_EMAILS` is not read by any service. Older installers wrote it into `.env`; a leftover line there does nothing and can be deleted.
 
 ---
 
@@ -1072,6 +1228,10 @@ git checkout main && git pull origin main      # expect a clean "Fast-forward"; 
 
 # 2. Rebuild the CORE stack (Go services + frontend). NEXT_PUBLIC_* vars are baked
 #    into the frontend bundle at build time, so the frontend MUST be rebuilt here.
+#    GIT_COMMIT/BUILD_TIME become each service's GET /version, which the admin
+#    drift check (GET /api/v1/admin/drift) compares; without them it says "dev".
+#    scripts/deploy-service.sh sets them itself.
+export GIT_COMMIT="$(git rev-parse HEAD)" BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 docker compose -f docker-compose.yml -f docker-compose.prod.yml \
   --env-file .env.prod build --pull
 
@@ -1135,6 +1295,7 @@ them fails, do **not** call it successful — diagnose first.
 ```bash
 export DOCKER_BUILDKIT=1
 git checkout <rollback-hash>        # the HEAD hash you saved in step 0
+export GIT_COMMIT="$(git rev-parse HEAD)" BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"   # GET /version
 
 # rebuild + restart BOTH stacks (core first, then connectors)
 docker compose -f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod build
@@ -1189,7 +1350,11 @@ If you see frequent rebalancing in orchestrator logs:
 
 ### Explorer not working
 
-The Explorer uses `LLM_PROVIDER` from `llm-service/.env`. Check:
+If it answers **`Set up an LLM first`**, no LLM is configured: natural-language questions are
+refused while raw SQL keeps working. That includes `LLM_PROVIDER=openai` with no key. Pick a
+provider under [LLM Provider Configuration](#llm-provider-configuration).
+
+Otherwise the Explorer uses `LLM_PROVIDER` from `llm-service/.env`. Check:
 
 1. **Azure/OpenAI**: Verify `AZURE_OPENAI_DEPLOYMENT` matches the deployment name exactly (case-sensitive). Check llm-service logs:
    ```bash

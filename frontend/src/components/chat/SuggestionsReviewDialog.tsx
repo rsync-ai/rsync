@@ -1272,14 +1272,14 @@ export function SuggestionsReviewDialog({
           {previewLoading ? (
             <div className="flex items-center justify-center py-12">
               <Loader2 className="h-6 w-6 animate-spin text-violet-600" />
-              <span className="ml-3 text-sm text-zinc-500">Fetching sample rows and applying transforms…</span>
+              <span className="ml-3 text-sm text-zinc-500 dark:text-zinc-400">Fetching sample rows and applying transforms…</span>
             </div>
           ) : !previewLoading && previewOpen && previewData === null ? (
             <div className="flex flex-col items-center justify-center py-12 gap-3 text-center">
               <Info className="h-8 w-8 text-zinc-400" />
               <div>
                 <div className="font-medium text-zinc-700 dark:text-zinc-200">No transforms selected</div>
-                <div className="text-sm text-zinc-500 mt-1">
+                <div className="text-sm text-zinc-500 dark:text-zinc-400 mt-1">
                   Enable at least one PII mask or transform to preview before/after rows.
                 </div>
               </div>
@@ -1292,13 +1292,13 @@ export function SuggestionsReviewDialog({
                   <CardContent className="pt-4">
                     <div className="grid grid-cols-4 gap-4 text-sm">
                       <div>
-                        <div className="text-zinc-500">Rows</div>
+                        <div className="text-zinc-500 dark:text-zinc-400">Rows</div>
                         <div className="font-medium">
                           {previewData.stats.rows_before} → {previewData.stats.rows_after}
                         </div>
                       </div>
                       <div>
-                        <div className="text-zinc-500">Columns</div>
+                        <div className="text-zinc-500 dark:text-zinc-400">Columns</div>
                         <div className="font-medium">
                           {previewData.stats.columns_before} → {previewData.stats.columns_after}
                         </div>

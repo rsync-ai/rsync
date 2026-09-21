@@ -91,6 +91,9 @@ type TableStatsSummary struct {
 	TablesFailed     int    `json:"tables_failed"`
 	TablesRunning    int    `json:"tables_running"`
 	TablesDegraded   int    `json:"tables_degraded"`
+	// TablesWaitingForData counts selected CDC tables with nothing captured or
+	// applied yet. They are not in TablesRunning.
+	TablesWaitingForData int `json:"tables_waiting_for_data"`
 
 	// Batch aggregates
 	TotalReadRows     *int64 `json:"total_read_rows,omitempty"`
@@ -147,6 +150,16 @@ func GetPipelineTableStats(c *gin.Context) {
 	// so UIs can always query the latest streaming counters, even when the current run has a
 	// separate Temporal execution/workflow ID.
 	if modeFilter == "cdc" {
+		executionID = pipelineID
+	}
+
+	// A caller that names a CDC run by its own id — the Execution Details page does
+	// — matched no row, because the run's stats live under the pipeline key above,
+	// and the page said "No table statistics" beside a pipeline showing 83,230 rows
+	// (UI #40). When the run has no rows of its own, read the stream key instead.
+	if modeFilter == "" && executionID != "" && executionID != pipelineID &&
+		cdcRunStatsAreUnderPipelineKey(database, pipelineID, executionID) {
+		modeFilter = "cdc"
 		executionID = pipelineID
 	}
 
@@ -444,6 +457,31 @@ func GetPipelineTableStats(c *gin.Context) {
 	})
 }
 
+// cdcRunStatsAreUnderPipelineKey reports whether executionID is a run of a CDC
+// pipeline with no table-stats rows of its own, i.e. one whose counters were written
+// under execution_id = pipeline_id. A batch run, a run of another pipeline, or a
+// CDC run that did write rows under its own id (a snapshot) keeps its own rows.
+// Fails closed: any error leaves the caller's execution id as given.
+func cdcRunStatsAreUnderPipelineKey(database *sql.DB, pipelineID, executionID string) bool {
+	if _, err := uuid.Parse(executionID); err != nil {
+		return false
+	}
+	var underPipelineKey bool
+	err := database.QueryRow(`
+		SELECT EXISTS (SELECT 1 FROM pipelines p WHERE p.id = $1::uuid AND `+pipelineRowIsCDCSQL+`)
+		   AND EXISTS (SELECT 1 FROM executions e WHERE e.id = $2::uuid AND e.pipeline_id = $1::uuid)
+		   AND NOT EXISTS (
+		     SELECT 1 FROM pipeline_run_table_stats s
+		     WHERE s.pipeline_id = $1::uuid AND s.execution_id = $2::uuid
+		   )
+	`, pipelineID, executionID).Scan(&underPipelineKey)
+	if err != nil {
+		log.WithError(err).Warn("table stats: could not resolve a CDC run to its pipeline key")
+		return false
+	}
+	return underPipelineKey
+}
+
 func getPipelineSelectedTables(database *sql.DB, pipelineID string) []string {
 	if database == nil || strings.TrimSpace(pipelineID) == "" {
 		return nil
@@ -617,23 +655,18 @@ func buildCDCTableStatsResponse(
 			continue
 		}
 
+		// A selected table the stats projector has no row for: nothing has been
+		// captured or applied. Its counters stay nil — nothing was measured, which
+		// is not a measured zero — and it is not "running", which is what a table
+		// that has never moved a row used to read as.
 		schemaName, tableName := splitQualified(qn)
-		zero := int64(0)
 		stat := TableStat{
-			SchemaName:         schemaName,
-			TableName:          tableName,
-			QualifiedName:      qn,
-			Mode:               "cdc",
-			Status:             "running",
-			Inserts:            &zero,
-			Updates:            &zero,
-			Deletes:            &zero,
-			TotalEvents:        &zero,
-			AppliedInserts:     &zero,
-			AppliedUpdates:     &zero,
-			AppliedDeletes:     &zero,
-			AppliedTotalEvents: &zero,
-			UpdatedAt:          now,
+			SchemaName:    schemaName,
+			TableName:     tableName,
+			QualifiedName: qn,
+			Mode:          "cdc",
+			Status:        tableStatusWaitingForData,
+			UpdatedAt:     now,
 		}
 		all = append(all, stat)
 	}
@@ -734,6 +767,10 @@ func derefInt64(v *int64) int64 {
 	return *v
 }
 
+// tableStatusWaitingForData is the status of a selected CDC table with no stats
+// row yet (see buildCDCTableStatsResponse).
+const tableStatusWaitingForData = "waiting_for_data"
+
 func statusRank(status string) int {
 	switch strings.ToLower(strings.TrimSpace(status)) {
 	case "failed":
@@ -742,10 +779,12 @@ func statusRank(status string) int {
 		return 2
 	case "running":
 		return 3
-	case "completed":
+	case tableStatusWaitingForData:
 		return 4
-	default:
+	case "completed":
 		return 5
+	default:
+		return 6
 	}
 }
 
@@ -767,6 +806,8 @@ func computeCDCSummary(all []TableStat) TableStatsSummary {
 			summary.TablesRunning++
 		case "degraded":
 			summary.TablesDegraded++
+		case tableStatusWaitingForData:
+			summary.TablesWaitingForData++
 		}
 
 		totalInserts += derefInt64(t.Inserts)

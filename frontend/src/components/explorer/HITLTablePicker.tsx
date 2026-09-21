@@ -114,7 +114,7 @@ export function HITLTablePicker({
         <div className="flex-1 overflow-y-auto space-y-4 py-4 pr-1">
           {/* Question */}
           <div className="p-3 bg-zinc-50 dark:bg-zinc-900 rounded-lg">
-            <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">
+            <div className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-1">
               Your Question
             </div>
             <p className="text-sm text-zinc-700 dark:text-zinc-300">{question}</p>
@@ -126,7 +126,7 @@ export function HITLTablePicker({
               <label className="text-sm font-medium">
                 Candidate Tables ({candidates.length})
               </label>
-              <div className="flex items-center gap-2 text-xs text-zinc-500">
+              <div className="flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
                 <Info className="h-3 w-3" />
                 Higher confidence = better match
               </div>
@@ -169,7 +169,7 @@ export function HITLTablePicker({
                               {Math.round(candidate.confidence * 100)}% match
                             </Badge>
                           </div>
-                          <p className="text-xs text-zinc-500 mt-1">{candidate.reason}</p>
+                          <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">{candidate.reason}</p>
                           {candidate.columns && candidate.columns.length > 0 && (
                             <div className="flex items-center gap-1 mt-2 flex-wrap">
                               <Columns className="h-3 w-3 text-zinc-400" />
@@ -209,7 +209,7 @@ export function HITLTablePicker({
           {/* Selection Summary */}
           {selectedTables.size > 0 && (
             <div className="flex items-center gap-2 flex-wrap">
-              <span className="text-xs text-zinc-500">Selected:</span>
+              <span className="text-xs text-zinc-500 dark:text-zinc-400">Selected:</span>
               {Array.from(selectedTables).map((t) => (
                 <Badge key={t} variant="secondary" className="text-xs">
                   {t}

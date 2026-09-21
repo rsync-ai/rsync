@@ -30,6 +30,28 @@ The same-ref case is the control, and it is the one that makes the rest mean
 something: a block that refreshed unconditionally would pass every upgrade
 assertion here while silently overwriting a hand-edited compose file on every
 ordinary re-run.
+
+Then the block shipped, and a third mechanism was waiting underneath both of
+the first two: every comparison it makes is between two ref NAMES, and a branch
+moves without its name changing. `RSYNC_REF=main` over an install already
+recorded at `main` compared "main" with "main", concluded there was nothing to
+do, and handed the decision to the `[[ -f ]]` repair below it -- which sees a
+file that exists and keeps it. So a main-tracking install pinned itself to
+whatever main pointed at on the day it was first installed, permanently, and
+every re-run printed the success banner over that file.
+
+Measured on the deploy host on 2026-09-12: an install from the previous day
+re-ran against a main whose compose file had been fixed hours earlier, re-read
+the day-old copy, and died pulling an image main no longer names. The fix for
+that image was in main, fetched by nothing. The tell is that this is the SAME
+defect as the first one in this file, one level up -- "refresh when the ref
+changed" is a version check only for a ref that cannot move -- and the tag
+cases here could not see it, because for a tag the old gate was right.
+
+The cases below therefore split the control in two: a release tag must still
+touch nothing, and a branch must refresh even though its name did not change.
+Neither alone discriminates -- refreshing unconditionally passes the second and
+fails the first, and the shipped gate did the reverse.
 """
 
 import os
@@ -115,6 +137,10 @@ def _harness(tmp_path, ref, version):
         "}\n"
         + _function_body("env_value")
         + _function_body("set_env_value")
+        # The gate calls this now. Lifted rather than restated: a stand-in here
+        # would answer for the installer, and answering correctly is the whole
+        # question.
+        + _function_body("ref_is_release_tag")
         + "rerun_branch() {\n"
         + _refresh_block()
         + "}\nrerun_branch\n"
@@ -190,13 +216,18 @@ def test_a_recorded_ref_that_changed_upgrades_both_halves(tmp_path):
     assert (tmp_path / "docker-compose.quickstart.yml.previous").read_text() == PINNED
 
 
-def test_the_same_ref_touches_nothing(tmp_path):
+def test_the_same_release_tag_touches_nothing(tmp_path):
     """The control, and the reason the assertions above discriminate.
 
     A block that refreshed unconditionally passes every upgrade case in this
     file. It also overwrites the operator's compose file and rewrites their .env
     on every ordinary re-run -- including the re-runs that exist only to restart
     a stopped stack.
+
+    A RELEASE TAG, specifically. This case read `ref="v0.1.2"` from the day it
+    was written, but its name said `same_ref`, and that reading is what made the
+    moving-branch defect invisible: a tag and a branch were one case here, and
+    the answer differs between them.
     """
     env = _seed(tmp_path, "RSYNC_VERSION=0.1.2\nRSYNC_INSTALLED_REF=v0.1.2\n")
     before = env.read_text()
@@ -279,3 +310,110 @@ def test_write_env_records_the_ref_it_installed_from():
         "a heredoc boundary sits between the two lines -- RSYNC_INSTALLED_REF is "
         "no longer in the interpolating heredoc and would be written literally"
     )
+
+
+def test_a_branch_ref_refreshes_even_though_the_name_did_not_change(tmp_path):
+    """The defect this file's second half exists for.
+
+    Nothing about these two values differs, and that is exactly the point: a
+    branch that moved is indistinguishable from a branch that did not, by any
+    comparison of names. The only safe answer for a ref that can move is to
+    fetch and look.
+    """
+    env = _seed(tmp_path, "RSYNC_VERSION=main\nRSYNC_INSTALLED_REF=main\n")
+    _run(tmp_path, ref="main", version="main")
+
+    assert _calls(tmp_path) == 1, (
+        "a main-tracking re-run fetched nothing, so this install is pinned to "
+        "whatever main pointed at on the day it was first installed"
+    )
+    assert (tmp_path / "docker-compose.quickstart.yml").read_text() == REFRESHED
+    assert _env_map(env)["RSYNC_INSTALLED_REF"] == ["main"]
+
+
+def test_the_gate_reads_the_refs_shape_and_not_the_word_main(tmp_path):
+    """`main` is the common case, not the rule.
+
+    A gate special-cased to the literal `main` would pass the case above and
+    leave every other branch -- a release branch, a fork's default, a feature
+    branch an operator is trialling -- pinned exactly as before.
+    """
+    _seed(tmp_path, "RSYNC_VERSION=release-1.0\nRSYNC_INSTALLED_REF=release/1.0\n")
+    _run(tmp_path, ref="release/1.0", version="release-1.0")
+    assert _calls(tmp_path) == 1, "a non-main branch re-run fetched nothing"
+
+
+def test_a_branch_rerun_that_fetched_nothing_new_keeps_the_operators_backup(tmp_path):
+    """The cost of running on every re-run, and the reason the rotation is
+    conditional.
+
+    The backup exists to make one thing recoverable: the operator's own edit to
+    the compose file. A rotation that fires whenever this block does would, on
+    the first re-run that fetched a byte-identical file, copy that file over the
+    backup and leave the edit recoverable from nowhere. Rotate on the content
+    changing, not on the block running.
+    """
+    _seed(tmp_path, "RSYNC_INSTALLED_REF=main\n", compose=REFRESHED)
+    edit = tmp_path / "docker-compose.quickstart.yml.previous"
+    edit.write_text("# the operator's edit\n")
+
+    _run(tmp_path, ref="main", version="main")
+
+    assert _calls(tmp_path) == 1
+    assert edit.read_text() == "# the operator's edit\n", (
+        "a re-run that changed nothing overwrote the backup of the edit"
+    )
+
+
+def test_a_branch_rerun_that_did_change_the_compose_file_still_keeps_a_backup(tmp_path):
+    """The other side of the same decision: when the fetch does replace the
+    file, the outgoing copy is still kept."""
+    _seed(tmp_path, "RSYNC_INSTALLED_REF=main\n", compose=PINNED)
+    _run(tmp_path, ref="main", version="main")
+    assert (tmp_path / "docker-compose.quickstart.yml.previous").read_text() == PINNED
+
+
+def test_no_run_leaves_its_working_copy_behind(tmp_path):
+    """The snapshot is an implementation detail of the comparison. Left in the
+    install directory it would be a second compose file sitting next to the
+    real one, a `-f` away from being started by an operator reading `ls`."""
+    for compose, ref in ((PINNED, "main"), (REFRESHED, "main"), (PINNED, "v0.1.2")):
+        d = tmp_path / f"{ref.replace('/', '-')}-{len(compose)}"
+        d.mkdir()
+        _seed(d, "RSYNC_INSTALLED_REF=main\n", compose=compose)
+        _run(d, ref=ref, version="main")
+        leftovers = sorted(p.name for p in d.glob("*.outgoing"))
+        assert leftovers == [], f"{ref} left {leftovers} in the install dir"
+
+
+def test_a_snapshot_left_by_a_crashed_run_is_not_mistaken_for_this_runs_file(tmp_path):
+    """`rm -f` before the copy, and the reason for it.
+
+    A run interrupted between the copy and the compare leaves a snapshot on
+    disk. If the next run's install directory has no compose file at all -- the
+    deleted-file case this block already handles -- a stale snapshot would be
+    read as this run's outgoing copy and promoted to `.previous`, presenting a
+    file from an interrupted run as the one just replaced.
+    """
+    _seed(tmp_path, "RSYNC_INSTALLED_REF=main\n", compose=None)
+    (tmp_path / "docker-compose.quickstart.yml.outgoing").write_text("# stale\n")
+
+    _run(tmp_path, ref="main", version="main")
+
+    assert not (tmp_path / "docker-compose.quickstart.yml.previous").exists(), (
+        "a stale snapshot was promoted to .previous for a compose file that "
+        "was never there"
+    )
+    assert (tmp_path / "docker-compose.quickstart.yml").read_text() == REFRESHED
+
+
+def test_a_no_op_branch_rerun_leaves_the_env_byte_identical(tmp_path):
+    """This block rewrites the .env through set_env_value, and it now runs on
+    every branch-tracking re-run. Writing the same values must be a no-op in
+    the file, not a rewrite that happens to carry the same meaning: the .env
+    holds every generated secret in the install, and the fewer runs that
+    replace it, the fewer chances to replace it wrongly."""
+    env = _seed(tmp_path, "RSYNC_VERSION=main\nRSYNC_INSTALLED_REF=main\nSECRET=k\n")
+    before = env.read_text()
+    _run(tmp_path, ref="main", version="main")
+    assert env.read_text() == before

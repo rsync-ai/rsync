@@ -82,6 +82,7 @@ var codeCategory = map[string]string{
 	"SQLSERVER_AGENT_NOT_RUNNING":         CategorySourceSetup,
 	"SQLSERVER_CAPTURE_INSTANCE_ERROR":    CategorySourceSetup,
 	"MONGODB_NOT_REPLICA_SET":             CategorySourceSetup,
+	"PRE_MIGRATION_ASSESSMENT_ISSUE":      CategorySourceSetup,
 
 	// The classifier gave up. These are still delivered by default: an
 	// unclassified failure is exactly the alert nobody should miss by accident.

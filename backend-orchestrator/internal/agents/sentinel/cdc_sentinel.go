@@ -24,6 +24,7 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
 	"github.com/rsync-ai/backend-orchestrator/internal/utils"
+	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 )
 
 var cdcSentinelTracer = otel.Tracer("cdc-sentinel")
@@ -154,7 +155,7 @@ type CDCSentinel struct {
 	workerID     string
 	connectURL   string
 	pollInterval time.Duration
-	// mu guards restartState, sinkRestartState, sinkRespawnState, sinkProgress, startedAt,
+	// mu guards restartState, sinkRestartState, sinkRespawnState, sinkProgress, sinkDrain, startedAt,
 	// and mcpManager — all touched from more than one of the Sentinel's background goroutines
 	// (monitoringLoop + sourceLagLoop + walWatchdogLoop) and, for mcpManager, from the startup
 	// goroutine via SetMCPManager. Without it, concurrent map iteration+write is a Go runtime
@@ -174,6 +175,14 @@ type CDCSentinel struct {
 	// Per-pipeline previous destination-apply marker (MAX(last_applied_ts)), so the wedge
 	// gate can tell a flat (non-advancing) sink from a slow-but-progressing one across ticks.
 	sinkProgress map[string]sql.NullTime
+	// Per-pipeline committed Kafka position from the previous tick, so the sink-lag alarm can
+	// tell a sink working through a backlog from one that has stopped (cdc_sink_drain.go).
+	sinkDrain map[string]sinkDrainState
+	// Per-connector committed SOURCE position from the previous tick, so the freshness alarm
+	// can tell a connector that Connect calls RUNNING but which has stopped advancing through
+	// the source's change stream (cdc_source_freshness.go). Keyed by connector name, because
+	// the position belongs to the Kafka Connect connector rather than to the pipeline.
+	sourceFreshness map[string]sourceFreshnessState
 	// startedAt anchors the respawn rung's startup grace window, so we don't race the CDC
 	// executor's own start_sink while the stack is still coming up.
 	startedAt time.Time
@@ -206,6 +215,7 @@ func NewCDCSentinel(db *sql.DB, kafkaManager *kafka.Manager) *CDCSentinel {
 		sinkRestartState: make(map[string]*connRestartState),
 		sinkRespawnState: make(map[string]*connRestartState),
 		sinkProgress:     make(map[string]sql.NullTime),
+		sinkDrain:        make(map[string]sinkDrainState),
 
 		walWatchdogInterval: walDurationFromEnv("CDC_WAL_WATCHDOG_INTERVAL", DefaultWALWatchdogInterval),
 		walWarnBytes:        walBytesFromEnv("CDC_WAL_WARN_BYTES", DefaultWALWarnBytes),
@@ -382,12 +392,20 @@ func (s *CDCSentinel) checkActivePipelines(ctx context.Context) {
 			// Connector is healthy again — clear any restart-attempt bookkeeping so a
 			// future failure starts from a clean slate (FINDING-04).
 			s.clearRestartState(connName)
+			// RUNNING is Connect's opinion, not evidence. Debezium retries a permanent
+			// error on a loop without ever leaving RUNNING, so this branch is exactly
+			// where a dead pipeline hides (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL).
+			// Ask the committed source position whether it is actually moving.
+			if pipelineID != "" {
+				s.checkSourceFreshness(ctx, pipelineID, connName, connState)
+			}
 		}
 	}
 
 	// Prune restart bookkeeping for connectors that no longer appear in Connect (deleted
-	// or reaped) so the map can't grow unbounded.
+	// or reaped) so the maps can't grow unbounded.
 	s.pruneRestartState(seenConnectors)
+	s.forgetSourceFreshness(seenConnectors)
 }
 
 // pipelineInInitialSnapshot reports whether the pipeline is in its (non-resumable) blocking
@@ -640,8 +658,17 @@ func (s *CDCSentinel) getDebeziumStatus(ctx context.Context) (map[string]interfa
 				taskState, _ := taskMap["state"].(string)
 				if taskState == "FAILED" {
 					finalState = "FAILED"
-					// Capture trace from task if possible
-					if trace, ok := taskMap["trace"]; ok {
+				}
+				// Harvest the trace from ANY task that carries one, not only a FAILED
+				// one. The trace is the only text that names what actually went wrong,
+				// and it is what the diagnoser classifies; gating the harvest on FAILED
+				// meant a task erroring in a retry loop — still reported RUNNING by
+				// Connect — handed the diagnoser nothing to work with, so a pipeline
+				// could sit broken and undiagnosed for days
+				// (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL). Keep the first trace seen:
+				// with tasks.max=1 there is only ever one.
+				if _, already := connectorState["trace"]; !already {
+					if trace, ok := taskMap["trace"].(string); ok && strings.TrimSpace(trace) != "" {
 						connectorState["trace"] = trace
 					}
 				}
@@ -719,9 +746,63 @@ func (s *CDCSentinel) restartConnector(ctx context.Context, connectorName string
 //
 // Severity is critical, not warning: unlike lag, there is no version of this
 // that resolves on its own.
+// maxIssueErrorText bounds how much of a task trace goes into an issue description.
+// Long enough for the exception class and its causes, short enough that the row stays
+// readable in the UI.
+const maxIssueErrorText = 1000
+
+// diagnosableErrorText reduces a Kafka Connect task trace to the part a diagnoser can
+// classify, scrubbed of anything that must never reach an LLM.
+//
+// The Healer's issue sweep (heal/issue_sweep.go) builds its diagnose.Signal from the
+// issue's DESCRIPTION column and never reads metadata, so an error that lives only in
+// metadata is an error the diagnoser cannot see. rsync already knows how to classify a
+// MongoDB resume-token loss (diagnose.go → ActionReSnapshot) and how to explain it
+// (structured_error.go → MONGODB_RESUME_TOKEN_INVALID); it never got the chance,
+// because the description said only that a connector had failed.
+//
+// A Java trace carries the diagnosable text on its first line and on each "Caused by:"
+// line; the frames between them are noise that would crowd the cause out of any sane
+// length cap. The result goes through llmscrub because a Debezium trace can quote the
+// connection URI, and this description is read back by the chat diagnoser.
+func diagnosableErrorText(trace string, max int) string {
+	trace = strings.TrimSpace(trace)
+	if trace == "" {
+		return ""
+	}
+	keep := []string{}
+	for _, line := range strings.Split(trace, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if len(keep) == 0 || strings.HasPrefix(line, "Caused by:") {
+			keep = append(keep, line)
+		}
+	}
+	return llmscrub.ScrubMax(strings.Join(keep, " | "), max)
+}
+
+// traceFromConnectorState pulls the harvested task trace out of the state map
+// getDebeziumStatus built, if it captured one.
+func traceFromConnectorState(state interface{}) string {
+	m, ok := state.(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	t, _ := m["trace"].(string)
+	return t
+}
+
 func (s *CDCSentinel) triggerHealer(ctx context.Context, pipelineID string, connectorName string, state interface{}) {
 	description := fmt.Sprintf(
 		"CDC connector %s is failed and did not recover from a restart", connectorName)
+	// Append what actually went wrong. Without this the diagnoser sees only the
+	// sentence above, which matches no rule, and every connector failure — a lost
+	// resume token, a revoked credential, a dropped table — is diagnosed identically.
+	if errText := diagnosableErrorText(traceFromConnectorState(state), maxIssueErrorText); errText != "" {
+		description += ": " + errText
+	}
 
 	s.emitCDCIssue(ctx, connectorIssueID(pipelineID),
 		IssueTypeConnectorDown, IssueSeverityCritical,
@@ -1187,7 +1268,7 @@ func (s *CDCSentinel) checkSinkConsumerLag(ctx context.Context, pipelineID, pipe
 	consumerGroup := s.resolveSinkConsumerGroup(ctx, pipelineID)
 	issueID := sinkLagIssueID(pipelineID)
 
-	lagMap, err := s.kafkaManager.GetConsumerGroupLag(consumerGroup)
+	drain, err := s.kafkaManager.GetConsumerGroupDrain(consumerGroup)
 	if err != nil {
 		// The group may not exist yet (sink not started / never consumed). Absence is
 		// not proof of health, so do NOT resolve — just skip this tick.
@@ -1198,26 +1279,34 @@ func (s *CDCSentinel) checkSinkConsumerLag(ctx context.Context, pipelineID, pipe
 		return
 	}
 
+	lagMap := drain.LagByTopic
 	var totalLag int64
 	for _, topicLag := range lagMap {
 		totalLag += topicLag
 	}
 
+	lagging := totalLag > walBytesFromEnv("CDC_SINK_KAFKA_LAG_ALERT", SinkKafkaLagAlert)
+	// A backlog alone is not a stuck sink: a first load puts one far above the threshold on
+	// a healthy sink. Alarm only when the sink has also stopped committing (cdc_sink_drain.go).
+	stalled, stalledFor := s.observeSinkDrain(pipelineID, drain.Committed, lagging, time.Now())
+
 	log.WithFields(log.Fields{
 		"pipeline_id":    pipelineID,
 		"consumer_group": consumerGroup,
 		"total_lag":      totalLag,
+		"committed":      drain.Committed,
+		"stalled":        stalled,
 		"db_type":        dbType,
 	}).Debug("🛡️ CDC sink consumer lag")
 
-	lagging := totalLag > walBytesFromEnv("CDC_SINK_KAFKA_LAG_ALERT", SinkKafkaLagAlert)
-	if lagging {
+	if stalled {
 		s.emitLagIssue(ctx, issueID, "sink_lag", pipelineID, pipelineName, dbType,
-			fmt.Sprintf("CDC sink is not draining Kafka: consumer lag is %d events (group: %s) — change events are captured but NOT reaching the destination (the sink worker may be dead, wedged, or crash-looping)", totalLag, consumerGroup),
+			fmt.Sprintf("CDC sink is not draining Kafka: consumer lag is %d events and the sink has not committed any progress for %s (group: %s) — change events are captured but NOT reaching the destination (the sink worker may be dead, wedged, or stuck retrying a batch)", totalLag, stalledFor.Round(time.Second), consumerGroup),
 			map[string]interface{}{
-				"total_lag":      totalLag,
-				"consumer_group": consumerGroup,
-				"topics":         lagMap,
+				"total_lag":           totalLag,
+				"stalled_for_seconds": int64(stalledFor.Seconds()),
+				"consumer_group":      consumerGroup,
+				"topics":              lagMap,
 			})
 	} else {
 		s.resolveLagIssue(ctx, issueID, pipelineID)

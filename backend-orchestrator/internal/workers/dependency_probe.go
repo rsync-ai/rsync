@@ -100,6 +100,12 @@ func (p *DependencyProbe) sweep(ctx context.Context) {
 	}
 	defer rows.Close()
 
+	// A nil *mcp.ServerManager inside the interface would not compare == nil.
+	var resolver concreteVersionResolver
+	if p.mcpManager != nil {
+		resolver = p.mcpManager
+	}
+
 	count := 0
 	for rows.Next() {
 		count++
@@ -108,6 +114,14 @@ func (p *DependencyProbe) sweep(ctx context.Context) {
 		if err := rows.Scan(&depID, &pipelineID, &kind, &identifier, &metaRaw); err != nil {
 			log.Warnf("dependency_probe: row scan failed: %v", err)
 			continue
+		}
+		if concrete := concreteLatestIdentifier(resolver, kind, identifier); concrete != "" {
+			switch p.persistConcreteIdentifier(ctx, depID, identifier, concrete) {
+			case identifierRenamed:
+				identifier = concrete
+			case identifierMergedIntoTwin:
+				continue // the concrete twin is its own row in this sweep
+			}
 		}
 		var meta map[string]interface{}
 		_ = json.Unmarshal(metaRaw, &meta)
@@ -376,13 +390,15 @@ func (p *DependencyProbe) probeOne(ctx context.Context, pipelineID, kind, identi
 		if resolved, rerr := p.mcpManager.ResolveConcreteVersion(sinkName, "latest"); rerr == nil && resolved != "" {
 			ver = resolved
 		}
-		server, ok := p.mcpManager.GetServer(sinkName, ver)
+		// FindRunningServer, not GetServer: the orchestrator only registers the sink
+		// when it calls it, so after a restart a healthy sink read "not registered".
+		server, ok := p.mcpManager.FindRunningServer(sinkName, ver)
 		if (!ok || server == nil) && ver != "" {
 			alt := "v" + ver
 			if strings.HasPrefix(ver, "v") {
 				alt = strings.TrimPrefix(ver, "v")
 			}
-			if s2, ok2 := p.mcpManager.GetServer(sinkName, alt); ok2 && s2 != nil {
+			if s2, ok2 := p.mcpManager.FindRunningServer(sinkName, alt); ok2 && s2 != nil {
 				server, ok = s2, true
 			}
 		}
@@ -506,6 +522,82 @@ func (p *DependencyProbe) writeHealth(ctx context.Context, depID, status, lastEr
 	if _, err := p.db.ExecContext(ctx, q, depID, status, lastError, detailsJSON); err != nil {
 		log.Warnf("dependency_probe: writeHealth failed (dep=%s status=%s): %v", depID, status, err)
 	}
+}
+
+// concreteVersionResolver is the one ServerManager method the identifier rewrite needs.
+type concreteVersionResolver interface {
+	ResolveConcreteVersion(connectorName, version string) (string, error)
+}
+
+// concreteLatestIdentifier is the identifier an MCP dependency row stored as
+// "name@latest" (or "name@") should carry: "name@<concrete version>", the
+// spelling dependency_manifest.go writes for new rows since #56. Rows written
+// before that fix kept "mongodb@latest" beside "gcs@v1.0.0" on one panel (#56
+// prod retest). "" means leave the row alone: not an MCP kind, already
+// concrete, or the version could not be resolved.
+func concreteLatestIdentifier(r concreteVersionResolver, kind, identifier string) string {
+	if kind != "mcp_source" && kind != "mcp_dest" {
+		return ""
+	}
+	name, version := splitIdentifier(identifier)
+	if name == "" || (version != "" && version != "latest") || r == nil {
+		return ""
+	}
+	resolved, err := r.ResolveConcreteVersion(name, "latest")
+	if err != nil || resolved == "" || resolved == "latest" {
+		return ""
+	}
+	return name + "@" + resolved
+}
+
+type identifierRewrite int
+
+const (
+	identifierUnchanged identifierRewrite = iota
+	identifierRenamed
+	identifierMergedIntoTwin
+)
+
+// persistConcreteIdentifier rewrites one "@latest" dependency row to its
+// concrete identifier. When the pipeline already holds a row with that
+// identifier (a later run upserted it), the "@latest" row is a duplicate of it
+// and is deleted instead — its health row cascades — because the unique key
+// (pipeline_id, execution_id, kind, identifier) forbids two. Both statements
+// re-check the old identifier, so a concurrent rewrite is a no-op, not a clobber.
+func (p *DependencyProbe) persistConcreteIdentifier(ctx context.Context, depID, oldIdentifier, concrete string) identifierRewrite {
+	res, err := p.db.ExecContext(ctx, `
+		UPDATE pipeline_dependencies d SET identifier = $2
+		WHERE d.id = $1 AND d.identifier = $3
+		  AND NOT EXISTS (
+			SELECT 1 FROM pipeline_dependencies o
+			WHERE o.pipeline_id = d.pipeline_id
+			  AND o.execution_id IS NOT DISTINCT FROM d.execution_id
+			  AND o.kind = d.kind AND o.identifier = $2 AND o.id <> d.id)
+	`, depID, concrete, oldIdentifier)
+	if err != nil {
+		log.Warnf("dependency_probe: rewriting %s to %s failed (dep=%s): %v", oldIdentifier, concrete, depID, err)
+		return identifierUnchanged
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return identifierRenamed
+	}
+	res, err = p.db.ExecContext(ctx, `
+		DELETE FROM pipeline_dependencies d
+		WHERE d.id = $1 AND d.identifier = $3
+		  AND EXISTS (
+			SELECT 1 FROM pipeline_dependencies o
+			WHERE o.pipeline_id = d.pipeline_id
+			  AND o.execution_id IS NOT DISTINCT FROM d.execution_id
+			  AND o.kind = d.kind AND o.identifier = $2 AND o.id <> d.id)
+	`, depID, concrete, oldIdentifier)
+	if err != nil {
+		log.Warnf("dependency_probe: dropping %s beside its %s twin failed (dep=%s): %v", oldIdentifier, concrete, depID, err)
+		return identifierUnchanged
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		return identifierMergedIntoTwin
+	}
+	return identifierUnchanged
 }
 
 // splitIdentifier turns "postgresql@v1.0.14" into ("postgresql", "v1.0.14").

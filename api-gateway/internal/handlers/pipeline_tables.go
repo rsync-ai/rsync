@@ -10,6 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	log "github.com/sirupsen/logrus"
 )
 
 type UpdatePipelineTablesRequest struct {
@@ -55,6 +56,10 @@ func UpdatePipelineTables(c *gin.Context) {
 	}
 
 	tables := normalizeSelectedTables(raw)
+	// The selection as the user expressed it — resolution below replaces
+	// `tables` with the expansion, and the sentinel is the rule CDC auto-pickup
+	// re-applies later.
+	rawTables := append([]string(nil), tables...)
 
 	// Expand any "select entire database" ("*") / "select entire namespace"
 	// ("<ns>.*") sentinel into an explicit list before persisting — the run path
@@ -87,6 +92,11 @@ func UpdatePipelineTables(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update pipeline tables"})
 		return
+	}
+	// Record the rule behind the selection (empty for an exact list, which is
+	// how narrowing a whole-database pipeline turns CDC auto-pickup off).
+	if err := persistTableSelectionRule(database, pipelineID, rawTables); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("Failed to persist table_selection_rule (ignored)")
 	}
 
 	c.JSON(http.StatusOK, gin.H{

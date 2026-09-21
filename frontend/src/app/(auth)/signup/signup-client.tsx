@@ -224,7 +224,7 @@ export default function SignupClient() {
             </CardDescription>
           </CardHeader>
           <CardContent className="flex flex-col gap-3">
-            <p className="text-center text-sm text-zinc-500">
+            <p className="text-center text-sm text-zinc-500 dark:text-zinc-400">
               The link expires in 24 hours. Check your spam folder if you don&apos;t see it.
             </p>
             <Button
@@ -296,7 +296,7 @@ export default function SignupClient() {
         </CardHeader>
         <CardContent>
           {inviteChecking ? (
-            <div className="text-center py-8 text-sm text-zinc-500">Validating invite...</div>
+            <div className="text-center py-8 text-sm text-zinc-500 dark:text-zinc-400">Validating invite...</div>
           ) : (
             <form onSubmit={handleSignup} className="space-y-4">
               {/* First + Last Name */}
@@ -410,7 +410,7 @@ export default function SignupClient() {
                   autoComplete="new-password"
                   minLength={8}
                 />
-                <p className="text-xs text-zinc-500">Minimum 8 characters</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">Minimum 8 characters</p>
               </div>
               <div className="space-y-2">
                 <Label htmlFor="confirmPassword">Confirm Password</Label>

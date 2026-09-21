@@ -1,10 +1,23 @@
-import { describe, it, expect } from "vitest"
+import { describe, it, expect, beforeAll } from "vitest"
+import fs from "node:fs"
+import path from "node:path"
+import { fileURLToPath } from "node:url"
 import {
   validateNamespace,
   namespaceKindForType,
   destDefaultSchemaName,
+  defaultNamespaceForTypes,
   kindMeta,
+  isLayoutV2Destination,
+  validatePipelinePrefix,
 } from "../destinationNamespace"
+
+import { primeNamespaceModels } from "../namespaceModel"
+import { repoNamespaceModels } from "./repoNamespaceModels"
+
+// Connector types resolve through the namespace models the repo's metadata
+// declares, as they do once the page has fetched them from the gateway.
+beforeAll(() => primeNamespaceModels(repoNamespaceModels()))
 
 // These tests pin the destination-namespace contract behind the multi-schema
 // "Select entire database" fix: a blank namespace must be VALID when the caller
@@ -54,4 +67,78 @@ describe("aws-s3 is recognized as object storage", () => {
     expect(meta.createable).toBe(false)
   })
 
+})
+
+// #13: the table-selection dialog pre-fills the namespace with this function
+// whenever the stored value is "", which the backend stores on purpose for object
+// storage. Returning the source slug put every MongoDB collection under a
+// "mongodb/" folder instead of the database's own folder.
+describe("object-storage destinations pre-fill an empty path prefix", () => {
+  it("never seeds a source name for a path destination", () => {
+    // "object-storage" is not a connector name (see shared/namespace_model_golden.json).
+    for (const dest of ["gcs", "aws-s3", "s3", "azure-blob", "minio"]) {
+      for (const src of ["mongodb", "sqlserver", "snowflake", "postgresql", "mysql", "shopify"]) {
+        expect(defaultNamespaceForTypes(src, dest)).toBe("")
+      }
+    }
+  })
+
+  it("keeps the relational pre-fills", () => {
+    expect(defaultNamespaceForTypes("mysql", "postgresql")).toBe("public")
+    expect(defaultNamespaceForTypes("postgresql", "mysql")).toBe("default")
+    expect(defaultNamespaceForTypes("sqlserver", "postgresql")).toBe("sqlserver")
+  })
+})
+
+// Object layout v2 (gcs, aws-s3, azure-blob): <prefix>/<database>/[<schema>/]<table>/.
+// The prefix is required and must satisfy both the server's namespace check and the
+// layout v2 prefix rule, or the pipeline silently falls back to the pipeline-id layout.
+describe("layout v2 path prefix (GCS, S3, Azure Blob)", () => {
+  it("applies to gcs, aws-s3 and azure-blob, matching the orchestrator's gate", () => {
+    for (const t of ["gcs", " GCS ", "aws-s3", "AWS_S3", "azure-blob", "Azure_Blob"]) {
+      expect(isLayoutV2Destination(t)).toBe(true)
+    }
+    for (const t of ["s3", "minio", "google-cloud-storage", "postgresql", "", undefined]) {
+      expect(isLayoutV2Destination(t)).toBe(false)
+    }
+  })
+
+  it("matches v2_destinations in the shared golden the sink and orchestrator also read", () => {
+    const goldenPath = path.resolve(
+      path.dirname(fileURLToPath(import.meta.url)),
+      "../../../../../shared/object_layout_golden.json",
+    )
+    const golden = JSON.parse(fs.readFileSync(goldenPath, "utf8"))
+    const { eligible, not_eligible: notEligible } = golden.v2_destinations as {
+      eligible: string[]
+      not_eligible: string[]
+    }
+    expect(eligible.length).toBeGreaterThan(0)
+    expect(notEligible.length).toBeGreaterThan(0)
+    for (const t of eligible) expect(isLayoutV2Destination(t), t).toBe(true)
+    for (const t of notEligible) expect(isLayoutV2Destination(t), t).toBe(false)
+  })
+
+  it("requires a prefix", () => {
+    expect(validatePipelinePrefix("")).toMatch(/Enter a path prefix/)
+    expect(validatePipelinePrefix("   ")).toMatch(/Enter a path prefix/)
+  })
+
+  it("accepts lowercase letters, digits and underscores starting with a letter", () => {
+    for (const ok of ["sales", "sales_orders", "s", "crm2", " sales "]) {
+      expect(validatePipelinePrefix(ok)).toBe("")
+    }
+    expect(validatePipelinePrefix("a".repeat(63))).toBe("")
+  })
+
+  it("rejects what either the server or the layout v2 rule would reject", () => {
+    // Upper case: layout v2 rule. Hyphen: server namespace check. Leading digit:
+    // server. Leading underscore: layout v2. Slash/dot: both.
+    for (const bad of ["Sales", "sales-eu", "1sales", "_sales", "a/b", "a.b", "sales orders"]) {
+      expect(validatePipelinePrefix(bad)).toMatch(/lowercase letters, digits and underscores/)
+    }
+    expect(validatePipelinePrefix("a".repeat(64))).toMatch(/too long/)
+    expect(validatePipelinePrefix("the")).toMatch(/reserved/)
+    expect(validatePipelinePrefix("default")).toMatch(/reserved/)
+  })
 })

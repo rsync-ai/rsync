@@ -566,10 +566,7 @@ func (h *OAuthHandler) Authorize(c *gin.Context) {
 	}
 
 	// Build authorization URL
-	callbackURL := os.Getenv("OAUTH_CALLBACK_URL")
-	if callbackURL == "" {
-		callbackURL = "http://localhost:5001/oauth/callback"
-	}
+	callbackURL := oauthCallbackBase()
 
 	// Substitute {shop} placeholder for providers that require a per-shop subdomain
 	// (e.g. Shopify: https://{shop}.myshopify.com/admin/oauth/authorize).
@@ -762,10 +759,7 @@ func buildTokenExchangeData(provider *OAuthProvider, code, redirectURI string) u
 
 // exchangeToken exchanges authorization code for access token
 func (h *OAuthHandler) exchangeToken(provider *OAuthProvider, code string, providerName string, subdomain string) (*OAuthToken, error) {
-	callbackURL := os.Getenv("OAUTH_CALLBACK_URL")
-	if callbackURL == "" {
-		callbackURL = "http://localhost:5001/oauth/callback"
-	}
+	callbackURL := oauthCallbackBase()
 
 	// Resolve {shop} in the token URL for per-shop providers (e.g. Shopify).
 	// Re-validate the subdomain (defense in depth) so a malformed stored value

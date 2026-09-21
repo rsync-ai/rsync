@@ -36,9 +36,8 @@ of the other five sites you forgot.
 
 Text-only by design: parsing the templates needs no `helm` binary and no render, so it holds on any checkout. This
 used to claim CI has no helm binary because `helm` appeared in .github/workflows
-only inside the tag-gated chart-publish job. That is no longer true of the
-workflows either: the job collecting this suite sets helm up and asserts it
-before pytest. See the `helm is present` step in .github/workflows/ci.yml.
+only inside the tag-gated chart-publish job -- true of the workflows, false of
+the runners, which are developer Macs that have it. the `helm is present` step in .github/workflows/ci.yml carries the correction.
 """
 
 import os

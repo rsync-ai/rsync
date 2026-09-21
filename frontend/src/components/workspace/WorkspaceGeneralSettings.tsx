@@ -5,13 +5,12 @@ import { useRouter } from "next/navigation"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { useWorkspace } from "@/contexts/WorkspaceContext"
-import { can, roleBadgeVariant, ROLE_LABELS, type WorkspaceRole } from "@/lib/workspace/roles"
+import { can } from "@/lib/workspace/roles"
 import { toast } from "sonner"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Badge } from "@/components/ui/badge"
 import {
   AlertDialog,
   AlertDialogAction,
@@ -180,11 +179,11 @@ export function WorkspaceGeneralSettings({
               )}
             </div>
             {isPersonal ? (
-              <p className="text-xs text-zinc-500">
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">
                 This is your personal workspace — its name is fixed and can&apos;t be changed.
               </p>
             ) : !canRename ? (
-              <p className="text-xs text-zinc-500">Only admins and owners can rename this workspace.</p>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">Only admins and owners can rename this workspace.</p>
             ) : null}
           </div>
 
@@ -196,15 +195,8 @@ export function WorkspaceGeneralSettings({
             </code>
           </div>
 
-          {/* Your role */}
-          <div className="space-y-1.5">
-            <Label>Your role</Label>
-            <div>
-              <Badge variant={roleBadgeVariant(currentRole)}>
-                {ROLE_LABELS[currentRole as WorkspaceRole] ?? currentRole}
-              </Badge>
-            </div>
-          </div>
+          {/* No "Your role" row: the page's banner above the tabs already shows it,
+              so this tab printed it a second time (#56). */}
         </CardContent>
       </Card>
 
@@ -212,7 +204,7 @@ export function WorkspaceGeneralSettings({
         <Card>
           <CardHeader>
             <CardTitle className="flex items-center gap-2">
-              <LogOut className="h-4 w-4 text-zinc-500" />
+              <LogOut className="h-4 w-4 text-zinc-500 dark:text-zinc-400" />
               Leave workspace
             </CardTitle>
             <CardDescription>

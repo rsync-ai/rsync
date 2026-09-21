@@ -21,12 +21,33 @@ func TestLoadDefaults(t *testing.T) {
 	if c.ToolsDir != "/app/shared/mcp-connectors" {
 		t.Errorf("ToolsDir = %q", c.ToolsDir)
 	}
-	if c.IsProd() {
-		t.Error("default environment must not be prod")
+	// An unset ENVIRONMENT must not count as dev: that is the default a container
+	// started without ENVIRONMENT gets, and dev is what lets an unauthenticated
+	// deploy through when the secret is unset.
+	if c.IsDev() {
+		t.Errorf("unset ENVIRONMENT must not be dev (Environment=%q)", c.Environment)
 	}
 	dc := c.DeployerConfig()
 	if dc.Network != "rsync-ai-mcp" || dc.OAuthVolumeName != "rsync-ai-oauth-tokens" || dc.OAuthVolumeTarget != "/root/.rsync-ai" {
 		t.Errorf("DeployerConfig view wrong: %+v", dc)
+	}
+}
+
+func TestIsDevIsAnExplicitAllowList(t *testing.T) {
+	for env, want := range map[string]bool{
+		"development":   true,
+		"dev":           true,
+		" Development ": true,
+		"":              false,
+		"production":    false,
+		"prod":          false,
+		"staging":       false,
+		"local":         false,
+		"develop":       false,
+	} {
+		if got := (&Config{Environment: env}).IsDev(); got != want {
+			t.Errorf("IsDev(%q) = %v, want %v", env, got, want)
+		}
 	}
 }
 
@@ -36,8 +57,8 @@ func TestProdAndOverrides(t *testing.T) {
 	t.Setenv("INTERNAL_SERVICE_SECRET", "  s3cr3t  ")
 	t.Setenv("OAUTH_TOKENS_VOLUME_NAME", "")
 	c := Load()
-	if !c.IsProd() {
-		t.Error("ENVIRONMENT=production ⇒ IsProd")
+	if c.IsDev() {
+		t.Error("ENVIRONMENT=production ⇒ not dev")
 	}
 	if c.Port != 6000 {
 		t.Errorf("Port = %d, want 6000", c.Port)

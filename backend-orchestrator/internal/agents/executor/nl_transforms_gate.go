@@ -489,3 +489,142 @@ func recommendType(name string) string {
 	}
 	return ""
 }
+
+// ---------------------------------------------------------------------------
+// MongoDB CDC / streaming mask block (KI-MONGO-CDC-MASK-SILENT-NOOP, issue #23
+// stop-gap).
+//
+// The CDC sink lands a MongoDB change event as a PACKED row, {_id, document},
+// with the whole source document nested under "document" (kafka-sink-worker
+// decodeMongoDocument). A consumer mask transform names a top-level column
+// ("email"), and the transform engine matches column keys exactly, so on a
+// packed row it matches nothing and the field lands in plaintext with no error.
+// Until the sink can mask inside the document, a MongoDB CDC/streaming run that
+// carries an enabled consumer mask is refused before any connector starts.
+// ---------------------------------------------------------------------------
+
+// mongoCDCMaskBlockKI is the stable marker the healer's diagnoser keys on
+// (pkg/diagnose RuleBasedDiagnoser → ActionEscalate).
+const mongoCDCMaskBlockKI = "KI-MONGO-CDC-MASK-SILENT-NOOP"
+
+// isMongoSourceFamily reports whether connectorType is any MongoDB alias. The
+// alias set mirrors the sink's isDocumentDBConnector ("mongodb", "mongo",
+// "mongodb-atlas", "atlas") plus the chat-handler spelling "mongodbatlas";
+// "_" is folded to "-" the same way the sink canonicalizes.
+func isMongoSourceFamily(connectorType string) bool {
+	t := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(connectorType)), "_", "-")
+	switch t {
+	case "mongodb", "mongo", "mongodb-atlas", "mongodbatlas", "atlas":
+		return true
+	}
+	return false
+}
+
+// isMaskTransformConfig reports whether a stored transform_config is a masking
+// transform ("mask" or "mask_pii", under "operation" or "type") — the aliases
+// transforms.NormalizeAndValidate folds to mask_pii.
+func isMaskTransformConfig(cfg map[string]any) bool {
+	for _, k := range []string{"operation", "type"} {
+		if s, ok := cfg[k].(string); ok {
+			switch strings.ToLower(strings.TrimSpace(s)) {
+			case "mask", "mask_pii":
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// maskTransformColumns returns the column NAMES a mask config targets
+// (column / field / columns). Names only, never values.
+func maskTransformColumns(cfg map[string]any) []string {
+	var out []string
+	for _, k := range []string{"column", "field"} {
+		if s, ok := cfg[k].(string); ok && strings.TrimSpace(s) != "" {
+			out = append(out, strings.TrimSpace(s))
+		}
+	}
+	if arr, ok := cfg["columns"].([]any); ok {
+		for _, v := range arr {
+			if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				out = append(out, strings.TrimSpace(s))
+			}
+		}
+	}
+	return out
+}
+
+// mongoCDCMaskBlockError returns a non-nil error when the run is a MongoDB
+// CDC/streaming run and the pipeline has at least one ENABLED consumer mask
+// transform. A DB error, or a stored config that cannot be parsed, fails closed
+// (a mask cannot be ruled out). The message carries column names only.
+//
+// It blocks masks scoped to any table, not only the selected ones (fail-closed).
+func (a *Agent) mongoCDCMaskBlockError(ctx context.Context, task ExecutorTask, syncMode string) error {
+	mode := strings.ToLower(strings.TrimSpace(syncMode))
+	if mode != "cdc" && mode != "streaming" {
+		return nil
+	}
+	if task.Source == nil || !isMongoSourceFamily(task.Source.Type) {
+		return nil
+	}
+	pipelineID := strings.TrimSpace(task.PipelineID)
+	// The sink loads consumer transforms only from the DB and only for UUID
+	// pipeline ids; with no DB handle or a non-UUID id it applies none.
+	if a.db == nil || !looksLikeUUID(pipelineID) {
+		return nil
+	}
+
+	failClosed := func(what string) error {
+		return fmt.Errorf("MongoDB CDC run refused: %s, so a mask cannot be ruled out (%s)", what, mongoCDCMaskBlockKI)
+	}
+	rows, err := a.db.QueryContext(ctx, `
+		SELECT transform_config
+		FROM transform_definitions
+		WHERE pipeline_id = $1 AND transform_type = 'consumer' AND enabled = TRUE
+		ORDER BY transform_order ASC
+	`, pipelineID)
+	if err != nil {
+		log.WithField("pipeline_id", pipelineID).Errorf("mongo CDC mask check: load consumer transforms: %v", err)
+		return failClosed("could not load the pipeline's transforms")
+	}
+	defer rows.Close()
+
+	masks := 0
+	seen := map[string]bool{}
+	columns := []string{}
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			log.WithField("pipeline_id", pipelineID).Errorf("mongo CDC mask check: scan transform row: %v", err)
+			return failClosed("could not read a transform row")
+		}
+		cfg := map[string]any{}
+		if len(raw) > 0 {
+			if err := json.Unmarshal(raw, &cfg); err != nil {
+				return failClosed("a stored transform config is unreadable")
+			}
+		}
+		if !isMaskTransformConfig(cfg) {
+			continue
+		}
+		masks++
+		for _, c := range maskTransformColumns(cfg) {
+			if key := strings.ToLower(c); !seen[key] {
+				seen[key] = true
+				columns = append(columns, c)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		log.WithField("pipeline_id", pipelineID).Errorf("mongo CDC mask check: iterate transforms: %v", err)
+		return failClosed("could not load the pipeline's transforms")
+	}
+	if masks == 0 {
+		return nil
+	}
+	return fmt.Errorf("MongoDB CDC/streaming cannot apply masking yet: %d enabled mask transform(s) on %v would land unmasked, "+
+		"because each document is written as one packed field. Refusing to run (%s). "+
+		"Remove the mask or run this pipeline in batch mode",
+		masks, columns, mongoCDCMaskBlockKI)
+}

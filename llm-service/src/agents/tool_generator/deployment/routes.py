@@ -34,6 +34,11 @@ logger = logging.getLogger(__name__)
 
 lifecycle_router = APIRouter(tags=["Connector Lifecycle"])
 
+# The only ENVIRONMENT values under which an unset INTERNAL_SERVICE_SECRET lets a
+# call through. Same set as shared/mcp-connectors/oauth/token_manager.py
+# _is_dev_env and connector-deployer config.IsDev.
+_DEV_ENVIRONMENTS = ("development", "dev")
+
 
 def require_internal_secret(
     x_internal_secret: Optional[str] = Header(default=None),
@@ -41,16 +46,19 @@ def require_internal_secret(
     """S2S gate: connector-lifecycle sits on rsync-ai-mcp with untrusted JIT
     connectors and holds docker.sock, so /v1/deploy can build+start containers.
     Mirror api-gateway InternalServiceMiddleware / orchestrator requirePrincipal.
-    No-op when INTERNAL_SERVICE_SECRET is unset in dev/e2e/OSS; enforced when set;
-    FAIL-CLOSED in production even if unset (an empty S2S secret must never leave
-    the docker.sock-backed /v1/deploy endpoint open to an unauthenticated caller
-    on rsync-ai-mcp). The prod compose also guards presence with ${...:?}; this is
+    Enforced when INTERNAL_SERVICE_SECRET is set. When it is unset the call is
+    let through ONLY if ENVIRONMENT is explicitly development/dev (the dev
+    compose); every other value -- production, staging, a typo, or ENVIRONMENT
+    missing altogether -- answers 503. It used to be the other way round (open
+    unless ENVIRONMENT said production), so a container started without
+    ENVIRONMENT left the docker.sock-backed /v1/deploy open to any caller on
+    rsync-ai-mcp. The prod compose also guards presence with ${...:?}; this is
     defense-in-depth for any other launch path.
     """
     secret = (os.getenv("INTERNAL_SERVICE_SECRET") or "").strip()
     if not secret:
         env = (os.getenv("ENVIRONMENT") or "").strip().lower()
-        if env in ("production", "prod"):
+        if env not in _DEV_ENVIRONMENTS:
             raise HTTPException(status_code=503, detail="internal_secret_not_configured")
         return
     if (x_internal_secret or "").strip() != secret:

@@ -34,10 +34,10 @@ const KIND_TEXT: Record<string, string> = {
 }
 
 const STATUS_BADGE: Record<string, { className: string; label: string; Icon: React.ElementType }> = {
-  complete: { className: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 border-green-300", label: "Complete", Icon: CheckCircle2 },
-  running: { className: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400 border-blue-300", label: "Running", Icon: Loader2 },
-  failed: { className: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400 border-red-300", label: "Failed", Icon: XCircle },
-  waiting: { className: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-400 border-amber-300", label: "Waiting", Icon: Clock },
+  complete: { className: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300 border-green-300", label: "Complete", Icon: CheckCircle2 },
+  running: { className: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300 border-blue-300", label: "Running", Icon: Loader2 },
+  failed: { className: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300 border-red-300", label: "Failed", Icon: XCircle },
+  waiting: { className: "bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300 border-amber-300", label: "Waiting", Icon: Clock },
   pending: { className: "bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400 border-zinc-300", label: "Pending", Icon: Clock },
 }
 
@@ -122,7 +122,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
                 className="bg-white dark:bg-zinc-900"
               />
             ) : (
-              <KindIconCmp className={cn("h-5 w-5", KIND_TEXT[kind] ?? "text-zinc-500")} />
+              <KindIconCmp className={cn("h-5 w-5", KIND_TEXT[kind] ?? "text-zinc-500 dark:text-zinc-400")} />
             )}
           </div>
           <div className="min-w-0">
@@ -135,7 +135,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
                 {statusInfo.label}
               </Badge>
               {kind && kind !== "default" && (
-                <span className={cn("text-[10px] uppercase tracking-wide font-medium", KIND_TEXT[kind] ?? "text-zinc-500")}>
+                <span className={cn("text-[10px] uppercase tracking-wide font-medium", KIND_TEXT[kind] ?? "text-zinc-500 dark:text-zinc-400")}>
                   {kind}
                 </span>
               )}
@@ -145,7 +145,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
         <button
           type="button"
           onClick={onClose}
-          className="shrink-0 p-1 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500"
+          className="shrink-0 p-1 rounded hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-500 dark:text-zinc-400"
           aria-label="Close"
         >
           <X className="h-4 w-4" />
@@ -179,7 +179,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
         {status === "running" && typeof stage.progress === "number" && stage.progress > 0 && (
           <div>
             <div className="flex items-center justify-between text-xs mb-1.5">
-              <span className="text-zinc-500">Progress</span>
+              <span className="text-zinc-500 dark:text-zinc-400">Progress</span>
               <span className="font-medium text-blue-600">{stage.progress}%</span>
             </div>
             <Progress value={stage.progress} />
@@ -189,7 +189,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
         {/* Result */}
         {stage.result_summary && (status === "complete" || status === "failed") && (
           <div className="rounded-md border border-zinc-200 dark:border-zinc-800 bg-zinc-50 dark:bg-zinc-800/40 p-3">
-            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1 flex items-center gap-1">
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1 flex items-center gap-1">
               <CheckCircle2 className="h-3 w-3" />
               Result
             </div>
@@ -215,7 +215,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
         {/* Timing */}
         {(startedAt || completedAt || durationMs !== null) && (
           <div>
-            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Timing</div>
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1.5">Timing</div>
             <div className="rounded-md border border-zinc-200 dark:border-zinc-800 px-3">
               {startedAt && <MetadataRow label="Started" value={formatDateTime(startedAt)} />}
               {completedAt && <MetadataRow label="Completed" value={formatDateTime(completedAt)} />}
@@ -237,7 +237,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
         {/* Configuration */}
         {(configEntries.length > 0 || connectorType) && (
           <div>
-            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Configuration</div>
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1.5">Configuration</div>
             <div className="rounded-md border border-zinc-200 dark:border-zinc-800 px-3">
               {connectorType && <MetadataRow label="Connector" value={connectorType} />}
               {configEntries.map(([k, v]) => (
@@ -250,7 +250,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
         {/* Other metadata */}
         {otherMetadata.length > 0 && (
           <div>
-            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Metadata</div>
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1.5">Metadata</div>
             <div className="rounded-md border border-zinc-200 dark:border-zinc-800 px-3">
               {otherMetadata.map(([k, v]) => (
                 <MetadataRow key={k} label={prettyKey(k)} value={String(v)} />
@@ -262,11 +262,11 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
         {/* Dependencies */}
         {(dependencies.length > 0 || downstream.length > 0) && (
           <div>
-            <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1.5">Connections</div>
+            <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1.5">Connections</div>
             <div className="space-y-2">
               {dependencies.length > 0 && (
                 <div>
-                  <div className="text-[11px] text-zinc-500 mb-1">Depends on</div>
+                  <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mb-1">Depends on</div>
                   <div className="flex flex-wrap gap-1.5">
                     {dependencies.map((depId) => {
                       const dep = allStages.find((s) => s.id === depId)
@@ -286,7 +286,7 @@ export function StageDetailPanel({ stage, allStages, onClose, onSelectStage }: S
               )}
               {downstream.length > 0 && (
                 <div>
-                  <div className="text-[11px] text-zinc-500 mb-1">Triggers</div>
+                  <div className="text-[11px] text-zinc-500 dark:text-zinc-400 mb-1">Triggers</div>
                   <div className="flex flex-wrap gap-1.5">
                     {downstream.map((d) => (
                       <button

@@ -246,3 +246,17 @@ describe("F-286 — changing the status filter returns to the first page", () =>
     expect(screen.queryByText(idCell(1))).toBeNull()
   })
 })
+
+describe("#56 retest — the Started time names its zone", () => {
+  it("renders the start as a <time> carrying the instant and a zone name", async () => {
+    listExecutionsResponse.mockResolvedValue({ executions: [exec(1, "completed")] })
+
+    const { container } = render(<ExecutionHistoryTab pipelineId="p1" />)
+    await waitFor(() => expect(screen.getByText(idCell(1))).toBeInTheDocument())
+
+    const started = container.querySelector('time[datetime="2026-08-05T10:00:00.000Z"]')
+    expect(started).not.toBeNull()
+    // "Aug 5, 10:00 AM UTC" / "GMT+2" / "IST" — whatever the viewer's zone, it is named.
+    expect(started!.textContent).toMatch(/\b(UTC|GMT[+-]?\d*|[A-Z]{2,5})\s*$/)
+  })
+})

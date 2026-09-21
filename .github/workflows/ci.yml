@@ -90,6 +90,17 @@ jobs:
               # below.
               - 'docker-compose.quickstart.yml'
               - 'docker-compose.mcp.yml'
+              # api-gateway's handlers/admin_drift_test.go reads these too: every
+              # deployment-drift target must name a host, port and /version route
+              # its service serves (the llm-service one lives in Python), and
+              # match config/services.yaml. Moving a port in one of these touches
+              # no Go file, and that is how the drift check probed a port nothing
+              # listened on.
+              - 'docker-compose.yml'
+              - 'docker-compose.prod.yml'
+              - 'docker-compose.staging.yml'
+              - 'config/services.yaml'
+              - 'llm-service/src/gateway/main.py'
               # Connector metadata is here for the same reason: the orchestrator's
               # registry tests (backend-orchestrator/internal/registry) load the real
               # connector tree and assert that every alias a connector declares
@@ -100,22 +111,53 @@ jobs:
               # is dead on its own subject and the job reports `skipping`, which
               # looks identical to a pass.
               - 'shared/mcp-connectors/**'
+              # backend-orchestrator/internal/storage/layout_test.go reads this
+              # fixture; a PR changing only the object-storage key contract must
+              # run it (same for the sink and llm filters below).
+              - 'shared/object_layout_golden.json'
+              # api-gateway validators/statement_class_golden_test.go reads this; the
+              # frontend filter below lists it too (the vitest copy reads it).
+              - 'shared/explorer_statement_class_golden.json'
+              # Duplicate-logic goldens, each pinned from both languages:
+              # security/masking_golden_test.go (gateway + orchestrator),
+              # executor/postgres_family_golden_test.go and
+              # handlers/data_loading_strategy_golden_test.go. The llm and frontend
+              # filters below list the ones their tests read.
+              - 'shared/sensitive_keys_golden.json'
+              - 'shared/postgres_family_golden.json'
+              - 'shared/data_loading_strategy_golden.json'
+              # pkg/namespacemodel/model_test.go and the frontend's
+              # namespaceModel.test.ts pin namespacemodel.For to the same cases.
+              - 'shared/namespace_model_golden.json'
               - '.github/workflows/ci.yml'
             go-shared:
               - 'shared/go/**'
               - '.github/workflows/ci.yml'
             # kafka-mcp-sink worker is its own Go module (NOT under shared/go,
-            # so neither the `go` nor `go-shared` matrix covers it). Trigger its
-            # dedicated job on the worker module itself AND on shared/go/transforms
+            # so neither the `go` nor `go-shared` module list covers it). Add it
+            # to the Go job on the worker module itself AND on shared/go/transforms
             # — the worker `replace`s that path, so a transforms API change can
             # break the sink build/tests and must be caught on the PR.
             sink:
               - 'shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/**'
               - 'shared/go/transforms/**'
+              # compression_default_test.go reads these to keep the sink's
+              # compression defaults in lockstep with the storage connectors'
+              # schema defaults; a PR changing only a schema must run it.
+              - 'shared/mcp-connectors/public/storage/*/latest.json'
+              - 'shared/mcp-connectors/public/storage/*/versions/*/metadata.json'
+              # object_layout_test.go pins the sink's key builders to this fixture.
+              - 'shared/object_layout_golden.json'
               - '.github/workflows/ci.yml'
             llm:
               - 'llm-service/**'
               - 'shared/mcp-connectors/**'
+              # tests/test_object_layout_golden.py pins rsync_protocol to it.
+              - 'shared/object_layout_golden.json'
+              # test_sensitive_keys_golden.py / test_postgres_family_golden.py pin
+              # the masking list and POSTGRES_FAMILY to these (Go reads them too).
+              - 'shared/sensitive_keys_golden.json'
+              - 'shared/postgres_family_golden.json'
               # The Helm chart is here because llm-service/tests holds the chart
               # guards (test_chart_service_hostnames_resolve.py,
               # test_chart_kafka_security_env.py) -- they parse deploy/helm as
@@ -139,16 +181,16 @@ jobs:
               # (or re-breaking) the script alone would skip the job.
               - 'scripts/mcp-connectors/**'
               # And the three Go service trees, for the same reason a fourth
-              # time. Two guards here read Go sources directly:
-              # test_chart_sets_every_service_url_env.py looks for env vars whose
-              # fallback is a bare compose service name and asserts the chart
-              # sets them -- and every instance of that defect ORIGINATED in a Go
-              # change, not a chart change; and
-              # test_failure_alerts_can_reach_a_self_host.py reads
-              # api-gateway/internal/notifier/notifier.go. Without these paths a
-              # PR touching only Go would skip llm-service-unit, so both guards
-              # would miss precisely the change they exist to catch -- and a
-              # skipped check reads as a passing one.
+              # time. test_chart_sets_every_service_url_env.py reads these
+              # sources to find env vars whose fallback is a bare compose
+              # service name, then asserts the chart sets them. Its subject is
+              # therefore Go code as much as the chart -- and every one of the
+              # four instances of that defect (KAFKA_CONNECT_URL,
+              # TOOL_GENERATOR_URL, LLM_SERVICE_URL/PLANNER_URL, the internal
+              # URL pairs) ORIGINATED in a Go change, not a chart change. Gated
+              # on 'deploy/helm/**' alone, the guard would skip on precisely the
+              # PR shape that introduces the bug: a new os.Getenv with a
+              # compose-shaped default and no chart edit.
               - 'api-gateway/**'
               - 'backend-orchestrator/**'
               - 'backend-temporal-adapter/**'
@@ -177,6 +219,19 @@ jobs:
               # test_mcp_compose_generation.py cross-checks against), so neither
               # is listed separately.
               - 'docker-compose*.yml'
+              # Same shape again -- and this one a census found rather than a
+              # reader. The compose glob above is anchored at the repo root, so
+              # the compose file under shared/internal/infra/kafka-connect/ --
+              # tracked, shipped, and read by test_shipped_images_are_pinned.py
+              # -- was matched by no pattern here. Two successive widenings of
+              # that guard's own pattern list had already missed it, which is
+              # why the guard now discovers compose files from `git ls-files`
+              # instead of from a list, and this path is what the discovery
+              # turned up. A directory glob rather than the one file, because
+              # the Dockerfile beside it is this component's build context and
+              # was equally uncovered.
+              - 'shared/internal/infra/kafka-connect/**'
+              - 'deploy/docker-compose.sidecar.yaml'
               - 'scripts/kafka-init-new-topics.sh'
               # A fourth time, same shape. test_mcp_compose_generation.py now reads
               # the release workflow's OWN connector pathspec and re-runs it
@@ -217,6 +272,10 @@ jobs:
               # security.yml, which CALLS them; it does not cover them.
               - 'scripts/summarize-sarif.sh'
               - 'scripts/report-sarif-sinks.sh'
+              # test_security_scan_scope.py drives this script, which picks the Go
+              # modules and files security.yml scans on a PR. Listed for the same
+              # reason as the two above: the security.yml glob does not cover it.
+              - 'scripts/security/ci-scan.py'
               # Same guard, third subject. test_retired_claims_are_not_quoted_verbatim
               # sweeps this report for two sentences retired from security.yml's
               # header, so the report is an INPUT to the guard and has to be able to
@@ -286,6 +345,10 @@ jobs:
               # references in the last alone). It matched no pattern here, so an
               # install.sh-only PR ran none of them.
               - 'install.sh'
+              # install-k8s.sh is the Kubernetes counterpart and has its own guard
+              # (test_install_k8s_defaults_work.py), which also compares its embedded
+              # connector list with shared/mcp-connectors/public/**/latest.json.
+              - 'install-k8s.sh'
               - 'scripts/mcp_generate_compose.py'
               # An eighth time, and the two paths are a matched pair rather than two
               # separate subjects. test_chart_waits_for_the_dependency_that_is_fatal_to_miss.py
@@ -336,12 +399,35 @@ jobs:
               # llm-service-unit and reported green.
               - 'e2e/**'
               - 'tests/**'
+              # A twelfth time, same shape, and this one is a Go file guarded
+              # from Python. test_insecure_token_endpoint_rule_is_one_rule.py
+              # holds ALL EIGHT places that decide whether a plain-http Kafka
+              # OAuth token endpoint is refused to one rule -- the Go tier, the
+              # Python tier, the Debezium connector, the Connect entrypoint, the
+              # kafka-init script, the quickstart compose and two chart
+              # templates. Seven are matched above; shared/go/kafkaclient is not
+              # under any pattern here, and it is the tier the rule was written
+              # in first. A PR that deleted the refusal from config.go alone --
+              # the single edit that re-opens the hole this guard exists to
+              # close -- would have skipped llm-service-unit and reported green.
+              - 'shared/go/kafkaclient/**'
             e2e:
               - 'e2e/_support/**'
               - '.github/workflows/ci.yml'
             frontend:
               - 'frontend/**'
-
+              # statementClassGolden.test.ts pins the Explorer classifier to the
+              # api-gateway's; a PR changing only the shared fixture must run it.
+              - 'shared/explorer_statement_class_golden.json'
+              # dataLoadingStrategyGolden.test.ts pins computeStrategySteps to the
+              # api-gateway's step builder the same way.
+              - 'shared/data_loading_strategy_golden.json'
+              # namespaceModel.test.ts pins the frontend's namespace lookup to
+              # backend-orchestrator/pkg/namespacemodel the same way, and builds
+              # its models from every connector's latest.json + metadata.json.
+              - 'shared/namespace_model_golden.json'
+              - 'shared/mcp-connectors/**/latest.json'
+              - 'shared/mcp-connectors/**/versions/*/metadata.json'
   # Deliberately NOT behind `needs: changes`. It is a sub-second pure-grep check, and
   # a paths-filter that excluded the very file it protects is exactly how
   # KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW happened. Running it unconditionally
@@ -360,28 +446,36 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: ./scripts/check-env-templates.sh
 
+  # ONE job for every Go module, not a job per module. This used to be three
+  # jobs -- a 4-way `go` matrix, a 5-way `go-shared` matrix and `sink-worker`
+  # -- so a push touching all three areas asked for ten runners, each spending
+  # more time on checkout + setup-go than on its tests. Four runners serve
+  # every workflow in this repo, so in a burst those ten small jobs were the
+  # ones still waiting at the end: in runs 35227539603, 35230181816 and
+  # 35227063653 each Go module job took 11-36 s, but started 36-70 min after
+  # the run's first job. One job asks for one runner.
+  #
+  # The three change-detection outputs still decide what runs: the module
+  # list below is built from them, so a sink-only PR still does not rebuild
+  # the service modules. Every selected module runs even after one fails
+  # (the matrices' fail-fast: false), and the job fails at the end naming each.
   go:
-    name: Go (${{ matrix.module }})
+    name: Go
     needs: changes
-    if: ${{ (needs.changes.outputs.go == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ (needs.changes.outputs.go == 'true' || needs.changes.outputs.go-shared == 'true' || needs.changes.outputs.sink == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        module:
-          - api-gateway
-          - backend-orchestrator
-          - backend-temporal-adapter
-          # SEC-H-02: the trusted socket-holder that replaces tool-generator's raw
-          # docker.sock access. Own Go module (github.com/rsync-ai/connector-deployer)
-          # — build + vet it here so a change can't ship unbuilt/unscanned.
-          - connector-deployer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # The job's own Go is api-gateway's toolchain. A module that declares a
+      # different `toolchain` in its go.mod still gets exactly that one: the
+      # loop below sets GOTOOLCHAIN per module, and the go command downloads
+      # it into the module cache on first use. A module with no `toolchain` line
+      # (correlation, crypto, naming, transforms) runs on this job's Go -- the
+      # toolchain the services that compile it are built with -- rather than
+      # the newest 1.23.x / 1.24.x its `go` line would otherwise resolve to.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version-file: ${{ matrix.module }}/go.mod
-          cache-dependency-path: ${{ matrix.module }}/go.sum
+          go-version-file: api-gateway/go.mod
           # Disable setup-go's built-in auto-cache. It saves the entire global
           # ~/go/pkg/mod (~2.95 GB) at job end via a "Post Run" step, and
           # nothing here restores a Go cache either -- see the note below -- so
@@ -414,8 +508,34 @@ jobs:
       # measured key is the opposite failure -- a warm-looking job restoring a
       # stale tree. Measure before adding one. Do not add one merely because
       # this comment no longer forbids it.
+      #
+      # Why each module is on its list:
+      # - connector-deployer (SEC-H-02): the trusted socket-holder that replaces
+      #   tool-generator's raw docker.sock access. Own Go module
+      #   (github.com/rsync-ai/connector-deployer), tested here so a change
+      #   can't ship unbuilt/unscanned.
+      # - shared/go/naming: consumed by api-gateway + orchestrator via
+      #   `replace`, but `replace` only builds it, it never runs the module's
+      #   *_test.go. Its tests (ValidateNamespace / IsSuspiciousIdentifier)
+      #   gatekeep destination namespace/identifier safety, a data path. No
+      #   go.sum (no external deps); the go-shared filter covers shared/go/**.
+      # - shared/go/pgdriver: the pgx shim every Go service reaches PostgreSQL
+      #   through (#830). Same reason as naming. Leaving it out would mean
+      #   preprotocol_dos_test.go -- the regression test for GO-2026-6173, the
+      #   advisory the whole module exists to close -- never ran in CI.
+      # - shared/go/kafkaclient: every Go service's Kafka config, TLS and SASL
+      #   (FromEnvForService). Same reason again: four modules `replace` it, so
+      #   it was built on every Go PR while its own config/auth tests never ran.
+      # - the kafka-mcp-sink worker is its own module outside both lists above,
+      #   so its data-critical unit tests (table normalization, namespace
+      #   routing, CDC/batch message parsing, DLQ handling) otherwise never
+      #   run. It `replace`s ../../../../go/transforms; actions/checkout pulls
+      #   the whole repo so that relative path resolves.
       - name: go test (includes build + vet via compiler)
-        working-directory: ${{ matrix.module }}
+        env:
+          SERVICES: ${{ needs.changes.outputs.go }}
+          SHARED: ${{ needs.changes.outputs.go-shared }}
+          SINK: ${{ needs.changes.outputs.sink }}
         # `go test ./...` compiles every package, so the explicit
         # `go build` + `go vet` steps that used to run before were
         # redundant — `go test` already runs the same compile checks
@@ -430,77 +550,30 @@ jobs:
         # belongs in its own PR that can be judged on the races it finds --
         # bundled into a runner move, a red job would be indistinguishable
         # from a broken split.
-        run: go test -timeout 5m ./...
-
-  go-shared:
-    name: Go shared modules
-    needs: changes
-    if: ${{ (needs.changes.outputs.go-shared == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        module:
-          - shared/go/correlation
-          - shared/go/crypto
-          - shared/go/transforms
-          # Own Go module (github.com/rsync-ai/shared/naming), consumed by
-          # api-gateway + orchestrator via `replace` — but `replace` only builds
-          # it, it never runs the module's *_test.go. Its tests (ValidateNamespace /
-          # IsSuspiciousIdentifier) gatekeep destination namespace/identifier
-          # safety, a data path, so they must run in CI. No go.sum (no external
-          # deps); the go-shared paths-filter already covers shared/go/**.
-          - shared/go/naming
-          # The pgx shim every Go service reaches PostgreSQL through (#830).
-          # Same reason as naming: the services consume it via `replace`, which
-          # builds the package but never runs its *_test.go. Leaving it out would
-          # mean preprotocol_dos_test.go — the regression test for GO-2026-6173,
-          # the advisory the whole module exists to close — never ran in CI, and
-          # a silent driver regression is exactly what it is there to catch.
-          - shared/go/pgdriver
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: ${{ matrix.module }}/go.mod
-          cache-dependency-path: ${{ matrix.module }}/go.sum
-          cache: false  # see go job above for why auto-cache is disabled
-      # No actions/cache — see go job above, including why that job's reason
-      # for having none did not survive the move to ephemeral runners.
-      - name: go test (includes build via compiler)
-        working-directory: ${{ matrix.module }}
-        # `go test ./...` runs the compiler so the prior explicit
-        # `go build` step was redundant. Dropped to save a clean
-        # rebuild per job. Same -race / LC_UUID note as the main
-        # go matrix above.
-        run: go test -timeout 5m ./...
-
-  # The kafka-mcp-sink worker is a SEPARATE Go module
-  # (shared/mcp-connectors/internal/kafka-mcp-sink/worker-src) that lives outside
-  # both Go matrices above, so its data-critical unit tests — table normalization,
-  # namespace routing, CDC/batch message parsing, DLQ handling — never ran in CI
-  # and only executed when a dev ran `go test` locally. Dedicated job (not folded
-  # into the `go` matrix) so a sink-only PR doesn't drag in a rebuild of the three
-  # big service modules, honoring this workflow's per-area change-detection design.
-  sink-worker:
-    name: Go (kafka-mcp-sink worker)
-    needs: changes
-    if: ${{ (needs.changes.outputs.sink == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/go.mod
-          cache-dependency-path: shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/go.sum
-          cache: false  # see go job above for why auto-cache is disabled
-      # No actions/cache — see go job above, including why that job's reason
-      # for having none did not survive the move to ephemeral runners.
-      - name: go test (includes build via compiler)
-        # The worker `replace`s ../../../../go/transforms (shared/go/transforms);
-        # actions/checkout pulls the whole repo so that relative path resolves.
-        working-directory: shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
-        run: go test -timeout 5m ./...
+        run: |
+          modules=""
+          if [ "$SERVICES" = true ]; then
+            modules="$modules api-gateway backend-orchestrator backend-temporal-adapter connector-deployer"
+          fi
+          if [ "$SHARED" = true ]; then
+            modules="$modules shared/go/correlation shared/go/crypto shared/go/transforms shared/go/naming shared/go/pgdriver shared/go/kafkaclient"
+          fi
+          if [ "$SINK" = true ]; then
+            modules="$modules shared/mcp-connectors/internal/kafka-mcp-sink/worker-src"
+          fi
+          failed=""
+          for m in $modules; do
+            tc=$(awk '$1 == "toolchain" { print $2; exit }' "$m/go.mod")
+            echo "::group::go test $m (${tc:-$(go env GOVERSION)})"
+            if ! (cd "$m" && GOTOOLCHAIN="${tc:-local}" go test -timeout 5m ./...); then
+              failed="$failed $m"
+            fi
+            echo "::endgroup::"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error title=go test failed::$failed"
+            exit 1
+          fi
 
   llm-service-unit:
     name: llm-service unit tests
@@ -567,8 +640,41 @@ jobs:
           # (~450MB each, and Dependabot moves this file most weeks). Drop the
           # stale ones, never the current one -- an untouched dir may still be
           # the live venv of an open PR whose deps have not changed in a while.
-          find "$HOME/.venvs" -maxdepth 1 -type d -name 'llm-ci-*' \
-            ! -name 'llm-ci-${{ hashFiles('llm-service/requirements.txt') }}' -mtime +14 -print -exec rm -rf {} + 2>/dev/null || true
+          # Not only directories: each venv's `.complete` marker (see the reuse
+          # step below) sits next to it and goes stale with it.
+          find "$HOME/.venvs" -maxdepth 1 -name 'llm-ci-*' \
+            ! -name 'llm-ci-${{ hashFiles('llm-service/requirements.txt') }}' \
+            ! -name 'llm-ci-${{ hashFiles('llm-service/requirements.txt') }}.complete' \
+            -mtime +14 -print -exec rm -rf {} + 2>/dev/null || true
+      # Reuse the venv this runner's disk already holds, and skip the GitHub
+      # cache restore below. The venv lives outside the workspace, so on a
+      # persistent runner it is normally already here and complete; restoring
+      # the cache anyway re-extracted ~450MB of identical bytes over it (31 s
+      # per job, measured) -- and over the site-packages of any concurrent job
+      # with the same hash that was mid-test at the time.
+      #
+      # "Complete" is a marker file written only after the venv was restored or
+      # fully installed (the "Mark this venv complete" step below). It sits NEXT
+      # TO the venv, not inside it, so it never enters the cached tarball. A
+      # venv without one -- a job with this hash still installing into it, or
+      # an install that died halfway -- takes the cache/install path exactly as
+      # before, and the import check catches a venv deleted from under its
+      # marker. Deleting a marker sends that venv back through the cache path
+      # once; deleting the directory and its marker rebuilds it.
+      #
+      # Only where a runner persists: a GitHub-hosted runner starts empty, so
+      # there it would only ever find nothing.
+      - name: Reuse the venv already on this runner's disk
+        id: venv-local
+        if: runner.environment == 'self-hosted'
+        run: |
+          v="$HOME/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}"
+          if [ -f "$v.complete" ] && "$v/bin/python" -c 'import pytest' 2>/dev/null; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+            echo "Reusing $v (complete since $(date -r "$v.complete" '+%Y-%m-%d %H:%M'))"
+          else
+            echo "No complete venv at $v -- restoring from the cache or installing."
+          fi
       # CI SPEEDUP: cache the entire installed venv, not just pip wheels.
       # The old pip-wheel cache still required dep resolution + extraction
       # on every run (~5-7 min). Caching the venv directly reduces to a
@@ -599,12 +705,13 @@ jobs:
       # still skips that step and keeps the ~5s restore.
       - name: Cache Python venv
         id: venv-cache
+        if: steps.venv-local.outputs.ready != 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}
           key: ${{ runner.os }}-venv-llm-${{ hashFiles('llm-service/requirements.txt') }}
       - name: Install dependencies
-        if: steps.venv-cache.outputs.cache-hit != 'true'
+        if: steps.venv-local.outputs.ready != 'true' && steps.venv-cache.outputs.cache-hit != 'true'
         working-directory: llm-service
         run: |
           PY=python3
@@ -629,6 +736,9 @@ jobs:
           "$VPY" -m pip install --upgrade pip
           "$VPY" -m pip install -r requirements.txt
           "$VPY" -m pip install pytest pytest-asyncio
+      - name: Mark this venv complete
+        if: runner.environment == 'self-hosted' && steps.venv-local.outputs.ready != 'true'
+        run: touch "$HOME/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}.complete"
       - name: Install connector test drivers
         # Test-only DB drivers NOT in llm-service/requirements.txt — each connector ships
         # its own driver in its own image and llm-service never imports them, so they don't
@@ -1114,8 +1224,14 @@ jobs:
       # CI SPEEDUP: cache the installed `frontend/node_modules` tree.
       # Caching node_modules directly + a hash on package-lock.json
       # cuts install to a few seconds on cache hit.
+      #
+      # GitHub-hosted runners only. On a self-hosted runner this restore took
+      # ~49 s at the cache backend's 1-6 MB/s, while `npm ci` from the ~/.npm
+      # already on that runner's disk takes ~11 s (both measured 2026-09-18),
+      # so there the step is skipped and the install below always runs.
       - name: Cache node_modules
         id: nm-cache
+        if: runner.environment != 'self-hosted'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: frontend/node_modules
@@ -1145,14 +1261,54 @@ jobs:
       # min to ~60-90s. Key includes package-lock so a dep bump forces a
       # cold build (new JS bundles). runner.os is implicit in the runner
       # label but explicit here for clarity.
+      #
+      # Keyed on the lockfile ONLY (2026-09-18). The key also carried a hash of
+      # every frontend/src .ts/.tsx file, so nearly every run missed the primary
+      # key and the post-job step uploaded a fresh copy of the cache: `Post Cache
+      # Next.js build cache` took a median 206 s (max 550 s) over the 16 runs
+      # measured, against a 37 s restore. A primary-key hit skips that upload,
+      # so now it is saved once per lockfile per branch scope. The cost: the
+      # restored cache ages as src changes until the next lockfile bump, and
+      # Next.js rebuilds whatever it no longer matches -- still warm, never wrong.
+      #
+      # GitHub-hosted runners only. A self-hosted runner keeps its own copy on
+      # its own disk instead -- the next step and the "Keep" step after the
+      # build. Measured 2026-09-18: this restore took 31-40 s and its upload
+      # 256 s, for a cache an APFS clone copies in 0.01 s; a warm build takes
+      # 9 s against 36 s cold.
       - name: Cache Next.js build cache
+        if: runner.environment != 'self-hosted'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: frontend/.next/cache
-          key: ${{ runner.os }}-nextjs-${{ hashFiles('frontend/package-lock.json') }}-${{ hashFiles('frontend/src/**/*.ts', 'frontend/src/**/*.tsx') }}
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('frontend/package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-nextjs-${{ hashFiles('frontend/package-lock.json') }}-
             ${{ runner.os }}-nextjs-
+      # What a self-hosted runner does instead of the step above: restore the
+      # last successful build's .next/cache, kept under
+      # ~/.cache/rsync-ci/<runner name>/.
+      # Per runner, because runner installs on one host can share a $HOME, and
+      # two jobs building at once must never write the same directory; one
+      # runner runs one job at a time. `cp -c` clones on APFS, so the copy is
+      # free whatever its size. A missing or failed copy only means a cold
+      # build, so neither this step nor the Keep step can fail the job.
+      - name: Restore Next.js build cache (this runner's disk)
+        if: runner.environment == 'self-hosted'
+        continue-on-error: true
+        run: |
+          d="$HOME/.cache/rsync-ci/$RUNNER_NAME/nextjs"
+          if [ ! -d "$d" ]; then
+            echo "No Next.js cache on this runner yet; building cold."
+            exit 0
+          fi
+          mkdir -p frontend/.next
+          rm -rf frontend/.next/cache
+          if cp -cR "$d" frontend/.next/cache; then
+            echo "Restored $(du -sm frontend/.next/cache | cut -f1) MB from $d"
+          else
+            rm -rf frontend/.next/cache
+            echo "::warning title=Next.js cache::copy from $d failed; building cold"
+          fi
       # CI SPEEDUP: run lint in the background while Next.js build compiles.
       # Lint is CPU-light (ESLint pass) and finishes well before the build.
       # Both must succeed; if lint fails its exit code surfaces at `wait`.
@@ -1167,6 +1323,36 @@ jobs:
           LINT_PID=$!
           npm run build
           wait $LINT_PID
+      # Keep this build's .next/cache for the next job on this runner: only
+      # after a successful build, and through a temp dir + rename so the kept
+      # copy is never a partial one. Capped at 2 GB -- past that it is dropped,
+      # and the next build starts cold and small again.
+      - name: Keep Next.js build cache (this runner's disk)
+        if: runner.environment == 'self-hosted'
+        continue-on-error: true
+        run: |
+          d="$HOME/.cache/rsync-ci/$RUNNER_NAME/nextjs"
+          src=frontend/.next/cache
+          if [ ! -d "$src" ]; then
+            echo "The build left no .next/cache; nothing to keep."
+            exit 0
+          fi
+          mb=$(du -sm "$src" | cut -f1)
+          if [ "$mb" -gt 2048 ]; then
+            echo "::warning title=Next.js cache::.next/cache is ${mb} MB (over 2048); dropping this runner's copy"
+            rm -rf "$d"
+            exit 0
+          fi
+          mkdir -p "$(dirname "$d")"
+          rm -rf "$d.new"
+          if cp -cR "$src" "$d.new"; then
+            rm -rf "$d"
+            mv "$d.new" "$d"
+            echo "Kept ${mb} MB at $d"
+          else
+            rm -rf "$d.new"
+            echo "::warning title=Next.js cache::copy to $d failed; the next build on this runner starts cold"
+          fi
       - name: Archive build output
         # Only the frontend-a11y job consumes this artifact, and it runs
         # nightly/manual only (schedule || workflow_dispatch). Gate the archive +

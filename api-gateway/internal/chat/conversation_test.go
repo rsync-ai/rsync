@@ -184,7 +184,13 @@ func TestNormalizeConnectorName(t *testing.T) {
 		{"mongo", "mongodb"},
 		{"gcs", "google-cloud-storage"},
 		{"bq", "bigquery"},
-		{"es", "elasticsearch"},
+		// "es" -> "elasticsearch" was REMOVED. No connector in
+		// shared/mcp-connectors is named or aliased elasticsearch -- the alias
+		// normalised a user's message onto a connector that has never existed, so
+		// anything built from it could not resolve. It passes through untouched
+		// now, like any other unknown name; TestEveryNormalizerTargetHasAConnector
+		// is what stops the next invented target.
+		{"es", "es"},
 		{"mssql", "sqlserver"},
 		{"sql-server", "sqlserver"},
 

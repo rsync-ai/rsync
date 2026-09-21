@@ -24,18 +24,52 @@ name: Security
 # /usr/local/bin, and gitleaks runs from its multi-arch Docker image.
 #
 # Gate policy:
-#   * BLOCKING  -> gitleaks (no new secrets) + govulncheck (no new REACHABLE
-#                  Go vuln). Both are currently GREEN, so they only fail on a
-#                  NEW problem — a real merge gate with ~zero false positives.
-#   * REPORTING -> gosec / Semgrep / Trivy upload SARIF to the code-scanning
-#                  ("Security") tab and never block (there is a pre-existing
-#                  backlog of SAST smells; blocking on them would wedge every
-#                  PR). Triage them from the Security tab over time.
-#   * LICENSE   -> trivy-license classifies EVERY dependency's REAL license
-#                  (the scanner behind licenses.yml's fast name-grep denylist).
-#                  Lands non-blocking to calibrate noise against /.trivyignore;
-#                  flip to blocking by deleting its `continue-on-error: true`.
-# Flip a REPORTING job to blocking by removing its `continue-on-error: true`.
+#   * BLOCKING  -> gitleaks (no new secrets), govulncheck (no new REACHABLE Go
+#                  vuln) and the license gate at the end of the `trivy` job (no
+#                  new strong-copyleft dependency). All three are GREEN, so they
+#                  fail only on a NEW problem — a real merge gate with ~zero
+#                  false positives.
+#   * REPORTING -> gosec / Semgrep / Trivy's vuln+IaC+secret scan write SARIF and
+#                  never block (there is a pre-existing backlog of SAST smells;
+#                  blocking on them would wedge every PR). gosec and Semgrep are
+#                  job-level `continue-on-error: true`; flip one to blocking by
+#                  deleting that line. The Trivy scan cannot fail its job because
+#                  it runs `--exit-code 0` -- the job itself has no
+#                  continue-on-error, since the license gate in it must block.
+#
+# Five jobs, scoped to the change (2026-09-18). This file used to fan out into
+# 14 jobs per push: govulncheck and gosec once per Go module (6 + 4), plus a
+# separate Trivy job for licenses. Each of those legs scanned for 2-5 s and
+# spent ~30 s on checkout, toolchain setup and uploads, and every leg queued for
+# a runner behind ci.yml -- the job count was the cost, not the scanning.
+#   * govulncheck and gosec are ONE job each, looping over the modules with the
+#     toolchain each module's go.mod pins (`toolchain`, else setup-go's).
+#   * On a pull_request they scan only the modules the PR touches. A module is
+#     touched by a change under it OR under any local `replace` target it
+#     compiles in, followed transitively, so a change to shared/go/pgdriver
+#     re-scans every service built on it. When the PR's file list cannot be
+#     read, everything is scanned.
+#   * Semgrep on a pull_request scans only the PR's changed files.
+#   * A PR that changes this file or scripts/security/ci-scan.py (which does
+#     the selecting) scans every module and the whole tree, so an edit to a
+#     scan is proven on everything that scan covers.
+#   * push to main, the nightly schedule and workflow_dispatch scan everything.
+#   * Trivy's license gate is the last step of the `trivy` job, not a job.
+#
+# What that trades away, on purpose: a CVE published against a module a PR does
+# not touch no longer turns that PR red. It turns the next push to main -- or
+# the nightly run, whichever comes first -- red instead, which is why the
+# schedule moved from weekly to nightly. The flip side is the old behaviour's
+# cost: an unrelated PR blocked on a vulnerability it did not introduce.
+#
+# Code-scanning upload is gated on the repository variable
+# CODE_SCANNING_ENABLED == 'true' (Settings -> Secrets and variables -> Actions
+# -> Variables). GHAS is OFF for this private repo (see below), so each upload
+# was a ~17 s call that could only fail. The sink report still prints `skipped`
+# for code scanning in every job summary, so the gap stays visible. Set the
+# variable when code scanning is turned on, or on the public repo after the
+# flip. A PR's scoped scan is never uploaded even then: code scanning would read
+# every finding in the modules or files it skipped as fixed.
 #
 # 2026-08-24: the REPORTING tier had been delivering its findings NOWHERE, and
 # said so in a way nothing was reading. `actions: read` was missing from the
@@ -94,11 +128,13 @@ name: Security
 # The three post-scan steps in each reporting job are `if: ${{ !cancelled() }}`,
 # deliberately NOT `always()`. `cancel-in-progress: true` below means a second
 # push to a PR branch cancels the run in flight, and `always()` RUNS on
-# cancellation -- so `always()` would make every superseded run stamp four gosec
-# jobs + semgrep + trivy with a red security annotation blaming GHAS and billing
+# cancellation -- so `always()` would make every superseded run stamp gosec,
+# semgrep and trivy with a red security annotation blaming GHAS and billing
 # for a cancellation, and would run `summarize-sarif.sh` against a SARIF the
 # cancelled scanner never wrote (exit 2: "the scanner produced no SARIF").
 # `!cancelled()` is GitHub's documented spelling for "everything except that".
+# They also skip when the scope step selected nothing to scan, since no scanner
+# ran to write a SARIF.
 
 on:
   pull_request:
@@ -109,7 +145,7 @@ on:
   push:
     branches: [main]
   schedule:
-    - cron: '0 8 * * 1'   # Mondays 08:00 UTC — weekly full-tree sweep
+    - cron: '0 8 * * *'   # daily 08:00 UTC — full-tree sweep; catches new CVEs a scoped PR scan no longer does
   workflow_dispatch:
 
 concurrency:
@@ -125,6 +161,8 @@ permissions:
   # -- and died SILENTLY, because that step is continue-on-error, so the step
   # reported conclusion=success while its real outcome was failure.
   actions: read
+  # Also read by scripts/security/ci-scan.py, which lists a PR's changed files
+  # (GET /repos/{o}/{r}/pulls/{n}/files) to scope the scans.
   pull-requests: read
 
 jobs:
@@ -156,111 +194,202 @@ jobs:
         run: ./scripts/check-gitleaks-allowlist.sh
 
   govulncheck:
-    name: govulncheck (${{ matrix.module }})
+    name: govulncheck
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        module:
-          - api-gateway
-          - backend-orchestrator
-          - backend-temporal-adapter
-          # SEC-H-02 trusted socket-holder (holds docker.sock) — a NEW reachable
-          # Go vuln here must block, same as the three big service modules.
-          - connector-deployer
-          # The CDC sink worker. It was absent from this matrix until #830 and
-          # so had never been scanned once: the first run found 27 reachable
-          # vulns, most of them stdlib ones the other modules never had, because
-          # its go.mod carried no `toolchain` directive and setup-go therefore
-          # analyzed it against whatever stdlib the runner happened to have. It
-          # holds DB credentials and consumes attacker-influenced Kafka payloads,
-          # so it belongs here exactly as much as the services do.
-          - shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
-          # The shared PostgreSQL driver shim. Its own graph is much smaller than
-          # the services that import it, and MVS hides that: a vulnerable version
-          # here is invisible from every service module whose graph happens to
-          # pull a newer one. #830 found exactly that — a reachable x/text
-          # infinite-loop on the SCRAM password-normalization path that all four
-          # service modules reported clean.
-          - shared/go/pgdriver
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Choose modules to scan
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # The modules, and why each one is here:
+        #   * api-gateway, backend-orchestrator, backend-temporal-adapter -- the
+        #     three service modules.
+        #   * connector-deployer -- SEC-H-02 trusted socket-holder (holds
+        #     docker.sock); a NEW reachable Go vuln here must block, same as the
+        #     services.
+        #   * kafka-mcp-sink/worker-src -- the CDC sink worker. It was absent from
+        #     this list until #830 and so had never been scanned once: the first
+        #     run found 27 reachable vulns, most of them stdlib ones the other
+        #     modules never had, because its go.mod carried no `toolchain`
+        #     directive and it was analyzed against whatever stdlib the runner
+        #     happened to have. It holds DB credentials and consumes
+        #     attacker-influenced Kafka payloads.
+        #   * shared/go/pgdriver -- the shared PostgreSQL driver shim. Its own
+        #     graph is much smaller than the services that import it, and MVS
+        #     hides that: a vulnerable version here is invisible from every
+        #     service module whose graph happens to pull a newer one. #830 found
+        #     exactly that -- a reachable x/text infinite-loop on the SCRAM
+        #     password-normalization path that all four service modules reported
+        #     clean.
+        run: |
+          PY=/opt/homebrew/opt/python@3.11/bin/python3.11; [ -x "$PY" ] || PY=python3
+          "$PY" scripts/security/ci-scan.py go-modules \
+            api-gateway \
+            backend-orchestrator \
+            backend-temporal-adapter \
+            connector-deployer \
+            shared/mcp-connectors/internal/kafka-mcp-sink/worker-src \
+            shared/go/pgdriver
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        if: ${{ steps.scope.outputs.modules != '' }}
         with:
-          go-version-file: ${{ matrix.module }}/go.mod
+          go-version-file: api-gateway/go.mod
           cache: false   # setup-go auto-cache uploads ~3GB per job for no gain here (ci.yml convention)
       # Reachability-based: only fails when the vulnerable symbol is actually
-      # called. setup-go honors the go.mod `toolchain` directive (go1.26.8 for
-      # the three services, go1.25.13 for the other modules), so this analyzes
-      # against the PATCHED stdlib — matching the Docker base.
-      # A NEW stdlib CVE surfaces here until the toolchain pin is bumped.
+      # called. Each module is analyzed with GOTOOLCHAIN=<its toolchain>+auto,
+      # the toolchain its go.mod pins (go1.26.8 for the three services, go1.25.13
+      # for the other modules), so the stdlib analyzed is the PATCHED one the
+      # Docker base ships. A NEW stdlib CVE surfaces here until the pin is bumped.
+      # A module with no `toolchain` line runs on setup-go's toolchain (`local`,
+      # the go1.26.8 api-gateway pins), as ci.yml's Go job does. Its `go` line
+      # is NOT a toolchain name: `go 1.23` gives `go1.23`, which go refuses
+      # ("go1.23 is a language version but not a toolchain version"), and this
+      # step used to build exactly that name. No module on the list has hit it,
+      # since all six pin a toolchain; shared/go/{correlation,crypto,naming,
+      # transforms} (go 1.23/1.24, no pin) would the day they are added.
       # A module MAY carry a `.govulncheck-allow.txt` listing GO-XXXX-XXXX IDs it
       # consciously accepts (with justification in that file). The gate still fails
       # on ANY reachable vuln NOT listed there, so new/other/fixable vulns block.
       # Modules without the file (the three big services) block on everything.
+      #
+      # Every module is scanned even after one fails, so one run reports them all.
+      # A non-zero exit that names no GO- ID is a TOOL failure (a build error, a
+      # toolchain download that failed) and fails the gate: before this, the
+      # `|| true` let a govulncheck that never analyzed anything pass as clean.
+      # That had already happened (2026-09-18): golang.org/x/vuln v1.8.0 needs go
+      # >= 1.26, and the old per-module job ran with GOTOOLCHAIN=local, so for
+      # connector-deployer, worker-src and pgdriver (go1.25.13) `go run` printed
+      # "requires go >= 1.26.0 ... GOTOOLCHAIN=local" and the job said "govulncheck
+      # OK" (run 35242937434). The `+auto` here lets go fetch 1.26 to BUILD the
+      # tool; the analysis still uses the module's pin (govulncheck -format json
+      # reports "go_version": "go1.25.13" for them).
+      # `set -o pipefail` is what lets that check see the exit code at all: the
+      # step runs under `bash -e`, so `( go run ... ) | tee` exits with TEE's
+      # status, rc stayed 0 and the check never fired. Until 2026-09-18 a
+      # govulncheck that could not start (the invalid `go1.23` toolchain above)
+      # still printed "govulncheck OK".
+      #
+      # `remove-matcher owner=go`: setup-go registers a problem matcher that reads
+      # any `<x>.go:<line>:<col>: <msg>` line as an error, and govulncheck's call
+      # traces are exactly that shape. connector-deployer's ACCEPTED findings
+      # print ~90 of them, which put 10 `failure` annotations on a green check
+      # (PR #1067's first run). The gate's real verdicts come from the ::error
+      # lines this loop writes itself.
       - name: govulncheck
-        working-directory: ${{ matrix.module }}
+        if: ${{ steps.scope.outputs.modules != '' }}
+        env:
+          MODULES: ${{ steps.scope.outputs.modules }}
         run: |
           set -o pipefail
-          go run golang.org/x/vuln/cmd/govulncheck@latest ./... | tee govulncheck.out || true
-          reachable=$(grep -oE 'GO-[0-9]{4}-[0-9]+' govulncheck.out | sort -u || true)
-          allow=""
-          if [ -f .govulncheck-allow.txt ]; then
-            allow=$(grep -oE 'GO-[0-9]{4}-[0-9]+' .govulncheck-allow.txt | sort -u || true)
-          fi
-          unexpected=$(comm -23 <(printf '%s\n' "$reachable" | grep -v '^$') <(printf '%s\n' "$allow" | grep -v '^$') || true)
-          if [ -n "$unexpected" ]; then
-            echo "::error::govulncheck found reachable vulnerabilities not in .govulncheck-allow.txt:"
-            printf '%s\n' "$unexpected"
-            exit 1
-          fi
-          echo "govulncheck OK — no unaccepted reachable vulnerabilities"
+          echo "::remove-matcher owner=go::"
+          fail=0
+          for m in $MODULES; do
+            tc=$(awk '$1 == "toolchain" { print $2; exit }' "$m/go.mod")
+            out="$RUNNER_TEMP/govulncheck-$(printf '%s' "$m" | tr / -).out"
+            echo "::group::govulncheck $m (${tc:-$(go env GOVERSION)})"
+            rc=0
+            ( cd "$m" && GOTOOLCHAIN="${tc:-local}+auto" go run golang.org/x/vuln/cmd/govulncheck@latest ./... ) | tee "$out" || rc=$?
+            echo "::endgroup::"
+            reachable=$(grep -oE 'GO-[0-9]{4}-[0-9]+' "$out" | sort -u || true)
+            if [ "$rc" -ne 0 ] && [ -z "$reachable" ]; then
+              echo "::error title=govulncheck did not run::$m: exited $rc without naming a vulnerability, so nothing was analyzed. See the group above."
+              fail=1
+              continue
+            fi
+            allow=""
+            if [ -f "$m/.govulncheck-allow.txt" ]; then
+              allow=$(grep -oE 'GO-[0-9]{4}-[0-9]+' "$m/.govulncheck-allow.txt" | sort -u || true)
+            fi
+            unexpected=$(comm -23 <(printf '%s\n' "$reachable" | grep -v '^$') <(printf '%s\n' "$allow" | grep -v '^$') || true)
+            if [ -n "$unexpected" ]; then
+              echo "::error title=govulncheck ($m)::reachable vulnerabilities not in $m/.govulncheck-allow.txt:" $unexpected
+              printf '%s\n' "$unexpected"
+              fail=1
+            else
+              echo "govulncheck OK ($m) — no unaccepted reachable vulnerabilities"
+            fi
+          done
+          exit "$fail"
 
   # ============ REPORTING (SARIF -> Security tab, never blocks) ============
   gosec:
-    name: gosec (${{ matrix.module }})
+    name: gosec
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        module:
-          - api-gateway
-          - backend-orchestrator
-          - backend-temporal-adapter
-          # SEC-H-02 trusted socket-holder — SAST-scan the code that speaks the
-          # Docker API on behalf of untrusted callers.
-          - connector-deployer
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Choose modules to scan
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # connector-deployer is the SEC-H-02 trusted socket-holder -- SAST-scan
+        # the code that speaks the Docker API on behalf of untrusted callers.
+        run: |
+          PY=/opt/homebrew/opt/python@3.11/bin/python3.11; [ -x "$PY" ] || PY=python3
+          "$PY" scripts/security/ci-scan.py go-modules \
+            api-gateway \
+            backend-orchestrator \
+            backend-temporal-adapter \
+            connector-deployer
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        if: ${{ steps.scope.outputs.modules != '' }}
         with:
-          go-version-file: ${{ matrix.module }}/go.mod
+          go-version-file: api-gateway/go.mod
           cache: false   # setup-go auto-cache uploads ~3GB per job for no gain here (ci.yml convention)
       - name: gosec
-        working-directory: ${{ matrix.module }}
+        if: ${{ steps.scope.outputs.modules != '' }}
+        env:
+          MODULES: ${{ steps.scope.outputs.modules }}
         # -no-fail: emit SARIF without a non-zero exit (reporting, not gating).
-        run: go run github.com/securego/gosec/v2/cmd/gosec@latest -no-fail -fmt sarif -out "${GITHUB_WORKSPACE}/gosec-${{ matrix.module }}.sarif" ./...
+        # One SARIF per module, then merged into ONE run with repo-relative paths:
+        # gosec writes module-relative URIs, and code scanning rejects a document
+        # carrying several runs of one tool under one category. A module whose
+        # gosec did not finish is left out of the merge and fails this step, so
+        # a scanner failure still turns the job red.
+        run: |
+          PY=/opt/homebrew/opt/python@3.11/bin/python3.11; [ -x "$PY" ] || PY=python3
+          mkdir -p "$RUNNER_TEMP/gosec"
+          fail=0
+          pairs=()
+          for m in $MODULES; do
+            tc=$(awk '$1 == "toolchain" { print $2; exit }' "$m/go.mod")
+            sarif="$RUNNER_TEMP/gosec/$(printf '%s' "$m" | tr / -).sarif"
+            echo "::group::gosec $m (${tc:-$(go env GOVERSION)})"
+            rc=0
+            ( cd "$m" && GOTOOLCHAIN="${tc:-local}+auto" go run github.com/securego/gosec/v2/cmd/gosec@latest -no-fail -fmt sarif -out "$sarif" ./... ) || rc=$?
+            echo "::endgroup::"
+            if [ "$rc" -ne 0 ]; then
+              echo "::error title=gosec did not finish::$m: gosec exited $rc; its findings are missing from gosec.sarif"
+              fail=1
+            fi
+            pairs+=("$m=$sarif")
+          done
+          "$PY" scripts/security/ci-scan.py merge-sarif gosec.sarif "${pairs[@]}"
+          exit "$fail"
       - name: Upload SARIF to code-scanning
         id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
+        # Only when code scanning exists (see the header) and only for a scan of
+        # every module: a PR's scoped SARIF would mark the skipped modules fixed.
+        if: ${{ vars.CODE_SCANNING_ENABLED == 'true' && steps.scope.outputs.mode == 'full' }}
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
         uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
-          sarif_file: gosec-${{ matrix.module }}.sarif
-          category: gosec-${{ matrix.module }}
+          sarif_file: gosec.sarif
+          category: gosec
       - name: Summarize SARIF into the job summary
         # Always reachable -- no GHAS, no artifact quota -- but a rule-level TALLY
         # only (level / ruleId / count, capped at 40 rules): no file, no line, no
         # message, so it is a human readout and NOT a third machine-readable sink.
         # See scripts/summarize-sarif.sh for why both of the real two were dead at
         # the same time.
-        if: ${{ !cancelled() }}   # NOT always(): see the header -- always() runs on cancellation, and this script exits 2 on the SARIF a cancelled scanner never wrote
-        run: ./scripts/summarize-sarif.sh "gosec-${{ matrix.module }}.sarif" "gosec (${{ matrix.module }})"
+        if: ${{ !cancelled() && steps.scope.outputs.modules != '' }}   # NOT always(): see the header -- always() runs on cancellation, and this script exits 2 on the SARIF a cancelled scanner never wrote
+        run: ./scripts/summarize-sarif.sh gosec.sarif "gosec (${{ steps.scope.outputs.modules }})"
       - name: Archive SARIF (convenience copy; the job summary carries only a tally)
         id: archive
-        if: ${{ !cancelled() }}   # NOT always(): see the header. Deliberately NOT gated on the upload above -- see retention-days
+        if: ${{ !cancelled() && steps.scope.outputs.modules != '' }}   # NOT always(): see the header. Deliberately NOT gated on the upload above -- see retention-days
         # A hit artifact quota must not turn a REPORTING job red. It did, on every
         # run including main, from 2026-08-24 -- and a red `gosec (api-gateway)`
         # reads as "gosec found something", which it cannot: gosec runs -no-fail.
@@ -275,8 +404,8 @@ jobs:
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: gosec-${{ matrix.module }}-sarif
-          path: gosec-${{ matrix.module }}.sarif
+          name: gosec-sarif
+          path: gosec.sarif
           if-no-files-found: ignore
           # Bounded on purpose. With no retention-days these inherit the 90-day repo
           # default; six reporting jobs x every push/PR/nightly had accumulated 4,630
@@ -307,12 +436,12 @@ jobs:
         # deliberate choice), and it takes the SARIF PATH as well as the outcomes
         # because `if-no-files-found: ignore` makes a zero-file upload succeed --
         # a `success` alone would certify a copy containing nothing.
-        if: ${{ !cancelled() }}   # NOT always(): a cancelled run must not be annotated as a security failure
+        if: ${{ !cancelled() && steps.scope.outputs.modules != '' }}   # NOT always(): a cancelled run must not be annotated as a security failure
         env:
           # `.outcome`, never `.conclusion` -- see above.
           CODE_SCANNING_OUTCOME: ${{ steps.code_scanning.outcome }}
           ARCHIVE_OUTCOME: ${{ steps.archive.outcome }}
-        run: ./scripts/report-sarif-sinks.sh "gosec (${{ matrix.module }})" "gosec-${{ matrix.module }}.sarif"
+        run: ./scripts/report-sarif-sinks.sh "gosec (${{ steps.scope.outputs.modules }})" gosec.sarif
 
   semgrep:
     name: Semgrep SAST
@@ -321,6 +450,17 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Choose files to scan
+        id: scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+        # A PR scans its own changed files; anything else scans the whole tree.
+        # Unlike the Go jobs there is no scan-everything trigger: Semgrep's rules
+        # come from the registry and match per file, so no edit in this repo
+        # changes what an unchanged file would report.
+        run: |
+          PY=/opt/homebrew/opt/python@3.11/bin/python3.11; [ -x "$PY" ] || PY=python3
+          "$PY" scripts/security/ci-scan.py semgrep-includes "$RUNNER_TEMP/semgrep-includes.txt"
       # The venv stays under RUNNER_TEMP — outside the workspace, so Semgrep does
       # not scan its own dependencies. This job used to hard-code the brew
       # interpreter because setup-python cannot write the hosted tool cache on
@@ -336,25 +476,49 @@ jobs:
           "$RUNNER_TEMP/semgrep-venv/bin/python" -m pip install --upgrade pip
           "$RUNNER_TEMP/semgrep-venv/bin/pip" install semgrep
           echo "$RUNNER_TEMP/semgrep-venv/bin" >> "$GITHUB_PATH"
+        if: ${{ steps.scope.outputs.mode != 'none' }}
       - name: Run Semgrep
+        if: ${{ steps.scope.outputs.mode != 'none' }}
+        env:
+          SCOPE: ${{ steps.scope.outputs.mode }}
         # Explicit rule packs — NOT `--config auto`, which refuses to run with
         # --metrics=off. --metrics=off: nothing leaves the runner (privacy).
+        # A scoped scan is the whole tree narrowed by one `--include` per changed
+        # file, NOT the files as arguments: Semgrep scans a named file even where
+        # its default ignore list would skip it, so a PR would report findings in
+        # tests/ or build/ that a full scan never shows. ci-scan.py has the
+        # measurement. Zero patterns would silently widen to the full tree, so a
+        # partial scope with none is refused.
         run: |
+          targets=(.)
+          if [ "$SCOPE" = partial ]; then
+            n=0
+            while IFS= read -r pattern; do
+              targets+=(--include "$pattern")
+              n=$((n + 1))
+            done < "$RUNNER_TEMP/semgrep-includes.txt"
+            if [ "$n" -eq 0 ]; then
+              echo "::error::scope is partial but ci-scan.py wrote no include patterns"
+              exit 1
+            fi
+            echo "scanning $n changed file(s)"
+          fi
           semgrep --config p/default --config p/secrets --metrics=off \
-            --sarif --output semgrep.sarif . || true
+            --sarif --output semgrep.sarif "${targets[@]}" || true
       - name: Upload SARIF to code-scanning
         id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
+        if: ${{ vars.CODE_SCANNING_ENABLED == 'true' && steps.scope.outputs.mode == 'full' }}   # see gosec's step of the same name
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
         uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
           sarif_file: semgrep.sarif
           category: semgrep
       - name: Summarize SARIF into the job summary
-        if: ${{ !cancelled() }}   # NOT always(): see gosec's step of the same name
+        if: ${{ !cancelled() && steps.scope.outputs.mode != 'none' }}   # NOT always(): see gosec's step of the same name
         run: ./scripts/summarize-sarif.sh semgrep.sarif "Semgrep SAST"
       - name: Archive SARIF (convenience copy; the job summary carries only a tally)
         id: archive
-        if: ${{ !cancelled() }}   # NOT always(): see the header. Deliberately NOT gated on the upload above -- see retention-days
+        if: ${{ !cancelled() && steps.scope.outputs.mode != 'none' }}   # NOT always(): see the header. Deliberately NOT gated on the upload above -- see retention-days
         # A hit artifact quota must not turn a REPORTING job red. It did, on every
         # run including main, from 2026-08-24 -- and a red `gosec (api-gateway)`
         # reads as "gosec found something", which it cannot: gosec runs -no-fail.
@@ -374,17 +538,22 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14   # see gosec's Archive SARIF; semgrep-sarif alone was 162 MB
       - name: Report which SARIF sinks accepted the findings
-        if: ${{ !cancelled() }}   # see gosec's step of the same name
+        if: ${{ !cancelled() && steps.scope.outputs.mode != 'none' }}   # see gosec's step of the same name
         env:
           CODE_SCANNING_OUTCOME: ${{ steps.code_scanning.outcome }}
           ARCHIVE_OUTCOME: ${{ steps.archive.outcome }}
         run: ./scripts/report-sarif-sinks.sh "Semgrep SAST" semgrep.sarif
 
   trivy:
-    name: Trivy (deps + IaC + secrets)
+    name: Trivy (deps + IaC + secrets + licenses)
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
-    continue-on-error: true
+    # No job-level continue-on-error: the license gate at the end BLOCKS. The
+    # vuln/IaC/secret scan still cannot fail the job (`--exit-code 0`), but a
+    # Trivy crash, or a SARIF it never wrote (summarize-sarif.sh exits 2), now
+    # turns this job red -- as its own job that red was masked by
+    # continue-on-error. A crashed Trivy could not have passed the license gate
+    # either, so the one new red it can show is a missing SARIF.
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - name: Install Trivy
@@ -436,6 +605,7 @@ jobs:
         run: trivy fs --scanners vuln,misconfig,secret --skip-files "**/*.j2" --format sarif --output trivy.sarif --severity HIGH,CRITICAL --exit-code 0 .
       - name: Upload SARIF to code-scanning
         id: code_scanning   # `Report which SARIF sinks...` below reads .outcome; without an id it reads nothing
+        if: ${{ vars.CODE_SCANNING_ENABLED == 'true' }}   # see the header; Trivy always scans the whole tree, so there is no scope to check
         continue-on-error: true   # tolerate no-code-scanning (private repo / no GHAS); artifact below keeps findings
         uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
         with:
@@ -471,74 +641,29 @@ jobs:
           CODE_SCANNING_OUTCOME: ${{ steps.code_scanning.outcome }}
           ARCHIVE_OUTCOME: ${{ steps.archive.outcome }}
         run: ./scripts/report-sarif-sinks.sh "Trivy (deps + IaC + secrets)" trivy.sarif
-
-  trivy-license:
-    name: Trivy (license scan)
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-latest
-    # This is the REAL license scanner backing the fast name-grep denylist in
-    # .github/workflows/licenses.yml. That grep only fails on copyleft it knows
-    # by NAME (mysql-connector-python, pymssql, ...) or by an SPDX id literally
-    # printed in a manifest — a new GPL/AGPL package under an unlisted name
-    # (e.g. PyQt5, python-Levenshtein) sails through GREEN. Trivy instead reads
-    # EACH dependency's actual license from its metadata and classifies it by
-    # category, so those slip-throughs are caught.
-    #
-    # BLOCKING (calibrated 2026-07-11). Noise triaged: the only HIGH findings were
-    # sharp/libvips (weak-copyleft, documented in THIRD_PARTY_NOTICES.md). The frontend
-    # npm lockfile is scoped out of the scan step below — Trivy 0.72 cannot suppress a
-    # 3+-component SPDX AND compound (@img/sharp-wasm32) even with the exact string in
-    # .trivyignore — and its npm licenses stay covered by licenses.yml's package.json
-    # grep + the release-time license-checker. The gate STILL scans the Go modules, so a
-    # new GPL/AGPL/SSPL transitive Go dep fails it. A real HIGH finding now blocks merge:
-    # swap the dependency for a permissive/weak-copyleft one, do NOT allowlist copyleft.
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install Trivy
-        # Same install as the vuln/IaC/secret `trivy` job: the official script
-        # auto-detects the runner's OS/arch; install to RUNNER_TEMP because
-        # writing /usr/local/bin needs sudo.
-        run: |
-          # Supply-chain hardening: pin the Trivy installer to a tagged release and
-          # verify its sha256 before executing — never `curl | sh` from a mutable
-          # branch. Also pin the installed binary to the same version.
-          TRIVY_VERSION=v0.72.0
-          TRIVY_INSTALL_SHA256=e00df553be558995b994758bc8995956554a16937f456dc6615b0cc411bfec7a
-          curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" -o "$RUNNER_TEMP/trivy-install.sh"
-          echo "${TRIVY_INSTALL_SHA256}  $RUNNER_TEMP/trivy-install.sh" | shasum -a 256 -c -
-          sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin" "${TRIVY_VERSION}"
-          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-      - name: Pull Trivy's databases anonymously
-        # Trivy fetches both of its databases as OCI artifacts
-        # (mirror.gcr.io/aquasec/trivy-db for vulnerabilities, trivy-checks for
-        # the misconfig rules) and resolves registry credentials the way Docker
-        # does — by reading ~/.docker/config.json and shelling out to whatever
-        # `credsStore` it names. On the self-hosted Macs that was Docker
-        # Desktop's helper, and when the helper wedged the child never returned,
-        # never timed out and never printed: the scan simply stopped after
-        # "Downloading artifact..." and held the runner until the job was
-        # cancelled.
-        #
-        # Measured 2026-09-06 — three of the four org runners sat on this job for
-        # 18, 19 and 54 minutes with a `docker-credential-desktop get` child that
-        # had accumulated 0.03s of CPU, and every other job in the org queued
-        # behind them. Same binary, same tree, same command, A/B: with the host
-        # config the download produced no bytes past 60 minutes; with an empty
-        # config it downloaded 111 MiB and finished in 8.5s.
-        #
-        # Neither database needs credentials — both are public. Pointing
-        # DOCKER_CONFIG at a directory whose config.json declares no credsStore
-        # makes Trivy resolve anonymously and never invoke a helper, which is
-        # also the correct dependency shape: a scan of a public database must not
-        # be able to hang on a developer machine's credential daemon. It is a
-        # no-op on this runner, which ships no credential helper to wedge, and it
-        # is kept anyway: the alternative is a step that has to be re-derived
-        # from the incident the day any job runs somewhere that does.
-        run: |
-          mkdir -p "$RUNNER_TEMP/trivy-docker-config"
-          printf '{"auths":{}}\n' > "$RUNNER_TEMP/trivy-docker-config/config.json"
-          echo "DOCKER_CONFIG=$RUNNER_TEMP/trivy-docker-config" >> "$GITHUB_ENV"
+      # ---- License gate (BLOCKING) --------------------------------------------
+      # This is the REAL license scanner backing the fast name-grep denylist in
+      # .github/workflows/licenses.yml. That grep only fails on copyleft it knows
+      # by NAME (mysql-connector-python, pymssql, ...) or by an SPDX id literally
+      # printed in a manifest — a new GPL/AGPL package under an unlisted name
+      # (e.g. PyQt5, python-Levenshtein) sails through GREEN. Trivy instead reads
+      # EACH dependency's actual license from its metadata and classifies it by
+      # category, so those slip-throughs are caught.
+      #
+      # BLOCKING (calibrated 2026-07-11). Noise triaged: the only HIGH findings were
+      # sharp/libvips (weak-copyleft, documented in THIRD_PARTY_NOTICES.md). The frontend
+      # npm lockfile is scoped out of the scan step below — Trivy 0.72 cannot suppress a
+      # 3+-component SPDX AND compound (@img/sharp-wasm32) even with the exact string in
+      # .trivyignore — and its npm licenses stay covered by licenses.yml's package.json
+      # grep + the release-time license-checker. The gate STILL scans the Go modules, so a
+      # new GPL/AGPL/SSPL transitive Go dep fails it. A real HIGH finding now blocks merge:
+      # swap the dependency for a permissive/weak-copyleft one, do NOT allowlist copyleft.
+      #
+      # It was its own job, `trivy-license`, with a second Trivy install and a
+      # second anonymous DB setup, until 2026-09-18; it reuses both above. Last
+      # and `!cancelled()`, so a red SARIF step above cannot skip the gate.
       - name: Trivy license scan (copyleft gate)
+        if: ${{ !cancelled() }}
         # --scanners license: classify every dependency's license by category.
         #   RESTRICTED (GPL/AGPL/SSPL family) => HIGH/CRITICAL severity.
         # --severity HIGH,CRITICAL: only the strong-copyleft classes gate;
@@ -547,7 +672,7 @@ jobs:
         # Reviewed weak-copyleft that ELv2 permits (MPL-2.0, LGPL-3.0 — see
         #   THIRD_PARTY_NOTICES.md) is allowlisted in /.trivyignore, which Trivy
         #   reads automatically from the scan root.
-        # --skip-files "**/*.j2": mirror the vuln job — Jinja templates aren't
+        # --skip-files "**/*.j2": mirror the vuln scan — Jinja templates aren't
         #   real manifests and only add parser noise.
         # --skip-files "frontend/package-lock.json": Trivy 0.72 bug — it cannot suppress a
         #   3+-component SPDX AND compound (@img/sharp-wasm32 = "Apache-2.0 AND

@@ -155,3 +155,37 @@ def test_it_stays_in_lockstep_with_the_connector_that_actually_runs():
             f"the generator accepts {key!r} as an explicit MongoDB URI but the "
             "debezium connector does not read it — advice that cannot be acted on"
         )
+
+
+def test_a_single_database_scopes_the_change_stream(generator):
+    """#19: Debezium's default cluster-wide change stream is refused to a user with
+    read on only the source database, and the task stays RUNNING while writing
+    nothing. The advice must scope the stream the way the running connector does."""
+    cfg = _mongo_config(generator, {"connection_string": ATLAS_URI, "database": "shop"})
+    assert cfg["collection.include.list"] == "shop.orders,shop.customers"
+    assert cfg["capture.scope"] == "database"
+    assert cfg["capture.target"] == "shop"
+
+
+@pytest.mark.parametrize(
+    "include_list,want",
+    [
+        ("shop.orders", {"capture.scope": "database", "capture.target": "shop"}),
+        ("shop.orders.archive", {"capture.scope": "database", "capture.target": "shop"}),
+        ("shop.orders,crm.contacts", {}),
+        ("shop.orders,orders", {}),
+        (r"shop\.orders", {}),
+        ("", {}),
+    ],
+)
+def test_capture_scope_mirrors_the_connector_rule(include_list, want):
+    assert CDCConfigGenerator._mongo_capture_scope(include_list) == want
+
+
+def test_the_connector_scopes_mongodb_change_streams_too():
+    """Lockstep for the #19 rule: the advice must not scope a stream the running
+    connector leaves cluster-wide, or the reverse."""
+    source = DEBEZIUM_CONNECTOR.read_text()
+    assert len(source) > 10_000
+    assert 'cfg["capture.scope"] = "database"' in source
+    assert "def mongo_capture_databases(" in source

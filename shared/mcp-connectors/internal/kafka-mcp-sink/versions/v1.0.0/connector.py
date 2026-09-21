@@ -12,6 +12,7 @@ import os
 import logging
 import subprocess
 import json
+import signal
 import asyncio
 import threading
 import time
@@ -44,6 +45,107 @@ RAPID_RESTART_WINDOW_SECONDS = 30.0
 # genuine tight loop, never on an occasional crash after healthy uptime. Cleared by an
 # explicit start_sink (which drops the dead worker and spawns a fresh one).
 MAX_RAPID_RESTARTS = 5
+
+# Destination-config key for the object-storage CDC flush interval: the longest time
+# changes wait in the worker before they are written as one file. Only object-storage
+# destinations use it; unset keeps the worker's 30-second default. The bounds mirror
+# minObjectFlushIntervalSeconds / maxObjectFlushIntervalSeconds in the worker's main.go,
+# which refuses the same values at startup (see there for why the ceiling is 240s).
+# Both sides are pinned to the worker's testdata/flush_interval_cases.json; change all
+# three together.
+FLUSH_INTERVAL_KEY = "max_file_interval_seconds"
+MIN_FLUSH_INTERVAL_SECONDS = 1
+MAX_FLUSH_INTERVAL_SECONDS = 240
+
+# cgroup files that count kernel OOM kills in THIS container (all workers share it).
+# A kernel OOM kill SIGKILLs the Go worker before it can log anything, so the only
+# trace is the worker's exit (signal 9) plus this counter going up. v2 first, then v1.
+CGROUP_OOM_EVENT_FILES = (
+    "/sys/fs/cgroup/memory.events",
+    "/sys/fs/cgroup/memory/memory.oom_control",
+)
+
+
+def _read_cgroup_oom_kill_count() -> Optional[int]:
+    """Return the container's cgroup ``oom_kill`` count, or None when unreadable.
+
+    Never raises: a missing file (not Linux, no cgroup mount) or an unexpected
+    format returns None. These are kernel pseudo-files, so the read does not block.
+    """
+    for path in CGROUP_OOM_EVENT_FILES:
+        try:
+            with open(path, "r") as fh:
+                for line in fh:
+                    parts = line.split()
+                    if len(parts) == 2 and parts[0] == "oom_kill":
+                        return int(parts[1])
+        except Exception:
+            continue
+    return None
+
+
+def _describe_exit(returncode: Optional[int]) -> Dict[str, Any]:
+    """Describe how a worker process ended: exit code, signal name, cgroup OOM count.
+
+    Popen reports death by signal as a negative returncode (-9 = SIGKILL). Only
+    process metadata goes in here, never worker output or row data.
+    """
+    signal_name = None
+    if isinstance(returncode, int) and returncode < 0:
+        try:
+            signal_name = signal.Signals(-returncode).name
+        except (ValueError, AttributeError):
+            signal_name = f"signal {-returncode}"
+    return {
+        "returncode": returncode,
+        "signal": signal_name,
+        "cgroup_oom_kill_count": _read_cgroup_oom_kill_count(),
+        "exited_at": time.time(),
+    }
+
+
+def flush_interval_error(destination_config: Any) -> Optional[str]:
+    """Return a plain-words error if the flush interval setting is invalid, else None.
+
+    Checked here, before the worker is spawned, because a worker that refuses its
+    config exits before it can report why, and start_sink could then only say
+    "worker exited during startup". Accepts what the two callers send: a JSON number
+    from a direct caller, or a string from the orchestrator (which flattens connection
+    config to strings, turning a JSON null into "<nil>"). Refuses rather than clamps,
+    so the interval in use is always the one the user set.
+    """
+    if not isinstance(destination_config, dict):
+        return None
+    raw = destination_config.get(FLUSH_INTERVAL_KEY)
+    if raw is None:
+        return None
+    value: Optional[int] = None
+    if isinstance(raw, bool):
+        value = None
+    elif isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, float):
+        if raw.is_integer():
+            value = int(raw)
+    elif isinstance(raw, str):
+        text = raw.strip()
+        if text in ("", "<nil>") or text.lower() == "null":
+            return None
+        digits = text[1:] if text[:1] in ("+", "-") else text
+        # ASCII digits only: int() would also take "1_000" and non-ASCII digits,
+        # which the worker's parser refuses.
+        if digits and all("0" <= ch <= "9" for ch in digits):
+            value = int(text)
+    if value is not None and MIN_FLUSH_INTERVAL_SECONDS <= value <= MAX_FLUSH_INTERVAL_SECONDS:
+        return None
+    shown = str(raw)
+    if len(shown) > 32:
+        shown = shown[:32] + "..."
+    return (
+        f"{FLUSH_INTERVAL_KEY} must be a whole number of seconds from "
+        f"{MIN_FLUSH_INTERVAL_SECONDS} to {MAX_FLUSH_INTERVAL_SECONDS} (got {shown!r}). "
+        f"Clear the setting to use the 30-second default."
+    )
 
 
 class KafkaMCPSinkConnector(BaseMCPConnector):
@@ -242,6 +344,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
         config = params.get("config", {})
         # Metrics port reserved for this worker (released in finally). None until picked.
         metrics_port = None
+        previous_exit = None
 
         try:
             worker_id = self._get_worker_id(params)
@@ -292,7 +395,9 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                             "metrics_url": f"http://localhost:{worker['metrics_port']}/status"
                         }
                     else:
-                        # Was running but died - clean up and restart
+                        # Was running but died - clean up and restart. Keep how it
+                        # died so the fresh worker's sink_status still shows it.
+                        previous_exit = self._record_worker_exit(worker_id, worker)
                         self.log(f"Worker {worker_id} died, restarting", level="warn")
                         self._cleanup_worker(worker_id)
 
@@ -333,6 +438,16 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                 # MUST be allowlisted here or it is dropped before reaching the Go
                 # worker (this dict is an implicit whitelist). Empty => unchanged.
                 "destination_namespace": config.get("destination_namespace", ""),
+                # Server-level source (no database named): route each CDC event to
+                # the namespace its source database/schema came from. Same allowlist
+                # rule — dropped here, every source database collapses into one.
+                "mirror_source_namespace": bool(config.get("mirror_source_namespace", False)),
+                # Object-storage layout v2 (GCS): 2 writes keys with no pipeline id,
+                # named by the source family and database. Same allowlist rule: a
+                # field missing here reaches the worker as v1.
+                "storage_layout_version": config.get("storage_layout_version", 0),
+                "source_family": config.get("source_family", ""),
+                "source_database": config.get("source_database", ""),
                 "metrics_port": metrics_port,
                 # Optional CDC controls
                 "sink_mode": config.get("sink_mode", ""),
@@ -351,6 +466,9 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                 return {"success": False, "error": "Missing 'consumer_group' in config"}
             if not worker_config["destination_connector"]:
                 return {"success": False, "error": "Missing 'destination_connector' in config"}
+            interval_error = flush_interval_error(worker_config["destination_config"])
+            if interval_error:
+                return {"success": False, "status": "invalid_config", "error": interval_error}
 
             # Start Go worker
             process = self._spawn_worker_process(worker_config)
@@ -365,6 +483,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                     "restart_attempts": 0,
                     "intentional_stop": False,
                     "auto_restart": auto_restart,
+                    "last_exit": previous_exit,
                 }
 
             # Wait for worker to be ready (best-effort)
@@ -378,12 +497,14 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
             if not self._is_worker_alive(worker_id):
                 last_err = self._worker_last_error(worker_config["metrics_port"])
                 with self._lock:
+                    startup_exit = self._record_worker_exit(worker_id, self.workers.get(worker_id))
                     self._cleanup_worker(worker_id)
                 return {
                     "success": False,
                     "status": "exited",
                     "worker_id": worker_id,
                     "error": last_err or "worker exited during startup",
+                    "last_exit": startup_exit,
                 }
 
             # Horizontal scale-out (Fix #3): optionally spawn additional workers in
@@ -535,6 +656,9 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                 alive = self._is_worker_alive(worker_id)
                 crashed = bool(worker.get("crashed"))
                 crashed_error = worker.get("last_error")
+                if not alive:
+                    self._record_worker_exit(worker_id, worker)
+                last_exit = worker.get("last_exit")
 
             # Check if process is alive
             if not alive:
@@ -547,6 +671,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                     "worker_id": worker_id,
                     "pid": pid,
                     "restart_attempts": restart_attempts,
+                    "last_exit": last_exit,
                 }
                 if crashed and crashed_error:
                     result["error"] = crashed_error
@@ -567,6 +692,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                     "worker_id": worker_id,
                     "pid": pid,
                     "restart_attempts": restart_attempts,
+                    "last_exit": last_exit,
                     "metrics": metrics
                 }
                 # Promote a worker-reported fatal error to the top level so callers don't
@@ -588,6 +714,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                     "worker_id": worker_id,
                     "pid": pid,
                     "restart_attempts": restart_attempts,
+                    "last_exit": last_exit,
                     "metrics": None,
                     "error": f"Failed to query metrics: {str(e)}"
                 }
@@ -630,6 +757,7 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                         "pid": worker.get("pid"),
                         "restart_attempts": worker.get("restart_attempts", 0),
                         "last_error": worker.get("last_error"),
+                        "last_exit": worker.get("last_exit"),
                     })
                 elif self._is_worker_alive(worker_id):
                     alive += 1
@@ -637,11 +765,13 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                     # Process not alive but breaker not tripped → transiently down /
                     # awaiting a supervisor respawn. Still not delivering right now.
                     dead += 1
+                    self._record_worker_exit(worker_id, worker)
                     unhealthy.append({
                         "worker_id": worker_id,
                         "state": "down",
                         "pid": worker.get("pid"),
                         "restart_attempts": worker.get("restart_attempts", 0),
+                        "last_exit": worker.get("last_exit"),
                     })
 
         healthy = (dead == 0 and crashed == 0)
@@ -724,6 +854,41 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
         if worker_id in self.workers:
             del self.workers[worker_id]
 
+    def _record_worker_exit(self, worker_id: str, worker: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """Store and log how a dead worker's process ended, once per process.
+
+        Sets ``worker["last_exit"]`` (returncode, signal, cgroup OOM count, pid) the
+        first time a given pid is seen dead, and logs one line with the same fields;
+        later calls for the same pid return the stored value without logging again.
+        A live process leaves the previous ``last_exit`` in place and returns it.
+        Caller holds ``self._lock``.
+        """
+        if not worker:
+            return None
+        process = worker.get("process")
+        if process is None:
+            return worker.get("last_exit")
+        try:
+            returncode = process.poll()
+        except Exception:
+            return worker.get("last_exit")
+        if returncode is None:
+            return worker.get("last_exit")
+        pid = worker.get("pid")
+        if worker.get("last_exit_pid") == pid and worker.get("last_exit"):
+            return worker["last_exit"]
+        last_exit = _describe_exit(returncode)
+        last_exit["pid"] = pid
+        worker["last_exit"] = last_exit
+        worker["last_exit_pid"] = pid
+        self.log(
+            f"Worker {worker_id} exited: pid={pid} returncode={returncode} "
+            f"signal={last_exit['signal']} "
+            f"cgroup_oom_kill_count={last_exit['cgroup_oom_kill_count']}",
+            level="warn",
+        )
+        return last_exit
+
     # ------------------------------------------------------------------ #
     # Supervisor — auto-restart workers that die unexpectedly
     # ------------------------------------------------------------------ #
@@ -757,6 +922,9 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                         if not worker.get("auto_restart", True):
                             continue
                         if not self._is_worker_alive(worker_id):
+                            # Record exit code / signal / cgroup OOM count once per
+                            # dead pid, before the backoff or the breaker can skip it.
+                            self._record_worker_exit(worker_id, worker)
                             now = time.monotonic()
                             # Respect the crash-loop backoff window: a fast-failing
                             # worker must not be respawned every poll (tight loop that
@@ -790,12 +958,22 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
             worker["rapid_restarts"] = 0
 
         if worker.get("rapid_restarts", 0) >= MAX_RAPID_RESTARTS:
+            # Capture the final death before going terminal, so `crashed` says how the
+            # worker died (e.g. SIGKILL from a cgroup OOM), not only that it looped.
+            last_exit = self._record_worker_exit(worker_id, worker)
+            exit_note = ""
+            if last_exit:
+                exit_note = (
+                    f"; last exit returncode={last_exit.get('returncode')} "
+                    f"signal={last_exit.get('signal')} "
+                    f"cgroup_oom_kill_count={last_exit.get('cgroup_oom_kill_count')}"
+                )
             worker["crashed"] = True
             worker["crashed_at"] = time.time()
             worker["last_error"] = (
                 worker.get("last_error")
                 or f"crash-looped: {worker['rapid_restarts']} rapid restarts "
-                   f"(>= MAX_RAPID_RESTARTS={MAX_RAPID_RESTARTS}); not respawning"
+                   f"(>= MAX_RAPID_RESTARTS={MAX_RAPID_RESTARTS}); not respawning{exit_note}"
             )
             self.log(
                 f"Worker {worker_id} crash-looped {worker['rapid_restarts']}x within "
@@ -836,6 +1014,9 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
             return
         worker["process"] = process
         worker["pid"] = process.pid
+        # A new process: its death must be recorded even if the kernel reuses a pid
+        # an earlier process in this slot had. last_exit stays visible until then.
+        worker.pop("last_exit_pid", None)
         worker["last_spawn_monotonic"] = time.monotonic()
         worker["restart_attempts"] = worker.get("restart_attempts", 0) + 1
         self.log(

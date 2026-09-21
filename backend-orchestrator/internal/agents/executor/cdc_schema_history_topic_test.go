@@ -210,23 +210,13 @@ func TestSchemaHistoryTopicIsPreCreatedBeforeStartSync(t *testing.T) {
 		return false
 	}
 
-	var ensurePos token.Pos
-	var ensureCall *ast.CallExpr
-	ast.Inspect(fn, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok || inClosure(call.Pos()) {
-			return true
-		}
-		sel, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || sel.Sel.Name != "EnsureTopicExistsWithConfig" {
-			return true
-		}
-		if !ensurePos.IsValid() {
-			ensurePos = call.Pos()
-			ensureCall = call
-		}
-		return true
-	})
+	// The pre-create, identified by the topic variable it is handed rather than by
+	// being the first EnsureTopicExistsWithConfig in the function. There is more than
+	// one pre-create here now (the Debezium heartbeat topic is the other — see
+	// cdc_heartbeat_topic_test.go), and a positional match would silently follow
+	// whichever one happens to be written first, then assert the schema history's
+	// retention against the wrong call.
+	ensurePos, ensureCall := findEnsureTopicCall(fn, inClosure, "shTopic")
 
 	// The start_sync request, located by the operation string rather than by the
 	// variable it is assigned to.
@@ -334,6 +324,60 @@ func TestSchemaHistoryTopicIsPreCreatedBeforeStartSync(t *testing.T) {
 					"expiry.", k, got[k], w)
 			}
 		}
+	}
+}
+
+// findEnsureTopicCall locates the EnsureTopicExistsWithConfig call whose topic
+// argument is the named variable, skipping calls written inside closures.
+//
+// Selection is by argument, not by position. executeStreamingDataTransfer pre-creates
+// more than one topic, each with deliberately different geometry (the schema history is
+// retained forever, a heartbeat is not), so "the first one" is the wrong call as soon
+// as anyone reorders the blocks — and it fails by asserting one topic's requirements
+// against another topic's config, which reads as a bug in the code under test.
+func findEnsureTopicCall(fn *ast.FuncDecl, inClosure func(token.Pos) bool, topicVar string) (token.Pos, *ast.CallExpr) {
+	var pos token.Pos
+	var found *ast.CallExpr
+	ast.Inspect(fn, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || inClosure(call.Pos()) {
+			return true
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || sel.Sel.Name != "EnsureTopicExistsWithConfig" || len(call.Args) == 0 {
+			return true
+		}
+		ident, ok := call.Args[0].(*ast.Ident)
+		if !ok || ident.Name != topicVar {
+			return true
+		}
+		if !pos.IsValid() {
+			pos = call.Pos()
+			found = call
+		}
+		return true
+	})
+	return pos, found
+}
+
+// closureFilter reports, for a position inside fn, whether it was written inside a
+// function literal. A call inside a closure runs wherever the closure is invoked, not
+// where it is written, so its written position proves nothing about ordering.
+func closureFilter(fn *ast.FuncDecl) func(token.Pos) bool {
+	var lits []*ast.FuncLit
+	ast.Inspect(fn, func(n ast.Node) bool {
+		if fl, ok := n.(*ast.FuncLit); ok {
+			lits = append(lits, fl)
+		}
+		return true
+	})
+	return func(p token.Pos) bool {
+		for _, fl := range lits {
+			if p > fl.Body.Lbrace && p < fl.Body.Rbrace {
+				return true
+			}
+		}
+		return false
 	}
 }
 

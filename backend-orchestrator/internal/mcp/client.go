@@ -148,14 +148,25 @@ func (c *Client) ExecuteWithContext(ctx context.Context, req ExecuteRequest) (*E
 
 	// Start MCP server if not running
 	serverConfig := ServerConfig{
-		Name:    req.Connector,
-		Version: version,
-		Config:  req.Config,
+		Name:                  req.Connector,
+		Version:               version,
+		Config:                req.Config,
+		NoStdioWhileDeploying: req.NoStdioWhileDeploying,
+		DeployWaitTimeout:     req.DeployWaitTimeout,
 	}
 
 	server, err := c.serverManager.StartServer(serverConfig)
 	if err != nil {
 		span.RecordError(err)
+		if IsConnectorDeploying(err) {
+			// Retryable and user-facing: pass the message through without the
+			// "Failed to start server" prefix, which would read as a hard failure.
+			span.SetStatus(codes.Error, "Connector still deploying")
+			return &ExecuteResponse{
+				Success: false,
+				Error:   err.Error(),
+			}, nil
+		}
 		span.SetStatus(codes.Error, "Failed to start server")
 		return &ExecuteResponse{
 			Success: false,
@@ -643,4 +654,13 @@ func (c *Client) CallMethod(connector string, method string, params map[string]i
 // If version is empty, defaults to "latest".
 func (c *Client) TestConnection(connector string, version string, config map[string]string) (bool, string) {
 	return c.serverManager.TestConnection(connector, version, config)
+}
+
+// ConnectorDisplayName returns the connector's metadata display_name for user-facing
+// messages, falling back to the connector id.
+func (c *Client) ConnectorDisplayName(connector, version string) string {
+	if c == nil || c.serverManager == nil {
+		return connector
+	}
+	return c.serverManager.ConnectorDisplayName(connector, version)
 }

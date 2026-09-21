@@ -125,7 +125,13 @@ async def generate_data_suggestions(request: SuggestionsRequest):
             degraded = True
             err_str = str(workflow_error)
             err_lower = err_str.lower()
-            if "token budget" in err_lower:
+            if "no llm configured" in err_lower:
+                error_code = "llm_not_configured"
+                error_msg = (
+                    "Set up an LLM first to get transform suggestions. PII and "
+                    "optimization suggestions are still available."
+                )
+            elif "token budget" in err_lower:
                 error_code = "token_budget"
                 error_msg = (
                     "Transform suggestions skipped: schema too large for the "

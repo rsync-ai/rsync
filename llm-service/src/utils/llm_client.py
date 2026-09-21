@@ -18,6 +18,27 @@ _RETRY_MAX_SECONDS = float(os.getenv("LLM_REQUEST_RETRY_MAX_SECONDS", "30.0"))
 _RETRIABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 
 
+def _is_llm_not_configured(response) -> bool:
+    """Whether a response is the gateway's "no LLM is set up" answer.
+
+    That 503 is not transient: retrying it only adds backoff before the same
+    answer. The body is flat when the gateway's handler is registered and nested
+    under ``detail`` when it is not.
+    """
+    if response.status_code != 503:
+        return False
+    try:
+        body = response.json()
+    except ValueError:
+        return False
+    if not isinstance(body, dict):
+        return False
+    detail = body.get("detail")
+    if isinstance(detail, dict):
+        body = detail
+    return body.get("error") == "llm_not_configured"
+
+
 def _retry_delay(attempt: int) -> float:
     """Full-jitter exponential backoff."""
     exponential = min(_RETRY_BASE_SECONDS * (2 ** attempt), _RETRY_MAX_SECONDS)
@@ -57,6 +78,9 @@ class LLMClient:
                 response = requests.post(
                     url, json=payload, timeout=(_CONNECT_TIMEOUT, _READ_TIMEOUT)
                 )
+                if _is_llm_not_configured(response):
+                    logger.warning("LLM Service has no LLM set up; not retrying %s", prompt_name)
+                    response.raise_for_status()
                 if response.status_code in _RETRIABLE_STATUSES and attempt < _MAX_RETRIES:
                     retry_after = response.headers.get("Retry-After")
                     delay = float(retry_after) if (retry_after and retry_after.replace(".", "", 1).isdigit()) else _retry_delay(attempt)

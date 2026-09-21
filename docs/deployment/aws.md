@@ -96,6 +96,8 @@ JWT_SECRET=<generated>
 POSTGRES_PASSWORD=<generated>
 REDIS_PASSWORD=<generated>
 
+# Optional LLM: a key is used when present, or set LLM_PROVIDER=none to run
+# without one (see self-hosting.md, "Which LLM is used")
 OPENAI_API_KEY=sk-...
 
 GITHUB_CLIENT_ID=<from GitHub OAuth app>

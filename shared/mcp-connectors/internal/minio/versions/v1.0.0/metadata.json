@@ -11,6 +11,10 @@
   "supports_source": false,
   "supports_destination": true,
   "supports_cdc": false,
+  "namespace_model": {
+    "destination_namespace": "path",
+    "destination_default": ""
+  },
   "auth_type": "basic",
   "config_schema": {
     "type": "object",

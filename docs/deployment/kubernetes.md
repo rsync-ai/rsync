@@ -14,7 +14,7 @@ right choice for evaluation and small production.
 
 | | Docker Compose | Kubernetes |
 |---|---|---|
-| Install | `curl … install.sh \| bash` | `helm install` |
+| Install | `curl … install.sh \| bash` | `curl … install-k8s.sh \| bash` (or `helm install`) |
 | Infra | bundled containers | bundled StatefulSets **or** managed services |
 | Scaling | one box | per-component replicas |
 | Best for | evaluation, single-tenant, small prod | multi-AZ, managed data stores, existing cluster |
@@ -44,7 +44,75 @@ managed Postgres, Redis, Kafka and object storage.
 > resolves the manifest long after the render. Check before pinning a tag:
 > `docker manifest inspect ghcr.io/rsync-ai/api-gateway:<tag> | grep '"architecture"'`.
 
-### From the published chart
+### One command (recommended)
+
+Point `kubectl` at any cluster and run:
+
+```bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install-k8s.sh | bash
+```
+
+That is the whole install. With no input at all it:
+
+- writes `~/rsync-ai-k8s/.env` with every secret generated (32 alphanumerics,
+  `chmod 600`) and every optional setting listed, commented out;
+- installs a working stack — the platform, the demo warehouse, and one pod each for
+  the `postgresql`, `mysql`, `mongodb`, `aws-s3` and `gcs` connectors (see
+  [why the fleet matters](#connectors-are-pods-you-choose));
+- downloads `helm` (checksum-verified, into `~/rsync-ai-k8s/bin`) if you do not have
+  one, checks that the cluster has a default StorageClass, and waits for the release;
+- prints the two `kubectl port-forward` commands that open the UI at
+  `http://localhost:3000`, and runs them for you when it is attached to a terminal.
+
+**To change anything, edit `~/rsync-ai-k8s/.env` and run the same command again.**
+Re-running is the upgrade path. Secrets already in the file are reused — and if the
+file is lost, they are read back from the `<release>-secrets` Secret the previous
+install left in the cluster — so `ENCRYPTION_KEY` and the database password are never
+regenerated. **Back the `.env` up:** `ENCRYPTION_KEY` encrypts every saved connection
+credential and there is no recovery without it.
+
+| Setting in `.env` | Default | Effect |
+|---|---|---|
+| `OPENAI_API_KEY` | — | The UI builds pipelines from chat. Without a key the install works and chat still understands a short request such as "mongodb to gcs"; anything free-form needs a model, so add a key and re-run. Never copied into the `.env`. |
+| `RSYNC_LLM_PROVIDER=ollama` | `openai` | Run a model inside the cluster instead (+6 GiB, +1 CPU, ~4.7 GB download) |
+| `RSYNC_APP_HOST` + `RSYNC_API_HOST` | — | Publish through an Ingress. Both or neither: the browser calls the API directly. |
+| `RSYNC_INGRESS_CLASS`, `RSYNC_TLS_SECRET` | cluster default, none | Ingress class; an existing `kubernetes.io/tls` Secret (URLs become `https`) |
+| `RSYNC_CONNECTORS` | `postgresql,mysql,mongodb,aws-s3,gcs` | Which connector pods to run |
+| `RSYNC_DEMO` | `true` | The sample-data try-it path |
+| `RSYNC_NAMESPACE`, `RSYNC_RELEASE` | `rsync`, `rsync` | Where it installs |
+| `RSYNC_STORAGE_CLASS` | cluster default | Required only when the cluster has no default |
+| `RSYNC_IMAGE_REGISTRY`, `RSYNC_IMAGE_TAG`, `RSYNC_IMAGE_PULL_SECRET` | `ghcr.io/rsync-ai`, chart version, none | Mirror or private registry |
+| `RSYNC_KUBE_CONTEXT` | current context | Target a specific cluster |
+| `RSYNC_EXTRA_VALUES` | — | A Helm values file layered on top — external Postgres/Kafka, Workload Identity, limits |
+
+Any setting can also go on the `bash` side of the pipe
+(`curl … | RSYNC_NAMESPACE=data bash`) — written before `curl`, it never reaches the
+script. `--render-only` writes the files and renders the chart without touching a
+cluster.
+
+A managed cloud (RDS/Cloud SQL, MSK/Managed Kafka, S3/GCS) goes in through
+`RSYNC_EXTRA_VALUES` — start from the matching overlay below. The installer still
+generates the secrets and the fleet.
+
+**A slow first pull.** A first install pulls ~20 images from `ghcr.io`, and a slow link can
+answer `net/http: timeout awaiting response headers` for one of them. The kubelet retries on
+its own, every Deployment in the chart tolerates 30 minutes without progress
+(`global.progressDeadlineSeconds`, above the installer's 15-minute `RSYNC_WAIT_TIMEOUT`), and
+if the installer does give up it names the registry as the cause. Re-run it: layers already
+pulled are cached. On a network that keeps doing this, mirror the images and set
+`RSYNC_IMAGE_REGISTRY`.
+
+**Sizing.** The default install requests about **8.5 GiB of memory and 3.6 CPU**
+(requests, not usage). The installer warns when the nodes cannot hold that. To run
+lighter: `RSYNC_CONNECTORS=postgresql` and `RSYNC_DEMO=false`.
+
+### With `helm` directly
+
+The manual path — what the installer above runs. Use it when you manage releases
+with your own tooling; you then supply the secrets, URLs and `connectors.fleet`
+yourself.
+
+#### From the published chart
 
 The chart is published as an OCI artifact alongside the images by the
 `publish-chart` job in
@@ -54,12 +122,21 @@ chart and the images it points at can never skew:
 
 ```bash
 helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
-  --version 0.1.2 \
+  --version 0.1.3 \
   --namespace rsync --create-namespace \
   -f my-values.yaml
 ```
 
-No registry login is needed — the chart and every image it pulls are public.
+No registry login is needed: the chart itself and every `ghcr.io/rsync-ai` image
+it names answer an anonymous pull.
+
+> [!NOTE]
+> **No image overrides are needed on this path.** An earlier 0.1.2 artifact was
+> packaged before MinIO withdrew `docker.io/minio/*`, so it named two images that
+> no longer exist and needed `objectStorage.minio.{image,mcImage}` overrides.
+> `0.1.2` has since been repackaged: its `values.yaml` names `quay.io/minio/*`,
+> the same images a checkout uses. If you pinned those two overrides in a values
+> file, they are now redundant.
 
 **Reaching a cloud overlay from here.** The `values-gke.yaml` / `values-eks.yaml`
 / `values-aks.yaml` overlays *are* packaged inside the published chart, but `-f`
@@ -69,27 +146,27 @@ is no local file to name, and the two halves of the documentation do not compose
 
 ```bash
 helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
-  --version 0.1.2 \
+  --version 0.1.3 \
   --namespace rsync --create-namespace \
-  -f https://raw.githubusercontent.com/rsync-ai/rsync/v0.1.2/deploy/helm/rsync-ai/values-gke.yaml \
+  -f https://raw.githubusercontent.com/rsync-ai/rsync/v0.1.3/deploy/helm/rsync-ai/values-gke.yaml \
   -f my-values.yaml
 ```
 
-Keep the two versions equal. The URL carries the tag `v0.1.2` and `--version`
-carries `0.1.2` — the same release, spelled the two different ways the tag and
+Keep the two versions equal. The URL carries the tag `v0.1.3` and `--version`
+carries `0.1.3` — the same release, spelled the two different ways the tag and
 the chart version use. If you would rather not fetch over the network at install
 time, unpack the chart and use the copy that shipped with it, which cannot skew
 from the chart at all:
 
 ```bash
-helm pull oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.2 --untar
+helm pull oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.3 --untar
 helm install rsync ./rsync-ai \
   --namespace rsync --create-namespace \
   -f ./rsync-ai/values-gke.yaml \
   -f my-values.yaml
 ```
 
-### From a checkout
+#### From a checkout
 
 The right path when you are modifying the chart:
 
@@ -101,9 +178,11 @@ helm install rsync ./deploy/helm/rsync-ai \
 ```
 
 The chart resolves its image tag to `.Chart.AppVersion`, so this pulls the
-**0.1.2** images. Every image the chart names is published at that tag: the
-`v0.1.2` release run built 36 of 36 jobs, and all 34 packages answer an
-anonymous pull.
+**0.1.3** images. Every `ghcr.io/rsync-ai` image the chart names is published at that tag: the
+`v0.1.3` release run built 36 of 36 jobs, and all 34 packages answer an
+anonymous pull. They are built for both `amd64` and `arm64` (checked 2026-09-21 by manifest
+fetch); `0.1.2` and older are `amd64` only and fail on Apple Silicon, Graviton, Axion or Ampere
+nodes with `no match for platform in manifest`.
 
 Do not hand-audit this list. `v0.1.0` shipped the same class of defect from the
 other direction — `mcp-minio` pointed at a Dockerfile removed by
@@ -130,6 +209,7 @@ install (in-chart Postgres/Redis/Kafka/MinIO):
 secrets:
   jwtSecret: "<openssl rand -base64 32>"
   encryptionKey: "<openssl rand -base64 32>"
+  internalServiceSecret: "<openssl rand -hex 24>"   # without it every pipeline run is refused
   postgresPassword: "<openssl rand -hex 24>"
   minioAccessKey: "<openssl rand -base64 16>"
   minioSecretKey: "<openssl rand -base64 24>"
@@ -157,6 +237,28 @@ frontend:
 > Ready — its readinessProbe is `/ready`, which answers `503 db_ping_failed`, so
 > the pod sits at `0/1` and its Service has no endpoints.
 
+### Connectors are pods you choose
+
+The chart installs **no connector pod by default** (`connectors.fleet: []`), and
+Kubernetes has no just-in-time connector deploy — that needs a Docker socket. A
+pipeline that names a connector the fleet does not list has nothing to talk to. Name
+what you need, as `id` + the connector's current `version` + its image:
+
+```yaml
+connectors:
+  fleet:
+    - { id: postgresql, version: v1.0.0, image: { repository: mcp-postgresql, tag: "" } }
+    - { id: gcs,        version: v1.0.0, image: { repository: mcp-gcs,        tag: "" } }
+```
+
+The demo needs a `postgresql` entry. Each connector is ~100 MiB of requests, so list
+what you use, not all 20. `install-k8s.sh` generates this list for you from
+`RSYNC_CONNECTORS`.
+
+**MongoDB in the same cluster:** the mongodb connector defaults to TLS for any
+non-local host. A plaintext in-cluster Mongo needs `"sslmode": "disable"` in the
+connection config, or the handshake fails.
+
 ---
 
 ## EKS
@@ -174,6 +276,7 @@ gp3 is sufficient and EFS is not needed.
 secrets:
   jwtSecret: "…"
   encryptionKey: "…"
+  internalServiceSecret: "…"    # openssl rand -hex 24; without it pipeline runs are refused
   postgresPassword: "…"        # the RDS password; restricted alphabet, see above
   redisPassword: "…"           # the ElastiCache AUTH token; same alphabet. Omit only if there is none
 frontend:
@@ -236,6 +339,7 @@ account that will reach it.
 secrets:
   jwtSecret: "…"
   encryptionKey: "…"
+  internalServiceSecret: "…"    # openssl rand -hex 24; without it pipeline runs are refused
   postgresPassword: "…"        # the Cloud SQL password; restricted alphabet, see above
   redisPassword: "…"           # the Memorystore AUTH string; same alphabet. Omit only if AUTH is off
 frontend:
@@ -264,7 +368,7 @@ helm install rsync ./deploy/helm/rsync-ai \
   -f my-values.yaml
 ```
 
-**Four GKE-specific things that are easy to get wrong:**
+**Six GKE-specific things that are easy to get wrong:**
 
 - **The GCS credentials are not optional and workload identity does not replace
   them.** The object-storage connectors speak S3 and nothing else, so `mode: gcs`
@@ -281,6 +385,25 @@ helm install rsync ./deploy/helm/rsync-ai \
 - **GCE ingress takes 5–10 minutes to serve traffic** and looks identical to a
   broken install for the first few. `values-gke.yaml` ships
   `ingress.enabled: false`; turn it on once the rest is healthy.
+- **Managed Kafka over mutual TLS uses port 9192, `securityProtocol: SSL`, and an
+  empty `tls.caCert`.** The broker's certificate chains to Google Trust Services,
+  a public root the images already trust. Putting *your* CA Service root in
+  `caCert` — the natural reading of "the CA" — replaces that trust with a root the
+  broker's certificate does not chain to, and every client fails the handshake.
+  Set only `clientCert` and `clientKey`. (`SASL_SSL` on 9092 needs neither.)
+  Verified with a Go, a Python and a JVM client against a live Managed Kafka
+  cluster.
+- **The `gcs` connector authenticates as the node's service account unless you
+  give it a key, and that account is read-only by default.** GKE's default node
+  scope is `devstorage.read_only`, so listing works and every write fails with a
+  403 that reads like a bucket-permission problem. Pick one: put the service
+  account's JSON in the connection's `service_account_json` (works everywhere), use
+  a node pool with the `cloud-platform` scope, or bind Workload Identity — annotate
+  the chart's ServiceAccount with `serviceAccount.annotations`
+  (`iam.gke.io/gcp-service-account: …`); connector pods run under it. Workload
+  Identity is the least tested of the three. This is the **connector**; the chart's
+  own object-storage block is a separate S3-API path that still needs the HMAC key
+  above.
 
 On **Autopilot**, every workload in this chart declares CPU/memory requests, so
 it is supported as-is. Autopilot also blocks `hostPath` and privileged pods,
@@ -313,6 +436,13 @@ per-value reference is in
 [the chart README](../../deploy/helm/rsync-ai/README.md), and the ACLs your
 cluster must grant are in [Kafka ACLs](kafka-acls.md).
 
+**`tls.caCert` is for a private or self-signed CA only.** Managed Kafka whose
+certificate chains to a public root — MSK, Confluent Cloud, Aiven, and Google's
+Managed Service for Apache Kafka — needs it **empty**: the images already trust
+that root, and a CA bundle that does not contain it *replaces* the default trust
+rather than adding to it. For mutual TLS (`securityProtocol: SSL`) set `clientCert`
+and `clientKey`, both or neither.
+
 The compose stack has the same capability — see
 [Self-hosting](self-hosting.md#bring-your-own-kafka).
 
@@ -334,24 +464,28 @@ postgresql:
     sslMode: require
 ```
 
-Grant the role DDL on the database: `api-gateway` and `orchestrator` each run
-their own migrations at startup.
-
-Then create Temporal's two databases yourself — required on every external
-instance, not only where `CREATE DATABASE` is forbidden:
-
-```sql
-CREATE DATABASE temporal OWNER rsync;
-CREATE DATABASE temporal_visibility OWNER rsync;
-```
+Create the role, and give it `CREATEDB` plus DDL on the database. `api-gateway`
+and `orchestrator` each run their own migrations at startup, and a pre-install
+hook Job creates the databases *as this role* — `pipeline_db`, Temporal's
+`temporal` and `temporal_visibility`, and the `uuid-ossp` and `pg_trgm`
+extensions. The role is the one thing that hook cannot create, because it
+authenticates as it.
 
 With `postgresql.enabled: false` the chart sets `SKIP_DB_CREATE=true` on the
-Temporal pod, so nothing creates them for you. Left enabled, auto-setup's create
+Temporal pod, so auto-setup does not create its own two. Left enabled, its create
 runs regardless of whether the databases exist (its only guard is the name test
 `${DBNAME} != ${POSTGRES_USER}`) and exits 1 with `permission denied to create
 database` unless `postgresql.username` holds `CREATEDB`. That exit is fatal —
 the image runs `auto-setup.sh && start-temporal.sh` under `set -e` — so the pod
-CrashLoopBackOffs and no workflow engine starts.
+CrashLoopBackOffs and no workflow engine starts. The hook is what covers the gap
+`SKIP_DB_CREATE` opens, which is why it is a hook and not a note in this file.
+
+Two values turn it off again: `postgresql.dbInit.enabled: false`, the opt-out for
+an instance whose databases belong to a platform team, and
+`postgresql.external.iamAuth: true`, where there is no password for the Job to
+authenticate with. On either path the three `CREATE DATABASE` statements and the
+two extensions are yours to run before installing — the chart README
+[lists them, and what each one failing looks like](../../deploy/helm/rsync-ai/README.md#external-postgresql).
 
 **`sslMode` is the only TLS knob you normally set.** It reaches all four
 consumers, and because Temporal has no `sslmode` concept the chart *derives* its
@@ -440,5 +574,6 @@ than as verified recipes, and expect to iterate on IAM and networking.
 
 - [Chart reference](../../deploy/helm/rsync-ai/README.md) — every value, the BYO matrix, troubleshooting
 - [Kafka ACLs](kafka-acls.md) — permissions for a customer-managed cluster
+- [Ollama](ollama.md) — the internal-LLM path, and what `ollama.enabled` renders
 - [Environment variables](env-vars.md) — the value → env-var map
 - [Self-hosting](self-hosting.md) — the Docker Compose path

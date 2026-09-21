@@ -18,7 +18,7 @@ export default async function PipelinesPage({
   }
 
   return (
-    <Suspense fallback={<div className="p-6 text-sm text-zinc-500">Loading pipelines…</div>}>
+    <Suspense fallback={<div className="p-6 text-sm text-zinc-500 dark:text-zinc-400">Loading pipelines…</div>}>
       <PipelinesPageClient />
     </Suspense>
   )

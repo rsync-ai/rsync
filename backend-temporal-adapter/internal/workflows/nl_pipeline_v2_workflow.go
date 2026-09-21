@@ -622,7 +622,10 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 
 							// Wait for connector generation signal
 							var connectorPayload ConnectorGeneratedPayload
-							if !awaitHITLSignal(ctx, connectorGeneratedCh, &connectorPayload, state.WaitReason.TimeoutAt) {
+							if cancelled || !awaitHITLSignal(ctx, childCtx, connectorGeneratedCh, &connectorPayload, state.WaitReason.TimeoutAt) {
+								if cancelled {
+									return nil
+								}
 								msg := hitlTimeoutMessage("a generated connector", state.WaitReason.TimeoutAt, state.WaitReason.WaitingSince)
 								_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "capability_resolver", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
 									"error_message": msg,
@@ -674,7 +677,10 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 								logger.Info("⏳ Waiting for connection configuration", "attempt", validationAttempts, "max_attempts", maxConnectionValidationAttempts)
 
 								var connectionPayload ConnectionsConfiguredPayload
-								if !awaitHITLSignal(ctx, connectionsConfiguredCh, &connectionPayload, state.WaitReason.TimeoutAt) {
+								if cancelled || !awaitHITLSignal(ctx, childCtx, connectionsConfiguredCh, &connectionPayload, state.WaitReason.TimeoutAt) {
+									if cancelled {
+										return nil
+									}
 									msg := hitlTimeoutMessage("connections to be configured", state.WaitReason.TimeoutAt, state.WaitReason.WaitingSince)
 									_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "connection_validation", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
 										"error_message": msg,
@@ -892,14 +898,19 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 						})
 
 						// Longer timeout for generation.
+						// No LLM set up, or the generator refusing the request, never
+						// clears on retry, so neither is retried. The retry policy is
+						// not part of replay matching (only the activity ID and type
+						// are), so this needs no version gate.
 						genOpts := workflow.ActivityOptions{
 							StartToCloseTimeout: 3 * time.Minute,
 							HeartbeatTimeout:    30 * time.Second,
 							RetryPolicy: &temporal.RetryPolicy{
-								InitialInterval:    time.Second,
-								BackoffCoefficient: 2.0,
-								MaximumInterval:    time.Minute,
-								MaximumAttempts:    3,
+								InitialInterval:        time.Second,
+								BackoffCoefficient:     2.0,
+								MaximumInterval:        time.Minute,
+								MaximumAttempts:        3,
+								NonRetryableErrorTypes: []string{llmNotConfiguredErrType, generatorRefusedErrType},
 							},
 						}
 						genCtx := workflow.WithActivityOptions(ctx, genOpts)
@@ -917,14 +928,23 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 							} else {
 								errMsg = "generation returned success=false"
 							}
+							checkMsg := fmt.Sprintf("Connector generation failed for %s", missing.Type)
+							reason := fmt.Sprintf("Connector generation failed for %s: %v", missing.Type, genErr)
+							// The chat shows the last stage event's error_message and the
+							// pipeline row keeps the transition reason: when no LLM is set
+							// up, or the generator refused the request, both say why and
+							// what to do instead of a generic failure.
+							if sentence, ok := connectorGenFailureReason(ctx, genErr, missing.Type); ok {
+								errMsg, checkMsg, reason = sentence, sentence, sentence
+							}
 							_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "connector_generation", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
 								"error_message":  errMsg,
 								"connector_type": missing.Type,
 							})
 							_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "connector_check", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
-								"error_message": fmt.Sprintf("Connector generation failed for %s", missing.Type),
+								"error_message": checkMsg,
 							})
-							_ = state.Transition(StateFailed, workflow.Now(ctx), fmt.Sprintf("Connector generation failed for %s: %v", missing.Type, genErr))
+							_ = state.Transition(StateFailed, workflow.Now(ctx), reason)
 							if genErr != nil {
 								return genErr
 							}
@@ -1099,7 +1119,10 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 				validationAttempts++
 
 				var connectionPayload ConnectionsConfiguredPayload
-				if !awaitHITLSignal(ctx, connectionsConfiguredCh, &connectionPayload, state.WaitReason.TimeoutAt) {
+				if cancelled || !awaitHITLSignal(ctx, childCtx, connectionsConfiguredCh, &connectionPayload, state.WaitReason.TimeoutAt) {
+					if cancelled {
+						return nil
+					}
 					msg := hitlTimeoutMessage("connections to be configured", state.WaitReason.TimeoutAt, state.WaitReason.WaitingSince)
 					_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "connection_validation", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
 						"error_message": msg,
@@ -1516,7 +1539,10 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 		const maxValidationAttempts = 3
 		for attempt := 1; attempt <= maxValidationAttempts; attempt++ {
 			var connectionPayload ConnectionsConfiguredPayload
-			if !awaitHITLSignal(ctx, connectionsConfiguredCh, &connectionPayload, state.WaitReason.TimeoutAt) {
+			if cancelled || !awaitHITLSignal(ctx, childCtx, connectionsConfiguredCh, &connectionPayload, state.WaitReason.TimeoutAt) {
+				if cancelled {
+					return workflow.ErrCanceled
+				}
 				msg := hitlTimeoutMessage("connections to be fixed", state.WaitReason.TimeoutAt, state.WaitReason.WaitingSince)
 				_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "executor", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
 					"error_message": msg,
@@ -1687,7 +1713,10 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 
 				// Wait for tables_selected signal
 				var tablePayload TablesSelectedPayload
-				if !awaitHITLSignal(ctx, tablesSelectedCh, &tablePayload, state.WaitReason.TimeoutAt) {
+				if cancelled || !awaitHITLSignal(ctx, childCtx, tablesSelectedCh, &tablePayload, state.WaitReason.TimeoutAt) {
+					if cancelled {
+						return nil
+					}
 					msg := hitlTimeoutMessage("tables to be selected", state.WaitReason.TimeoutAt, state.WaitReason.WaitingSince)
 					_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "executor", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
 						"error_message": msg,
@@ -1731,6 +1760,9 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 				}
 
 				if werr := waitForConnectionFixAndValidate(waitDetails); werr != nil {
+					if recoveryEndedByCancel(ctx, cancelled) {
+						return nil
+					}
 					compensate()
 					_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "executor", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
 						"error_message": werr.Error(),
@@ -1794,6 +1826,9 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 					},
 				})
 				if werr := waitForConnectionFixAndValidate(waitDetails); werr != nil {
+					if recoveryEndedByCancel(ctx, cancelled) {
+						return nil
+					}
 					compensate()
 					_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "executor", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
 						"error_message": werr.Error(),
@@ -1881,7 +1916,10 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 				_ = emitPipelineWaitingEvent(ctx, input.PipelineID, input.ExecutionID, "executor", "approval", state.ExecutionPlan, waitDetails)
 
 				var approval ApprovalGivenPayload
-				if !awaitHITLSignal(ctx, approvalGivenCh, &approval, state.WaitReason.TimeoutAt) {
+				if cancelled || !awaitHITLSignal(ctx, childCtx, approvalGivenCh, &approval, state.WaitReason.TimeoutAt) {
+					if cancelled {
+						return nil
+					}
 					msg := hitlTimeoutMessage("the schema change to be approved", state.WaitReason.TimeoutAt, state.WaitReason.WaitingSince)
 					emitRepairEvent("REPAIR_FAILED", map[string]interface{}{"kind": "schema_approval", "reason": msg})
 					_ = emitStageEvent(ctx, input.PipelineID, input.ExecutionID, "executor", "STAGE_FAILED", state.ExecutionPlan, map[string]interface{}{
@@ -2114,8 +2152,47 @@ func traceContextFromWorkflowCtx(ctx workflow.Context, executionID string) (trac
 // and the operator-facing recovery for them is unchanged.
 const hitlWaitTimeoutVersion = "hitl-wait-timeout"
 
-// awaitHITLSignal blocks until the signal arrives or the park deadline passes,
-// reporting true only when a payload was actually received.
+// hitlWaitHonoursCancelVersion gates a HITL park also ending on the user's cancel.
+//
+// The park used to listen only for its own signal and its deadline, so a cancel
+// (StopPipeline sends the "cancel" signal) marked the run cancelled but left it
+// parked until the deadline. Versioned for the same reason as the timeout: under
+// the old code a cancel received during a park completed its workflow task with no
+// commands and the park kept waiting, so replaying that history must do the same.
+//
+// The callers' cancelled checks are deliberately not gated. Every path they now
+// take used to panic: the cancel handler's Transition(StateCancelled) clears
+// state.WaitReason, which the call and the timeout message both dereference, so no
+// history ever recorded commands there. Nothing can set it again after a cancel:
+// each of the six SetWaitReason calls sits directly behind a Transition into its
+// wait state that returns on error, and no transition leaves StateCancelled. A new
+// park must keep that shape (or gate its check) for this reasoning to hold. On
+// DefaultVersion a cancelled run still waits out its deadline, but then ends as
+// stopped instead of panicking.
+//
+// The one gated caller-side change is recoveryEndedByCancel.
+const hitlWaitHonoursCancelVersion = "hitl-wait-honours-cancel"
+
+// recoveryEndedByCancel reports that the executor's connection-fix wait failed
+// because the user cancelled, so its caller ends the run as stopped instead of as
+// a failed recovery (partial-data cleanup, STAGE_FAILED and the cancel error).
+//
+// waitForConnectionFixAndValidate keeps returning an error on a cancel, because
+// nil means "connections fixed" and its callers then re-dispatch the executor; at
+// the loop's iteration cap that re-dispatch continues the cancelled run as new.
+//
+// Gated, unlike the park checks above, because a cancel could already reach the
+// callers without a panic and those histories recorded the failure commands: a
+// cancel while the park was being entered fails the helper's Transition, and a
+// connections_configured signal after a cancel makes awaitIfPaused return
+// workflow.ErrCanceled. cancelled is checked first so a run that was not cancelled
+// records no marker here.
+func recoveryEndedByCancel(ctx workflow.Context, cancelled bool) bool {
+	return cancelled && workflow.GetVersion(ctx, hitlWaitHonoursCancelVersion, workflow.DefaultVersion, 1) != workflow.DefaultVersion
+}
+
+// awaitHITLSignal blocks until the signal arrives, the park deadline passes or the
+// run is cancelled, reporting true only when a payload was actually received.
 //
 // This is the sole place WaitReason.TimeoutAt is enforced. Every HITL park must go
 // through it (TestNoBareHITLChannelReceives holds that line): the deadline was
@@ -2124,7 +2201,13 @@ const hitlWaitTimeoutVersion = "hitl-wait-timeout"
 // is not a hypothetical — it is the "pipeline hangs at table selection" report, and
 // the zombie sweeper cannot clean up after it because it deliberately skips
 // pipeline_progress.status='waiting_for_user'.
-func awaitHITLSignal(ctx workflow.Context, ch workflow.ReceiveChannel, valuePtr interface{}, deadline time.Time) bool {
+//
+// cancelCtx is the run's cancellable context; the cancel signal handler cancels it.
+// A false return is either a timeout or a cancel, so every caller checks its
+// cancelled flag first, both on a false return and before the call: a cancel that
+// lands while the park is being announced has already cleared state.WaitReason,
+// and reading its TimeoutAt for the call would panic.
+func awaitHITLSignal(ctx, cancelCtx workflow.Context, ch workflow.ReceiveChannel, valuePtr interface{}, deadline time.Time) bool {
 	if workflow.GetVersion(ctx, hitlWaitTimeoutVersion, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
 		ch.Receive(ctx, valuePtr)
 		return true
@@ -2138,6 +2221,8 @@ func awaitHITLSignal(ctx workflow.Context, ch workflow.ReceiveChannel, valuePtr 
 		return false
 	}
 
+	honoursCancel := workflow.GetVersion(ctx, hitlWaitHonoursCancelVersion, workflow.DefaultVersion, 1) != workflow.DefaultVersion
+
 	// Cancel the timer on the receive path so a park that ends normally does not
 	// leave a pending timer behind for the rest of the workflow's life.
 	timerCtx, cancelTimer := workflow.WithCancel(ctx)
@@ -2145,6 +2230,11 @@ func awaitHITLSignal(ctx workflow.Context, ch workflow.ReceiveChannel, valuePtr 
 
 	received := false
 	selector := workflow.NewSelector(ctx)
+	if honoursCancel {
+		// Added before the signal: when both are ready the selector takes the
+		// earliest-added case, and a cancelled run must not resume on a late payload.
+		selector.AddReceive(cancelCtx.Done(), func(workflow.ReceiveChannel, bool) {})
+	}
 	selector.AddReceive(ch, func(c workflow.ReceiveChannel, _ bool) {
 		c.Receive(ctx, valuePtr)
 		received = true
@@ -2234,16 +2324,22 @@ func emitPipelineWaitingEvent(ctx workflow.Context, pipelineID, executionID, sta
 		"execution_id":   executionID,
 		"trace_id":       traceID,
 		"stage":          stage,
-		"status":         "waiting_for_user",
-		"message":        description,
-		"metadata":       details, // Persist execution_plan + wait details
-		"state":          "waiting",
+		// Without stage_group the Trace tab filed this wait (e.g. "Select table(s)
+		// to sync") in a group of its own that never saw a lifecycle event, so it
+		// stayed "Pending" after the user answered it.
+		"stage_group": stageGroupForStage(stage),
+		"status":      "waiting_for_user",
+		"message":     description,
+		"metadata":    details, // Persist execution_plan + wait details
+		"state":       "waiting",
 		"blocking_reason": map[string]interface{}{
 			"type":        blockingType,
 			"description": description,
 			"details":     details,
 		},
-		"timestamp": now.Format(time.RFC3339),
+		// Sub-second precision: the worker's copy of neighbouring events carries
+		// it, and whole seconds sorted this row out of order against them.
+		"timestamp": now.Format(time.RFC3339Nano),
 	}
 	if traceparent != "" {
 		event["traceparent"] = traceparent
@@ -2313,7 +2409,7 @@ func emitStageEvent(ctx workflow.Context, pipelineID, executionID, stage, eventT
 		"stage_group":    stageGroup,
 		"state":          stageState,
 		"status":         status,
-		"timestamp":      now.Format(time.RFC3339),
+		"timestamp":      now.Format(time.RFC3339Nano), // sub-second: see emitPipelineWaitingEvent
 		"metadata":       metadata,
 	}
 	if traceparent != "" {
@@ -2571,6 +2667,9 @@ func stageGroupForStage(stage string) string {
 		return "discovering"
 	case "planner":
 		return "planning"
+	case "infra_preflight":
+		// Its own lane: under the "planning" default it read as a second Planning.
+		return "infra_preflight"
 	case "cost_estimation", "policy_check", "validator":
 		return "validating"
 	case "executor":

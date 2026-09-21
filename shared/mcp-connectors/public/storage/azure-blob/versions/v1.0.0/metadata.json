@@ -20,6 +20,10 @@
   "supports_source": true,
   "supports_destination": true,
   "supports_cdc": false,
+  "namespace_model": {
+    "destination_namespace": "path",
+    "destination_default": ""
+  },
   "supports_ddl": false,
   "auto_create_destination_tables": true,
   "spec_version": "1.0",
@@ -184,6 +188,13 @@
         "description": "Destination only: roll a new part-file at ~N MB, estimated pre-compression (0 = off). 128-256 is a good warehouse target; applies to CDC and batch output.",
         "default": 0,
         "ui_order": 15,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "max_file_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as a file, in whole seconds from 1 to 240. Leave blank for 30. Any other value stops the pipeline from starting. Batch output is not affected.",
+        "ui_order": 18,
         "applies": "destination",
         "ui_tier": "advanced"
       },
@@ -430,6 +441,13 @@
         "description": "Destination only: roll a new part-file at ~N MB, estimated pre-compression (0 = off). 128-256 is a good warehouse target; applies to CDC and batch output.",
         "default": 0,
         "ui_order": 15,
+        "applies": "destination",
+        "ui_tier": "advanced"
+      },
+      "max_file_interval_seconds": {
+        "type": "integer",
+        "description": "Destination only (CDC): the longest changes wait before they are written as a file, in whole seconds from 1 to 240. Leave blank for 30. Any other value stops the pipeline from starting. Batch output is not affected.",
+        "ui_order": 18,
         "applies": "destination",
         "ui_tier": "advanced"
       },

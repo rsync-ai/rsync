@@ -240,7 +240,7 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
           loading/error is isolated to this block so a hiccup here can't blank the
           self-fetching run-level monitoring panel rendered below. */}
       {loading ? (
-        <div role="status" aria-live="polite" className="text-sm text-zinc-500">
+        <div role="status" aria-live="polite" className="text-sm text-zinc-500 dark:text-zinc-400">
           Loading transforms…
         </div>
       ) : error ? (
@@ -257,7 +257,7 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
             <div className="text-sm font-semibold text-zinc-900 dark:text-white">Configured transforms</div>
 
             {!hasConfigured ? (
-              <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500">
+              <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500 dark:text-zinc-400">
                 No transforms configured. Rsync didn&apos;t detect any columns that need shaping.
               </div>
             ) : (
@@ -280,7 +280,7 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
                 </div>
 
                 {groups.length === 0 ? (
-                  <div className="text-sm text-zinc-500 px-1">No transforms match &ldquo;{query}&rdquo;.</div>
+                  <div className="text-sm text-zinc-500 dark:text-zinc-400 px-1">No transforms match &ldquo;{query}&rdquo;.</div>
                 ) : (
                   <div className="space-y-2">
                     {groups.map((group) => (
@@ -303,7 +303,7 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
             <div className="flex items-center justify-between gap-3">
               <div className="min-w-0">
                 <div className="text-sm font-semibold text-zinc-900 dark:text-white">Latest run · per-table</div>
-                <div className="text-xs text-zinc-500">
+                <div className="text-xs text-zinc-500 dark:text-zinc-400">
                   Per-table transform results for the most recent run. Run-level totals are in Transform run history below.
                 </div>
               </div>
@@ -316,7 +316,7 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
                   {latestExecutionId.slice(0, 8)}
                 </Link>
               ) : (
-                <div className="shrink-0 text-xs text-zinc-500">No executions yet</div>
+                <div className="shrink-0 text-xs text-zinc-500 dark:text-zinc-400">No executions yet</div>
               )}
             </div>
 
@@ -396,16 +396,16 @@ function TransformGroupCard({
         className="flex w-full items-center gap-3 p-3 text-left hover:bg-zinc-50 dark:hover:bg-zinc-900/40"
       >
         {open ? (
-          <ChevronDown aria-hidden="true" className="h-4 w-4 text-zinc-500 shrink-0" />
+          <ChevronDown aria-hidden="true" className="h-4 w-4 text-zinc-500 dark:text-zinc-400 shrink-0" />
         ) : (
-          <ChevronRight aria-hidden="true" className="h-4 w-4 text-zinc-500 shrink-0" />
+          <ChevronRight aria-hidden="true" className="h-4 w-4 text-zinc-500 dark:text-zinc-400 shrink-0" />
         )}
         <span aria-hidden="true" className={`h-2 w-2 rounded-full shrink-0 ${tone.dot}`} />
         <div className="min-w-0 flex-1">
           <div className="text-sm font-medium text-zinc-900 dark:text-white">
             {transformTypeLabel(group.operation)}
           </div>
-          {blurb && <div className="text-xs text-zinc-500 truncate">{blurb}</div>}
+          {blurb && <div className="text-xs text-zinc-500 dark:text-zinc-400 truncate">{blurb}</div>}
         </div>
         <Badge variant="secondary" className="font-normal">
           {group.items.length}
@@ -452,12 +452,12 @@ function TransformRow({ lt, tone }: { lt: LogicalTransform; tone: { badge: strin
         <div className="min-w-0 flex-1">
           <span className="text-sm font-medium text-zinc-900 dark:text-white">{primary}</span>
           {secondary && (
-            <span className="ml-2 text-xs font-mono text-zinc-500">{secondary}</span>
+            <span className="ml-2 text-xs font-mono text-zinc-500 dark:text-zinc-400">{secondary}</span>
           )}
         </div>
         <Badge className={`font-normal ${tone.badge}`}>{transformTypeVerb(lt.operation)}</Badge>
         {sideLabel && (
-          <span className="text-[11px] text-zinc-500">{sideLabel}</span>
+          <span className="text-[11px] text-zinc-500 dark:text-zinc-400">{sideLabel}</span>
         )}
         <span
           className={`text-xs ${lt.enabled ? "text-emerald-600 dark:text-emerald-400" : "text-zinc-400"}`}

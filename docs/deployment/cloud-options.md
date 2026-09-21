@@ -71,7 +71,7 @@ image with no emulation and no flags.
 | Object storage 10 GB | $0/mo |
 | **Total** | **$0/mo** |
 
-Only external cost: OpenAI API calls (~$1–5/month for demo traffic). You can eliminate even this by running Ollama on the same VM.
+Only external cost: OpenAI API calls (~$1–5/month for demo traffic), if you use a key. You can eliminate even this by running Ollama on the same VM, or by running with no LLM until you need one.
 
 #### Limitations
 - No managed Kafka (MSK equivalent) in Always Free

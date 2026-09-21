@@ -4,10 +4,10 @@
 #
 #     docker compose -f docker-compose.quickstart.yml -f docker-compose.ollama.yml up -d
 #
-# install.sh adds this overlay for you when you pick the internal LLM, and the
-# status / logs / retry commands it prints at the end of a run carry the same
-# `-f` set, because they are built from the same array. Combine freely with the
-# byo-postgres and byo-kafka overlays; all three are independent.
+# install.sh adds this overlay for you when you pick the internal LLM, and
+# writes the same `-f` set to ~/rsync-ai/compose.sh so a later `up`/`down`/`logs`
+# carries it too. Combine freely with the byo-postgres and byo-kafka overlays;
+# all three are independent.
 #
 # Set LLM_PROVIDER=ollama in .env. Without this overlay that setting points the
 # LLM tier at an Ollama running on the HOST (http://host.docker.internal:11434),
@@ -84,7 +84,7 @@ services:
   #
   # Until this service existed, starting the bundled Ollama gave you a server
   # with no models in it, and the only thing telling you to fix that was a line
-  # in this file's own header:
+  # in this file's header:
   #
   #     docker exec rsync-ollama ollama pull qwen2.5:7b
   #
@@ -93,7 +93,13 @@ services:
   # surfaces that as a failed generation, and the stack around it stays green —
   # every container `running`, `/ready` 200, nothing to point at. The whole
   # offline path was one undocumented-by-anything-executable step away from
-  # working.
+  # working, which is the same defect class as the manual CREATE DATABASE this
+  # release removed from the Postgres paths.
+  #
+  # Mirrors the chart's templates/infra/ollama.yaml, which runs the same pull as
+  # a post-install hook Job. The two are hand-kept in step for the same reason
+  # kafka-init's script is inline: install.sh downloads compose files alone,
+  # with no repo checkout, so there is no shared script on the host to call.
   ollama-pull:
     image: ollama/ollama:0.33.2
     container_name: rsync-ollama-pull
@@ -161,7 +167,7 @@ services:
       # OLLAMA_BASE_URL as well, not OLLAMA_URL alone. _ollama_base_url in
       # llm-service/src/utils/openai_client.py:70 reads BASE_URL first and only
       # falls back to URL when BASE_URL is unset or empty -- and
-      # docker-compose.yml:1583 hard-codes
+      # docker-compose.yml:1585 hard-codes
       # OLLAMA_BASE_URL=http://host.docker.internal:11434/v1 on tool-generator,
       # a line docker-compose.prod.yml:789 repeats. With only OLLAMA_URL set
       # here, that service kept dialling the host on both of those bases while
@@ -171,15 +177,14 @@ services:
       # appends anyway; writing it keeps the rendered value byte-identical in
       # shape to the ones the base files already carry.
       OLLAMA_BASE_URL: http://ollama:11434/v1
-      # Pinned, and the quickstart is why. Its own default for this key is
+      # Pinned. The quickstart's default for this key used to be
       # `${LLM_MODEL:-gpt-4o}`, so a hand-run
       # `docker compose -f docker-compose.quickstart.yml -f docker-compose.ollama.yml up -d`
-      # with nothing set hands this container LLM_MODEL=gpt-4o while ollama-pull
-      # downloads qwen2.5:7b -- and get_default_model returns LLM_MODEL before it
-      # ever looks at OLLAMA_MODEL, so the main chat path asks the bundled Ollama
-      # for an OpenAI catalog name. Verified by rendering the two files together.
-      # install.sh happens to hide this by writing LLM_MODEL into the .env; the
-      # hand-run command in this file's header does not, and it is supported.
+      # with nothing set handed this container LLM_MODEL=gpt-4o while ollama-pull
+      # downloaded qwen2.5:7b -- and get_default_model returns LLM_MODEL before it
+      # ever looks at OLLAMA_MODEL, so the main chat path asked the bundled Ollama
+      # for an OpenAI catalog name. That default is empty now, but an .env kept
+      # from an OpenAI install still says LLM_MODEL=gpt-4o, and the pin covers it.
       LLM_MODEL: *ollama-model
       # Not redundant with LLM_MODEL above, and not decoration. FOUR functions in
       # llm-service/src/utils/openai_client.py pick a model name for the Ollama
@@ -187,9 +192,9 @@ services:
       # ollama-pull downloads exactly one:
       #
       #   get_default_model            :120-138  LLM_MODEL, OLLAMA_MODEL, qwen2.5:7b
-      #   explorer_default_model       :164-195  OLLAMA_MODEL, llama3:latest
-      #   explorer_default_sql_model   :198-207  OLLAMA_MODEL, sqlcoder:latest
-      #   rank_tables_default_model    :210-233  RANK_TABLES_MODEL, llama3:latest
+      #   explorer_default_model       :164-194  OLLAMA_MODEL, llama3:latest
+      #   explorer_default_sql_model   :197-206  OLLAMA_MODEL, sqlcoder:latest
+      #   rank_tables_default_model    :209-235  RANK_TABLES_MODEL, OLLAMA_MODEL, llama3:latest
       #
       # So without these two lines the main chat path works on the pulled model
       # while the Data Explorer and the table-ranking step ask Ollama for
@@ -197,10 +202,13 @@ services:
       # are not going to be. The operator sees a working /chat beside a Data
       # Explorer that fails — the exact split-brain this overlay exists to end.
       OLLAMA_MODEL: *ollama-model
-      # rank-tables is the one that reads its own variable rather than
+      # rank-tables is the one that reads a variable of its own BEFORE
       # OLLAMA_MODEL, deliberately: on the cloud providers it is pinned to a
       # cheap model so a stack-wide upgrade cannot silently multiply its bill.
-      # Offline there is only one model, so point it at that one.
+      # Offline it does fall through to OLLAMA_MODEL (:227-228), so the line
+      # below is belt and braces rather than the only thing holding it -- keep
+      # it, because it is also what an operator greps for when they want this
+      # one endpoint moved somewhere else.
       RANK_TABLES_MODEL: *ollama-model
       # A fifth model name, and the only one that is a LIST. When the Explorer's
       # NL->SQL step returns something that is not a SELECT, it retries against
@@ -250,8 +258,8 @@ services:
       # three extended services resolve the same way and a later base-file edit
       # cannot strand this one the way it stranded tool-generator.
       OLLAMA_BASE_URL: http://ollama:11434/v1
-      # Threads the quickstart's `${LLM_MODEL:-gpt-4o}` default too, so it needs
-      # the same pin llm-service does.
+      # Takes LLM_MODEL from the same .env as llm-service, so it needs the same
+      # pin llm-service does.
       LLM_MODEL: *ollama-model
       OLLAMA_MODEL: *ollama-model
     depends_on:

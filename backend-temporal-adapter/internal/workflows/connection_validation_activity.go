@@ -197,13 +197,67 @@ func getDBFromActivityContext() *sql.DB {
 	return nil
 }
 
-// connectorKey normalizes connector names for matching, making it work generically across all connectors.
-// Removes spaces, hyphens, underscores and lowercases to handle: "aws-s3", "aws_s3", "AWS S3", etc.
-func connectorKey(connectorType string) string {
-	normalized := strings.ToLower(connectorType)
+// connectorSpellingKey removes spaces, hyphens, underscores and lowercases to handle:
+// "aws-s3", "aws_s3", "AWS S3", etc. It is for substring matching against free text;
+// identity comparisons use connectorKey, which also folds aliases.
+func connectorSpellingKey(connectorType string) string {
+	normalized := strings.ToLower(strings.TrimSpace(connectorType))
 	normalized = strings.ReplaceAll(normalized, " ", "")
 	normalized = strings.ReplaceAll(normalized, "-", "")
 	normalized = strings.ReplaceAll(normalized, "_", "")
+	return normalized
+}
+
+// connectorIdentityAliases folds a separator-stripped connector name onto its
+// connector's separator-stripped id. The intent parser names a connector by its
+// catalog spelling ("google-cloud-storage") while the connection row stores the id
+// ("gcs"); without the fold the lookup finds no connection and the pipeline is
+// created with neither side set. Every alias a connector declares in its
+// metadata.json must fold here — TestConnectorKeyFoldsEveryDeclaredAlias.
+// api-gateway's connectorKeyForConnResolution carries the same table.
+var connectorIdentityAliases = map[string]string{
+	"googlecloudstorage":  "gcs",
+	"gcsstorage":          "gcs",
+	"azureblobstorage":    "azureblob",
+	"abs":                 "azureblob",
+	"s3":                  "awss3",
+	"amazons3":            "awss3",
+	"postgres":            "postgresql",
+	"postgesql":           "postgresql",
+	"pg":                  "postgresql",
+	"aurorapostgresql":    "postgresql",
+	"mariadb":             "mysql",
+	"auroramysql":         "mysql",
+	"mongo":               "mongodb",
+	"mongodbatlas":        "mongodb",
+	"atlas":               "mongodb",
+	"bq":                  "bigquery",
+	"googlebigquery":      "bigquery",
+	"mssql":               "sqlserver",
+	"azuresql":            "sqlserver",
+	"oracledb":            "oracle",
+	"oracledatabase":      "oracle",
+	"amazonredshift":      "redshift",
+	"awsredshift":         "redshift",
+	"gsheets":             "googlesheets",
+	"notion":              "notionrest",
+	"shopify":             "shopifyadmingraphql",
+	"clickhouseserver":    "clickhouse",
+	"yandexclickhouse":    "clickhouse",
+	"clickhousecloud":     "clickhouse",
+	"databrickssql":       "databricks",
+	"databrickslakehouse": "databricks",
+	"snowflakewarehouse":  "snowflake",
+}
+
+// connectorKey is a connector's identity for matching a requested type against a
+// stored connection's connector_type: "gcs", "google-cloud-storage" and
+// "Google Cloud Storage" all key to "gcs".
+func connectorKey(connectorType string) string {
+	normalized := connectorSpellingKey(connectorType)
+	if id, ok := connectorIdentityAliases[normalized]; ok {
+		return id
+	}
 	return normalized
 }
 
@@ -409,57 +463,7 @@ func generateIntentSuggestions(ctx context.Context, db *sql.DB, userID string, u
 		return nil, nil
 	}
 
-	req := strings.ToLower(strings.TrimSpace(userRequest))
-	reqKey := connectorKey(req)
-
-	mentionedSources := []string{}
-	mentionedDests := []string{}
-
-	// Simple mention detection: check if normalized connector token appears in normalized request string.
-	for _, s := range sources {
-		if s == "" {
-			continue
-		}
-		if strings.Contains(reqKey, connectorKey(s)) {
-			mentionedSources = append(mentionedSources, s)
-		}
-	}
-	for _, d := range dests {
-		if d == "" {
-			continue
-		}
-		if strings.Contains(reqKey, connectorKey(d)) {
-			mentionedDests = append(mentionedDests, d)
-		}
-	}
-
-	// Fallback alias hints for common shorthands users type.
-	aliasToKey := map[string]string{
-		"s3":        "awss3",
-		"aws_s3":    "awss3",
-		"aws-s3":    "awss3",
-		"postgres":  "postgresql",
-		"pg":        "postgresql",
-		"mysql":     "mysql",
-		"mongo":     "mongodb",
-		"mongodb":   "mongodb",
-		"pipedrive": "pipedrive",
-	}
-	for alias, key := range aliasToKey {
-		if strings.Contains(reqKey, connectorKey(alias)) {
-			// If alias suggests a destination, prefer matching against dests too.
-			for _, s := range sources {
-				if connectorKey(s) == key && !containsStr(mentionedSources, s) {
-					mentionedSources = append(mentionedSources, s)
-				}
-			}
-			for _, d := range dests {
-				if connectorKey(d) == key && !containsStr(mentionedDests, d) {
-					mentionedDests = append(mentionedDests, d)
-				}
-			}
-		}
-	}
+	mentionedSources, mentionedDests := connectorsMentioned(userRequest, sources, dests)
 
 	suggestions := []IntentSuggestion{}
 
@@ -517,6 +521,66 @@ func generateIntentSuggestions(ctx context.Context, db *sql.DB, userID string, u
 		suggestions = suggestions[:3]
 	}
 	return suggestions, nil
+}
+
+// connectorsMentioned picks, from the user's configured connector types, the ones the
+// request text names. It matches spellings inside free text, so it uses
+// connectorSpellingKey: the folded identity key would turn "s3" into "awss3", which
+// never appears in "postgres to s3".
+func connectorsMentioned(userRequest string, sources, dests []string) ([]string, []string) {
+	req := strings.ToLower(strings.TrimSpace(userRequest))
+	reqKey := connectorSpellingKey(req)
+
+	mentionedSources := []string{}
+	mentionedDests := []string{}
+
+	// Simple mention detection: check if normalized connector token appears in normalized request string.
+	for _, s := range sources {
+		if s == "" {
+			continue
+		}
+		if strings.Contains(reqKey, connectorSpellingKey(s)) {
+			mentionedSources = append(mentionedSources, s)
+		}
+	}
+	for _, d := range dests {
+		if d == "" {
+			continue
+		}
+		if strings.Contains(reqKey, connectorSpellingKey(d)) {
+			mentionedDests = append(mentionedDests, d)
+		}
+	}
+
+	// Fallback alias hints for common shorthands users type.
+	aliasToKey := map[string]string{
+		"s3":        "awss3",
+		"aws_s3":    "awss3",
+		"aws-s3":    "awss3",
+		"postgres":  "postgresql",
+		"pg":        "postgresql",
+		"mysql":     "mysql",
+		"mongo":     "mongodb",
+		"mongodb":   "mongodb",
+		"pipedrive": "pipedrive",
+	}
+	for alias, key := range aliasToKey {
+		if strings.Contains(reqKey, connectorSpellingKey(alias)) {
+			// If alias suggests a destination, prefer matching against dests too.
+			for _, s := range sources {
+				if connectorKey(s) == key && !containsStr(mentionedSources, s) {
+					mentionedSources = append(mentionedSources, s)
+				}
+			}
+			for _, d := range dests {
+				if connectorKey(d) == key && !containsStr(mentionedDests, d) {
+					mentionedDests = append(mentionedDests, d)
+				}
+			}
+		}
+	}
+
+	return mentionedSources, mentionedDests
 }
 
 func containsStr(xs []string, s string) bool {

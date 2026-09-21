@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"strings"
 	"testing"
@@ -93,5 +94,34 @@ func TestContainsPrivilege(t *testing.T) {
 		if containsPrivilege(g, "CREATE") {
 			t.Errorf("containsPrivilege(%q, CREATE) = true, want false", g)
 		}
+	}
+}
+
+// #39: a pipeline created without a destination mapping (Mongo→GCS from chat) got no
+// destination row at all, so the Assessment tab showed 0 Destination checks. It must
+// get one informational row, in the Destination category, that never blocks a run.
+func TestAssessDestinationNamespace_NoMappingStillReportsDestination(t *testing.T) {
+	tbl, ok := assessDestinationNamespace(context.Background(), nil, "ws", "conn", "gcs", []byte(`{"selected_tables":["shop.orders"]}`))
+	if !ok {
+		t.Fatal("no destination row for a pipeline without a mapping")
+	}
+	if got := findingCategory(tbl.Name); got != CategoryDestination {
+		t.Fatalf("row category = %q, want %q", got, CategoryDestination)
+	}
+	if len(tbl.Findings) != 1 {
+		t.Fatalf("findings = %+v, want exactly one", tbl.Findings)
+	}
+	f := tbl.Findings[0]
+	if f.Code != FindingDestNamespaceDefault || f.Severity != AssessmentInfo {
+		t.Fatalf("finding = %+v, want an info %s", f, FindingDestNamespaceDefault)
+	}
+	if !strings.Contains(f.Message, "path") {
+		t.Fatalf("message should name the object-storage namespace kind: %q", f.Message)
+	}
+	if hasBlockingFindings([]AssessmentTable{tbl}) {
+		t.Fatal("the no-mapping row must not block the run")
+	}
+	if _, ok := assessmentCatalog[FindingDestNamespaceDefault]; !ok {
+		t.Fatal("DEST_NAMESPACE_DEFAULT is missing from the check catalog")
 	}
 }

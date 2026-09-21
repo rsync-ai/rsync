@@ -49,6 +49,7 @@ import {
   type HealerActivity,
   type PipelineRunEvent,
 } from "@/lib/pipeline/eventNormalizer"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 /** Matches the healer's own PollInterval; there is nothing faster to see. */
 const POLL_MS = 60_000
@@ -297,7 +298,7 @@ function ActivityRow({ a }: { a: HealerActivity }) {
                 {a.eventType}
                 {a.attemptId ? ` · attempt #${a.attemptId}` : ""}
                 {" · "}
-                {new Date(a.timestamp).toLocaleString()}
+                {formatAbsoluteTime(a.timestamp)}
               </div>
             </dl>
           )}

@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Protocol
 class DataWarehouseAdapter(Protocol):
     def test_connection(self, config: Dict[str, Any]) -> Dict[str, Any]: ...
     def discover_schema(self, config: Dict[str, Any], params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]: ...
+    def list_namespaces(self, config: Dict[str, Any]) -> Dict[str, Any]: ...
     def export(self, config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]: ...
     def import_data(self, config: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]: ...
     # Optional warehouse-native operations (prefer bulk load + merge semantics)
@@ -276,6 +277,25 @@ class BigQueryWarehouseAdapter:
 
         result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
         return result
+
+    def list_namespaces(self, config: Dict[str, Any]) -> Dict[str, Any]:
+        """List the project's datasets: the level metadata.json's
+        namespace_model.table_namespace names. "current" is the configured
+        dataset_id, "" when there is none.
+        """
+        project_id = (config.get("project_id") or "").strip()
+        if not project_id:
+            return {"success": False, "error": "Missing project_id; cannot list datasets."}
+        try:
+            client = self._client(config)
+            names = [getattr(ds, "dataset_id", None) for ds in client.list_datasets(project_id)]
+            return {
+                "success": True,
+                "namespaces": sorted({str(n) for n in names if n}),
+                "current": (config.get("dataset_id") or "").strip(),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Listing namespaces failed: {e}"}
 
     # A BigQuery unquoted column identifier: letter/underscore then word chars.
     # cursor_column is caller/pipeline-config controlled and gets interpolated

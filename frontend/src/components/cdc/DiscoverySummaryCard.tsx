@@ -92,7 +92,7 @@ function StatCard({
         <p className="text-2xl font-bold text-zinc-900 dark:text-white">{value}</p>
         <p className="text-xs text-zinc-500 dark:text-zinc-400">{label}</p>
         {subValue && (
-          <p className="text-xs text-zinc-400 dark:text-zinc-500">{subValue}</p>
+          <p className="text-xs text-zinc-400">{subValue}</p>
         )}
       </div>
     </div>
@@ -227,26 +227,26 @@ export function DiscoverySummaryCard({
                   </p>
                   <div className="grid grid-cols-2 gap-2 text-sm">
                     <div className="flex justify-between p-2 rounded bg-zinc-50 dark:bg-zinc-900/50">
-                      <span className="text-zinc-500">With Primary Key</span>
+                      <span className="text-zinc-500 dark:text-zinc-400">With Primary Key</span>
                       <span className="font-medium">{tablesWithPK}</span>
                     </div>
                     <div className="flex justify-between p-2 rounded bg-zinc-50 dark:bg-zinc-900/50">
-                      <span className="text-zinc-500">Without Primary Key</span>
+                      <span className="text-zinc-500 dark:text-zinc-400">Without Primary Key</span>
                       <span className="font-medium">{tablesWithoutPK}</span>
                     </div>
                     <div className="flex justify-between p-2 rounded bg-zinc-50 dark:bg-zinc-900/50">
-                      <span className="text-zinc-500">Empty Tables</span>
+                      <span className="text-zinc-500 dark:text-zinc-400">Empty Tables</span>
                       <span className="font-medium">{emptyTables.length}</span>
                     </div>
                     <div className="flex justify-between p-2 rounded bg-zinc-50 dark:bg-zinc-900/50">
-                      <span className="text-zinc-500">Large Tables (100K+)</span>
+                      <span className="text-zinc-500 dark:text-zinc-400">Large Tables (100K+)</span>
                       <span className="font-medium">{largeTables.length}</span>
                     </div>
                   </div>
 
                   {/* Sample Tables */}
                   <div className="space-y-1">
-                    <p className="text-xs text-zinc-500">Sample Tables:</p>
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">Sample Tables:</p>
                     <div className="flex flex-wrap gap-1">
                       {tables.slice(0, 8).map((t) => (
                         <Badge key={t.name} variant="secondary" className="text-xs font-mono">

@@ -47,6 +47,7 @@ import { toast } from "sonner"
 import { Plus, Copy, Trash2 } from "lucide-react"
 import type { AdminInvitation } from "@/lib/api/admin"
 import { adminCreateInvitation, adminListInvitations, adminRevokeInvitation } from "@/lib/api/admin"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 const statusBadgeVariant: Record<string, "default" | "secondary" | "outline" | "destructive"> = {
   pending: "default",
@@ -159,7 +160,7 @@ export default function AdminInvitationsPage() {
             <TableBody>
               {invitations.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={7} className="text-center text-sm text-zinc-500 py-8">
+                  <TableCell colSpan={7} className="text-center text-sm text-zinc-500 dark:text-zinc-400 py-8">
                     No invitations yet
                   </TableCell>
                 </TableRow>
@@ -173,13 +174,13 @@ export default function AdminInvitationsPage() {
                     <TableCell>
                       <Badge variant={statusBadgeVariant[inv.status] || "outline"}>{inv.status}</Badge>
                     </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-zinc-500">
+                    <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
                       {inv.created_by_email}
                     </TableCell>
-                    <TableCell className="hidden md:table-cell text-sm text-zinc-500">
-                      {new Date(inv.expires_at).toLocaleString()}
+                    <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
+                      {formatAbsoluteTime(inv.expires_at)}
                     </TableCell>
-                    <TableCell className="hidden lg:table-cell text-sm text-zinc-500">
+                    <TableCell className="hidden lg:table-cell text-sm text-zinc-500 dark:text-zinc-400">
                       {inv.used_by_email || "-"}
                     </TableCell>
                     <TableCell className="text-right">
@@ -233,7 +234,7 @@ export default function AdminInvitationsPage() {
                   <Copy className="h-4 w-4" />
                 </Button>
               </div>
-              <p className="text-xs text-zinc-500">This link expires in 72 hours.</p>
+              <p className="text-xs text-zinc-500 dark:text-zinc-400">This link expires in 72 hours.</p>
             </div>
           ) : (
             <div className="space-y-4">
@@ -244,7 +245,7 @@ export default function AdminInvitationsPage() {
                   value={emailHint}
                   onChange={(e) => setEmailHint(e.target.value)}
                 />
-                <p className="text-xs text-zinc-500">Optional hint shown on the signup page.</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">Optional hint shown on the signup page.</p>
               </div>
               <div className="space-y-2">
                 <Label>Role</Label>

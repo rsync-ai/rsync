@@ -96,7 +96,7 @@ function AdminUsagePageContent() {
 
   return (
     <div className="space-y-6">
-      <PageHeader heading="Platform admin" description="Consumption across all workspaces and users (beta)" />
+      <PageHeader heading="Admin" description="Consumption across all workspaces and users (beta)" />
       <AdminNav />
 
       <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-200">
@@ -177,7 +177,7 @@ function AdminUsagePageContent() {
                   <TableBody>
                     {data.workspaces.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={9} className="py-8 text-center text-sm text-zinc-500">
+                        <TableCell colSpan={9} className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
                           No workspaces found.
                         </TableCell>
                       </TableRow>
@@ -203,7 +203,7 @@ function AdminUsagePageContent() {
                                 → <span className="capitalize">{w.effective_plan}</span>
                               </span>
                             ) : null}
-                            <span className="ml-2 text-xs text-zinc-500">
+                            <span className="ml-2 text-xs text-zinc-500 dark:text-zinc-400">
                               {w.plan_limit == null ? "∞" : `${fmt(w.pipelines)}/${fmt(w.plan_limit)}`}
                             </span>
                             {/* An override is invisible otherwise: the number
@@ -225,7 +225,7 @@ function AdminUsagePageContent() {
                           <TableCell className="text-right tabular-nums">{fmt(w.records_processed)}</TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(w.rows_read)}</TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(w.rows_written)}</TableCell>
-                          <TableCell className="text-zinc-500">{fmtDate(w.last_activity)}</TableCell>
+                          <TableCell className="text-zinc-500 dark:text-zinc-400">{fmtDate(w.last_activity)}</TableCell>
                         </TableRow>
                       ))
                     )}
@@ -251,7 +251,7 @@ function AdminUsagePageContent() {
                   <TableBody>
                     {data.users.length === 0 ? (
                       <TableRow>
-                        <TableCell colSpan={7} className="py-8 text-center text-sm text-zinc-500">
+                        <TableCell colSpan={7} className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
                           No users with activity found.
                         </TableCell>
                       </TableRow>
@@ -270,7 +270,7 @@ function AdminUsagePageContent() {
                           <TableCell className="text-right tabular-nums font-medium">{fmt(u.records_processed)}</TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(u.rows_read)}</TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(u.rows_written)}</TableCell>
-                          <TableCell className="text-zinc-500">{fmtDate(u.last_activity)}</TableCell>
+                          <TableCell className="text-zinc-500 dark:text-zinc-400">{fmtDate(u.last_activity)}</TableCell>
                         </TableRow>
                       ))
                     )}
@@ -281,7 +281,7 @@ function AdminUsagePageContent() {
           )}
 
           {data.retention_enabled ? (
-            <div className="text-xs text-zinc-500">
+            <div className="text-xs text-zinc-500 dark:text-zinc-400">
               Transfer totals cover the last {data.retention_days} days (run-stat retention is enabled).
             </div>
           ) : null}

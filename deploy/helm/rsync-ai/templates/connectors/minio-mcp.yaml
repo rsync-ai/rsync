@@ -39,6 +39,7 @@ metadata:
     app.kubernetes.io/component: minio-mcp
 spec:
   replicas: 1
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   selector:
     matchLabels:
       {{- include "rsync-ai.selectorLabels" . | nindent 6 }}

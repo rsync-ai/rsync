@@ -26,6 +26,7 @@ metadata:
     app.kubernetes.io/component: frontend
 spec:
   replicas: {{ .Values.frontend.replicaCount }}
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   selector:
     matchLabels:
       {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
@@ -55,17 +56,25 @@ spec:
             # Server-side (Next route handlers) calls stay in-cluster.
             - name: API_GATEWAY_INTERNAL_URL
               value: "http://{{ $fullname }}-api-gateway:{{ .Values.apiGateway.service.port }}"
-            # The next three are read by the BROWSER, so they must be the
-            # external addresses. A Service name here renders a page whose every
-            # API call fails DNS on the user's machine — the pods stay green and
-            # the app is blank.
+            # PUBLIC_URL / PUBLIC_WS_URL are what the BROWSER is told. They are read
+            # at request time and inlined into the page (frontend/src/lib/config/
+            # runtime-env.ts), and they must be the external addresses: a Service
+            # name here renders a page whose every API call fails DNS on the
+            # user's machine -- the pods stay green and the app is blank.
             #
-            # NEXT_PUBLIC_* are baked at build time in a normal Next build; this
-            # image reads them at runtime, which is why setting them here works
-            # at all. If you swap in a self-built image that inlines them, these
-            # values are inert and the URLs must be set at docker build time.
-            - name: NEXT_PUBLIC_API_URL
+            # These names, not NEXT_PUBLIC_*: the published image was compiled by
+            # CI with NEXT_PUBLIC_API_URL=http://localhost:5001, the compiler
+            # substituted that text into the bundle, and nothing set here under the
+            # NEXT_PUBLIC_ names can undo it. Before this pair existed every
+            # Kubernetes install sent its browser to localhost:5001.
+            - name: PUBLIC_URL
               value: {{ required "frontend.apiUrl is required: it is the address the BROWSER calls the API on" .Values.frontend.apiUrl | quote }}
+            - name: PUBLIC_WS_URL
+              value: {{ .Values.frontend.wsUrl | default (printf "%s/ws" (.Values.frontend.apiUrl | replace "https://" "wss://" | replace "http://" "ws://")) | quote }}
+            # Kept for a self-built image that inlines them at `docker build`;
+            # inert on the published one (see above).
+            - name: NEXT_PUBLIC_API_URL
+              value: {{ .Values.frontend.apiUrl | quote }}
             - name: NEXT_PUBLIC_WS_URL
               value: {{ .Values.frontend.wsUrl | default (printf "%s/ws" (.Values.frontend.apiUrl | replace "https://" "wss://" | replace "http://" "ws://")) | quote }}
             - name: NEXTAUTH_URL

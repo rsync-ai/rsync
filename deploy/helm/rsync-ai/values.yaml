@@ -28,6 +28,16 @@ global:
   # to the orchestrator. These two MUST agree; the chart wires both from here.
   stackPrefix: rsync-ai
 
+  # How long a Deployment may go without progress before Kubernetes marks it
+  # ProgressDeadlineExceeded. Applied to every Deployment in this chart. The
+  # Kubernetes default is 600s, and Helm 4's `--wait` (kstatus) fails the whole
+  # release the moment that flag is set -- whatever `--timeout` says. A first
+  # install pulls ~20 images from a registry, and one slow ghcr.io pull is enough
+  # to spend ten minutes. 1800s keeps a genuinely stuck rollout loud without making
+  # a slow network look like a broken chart. Keep it above install-k8s.sh's
+  # WAIT_TIMEOUT (guarded by test_install_k8s_defaults_work.py).
+  progressDeadlineSeconds: 1800
+
   image:
     registry: ghcr.io/rsync-ai
     # Empty = use the chart's appVersion, which .github/workflows/docker-publish.yml
@@ -97,8 +107,11 @@ secrets:
   jwtSecret: ""
   encryptionKey: ""
 
-  # Service-to-service shared secret. Empty is allowed and the services fail
-  # closed (503) rather than open, but you want this set.
+  # Service-to-service shared secret (gateway -> orchestrator, frontend, adapter,
+  # generation pods). Empty is allowed and the services fail closed rather than
+  # open -- which means pipeline runs are refused ("authentication required"),
+  # so a real install must set it. install-k8s.sh generates one; by hand:
+  #   --set secrets.internalServiceSecret=$(openssl rand -hex 24)
   internalServiceSecret: ""
 
   # RESTRICTED ALPHABET -- these three, plus demoWarehousePassword below, must
@@ -359,6 +372,15 @@ kafka:
       # uses this for logicalCluster/identityPoolId. `auth` is reserved by the
       # mechanism and is rejected.
       extensions: ""
+      # Escape hatch for a disposable test rig running a throwaway IdP over
+      # plain http. LEAVE FALSE: the client-credentials grant POSTs
+      # clientSecret on every token fetch, so an http hop off loopback hands a
+      # credential that does not expire to anyone on the path -- worse than the
+      # short-lived token it buys, and nothing broker-side can repair it.
+      # A LOOPBACK endpoint does not need this (the request never leaves the
+      # pod), which is what Google's Workload Identity token sidecar on
+      # localhost:14293 relies on.
+      allowInsecureTokenEndpoint: false
       # The JVM's login callback handler class. Leave empty for the default.
       #
       # Override only to match your broker's Kafka version: the class was
@@ -372,8 +394,10 @@ kafka:
     # verify and everything below is ignored.
     #
     # Leaving the whole block empty is the RIGHT answer for managed Kafka whose
-    # certificate chains to a public root (MSK, Confluent Cloud, Aiven): the
-    # images already trust those. It is the wrong answer for a private or
+    # certificate chains to a public root (MSK, Confluent Cloud, Aiven, Google
+    # Managed Kafka): the images already trust those. For mTLS to such a broker
+    # set clientCert + clientKey and leave caCert EMPTY -- a caCert that lacks the
+    # public root REPLACES the default trust instead of adding to it. It is the wrong answer for a private or
     # self-signed CA, where the handshake fails with a certificate error that
     # names the issuer and not this setting.
     tls:
@@ -572,7 +596,7 @@ frontend:
   # Browser-visible URLs. These are baked into what the browser calls, so they
   # must be the EXTERNAL addresses, not in-cluster Service names.
   publicUrl: ""       # https://app.example.com  → NEXTAUTH_URL
-  apiUrl: ""          # https://api.example.com  → NEXT_PUBLIC_API_URL
+  apiUrl: ""          # https://api.example.com  → PUBLIC_URL (what the browser calls)
   wsUrl: ""           # wss://api.example.com/ws → NEXT_PUBLIC_WS_URL
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -797,8 +821,9 @@ connectors:
   # debezium-mcp and kafka-mcp-sink together (infra_preflight.go:177-201).
   # debezium-mcp runs as a sidecar of kafka-connect, not a separate Deployment,
   # because debezium writes source-DB credentials to a directory kafka-connect
-  # reads through FileConfigProvider. Sharing an emptyDir in one pod keeps those
-  # credentials off the Kafka config topic without needing a RWX volume.
+  # reads through FileConfigProvider. One pod means the shared volume is an
+  # ordinary ReadWriteOnce claim (kafkaConnect.secretsPersistence), so those
+  # credentials stay off the Kafka config topic AND survive a pod restart.
   #
   # On by default, because "all three or none" has no third branch that degrades:
   # a streaming pipeline on a release without them does not fall back to batch,
@@ -811,13 +836,27 @@ connectors:
     kafkaConnect:
       image: { repository: kafka-connect, tag: "" }
       groupId: rsync-connect-cluster
-      # Only consulted when kafka.external.saslMechanism is set. In that case the
-      # container runs a short prelude that builds sasl.jaas.config with the
-      # escaping the value needs (see templates/connectors/cdc.yaml) and then
-      # execs this. Override it if you point `image` at a Connect distribution
-      # whose entrypoint is not Debezium's.
-      entrypoint: "/docker-entrypoint.sh start"
+      # DEPRECATED -- leave empty. The rsync kafka-connect image's own entrypoint
+      # builds sasl.jaas.config (and OAuth, and the mTLS keystore) from the
+      # KAFKA_* settings; see shared/internal/infra/kafka-connect/connect-entrypoint.sh.
+      # A value here replaces that entrypoint entirely, so set it only when
+      # `image` is a Connect distribution that is not rsync's -- that image must
+      # then configure Kafka security itself. The old default
+      # "/docker-entrypoint.sh start" is treated as empty.
+      entrypoint: ""
       heapOpts: "-Xms256M -Xmx768M"
+      # Where debezium-mcp writes each source database's credentials for
+      # Connect's FileConfigProvider. It MUST survive a pod restart: the
+      # connector configs live in Kafka and reference these files, so with an
+      # emptyDir every restart leaves every CDC connector RESTARTING ("Could not
+      # read properties from file") until its pipeline is re-run. A few KB per
+      # connector; ReadWriteOnce is enough (one pod). Set enabled=false only on
+      # a cluster with no StorageClass, and accept that restart behaviour.
+      secretsPersistence:
+        enabled: true
+        size: 1Gi
+        # Overrides global.storageClass for this volume only. Empty = inherit it.
+        storageClass: ""
       resources:
         requests: { cpu: 300m, memory: 1Gi }
         limits: { memory: 1536Mi }

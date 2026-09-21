@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -24,6 +25,7 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmjson"
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 	"github.com/rsync-ai/shared/crypto"
+	"github.com/rsync-ai/shared/naming"
 	log "github.com/sirupsen/logrus"
 	"go.temporal.io/sdk/client"
 )
@@ -226,6 +228,71 @@ func parseSyncModeOverrides(message string) (syncMode string, cdcMode string, cd
 		cdcInitialLoad = ""
 	}
 	return syncMode, cdcMode, cdcInitialLoad
+}
+
+const clientTimezoneCtxKey = "client_timezone"
+
+// chatPipelineName builds the default name of a chat-created pipeline. The
+// time is rendered in the caller's IANA zone (sent by the browser as
+// context.timezone) so it matches the local times the UI shows everywhere
+// else; the old time.Now().Format on a UTC server produced "Chat Pipeline
+// 18:46:58" for a user at 20:46 GMT+2 (issue #11). An empty, oversized or
+// unknown zone falls back to UTC. time/tzdata is embedded in this binary
+// (saved_query_schedules.go), so LoadLocation works in distroless images.
+func chatPipelineName(now time.Time, tz string) string {
+	loc := time.UTC
+	if tz = strings.TrimSpace(tz); tz != "" && len(tz) <= 64 && tz != "Local" {
+		if l, err := time.LoadLocation(tz); err == nil {
+			loc = l
+		}
+	}
+	return fmt.Sprintf("Chat Pipeline %s", now.In(loc).Format("15:04:05"))
+}
+
+// requestedSyncModeForConfirmation reports the sync mode the user EXPLICITLY
+// asked for in their original NL request ("... using CDC with snapshot +
+// streaming"), so the confirmation card can pre-select it instead of asking
+// "Choose Sync Mode" as if nothing had been said. It deliberately ignores
+// PendingIntent.SyncMode: the intent classifier maps the verb "sync" to batch,
+// so that field is a guess, not a request. Returns ("", "") when the request
+// names no mode, or names CDC for a source that cannot do CDC (the card then
+// falls back to an explicit pick). Pure + unit-tested in
+// chat_nl_requested_syncmode_test.go.
+func requestedSyncModeForConfirmation(sourceType, originalRequest string) (syncMode, cdcMode string) {
+	if strings.TrimSpace(originalRequest) == "" {
+		return "", ""
+	}
+	syncMode, cdcMode, _ = parseSyncModeOverrides(originalRequest)
+	switch syncMode {
+	case "cdc":
+		if !connectorSupportsCDC(sourceType) {
+			return "", ""
+		}
+		if cdcMode == "" {
+			cdcMode = "initial"
+		}
+		return syncMode, cdcMode
+	case "batch":
+		return syncMode, ""
+	}
+	return "", ""
+}
+
+func requestedSyncMode(sourceType, originalRequest string) string {
+	m, _ := requestedSyncModeForConfirmation(sourceType, originalRequest)
+	return m
+}
+
+func requestedCDCMode(sourceType, originalRequest string) string {
+	_, m := requestedSyncModeForConfirmation(sourceType, originalRequest)
+	return m
+}
+
+func pendingOriginalRequest(pi *chat.PendingIntent) string {
+	if pi == nil {
+		return ""
+	}
+	return pi.OriginalRequest
 }
 
 // resolveConfirmationSyncMode picks the pipeline's sync mode at confirmation time
@@ -605,6 +672,50 @@ var nlTableAfterRe = regexp.MustCompile("\\btable\\s+[\"'`]?([a-z_][a-z0-9_.-]*)
 // half-parsing.
 var nlPluralTablesRe = regexp.MustCompile(`\btables\b`)
 
+// destNamespaceTokenRe is the explicit token the chat Confirm card sends when the
+// user types a destination database/schema on it ("Yes sync_mode=cdc
+// destination_namespace=sales_copy").
+var destNamespaceTokenRe = regexp.MustCompile(`(?i)\bdestination[_\s-]?namespace\s*[:=]\s*([A-Za-z_][A-Za-z0-9_]*)`)
+
+// destNamespaceNLRe matches the destination clause of a request that names the
+// database to write into: "… into my MongoDB Dest, database datingapp_pg3" or "…
+// to snowflake schema analytics". It needs "into"/"to" earlier in the same
+// sentence and the keyword BEFORE the name, so the source half ("from my
+// datingapp database") never matches.
+var destNamespaceNLRe = regexp.MustCompile(`(?i)\b(?:into|to)\b[^.;!?]*?\b(?:database|schema|dataset|db)\s+(?:named\s+|called\s+)?[` + "`" + `"']?([A-Za-z_][A-Za-z0-9_]*)`)
+
+// parseDestinationNamespaceIntent returns the destination database/schema the user
+// named, or "". The chat flow used to create every pipeline with the destination's
+// default namespace, so "sync … into my MongoDB Dest, database datingapp_pg3"
+// silently wrote to a different database, and the Confirm card never showed which.
+// The card's explicit token wins over the NL phrasing. Anything
+// naming.ValidateNamespace rejects (filler words, characters that need quoting)
+// is dropped, leaving the default and the table-selection HITL's field.
+func parseDestinationNamespaceIntent(message string) string {
+	if m := destNamespaceTokenRe.FindStringSubmatch(message); len(m) == 2 {
+		if naming.ValidateNamespace(m[1]) == "" {
+			return m[1]
+		}
+		return ""
+	}
+	for _, m := range destNamespaceNLRe.FindAllStringSubmatch(message, -1) {
+		if len(m) == 2 && naming.ValidateNamespace(m[1]) == "" {
+			return m[1]
+		}
+	}
+	return ""
+}
+
+// confirmationNamespaceFields is what the Confirm card needs to show and edit the
+// destination namespace: the name the request gave (if any), the destination's own
+// default, and what a namespace is on that engine (schema, database, dataset, path).
+func confirmationNamespaceFields(data map[string]interface{}, sourceType, destType, request string) map[string]interface{} {
+	data["requested_destination_namespace"] = parseDestinationNamespaceIntent(request)
+	data["default_destination_namespace"] = seedDestinationNamespace(sourceType, destType)
+	data["destination_namespace_kind"] = namespaceKindForConnector(destType)
+	return data
+}
+
 // parseTableIntent extracts an explicitly-named SINGLE source table from a chat NL
 // message so a one-turn create can skip the table-selection HITL (KI-NLCHAT-
 // TABLENAME-IGNORED). Conservative by design: it only fires on the singular
@@ -700,6 +811,14 @@ func (h *ChatHandler) SendMessageNLPipeline(c *gin.Context) {
 	if sessionID == "" {
 		sessionID = fmt.Sprintf("session-%d", time.Now().Unix())
 	}
+	// The browser's IANA time zone (context.timezone), used only to render the
+	// auto-generated "Chat Pipeline HH:MM:SS" name in the user's local clock
+	// instead of the server's UTC (issue #11). Validated in chatPipelineName.
+	if req.Context != nil {
+		if tz, ok := req.Context["timezone"].(string); ok {
+			c.Set(clientTimezoneCtxKey, strings.TrimSpace(tz))
+		}
+	}
 
 	log.WithFields(log.Fields{
 		"trace_id":   traceID,
@@ -773,6 +892,33 @@ func (h *ChatHandler) SendMessageNLPipeline(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+// chatNoLLMExample is a request the deterministic fast path
+// (quickParseDataSyncIntent) understands without calling the LLM. A test pins
+// that, so the hint in the no-LLM reply cannot go stale.
+const chatNoLLMExample = "mongodb to gcs"
+
+// llmNotConfiguredChatReply answers a chat message that needed the LLM to be
+// understood when no LLM is set up: the service's sentence on what to do, plus
+// one phrasing that works without an LLM.
+func llmNotConfiguredChatReply(gated *llmNotConfiguredError, traceID string) ChatMessageResponse {
+	setup, _ := gated.Body()["message"].(string)
+	if strings.TrimSpace(setup) == "" {
+		setup = llmNotConfiguredFallbackMessage
+	}
+	return ChatMessageResponse{
+		Message: "I need an LLM to understand this request, and none is set up. " + setup + "\n\n" +
+			"Without an LLM, name the source and the destination directly, for example **\"" + chatNoLLMExample + "\"**.",
+		Type:      "text",
+		TraceID:   traceID,
+		Timestamp: time.Now().Format(time.RFC3339),
+		Data: map[string]interface{}{
+			"needs_llm": true,
+			"example":   chatNoLLMExample,
+		},
+		Suggestions: []string{chatNoLLMExample},
+	}
+}
+
 // handleNewIntent processes a new message when conversation is idle
 func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv *chat.ConversationContext, message, traceID, sessionID, userID string) ChatMessageResponse {
 	// Fast path: "why did pipeline X fail" / "diagnose execution Y". This
@@ -840,6 +986,10 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 		intent, err = h.parseIntent(ctx, message)
 		if err != nil {
 			log.WithError(err).Warn("Failed to parse intent")
+			var gated *llmNotConfiguredError
+			if errors.As(err, &gated) {
+				return llmNotConfiguredChatReply(gated, traceID)
+			}
 			return ChatMessageResponse{
 				Message: "I can help you move data between systems. Try something like:\n\n" +
 					"• **\"Sync MySQL to BigQuery\"**\n" +
@@ -1130,14 +1280,16 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 			Type:      "confirmation",
 			TraceID:   traceID,
 			Timestamp: time.Now().Format(time.RFC3339),
-			Data: map[string]interface{}{
+			Data: confirmationNamespaceFields(map[string]interface{}{
 				"source_type":                       intent.SourceType,
 				"destination_type":                  intent.DestinationType,
 				"supported_sync_modes":              supportedSyncModes,
 				"source_supports_cdc":               sourceSupportsCDC,
 				"source_supports_incremental_batch": sourceSupportsIncrementalBatch,
 				"pending_intent":                    pendingIntent,
-			},
+				"requested_sync_mode":               requestedSyncMode(intent.SourceType, message),
+				"requested_cdc_mode":                requestedCDCMode(intent.SourceType, message),
+			}, intent.SourceType, intent.DestinationType, message),
 		}
 	}
 
@@ -1727,14 +1879,16 @@ func (h *ChatHandler) handleSlotFilling(ctx context.Context, c *gin.Context, con
 			Type:      "confirmation",
 			TraceID:   traceID,
 			Timestamp: time.Now().Format(time.RFC3339),
-			Data: map[string]interface{}{
+			Data: confirmationNamespaceFields(map[string]interface{}{
 				"source_type":                       pendingIntent.SourceType,
 				"destination_type":                  pendingIntent.DestinationType,
 				"supported_sync_modes":              supportedSyncModes,
 				"source_supports_cdc":               sourceSupportsCDC,
 				"source_supports_incremental_batch": sourceSupportsIncrementalBatch,
 				"pending_intent":                    pendingIntent,
-			},
+				"requested_sync_mode":               requestedSyncMode(pendingIntent.SourceType, pendingIntent.OriginalRequest),
+				"requested_cdc_mode":                requestedCDCMode(pendingIntent.SourceType, pendingIntent.OriginalRequest),
+			}, pendingIntent.SourceType, pendingIntent.DestinationType, pendingIntent.OriginalRequest),
 		}
 	}
 
@@ -1821,14 +1975,16 @@ func (h *ChatHandler) handleRoleClarification(ctx context.Context, c *gin.Contex
 			Type:      "confirmation",
 			TraceID:   traceID,
 			Timestamp: time.Now().Format(time.RFC3339),
-			Data: map[string]interface{}{
+			Data: confirmationNamespaceFields(map[string]interface{}{
 				"source_type":                       conn,
 				"destination_type":                  otherID,
 				"supported_sync_modes":              supportedSyncModes,
 				"source_supports_cdc":               connectorSupportsCDC(conn),
 				"source_supports_incremental_batch": connectorSupportsIncrementalBatch(conn),
 				"pending_intent":                    pi,
-			},
+				"requested_sync_mode":               requestedSyncMode(conn, pi.OriginalRequest),
+				"requested_cdc_mode":                requestedCDCMode(conn, pi.OriginalRequest),
+			}, conn, otherID, pi.OriginalRequest),
 		}
 	}
 
@@ -1924,9 +2080,10 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 		if connScanNL == "" {
 			connScanNL = message
 		}
-		if scid, dcid, connErr := h.checkConnections(activeWorkspaceID(c), connScanNL, pendingIntent.SourceType, pendingIntent.DestinationType); connErr == nil {
-			sourceConnID, destConnID = scid, dcid
-		} else {
+		// Keep whichever side resolved even when the other did not.
+		scid, dcid, connErr := h.checkConnections(activeWorkspaceID(c), connScanNL, pendingIntent.SourceType, pendingIntent.DestinationType)
+		sourceConnID, destConnID = scid, dcid
+		if connErr != nil {
 			log.WithError(connErr).WithFields(log.Fields{
 				"source_type":      pendingIntent.SourceType,
 				"destination_type": pendingIntent.DestinationType,
@@ -1966,7 +2123,11 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 		if desiredSyncMode == "" || desiredSyncMode == "auto" {
 			if connSync, connCDC := getSourceConnectionModes(db.GetDB(), sourceConnID); connSync == "cdc" || connSync == "batch" {
 				desiredSyncMode = connSync
-				if connCDC != "" {
+				// connections.cdc_mode carries a column default ('initial') on
+				// every connection, batch ones included. Copying it onto a batch
+				// pipeline persisted cdc_mode='initial' and the UI badged the batch
+				// pipeline "CDC". Only a CDC source's cdc_mode means anything.
+				if connSync == "cdc" && connCDC != "" {
 					desiredCDCMode = connCDC
 				}
 			}
@@ -2056,10 +2217,18 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 			namedTables = mergeUniqueColumns(namedTables, mt)
 		}
 
+		// The destination namespace the user named: typed on the Confirm card (sent
+		// as a destination_namespace= token) or said in the original request.
+		requestedNamespace := parseDestinationNamespaceIntent(message)
+		if requestedNamespace == "" {
+			requestedNamespace = parseDestinationNamespaceIntent(pendingIntent.OriginalRequest)
+		}
+
 		pipelineID, workflowID, namespaceNote, err := h.createAndRunPipeline(c,
 			requestNL,
 			userID, traceID, sourceConnID, destConnID,
-			desiredSyncMode, desiredCDCMode, desiredCDCInitialLoad, nlSpec, scheduleOnly, namedTables)
+			desiredSyncMode, desiredCDCMode, desiredCDCInitialLoad, nlSpec, scheduleOnly, namedTables,
+			requestedNamespace)
 		if err != nil {
 			return ChatMessageResponse{
 				Message:   fmt.Sprintf("Failed to create pipeline: %v", err),
@@ -2144,14 +2313,16 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 					Type:      "confirmation",
 					TraceID:   traceID,
 					Timestamp: time.Now().Format(time.RFC3339),
-					Data: map[string]interface{}{
+					Data: confirmationNamespaceFields(map[string]interface{}{
 						"source_type":                       pi.SourceType,
 						"destination_type":                  pi.DestinationType,
 						"supported_sync_modes":              supportedSyncModesForSource(pi.SourceType),
 						"source_supports_cdc":               connectorSupportsCDC(pi.SourceType),
 						"source_supports_incremental_batch": connectorSupportsIncrementalBatch(pi.SourceType),
 						"pending_intent":                    pi,
-					},
+						"requested_sync_mode":               requestedSyncMode(pi.SourceType, pi.OriginalRequest),
+						"requested_cdc_mode":                requestedCDCMode(pi.SourceType, pi.OriginalRequest),
+					}, pi.SourceType, pi.DestinationType, pi.OriginalRequest),
 				}
 			}
 		}
@@ -2207,14 +2378,16 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 			Type:      "confirmation",
 			TraceID:   traceID,
 			Timestamp: time.Now().Format(time.RFC3339),
-			Data: map[string]interface{}{
+			Data: confirmationNamespaceFields(map[string]interface{}{
 				"source_type":                       sourceType,
 				"destination_type":                  destType,
 				"supported_sync_modes":              supportedSyncModes,
 				"source_supports_cdc":               sourceSupportsCDC,
 				"source_supports_incremental_batch": sourceSupportsIncrementalBatch,
 				"pending_intent":                    pendingIntent,
-			},
+				"requested_sync_mode":               requestedSyncMode(sourceType, pendingOriginalRequest(pendingIntent)),
+				"requested_cdc_mode":                requestedCDCMode(sourceType, pendingOriginalRequest(pendingIntent)),
+			}, sourceType, destType, pendingOriginalRequest(pendingIntent)),
 		}
 	}
 }
@@ -2550,6 +2723,11 @@ func (h *ChatHandler) parseIntent(ctx context.Context, message string) (*Intent,
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		// No LLM set up: keep the service's own sentence so the chat reply
+		// can tell the user what to do instead of the generic examples.
+		if gated, ok := llmNotConfiguredBody(resp.StatusCode, body); ok {
+			return nil, &llmNotConfiguredError{body: gated}
+		}
 		return nil, fmt.Errorf("intent agent returned %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -2599,11 +2777,56 @@ func (h *ChatHandler) normalizeConnectorName(name string) string {
 	}
 }
 
+// connectorIdentityAliases folds a separator-stripped connector name onto its
+// connector's separator-stripped id. The chat intent and a connection row can
+// spell the same connector differently ("google-cloud-storage" vs the stored
+// "gcs"); without the fold the lookup finds no connection and the pipeline row
+// is created with neither connection set. Every alias a connector declares in
+// its metadata.json must fold here — TestConnectorKeyFoldsEveryDeclaredAlias.
+// backend-temporal-adapter's connectorKey carries the same table.
+var connectorIdentityAliases = map[string]string{
+	"googlecloudstorage":  "gcs",
+	"gcsstorage":          "gcs",
+	"azureblobstorage":    "azureblob",
+	"abs":                 "azureblob",
+	"s3":                  "awss3",
+	"amazons3":            "awss3",
+	"postgres":            "postgresql",
+	"postgesql":           "postgresql",
+	"pg":                  "postgresql",
+	"aurorapostgresql":    "postgresql",
+	"mariadb":             "mysql",
+	"auroramysql":         "mysql",
+	"mongo":               "mongodb",
+	"mongodbatlas":        "mongodb",
+	"atlas":               "mongodb",
+	"bq":                  "bigquery",
+	"googlebigquery":      "bigquery",
+	"mssql":               "sqlserver",
+	"azuresql":            "sqlserver",
+	"oracledb":            "oracle",
+	"oracledatabase":      "oracle",
+	"amazonredshift":      "redshift",
+	"awsredshift":         "redshift",
+	"gsheets":             "googlesheets",
+	"notion":              "notionrest",
+	"shopify":             "shopifyadmingraphql",
+	"clickhouseserver":    "clickhouse",
+	"yandexclickhouse":    "clickhouse",
+	"clickhousecloud":     "clickhouse",
+	"databrickssql":       "databricks",
+	"databrickslakehouse": "databricks",
+	"snowflakewarehouse":  "snowflake",
+}
+
 func connectorKeyForConnResolution(connectorType string) string {
 	normalized := strings.ToLower(strings.TrimSpace(connectorType))
 	normalized = strings.ReplaceAll(normalized, " ", "")
 	normalized = strings.ReplaceAll(normalized, "-", "")
 	normalized = strings.ReplaceAll(normalized, "_", "")
+	if id, ok := connectorIdentityAliases[normalized]; ok {
+		return id
+	}
 	return normalized
 }
 
@@ -2802,6 +3025,21 @@ func (h *ChatHandler) dispatchConnectorGeneration(apiName, traceID string) {
 // chance to select a different one.
 var errAmbiguousConnection = fmt.Errorf("multiple connections match; user selection required")
 
+// databaseHintRe finds the first "db.table" in a request. In a raw string a single
+// backslash is the regexp escape; the doubled form matched a literal backslash, so the
+// hint was always empty and two same-type sources always went to the user.
+var databaseHintRe = regexp.MustCompile(`\b([a-zA-Z0-9_]+)\.([a-zA-Z0-9_]+)\b`)
+
+// databaseHintFromRequest returns the db/schema part of the first "db.table" in the
+// request, or "". It is only a hint: a connection is picked by it only when exactly one
+// candidate's configured database equals it.
+func databaseHintFromRequest(userRequest string) string {
+	if m := databaseHintRe.FindStringSubmatch(userRequest); len(m) >= 3 {
+		return m[1]
+	}
+	return ""
+}
+
 // checkConnections tries to resolve a concrete source + destination connection for this user.
 // It is best-effort: if it cannot confidently pick a connection, callers should fall back to HITL selection.
 func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType string) (sourceConnID, destConnID string, err error) {
@@ -2815,13 +3053,7 @@ func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType s
 	normalizedDest := h.normalizeConnectorName(destType)
 
 	// If user mentions "db.table", use the db/schema as a hint for choosing a matching source connection.
-	dbHint := ""
-	if strings.TrimSpace(userRequest) != "" {
-		re := regexp.MustCompile(`\\b([a-zA-Z0-9_]+)\\.([a-zA-Z0-9_]+)\\b`)
-		if m := re.FindStringSubmatch(userRequest); len(m) >= 3 {
-			dbHint = m[1]
-		}
-	}
+	dbHint := databaseHintFromRequest(userRequest)
 
 	// If the user explicitly names connections, honor that first.
 	// This prevents the "latest connection wins" behavior when users provide concrete connection names.
@@ -2947,6 +3179,7 @@ func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType s
 		targetKey := connectorKeyForConnResolution(connectorType)
 		matchIDs := make([]string, 0, 4)
 		var dbHintMatchID string
+		dbHintMatches := 0
 
 		for rows.Next() {
 			var id, dbConnectorType, configEncrypted string
@@ -2961,8 +3194,10 @@ func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType s
 
 			// If the user named a db/schema in the request, prefer a connection
 			// whose decrypted config.database matches it — that's the strongest
-			// disambiguation signal we can use without asking the user.
-			if databaseHint == "" || dbHintMatchID != "" {
+			// disambiguation signal we can use without asking the user. Every
+			// candidate is checked: two connections to the same database are
+			// still ambiguous.
+			if databaseHint == "" {
 				continue
 			}
 			cfgJSON, decErr := crypto.DecryptString(configEncrypted)
@@ -2975,6 +3210,7 @@ func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType s
 			}
 			if v, ok := cfg["database"]; ok && strings.EqualFold(strings.TrimSpace(fmt.Sprint(v)), databaseHint) {
 				dbHintMatchID = id
+				dbHintMatches++
 			}
 		}
 
@@ -2983,7 +3219,7 @@ func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType s
 			return "", sql.ErrNoRows
 		case len(matchIDs) == 1:
 			return matchIDs[0], nil
-		case dbHintMatchID != "":
+		case dbHintMatches == 1:
 			// Multiple candidates but exactly one has the right database — safe.
 			return dbHintMatchID, nil
 		default:
@@ -3001,6 +3237,10 @@ func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType s
 		}
 	}
 
+	// Each side resolves independently and a miss on one never discards the other:
+	// the caller persists whatever did resolve, so a destination lookup miss no
+	// longer leaves a pipeline row with neither connection set.
+	var missing []string
 	if sourceConnID == "" {
 		picked, perr := pick("source", normalizedSource, dbHint)
 		switch perr {
@@ -3010,7 +3250,7 @@ func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType s
 			// Leave empty so the workflow asks the user which connection to use.
 			sourceConnID = ""
 		default:
-			return "", "", fmt.Errorf("source connection not found for type %s", sourceType)
+			missing = append(missing, fmt.Sprintf("source connection not found for type %s", sourceType))
 		}
 	}
 
@@ -3023,11 +3263,27 @@ func (h *ChatHandler) checkConnections(wsID, userRequest, sourceType, destType s
 		case errAmbiguousConnection:
 			destConnID = ""
 		default:
-			return "", "", fmt.Errorf("destination connection not found for type %s", destType)
+			missing = append(missing, fmt.Sprintf("destination connection not found for type %s", destType))
 		}
 	}
 
+	if len(missing) > 0 {
+		return sourceConnID, destConnID, errors.New(strings.Join(missing, "; "))
+	}
 	return sourceConnID, destConnID, nil
+}
+
+// normalizePersistedPipelineModes drops CDC-only options from a pipeline whose
+// sync_mode is batch. Every reader that asks "is this CDC?" from a pipeline row
+// (resolveEffectiveSyncMode, the frontend's detail page and list) treats a
+// non-empty cdc_mode as a CDC signal when sync_mode is absent, and older readers
+// did so even when sync_mode was "batch", so a stray cdc_mode on a batch row is a
+// mislabelled pipeline waiting to happen.
+func normalizePersistedPipelineModes(syncMode, cdcMode, cdcInitialLoad string) (string, string, string) {
+	if strings.EqualFold(strings.TrimSpace(syncMode), "batch") {
+		return syncMode, "", ""
+	}
+	return syncMode, cdcMode, cdcInitialLoad
 }
 
 // createAndRunPipeline creates a pipeline and starts the Temporal workflow
@@ -3042,6 +3298,7 @@ func (h *ChatHandler) createAndRunPipeline(
 	nlTransforms nlTransformSpec,
 	scheduleOnly bool,
 	namedTables []string,
+	requestedNamespace string,
 ) (string, string, string, error) {
 	// 4th return value is `namespaceNote`: an empty string when the
 	// destination namespace was assigned cleanly, OR a user-facing
@@ -3084,7 +3341,7 @@ func (h *ChatHandler) createAndRunPipeline(
 
 	// Create pipeline
 	createReq := CreatePipelineRequest{
-		Name:        fmt.Sprintf("Chat Pipeline %s", time.Now().Format("15:04:05")),
+		Name:        chatPipelineName(time.Now(), c.GetString(clientTimezoneCtxKey)),
 		Description: fmt.Sprintf("Created from chat: %s", request),
 		Request:     request,
 	}
@@ -3112,6 +3369,9 @@ func (h *ChatHandler) createAndRunPipeline(
 	if destinationConnectionID != "" && !connectionInWorkspace(database, destinationConnectionID, workspaceID) {
 		return "", "", "", fmt.Errorf("the selected destination connection is not in your active workspace")
 	}
+
+	// A batch pipeline never persists CDC options (see normalizePersistedPipelineModes).
+	syncMode, cdcMode, cdcInitialLoad = normalizePersistedPipelineModes(syncMode, cdcMode, cdcInitialLoad)
 
 	// Note: created_by must never be NULL to ensure proper event visibility
 	// resolveUserID always returns a non-empty string with dev fallback
@@ -3218,7 +3478,11 @@ func (h *ChatHandler) createAndRunPipeline(
 		var destConnectorType string
 		_ = database.QueryRow(`SELECT connector_type FROM connections WHERE id = $1 AND workspace_id = $2`, destinationConnectionID, workspaceID).Scan(&destConnectorType)
 		defaultNamespace := seedDestinationNamespace(sourceConnectorType, destConnectorType)
-		destinationNamespace := resolveDestinationNamespace(database, pipelineID, sourceConnectorType, destConnectorType, destinationConnectionID, nil)
+		var nsOverride *string
+		if requestedNamespace != "" {
+			nsOverride = &requestedNamespace
+		}
+		destinationNamespace := resolveDestinationNamespace(database, pipelineID, sourceConnectorType, destConnectorType, destinationConnectionID, nsOverride)
 		if nsErr := persistDestinationConfig(database, pipelineID, DestinationConfig{
 			Namespace:     destinationNamespace,
 			NamespaceKind: namespaceKindForConnector(destConnectorType),
@@ -3233,7 +3497,7 @@ func (h *ChatHandler) createAndRunPipeline(
 		// Option B (transparency): if auto-suffix kicked in, surface a
 		// user-facing note so the chat reply explains where data is
 		// actually landing. Empty when the bare namespace was free.
-		if destinationNamespace != "" && destinationNamespace != defaultNamespace {
+		if nsOverride == nil && destinationNamespace != "" && destinationNamespace != defaultNamespace {
 			namespaceNote = fmt.Sprintf(
 				"⚠️ The `%s` namespace in this destination is already owned by another pipeline — your data will land in `%s` instead. Cancel and recreate the pipeline with a custom destination_namespace if you'd prefer a specific name.",
 				defaultNamespace, destinationNamespace,

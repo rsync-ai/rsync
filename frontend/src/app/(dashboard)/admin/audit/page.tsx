@@ -20,6 +20,7 @@ import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/compo
 import { toast } from "sonner"
 import { Search, ChevronDown, ChevronRight } from "lucide-react"
 import type { AdminAuditLog } from "@/lib/api/admin"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 export default function AdminAuditPage() {
   const [logs, setLogs] = useState<AdminAuditLog[]>([])
@@ -108,7 +109,7 @@ export default function AdminAuditPage() {
             <TableBody>
               {logs.length === 0 ? (
                 <TableRow>
-                  <TableCell colSpan={6} className="text-center text-sm text-zinc-500 py-8">
+                  <TableCell colSpan={6} className="text-center text-sm text-zinc-500 dark:text-zinc-400 py-8">
                     No audit logs found
                   </TableCell>
                 </TableRow>
@@ -128,8 +129,8 @@ export default function AdminAuditPage() {
                           <ChevronRight className="h-3.5 w-3.5" />
                         )}
                       </TableCell>
-                      <TableCell className="text-sm text-zinc-500 font-mono">
-                        {new Date(log.created_at).toLocaleString()}
+                      <TableCell className="text-sm text-zinc-500 dark:text-zinc-400 font-mono">
+                        {formatAbsoluteTime(log.created_at)}
                       </TableCell>
                       <TableCell className="text-sm">
                         {log.user_email || "-"}
@@ -139,11 +140,11 @@ export default function AdminAuditPage() {
                           {log.action}
                         </Badge>
                       </TableCell>
-                      <TableCell className="hidden md:table-cell text-sm text-zinc-500">
+                      <TableCell className="hidden md:table-cell text-sm text-zinc-500 dark:text-zinc-400">
                         {log.resource_type}
                         {log.resource_id ? ` / ${log.resource_id.slice(0, 8)}...` : ""}
                       </TableCell>
-                      <TableCell className="hidden lg:table-cell text-sm text-zinc-500 font-mono">
+                      <TableCell className="hidden lg:table-cell text-sm text-zinc-500 dark:text-zinc-400 font-mono">
                         {log.ip_address || "-"}
                       </TableCell>
                     </TableRow>,
@@ -166,7 +167,7 @@ export default function AdminAuditPage() {
           </Table>
 
           {total > 50 && (
-            <div className="flex items-center justify-between mt-4 text-sm text-zinc-500">
+            <div className="flex items-center justify-between mt-4 text-sm text-zinc-500 dark:text-zinc-400">
               <span>Showing {offset + 1}-{Math.min(offset + 50, total)} of {total}</span>
               <div className="flex gap-2">
                 <Button variant="outline" size="sm" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - 50))}>

@@ -158,7 +158,7 @@ export function AuthMethodPicker({
           </div>
         )}
         {renderedKeys.length === 0 && !isOauth2 && (
-          <div className="text-xs text-zinc-500 italic">
+          <div className="text-xs text-zinc-500 dark:text-zinc-400 italic">
             This auth method has no credential fields (likely public/no-auth API).
           </div>
         )}
@@ -216,7 +216,7 @@ function CredentialField({
           <button
             type="button"
             onClick={() => setReveal(!reveal)}
-            className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-zinc-400 hover:text-zinc-600"
+            className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
             tabIndex={-1}
             aria-label={reveal ? `Hide ${labelText}` : `Show ${labelText}`}
           >

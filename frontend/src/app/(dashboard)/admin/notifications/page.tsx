@@ -24,6 +24,7 @@ import {
   type NotificationChannelsUpdate,
   type SmtpTlsMode,
 } from "@/lib/api/notification-settings"
+import { formatAbsoluteTime } from "@/lib/utils"
 
 interface ChannelForm {
   slackEnabled: boolean
@@ -224,7 +225,7 @@ export default function AdminNotificationsPage() {
               <p>
                 Alerts always appear in the in-app bell. These settings also send them to Slack, to
                 each pipeline owner by email, and to any address on the email alert list
-                {view.updated_at ? ` · last saved ${new Date(view.updated_at).toLocaleString()}` : ""}.
+                {view.updated_at ? ` · last saved ${formatAbsoluteTime(view.updated_at)}` : ""}.
               </p>
             )}
           </div>
@@ -235,7 +236,7 @@ export default function AdminNotificationsPage() {
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <CardTitle className="flex items-center gap-2">
-                    <MessageSquare className="h-5 w-5 text-zinc-500" />
+                    <MessageSquare className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
                     Slack
                   </CardTitle>
                   <CardDescription>Post alerts to one channel through an incoming webhook.</CardDescription>
@@ -263,7 +264,7 @@ export default function AdminNotificationsPage() {
                   onChange={(e) => patch({ slackWebhook: e.target.value, clearWebhook: false })}
                 />
                 {view.slack.webhook_configured && (
-                  <p className="text-xs text-zinc-500">
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
                     {form.clearWebhook ? (
                       <>The saved webhook will be removed when you save. </>
                     ) : (
@@ -284,13 +285,13 @@ export default function AdminNotificationsPage() {
               <div className="space-y-3">
                 <div>
                   <p className="text-sm font-medium">Alerts sent to Slack</p>
-                  <p className="text-xs text-zinc-500">Muted categories still appear in the bell and in email.</p>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">Muted categories still appear in the bell and in email.</p>
                 </div>
                 {view.categories.map((cat) => (
                   <div key={cat.id} className="flex items-center justify-between gap-4">
                     <div>
                       <p className="text-sm">{cat.label}</p>
-                      <p className="text-xs text-zinc-500">{cat.description}</p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">{cat.description}</p>
                     </div>
                     <Switch
                       aria-label={`Slack: ${cat.label}`}
@@ -318,7 +319,7 @@ export default function AdminNotificationsPage() {
               <div className="flex items-center justify-between gap-4">
                 <div>
                   <CardTitle className="flex items-center gap-2">
-                    <Mail className="h-5 w-5 text-zinc-500" />
+                    <Mail className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
                     Email (SMTP)
                   </CardTitle>
                   <CardDescription>
@@ -368,7 +369,7 @@ export default function AdminNotificationsPage() {
                   </SelectContent>
                 </Select>
                 {view.email.tls_mode === "opportunistic" && (
-                  <p className="text-xs text-zinc-500">
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
                     The environment fallback upgrades to TLS only when the server offers it. Saving pins the
                     mode chosen here.
                   </p>
@@ -398,7 +399,7 @@ export default function AdminNotificationsPage() {
                     onChange={(e) => patch({ smtpPassword: e.target.value, clearPassword: false })}
                   />
                   {view.email.password_configured && (
-                    <p className="text-xs text-zinc-500">
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">
                       {form.clearPassword ? "The saved password will be removed when you save. " : "A password is saved. "}
                       <button
                         type="button"
@@ -426,7 +427,7 @@ export default function AdminNotificationsPage() {
               <div className="space-y-3">
                 <div>
                   <p className="text-sm font-medium">Alerts sent by email</p>
-                  <p className="text-xs text-zinc-500">
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">
                     A category switched off here is emailed to nobody — not owners, not the alert list. It still
                     appears in the bell and in Slack.
                   </p>
@@ -435,7 +436,7 @@ export default function AdminNotificationsPage() {
                   <div key={cat.id} className="flex items-center justify-between gap-4">
                     <div>
                       <p className="text-sm">{cat.label}</p>
-                      <p className="text-xs text-zinc-500">{cat.description}</p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">{cat.description}</p>
                     </div>
                     <Switch
                       aria-label={`Email: ${cat.label}`}
@@ -457,7 +458,7 @@ export default function AdminNotificationsPage() {
                   value={form.extraRecipients}
                   onChange={(e) => patch({ extraRecipients: e.target.value })}
                 />
-                <p className="text-xs text-zinc-500">
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">
                   One address per line, up to {MAX_EXTRA_RECIPIENTS}. These addresses get every alert emailed
                   above, whatever each owner chose — use it for an on-call inbox or a team list.
                 </p>
@@ -473,7 +474,7 @@ export default function AdminNotificationsPage() {
           </Card>
 
           <div className="flex items-center justify-end gap-3">
-            {dirty && <span className="text-sm text-zinc-500">Unsaved changes</span>}
+            {dirty && <span className="text-sm text-zinc-500 dark:text-zinc-400">Unsaved changes</span>}
             <Button onClick={handleSave} disabled={saving || !dirty}>
               {saving ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <Save className="mr-1.5 h-4 w-4" />}
               {saving ? "Saving..." : "Save changes"}
@@ -498,7 +499,7 @@ function TestRow({
 }) {
   return (
     <div className="flex flex-wrap items-center justify-end gap-3 pt-2">
-      {disabledReason && <span className="text-xs text-zinc-500">{disabledReason}</span>}
+      {disabledReason && <span className="text-xs text-zinc-500 dark:text-zinc-400">{disabledReason}</span>}
       <Button variant="outline" size="sm" onClick={onTest} disabled={busy || disabledReason !== null}>
         {busy ? <Loader2 className="mr-1.5 h-4 w-4 animate-spin" /> : <Send className="mr-1.5 h-4 w-4" />}
         {label}

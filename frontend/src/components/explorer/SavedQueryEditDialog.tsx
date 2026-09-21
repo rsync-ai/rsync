@@ -191,14 +191,14 @@ export function SavedQueryEditDialog({
         </DialogHeader>
 
         {loading ? (
-          <div className="flex items-center gap-2 py-8 text-sm text-zinc-500">
+          <div className="flex items-center gap-2 py-8 text-sm text-zinc-500 dark:text-zinc-400">
             <Loader2 className="h-4 w-4 animate-spin" />
             Loading this query…
           </div>
         ) : loadError ? (
           <div className="flex flex-col items-start gap-2 py-6">
             <p className="text-sm text-red-600 dark:text-red-400">{loadError}</p>
-            <p className="text-xs text-zinc-500">The query itself has not been changed.</p>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">The query itself has not been changed.</p>
             <Button size="sm" variant="outline" onClick={() => void load()}>
               Retry
             </Button>
@@ -207,7 +207,7 @@ export function SavedQueryEditDialog({
           <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
             {!canEdit && (
               <div className="flex items-start gap-2 rounded-md border bg-zinc-50 p-2 dark:bg-zinc-900">
-                <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-500" />
+                <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-500 dark:text-zinc-400" />
                 <p className="text-xs text-zinc-600 dark:text-zinc-400">
                   Only the person who saved this query, or a workspace admin, can edit it.
                   You can read it here and load it into the editor to run your own version.
@@ -286,7 +286,7 @@ export function SavedQueryEditDialog({
             <div className="flex items-center justify-between rounded-md border p-3">
               <div className="space-y-0.5">
                 <Label htmlFor="edit-query-share">Share with workspace</Label>
-                <p className="text-xs text-zinc-500">Off means only you can see it.</p>
+                <p className="text-xs text-zinc-500 dark:text-zinc-400">Off means only you can see it.</p>
               </div>
               <Switch
                 id="edit-query-share"

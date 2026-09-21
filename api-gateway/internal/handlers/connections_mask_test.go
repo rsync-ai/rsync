@@ -1,6 +1,12 @@
 package handlers
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"regexp"
+	"testing"
+)
 
 const maskGlyph = "••••••••"
 
@@ -43,6 +49,48 @@ func TestMaskSensitiveFields_KnownCredentialNames(t *testing.T) {
 		out := maskSensitiveFields(map[string]interface{}{k: "v"})
 		if out[k] != maskGlyph {
 			t.Errorf("expected %q to be masked, got %v", k, out[k])
+		}
+	}
+}
+
+// TestMaskSensitiveFields_EveryMongoURIAliasIsMasked reads the names the MongoDB
+// connector accepts a full connection URI under, straight from the connector
+// that runs, so an alias added there without a masking entry fails here instead
+// of returning user:password@hosts in a GET response.
+func TestMaskSensitiveFields_EveryMongoURIAliasIsMasked(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "shared", "mcp-connectors", "public", "database", "mongodb")
+	lb, err := os.ReadFile(filepath.Join(root, "latest.json"))
+	if err != nil {
+		t.Fatalf("read latest.json: %v", err)
+	}
+	var manifest struct {
+		CurrentVersion string `json:"current_version"`
+	}
+	if err := json.Unmarshal(lb, &manifest); err != nil || manifest.CurrentVersion == "" {
+		t.Fatalf("latest.json has no current_version: %v", err)
+	}
+	src, err := os.ReadFile(filepath.Join(root, "versions", manifest.CurrentVersion, "connector.py"))
+	if err != nil {
+		t.Fatalf("read connector.py: %v", err)
+	}
+	block := regexp.MustCompile(`(?s)explicit = str\((.*?)or ""`).FindSubmatch(src)
+	if block == nil {
+		t.Fatal(`connector.py no longer has the explicit = str(config.get(...) or ... or "") lookup this test reads`)
+	}
+	aliases := regexp.MustCompile(`config\.get\("([a-z_]+)"\)`).FindAllSubmatch(block[1], -1)
+	// Vacuity guard: connection_string, mongodb_connection_string, mongodb_uri, uri.
+	if len(aliases) < 4 {
+		t.Fatalf("found only %d URI aliases in connector.py", len(aliases))
+	}
+	for _, m := range aliases {
+		key := string(m[1])
+		uri := "mongodb+srv://reader:FAKEPLACEHOLDER-pw@cluster0.example.net/shop"
+		out := maskSensitiveFields(map[string]interface{}{key: uri, "host": "cluster0.example.net"})
+		if out[key] != maskGlyph {
+			t.Errorf("%q holds a whole MongoDB URI but was returned as %v", key, out[key])
+		}
+		if out["host"] != "cluster0.example.net" {
+			t.Errorf("host was altered next to %q: %v", key, out["host"])
 		}
 	}
 }

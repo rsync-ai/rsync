@@ -93,7 +93,7 @@ curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bas
 ```
 
 The installer will:
-- Ask for your OpenAI API key
+- Ask which LLM to use: your OpenAI API key, the bundled Ollama, or none for now ([which LLM is used](self-hosting.md#which-llm-is-used))
 - Ask for your domain or IP
 - Ask for your admin email
 - Generate all secrets automatically

@@ -37,11 +37,14 @@ import (
 //	        cdc-<id8>.<db>.<table>         Debezium per-table topic
 //	        cdc-<id8>.<db>.<table>.dlq     kafka-sink-worker (srcTopic + ".dlq")
 //	        schemahistory.cdc-<id8>        debezium connector.py
+//	        signals.<id8>                  executor.go incremental-snapshot signal channel
+//	        signals.cdc-<id8>              debezium connector.py fallback for the same
 //	        pipeline.<id8>.data(+.dlq)     batch backfill
 //	groups  sink-<id8>                     CDC streaming sink
 //	        sink-<id8>-batch               batch backfill sink
 //	        sink-<id8>-stream              CDC streaming_only/never (stable per pipeline)
 //	        sink-<id8>-<exec8>             ditto, when CDC_STREAMING_SINK_GROUP_PER_EXECUTION is on
+//	        cdc-<id8>-signal               debezium connector.py signal.kafka.groupId
 //	        cdc-schema-changes-<uuid>      cdcstats/schema_changes.go
 //	        cdc-table-stats-<uuid>         cdcstats/agent.go
 //
@@ -68,16 +71,28 @@ func (n pipelineKafkaNames) ownsTopic(topic string) bool {
 			return true
 		}
 	}
+	// Signal topics carry no suffix, so they match exactly.
+	for _, base := range []string{"signals." + n.id8, "signals.cdc-" + n.id8} {
+		if topic == base || topic == kafkaclient.Topic(base) {
+			return true
+		}
+	}
 	return kafkaclient.InNamespace(topic, "pipeline."+n.id8+".")
+}
+
+// ownsSinkGroup reports whether a consumer group is one of this pipeline's
+// kafka-mcp-sink workers, in either spelling. Only these have a worker to stop.
+func (n pipelineKafkaNames) ownsSinkGroup(group string) bool {
+	return matchesEitherSpelling(group, "sink-"+n.id8, "-", kafkaclient.Group)
 }
 
 // ownsGroup reports whether a consumer group belongs to this pipeline. Same
 // anchoring rule as ownsTopic, with "-" as the sink-group separator.
 func (n pipelineKafkaNames) ownsGroup(group string) bool {
-	if matchesEitherSpelling(group, "sink-"+n.id8, "-", kafkaclient.Group) {
+	if n.ownsSinkGroup(group) {
 		return true
 	}
-	for _, base := range []string{"cdc-schema-changes-" + n.uuid, "cdc-table-stats-" + n.uuid} {
+	for _, base := range []string{"cdc-schema-changes-" + n.uuid, "cdc-table-stats-" + n.uuid, "cdc-" + n.id8 + "-signal"} {
 		if group == base || group == kafkaclient.Group(base) {
 			return true
 		}
@@ -124,7 +139,7 @@ func id8IsUnique(ctx context.Context, db *sql.DB, pipelineID, id8 string) bool {
 		pipelineID, id8).Scan(&others)
 	if err != nil {
 		log.WithError(err).WithField("pipeline_id", pipelineID).
-			Warn("kafka teardown: id8 uniqueness check failed; skipping topic/group sweep")
+			Warn("pipeline teardown: id8 uniqueness check failed; skipping cleanup by derived name")
 		return false
 	}
 	if others > 0 {
@@ -132,16 +147,145 @@ func id8IsUnique(ctx context.Context, db *sql.DB, pipelineID, id8 string) bool {
 			"pipeline_id": pipelineID,
 			"id8":         id8,
 			"others":      others,
-		}).Warn("kafka teardown: another pipeline shares this id8 prefix; skipping sweep so its topics survive")
+		}).Warn("pipeline teardown: another pipeline shares this id8 prefix; skipping cleanup by derived name so its resources survive")
 		return false
 	}
 	return true
 }
 
-// kafkaTeardownTimeout bounds the whole teardown. Deliberately short: the
-// pipeline row is already gone, so this is reclamation, not correctness — a slow
-// broker must not hold the user's delete request open.
-const kafkaTeardownTimeout = 45 * time.Second
+// sinkStopExecutor is the one mcp.Client method the delete path uses to stop sink
+// workers. It is an interface so handler tests can stand in for the sink service.
+type sinkStopExecutor interface {
+	ExecuteWithContext(ctx context.Context, req mcp.ExecuteRequest) (*mcp.ExecuteResponse, error)
+}
+
+// newSinkStopExecutor returns a nil interface, not a typed nil pointer, when there is no
+// MCP manager, so the callers' `sinks == nil` checks mean what they say.
+func newSinkStopExecutor(mcpManager *mcp.ServerManager) sinkStopExecutor {
+	if mcpManager == nil {
+		return nil
+	}
+	return mcp.NewClient(mcpManager)
+}
+
+const (
+	// sinkWorkerNotFound is kafka-mcp-sink's stop_sink answer when no worker holds the
+	// group (connector.py stop_sink). The worker is already gone, which is what a delete
+	// wants, so it counts as stopped.
+	sinkWorkerNotFound = "Worker not found"
+
+	// mcpStdioFallbackMarker is the text mcp.Client adds (mcp.stdioFallbackMarker) when
+	// the call ran in a subprocess inside the orchestrator because the sink container was
+	// unreachable. That subprocess has no workers at all, so its "Worker not found" says
+	// nothing about the container where the real worker runs. A test ties the two.
+	mcpStdioFallbackMarker = "mcp stdio fallback"
+)
+
+// stopSinkRequest is the stop_sink call for one consumer group.
+func stopSinkRequest(group string) mcp.ExecuteRequest {
+	return mcp.ExecuteRequest{
+		Connector: "kafka-mcp-sink",
+		Operation: "stop_sink",
+		Config:    map[string]string{},
+		Params: map[string]interface{}{
+			"config": map[string]interface{}{
+				"consumer_group": group,
+			},
+		},
+	}
+}
+
+// sinkStopFailure explains why a stop_sink answer does not prove the worker is gone, or
+// returns "" when it does.
+func sinkStopFailure(resp *mcp.ExecuteResponse, err error) string {
+	switch {
+	case err != nil:
+		return "the stop request failed: " + err.Error()
+	case resp == nil:
+		return "the sink service sent no answer"
+	case resp.Success:
+		return ""
+	case strings.Contains(resp.Error, sinkWorkerNotFound) && !strings.Contains(resp.Error, mcpStdioFallbackMarker):
+		return ""
+	case strings.TrimSpace(resp.Error) == "":
+		return "the sink service reported a failure without saying why"
+	default:
+		return "the stop request failed: " + resp.Error
+	}
+}
+
+// stopSinkWorker asks the sink service to stop one group and returns "" once the worker
+// is gone, otherwise why it may still be running.
+//
+// The call runs in a goroutine and the wait ends when ctx does. mcp.Client may spend up to
+// a minute starting the sink container before it sends anything, and it does not watch ctx
+// while it does, so waiting on the call itself would let one stop hold the whole delete.
+// The channel is buffered so an abandoned call can still finish and exit.
+func stopSinkWorker(ctx context.Context, sinks sinkStopExecutor, group string) string {
+	if ctx.Err() != nil {
+		return "it was not tried because the time allowed for stopping sink workers ran out"
+	}
+	type answer struct {
+		resp *mcp.ExecuteResponse
+		err  error
+	}
+	done := make(chan answer, 1)
+	go func() {
+		resp, err := sinks.ExecuteWithContext(ctx, stopSinkRequest(group))
+		done <- answer{resp: resp, err: err}
+	}()
+	select {
+	case a := <-done:
+		return sinkStopFailure(a.resp, a.err)
+	case <-ctx.Done():
+		return "the sink service did not answer in the time allowed for stopping sink workers"
+	}
+}
+
+// stopSinkWorkers stops each group in turn within ctx and returns one plain-words error
+// per group whose worker may still be running. A failure used to be logged at Debug and
+// dropped, so a delete reported success while a worker kept writing to the destination of
+// a pipeline that no longer existed.
+func stopSinkWorkers(ctx context.Context, sinks sinkStopExecutor, pipelineID string, groups []string) []string {
+	if sinks == nil {
+		return nil
+	}
+	var errs []string
+	for _, group := range groups {
+		reason := stopSinkWorker(ctx, sinks, group)
+		if reason == "" {
+			continue
+		}
+		log.WithFields(log.Fields{
+			"pipeline_id":    pipelineID,
+			"consumer_group": group,
+			"reason":         reason,
+		}).Warn("stop_sink did not stop the worker; it may still be writing to the destination")
+		errs = append(errs, fmt.Sprintf("could not stop the sink worker for consumer group %s (%s); "+
+			"it may still be writing to the destination. Stop it from the sink service or restart the kafka-mcp-sink container.",
+			group, reason))
+	}
+	return errs
+}
+
+// kafkaTeardownBudgets gives each teardown phase its own time. Deliberately short: the
+// pipeline row is already gone, so this is reclamation, not correctness — a slow broker
+// must not hold the user's delete request open.
+//
+// The phases used to share one 45s context, so a sink stop that never answered spent
+// the time the group and topic deletes needed. Separate budgets bound each phase alone;
+// together they stay under the 45s api-gateway waits (runKafkaTeardownSync) with room for
+// the reply, because an answer after that wait is dropped
+// (TestDeleteBudgetsFitTheGatewayWaits).
+type kafkaTeardownBudgets struct {
+	sinkStop time.Duration // uniqueness check, group listing and every stop_sink
+	cleanup  time.Duration // consumer group and topic deletes
+}
+
+var defaultKafkaTeardownBudgets = kafkaTeardownBudgets{
+	sinkStop: 12 * time.Second,
+	cleanup:  28 * time.Second,
+}
 
 // pipelineWorkerStopper is the slice of the CDC table-stats agent this handler
 // needs. Declared here (rather than importing internal/agents/cdcstats) to keep
@@ -170,6 +314,16 @@ type KafkaTeardownRequest struct {
 // so a user principal cannot be checked and is refused outright — api-gateway
 // has already applied its own workspace-role gate before calling.
 func TeardownPipelineKafka(db *sql.DB, mcpManager *mcp.ServerManager, tm *kafka.TopologyManager, stats pipelineWorkerStopper) gin.HandlerFunc {
+	return teardownPipelineKafka(db, newSinkStopExecutor(mcpManager), tm, stats, cleanupPipelineKafkaResources, defaultKafkaTeardownBudgets)
+}
+
+// kafkaResourceCleanup deletes a pipeline's consumer groups and topics and returns one
+// error per failure (cleanupPipelineKafkaResources).
+type kafkaResourceCleanup func(ctx context.Context, db *sql.DB, tm *kafka.TopologyManager, pipelineID string) []string
+
+// teardownPipelineKafka is TeardownPipelineKafka with the sink service, the group and
+// topic cleanup and the phase budgets passed in, so tests can replace them.
+func teardownPipelineKafka(db *sql.DB, sinks sinkStopExecutor, tm *kafka.TopologyManager, stats pipelineWorkerStopper, cleanupKafka kafkaResourceCleanup, budgets kafkaTeardownBudgets) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req KafkaTeardownRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -182,9 +336,6 @@ func TeardownPipelineKafka(db *sql.DB, mcpManager *mcp.ServerManager, tm *kafka.
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), kafkaTeardownTimeout)
-		defer cancel()
-
 		// Lower-case, because every producer of these names derives them from
 		// pipelines.id::text, which Postgres renders lower-case. The delete path
 		// takes the id from a URL param instead (requireUUIDParam does not
@@ -194,8 +345,13 @@ func TeardownPipelineKafka(db *sql.DB, mcpManager *mcp.ServerManager, tm *kafka.
 		pipelineID := strings.ToLower(strings.TrimSpace(req.PipelineID))
 		log.WithField("pipeline_id", pipelineID).Info("Tearing down pipeline Kafka resources")
 
-		stopPipelineConsumers(ctx, mcpManager, tm, stats, pipelineID)
-		errs := cleanupPipelineKafkaResources(ctx, db, tm, pipelineID)
+		stopCtx, cancelStop := context.WithTimeout(context.Background(), budgets.sinkStop)
+		defer cancelStop()
+		errs := stopPipelineConsumers(stopCtx, db, sinks, tm, stats, pipelineID)
+
+		cleanupCtx, cancelCleanup := context.WithTimeout(context.Background(), budgets.cleanup)
+		defer cancelCleanup()
+		errs = append(errs, cleanupKafka(cleanupCtx, db, tm, pipelineID)...)
 
 		if len(errs) > 0 {
 			log.WithFields(log.Fields{"pipeline_id": pipelineID, "errors": errs}).
@@ -224,9 +380,17 @@ func TeardownPipelineKafka(db *sql.DB, mcpManager *mcp.ServerManager, tm *kafka.
 // sink-<id8>-<exec8> group PER EXECUTION, so a long-lived pipeline would mean
 // hundreds of stop_sink round-trips, nearly all for workers that exited long ago.
 // The broker knows which ones are actually still there.
-func stopPipelineConsumers(ctx context.Context, mcpManager *mcp.ServerManager, tm *kafka.TopologyManager, stats pipelineWorkerStopper, pipelineID string) {
+//
+// It returns one error per sink worker that may still be running. "Worker not found"
+// is not one: only the CDC streaming worker is long-lived, while batch and
+// per-execution workers stop on their own when their run ends.
+//
+// Every sink group here is derived from the 8-character id -- the manifest rows went
+// with the pipeline row -- so none is stopped when another pipeline shares that id:
+// the names could be that pipeline's live workers. The warning says so instead.
+func stopPipelineConsumers(ctx context.Context, db *sql.DB, sinks sinkStopExecutor, tm *kafka.TopologyManager, stats pipelineWorkerStopper, pipelineID string) []string {
 	if strings.TrimSpace(pipelineID) == "" {
-		return
+		return nil
 	}
 
 	// In-process CDC table-stats / schema-change consumers.
@@ -234,42 +398,35 @@ func stopPipelineConsumers(ctx context.Context, mcpManager *mcp.ServerManager, t
 		stats.StopPipeline(pipelineID)
 	}
 
-	if mcpManager == nil {
-		return
+	if sinks == nil {
+		return nil
 	}
 
 	names := pipelineKafkaNames{id8: utils.SafeID8(pipelineID), uuid: pipelineID}
-	groups := discoverSinkGroups(ctx, tm, names)
-
-	client := mcp.NewClient(mcpManager)
-	for _, group := range groups {
-		if stopResp, _ := client.ExecuteWithContext(ctx, mcp.ExecuteRequest{
-			Connector: "kafka-mcp-sink",
-			Operation: "stop_sink",
-			Config:    map[string]string{},
-			Params: map[string]interface{}{
-				"config": map[string]interface{}{
-					"consumer_group": group,
-				},
-			},
-		}); stopResp != nil && !stopResp.Success {
-			// A worker that already exited is the normal case here, not a failure:
-			// only the CDC streaming worker is long-lived, while batch and
-			// per-execution workers stop on their own when their run ends.
-			log.WithFields(log.Fields{
-				"pipeline_id":     pipelineID,
-				"consumer_group":  group,
-				"stop_sink_error": stopResp.Error,
-			}).Debug("stop_sink on teardown returned failure (likely no worker running; continuing)")
-		}
+	if !id8IsUnique(ctx, db, pipelineID, names.id8) {
+		return []string{sharedID8TeardownWarning}
 	}
+	return stopSinkWorkers(ctx, sinks, pipelineID, discoverSinkGroups(ctx, tm, names))
 }
 
+// sharedID8TeardownWarning is returned by the Kafka teardown when it stopped no sink
+// worker because another pipeline's id starts with the same 8 characters.
+const sharedID8TeardownWarning = "sink workers for this pipeline were not stopped: another pipeline's id starts " +
+	"with the same 8 characters, so the worker names could belong to it. Check the sink service for a leftover worker."
+
 // discoverSinkGroups returns this pipeline's sink consumer groups that currently
-// exist on the broker. Falls back to the two long-lived well-known names when the
+// exist on the broker. Falls back to the long-lived well-known names when the
 // broker cannot be listed, so a listing failure still stops the streaming worker.
+//
+// Both the listing filter and the fallback accept the namespace-qualified
+// spelling. They used to require a bare "sink-" prefix, which every group the
+// executor mints since kafkaclient.Group ("rsync.sink-<pid8>") fails: the delete
+// found no groups, stopped no worker, and the sink kept consuming a pipeline that
+// no longer existed while the broker refused to delete its still-joined group.
+// The fallback lists the bare spelling too, for a pipeline created before the
+// namespace whose worker still runs under it.
 func discoverSinkGroups(ctx context.Context, tm *kafka.TopologyManager, names pipelineKafkaNames) []string {
-	fallback := []string{"sink-" + names.id8, "sink-" + names.id8 + "-batch"}
+	fallback := derivedSinkGroups(names.uuid)
 	if tm == nil {
 		return fallback
 	}
@@ -281,9 +438,13 @@ func discoverSinkGroups(ctx context.Context, tm *kafka.TopologyManager, names pi
 		return fallback
 	}
 
+	return filterSinkGroups(all, names)
+}
+
+func filterSinkGroups(all []string, names pipelineKafkaNames) []string {
 	var groups []string
 	for _, g := range all {
-		if strings.HasPrefix(g, "sink-") && names.ownsGroup(g) {
+		if names.ownsSinkGroup(g) {
 			groups = append(groups, g)
 		}
 	}
@@ -322,15 +483,18 @@ func cleanupPipelineKafkaResources(ctx context.Context, db *sql.DB, tm *kafka.To
 		errs = append(errs, "list consumer groups: "+err.Error())
 		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("kafka teardown: list consumer groups failed")
 	} else {
-		for _, g := range groups {
-			if !names.ownsGroup(g) {
-				continue
-			}
+		left := forEachOwned(ctx, groups, names.ownsGroup, func(g string) {
 			if err := tm.DeleteConsumerGroup(ctx, g); err != nil {
 				errs = append(errs, fmt.Sprintf("delete consumer group %s: %s", g, err.Error()))
 				log.WithError(err).WithFields(log.Fields{"pipeline_id": pipelineID, "group": g}).
 					Warn("kafka teardown: consumer group delete failed")
 			}
+		})
+		if left > 0 {
+			errs = append(errs, fmt.Sprintf(
+				"kafka teardown ran out of time: %d consumer group(s) left behind", left))
+			log.WithField("pipeline_id", pipelineID).WithField("remaining", left).
+				Warn("kafka teardown: budget expired before consumer groups were deleted")
 		}
 	}
 
@@ -338,21 +502,65 @@ func cleanupPipelineKafkaResources(ctx context.Context, db *sql.DB, tm *kafka.To
 		errs = append(errs, "list topics: "+err.Error())
 		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("kafka teardown: list topics failed")
 	} else {
-		for _, t := range topics {
-			if !names.ownsTopic(t) {
-				continue
-			}
+		left := forEachOwned(ctx, topics, names.ownsTopic, func(t string) {
 			if err := tm.DeleteTopic(ctx, t); err != nil {
 				// Already gone is the desired end state, not a failure.
 				if strings.Contains(strings.ToLower(err.Error()), "unknown topic") {
-					continue
+					return
 				}
 				errs = append(errs, fmt.Sprintf("delete topic %s: %s", t, err.Error()))
 				log.WithError(err).WithFields(log.Fields{"pipeline_id": pipelineID, "topic": t}).
 					Warn("kafka teardown: topic delete failed")
 			}
+		})
+		if left > 0 {
+			errs = append(errs, fmt.Sprintf(
+				"kafka teardown ran out of time: %d topic(s) left behind", left))
+			log.WithField("pipeline_id", pipelineID).WithField("remaining", left).
+				Warn("kafka teardown: budget expired before topics were deleted")
 		}
 	}
 
 	return errs
+}
+
+// forEachOwned runs fn over every entry of a cluster listing this pipeline owns,
+// re-checking the caller's budget before each one, and returns how many owned
+// entries it did NOT get to (0 = the whole list was processed).
+//
+// Two things here are load-bearing.
+//
+// The budget is re-checked BETWEEN items, not once up front: every fn is a
+// broker round-trip, so a teardown given 5 seconds and 200 topics would
+// otherwise run long past its deadline and report success for deletes that were
+// refused. Each remaining item is then reported, not silently dropped.
+//
+// The remainder is counted from the LOOP INDEX, not from a count of owned items
+// seen so far. The listing interleaves other pipelines' names, so those two
+// numbers diverge, and counting from the owned-so-far counter re-counts entries
+// already deleted — over-reporting what is left on the cluster. That number is
+// what an operator uses to decide what to clean up by hand, so it has to be
+// exact; on an all-owned listing the two agree, which is what makes the wrong
+// one look right.
+func forEachOwned(ctx context.Context, listed []string, owns func(string) bool, fn func(string)) int {
+	for i, name := range listed {
+		if !owns(name) {
+			continue
+		}
+		if ctx.Err() != nil {
+			return countOwned(listed[i:], owns)
+		}
+		fn(name)
+	}
+	return 0
+}
+
+func countOwned(listed []string, owns func(string) bool) int {
+	n := 0
+	for _, name := range listed {
+		if owns(name) {
+			n++
+		}
+	}
+	return n
 }

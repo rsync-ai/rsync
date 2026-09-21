@@ -1,19 +1,19 @@
 //go:build integration_pg
 
-// Real-Postgres coverage for upstream inference — "which pipeline produces the tables
-// this model reads".
+// Real-Postgres coverage for upstream inference — "which pipeline or model produces the
+// tables this model reads".
 //
 // It has to run against a real Postgres because the half of the answer that is easiest
 // to get wrong lives in the SQL, not in Go: which COLUMN is compared (the whole point of
-// migration 089), which rows the tenancy and connection predicates exclude, and how a
-// NULL destination behaves. A mock returning canned rows would pass with every one of
-// those inverted.
+// migration 089), which rows the tenancy, connection and visibility predicates exclude,
+// and how a NULL destination behaves. A mock returning canned rows would pass with every
+// one of those inverted.
 //
 // The fixture is the shape migration 089 was written about: a MySQL->Postgres CDC
 // pipeline whose source schema and destination schema differ. That difference is what
 // makes the wrong column look right in every test where they happen to match.
 //
-// Needs only a bare postgres — the query touches two tables, so the test creates them
+// Needs only a bare postgres — the queries touch three tables, so the test creates them
 // itself rather than running the migration stack:
 //
 //	docker run -d --name upstream-pg -e POSTGRES_PASSWORD=verify \
@@ -21,8 +21,9 @@
 //	UPSTREAM_PG_DSN='postgres://postgres:verify@localhost:55443/cplane?sslmode=disable' \
 //	    go test -tags integration_pg ./internal/handlers/ -run PG_Upstream -v
 //
-// The tests DROP and recreate `pipelines` and `pipeline_run_table_stats`, so point this
-// at a scratch database — never at one holding a migrated schema you care about.
+// The tests DROP and recreate `pipelines`, `pipeline_run_table_stats` and
+// `saved_queries`, so point this at a scratch database — never at one holding a
+// migrated schema you care about.
 
 package handlers
 
@@ -63,22 +64,36 @@ const (
 	upCustomer = "cccccccc-1111-0000-0000-000000000002" // lands analytics.customers
 	upForeign  = "cccccccc-1111-0000-0000-000000000003" // lands analytics.orders elsewhere
 	upNoDest   = "cccccccc-1111-0000-0000-000000000004" // object-storage: NULL destination
+
+	upMe   = "dddddddd-1111-0000-0000-000000000001" // the user asking
+	upThem = "dddddddd-1111-0000-0000-000000000002" // another member of the workspace
+
+	upSelf       = "eeeeeeee-1111-0000-0000-000000000001" // the model being scheduled; builds analytics.daily_mrr
+	upDim        = "eeeeeeee-1111-0000-0000-000000000002" // builds analytics.customer_dim
+	upDimElse    = "eeeeeeee-1111-0000-0000-000000000003" // builds analytics.customer_dim on another connection
+	upDimOtherWS = "eeeeeeee-1111-0000-0000-000000000004" // builds analytics.customer_dim in another workspace
+	upMine       = "eeeeeeee-1111-0000-0000-000000000005" // private to me; builds analytics.my_scratch
+	upTheirs     = "eeeeeeee-1111-0000-0000-000000000006" // private to them; builds analytics.their_scratch
+	upStatement  = "eeeeeeee-1111-0000-0000-000000000007" // a statement model with a leftover target
 )
 
-// upstreamFixture builds the two tables and the rows every test below shares.
+// upstreamFixture builds the three tables and the rows every test below shares.
 //
 // The CDC detail that matters: every stat row's SOURCE-side qualified_name is
 // `shop.<table>` (the MySQL database) while the DESTINATION is `analytics.<table>`.
 // A resolver matching qualified_name finds nothing for `analytics.orders` and
 // everything for `shop.orders` — which is the bug this fixture exists to catch.
+//
+// Every model the resolver must NOT offer builds a table that some other test's query
+// reads, next to one it must offer, so a predicate dropped from the model query shows
+// up as an extra candidate rather than as a quiet pass.
 func upstreamFixture(t *testing.T, db *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
 
-	_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS pipeline_run_table_stats, pipelines`)
-	t.Cleanup(func() {
-		_, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS pipeline_run_table_stats, pipelines`)
-	})
+	const drop = `DROP TABLE IF EXISTS pipeline_run_table_stats, pipelines, saved_queries`
+	_, _ = db.ExecContext(ctx, drop)
+	t.Cleanup(func() { _, _ = db.ExecContext(ctx, drop) })
 
 	mustExec(t, db, `CREATE TABLE pipelines (
 		id UUID PRIMARY KEY,
@@ -93,6 +108,22 @@ func upstreamFixture(t *testing.T, db *sql.DB) {
 		qualified_name TEXT NOT NULL,
 		destination_schema TEXT,
 		destination_qualified_name TEXT
+	)`)
+	// The columns and constraints the model query depends on, as migrations 084, 085
+	// and 088 define them — including the CHECK that lets a statement model keep a
+	// target_table, which is exactly the row the resolver has to ignore.
+	mustExec(t, db, `CREATE TABLE saved_queries (
+		id UUID PRIMARY KEY,
+		workspace_id UUID NOT NULL,
+		connection_id UUID NOT NULL,
+		name TEXT NOT NULL,
+		sql_text TEXT NOT NULL DEFAULT '',
+		visibility TEXT NOT NULL CHECK (visibility IN ('private','workspace')),
+		created_by UUID NOT NULL,
+		materialization TEXT NOT NULL DEFAULT 'none'
+			CHECK (materialization IN ('none','table','statement')),
+		target_table TEXT,
+		CHECK (materialization <> 'table' OR NULLIF(TRIM(target_table), '') IS NOT NULL)
 	)`)
 
 	mustExec(t, db, `INSERT INTO pipelines VALUES
@@ -110,6 +141,19 @@ func upstreamFixture(t *testing.T, db *sql.DB) {
 		($3,'orders',   'shop','shop.orders',      'analytics','analytics.orders'),
 		($4,'events',   'shop','shop.events',      NULL,        NULL)`,
 		upOrders, upCustomer, upForeign, upNoDest)
+
+	mustExec(t, db, `INSERT INTO saved_queries
+		(id, workspace_id, connection_id, name, visibility, created_by, materialization, target_table)
+		VALUES
+		($1, $8, $10, 'Daily MRR',            'workspace', $12, 'table',     'analytics.daily_mrr'),
+		($2, $8, $10, 'Customer dim',         'workspace', $13, 'table',     'analytics.customer_dim'),
+		($3, $8, $11, 'Customer dim (other)', 'workspace', $12, 'table',     'analytics.customer_dim'),
+		($4, $9, $10, 'Customer dim (ws2)',   'workspace', $12, 'table',     'analytics.customer_dim'),
+		($5, $8, $10, 'My scratch',           'private',   $12, 'table',     'analytics.my_scratch'),
+		($6, $8, $10, 'Their scratch',        'private',   $13, 'table',     'analytics.their_scratch'),
+		($7, $8, $10, 'Nightly delete',       'workspace', $12, 'statement', 'analytics.stmt_out')`,
+		upSelf, upDim, upDimElse, upDimOtherWS, upMine, upTheirs, upStatement,
+		upWS, upOtherWS, upWarehse, upOtherCn, upMe, upThem)
 }
 
 func mustExec(t *testing.T, db *sql.DB, q string, args ...any) {
@@ -119,24 +163,40 @@ func mustExec(t *testing.T, db *sql.DB, q string, args ...any) {
 	}
 }
 
-// names renders candidates as "pipeline<-reference" pairs, sorted, so an assertion
+// names renders candidates as "producer<-reference" pairs, sorted, so an assertion
 // reads as the mapping it is testing rather than as struct literals.
 func names(resp upstreamSuggestionResponse) []string {
 	out := make([]string, 0, len(resp.Candidates))
 	for _, c := range resp.Candidates {
-		out = append(out, c.PipelineName+"<-"+c.MatchedReference)
+		out = append(out, c.Name+"<-"+c.MatchedReference)
 	}
 	sort.Strings(out)
 	return out
 }
 
-func resolve(t *testing.T, db *sql.DB, sqlText string) upstreamSuggestionResponse {
+// lookup is the model being scheduled, asked about by upMe, in the fixture's workspace.
+func lookup(sqlText string) upstreamLookup {
+	return upstreamLookup{
+		SavedQueryID: upSelf,
+		SQLText:      sqlText,
+		ConnectionID: upWarehse,
+		WorkspaceID:  upWS,
+		UserID:       upMe,
+	}
+}
+
+func resolveAs(t *testing.T, db *sql.DB, in upstreamLookup) upstreamSuggestionResponse {
 	t.Helper()
-	resp, err := resolveUpstreams(context.Background(), db, sqlText, upWarehse, upWS)
+	resp, err := resolveUpstreams(context.Background(), db, in)
 	if err != nil {
 		t.Fatalf("resolveUpstreams: %v", err)
 	}
 	return resp
+}
+
+func resolve(t *testing.T, db *sql.DB, sqlText string) upstreamSuggestionResponse {
+	t.Helper()
+	return resolveAs(t, db, lookup(sqlText))
 }
 
 func TestPG_UpstreamMatchesDestinationNotSource(t *testing.T) {
@@ -197,7 +257,7 @@ func TestPG_UpstreamStaysInsideWorkspaceAndConnection(t *testing.T) {
 	// hang the schedule off a pipeline that never touches what this model reads.
 	resp := resolve(t, db, "SELECT * FROM analytics.orders")
 	for _, c := range resp.Candidates {
-		if c.PipelineID == upForeign {
+		if c.ID == upForeign {
 			t.Fatal("a pipeline writing to another destination connection was suggested")
 		}
 	}
@@ -206,11 +266,9 @@ func TestPG_UpstreamStaysInsideWorkspaceAndConnection(t *testing.T) {
 	}
 
 	// Same query, asked on behalf of a workspace that owns none of these pipelines.
-	resp2, err := resolveUpstreams(context.Background(), db, "SELECT * FROM analytics.orders", upWarehse, upOtherWS)
-	if err != nil {
-		t.Fatalf("resolveUpstreams: %v", err)
-	}
-	if len(resp2.Candidates) != 0 {
+	other := lookup("SELECT * FROM analytics.orders")
+	other.WorkspaceID = upOtherWS
+	if resp2 := resolveAs(t, db, other); len(resp2.Candidates) != 0 {
 		t.Fatalf("cross-workspace leak: %v", names(resp2))
 	}
 }
@@ -269,26 +327,65 @@ func TestPG_UpstreamResolvesEveryInputOfAJoin(t *testing.T) {
 	}
 }
 
-func TestPG_UpstreamReportsAmbiguityRatherThanPickingOne(t *testing.T) {
+func TestPG_UpstreamOffersEveryProducerOfOneTableWithoutCallingItAmbiguous(t *testing.T) {
 	db := upstreamPGDB(t)
 	upstreamFixture(t, db)
 
-	// Two pipelines land the same destination table. Which one a schedule should follow
-	// is a real question with no derivable answer, so the flag exists to stop the UI
-	// pre-selecting whichever sorted first.
+	// A pipeline and a model both write analytics.orders. Both really do, and a schedule
+	// can follow both, so both are offered — but this is fan-in, not ambiguity: the
+	// table is not in question. The asset graph draws the same two edges and calls the
+	// same thing fan-in; the two answers must not disagree.
 	mustExec(t, db, `INSERT INTO pipelines VALUES ($1,'Orders backfill',$2,$3)`,
 		"cccccccc-1111-0000-0000-000000000005", upWS, upWarehse)
 	mustExec(t, db, `INSERT INTO pipeline_run_table_stats
 		(pipeline_id, table_name, schema_name, qualified_name, destination_schema, destination_qualified_name)
 		VALUES ($1,'orders','shop','shop.orders','analytics','analytics.orders')`,
 		"cccccccc-1111-0000-0000-000000000005")
+	mustExec(t, db, `INSERT INTO saved_queries
+		(id, workspace_id, connection_id, name, visibility, created_by, materialization, target_table)
+		VALUES ($1,$2,$3,'Orders corrections','workspace',$4,'table','analytics.orders')`,
+		"eeeeeeee-1111-0000-0000-000000000008", upWS, upWarehse, upMe)
 
 	resp := resolve(t, db, "SELECT * FROM analytics.orders")
+	want := []string{
+		"Orders CDC<-analytics.orders",
+		"Orders backfill<-analytics.orders",
+		"Orders corrections<-analytics.orders",
+	}
+	if got := names(resp); strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("want every producer offered, got %v", got)
+	}
+	if resp.Ambiguous {
+		t.Fatal("three producers of one table were reported as ambiguous")
+	}
+}
+
+func TestPG_UpstreamReportsAmbiguityRatherThanPickingOne(t *testing.T) {
+	db := upstreamPGDB(t)
+	upstreamFixture(t, db)
+
+	// `orders` names no schema, and two different tables answer to it. Which one the
+	// query reads depends on a search_path nothing here can see, so the flag exists to
+	// stop the UI pre-selecting whichever sorted first.
+	mustExec(t, db, `INSERT INTO pipelines VALUES ($1,'Staging orders',$2,$3)`,
+		"cccccccc-1111-0000-0000-000000000006", upWS, upWarehse)
+	mustExec(t, db, `INSERT INTO pipeline_run_table_stats
+		(pipeline_id, table_name, schema_name, qualified_name, destination_schema, destination_qualified_name)
+		VALUES ($1,'orders','shop','shop.orders','staging','staging.orders')`,
+		"cccccccc-1111-0000-0000-000000000006")
+
+	resp := resolve(t, db, "SELECT * FROM orders")
 	if !resp.Ambiguous {
-		t.Fatal("two producers of one table must be reported as ambiguous")
+		t.Fatalf("a bare name matching two tables must be reported as ambiguous: %v", names(resp))
 	}
 	if len(resp.Candidates) != 2 {
-		t.Fatalf("both producers should be offered, got %v", names(resp))
+		t.Fatalf("both readings should be offered, got %v", names(resp))
+	}
+
+	// Naming the schema settles it — the control that keeps the flag from being
+	// set on every match.
+	if named := resolve(t, db, "SELECT * FROM staging.orders"); named.Ambiguous || len(named.Candidates) != 1 {
+		t.Fatalf("a qualified reference is not ambiguous: ambiguous=%v %v", named.Ambiguous, names(named))
 	}
 }
 
@@ -300,7 +397,7 @@ func TestPG_UpstreamUnqualifiedReferencePrefersTheQualifiedMatch(t *testing.T) {
 	// user's ad-hoc SQL relies on the connection's search_path far more often than it
 	// spells out the schema — and the candidate is confirmed by a person either way.
 	resp := resolve(t, db, "SELECT * FROM orders")
-	if len(resp.Candidates) != 1 || resp.Candidates[0].PipelineID != upOrders {
+	if len(resp.Candidates) != 1 || resp.Candidates[0].ID != upOrders {
 		t.Fatalf("bare table name did not resolve: %v", names(resp))
 	}
 	if resp.Candidates[0].Qualified {
@@ -334,5 +431,77 @@ func TestPG_UpstreamIgnoresCTEsAndInventsNothing(t *testing.T) {
 	}
 	if len(resp.References) != 0 {
 		t.Fatalf("no tables in this query, got %v", resp.References)
+	}
+}
+
+func TestPG_UpstreamOffersTheModelThatBuildsTheTable(t *testing.T) {
+	db := upstreamPGDB(t)
+	upstreamFixture(t, db)
+
+	// Three models build analytics.customer_dim: one here, one on another connection,
+	// one in another workspace. Only the first builds the table this model reads; the
+	// other two are the same name in a different warehouse, and would arrive as extra
+	// candidates if either predicate went missing from the model query.
+	resp := resolve(t, db, "SELECT * FROM analytics.customer_dim")
+	if got := names(resp); len(got) != 1 || got[0] != "Customer dim<-analytics.customer_dim" {
+		t.Fatalf("want only this connection's model offered, got %v", got)
+	}
+	c := resp.Candidates[0]
+	if c.Kind != assetKindModel || c.ID != upDim || c.Table != "analytics.customer_dim" || !c.Qualified {
+		t.Fatalf("candidate is not the model as the picker needs it: %+v", c)
+	}
+}
+
+func TestPG_UpstreamNeverNamesAnotherUsersPrivateModel(t *testing.T) {
+	db := upstreamPGDB(t)
+	upstreamFixture(t, db)
+
+	sqlText := `SELECT * FROM analytics.my_scratch m JOIN analytics.their_scratch t ON t.id = m.id`
+
+	// My private model is mine to follow. Theirs is theirs: offering it by name would
+	// tell me it exists, and what it builds.
+	mine := resolve(t, db, sqlText)
+	if got := names(mine); len(got) != 1 || got[0] != "My scratch<-analytics.my_scratch" {
+		t.Fatalf("want only my own private model offered, got %v", got)
+	}
+	if len(mine.Unresolved) != 1 || mine.Unresolved[0] != "analytics.their_scratch" {
+		t.Fatalf("another user's private model must leave its table unresolved, got %v", mine.Unresolved)
+	}
+
+	// The control: the same query asked by its author does find it. Without this, a
+	// model query that dropped private models altogether would pass the half above.
+	asThem := lookup(sqlText)
+	asThem.UserID = upThem
+	theirs := resolveAs(t, db, asThem)
+	if got := names(theirs); len(got) != 1 || got[0] != "Their scratch<-analytics.their_scratch" {
+		t.Fatalf("the author should see their own private model, got %v", got)
+	}
+}
+
+func TestPG_UpstreamIgnoresAModelThatBuildsNoTable(t *testing.T) {
+	db := upstreamPGDB(t)
+	upstreamFixture(t, db)
+
+	// A statement model may well write analytics.stmt_out, but nothing records that it
+	// does; the target_table left on it from an earlier mode is not a claim.
+	resp := resolve(t, db, "SELECT * FROM analytics.stmt_out")
+	if len(resp.Candidates) != 0 {
+		t.Fatalf("a model that does not materialize a table was offered: %v", names(resp))
+	}
+}
+
+func TestPG_UpstreamModelIsNotItsOwnUpstream(t *testing.T) {
+	db := upstreamPGDB(t)
+	upstreamFixture(t, db)
+
+	// Daily MRR reads the table it builds (an incremental model). The saved query's own
+	// id has to reach the builder for this to hold; a lookup that lost it would offer
+	// the model as its own upstream.
+	resp := resolve(t, db, "SELECT * FROM analytics.daily_mrr")
+	if len(resp.Candidates) != 0 {
+		t.Fatalf("the model was offered as its own upstream: %v", names(resp))
+	}
+	if len(resp.Unresolved) != 1 || resp.Unresolved[0] != "analytics.daily_mrr" {
+		t.Fatalf("expected analytics.daily_mrr unresolved, got %v", resp.Unresolved)
 	}
 }

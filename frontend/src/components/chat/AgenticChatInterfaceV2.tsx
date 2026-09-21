@@ -30,9 +30,12 @@ import { resetSessionId, sendChatMessage, type PipelinePlan } from "@/lib/api/ch
 import { getPipeline, type DestinationConfig } from "@/lib/api/pipelines"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { readResponseErrorMessage } from "@/lib/utils/error-handling"
 import type { BlockingReason } from "@/lib/pipeline/stageDefinitions"
 import type { DataLoadingStrategy } from "@/lib/pipeline/dataLoadingStrategy"
 import { useOptimisticAction, usePipelineState } from "@/lib/pipeline/usePipelineState"
+import { isSlotFillingState, nextActiveIntent, shouldStartFreshThread } from "@/lib/chat/thread-intent"
+import { notifyPipelinesChanged } from "@/lib/plan/plan-events"
 
 // Re-export so consumers can import the type from this file.
 export type { ChatMessage as Message }
@@ -46,6 +49,30 @@ function msgId(prefix: string) {
 
 function asRecord(v: unknown): Record<string, unknown> {
   return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {}
+}
+
+// stopPipeline asks the gateway to stop the pipeline. It resolves when the
+// pipeline is stopped, including when it already was (another tab, the pipeline
+// page). Anything else throws an Error whose message is a plain sentence naming
+// `what` is being cancelled and why it was not: a refusal, a proxy's error page,
+// or a request that never reached the server. Only a body that says the pipeline
+// is stopped counts as stopped; an unreadable body does not.
+async function stopPipeline(pipelineId: string, what: string): Promise<void> {
+  let res: Response
+  try {
+    res = await authFetch(API_ENDPOINTS.PIPELINES.STOP(pipelineId), { method: "POST" })
+  } catch {
+    throw new Error(`Could not reach the server to cancel ${what}. Check your connection and try again.`)
+  }
+  if (res.ok) return
+  const alreadyStopped = await res
+    .clone()
+    .json()
+    .then((body: unknown) => String(asRecord(body)["current_status"] || "") === "stopped")
+    .catch(() => false)
+  if (alreadyStopped) return
+  const reason = (await readResponseErrorMessage(res, "Cancel")).replace(/[.\s]+$/, "")
+  throw new Error(`Could not cancel ${what}: ${reason}. Try again, or open the pipeline to check its state.`)
 }
 
 // AgenticChatInterfaceV2 is the sole chat interface. The "V2" suffix is
@@ -87,6 +114,13 @@ export function AgenticChatInterfaceV2() {
     sourceType?: string
     destType?: string
   } | null>(null)
+  // Mirrors read inside runPrompt without re-creating it on every keystroke.
+  const chatSlotRef = useRef(chatSlot)
+  const activeIntentRef = useRef(activeIntent)
+  useEffect(() => {
+    chatSlotRef.current = chatSlot
+    activeIntentRef.current = activeIntent
+  }, [chatSlot, activeIntent])
 
   // Right panel (DAG/Status/Timeline)
   const [rightPanelOpen, setRightPanelOpen] = useState(false)
@@ -131,6 +165,8 @@ export function AgenticChatInterfaceV2() {
     setTableHitlNodeId,
     tableDiscoveryStatus,
     tableSourceDatabase,
+    tableSourceServerLevel,
+    tableTruncatedTotal,
     tableDiscoveryReason,
     suggestionsReviewOpen,
     selectedTablesForSuggestions,
@@ -286,13 +322,17 @@ export function AgenticChatInterfaceV2() {
 
   // Defer runPrompt resolution to break the temporal-dead-zone cycle
   // (URL handler effect runs before runPrompt is declared below).
-  const runPromptRef = useRef<((prompt: string) => Promise<void>) | null>(null)
+  const runPromptRef = useRef<
+    ((prompt: string, displayText?: string, opts?: { freshThread?: boolean }) => Promise<void>) | null
+  >(null)
 
   // ── URL ?prompt= deep-link (with optional ?autosend=1 to auto-submit) ─────
   useEffect(() => {
     const promptFromUrl = searchParams.get("prompt") || ""
     const autoSend = searchParams.get("autosend") === "1"
-    if (!promptFromUrl || consumedPromptRef.current === promptFromUrl || pipelineId) return
+    // No `pipelineId` guard: an autosend deep link (Home "Create with AI") is a
+    // brand-new request and always opens its own thread (issue #13).
+    if (!promptFromUrl || consumedPromptRef.current === promptFromUrl) return
     consumedPromptRef.current = promptFromUrl
     setInput(promptFromUrl)
     try {
@@ -310,10 +350,10 @@ export function AgenticChatInterfaceV2() {
       setTimeout(() => {
         setInput("")
         const fn = runPromptRef.current
-        if (fn) void fn(promptFromUrl)
+        if (fn) void fn(promptFromUrl, undefined, { freshThread: true })
       }, 0)
     }
-  }, [pipelineId, pathname, router, searchParams])
+  }, [pathname, router, searchParams])
 
   // ── Authoritative state polling (2 s) ─────────────────────────────────────
   useEffect(() => {
@@ -369,6 +409,16 @@ export function AgenticChatInterfaceV2() {
           dispatch({
             type: "EXECUTION_STATE_CHANGE",
             payload: { executionState: "running", timestamp: Date.now() },
+          })
+        }
+        // A stop from anywhere (the picker's Cancel, the panel, the pipeline page,
+        // another tab) ends this chat's run. Before, only the HITL branch below
+        // reacted: it resolved the park, which the reducer turns into "running", so
+        // the composer stayed locked with nothing left to wait for.
+        if (status === "stopped") {
+          dispatch({
+            type: "EXECUTION_STATE_CHANGE",
+            payload: { executionState: "cancelled", timestamp: Date.now() },
           })
         }
 
@@ -447,29 +497,82 @@ export function AgenticChatInterfaceV2() {
     }
   }, [pipelineId])
 
+  // Cancel on the pipeline card. It used to discard the stop's answer, so a refused
+  // stop (a 403, a 502 from a proxy) looked exactly like one that worked. A stop that
+  // lands needs no message: the card follows /state to stopped.
   const handleCancelPipeline = useCallback(async () => {
     if (!pipelineId) return
     try {
-      await authFetch(API_ENDPOINTS.PIPELINES.STOP(pipelineId), { method: "POST" })
-    } catch {
-      // ignore
+      await stopPipeline(pipelineId, "the pipeline")
+    } catch (e) {
+      addMessage("assistant", e instanceof Error ? e.message : String(e))
     }
-  }, [pipelineId])
+  }, [pipelineId, addMessage])
+
+  // ── Cancel from the table picker ──────────────────────────────────────────
+  // The picker's Cancel used to only hide the dialog. The run stayed parked on
+  // the selection, so /state kept reporting waiting_for_user: the composer stayed
+  // disabled and the picker would not reopen for the same prompt. Cancel now
+  // stops the pipeline being set up (the workflow ends on the cancel signal) and
+  // marks this chat's run cancelled, so the composer offers a new pipeline.
+  // Throws a plain message on failure; the picker shows it and stays open.
+  const handleCancelTableSetup = useCallback(async () => {
+    if (!pipelineId) return
+    // Stopped already (another tab, or the pipeline page) counts: the setup is over,
+    // so it is treated as cancelled instead of asking the user to retry something done.
+    await stopPipeline(pipelineId, "pipeline setup")
+    suppressHitlUntilRef.current = Date.now() + 15000
+    lastBlockingKeyRef.current = ""
+    if (resumingTimerRef.current) clearTimeout(resumingTimerRef.current)
+    setResumingFromHITL(false)
+    resolveHITL()
+    dispatch({
+      type: "EXECUTION_STATE_CHANGE",
+      payload: { executionState: "cancelled", timestamp: Date.now() },
+    })
+    addMessage("assistant", "Pipeline setup cancelled. Start a new pipeline when you're ready.")
+  }, [pipelineId, suppressHitlUntilRef, lastBlockingKeyRef, resolveHITL, dispatch, addMessage])
 
   // ── runPrompt ─────────────────────────────────────────────────────────────
   const runPrompt = useCallback(
-    async (promptRaw: string, displayText?: string) => {
+    async (promptRaw: string, displayText?: string, opts?: { freshThread?: boolean }) => {
       const prompt = String(promptRaw || "").trim()
       if (!prompt) return
 
       // The backend receives `prompt` (which may be a machine command like
-      // "Yes sync_mode=batch"); the user-facing chat + intent show `display`.
+      // "Yes sync_mode=batch"); the user-facing chat shows `display`.
       const display = String(displayText || "").trim() || prompt
 
-      setActiveIntent(display)
+      // A new pipeline request after this thread already created a pipeline
+      // gets its own thread and chat session (issue #13).
+      const awaitingSlot = isSlotFillingState(chatSlotRef.current?.state)
+      let currentIntent = activeIntentRef.current
+      if (
+        opts?.freshThread ||
+        shouldStartFreshThread({
+          prompt,
+          displayText,
+          awaitingSlot,
+          threadResponseTypes: loadPersistedUiState().messages.map((m) => m.responseType),
+        })
+      ) {
+        startNew()
+        currentIntent = ""
+      }
+
+      // "YOU ASKED" keeps the original request; a sync-mode click or a yes/no
+      // reply must not overwrite it (issue #3).
+      const intent = nextActiveIntent({
+        current: currentIntent,
+        prompt,
+        displayText,
+        awaitingSlot,
+      })
+      activeIntentRef.current = intent
+      setActiveIntent(intent)
       try {
         const cur = loadPersistedUiState()
-        persistUiState({ messages: cur.messages, activeIntent: display })
+        persistUiState({ messages: cur.messages, activeIntent: intent })
       } catch {
         // ignore
       }
@@ -491,6 +594,20 @@ export function AgenticChatInterfaceV2() {
           : []
         const sourceSupportsCDC = Boolean(data["source_supports_cdc"])
         const sourceSupportsIncrementalBatch = Boolean(data["source_supports_incremental_batch"])
+        // The mode the ORIGINAL request named ("... CDC with snapshot + streaming"),
+        // pre-selected on the card instead of asking again (issue #13).
+        const requestedSyncMode = String(data["requested_sync_mode"] || "").trim().toLowerCase()
+        const requestedCdcMode = String(data["requested_cdc_mode"] || "").trim().toLowerCase()
+        // Where the rows land (#45): the name the request gave, the destination's
+        // default, and what the destination calls it (schema / database / dataset / path).
+        const destinationNamespaceKind = String(data["destination_namespace_kind"] || "").trim().toLowerCase()
+        const requestedDestinationNamespace = String(data["requested_destination_namespace"] || "").trim()
+        const defaultDestinationNamespace = String(data["default_destination_namespace"] || "").trim()
+        const originalRequest = String(pendingIntent["original_request"] || "").trim()
+        if (originalRequest) {
+          activeIntentRef.current = originalRequest
+          setActiveIntent(originalRequest)
+        }
         const effectiveSupportedModes =
           supportedSyncModes.length > 0
             ? supportedSyncModes
@@ -561,6 +678,15 @@ export function AgenticChatInterfaceV2() {
                   supportedSyncModes: effectiveSupportedModes,
                   sourceSupportsCDC,
                   sourceSupportsIncrementalBatch,
+                  requestedSyncMode: requestedSyncMode || undefined,
+                  requestedCdcMode: requestedCdcMode || undefined,
+                  destinationNamespace: destinationNamespaceKind
+                    ? {
+                        kind: destinationNamespaceKind,
+                        requested: requestedDestinationNamespace,
+                        defaultName: defaultDestinationNamespace,
+                      }
+                    : undefined,
                 }
               : undefined,
           diagnosis,
@@ -592,6 +718,7 @@ export function AgenticChatInterfaceV2() {
             payload: { pipelineId: pid, executionId: execId || pid, timestamp: Date.now() },
           })
           addPipeline(pid, undefined, "processing")
+          notifyPipelinesChanged() // plan banner re-reads the pipeline meter
         }
       } catch {
         addMessage("assistant", "Failed to start pipeline. Please try again.")
@@ -599,7 +726,7 @@ export function AgenticChatInterfaceV2() {
         setIsSendingMessage(false)
       }
     },
-    [addMessage, addPipeline, dispatch, loadPersistedUiState, persistUiState]
+    [addMessage, addPipeline, dispatch, loadPersistedUiState, persistUiState, startNew]
   )
 
   // Expose runPrompt to the URL deep-link effect declared above.
@@ -665,6 +792,7 @@ export function AgenticChatInterfaceV2() {
               setTableSourceType("")
               setTableHitlNodeId("")
             }}
+            onCancel={handleCancelTableSetup}
             onResolved={() => {
               suppressHitlUntilRef.current = Date.now() + 15000
               lastBlockingKeyRef.current = ""
@@ -684,6 +812,8 @@ export function AgenticChatInterfaceV2() {
             suggestedTables={suggestedTables}
             discoveryStatus={tableDiscoveryStatus}
             sourceDatabase={tableSourceDatabase}
+            sourceServerLevel={tableSourceServerLevel}
+            truncatedTotal={tableTruncatedTotal}
             discoveryReason={tableDiscoveryReason}
             destinationConfig={destinationConfig}
             destinationType={destinationType}

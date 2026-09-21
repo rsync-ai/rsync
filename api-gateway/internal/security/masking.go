@@ -5,7 +5,9 @@ import (
 	"strings"
 )
 
-// SensitiveKeys is the list of keys that should be masked in logs
+// SensitiveKeys is the list of keys that should be masked in logs. Pinned, with
+// backend-orchestrator's copy and llm-service's SENSITIVE_KEYS, to
+// shared/sensitive_keys_golden.json (masking_golden_test.go): change all together.
 var SensitiveKeys = []string{
 	"password",
 	"secret",

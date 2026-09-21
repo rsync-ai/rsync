@@ -273,13 +273,13 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
                     className={
                       "text-sm font-medium " +
                       (step.done
-                        ? "text-zinc-400 line-through decoration-zinc-300 dark:text-zinc-500 dark:decoration-zinc-700"
+                        ? "text-zinc-400 line-through decoration-zinc-300 dark:text-zinc-400 dark:decoration-zinc-700"
                         : "text-zinc-900 dark:text-zinc-100")
                     }
                   >
                     {step.title}
                   </p>
-                  <p className="truncate text-xs text-zinc-400 dark:text-zinc-500">{step.desc}</p>
+                  <p className="truncate text-xs text-zinc-400">{step.desc}</p>
                 </div>
                 {step.done ? (
                   <span className="flex-none text-xs font-medium text-emerald-600 dark:text-emerald-400">Done</span>
@@ -289,7 +289,7 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
                     className={
                       "flex-none whitespace-nowrap rounded-md px-1 text-xs font-semibold focus:outline-none focus-visible:ring-2 focus-visible:ring-violet-500 " +
                       (isUpcoming
-                        ? "text-zinc-400 hover:text-violet-600 dark:text-zinc-500 dark:hover:text-violet-400"
+                        ? "text-zinc-400 hover:text-violet-600 dark:text-zinc-400 dark:hover:text-violet-400"
                         : "text-violet-600 hover:text-violet-700 dark:text-violet-400")
                     }
                   >

@@ -23,22 +23,29 @@
 # cannot silently turn a strip entry into a no-op that ships the moat.
 
 # ── Generation package (curated API intelligence + the agents that use it) ──
+#
+# What is NOT here, deliberately: contracts/, generator/, scaffold/, schemas/,
+# templates/ and validation/. Those are the DETERMINISTIC renderer -- an OpenAPI
+# document in, a connector out, with no model call and no API key. The moat is the
+# curated intelligence that decides WHAT to build (config/ + agents/ + prompts/),
+# not the machinery that writes the file. Splitting the two is what lets a
+# self-hosted user generate their own connectors from a spec they already have.
+#
+# The split is load-bearing on one file: schemas/context.py used to sit in the
+# shipped half while importing three modules from agents/. It now lives at
+# agents/pipeline_context.py, beside its only consumer (agents/orchestrator.py),
+# which is what makes schemas/ strippable-or-shippable as a whole directory.
 src/agents/tool_generator/AGENTIC_PIPELINE.md
 src/agents/tool_generator/agents
 src/agents/tool_generator/config
-src/agents/tool_generator/contracts
 src/agents/tool_generator/discovery_routes.py
 src/agents/tool_generator/field_templates.py
-src/agents/tool_generator/generator
 src/agents/tool_generator/harness
 src/agents/tool_generator/mock_server
 src/agents/tool_generator/prompts
-src/agents/tool_generator/schemas
 src/agents/tool_generator/service.py
-src/agents/tool_generator/templates
 src/agents/tool_generator/tests
 src/agents/tool_generator/utils
-src/agents/tool_generator/validation
 
 # ── Generation prompts ──────────────────────────────────────────────────────
 prompts/standards

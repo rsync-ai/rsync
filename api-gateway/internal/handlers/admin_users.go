@@ -11,6 +11,7 @@ import (
 	"api-gateway/internal/db"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rsync-ai/shared/pgdriver"
 )
 
 type adminUserRow struct {
@@ -363,7 +364,79 @@ func AdminUpdateUserStatus(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "Status updated", "status": req.Status})
 }
 
-// AdminDeleteUser hard-deletes a user and their sessions.
+// userDeleteBlockersSQL counts, for the user id in $1, what deleting that user
+// would destroy without teardown or trip over. Each column is a category the
+// admin has to clear first:
+//
+//   - pipelines: every pipeline in a workspace the user owns (workspaces.owner_id
+//     ON DELETE CASCADE, then pipelines.workspace_id ON DELETE CASCADE, migration
+//     047), plus pipelines the user created anywhere else (pipelines.created_by has
+//     no ON DELETE action, migration 001, so those make the delete fail). A pipeline
+//     row removed by cascade skips the pipeline delete handler, so its replication
+//     slot, publication and schedules are never torn down.
+//   - connections: every connection in a workspace the user owns, plus connections
+//     the user created elsewhere (connections.user_id ON DELETE CASCADE, 001).
+//   - saved queries: every saved query in a workspace the user owns (084), the same
+//     rule DeleteWorkspace refuses on.
+//   - schedules: live pipeline schedules the user created
+//     (pipeline_schedules.created_by ON DELETE RESTRICT, 042) and live saved-query
+//     schedules the user created or that run as the user, which stop firing once
+//     the user's memberships cascade away.
+const userDeleteBlockersSQL = `
+	WITH owned AS (SELECT id FROM workspaces WHERE owner_id = $1)
+	SELECT
+		(SELECT COUNT(*) FROM pipelines
+			WHERE workspace_id IN (SELECT id FROM owned) OR created_by = $1),
+		(SELECT COUNT(*) FROM connections
+			WHERE workspace_id IN (SELECT id FROM owned) OR user_id = $1),
+		(SELECT COUNT(*) FROM saved_queries
+			WHERE workspace_id IN (SELECT id FROM owned)),
+		(SELECT COUNT(*) FROM pipeline_schedules
+			WHERE created_by = $1 AND status <> 'deleted')
+		+ (SELECT COUNT(*) FROM saved_query_schedules
+			WHERE (created_by = $1 OR run_as_user_id = $1) AND status <> 'deleted')`
+
+// userDeleteBlockers is the scanned result of userDeleteBlockersSQL, returned to
+// the admin so they know what to delete first.
+type userDeleteBlockers struct {
+	Pipelines    int `json:"pipelines"`
+	Connections  int `json:"connections"`
+	SavedQueries int `json:"saved_queries"`
+	Schedules    int `json:"schedules"`
+}
+
+func (b userDeleteBlockers) hasAny() bool {
+	return b.Pipelines > 0 || b.Connections > 0 || b.SavedQueries > 0 || b.Schedules > 0
+}
+
+// message is the plain sentence the admin sees, e.g. "This user still has 2
+// pipelines and 1 schedule. ...".
+func (b userDeleteBlockers) message() string {
+	var parts []string
+	add := func(n int, one, many string) {
+		switch {
+		case n == 1:
+			parts = append(parts, "1 "+one)
+		case n > 1:
+			parts = append(parts, strconv.Itoa(n)+" "+many)
+		}
+	}
+	add(b.Pipelines, "pipeline", "pipelines")
+	add(b.Connections, "connection", "connections")
+	add(b.SavedQueries, "saved query", "saved queries")
+	add(b.Schedules, "schedule", "schedules")
+
+	list := strings.Join(parts, ", ")
+	if len(parts) > 1 {
+		list = strings.Join(parts[:len(parts)-1], ", ") + " and " + parts[len(parts)-1]
+	}
+	return "This user still has " + list + " (in workspaces they own or created by them). " +
+		"Deleting the user now would remove them without stopping them cleanly. " +
+		"Delete those first, then try again, or deactivate the user instead."
+}
+
+// AdminDeleteUser hard-deletes a user and their sessions, but only once nothing
+// the delete would cascade into or be blocked by is left (userDeleteBlockersSQL).
 // DELETE /api/v1/admin/users/:id
 func AdminDeleteUser(c *gin.Context) {
 	database := db.GetDB()
@@ -383,9 +456,23 @@ func AdminDeleteUser(c *gin.Context) {
 		return
 	}
 
+	// The check and the delete share one transaction so nothing can be added
+	// between them. The user row lock blocks new rows that reference the user
+	// (a new workspace, connection, pipeline or schedule takes a key-share lock on
+	// it); the owned-workspace locks block new pipelines, connections and saved
+	// queries created in those workspaces by other members. The count runs as a
+	// new statement after both locks, so it sees anything committed while waiting.
+	ctx := c.Request.Context()
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+	defer func() { _ = tx.Rollback() }() // no-op once committed
+
 	// Get email for audit before deletion
 	var email string
-	err := database.QueryRow("SELECT email FROM users WHERE id = $1", targetID).Scan(&email)
+	err = tx.QueryRowContext(ctx, "SELECT email FROM users WHERE id = $1 FOR UPDATE", targetID).Scan(&email)
 	if err == sql.ErrNoRows {
 		c.JSON(http.StatusNotFound, gin.H{"error": "User not found"})
 		return
@@ -394,13 +481,50 @@ func AdminDeleteUser(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
 		return
 	}
+	if _, err := tx.ExecContext(ctx, "SELECT id FROM workspaces WHERE owner_id = $1 FOR UPDATE", targetID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
+		return
+	}
+
+	var blockers userDeleteBlockers
+	if err := tx.QueryRowContext(ctx, userDeleteBlockersSQL, targetID).Scan(
+		&blockers.Pipelines, &blockers.Connections, &blockers.SavedQueries, &blockers.Schedules,
+	); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"error": "Could not check what this user still owns, so nothing was deleted. Try again.",
+		})
+		return
+	}
+	if blockers.hasAny() {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":    blockers.message(),
+			"blocking": blockers,
+		})
+		return
+	}
 
 	// Delete sessions first (cascade should handle, but be explicit)
-	database.Exec("DELETE FROM sessions WHERE user_id = $1", targetID)
+	if _, err := tx.ExecContext(ctx, "DELETE FROM sessions WHERE user_id = $1", targetID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user"})
+		return
+	}
 
 	// Delete user
-	_, err = database.Exec("DELETE FROM users WHERE id = $1", targetID)
-	if err != nil {
+	if _, err := tx.ExecContext(ctx, "DELETE FROM users WHERE id = $1", targetID); err != nil {
+		// 23503: a row with no ON DELETE action still points at the user, e.g.
+		// audit_logs.user_id or an invitation they sent. Nothing was deleted.
+		if pgdriver.SQLState(err) == "23503" {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "This user can't be deleted because other records still point to the account, " +
+					"such as their audit history or invitations they sent. Nothing was deleted. " +
+					"Deactivate the user instead to block sign-in.",
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete user"})
 		return
 	}

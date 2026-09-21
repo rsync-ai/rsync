@@ -103,7 +103,7 @@ export function ConnectorConfigModal({
             }}
           />
         ) : (
-          <div className="py-8 text-center text-zinc-500">
+          <div className="py-8 text-center text-zinc-500 dark:text-zinc-400">
             Connector not found: {connectorType}
           </div>
         )}

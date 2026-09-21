@@ -202,6 +202,33 @@ func LoadConfig() (*Config, error) {
 	return cfg, nil
 }
 
+// StartupSettingProblems returns one message per setting the orchestrator needs but
+// was not given, each naming the setting and exactly what will not work without it.
+// Messages never contain a value. getenv is os.Getenv in main and a map in tests.
+//
+// It reads the process environment rather than viper because every reader of these
+// settings uses os.Getenv, so a value that only exists in a .env file never reaches
+// them. main() calls it once; it is deliberately not called from init() or
+// LoadConfig, so tests that load the package never run it.
+//
+// These are ERROR lines, not a refusal to start: the start-path census for issue
+// #24 found INTERNAL_SERVICE_SECRET absent on the dev compose and the CI gates and
+// optional on Helm, and the orchestrator still serves pipelines without it.
+func StartupSettingProblems(getenv func(string) string) []string {
+	var problems []string
+	if strings.TrimSpace(getenv("INTERNAL_SERVICE_SECRET")) == "" {
+		problems = append(problems, "INTERNAL_SERVICE_SECRET is not set, empty or only spaces. "+
+			"The orchestrator's calls to other services' internal endpoints will be refused, so "+
+			"pipeline re-runs started by the self-healer, OAuth token refresh, pipeline namespace "+
+			"locking (runs go ahead unlocked) and connector deploys in production will not work, "+
+			"and when ENVIRONMENT is production other services' internal calls into the "+
+			"orchestrator (such as the dashboard's pipeline statistics) are refused too. Generate "+
+			"one (for example openssl rand -hex 32) and give the same value to api-gateway, "+
+			"orchestrator, temporal-adapter and frontend.")
+	}
+	return problems
+}
+
 // setDefaults sets default values for all configuration options
 func setDefaults(v *viper.Viper) {
 	// Server defaults

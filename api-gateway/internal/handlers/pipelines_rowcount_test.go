@@ -138,11 +138,11 @@ func TestGetExecution_RecordsProcessedFromTableStats(t *testing.T) {
 	mock.ExpectQuery(`pipeline_run_table_stats`).
 		WithArgs(wsScopeExecution, wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "pipeline_id", "status", "trigger_source", "schedule_id",
+			"id", "pipeline_id", "status", "live_stream", "trigger_source", "schedule_id",
 			"scheduled_time", "start_time", "end_time", "error_message",
 			"pipeline_name", "records_processed",
 		}).AddRow(
-			wsScopeExecution, rcPipeline, "completed", "manual", nil,
+			wsScopeExecution, rcPipeline, "completed", false, "manual", nil,
 			nil, ts, ts, nil,
 			"P", int64(2000),
 		))
@@ -182,11 +182,11 @@ func TestGetExecution_ZeroRowsOmitsMetrics(t *testing.T) {
 	mock.ExpectQuery(`pipeline_run_table_stats`).
 		WithArgs(wsScopeExecution, wsScopeWS).
 		WillReturnRows(sqlmock.NewRows([]string{
-			"id", "pipeline_id", "status", "trigger_source", "schedule_id",
+			"id", "pipeline_id", "status", "live_stream", "trigger_source", "schedule_id",
 			"scheduled_time", "start_time", "end_time", "error_message",
 			"pipeline_name", "records_processed",
 		}).AddRow(
-			wsScopeExecution, rcPipeline, "completed", "manual", nil,
+			wsScopeExecution, rcPipeline, "completed", false, "manual", nil,
 			nil, ts, ts, nil,
 			"P", int64(0),
 		))

@@ -53,7 +53,7 @@ export function WorkspaceRolesMatrix({ currentRole }: WorkspaceRolesMatrixProps)
                       )}
                     >
                       {ROLE_LABELS[role]}
-                      {isCurrent && <span className="ml-1 text-xs font-normal text-zinc-500">(you)</span>}
+                      {isCurrent && <span className="ml-1 text-xs font-normal text-zinc-500 dark:text-zinc-400">(you)</span>}
                     </TableHead>
                   )
                 })}

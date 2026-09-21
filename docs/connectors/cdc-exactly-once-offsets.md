@@ -243,8 +243,17 @@ No object-store CDC destination exists yet. When you add one, **do not** create 
 Instead make the **object key itself** the idempotency token:
 
 ```
-s3://bucket/<path_prefix>/<db_or_schema>/<table>/<YYYY-MM-DD>/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<offset>.<fmt>
+s3://bucket/<path_prefix>/<dataset>/<db_or_schema>/<table>/<YYYY-MM-DD>/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<offset>.<fmt>
 ```
+
+(`<dataset>` = slugified pipeline id, added by #14 so two pipelines never share a folder.)
+
+A GCS, S3 or Azure Blob pipeline on **layout v2** has no pipeline id in the key:
+`<path_prefix>/<pipeline prefix>/<db>/[<schema>/]<table>/dt=YYYY-MM-DD/<YYYYMMDD-HHMMSSmmm>[-p<n>]-<first offset>.parquet`,
+and its `get_cdc_offsets` listing root is `<path_prefix>/<pipeline prefix>/`. The key is still
+deterministic from the first offset, and the connector still keeps only objects whose
+`rsync_pipeline_id` metadata matches. See
+[cloud-storage-config.md § Layout v2](cloud-storage-config.md#layout-v2-gcs-s3-azure-blob-no-pipeline-id-in-the-path).
 
 > Implemented layout (sink `cdcObjectKey`) — a DMS-style table root with a plain date
 > folder and an event-timestamp leaf. The trailing Kafka `<offset>` (and `-p<n>` for a
@@ -255,11 +264,21 @@ s3://bucket/<path_prefix>/<db_or_schema>/<table>/<YYYY-MM-DD>/<YYYYMMDD-HHMMSSmm
 - A batch writes exactly one object whose key encodes its partition + offset range.
   Kafka redelivery of the same batch writes the **same key** → an overwrite, not a
   duplicate. That is the idempotency guarantee (effectively-once).
-- **Read path (`get_cdc_offsets`):** there is no offsets table to query. Derive the
-  high-water mark by **listing keys** under `<path_prefix>/<dataset>/<db_or_schema>/<table>/`
-  and taking the max `offset_end`. Return the same §2.3 shape so the sink is tier-agnostic.
-  (The shipped sink instead uses an in-memory high-water tracker + deterministic keys for
-  idempotency; key-listing recovery is the fallback design if durable recovery is needed.)
+- **Read path (`get_cdc_offsets`):** there is no offsets table to query, and the key leaf
+  holds only the batch's **first** offset and no topic, so the key alone cannot give the
+  high-water mark. Instead the sink stamps object metadata on every CDC `import_data`
+  (`object_metadata`: `rsync_pipeline_id`, `rsync_topic`, `rsync_partition`,
+  `rsync_first_offset`, `rsync_last_offset` — `cdcObjectMetadata`) and calls
+  `get_cdc_offsets` with `prefix=<path_prefix>/<dataset>/` plus `bucket`/`container`
+  (`getCDCOffsetsArgs`). The connector lists that prefix, keeps objects whose
+  `rsync_pipeline_id` matches, and returns the max `rsync_last_offset` per
+  (topic, partition) in the §2.3 shape. No prefix → empty list (never a whole-bucket scan).
+  **Implemented for `gcs` (#16), `aws-s3` and `azure-blob` (#1074)**. azure-blob lists with
+  `include=["metadata"]`. An S3 listing carries no user metadata, so aws-s3 HEADs each object
+  (10 at a time, newest first) and stops at a 60 s budget (`time_budget_s`) or `max_objects`,
+  answering `truncated: true`; a truncated answer can only be low (duplicates on a replay, never
+  lost rows). `minio` still returns "Unknown tool", which the sink treats as "no seed". Objects
+  written before the metadata was stamped carry none and are ignored.
 - Make the writer's key derivation **deterministic** (no timestamps, no UUIDs, no random
   suffixes in the key) — otherwise a replay produces a *new* object instead of
   overwriting, and dedup is lost.

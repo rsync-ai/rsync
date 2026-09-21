@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach } from "vitest"
+import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest"
 import { render, screen, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import "@testing-library/jest-dom"
@@ -12,6 +12,12 @@ vi.mock("@/lib/api/auth-fetch", () => ({
 }))
 
 import { PipelineTableSelector } from "../PipelineTableSelector"
+import { primeNamespaceModels } from "@/lib/pipeline/namespaceModel"
+import { repoNamespaceModels } from "@/lib/pipeline/__tests__/repoNamespaceModels"
+
+// Connector types resolve through the namespace models the repo's metadata
+// declares, as they do once the page has fetched them from the gateway.
+beforeAll(() => primeNamespaceModels(repoNamespaceModels()))
 
 // A selection that spans three source schemas (sales + procurement + hr), with a
 // same-named table (orders) in two of them — the exact shape that used to
@@ -35,7 +41,10 @@ function setup(props: Record<string, unknown> = {}) {
       availableTables={multiSchemaTables as never}
       // Present (even empty) ⇒ caller owns suggestions ⇒ no self-fetch polling.
       suggestedTables={[]}
-      destinationType="aws-s3"
+      // minio: a path destination still on the old object layout (aws-s3, the
+      // original bug report's destination, now writes layout v2 and requires a
+      // prefix; see the layout v2 block below).
+      destinationType="minio"
       // Mirrors the real, already-seeded pipeline from the bug report: the field
       // was mislabeled "schema" (createable) with a blank namespace, which is
       // what wedged the button. The fix must unblock even this shape.
@@ -45,6 +54,16 @@ function setup(props: Record<string, unknown> = {}) {
   )
   return { onTablesSelected, user }
 }
+
+describe("PipelineTableSelector — connector display names (issue #4)", () => {
+  it('shows "MongoDB" / "Google Cloud Storage", not CSS-capitalized raw ids', () => {
+    setup({ sourceType: "mongodb", destinationType: "gcs" })
+    expect(screen.getAllByText("MongoDB").length).toBeGreaterThan(0)
+    expect(screen.getAllByText("Google Cloud Storage").length).toBeGreaterThan(0)
+    expect(screen.queryByText(/^mongodb$/)).toBeNull()
+    expect(screen.queryByText(/^gcs$/)).toBeNull()
+  })
+})
 
 describe("PipelineTableSelector — multi-schema destination namespace", () => {
   beforeEach(() => vi.clearAllMocks())
@@ -60,7 +79,7 @@ describe("PipelineTableSelector — multi-schema destination namespace", () => {
     await user.click(within(wholeDbLabel).getByRole("checkbox"))
 
     // The namespace field is now optional and a preserve hint is shown, even
-    // though the field is blank. aws-s3 is a path destination, so the copy talks
+    // though the field is blank. minio is a path destination, so the copy talks
     // about a folder per source schema.
     expect(screen.getByText(/\(optional\)/i)).toBeInTheDocument()
     expect(screen.getByText(/written to its own\s+folder on the destination/i)).toBeInTheDocument()
@@ -71,7 +90,7 @@ describe("PipelineTableSelector — multi-schema destination namespace", () => {
 
     // Confirming sends the whole-source sentinel plus an explicit preserve
     // directive (blank namespace) — so each source schema is mirrored regardless
-    // of the seeded destination namespace. aws-s3 resolves to a path kind (not
+    // of the seeded destination namespace. minio resolves to a path kind (not
     // "schema"), so it is non-createable even though the persisted kind was the
     // stale "schema".
     await user.click(confirm)
@@ -105,9 +124,9 @@ describe("PipelineTableSelector — multi-schema destination namespace", () => {
     })
   })
 
-  it("does NOT wedge a single-schema selection on an existing S3 pipeline with a stale persisted kind:'schema'", async () => {
-    // Regression for the reviewer's Finding 1: an already-seeded aws-s3 pipeline
-    // carries namespace_kind:"schema" (seeded before aws-s3 was mapped). The
+  it("does NOT wedge a single-schema selection on an existing path pipeline with a stale persisted kind:'schema'", async () => {
+    // Regression for the reviewer's Finding 1: an already-seeded path pipeline
+    // carries namespace_kind:"schema" (seeded before its type was mapped). The
     // connector type must win → path kind → non-createable → name NOT required,
     // even for a single-schema (non-whole-DB) selection with a blank namespace.
     const { onTablesSelected, user } = setup()
@@ -281,5 +300,141 @@ describe("PipelineTableSelector — multi-schema destination namespace", () => {
     // Deselect back to one schema → seed restored (single-schema needs a name).
     await user.click(within(hrEmployees).getByRole("checkbox"))
     expect((screen.getByLabelText(/Schema name/i) as HTMLInputElement).value).toBe("public")
+  })
+})
+
+describe("PipelineTableSelector — object storage path prefix (object layout v2)", () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  it.each(["gcs", "aws-s3", "azure-blob"])("%s requires a valid prefix and sends it without a flatten directive", async (destinationType) => {
+    // GCS, S3 and Azure Blob write <prefix>/<database>/[<schema>/]<table>/, so a
+    // multi-schema selection keeps each schema apart by itself: the typed prefix is
+    // the pipeline's folder, not a "merge everything" target.
+    const { onTablesSelected, user } = setup({
+      destinationType,
+      destinationConfig: { namespace: "", namespace_kind: "path", create_if_not_exists: false },
+    })
+
+    const wholeDbLabel = screen.getByText("Select entire database").closest("label") as HTMLElement
+    await user.click(within(wholeDbLabel).getByRole("checkbox"))
+
+    expect(screen.queryByText(/\(optional\)/i)).toBeNull()
+    const confirm = screen.getByRole("button", { name: /Sync entire database/i })
+    expect(confirm).toBeDisabled()
+    expect(screen.getByRole("alert")).toHaveTextContent(/Enter a path prefix/)
+
+    const field = screen.getByLabelText(/Path prefix/i)
+    await user.type(field, "Sales-EU")
+    expect(confirm).toBeDisabled()
+    expect(screen.getByRole("alert")).toHaveTextContent(/lowercase letters, digits and underscores/)
+
+    await user.clear(field)
+    await user.type(field, "sales_eu")
+    expect(confirm).toBeEnabled()
+    expect(screen.getByText(/sales_eu\/<database>\/\[<schema>\/\]<table>\//)).toBeInTheDocument()
+
+    await user.click(confirm)
+    expect(onTablesSelected).toHaveBeenCalledWith(["*"], {
+      namespace: "sales_eu",
+      namespace_kind: "path",
+      create_if_not_exists: false,
+    })
+  })
+
+  it("keeps a stored prefix on a multi-schema selection instead of blanking it", async () => {
+    const { onTablesSelected, user } = setup({
+      destinationType: "gcs",
+      destinationConfig: { namespace: "sales", namespace_kind: "path", create_if_not_exists: false },
+    })
+
+    const wholeDbLabel = screen.getByText("Select entire database").closest("label") as HTMLElement
+    await user.click(within(wholeDbLabel).getByRole("checkbox"))
+
+    expect(screen.getByLabelText(/Path prefix/i)).toHaveValue("sales")
+    await user.click(screen.getByRole("button", { name: /Sync entire database/i }))
+    expect(onTablesSelected).toHaveBeenCalledWith(["*"], {
+      namespace: "sales",
+      namespace_kind: "path",
+      create_if_not_exists: false,
+    })
+  })
+
+  it("leaves the prefix optional for minio, which keeps the old layout", async () => {
+    const { user } = setup({
+      destinationType: "minio",
+      destinationConfig: { namespace: "", namespace_kind: "path", create_if_not_exists: false },
+    })
+
+    const wholeDbLabel = screen.getByText("Select entire database").closest("label") as HTMLElement
+    await user.click(within(wholeDbLabel).getByRole("checkbox"))
+
+    expect(screen.getByRole("button", { name: /Sync entire database/i })).toBeEnabled()
+    expect(screen.queryByText(/Enter a path prefix/)).toBeNull()
+  })
+})
+
+describe("PipelineTableSelector — server-level source (a connection naming no database)", () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  // Two databases on one MySQL server; the pick stays inside one of them.
+  const serverTables = [
+    { name: "orders", schema: "shop", row_count: 10, columns: 3 },
+    { name: "customers", schema: "crm", row_count: 5, columns: 2 },
+  ]
+  const into = (props: Record<string, unknown>) =>
+    setup({
+      sourceType: "mysql",
+      availableTables: serverTables,
+      destinationType: "postgresql",
+      destinationConfig: { namespace: "public", namespace_kind: "schema", create_if_not_exists: true },
+      ...props,
+    })
+
+  it("mirrors a one-database pick, as the server does, so the name is optional", async () => {
+    const { onTablesSelected, user } = into({ sourceServerLevel: true })
+    await user.click(within(screen.getByText("shop.orders").closest("label") as HTMLElement).getByRole("checkbox"))
+
+    // The seeded "public" is blanked: left in place it would read as a deliberate
+    // merge target, while the executor mirrors shop into a schema named shop.
+    expect(screen.getByLabelText(/Schema name/i)).toHaveValue("")
+    expect(screen.getByText(/\(optional\)/i)).toBeInTheDocument()
+    expect(screen.getByText(/creates a matching schema/i)).toBeInTheDocument()
+
+    await user.click(screen.getByRole("button", { name: /Sync 1 table/i }))
+    expect(onTablesSelected).toHaveBeenCalledWith(["shop.orders"], {
+      namespace: "",
+      namespace_kind: "schema",
+      create_if_not_exists: true,
+      schema_mode: "preserve",
+    })
+  })
+
+  it("a typed name sends everything to that one place", async () => {
+    const { onTablesSelected, user } = into({ sourceServerLevel: true })
+    await user.click(within(screen.getByText("shop.orders").closest("label") as HTMLElement).getByRole("checkbox"))
+    await user.type(screen.getByLabelText(/Schema name/i), "landing")
+
+    await user.click(screen.getByRole("button", { name: /Sync 1 table/i }))
+    expect(onTablesSelected).toHaveBeenCalledWith(["shop.orders"], {
+      namespace: "landing",
+      namespace_kind: "schema",
+      create_if_not_exists: true,
+      schema_mode: "flatten",
+    })
+  })
+
+  it("a connection pinned to one database keeps the seeded name (control)", async () => {
+    const { onTablesSelected, user } = into({})
+    await user.click(within(screen.getByText("shop.orders").closest("label") as HTMLElement).getByRole("checkbox"))
+
+    expect(screen.getByLabelText(/Schema name/i)).toHaveValue("public")
+    expect(screen.queryByText(/\(optional\)/i)).toBeNull()
+
+    await user.click(screen.getByRole("button", { name: /Sync 1 table/i }))
+    expect(onTablesSelected).toHaveBeenCalledWith(["shop.orders"], {
+      namespace: "public",
+      namespace_kind: "schema",
+      create_if_not_exists: true,
+    })
   })
 })

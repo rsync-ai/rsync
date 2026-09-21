@@ -17,64 +17,31 @@
 # freely with docker-compose.byo-kafka.yml — the two overlays are independent.
 #
 # ── What you must create first ───────────────────────────────────────────────
-# The database named by POSTGRES_DB, and a role that can create tables in it.
-# api-gateway and orchestrator both run their own migrations into it on first
-# boot, so that role needs DDL there.
+# One thing: the ROLE named by POSTGRES_USER, with a password matching
+# POSTGRES_PASSWORD and the right to create databases.
 #
-# Then TWO MORE DATABASES, and these are mandatory, not a managed-instance
-# caveat. Temporal keeps its own state outside POSTGRES_DB entirely:
+#   CREATE ROLE rsync LOGIN PASSWORD '…' CREATEDB;
 #
-#   CREATE DATABASE temporal            OWNER rsync;
-#   CREATE DATABASE temporal_visibility OWNER rsync;
+# Nothing in this file can create that role, because everything in it
+# authenticates AS it. The databases are no longer yours to create: `db-init`
+# below makes POSTGRES_DB and Temporal's two, plus the two extensions the
+# migrations need, before any service that reads them starts. It is idempotent,
+# so bringing the stack up again is a no-op.
 #
-# This overlay sets SKIP_DB_CREATE=true on `temporal` (bottom of this file), so
-# nothing creates them for you. Both halves are required, and each alone fails:
-#
-#   * Without SKIP_DB_CREATE, auto-setup runs `CREATE DATABASE` as POSTGRES_USER
-#     whether or not the database is already there. Its only guard is the name
-#     test `[[ ${DBNAME} != ${POSTGRES_USER} && ${SKIP_DB_CREATE} != true ]]` —
-#     existence is never checked — so on a BYO instance it always runs, and
-#     exits 1 with `pq: permission denied to create database` for any role
-#     without CREATEDB. A managed instance's application role normally has none.
-#     Pre-creating the databases does NOT avoid this: the create is still
-#     attempted, and still denied.
-#   * With SKIP_DB_CREATE but without the two databases, the next step fails
-#     instead: `pq: database "temporal" does not exist` from setup-schema.
-#
-# Either failure takes the whole container down rather than degrading. The image
-# entrypoint is `auto-setup.sh && start-temporal.sh` under `set -e`, so a
-# non-zero create means the server is never reached: the stack crash-loops with
-# no workflow engine and every pipeline hangs.
-#
-# Also TWO EXTENSIONS, which a locked-down managed role usually cannot create:
-#
-#   uuid-ossp   001_init_schema.sql:5, 021_add_audit_logs.sql:4 -- uuid_generate_v4()
-#   pg_trgm     020b_workspace_connection_refs.sql:12 -- the gin_trgm_ops indexes
-#
-# `IF NOT EXISTS` does NOT make them optional: it only suppresses the error when
-# the extension is ALREADY there. Absent + unprivileged still raises. Pre-create
-# both as an admin against POSTGRES_DB and the migrations' statements become the
-# no-op they look like:
-#
-#   CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
-#   CREATE EXTENSION IF NOT EXISTS pg_trgm;
-#
-# Skip this and the break is silent, not loud: the runner stops at the FIRST
-# failing file (migrate.go:127-129) and 001 is the first, so nothing migrates;
-# main.go:311-313 logs the error and starts serving anyway; and the healthcheck
-# hits /health, an unconditional 200 that never touches the DB. You get a
-# "healthy" stack on an empty schema. `/ready` is the endpoint that knows.
-# Full walkthrough + per-provider caveats (Azure's azure.extensions allow-list,
-# Cloud SQL's cloudsqlsuperuser): docs/deployment/self-hosting.md
-# § Bring Your Own PostgreSQL, step 2b.
+# If your instance's application role cannot hold CREATEDB, create those three
+# databases as an admin and db-init will find them and move on. What it will
+# NOT do is treat "permission denied" and "already exists" as the same outcome:
+# it fails loudly and prints the grant to run. Per-provider caveats (Azure's
+# azure.extensions allow-list, Cloud SQL's cloudsqlsuperuser):
+# docs/deployment/self-hosting.md § Bring Your Own PostgreSQL.
 #
 # ── TLS is not one switch ────────────────────────────────────────────────────
-# POSTGRES_SSLMODE covers the three Go services (api-gateway's DSN,
-# orchestrator's DB_SSLMODE, temporal-adapter's POSTGRES_SSLMODE). Temporal
-# ignores it, and Temporal is really two programs: auto-setup runs
-# temporal-sql-tool to create the schemas, then starts the server, and they read
-# DIFFERENT env names for the same fact. The base file feeds both from one
-# POSTGRES_TLS_* key each, so you set these once:
+# POSTGRES_SSLMODE covers `db-init` below and the three Go services
+# (api-gateway's DSN, orchestrator's DB_SSLMODE, temporal-adapter's
+# POSTGRES_SSLMODE). Temporal ignores it, and Temporal is really two programs:
+# auto-setup runs temporal-sql-tool to create the schemas, then starts the
+# server, and they read DIFFERENT env names for the same fact. The base file
+# feeds both from one POSTGRES_TLS_* key each, so you set these once:
 #
 #   POSTGRES_TLS_ENABLED      -> SQL_TLS_ENABLED (server) + SQL_TLS (schema tool)
 #   POSTGRES_TLS_CA_FILE      -> SQL_CA          + SQL_TLS_CA_FILE
@@ -98,6 +65,15 @@
 # file: every `depends_on: postgres` there carries `required: false`. Both
 # halves are needed; either one alone takes the stack down.
 #
+# Do not copy that flag onto the three `depends_on: db-init` entries below. It
+# reads like the house style here, and it would quietly undo this whole file:
+# measured on Compose 2.x, a FAILED `service_completed_successfully` dependency
+# marked `required: false` degrades to the warning `optional dependency "…"
+# didn't complete successfully: exit 7`, and the dependent starts anyway with
+# `up` still exiting 0. That is the silent start on an empty schema db-init
+# exists to prevent. The flag is for a service that may be absent from the
+# project; db-init is defined right here and never is.
+#
 # ── What still runs ──────────────────────────────────────────────────────────
 # `demo-warehouse` is a different service and is deliberately NOT excluded. It
 # is the sample destination behind "Start with sample data" — a throwaway
@@ -109,10 +85,196 @@ services:
     # Never activated => the bundled database is excluded from the project.
     profiles: ["bundled-db-disabled"]
 
-  temporal:
+  # ─── DATABASE BOOTSTRAP ──────────────────────────────────────────────────────
+  #
+  # The bundled path creates three databases without anyone noticing, through two
+  # upstream images: the postgres image's initdb makes POSTGRES_DB, and Temporal's
+  # auto-setup makes its own two. Excluding `postgres` above removes the first and
+  # SKIP_DB_CREATE below removes the second, so on this path NOTHING creates them
+  # — and until this service existed, that gap was fifty lines of instructions in
+  # this header, enforced by nothing.
+  #
+  # It is worth being exact about why the gap had to be closed with code rather
+  # than prose: two of the three failures are silent. Temporal's is loud (its
+  # entrypoint is `auto-setup.sh && start-temporal.sh` under `set -e`, so the
+  # container crash-loops). POSTGRES_DB's is not. A failed `db.Init` is a warning
+  # and not an exit (main.go:306-308), and the migration runner sits inside that
+  # call's success branch — so no schema is created and the gateway serves
+  # regardless. Missing extensions fail the same way one step later: the runner
+  # returns on the first failing file (migrate.go:126-129) and 001_init_schema.sql
+  # is the first, needing uuid-ossp.
+  #
+  # Nothing in this project observes either one. api-gateway and orchestrator
+  # declare no healthcheck at all — of the services here only kafka, postgres,
+  # redis, minio, temporal, llm-service, kafka-connect and demo-warehouse do — so
+  # `docker compose ps` reports both as plain `running` over an empty database.
+  # `/ready` is the endpoint that knows (ready.go:15-25 returns `db_not_connected`
+  # then `schema_not_migrated`), and install.sh polls it for exactly this reason
+  # (install.sh:744-754). A hand-run `docker compose up` polls nothing.
+  #
+  # Mirrors the chart's templates/jobs/db-init.yaml, which does the same work as
+  # a pre-install hook, on the two paths where the chart renders it: external
+  # Postgres with dbInit left on and IAM auth off.
+  # The two are hand-kept in step for the same reason kafka-init's script is
+  # inline: install.sh downloads compose files alone, with no repo checkout, so
+  # there is no shared script on the host to call.
+  db-init:
+    image: postgres:16-alpine
+    container_name: rsync-db-init
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    # Run-once job: one psql client, a handful of statements.
+    mem_limit: 256m
     environment:
-      # Pairs with the two pre-created databases above — see "What you must
-      # create first". The bundled path does not need this (its POSTGRES_USER is
-      # the postgres superuser), which is why it lives in this overlay and not in
-      # the base file: it must not change the bundled-database behaviour.
+      PGHOST: ${POSTGRES_HOST:-postgres}
+      PGPORT: ${POSTGRES_PORT:-5432}
+      PGUSER: ${POSTGRES_USER:-rsync}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # The database this connects TO in order to run CREATE DATABASE — never one
+      # of the databases it creates. `postgres` exists on RDS, Cloud SQL and Azure
+      # Database alike; override it only for an instance that dropped it.
+      PGDATABASE: ${POSTGRES_MAINTENANCE_DB:-postgres}
+      PGSSLMODE: ${POSTGRES_SSLMODE:-disable}
+      # Not PGSSLROOTCERT directly: libpq reads an EMPTY PGSSLROOTCERT as a
+      # filename and fails to open it, so under verify-ca an unset CA would break
+      # the connection rather than fall back to the system store. The script
+      # exports it only when non-empty. Note that nothing here mounts the file —
+      # if you set this, give this service the same bind mount you gave `temporal`.
+      POSTGRES_TLS_CA_FILE: ${POSTGRES_TLS_CA_FILE:-}
+      # Fail fast per attempt; the retry loop below supplies the patience.
+      PGCONNECT_TIMEOUT: "10"
+      APP_DATABASE: ${POSTGRES_DB:-pipeline_db}
+      # auto-setup's own defaults, and the SAME two names `temporal` is given
+      # explicitly below. A name that the creator and the consumer each hardcode
+      # separately is a name that can drift.
+      TEMPORAL_DATABASE: ${TEMPORAL_DB:-temporal}
+      TEMPORAL_VISIBILITY_DATABASE: ${TEMPORAL_VISIBILITY_DB:-temporal_visibility}
+    # /bin/sh, not /bin/bash: the image is Alpine and has no bash.
+    entrypoint: ["/bin/sh", "-c"]
+    # Single-element list, not a bare block scalar: Compose splits a string
+    # command into argv, which would leave `sh -c` running only the first word.
+    # `docker compose config` must show ONE item.
+    command:
+      - |
+        set -u;
+        if [ -n "$${POSTGRES_TLS_CA_FILE:-}" ]; then
+          export PGSSLROOTCERT="$$POSTGRES_TLS_CA_FILE";
+        fi;
+        # A managed instance that is still provisioning answers the port before
+        # it accepts connections. The error is captured rather than discarded
+        # because the failures that land here read identically from outside — a
+        # wrong password and an unreachable host both just end this loop — and
+        # the operator needs the server's own words to tell them apart.
+        ERR="";
+        n=0;
+        until ERR="$$(psql -w -Atc 'SELECT 1' 2>&1)"; do
+          n=$$((n + 1));
+          if [ "$$n" -ge 30 ]; then
+            echo "FATAL: cannot reach PostgreSQL at $$PGHOST:$$PGPORT as \"$$PGUSER\" after 60s." >&2;
+            echo "  Last error from the server: $$ERR" >&2;
+            echo "  Checked in this order:" >&2;
+            echo "    * POSTGRES_HOST / POSTGRES_PORT reach the instance" >&2;
+            echo "    * the role \"$$PGUSER\" exists and its password matches" >&2;
+            echo "      POSTGRES_PASSWORD (nothing here creates the role it logs in as)" >&2;
+            echo "    * POSTGRES_MAINTENANCE_DB=\"$$PGDATABASE\" exists and \"$$PGUSER\"" >&2;
+            echo "      may connect to it" >&2;
+            echo "    * POSTGRES_SSLMODE=\"$$PGSSLMODE\" matches what the server requires" >&2;
+            exit 1;
+          fi;
+          echo "waiting for postgres at $$PGHOST:$$PGPORT ($$n/30): $$ERR";
+          sleep 2;
+        done;
+        echo "connected to $$PGHOST:$$PGPORT as \"$$PGUSER\" (maintenance database \"$$PGDATABASE\")";
+        # CREATE DATABASE has no IF NOT EXISTS and cannot run inside a
+        # transaction, so idempotency is an existence check against pg_database
+        # rather than a swallowed error. Swallowing would be worse than it looks:
+        # "permission denied to create database" and "already exists" would then
+        # be the same outcome, and the first has to stay fatal.
+        #
+        # No OWNER clause. The creating role owns what it creates, and naming an
+        # owner is how this would break on a managed instance whose admin role is
+        # not POSTGRES_USER.
+        mkdb() {
+          if [ "$$(psql -w -Atc "SELECT 1 FROM pg_database WHERE datname = '$$1'")" = "1" ]; then
+            echo "  database \"$$1\" already exists";
+            return 0;
+          fi;
+          if ! OUT="$$(psql -w -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$$1\"" 2>&1)"; then
+            if [ "$$(psql -w -Atc "SELECT 1 FROM pg_database WHERE datname = '$$1'")" = "1" ]; then
+              echo "  database \"$$1\" was created concurrently";
+              return 0;
+            fi;
+            echo "FATAL: could not create database \"$$1\"." >&2;
+            echo "  $$OUT" >&2;
+            echo "  The role \"$$PGUSER\" needs CREATEDB:" >&2;
+            echo "    ALTER ROLE \"$$PGUSER\" CREATEDB;" >&2;
+            echo "  On a managed instance grant its admin role instead (RDS:" >&2;
+            echo "  rds_superuser; Azure: azure_pg_admin; Cloud SQL:" >&2;
+            echo "  cloudsqlsuperuser). Or create the three databases yourself —" >&2;
+            echo "  this finds them and moves on." >&2;
+            exit 1;
+          fi;
+          echo "  database \"$$1\" created";
+        };
+        mkdb "$$APP_DATABASE";
+        mkdb "$$TEMPORAL_DATABASE";
+        mkdb "$$TEMPORAL_VISIBILITY_DATABASE";
+        # In the APPLICATION database only. Temporal's two need no extensions,
+        # and creating one inside a database whose schema another product owns is
+        # not ours to do.
+        #
+        # Fatal, not best-effort. Both are trusted extensions on PostgreSQL 13+,
+        # so a database owner can create them without superuser — but a managed
+        # instance can still refuse (Azure Flexible Server permits only what
+        # `azure.extensions` lists). Continuing past that refusal hands it to the
+        # migration runner, which stops at the first failing file and logs one
+        # line while the process keeps serving: the whole schema is then missing
+        # and nothing says why.
+        mkext() {
+          if ! OUT="$$(psql -w -v ON_ERROR_STOP=1 -d "$$APP_DATABASE" -c "CREATE EXTENSION IF NOT EXISTS \"$$1\"" 2>&1)"; then
+            echo "FATAL: could not create extension \"$$1\" in \"$$APP_DATABASE\"." >&2;
+            echo "  $$OUT" >&2;
+            echo "  $$2" >&2;
+            echo "  Both are trusted extensions on PostgreSQL 13+, so the database" >&2;
+            echo "  owner may create them — but a managed instance can still refuse." >&2;
+            echo "  Azure Database for PostgreSQL needs the extension allowlisted in" >&2;
+            echo "  the azure.extensions server parameter before this succeeds." >&2;
+            exit 1;
+          fi;
+          echo "  extension \"$$1\" ready";
+        };
+        mkext "uuid-ossp" "001_init_schema.sql calls uuid_generate_v4() and is the FIRST migration, so without it NO table is created.";
+        mkext "pg_trgm" "020b_workspace_connection_refs.sql builds the gin_trgm_ops indexes.";
+        echo "✅ Databases and extensions ready"
+    restart: "no"
+
+  temporal:
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+    environment:
+      # db-init above creates the two databases, so auto-setup must not try.
+      # Its create is unconditional: the only guard is the name test
+      # `[[ ${DBNAME} != ${POSTGRES_USER} && ${SKIP_DB_CREATE} != true ]]`, so
+      # pre-existence does not stop it, and it runs as POSTGRES_USER, which on a
+      # managed instance normally lacks CREATEDB. The bundled path does not need
+      # this (there POSTGRES_USER is the superuser), which is why it lives in
+      # this overlay: it must not change the bundled-database behaviour.
       SKIP_DB_CREATE: "true"
+      # auto-setup's own defaults, set explicitly so that the creator above and
+      # the consumer here read ONE pair of names instead of two hardcoded copies.
+      DBNAME: ${TEMPORAL_DB:-temporal}
+      VISIBILITY_DBNAME: ${TEMPORAL_VISIBILITY_DB:-temporal_visibility}
+
+  orchestrator:
+    depends_on:
+      db-init:
+        condition: service_completed_successfully
+
+  api-gateway:
+    depends_on:
+      db-init:
+        condition: service_completed_successfully

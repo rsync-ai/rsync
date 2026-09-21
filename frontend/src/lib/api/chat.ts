@@ -11,6 +11,7 @@ import { API_ENDPOINTS } from "@/lib/config/api"
 import { getAuthHeaders } from "@/lib/auth"
 import { extractErrorMessage } from "@/lib/utils/error-handling"
 import { dropLegacyUnscopedValue, workspaceScopedKey } from "@/lib/workspace/scoped-storage"
+import { browserTimeZone } from "@/lib/chat/thread-intent"
 
 // Session ID storage key — BASE key; the stored key is workspace-scoped.
 // A conversation is created and resumed inside one workspace (its connections,
@@ -185,6 +186,9 @@ export async function sendChatMessage(request: SendChatRequest): Promise<AgentRe
         body: JSON.stringify({
           message: request.message,
           context: {
+            // Browser IANA zone: the gateway renders the default
+            // "Chat Pipeline HH:MM:SS" name in local time (issue #11).
+            timezone: browserTimeZone(),
             ...request.context,
             session_id: sessionId,
           },

@@ -46,6 +46,32 @@ import (
 // retention sweep, so "to-date" is really "within the retention window" when
 // retention is enabled. retention_enabled + retention_days let the UI say so.
 
+// GetPlanSummary returns the ACTIVE workspace's plan banner data (plan,
+// pipelines_used, pipelines_limit, trial_ends_at) — the lightweight counterpart
+// of GetWorkspaceUsage without the per-pipeline transfer join, cheap enough for
+// the plan banner to poll on navigation/focus. The pipeline count is the same
+// countWorkspacePipelines meter checkPipelineCreateOK enforces against, on the
+// same (active) workspace, so "N/limit pipelines used" matches what the create
+// gate will allow (issues #7/#21). GET /api/v1/usage/plan
+func GetPlanSummary(c *gin.Context) {
+	if _, ok := resolveUserID(c); !ok {
+		return
+	}
+	wsID, ok := resolveActiveWorkspace(c)
+	if !ok {
+		return
+	}
+	if _, ok := requireWorkspaceRole(c, security.WSViewer); !ok {
+		return
+	}
+	database := db.GetDB()
+	if database == nil {
+		respondError(c, http.StatusServiceUnavailable, "database_unavailable", "Database not available", nil)
+		return
+	}
+	c.JSON(http.StatusOK, planSummary(c.Request.Context(), database, wsID))
+}
+
 // pipelineUsageRow is one pipeline's transfer rollup within a workspace.
 type pipelineUsageRow struct {
 	ID               string     `json:"id"`

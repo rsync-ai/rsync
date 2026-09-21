@@ -4,6 +4,7 @@ import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { formatConfigLabel } from "@/lib/utils/config-label"
 import {
   Accordion,
   AccordionContent,
@@ -28,9 +29,19 @@ import { testMCPConnection } from "@/lib/api/mcp-connectors"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { APIRequestError, parseAPIError, ErrorCodes } from "@/lib/errors/api-errors"
+import { connectorDeployingErrorMessage, isConnectorDeployingResponse } from "@/lib/errors/connector-deploying"
 import { OAuthConnectButton } from "@/components/oauth/OAuthConnectButton"
 import { AuthMethodPicker } from "@/components/connectors/AuthMethodPicker"
 import { toast } from "sonner"
+import {
+  ConnectionScopeSection,
+  scopeConfigError,
+  scopeFromConfig,
+  type NamespaceListing,
+  type ScopeValue,
+} from "@/components/connectors/ConnectionScopeSection"
+import { listsNamespaces, namespaceModelFor, useNamespaceModels } from "@/lib/pipeline/namespaceModel"
+import { NAMESPACE_FILTER_MODE_KEY, NAMESPACE_FILTER_PATTERNS_KEY } from "@/lib/pipeline/namespaceFilter"
 
 type SyncMode = "batch" | "cdc"
 type CDCMode = "initial" | "streaming_only"
@@ -273,6 +284,24 @@ export function computeAuthUI(
   return { ...noAuth, kind: schemaHasCredentialField ? "schema" : "fallback" }
 }
 
+// parseNumberInput turns the text of a number <input> into the value the form
+// stores. An empty box — or text that is not a number yet, such as a lone "-" —
+// is "unset": undefined, so the key is left out of the saved config and every
+// reader falls back to its own default (the MongoDB connector and the CDC
+// generator use 27017, the storage connectors their sampling limits). It used to
+// store 0, so clearing a MongoDB port saved `port: 0` and the connection page
+// showed "Port 0". A typed 0 is still 0: `max_file_rows: 0` means "no cap".
+export function parseNumberInput(
+  raw: string,
+  type: "integer" | "number",
+): number | undefined {
+  const text = raw.trim()
+  if (text === "") return undefined
+  const n = Number(text)
+  if (!Number.isFinite(n)) return undefined
+  return type === "integer" ? Math.trunc(n) : n
+}
+
 export function GenericConnectorForm({
   connector,
   onSave,
@@ -350,6 +379,9 @@ export function GenericConnectorForm({
   const [testResult, setTestResult] = useState<{
     success: boolean
     message: string
+    // The connector's container is still being set up — show "try again shortly",
+    // not a failure.
+    retryable?: boolean
   } | null>(null)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<{
@@ -475,6 +507,22 @@ export function GenericConnectorForm({
   useEffect(() => {
     formDataRef.current = formData
   }, [formData])
+
+  // Scope step (#31): a source whose connector lists its databases or schemas
+  // can narrow which ones it reads. A database-namespace connection (MySQL,
+  // MongoDB, ClickHouse) that names a database is pinned to it, as the server
+  // pins it (orchestrator connectionScope); the Scope applies server-level.
+  const namespaceModels = useNamespaceModels()
+  const showScope = connectionType === "source" && listsNamespaces(namespaceModels, connector.name)
+  const tableNamespace = namespaceModelFor(namespaceModels, connector.name).table_namespace
+  const scopePinnedDatabase =
+    tableNamespace === "database"
+      ? ["database", "db_name", "db"]
+          .map((k) => formData[k])
+          .find((v): v is string => typeof v === "string" && v.trim() !== "")
+      : undefined
+  const setScope = (v: ScopeValue) =>
+    setFormData((prev) => ({ ...prev, [NAMESPACE_FILTER_MODE_KEY]: v.mode, [NAMESPACE_FILTER_PATTERNS_KEY]: v.patterns }))
 
   // Component mount logging (minimal) - disabled in production
   useEffect(() => {
@@ -677,6 +725,9 @@ export function GenericConnectorForm({
   const handleInputChange = (key: string, value: unknown) => {
     setFormData((prev) => {
       const next: Record<string, unknown> = { ...prev, [key]: value }
+      // undefined means "unset" (a cleared number box): drop the key so the
+      // saved config omits it rather than carrying a stand-in value.
+      if (value === undefined) delete next[key]
 
       // Prevent ambiguous auth: many API connectors support either OAuth access_token OR api_key.
       // If user fills one, clear the other to avoid sending the wrong header (common cause of 401s).
@@ -696,6 +747,33 @@ export function GenericConnectorForm({
     })
     setTestResult(null)
     setError(null)
+  }
+
+  // The config a request for an unsaved connection carries: the form's fields
+  // plus what OAuth and the multi-auth picker hold outside formData.
+  const requestConfig = (base: Record<string, unknown>) => {
+    const withToken = oauthTokenId ? { ...base, oauth_token_id: oauthTokenId } : { ...base }
+    const withAuth = hasMultiAuth ? { ...withToken, ...authValues, auth_method: authMethod } : withToken
+    return normalizeAuthFields(withAuth as Record<string, unknown>)
+  }
+
+  // What the Scope preview filters: a saved connection lists with its stored
+  // credentials (the form holds masked ones); a new one with the form's config.
+  const loadScopeNamespaces = async (): Promise<NamespaceListing> => {
+    const res =
+      isEditing && connectionId
+        ? await authFetch(API_ENDPOINTS.CONNECTIONS.NAMESPACES(connectionId))
+        : await authFetch(API_ENDPOINTS.CONNECTIONS.NAMESPACES_PREVIEW, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ connector_type: connector.name, config: requestConfig(formDataRef.current) }),
+          })
+    const body = await res.json().catch(() => ({}))
+    if (!res.ok) throw new Error(body?.details || body?.error || `HTTP ${res.status}`)
+    return {
+      namespaces: Array.isArray(body?.namespaces) ? body.namespaces.filter((n: unknown) => typeof n === "string") : [],
+      current: typeof body?.current === "string" ? body.current : "",
+    }
   }
 
   const toggleSecretVisibility = (key: string) => {
@@ -748,7 +826,7 @@ export function GenericConnectorForm({
         await new Promise(resolve => setTimeout(resolve, 1500))
       }
       
-      let result: { success: boolean; message: string }
+      let result: { success: boolean; message: string; retryable?: boolean }
       
       // If editing existing connection, use connection ID to test with stored credentials
       // This avoids sending masked passwords
@@ -762,6 +840,7 @@ export function GenericConnectorForm({
           message: !data.success && data.error 
             ? data.error 
             : (data.message || data.error || "Connection test successful"),
+          retryable: isConnectorDeployingResponse(data),
         }
       } else {
         // New connection - use form data, plus any credentials from the
@@ -782,8 +861,17 @@ export function GenericConnectorForm({
         result = await testMCPConnection(connector.name, testConfig)
       }
       
-      // Improve error messages for better UX
-      if (!result.success && result.message) {
+      // Connector container still being set up (or a raw import error, which only ever
+      // means that): show the retryable message verbatim — improveErrorMessage's
+      // generic matchers must not rewrite it into a credentials/network checklist.
+      const deployingMessage = !result.success
+        ? connectorDeployingErrorMessage(result.message, connector.display_name)
+        : null
+      if (deployingMessage) {
+        result.message = deployingMessage
+        result.retryable = true
+      } else if (!result.success && result.message) {
+        // Improve error messages for better UX
         result.message = improveErrorMessage(result.message, connector.name)
       }
       
@@ -924,6 +1012,20 @@ export function GenericConnectorForm({
         field: "connection_type",
       })
       return
+    }
+
+    // A Scope the server would refuse (fail closed) is not saved.
+    if (showScope && !scopePinnedDatabase) {
+      const scopeError = scopeConfigError(formData)
+      if (scopeError) {
+        setError({
+          message: `Scope: ${scopeError}`,
+          suggestion: "Add at least one database or schema pattern, or choose All.",
+          field: NAMESPACE_FILTER_PATTERNS_KEY,
+        })
+        document.getElementById(NAMESPACE_FILTER_PATTERNS_KEY)?.focus()
+        return
+      }
     }
 
     // Validate required config fields
@@ -1128,6 +1230,7 @@ export function GenericConnectorForm({
 
     // Handle integer
     if (prop.type === "integer" || prop.type === "number") {
+      const numberType = prop.type
       return (
         <div key={key} className="space-y-2">
           <Label htmlFor={key} className="flex items-center gap-1">
@@ -1139,7 +1242,7 @@ export function GenericConnectorForm({
             type="number"
             value={value as number}
             onChange={(e) =>
-              handleInputChange(key, parseInt(e.target.value) || 0)
+              handleInputChange(key, parseNumberInput(e.target.value, numberType))
             }
             // Don't fall back to description: it's already rendered as helper text
             // below, so duplicating it shows the same string twice (ISSUE-009).
@@ -1205,7 +1308,7 @@ export function GenericConnectorForm({
             <button
               type="button"
               onClick={() => toggleSecretVisibility(key)}
-              className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600"
+              className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-400 hover:text-zinc-600 dark:hover:text-zinc-200"
             >
               {showSecrets[key] ? (
                 <EyeOff className="h-4 w-4" />
@@ -1339,7 +1442,7 @@ export function GenericConnectorForm({
                 </p>
               </div>
             )}
-            <p className="text-xs text-zinc-500">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
               Choose whether to read data from or write data to this connector
             </p>
           </div>
@@ -1377,7 +1480,7 @@ export function GenericConnectorForm({
                         }`}
                       >
                         <div className="font-medium">Real-time dashboards / features</div>
-                        <div className="text-xs text-zinc-500 mt-1">Live metrics, alerts, user-facing apps</div>
+                        <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Live metrics, alerts, user-facing apps</div>
                       </button>
                       <button
                         type="button"
@@ -1389,7 +1492,7 @@ export function GenericConnectorForm({
                         }`}
                       >
                         <div className="font-medium">Analytics & reporting</div>
-                        <div className="text-xs text-zinc-500 mt-1">BI, reports, warehouse</div>
+                        <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">BI, reports, warehouse</div>
                       </button>
                       <button
                         type="button"
@@ -1401,7 +1504,7 @@ export function GenericConnectorForm({
                         }`}
                       >
                         <div className="font-medium">Backup / archival</div>
-                        <div className="text-xs text-zinc-500 mt-1">Snapshots, periodic copies</div>
+                        <div className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">Snapshots, periodic copies</div>
                       </button>
                     </div>
                   </div>
@@ -1457,7 +1560,7 @@ export function GenericConnectorForm({
                         setUseCase("")
                         setFreshnessRequirement("")
                       }}
-                      className="text-xs text-zinc-500 hover:underline"
+                      className="text-xs text-zinc-500 dark:text-zinc-400 hover:underline"
                     >
                       Reset answers
                     </button>
@@ -1562,7 +1665,7 @@ export function GenericConnectorForm({
                     Real-time (CDC)
                   </span>
                   {!connector.supports_cdc && (
-                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500">
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-100 dark:bg-zinc-800 text-zinc-500 dark:text-zinc-400">
                       Not Available
                     </span>
                   )}
@@ -1594,14 +1697,14 @@ export function GenericConnectorForm({
                           <SelectItem value="streaming_only">Only stream new changes (no snapshot)</SelectItem>
                         </SelectContent>
                       </Select>
-                      <p className="text-xs text-zinc-500">
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
                         Default is recommended for new pipelines.
                       </p>
                     </div>
 
                     <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-zinc-50/50 dark:bg-zinc-900/20 p-3">
                       <div className="flex items-start gap-2">
-                        <Info className="h-4 w-4 text-zinc-500 mt-0.5 flex-shrink-0" />
+                        <Info className="h-4 w-4 text-zinc-500 dark:text-zinc-400 mt-0.5 flex-shrink-0" />
                         <div className="text-xs text-zinc-600 dark:text-zinc-400 space-y-1">
                           <div className="font-medium text-zinc-700 dark:text-zinc-300">How changes are written</div>
                           <div>
@@ -1621,7 +1724,7 @@ export function GenericConnectorForm({
               </Accordion>
             )}
 
-            <p className="text-xs text-zinc-500">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
               {syncMode === "batch" 
                 ? "Data will be extracted on-demand or on a schedule" 
                 : cdcMode === "initial"
@@ -2029,17 +2132,34 @@ export function GenericConnectorForm({
         )
       })()}
 
+      {showScope && (
+        <ConnectionScopeSection
+          namespaceKind={tableNamespace}
+          value={scopeFromConfig(formData)}
+          onChange={setScope}
+          pinnedDatabase={scopePinnedDatabase}
+          loadNamespaces={loadScopeNamespaces}
+        />
+      )}
+
       {/* Test Result */}
       {testResult && (
         <div
+          role="status"
+          data-testid="connection-test-result"
+          data-retryable={testResult.retryable ? "true" : undefined}
           className={`p-4 rounded-lg flex items-start gap-3 ${
             testResult.success
               ? "bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800"
-              : "bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800"
+              : testResult.retryable
+                ? "bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800"
+                : "bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800"
           }`}
         >
           {testResult.success ? (
             <CheckCircle2 className="h-5 w-5 text-green-600 mt-0.5 flex-shrink-0" />
+          ) : testResult.retryable ? (
+            <Clock className="h-5 w-5 text-amber-600 mt-0.5 flex-shrink-0" />
           ) : (
             <AlertCircle className="h-5 w-5 text-red-600 mt-0.5 flex-shrink-0" />
           )}
@@ -2047,7 +2167,9 @@ export function GenericConnectorForm({
             className={`text-sm whitespace-pre-line ${
               testResult.success
                 ? "text-green-700 dark:text-green-300"
-                : "text-red-700 dark:text-red-300"
+                : testResult.retryable
+                  ? "text-amber-800 dark:text-amber-300"
+                  : "text-red-700 dark:text-red-300"
             }`}
           >
             {testResult.message}
@@ -2133,11 +2255,5 @@ export function GenericConnectorForm({
   )
 }
 
-// Helper to format field labels
-function formatLabel(key: string): string {
-  return key
-    .split(/[-_]/)
-    .map((word) => word.charAt(0).toUpperCase() + word.slice(1))
-    .join(" ")
-}
+const formatLabel = formatConfigLabel
 

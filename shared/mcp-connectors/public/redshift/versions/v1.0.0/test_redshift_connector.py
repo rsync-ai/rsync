@@ -254,6 +254,39 @@ def test_upsert_sql_uses_delete_insert_not_on_conflict():
     assert insert_sql.startswith("INSERT INTO") and "SELECT" in insert_sql, insert_sql
 
 
+# ======================== discovery: every schema ==========================
+
+def test_discover_lists_every_schema_with_the_configured_one_first():
+    rows = [
+        {"table_schema": "sales", "table_name": "invoices"},
+        {"table_schema": "public", "table_name": "orders"},
+        {"table_schema": "public", "table_name": "customers"},
+        {"table_schema": "zz_audit", "table_name": "events"},
+    ]
+    s, conn = _rs_fakes.make_connector(rs, rows=rows)
+    out = s.discover_schema({**CFG, "max_tables": 3})
+    assert out["overall_status"] == "success", out
+    got = [(t["schema"], t["name"]) for t in out["tables"]]
+    # Configured schema first, then the rest by schema/name; cut at max_tables.
+    assert got == [("public", "customers"), ("public", "orders"),
+                   ("sales", "invoices")], got
+    assert out["tables"][2]["endpoint"] == "sales.invoices", out["tables"][2]
+    assert out["total_tables_available"] == 4, out
+    assert out["total_tables_discovered"] == 3, out
+    sql = conn.all_sql()[-1]
+    # Control: the query no longer pins one schema, and still hides the catalog.
+    assert "table_schema = %s" not in sql, sql
+    assert "pg_catalog" in sql, sql
+
+
+def test_discover_defaults_to_every_table_when_max_tables_is_unset():
+    rows = [{"table_schema": "public", "table_name": f"t{i}"} for i in range(150)]
+    s, _ = _rs_fakes.make_connector(rs, rows=rows)
+    out = s.discover_schema(CFG)
+    # The connector's own default stays 100; the orchestrator sends max_tables.
+    assert out["total_tables_discovered"] == 100 and out["total_tables_available"] == 150, out
+
+
 # ================================= runner ===================================
 
 def _run():

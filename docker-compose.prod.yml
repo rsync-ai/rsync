@@ -184,7 +184,10 @@ services:
       # Unset, auto-setup attempts CREATE DATABASE as ${POSTGRES_USER} and the
       # container crash-loops; pre-creating alone does not help, because the
       # create is attempted regardless of whether the database is there.
-      - SKIP_DB_CREATE=true
+      # Single-VM self-host on the bundled `postgres` (COMPOSE_PROFILES=local-db,
+      # POSTGRES_HOST=postgres): set TEMPORAL_SKIP_DB_CREATE=false so auto-setup
+      # creates both databases as the container's superuser — nothing else does.
+      - SKIP_DB_CREATE=${TEMPORAL_SKIP_DB_CREATE:-true}
       # ── TLS to the metadata database ───────────────────────────────────────
       # Temporal does NOT read DB_SSLMODE. It is really two programs, and they
       # read DIFFERENT env names for the same fact: auto-setup runs
@@ -287,7 +290,9 @@ services:
       # every scheduled run silently skips as "pipeline not found (orphaned)". The
       # base docker-compose.yml (dev/e2e) does NOT set this, so local Postgres stays
       # valid there. Enforced in adapter main.go::requireRemoteDatabase.
-      - RSYNC_REQUIRE_REMOTE_DB=true
+      # Default true (managed DB). Only a single-VM install on the bundled
+      # `postgres` (COMPOSE_PROFILES=local-db) sets RSYNC_REQUIRE_REMOTE_DB=false.
+      - RSYNC_REQUIRE_REMOTE_DB=${RSYNC_REQUIRE_REMOTE_DB:-true}
       # Connection pool caps for shared managed DB.
       - POSTGRES_MAX_OPEN_CONNS=${ADAPTER_DB_MAX_OPEN_CONNS:-6}
       - POSTGRES_MAX_IDLE_CONNS=${ADAPTER_DB_MAX_IDLE_CONNS:-3}
@@ -343,7 +348,9 @@ services:
       # on the wrong DB the UI shows an empty/mismatched connection list and
       # pipelines 404. The base docker-compose.yml (dev/e2e) does NOT set this, so
       # local Postgres stays valid there. Enforced in main.go::requireRemoteDatabase.
-      - RSYNC_REQUIRE_REMOTE_DB=true
+      # Default true (managed DB). Only a single-VM install on the bundled
+      # `postgres` (COMPOSE_PROFILES=local-db) sets RSYNC_REQUIRE_REMOTE_DB=false.
+      - RSYNC_REQUIRE_REMOTE_DB=${RSYNC_REQUIRE_REMOTE_DB:-true}
       # Connection pool caps for shared managed DB.
       - DB_MAX_OPEN_CONNS=${ORCHESTRATOR_DB_MAX_OPEN_CONNS:-10}
       - DB_MAX_IDLE_CONNS=${ORCHESTRATOR_DB_MAX_IDLE_CONNS:-4}
@@ -437,7 +444,9 @@ services:
       # DATABASE_URL was unset — i.e. launched without `--env-file .env.staging`.
       # The base docker-compose.yml (dev/e2e) does NOT set this, so local Postgres
       # stays valid there. Enforced in api-gateway main.go::requireRemoteDatabase.
-      - RSYNC_REQUIRE_REMOTE_DB=true
+      # Default true (managed DB). Only a single-VM install on the bundled
+      # `postgres` (COMPOSE_PROFILES=local-db) sets RSYNC_REQUIRE_REMOTE_DB=false.
+      - RSYNC_REQUIRE_REMOTE_DB=${RSYNC_REQUIRE_REMOTE_DB:-true}
       # Connection pool caps for shared managed DB.
       - DB_MAX_OPEN_CONNS=${APIGW_DB_MAX_OPEN_CONNS:-10}
       - DB_MAX_IDLE_CONNS=${APIGW_DB_MAX_IDLE_CONNS:-4}
@@ -452,6 +461,13 @@ services:
       - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
       - RSYNC_ALLOW_INTERNAL_CONNECTORS=false
       - RSYNC_ADMIN_EMAILS=${RSYNC_ADMIN_EMAILS:-}
+      # CDC auto-pickup: a pipeline selected as "this whole database/schema"
+      # keeps that meaning — the api-gateway re-expands the selection rule on
+      # this interval and adds source tables created since. Default ON; set
+      # false to freeze every CDC pipeline at its current table list. The
+      # interval is floored at 60s (discovery runs once per CDC pipeline per tick).
+      - CDC_TABLE_AUTOPICKUP_ENABLED=${CDC_TABLE_AUTOPICKUP_ENABLED:-true}
+      - CDC_TABLE_WATCH_INTERVAL_SECONDS=${CDC_TABLE_WATCH_INTERVAL_SECONDS:-300}
       - TEMPORAL_ADDRESS=temporal:7233
       - ORCHESTRATOR_URL=http://orchestrator:8080
       - AGENT_ORCHESTRATOR_URL=http://orchestrator:8080
@@ -842,6 +858,9 @@ services:
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=planner
       - OTEL_ENABLED=true
+      # Plan-time topic creation POSTs the orchestrator's requirePrincipal-gated
+      # /api/v1/topology with no user session; ENVIRONMENT=production, so no secret = 401.
+      - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
     deploy:
       resources:
         limits:
@@ -962,10 +981,14 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
+    # 768M, not 256M: the supervisor spawns Go sink worker processes
+    # (connector.py _spawn_worker_process) that share this one limit, and at
+    # 256M demo issue #32 reported the kernel OOM-killing them mid-run. Matches
+    # quickstart (mem_limit: 768m) and the Helm chart (sink limits 768Mi).
     deploy:
       resources:
         limits:
-          memory: 256M
+          memory: 768M
 
   context7-mcp:
     restart: unless-stopped

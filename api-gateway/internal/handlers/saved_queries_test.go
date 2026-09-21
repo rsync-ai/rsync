@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -74,7 +75,7 @@ func savedQueryRowsOnConnector(connectorType, createdBy, visibility, sqlText, cl
 			// savedQueryFixtureUpdatedAt. A string here would hand the handler the
 			// answer instead of making it produce one.
 			createdBy, createdBy, "2026-08-13T00:00:00Z", savedQueryFixtureUpdatedAt, nil,
-			"none", "", "", "", "", "", nil, connectorType)
+			"none", "", "", "", "", "", nil, connectorType, nil)
 }
 
 // savedQueryScanColumns is the exact column list, in order, that both reads scan.
@@ -87,6 +88,8 @@ var savedQueryScanColumns = []string{
 	// From the LEFT JOIN on connections; feeds supports_materialization via the
 	// Explorer capability table.
 	"connector_type",
+	// The model's freshness promise (migration 101); NULL = none.
+	"freshness_deadline_seconds",
 }
 
 // savedQueryRowsScheduled is savedQueryRows with the joined schedule filled in.
@@ -96,7 +99,7 @@ func savedQueryRowsScheduled(status, scheduleType, spec string) *sqlmock.Rows {
 			"SELECT 1", "", "read", "workspace",
 			wsScopeUser, wsScopeUser, "2026-08-13T00:00:00Z", savedQueryFixtureUpdatedAt, nil,
 			"table", "public.daily_mrr", "", "",
-			status, scheduleType, []byte(spec), "postgresql")
+			status, scheduleType, []byte(spec), "postgresql", nil)
 }
 
 // savedQueryFixtureUpdatedAt is the updated_at both fixtures above carry, as a
@@ -514,6 +517,60 @@ func TestGetSavedQuery_HidesAnotherMembersPrivateQuery(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("%v", err)
+	}
+}
+
+// The model page's "Alert if older than…" control edits the deadline PUT …/freshness
+// stores; without it on the read, the control cannot show what is set and every save
+// would look like the first one. Both directions: a stored deadline comes back in
+// seconds, and NULL (no promise) is absent rather than 0 — 0 would read as a deadline
+// the migration 101 CHECK can never hold.
+func TestGetSavedQuery_ReportsTheFreshnessDeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stored interface{}
+		want   *int
+	}{
+		{"six hours", int64(21600), func() *int { v := 21600; return &v }()},
+		{"none", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mock, cleanup := wsScopeMockDB(t)
+			defer cleanup()
+
+			mock.ExpectQuery(`FROM saved_queries r\s+JOIN workspace_members`).
+				WithArgs(savedQueryID, wsScopeUser, wsScopeWS).
+				WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("viewer"))
+			mock.ExpectQuery(`sq\.freshness_deadline_seconds[\s\S]+FROM saved_queries sq[\s\S]+WHERE sq\.id = \$1`).
+				WithArgs(savedQueryID).
+				WillReturnRows(sqlmock.NewRows(savedQueryScanColumns).
+					AddRow(savedQueryID, wsScopeWS, savedQueryConn, "Daily MRR", "",
+						"SELECT 1", "", "read", "workspace",
+						wsScopeUser, wsScopeUser, "2026-08-13T00:00:00Z", savedQueryFixtureUpdatedAt, nil,
+						"table", "public.daily_mrr", "", "",
+						"", "", nil, "postgresql", tc.stored))
+
+			r := savedQueryRouter(http.MethodGet, "/explorer/saved/:id", "viewer", GetSavedQuery)
+			w := doJSON(r, http.MethodGet, "/explorer/saved/"+savedQueryID, nil)
+			if w.Code != http.StatusOK {
+				t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+			}
+
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			got, present := raw["freshness_deadline_seconds"]
+			switch {
+			case tc.want == nil && present:
+				t.Errorf("no deadline must be absent, got %s", got)
+			case tc.want != nil && string(got) != strconv.Itoa(*tc.want):
+				t.Errorf("freshness_deadline_seconds = %q, want %d", got, *tc.want)
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("%v", err)
+			}
+		})
 	}
 }
 

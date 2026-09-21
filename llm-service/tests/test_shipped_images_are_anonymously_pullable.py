@@ -73,12 +73,20 @@ AUTH_WALLED = {
 #
 # Kept to exactly the files that need it. The first draft also exempted
 # CAPABILITIES.md and CAPABILITIES-ARCHIVE.md on the same reasoning, and
-# test_every_exemption_is_still_needed below rejected both: neither names a
-# walled image, so both entries were holes covering nothing. That is the whole
-# argument for having that test -- an exemption written from caution rather than
-# from a read of the file is indistinguishable from one that is load-bearing.
+# test_every_exemption_is_still_needed below rejected both: at the time neither
+# named a walled image, so both entries were holes covering nothing. That is the
+# whole argument for having that test -- an exemption written from caution rather
+# than from a read of the file is indistinguishable from one that is load-bearing.
+# CAPABILITIES.md then earned the entry, because its dated row for the
+# registry-prefix defect cites `docker.io/minio/minio` as the evidence: recording
+# the reference that broke is not pulling it. On 2026-09-16 CAPABILITIES.md became
+# a one-line index and that row moved verbatim to CAPABILITIES-ARCHIVE.md, so the
+# entry moved with it -- and the exemption test is what proved it had to: the
+# index no longer names a walled image, and the archive now does. The same test
+# forces the entry back out if that citation ever leaves the archive.
 EXEMPT = {
     "BACKLOG.md": "historical: names the pre-move image in a closed row",
+    "CAPABILITIES-ARCHIVE.md": "historical: cites the docker.io-qualified name as evidence",
     # This file names every walled repository by definition.
     os.path.relpath(__file__, REPO_ROOT): "this guard's own denylist",
 }
@@ -90,6 +98,7 @@ EXEMPT = {
 # becoming an inert typo: a path absent for any OTHER reason still fails.
 STRIPPED_FROM_THE_PUBLIC_REPO = {
     "BACKLOG.md": "scripts/flip/excludes.txt",
+    "CAPABILITIES-ARCHIVE.md": "scripts/flip/excludes.txt",
 }
 
 # The exclude list itself is stripped from the public cut, so the cross-check
@@ -97,19 +106,60 @@ STRIPPED_FROM_THE_PUBLIC_REPO = {
 # hide, since that is where the exemption does work.
 FLIP_EXCLUDES = os.path.join(REPO_ROOT, "scripts", "flip", "excludes.txt")
 
-# A Docker-Hub-hosted reference to one of the repositories above: the bare name,
-# with nothing registry-like in front of it. The lookbehind is the whole trick --
-# `quay.io/minio/minio` ends in `/minio`, so a naive search for `minio/minio`
-# matches the fixed form too and the guard would fail on its own fix.
-_WALLED_RE = re.compile(
-    r"(?<![A-Za-z0-9_./-])(" + "|".join(re.escape(k) for k in AUTH_WALLED) + r")(?![A-Za-z0-9_/-])"
+# Docker Hub's own hostnames. A reference with no host at all is Docker Hub too --
+# it is the default registry -- so the host is optional here, not forbidden.
+_DOCKER_HUB_HOSTS = (
+    "docker.io",
+    "index.docker.io",
+    "registry-1.docker.io",
+    "registry.hub.docker.com",
 )
+
+# A Docker-Hub-hosted reference to one of the repositories above. The predicate is
+# "this path, on Docker Hub", which means the bare name OR the same name behind any
+# of the hostnames above: `docker pull docker.io/minio/minio` and `docker pull
+# minio/minio` fetch from the same walled repository.
+#
+# The lookbehind is what keeps `quay.io/minio/minio` -- the fix -- from matching: it
+# ends in `/minio`, so a bare search for `minio/minio` would flag the fixed form and
+# the guard would fail on its own fix. But a lookbehind ALONE rejects every host,
+# Docker Hub's included, so all three qualified forms of the walled name went unseen
+# and the guard stayed green on the exact regression it exists for. The optional
+# prefix re-admits precisely those and nothing else -- a host absent from the tuple
+# still fails the lookbehind, which is why quay.io and ghcr.io stay clean.
+_WALLED_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])"
+    r"(?:(?:" + "|".join(re.escape(h) for h in _DOCKER_HUB_HOSTS) + r")/)?"
+    r"(?:" + "|".join(re.escape(k) for k in AUTH_WALLED) + r")"
+    r"(?![A-Za-z0-9_/-])"
+)
+
+# Files that MENTION the replacement without USING it. Deliberately a separate set
+# from EXEMPT, because the two answer different questions: EXEMPT asks "may this
+# file name a walled image", this one asks "does this file count as evidence the
+# replacement is actually in use". A file can need one and not the other, and
+# folding them together would silently drop a future exemption out of the census.
+#
+# It exists because the census counted its own source. The walled branch below is
+# gated on EXEMPT; the fixed branch was gated on nothing, so AUTH_WALLED's own dict
+# literal -- four lines naming both quay.io repositories -- landed in the census as
+# evidence that the repo uses them. That made
+# test_every_denylisted_repository_has_a_replacement_the_repo_actually_uses
+# non-empty by construction: delete every real use of quay.io/minio/mc and this file
+# would still vouch for it. The floor below was inflated by the same four lines.
+NOT_EVIDENCE_OF_USE = {
+    os.path.relpath(__file__, REPO_ROOT): "AUTH_WALLED names both replacements",
+    # Moved from CAPABILITIES.md with the row itself (2026-09-16 index split).
+    "CAPABILITIES-ARCHIVE.md": "a status row citing the fix is a record, not a pull",
+}
 
 # The census must keep finding the *fixed* references. If a rename or a file move
 # empties it, every assertion below passes while checking nothing -- the shape of
 # a vacuous green. Floored below the 21 references present at the time of writing
 # so ordinary churn does not trip it, but far enough above zero to catch a
-# wholesale disappearance.
+# wholesale disappearance. That 21 is now what the code actually counts: before the
+# exclusion above it counted 26, and the extra five were this file vouching for
+# itself and one CAPABILITIES.md row -- the comment was right and the code was not.
 _MIN_FIXED_REFS = 12
 
 
@@ -148,7 +198,9 @@ def _scan():
         for n, line in enumerate(text.splitlines(), start=1):
             if rel not in EXEMPT and _WALLED_RE.search(line):
                 walled.append((rel, n, line.strip()))
-            if any(repl in line for repl in AUTH_WALLED.values()):
+            if rel not in NOT_EVIDENCE_OF_USE and any(
+                repl in line for repl in AUTH_WALLED.values()
+            ):
                 fixed.append((rel, n, line.strip()))
     return walled, fixed
 
@@ -242,6 +294,31 @@ def test_at_least_one_exemption_is_live():
     assert live, (
         "every exempt path is absent, so test_every_exemption_is_still_needed "
         f"skipped all of them and checked nothing: {sorted(EXEMPT)}"
+    )
+
+
+@pytest.mark.parametrize("rel,reason", sorted(NOT_EVIDENCE_OF_USE.items()))
+def test_every_census_exclusion_still_holds_a_reference(rel, reason):
+    """An exclusion for a file that stopped mentioning the name is inert.
+
+    Inert is not harmless: the entry stays, the file keeps its name, and the day
+    something real moves to that path the census drops it without a word. Same
+    argument as test_every_exemption_is_still_needed, aimed at the other set --
+    written together with the exclusion precisely so the exclusion cannot become
+    the next unexamined hole.
+    """
+    text = _read(rel)
+    if text is None:
+        stripped_by = STRIPPED_FROM_THE_PUBLIC_REPO.get(rel)
+        assert stripped_by, (
+            f"{rel} is excluded from the fixed-reference census ({reason}) but does "
+            f"not exist, so the entry excludes nothing. Fix the path or drop it."
+        )
+        pytest.skip(f"{rel} is stripped from this repo by {stripped_by}")
+    assert any(repl in text for repl in AUTH_WALLED.values()), (
+        f"{rel} is excluded from the fixed-reference census ({reason}) but no longer "
+        f"mentions any replacement name, so the exclusion removes nothing and only "
+        f"waits to remove something real. Drop it."
     )
 
 

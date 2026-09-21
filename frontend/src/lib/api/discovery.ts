@@ -295,7 +295,9 @@ export async function generateFromSession(
     let detail: string = res.statusText
     try {
       const body = await res.json()
-      detail = body?.error || body?.detail || detail
+      // error_message is the sentence; error can be a code such as
+      // llm_not_configured (api-gateway connector_generator.go).
+      detail = body?.error_message || body?.error || body?.detail || detail
     } catch {
       // ignore
     }

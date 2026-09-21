@@ -21,6 +21,11 @@
   "supports_source": true,
   "supports_destination": true,
   "supports_cdc": true,
+  "namespace_model": {
+    "table_namespace": "schema",
+    "destination_namespace": "schema",
+    "destination_default": ""
+  },
   "supports_ddl": true,
   "auto_create_destination_tables": true,
   "spec_version": "1.0",

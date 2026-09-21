@@ -294,6 +294,11 @@ class SnowflakeMCPServer(DestinationLoadMixin, BaseMCPConnector):
         except Exception as e:  # noqa: BLE001
             return {"success": False, "error": str(e)}
 
+    # Which tables are user tables: base tables outside INFORMATION_SCHEMA.
+    # discover_schema and list_namespaces both filter by it, so the schema list
+    # and the table list never disagree.
+    _USER_TABLES_WHERE = "table_type = 'BASE TABLE' AND table_schema <> 'INFORMATION_SCHEMA'"
+
     def discover_schema(self, params: Dict = None) -> Dict[str, Any]:
         import time
         from datetime import datetime
@@ -328,23 +333,31 @@ class SnowflakeMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 cur = self._dict_cursor(conn)
                 # Snowflake's INFORMATION_SCHEMA is per-database; the connection's
                 # database scopes it. TABLE_SCHEMA is stored folded (UPPERCASE for
-                # unquoted schemas), so callers pass the stored form.
+                # unquoted schemas), which is also the form export needs.
+                # Every user schema, not only the configured one: a source's tables
+                # are rarely all in one schema. The configured schema comes first,
+                # and each table carries its schema so a pick reaches export as
+                # "schema.table" (_qualify_table takes 2 parts).
                 cur.execute(
-                    "SELECT table_name FROM information_schema.tables "
-                    "WHERE table_schema = %s AND table_type = 'BASE TABLE' "
-                    "ORDER BY table_name",
-                    [schema],
+                    "SELECT table_schema, table_name FROM information_schema.tables "
+                    "WHERE " + self._USER_TABLES_WHERE + " "
+                    "ORDER BY table_schema, table_name"
                 )
                 rows = cur.fetchall()
             finally:
                 self._safe_close(conn)
-            names = [self._row_value(r, "table_name", 0)
-                     or self._row_value(r, "TABLE_NAME", 0) for r in rows]
-            names = [n for n in names if n]
-            result["total_tables_available"] = len(names)
+            pairs = []
+            for r in rows:
+                s = self._row_value(r, "table_schema", 0)
+                n = self._row_value(r, "table_name", 1)
+                if s and n:
+                    pairs.append((str(s), str(n)))
+            default = schema.lower()
+            pairs.sort(key=lambda p: (p[0].lower() != default, p[0], p[1]))
+            result["total_tables_available"] = len(pairs)
             out = [
-                {"name": n, "endpoint": f"{schema}.{n}", "discovery_status": "complete"}
-                for n in names[:max_tables]
+                {"name": n, "schema": s, "endpoint": f"{s}.{n}", "discovery_status": "complete"}
+                for s, n in pairs[:max_tables]
             ]
             result["tables"] = out
             result["total_tables_discovered"] = len(out)
@@ -357,6 +370,32 @@ class SnowflakeMCPServer(DestinationLoadMixin, BaseMCPConnector):
             result["warnings_messages"].append(msg)
         result["discovery_duration_ms"] = int(time.time() * 1000) - start_ms
         return result
+
+    def list_namespaces(self, params: Dict = None) -> Dict[str, Any]:
+        """List the schemas that hold user tables: the level metadata.json's
+        namespace_model.table_namespace names. Filtered by _USER_TABLES_WHERE,
+        the filter discover_schema uses, so the two never disagree. "current"
+        is the schema the connection names, "" when it names none.
+        """
+        config = self._get_config(params or {})
+        try:
+            conn = self._connect(config)
+            try:
+                cur = self._dict_cursor(conn)
+                cur.execute(
+                    "SELECT DISTINCT table_schema FROM information_schema.tables "
+                    "WHERE " + self._USER_TABLES_WHERE + " ORDER BY table_schema"
+                )
+                names = [self._row_value(r, "table_schema", 0) for r in cur.fetchall()]
+            finally:
+                self._safe_close(conn)
+            return {
+                "success": True,
+                "namespaces": sorted({str(n) for n in names if n}),
+                "current": str(config.get("schema") or "").strip(),
+            }
+        except Exception as e:  # noqa: BLE001
+            return {"success": False, "error": f"Listing namespaces failed: {e}"}
 
     def export(self, params: Dict = None) -> Dict[str, Any]:
         """Optimized paginated read (keyset preferred, offset fallback, verbatim

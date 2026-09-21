@@ -26,6 +26,7 @@ metadata:
     app.kubernetes.io/component: orchestrator
 spec:
   replicas: {{ .Values.orchestrator.replicaCount }}
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   # Recreate, not RollingUpdate. The orchestrator holds an in-process MCP server
   # registry and takes correlation claims in Redis; overlapping old and new pods
   # during a rollout means two processes probing and claiming for the same run.

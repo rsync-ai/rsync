@@ -26,6 +26,12 @@ defect was never that resolution was wrong, it was that ONE site skipped it:
    directly. This is the guard that generalises: a new endpoint that copies the
    old pattern fails here rather than in a customer's Diagnose panel.
 
+The census first matched only a subscript on a variable named `config`, so SQL
+generation's `cfg.get("model")` walked past it: on an OpenAI-protocol endpoint
+(Groq, Vertex AI, OpenRouter) the Data Explorer asked for the YAML's gpt-4o
+while every other prompt used LLM_MODEL. It now matches the key however it is
+read and whatever the dict is called.
+
 This is the same defect class as the divergent Explorer provider resolution
 pinned in test_explorer_offline_resolution.py — a second copy of "which model
 do we call" that drifted from the one the environment configures.
@@ -77,7 +83,33 @@ def test_yaml_default_is_used_when_no_env_model_is_set(monkeypatch):
     # working call, which is why this is a resolution ORDER and not a rewrite.
     main = _resolve_model()
     monkeypatch.setattr(main, "DEFAULT_LLM_MODEL", "")
+    monkeypatch.setattr(main, "DEFAULT_LLM_PROVIDER", "openai")
     assert main.resolve_model({"model": "gpt-4o"}) == "gpt-4o"
+
+
+@pytest.mark.parametrize(
+    ("provider", "env", "expected"),
+    [
+        ("groq", {}, "llama-3.3-70b-versatile"),
+        ("azure", {"AZURE_OPENAI_DEPLOYMENT": "prod-chat"}, "prod-chat"),
+        ("ollama", {"OLLAMA_MODEL": "qwen2.5:7b"}, "qwen2.5:7b"),
+    ],
+)
+def test_the_yaml_default_is_not_sent_to_a_provider_that_lacks_it(monkeypatch, provider, env, expected):
+    # The YAML's gpt-4o is an OpenAI catalog name. A Groq, Azure or Ollama stack
+    # with no LLM_MODEL asked for it and got a 404 on every prompt.
+    main = _resolve_model()
+    monkeypatch.delenv("LLM_MODEL", raising=False)
+    for key in ("AZURE_OPENAI_DEPLOYMENT", "OLLAMA_MODEL"):
+        monkeypatch.delenv(key, raising=False)
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setattr(main, "DEFAULT_LLM_MODEL", "")
+    monkeypatch.setattr(main, "DEFAULT_LLM_PROVIDER", provider)
+    assert main.resolve_model({"model": "gpt-4o"}) == expected
+    # A caller whose client was built for another provider says so.
+    monkeypatch.setattr(main, "DEFAULT_LLM_PROVIDER", "openai")
+    assert main.resolve_model({"model": "gpt-4o"}, None, provider) == expected
 
 
 @pytest.mark.parametrize("empty", ["", None])
@@ -94,17 +126,36 @@ def test_an_empty_override_does_not_blank_the_model(monkeypatch, empty):
 
 
 def _config_model_reads(tree: ast.AST) -> list[int]:
-    """Line numbers of every `config["model"]` subscript in a module."""
+    """Line numbers of every read of a "model" key in a module.
+
+    `x["model"]` and `x.get("model", ...)`, whatever `x` is named: the prompt
+    config has been bound as `config`, `cfg` and `repair_cfg`.
+    """
     hits = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Subscript):
-            continue
-        if not (isinstance(node.value, ast.Name) and node.value.id == "config"):
-            continue
-        key = node.slice
-        if isinstance(key, ast.Constant) and key.value == "model":
-            hits.append(node.lineno)
+        if isinstance(node, ast.Subscript):
+            key = node.slice
+            if isinstance(key, ast.Constant) and key.value == "model":
+                hits.append(node.lineno)
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "get" and node.args):
+                continue
+            key = node.args[0]
+            if isinstance(key, ast.Constant) and key.value == "model":
+                hits.append(node.lineno)
     return hits
+
+
+def test_the_census_sees_both_ways_of_reading_the_key():
+    """Arms the census with a control: both spellings that have shipped must hit."""
+    tree = ast.parse(
+        "def f(config, cfg):\n"
+        "    a = config['model']\n"
+        "    b = cfg.get('model') or 'x'\n"
+        "    c = cfg.get('parameters')\n"
+    )
+    assert _config_model_reads(tree) == [2, 3]
 
 
 def _resolve_model_body_lines(tree: ast.AST) -> set[int]:
@@ -126,7 +177,7 @@ def test_resolve_model_exists_and_is_the_only_reader_of_the_yaml_key():
 
     stray = [ln for ln in _config_model_reads(tree) if ln not in allowed]
     assert not stray, (
-        f"{GATEWAY_MAIN.name} reads config[\"model\"] directly at line(s) {stray}; "
+        f"{GATEWAY_MAIN.name} reads the prompt config's \"model\" key directly at line(s) {stray}; "
         "that bypasses LLM_MODEL and sends the YAML's literal gpt-4o to whatever "
         "provider is configured. Call resolve_model(config) instead."
     )

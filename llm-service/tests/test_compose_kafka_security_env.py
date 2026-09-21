@@ -113,9 +113,13 @@ APICURIO_SECURITY_KEYS = (
 # entry stops being needed -- a stale exemption is how the next real client gets
 # waved through.
 #
-# NOT EMPTY: the kafka-connect entries are added by the loop directly below, one per
-# compose file. It starts empty here only because those are generated rather than
-# spelled out twice.
+# kafka-connect was exempted here until 2026-09-19, on the grounds that the anchor's
+# bare KAFKA_* names are inert to a Connect image. They are not any more: the image's
+# own connect-entrypoint.sh derives the CONNECT_* lines from them (the JAAS line from
+# the username/password or OAuth set, the one-file PEM keystore from the cert/key
+# pair), so kafka-connect now merges the anchor like every other client. Without it
+# the compose worker could not use the pair or OAuth at all -- the gap the kafka
+# security matrix's cx-* rows found.
 #
 # schema-registry was exempted here until 2026-08-29. It is not any more, and the
 # reason is the good one: the KAFKA_BOOTSTRAP_SERVERS/REGISTRY_KAFKASQL_TOPIC that put
@@ -132,15 +136,6 @@ APICURIO_SECURITY_KEYS = (
 # somebody sets APICURIO_BROKER_KEY, and at that moment APICURIO_SECURITY_KEYS -- not
 # the anchor -- becomes its requirement.
 NOT_A_CLIENT = {}
-
-_CONNECT_EXEMPTION = (
-    "Kafka Connect takes its security through CONNECT_*-prefixed keys at three "
-    "client levels (worker, producer., consumer.), which the anchor's bare KAFKA_* "
-    "names cannot express -- Connect would ignore them. Covered instead by its own "
-    "CONNECT_* block, which test_connect_configures_all_three_client_levels pins."
-)
-for _f in COMPOSE_FILES:
-    NOT_A_CLIENT[(_f, "kafka-connect")] = _CONNECT_EXEMPTION
 
 
 def _load(name):

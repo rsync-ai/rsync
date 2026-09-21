@@ -1,4 +1,5 @@
 import { API_GATEWAY_URL, API_GATEWAY_URL_INTERNAL, WS_ENDPOINTS, getApiUrl } from "@/lib/config/api"
+import { frontendStartupProblems } from "@/instrumentation"
 
 export const dynamic = "force-dynamic"
 
@@ -13,6 +14,10 @@ type HealthResponse = {
         NEXT_PUBLIC_API_URL: boolean
         NEXT_PUBLIC_WS_URL: boolean
       }
+      // Names (never values) of server settings a production frontend needs but
+      // was not given; the startup log says what each one breaks. Settings whose
+      // absence says something about a credential are left out: this route needs no login.
+      missingSettings: string[]
     }
     backend: { status: "ok" | "error"; code?: number; message?: string; data?: unknown }
   }
@@ -30,6 +35,9 @@ export async function GET() {
           NEXT_PUBLIC_API_URL: !!process.env.NEXT_PUBLIC_API_URL,
           NEXT_PUBLIC_WS_URL: !!process.env.NEXT_PUBLIC_WS_URL,
         },
+        missingSettings: frontendStartupProblems(process.env)
+          .filter((problem) => !problem.sensitive)
+          .map((problem) => problem.setting),
       },
       backend: { status: "error" },
     },

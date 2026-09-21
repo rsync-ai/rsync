@@ -225,6 +225,8 @@ export async function httpErrorFromResponse(response: Response, fallbackMessage:
  *               "Pause failed (HTTP 502)". Omit it when the toast title already
  *               names the action, otherwise the user reads "Stop failed" twice.
  */
+const HTML_ERROR_PAGE = /^<(?:!doctype|html|head|body|title|center|h1)\b/i
+
 export async function readResponseErrorMessage(res: Response, action?: string): Promise<string> {
   let body = ""
   try {
@@ -242,11 +244,14 @@ export async function readResponseErrorMessage(res: Response, action?: string): 
       if (msg) return msg
       // Structured, but with nothing human-readable in it. Fall through to the
       // status line rather than dumping a JSON blob into a toast.
-    } else {
-      // Not JSON at all (an nginx/Envoy error page, a proxy's plain text). This
-      // is the case the old json()-first ordering could never reach.
+    } else if (!HTML_ERROR_PAGE.test(trimmed)) {
+      // Not JSON at all (a proxy's plain text, e.g. Envoy's "upstream connect
+      // error"). This is the case the old json()-first ordering could never reach.
       return trimmed.length > 300 ? `${trimmed.slice(0, 300)}…` : trimmed
     }
+    // An HTML error page (nginx's or a load balancer's "502 Bad Gateway") is
+    // markup, not a reason: it falls through to the status line below rather
+    // than printing tags into a toast or a chat message.
   }
 
   const what = action ? `${action} failed` : "Request failed"

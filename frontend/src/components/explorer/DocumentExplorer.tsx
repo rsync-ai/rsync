@@ -30,9 +30,31 @@ export interface DocumentExplorerProps {
   /** Collections from the schema index (one entry per collection). */
   collections: SchemaTableLike[]
   collection: string
-  onCollectionChange: (name: string) => void
+  /**
+   * The database the picked collection belongs to: its schema-index `schema`,
+   * sent as the find's `database`. A server-level connection (one naming no
+   * database) lists collections from several databases and needs it; a
+   * connection pinned to one database reports that database. Undefined: the
+   * first collection with this name.
+   */
+  database?: string
+  onCollectionChange: (name: string, database?: string) => void
   loadingCollections?: boolean
+  /**
+   * Set when the collection list could not be loaded (bad credentials, host not
+   * reachable, address not on the cluster's allowlist). An empty `collections` then
+   * means "unknown", not "this database has no collections".
+   */
+  collectionsError?: { title: string; message: string; hint?: string } | null
+  onRetryCollections?: () => void
 }
+
+// One option per database and collection: two databases may hold a collection
+// with the same name.
+const collectionKey = (c: SchemaTableLike) => `${c.schema ?? ""}\u001f${c.name}`
+
+const COLLECTIONS_ERROR_HINT =
+  "Check the username and password saved on this connection, and that the database accepts connections from this server's IP address (network access / IP allowlist). Then retry."
 
 interface FindError {
   message: string
@@ -49,8 +71,8 @@ const KIND_CLASS: Record<CellKind, string> = {
   boolean: "text-amber-700 dark:text-amber-400",
   objectId: "text-violet-700 dark:text-violet-400",
   date: "text-emerald-700 dark:text-emerald-400",
-  object: "text-zinc-500",
-  array: "text-zinc-500",
+  object: "text-zinc-500 dark:text-zinc-400",
+  array: "text-zinc-500 dark:text-zinc-400",
   special: "text-rose-700 dark:text-rose-400",
 }
 
@@ -62,8 +84,11 @@ export function DocumentExplorer({
   connectionId,
   collections,
   collection,
+  database,
   onCollectionChange,
   loadingCollections,
+  collectionsError,
+  onRetryCollections,
 }: DocumentExplorerProps) {
   const [filter, setFilter] = useState("")
   const [projection, setProjection] = useState("")
@@ -82,7 +107,16 @@ export function DocumentExplorer({
       if (!collection) return
       const page = append && result ? nextPageParams(result) : null
       if (append && !page) return
-      const built = buildFindBody({ connectionId, collection, filter, projection, sort, limit, ...(page ?? {}) })
+      const built = buildFindBody({
+        connectionId,
+        collection,
+        database,
+        filter,
+        projection,
+        sort,
+        limit,
+        ...(page ?? {}),
+      })
       if (!built.ok) {
         setError({ message: built.error, field: built.field })
         return
@@ -144,7 +178,7 @@ export function DocumentExplorer({
         }
       }
     },
-    [collection, connectionId, filter, projection, sort, limit, result],
+    [collection, database, connectionId, filter, projection, sort, limit, result],
   )
 
   // Browsing starts as soon as a collection is picked. The ref keeps the effect keyed
@@ -155,15 +189,22 @@ export function DocumentExplorer({
   }, [runFind])
   useEffect(() => {
     if (collection) void runFindRef.current(false)
-  }, [connectionId, collection])
+  }, [connectionId, collection, database])
   useEffect(() => () => abortRef.current?.abort(), [])
+
+  const picked = collections.find(
+    (c) => c.name === collection && (database === undefined || (c.schema ?? "") === database),
+  )
+  // Collections from more than one database are grouped by database.
+  const databases = [...new Set(collections.map((c) => c.schema ?? ""))]
+  const grouped = databases.length > 1
 
   // Default to the first collection, and drop a pick that no longer exists.
   useEffect(() => {
     if (loadingCollections) return
-    if (collections.some((c) => c.name === collection)) return
-    onCollectionChange(collections[0]?.name ?? "")
-  }, [collections, collection, loadingCollections, onCollectionChange])
+    if (picked) return
+    onCollectionChange(collections[0]?.name ?? "", collections[0]?.schema || undefined)
+  }, [collections, picked, loadingCollections, onCollectionChange])
 
   const onKeyDown = (e: React.KeyboardEvent) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -184,6 +225,7 @@ export function DocumentExplorer({
   const docs = result?.documents ?? []
   const shownForCollection = result && result.collection === collection
   const canLoadMore = Boolean(result && nextPageParams(result))
+  const listFailed = Boolean(collectionsError) && !loadingCollections
 
   return (
     <div className="space-y-6">
@@ -207,20 +249,37 @@ export function DocumentExplorer({
               </Label>
               <select
                 id="doc-collection"
-                value={collection}
-                onChange={(e) => onCollectionChange(e.target.value)}
+                value={picked ? collectionKey(picked) : ""}
+                onChange={(e) => {
+                  const c = collections.find((x) => collectionKey(x) === e.target.value)
+                  if (c) onCollectionChange(c.name, c.schema || undefined)
+                }}
                 disabled={loadingCollections || collections.length === 0}
                 className={cn(
                   "h-9 w-full rounded-md border border-input bg-background px-2 text-sm",
                   error?.field === "collection" && "border-red-400",
                 )}
               >
-                {collections.length === 0 && <option value="">No collections</option>}
-                {collections.map((c) => (
-                  <option key={`${c.schema ?? ""}.${c.name}`} value={c.name}>
-                    {c.name}
-                  </option>
-                ))}
+                {collections.length === 0 && (
+                  <option value="">{listFailed ? "Collections could not be loaded" : "No collections"}</option>
+                )}
+                {grouped
+                  ? databases.map((db) => (
+                      <optgroup key={db} label={db || "(default)"}>
+                        {collections
+                          .filter((c) => (c.schema ?? "") === db)
+                          .map((c) => (
+                            <option key={collectionKey(c)} value={collectionKey(c)}>
+                              {c.name}
+                            </option>
+                          ))}
+                      </optgroup>
+                    ))
+                  : collections.map((c) => (
+                      <option key={collectionKey(c)} value={collectionKey(c)}>
+                        {c.name}
+                      </option>
+                    ))}
               </select>
             </div>
             <div className="space-y-1.5">
@@ -238,6 +297,26 @@ export function DocumentExplorer({
               />
             </div>
           </div>
+
+          {listFailed && collectionsError && (
+            <div
+              role="alert"
+              data-testid="doc-collections-error"
+              className="flex gap-2 rounded-md border border-red-200 bg-red-50 p-3 text-xs text-red-700 dark:border-red-900 dark:bg-red-950/40 dark:text-red-300"
+            >
+              <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+              <div className="min-w-0 space-y-1 break-words">
+                <div className="font-medium">Could not list the collections on this connection</div>
+                <div>{collectionsError.message}</div>
+                <div className="text-red-600/80 dark:text-red-300/80">{collectionsError.hint || COLLECTIONS_ERROR_HINT}</div>
+                {onRetryCollections && (
+                  <Button variant="outline" size="sm" className="mt-1 h-7 text-xs" onClick={onRetryCollections}>
+                    Retry
+                  </Button>
+                )}
+              </div>
+            </div>
+          )}
 
           <JsonInput
             id="doc-filter"
@@ -270,7 +349,7 @@ export function DocumentExplorer({
           </div>
 
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <span className="text-[11px] text-zinc-500">
+            <span className="text-[11px] text-zinc-500 dark:text-zinc-400">
               Cmd+Enter to run · the default _id order pages by cursor; a custom sort pages through the first 10,000
               documents
             </span>
@@ -304,7 +383,9 @@ export function DocumentExplorer({
                 {shownForCollection
                   ? `${docs.length} document${docs.length === 1 ? "" : "s"}${result.has_more ? " (more available)" : ""}` +
                     (result.execution_time_ms != null ? ` · ${result.execution_time_ms} ms` : "")
-                  : "Pick a collection to browse its documents"}
+                  : listFailed
+                    ? "No collections to browse until the connection problem above is fixed"
+                    : "Pick a collection to browse its documents"}
               </CardDescription>
             </div>
             <div className="flex items-center gap-1">
@@ -335,7 +416,7 @@ export function DocumentExplorer({
               <Loader2 className="h-5 w-5 animate-spin text-violet-500" />
             </div>
           ) : !result ? null : docs.length === 0 ? (
-            <div className="py-10 text-center text-sm text-zinc-500">No documents match this filter</div>
+            <div className="py-10 text-center text-sm text-zinc-500 dark:text-zinc-400">No documents match this filter</div>
           ) : view === "json" ? (
             <pre className="max-h-[560px] overflow-auto rounded-md border bg-zinc-50 p-3 text-xs dark:bg-zinc-900">
               {JSON.stringify(docs, null, 2)}

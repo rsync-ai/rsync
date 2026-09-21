@@ -34,6 +34,11 @@ RUN mkdir -p /app/shared/mcp-connectors
 # Copy entire build context (safe: per-connector version directory is small).
 COPY . /app/
 
+# Scope filter for server-level connections (no database named), from the
+# `shared` BuildKit named context (public/ root) — see
+# docker-compose.mcp.yml build.additional_contexts.
+COPY --from=shared namespace_filter.py /app/namespace_filter.py
+
 # Copy base_connector to shared location if present
 RUN if [ -f /app/base_connector.py ]; then \
     cp /app/base_connector.py /app/shared/mcp-connectors/; \

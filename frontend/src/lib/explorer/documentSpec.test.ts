@@ -41,6 +41,13 @@ describe("buildFindBody", () => {
     expect(buildFindBody({ ...base, sort: `"total"` })).toMatchObject({ ok: false, field: "sort" })
   })
 
+  it("names the database only when there is one", () => {
+    const b = buildFindBody({ ...base, database: " shop " })
+    expect(b.ok && JSON.parse(b.body)).toEqual({ connection_id: "conn-1", collection: "orders", database: "shop", limit: 50 })
+    const none = buildFindBody({ ...base, database: "  " })
+    expect(none.ok && JSON.parse(none.body)).not.toHaveProperty("database")
+  })
+
   it("escapes the collection name", () => {
     const b = buildFindBody({ ...base, collection: `we"ird` })
     expect(b.ok && JSON.parse(b.body).collection).toBe(`we"ird`)

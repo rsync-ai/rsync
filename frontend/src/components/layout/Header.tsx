@@ -41,7 +41,7 @@ import {
   Cable,
   ArrowRight,
 } from "lucide-react"
-import { cn } from "@/lib/utils"
+import { cn, formatDate } from "@/lib/utils"
 import { logout, getUserEmail } from "@/lib/auth"
 import { authFetch } from "@/lib/api/auth-fetch"
 import {
@@ -115,7 +115,7 @@ function formatRelativeTime(iso: string): string {
   if (hrs < 24) return `${hrs}h ago`
   const days = Math.floor(hrs / 24)
   if (days < 7) return `${days}d ago`
-  return new Date(then).toLocaleDateString()
+  return formatDate(iso)
 }
 
 export function Header({ user }: HeaderProps) {
@@ -380,14 +380,26 @@ export function Header({ user }: HeaderProps) {
       {mounted && workspaces.length > 0 && (
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
-            <Button variant="outline" size="sm" aria-label="Switch workspace" className="gap-1.5 max-w-[160px] sm:max-w-[200px]">
+            {/* 200px cut ordinary workspace names short (#56); the header row has
+                room for more, and the title shows a name that still doesn't fit.
+                The accessible name carries the visible name too (WCAG 2.5.3). */}
+            <Button
+              variant="outline"
+              size="sm"
+              aria-label={`Switch workspace (current: ${activeWorkspace?.name ?? "none"})`}
+              title={activeWorkspace?.name}
+              className="gap-1.5 max-w-[160px] sm:max-w-[320px]"
+            >
               <Building2 className="h-3.5 w-3.5 shrink-0 text-violet-500" />
               <span className="hidden sm:block truncate text-xs">{activeWorkspace?.name ?? "Workspace"}</span>
               <ChevronDown className="h-3 w-3 shrink-0 opacity-50" />
             </Button>
           </DropdownMenuTrigger>
-          <DropdownMenuContent align="start" className="w-56">
-            <DropdownMenuLabel className="text-xs text-zinc-500">Switch workspace</DropdownMenuLabel>
+          {/* Sized to the longest name (#56 retest: a fixed w-56 cut an e-mail-style
+              name to "jordan.ex…" once the Personal tag and check took their room),
+              capped so it never runs off a phone; the title keeps a longer name whole. */}
+          <DropdownMenuContent align="start" className="w-max min-w-56 max-w-[min(24rem,90vw)]">
+            <DropdownMenuLabel className="text-xs text-zinc-500 dark:text-zinc-400">Switch workspace</DropdownMenuLabel>
             <DropdownMenuSeparator />
             {/* The "Personal" tag is the only place the switcher distinguishes the
                 auto-provisioned identity-anchor workspace from a team one. Without it
@@ -396,7 +408,7 @@ export function Header({ user }: HeaderProps) {
             {workspaces.map((ws) => (
               <DropdownMenuItem key={ws.id} onClick={() => switchWorkspace(ws)} className="gap-2">
                 <Building2 className="h-3.5 w-3.5 text-zinc-400" />
-                <span className="flex-1 truncate text-sm">{ws.name}</span>
+                <span className="flex-1 truncate text-sm" title={ws.name}>{ws.name}</span>
                 {ws.is_personal && (
                   <span className="shrink-0 rounded bg-zinc-100 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-zinc-500 dark:bg-zinc-800 dark:text-zinc-400">
                     Personal
@@ -442,7 +454,7 @@ export function Header({ user }: HeaderProps) {
             <Button variant="ghost" size="icon-sm" className="relative" aria-label="Notifications">
               <Bell className="h-4 w-4" />
               {unreadCount > 0 && (
-                <span className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[10px] font-medium text-white">
+                <span className="absolute -right-1 -top-1 flex h-4 w-4 items-center justify-center rounded-full bg-red-600 text-[10px] font-medium text-white">
                   {unreadCount > 9 ? "9+" : unreadCount}
                 </span>
               )}
@@ -465,7 +477,7 @@ export function Header({ user }: HeaderProps) {
             <DropdownMenuSeparator />
             <div className="max-h-96 overflow-y-auto">
               {notifications.length === 0 ? (
-                <div className="p-4 text-center text-sm text-zinc-500">
+                <div className="p-4 text-center text-sm text-zinc-500 dark:text-zinc-400">
                   No new notifications
                 </div>
               ) : (
@@ -512,7 +524,7 @@ export function Header({ user }: HeaderProps) {
                         {formatRelativeTime(n.created_at)}
                       </p>
                       {n.message ? (
-                        <p className="mt-1 line-clamp-3 text-xs text-zinc-500">{n.message}</p>
+                        <p className="mt-1 line-clamp-3 text-xs text-zinc-500 dark:text-zinc-400">{n.message}</p>
                       ) : null}
                       {n.impact ? (
                         <p className="mt-1 line-clamp-2 text-xs text-zinc-600 dark:text-zinc-300">
@@ -620,7 +632,7 @@ export function Header({ user }: HeaderProps) {
                 {createdWorkspace.name} is ready
               </DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-zinc-500">
+            <p className="text-sm text-zinc-500 dark:text-zinc-400">
               You&apos;re the owner of this workspace. Here&apos;s how to get going:
             </p>
             <div className="space-y-2 py-1">
@@ -632,7 +644,7 @@ export function Header({ user }: HeaderProps) {
                 <UserPlus className="h-4 w-4 shrink-0 text-violet-500" />
                 <span className="flex-1">
                   <span className="block text-sm font-medium">Invite your team</span>
-                  <span className="block text-xs text-zinc-500">Add teammates and set their roles</span>
+                  <span className="block text-xs text-zinc-500 dark:text-zinc-400">Add teammates and set their roles</span>
                 </span>
                 <ArrowRight className="h-4 w-4 shrink-0 text-zinc-400" />
               </button>
@@ -644,7 +656,7 @@ export function Header({ user }: HeaderProps) {
                 <Cable className="h-4 w-4 shrink-0 text-violet-500" />
                 <span className="flex-1">
                   <span className="block text-sm font-medium">Create your first connection</span>
-                  <span className="block text-xs text-zinc-500">Connect a source to start a pipeline</span>
+                  <span className="block text-xs text-zinc-500 dark:text-zinc-400">Connect a source to start a pipeline</span>
                 </span>
                 <ArrowRight className="h-4 w-4 shrink-0 text-zinc-400" />
               </button>
@@ -664,7 +676,7 @@ export function Header({ user }: HeaderProps) {
                 New Workspace
               </DialogTitle>
             </DialogHeader>
-            <p className="text-sm text-zinc-500">
+            <p className="text-sm text-zinc-500 dark:text-zinc-400">
               A workspace keeps a team&apos;s connections, pipelines and runs together. You&apos;ll be its
               owner and can invite teammates with their own roles.
             </p>
@@ -679,7 +691,7 @@ export function Header({ user }: HeaderProps) {
                 autoFocus
               />
               {newWorkspaceName.trim() && (
-                <p data-testid="slug-preview" className="text-xs text-zinc-500">
+                <p data-testid="slug-preview" className="text-xs text-zinc-500 dark:text-zinc-400">
                   URL slug:{" "}
                   <code className="rounded bg-zinc-100 px-1 py-0.5 font-mono text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300">
                     {toWorkspaceSlug(newWorkspaceName)}

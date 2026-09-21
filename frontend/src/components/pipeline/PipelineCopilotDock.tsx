@@ -141,7 +141,7 @@ export function PipelineCopilotDock({
             <div className="text-sm font-semibold text-zinc-900 dark:text-white">
               Pipeline Copilot
             </div>
-            <div className="text-[10px] text-zinc-500 truncate">
+            <div className="text-[10px] text-zinc-500 dark:text-zinc-400 truncate">
               {pipelineName ?? "Live observability"}
             </div>
           </div>
@@ -149,7 +149,7 @@ export function PipelineCopilotDock({
         <button
           type="button"
           onClick={() => setOpen(false)}
-          className="shrink-0 p-1 rounded hover:bg-white/60 dark:hover:bg-zinc-800 text-zinc-500"
+          className="shrink-0 p-1 rounded hover:bg-white/60 dark:hover:bg-zinc-800 text-zinc-500 dark:text-zinc-400"
           aria-label="Close"
         >
           <ChevronRight className="h-4 w-4" />
@@ -186,7 +186,7 @@ export function PipelineCopilotDock({
 
       {/* Preset questions */}
       <div className="flex-1 overflow-y-auto p-3 space-y-1.5">
-        <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">
+        <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1">
           Suggested questions
         </div>
         {presetQuestions.map((q, i) => {

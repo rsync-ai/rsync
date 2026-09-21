@@ -68,8 +68,9 @@ func TestUpdatePipelineCDCTables_Success(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	defer sqlDB.Close()
+	prev := db.DB
 	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 	// Authorization gate is now requireResourceRole (workspace-role), not the old
 	// membership-only canAccessPipeline. It binds (resourceID, userID, activeWS)
 	// and returns the caller's role; "owner" satisfies the >= member requirement.
@@ -157,8 +158,9 @@ func TestUpdatePipelineCDCTables_NoConnectorPersistsSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	defer sqlDB.Close()
+	prev := db.DB
 	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 	mock.ExpectQuery(`SELECT wm\.role\s+FROM pipelines r`).
 		WithArgs(pipelineID, userID, "99999999-9999-9999-9999-999999999999").
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("owner"))
@@ -237,8 +239,9 @@ func TestUpdatePipelineCDCTables_ConnectUnreachableDoesNotPersist(t *testing.T) 
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	defer sqlDB.Close()
+	prev := db.DB
 	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 	mock.ExpectQuery(`SELECT wm\.role\s+FROM pipelines r`).
 		WithArgs(pipelineID, userID, "99999999-9999-9999-9999-999999999999").
 		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("owner"))
@@ -399,8 +402,9 @@ func TestUpdatePipelineCDCTables_BackfillNewlyAdded_TriggersOrchestrator(t *test
 	if err != nil {
 		t.Fatalf("sqlmock: %v", err)
 	}
-	defer sqlDB.Close()
+	prev := db.DB
 	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
 	// Authorization gate is now requireResourceRole (workspace-role), not the old
 	// membership-only canAccessPipeline. It binds (resourceID, userID, activeWS)
 	// and returns the caller's role; "owner" satisfies the >= member requirement.

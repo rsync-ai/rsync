@@ -54,6 +54,9 @@ ALLOWED = (
     "docs/",                            # the caveat lives here
     "INVENTORY.md",
     "CAPABILITIES.md",
+    # The ⚠️ row and the KI-PII-POLICIES-STORED-NOT-ENFORCED body that name the table
+    # moved here verbatim when CAPABILITIES.md became a one-line index (2026-09-16).
+    "CAPABILITIES-ARCHIVE.md",
     "BACKLOG.md",
     "PRODUCT_STATUS.md",
 )

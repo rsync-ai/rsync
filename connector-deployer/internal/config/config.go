@@ -16,7 +16,8 @@ import (
 type Config struct {
 	// Port is the HTTP listen port.
 	Port int
-	// Environment; "production"/"prod" ⇒ auth fails closed when the secret is unset.
+	// Environment; only "development"/"dev" lets a request through when the
+	// secret is unset. Anything else, including unset, fails closed.
 	Environment string
 	// InternalSecret is the S2S shared secret. Required in prod (fail-closed).
 	InternalSecret string
@@ -65,7 +66,7 @@ type Config struct {
 func Load() *Config {
 	c := &Config{
 		Port:              envInt("PORT", 5011),
-		Environment:       env("ENVIRONMENT", "development"),
+		Environment:       env("ENVIRONMENT", ""),
 		InternalSecret:    strings.TrimSpace(os.Getenv("INTERNAL_SERVICE_SECRET")),
 		Network:           env("DEPLOYER_DOCKER_NETWORK", "rsync-ai-mcp"),
 		MCPSharedNetwork:  env("MCP_SHARED_NETWORK", "rsync-ai-mcp"),
@@ -90,10 +91,13 @@ func Load() *Config {
 	return c
 }
 
-// IsProd reports whether auth must fail closed when the secret is unset.
-func (c *Config) IsProd() bool {
+// IsDev reports whether an unset secret may let a request through. It is true
+// only for an explicit "development"/"dev" (the dev compose). An unset
+// ENVIRONMENT is NOT dev: a container started without it must fail closed, not
+// open (same set as llm-service routes.py _DEV_ENVIRONMENTS).
+func (c *Config) IsDev() bool {
 	e := strings.ToLower(strings.TrimSpace(c.Environment))
-	return e == "production" || e == "prod"
+	return e == "development" || e == "dev"
 }
 
 // DeployerConfig returns the spec-layer view of this config — exactly the trusted

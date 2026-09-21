@@ -161,7 +161,7 @@ function UsagePageContent() {
       {loading ? (
         <LoadingState />
       ) : noWorkspace ? (
-        <Card className="p-6 text-sm text-zinc-500">
+        <Card className="p-6 text-sm text-zinc-500 dark:text-zinc-400">
           No workspace selected. Pick a workspace from the switcher in the header to see its usage.
         </Card>
       ) : error ? (
@@ -184,7 +184,7 @@ function UsagePageContent() {
               <div className="flex items-center gap-2">
                 <Gauge className="h-5 w-5 text-violet-600" />
                 <div>
-                  <div className="text-sm text-zinc-500">Current plan</div>
+                  <div className="text-sm text-zinc-500 dark:text-zinc-400">Current plan</div>
                   <div className="mt-0.5 flex items-center gap-2">
                     <Badge variant={planBadgeVariant(data.plan)} className="capitalize">
                       {data.plan}
@@ -198,7 +198,7 @@ function UsagePageContent() {
                 </div>
               </div>
               <div className="text-right text-sm">
-                <div className="text-zinc-500">Plan renews / expires</div>
+                <div className="text-zinc-500 dark:text-zinc-400">Plan renews / expires</div>
                 <div className="font-medium text-zinc-900 dark:text-white">
                   {data.plan_expires_at
                     ? `${fmtDate(data.plan_expires_at)}${expiryDays != null ? ` · ${expiryDays} day${expiryDays === 1 ? "" : "s"} left` : ""}`
@@ -210,7 +210,7 @@ function UsagePageContent() {
             <div className="mt-5">
               <div className="mb-1.5 flex items-center justify-between text-sm">
                 <span className="font-medium text-zinc-700 dark:text-zinc-300">Pipelines</span>
-                <span className="text-zinc-500">
+                <span className="text-zinc-500 dark:text-zinc-400">
                   {unlimited ? `${fmt(used)} used · unlimited` : `${fmt(used)} / ${fmt(limit!)} used`}
                 </span>
               </div>
@@ -224,7 +224,7 @@ function UsagePageContent() {
             <div className="mt-4">
               <div className="mb-1.5 flex items-center justify-between text-sm">
                 <span className="font-medium text-zinc-700 dark:text-zinc-300">Data transfer (this month)</span>
-                <span className="text-zinc-500">
+                <span className="text-zinc-500 dark:text-zinc-400">
                   {gbLimit == null
                     ? `${gbUsed.toFixed(2)} GB used · unlimited`
                     : `${gbUsed.toFixed(2)} / ${fmt(gbLimit)} GB`}
@@ -240,7 +240,7 @@ function UsagePageContent() {
             <div className="mt-4">
               <div className="mb-1.5 flex items-center justify-between text-sm">
                 <span className="font-medium text-zinc-700 dark:text-zinc-300">NL→SQL queries (this month)</span>
-                <span className="text-zinc-500">
+                <span className="text-zinc-500 dark:text-zinc-400">
                   {queriesLimit == null
                     ? `${fmt(queriesUsed)} used · unlimited`
                     : `${fmt(queriesUsed)} / ${fmt(queriesLimit)} queries`}
@@ -265,19 +265,19 @@ function UsagePageContent() {
 
             <div className="mt-4 grid gap-4 sm:grid-cols-3">
               <div className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-                <div className="text-sm text-zinc-500">Records processed</div>
+                <div className="text-sm text-zinc-500 dark:text-zinc-400">Records processed</div>
                 <div className="mt-1 text-2xl font-semibold text-zinc-900 dark:text-white">
                   {fmt(data.transfer.records_processed)}
                 </div>
               </div>
               <div className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-                <div className="text-sm text-zinc-500">Rows read (source)</div>
+                <div className="text-sm text-zinc-500 dark:text-zinc-400">Rows read (source)</div>
                 <div className="mt-1 text-2xl font-semibold text-zinc-900 dark:text-white">
                   {fmt(data.transfer.rows_read)}
                 </div>
               </div>
               <div className="rounded-lg border border-zinc-200 p-4 dark:border-zinc-800">
-                <div className="text-sm text-zinc-500">Rows written (dest)</div>
+                <div className="text-sm text-zinc-500 dark:text-zinc-400">Rows written (dest)</div>
                 <div className="mt-1 text-2xl font-semibold text-zinc-900 dark:text-white">
                   {fmt(data.transfer.rows_written)}
                 </div>
@@ -285,7 +285,7 @@ function UsagePageContent() {
             </div>
 
             {data.retention_enabled ? (
-              <div className="mt-3 text-xs text-zinc-500">
+              <div className="mt-3 text-xs text-zinc-500 dark:text-zinc-400">
                 Totals cover the last {data.retention_days} days (run-stat retention is enabled).
               </div>
             ) : null}
@@ -295,7 +295,7 @@ function UsagePageContent() {
           <Card className="p-0">
             <div className="border-b border-zinc-200 p-4 dark:border-zinc-800">
               <div className="font-semibold text-zinc-900 dark:text-white">Per-pipeline transfer</div>
-              <div className="text-sm text-zinc-500">Cumulative rows moved by each pipeline in this workspace.</div>
+              <div className="text-sm text-zinc-500 dark:text-zinc-400">Cumulative rows moved by each pipeline in this workspace.</div>
             </div>
             <div className="overflow-x-auto">
               <Table>
@@ -313,7 +313,7 @@ function UsagePageContent() {
                 <TableBody>
                   {data.pipelines.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={7} className="py-8 text-center text-sm text-zinc-500">
+                      <TableCell colSpan={7} className="py-8 text-center text-sm text-zinc-500 dark:text-zinc-400">
                         No pipelines in this workspace yet.
                       </TableCell>
                     </TableRow>
@@ -331,10 +331,10 @@ function UsagePageContent() {
                         <TableCell className="text-right tabular-nums">{fmt(p.records_processed)}</TableCell>
                         <TableCell className="text-right tabular-nums">{fmt(p.rows_read)}</TableCell>
                         <TableCell className="text-right tabular-nums">{fmt(p.rows_written)}</TableCell>
-                        <TableCell className="text-right tabular-nums text-zinc-500">
+                        <TableCell className="text-right tabular-nums text-zinc-500 dark:text-zinc-400">
                           {fmt(p.cdc_inserts)}/{fmt(p.cdc_updates)}/{fmt(p.cdc_deletes)}
                         </TableCell>
-                        <TableCell className="text-zinc-500">{fmtDate(p.last_activity)}</TableCell>
+                        <TableCell className="text-zinc-500 dark:text-zinc-400">{fmtDate(p.last_activity)}</TableCell>
                       </TableRow>
                     ))
                   )}

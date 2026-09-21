@@ -51,6 +51,17 @@ type ServerConfig struct {
 	// default (60s). Only relevant when RequireHTTP=true or the caller wants to
 	// be sure a Docker container is up before proceeding.
 	DeployWaitTimeout time.Duration
+	// NoStdioWhileDeploying is a per-request opt-in for interactive callers (the UI's
+	// Test Connection). When a deploy of the connector's container was requested and
+	// the container is still not reachable after DeployWaitTimeout, StartServer returns
+	// a *ConnectorDeployingError instead of falling back to a stdio subprocess — that
+	// subprocess runs on the orchestrator's interpreter, which has none of the
+	// connector's dependencies, so it can only fail with "No module named 'X'".
+	// The cold-build deadline extension is also capped at DeployWaitTimeout so the
+	// caller answers within its own HTTP budget. When no deploy was possible at all
+	// (no tool-generator — e.g. Docker-less Helm batch), stdio is still used.
+	// See KI-FIRST-CONNECTION-TEST-FALLS-BACK-TO-AN-UNUSABLE-STDIO-INTERPRETER.
+	NoStdioWhileDeploying bool
 }
 
 // JSONRPCRequest represents a JSON-RPC 2.0 request
@@ -83,6 +94,11 @@ type ExecuteRequest struct {
 	Operation string                 `json:"operation"` // e.g., "query", "execute"
 	Config    map[string]string      `json:"config"`    // Connection config
 	Params    map[string]interface{} `json:"params"`    // Operation parameters
+
+	// NoStdioWhileDeploying / DeployWaitTimeout are forwarded to ServerConfig
+	// (see there). In-process only; never serialized.
+	NoStdioWhileDeploying bool          `json:"-"`
+	DeployWaitTimeout     time.Duration `json:"-"`
 }
 
 // ExecuteResponse represents the response from an MCP operation

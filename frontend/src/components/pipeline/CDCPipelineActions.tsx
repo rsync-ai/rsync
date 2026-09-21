@@ -320,9 +320,16 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
   // live connector and left Delete as the sole way to end the stream. So: the recovery
   // cluster below keeps using `effectiveStatus` (reacting to the dependency-aware phase
   // is its entire job), while Pause uses `liveStatus` — anything actually streaming can
-  // always be stopped. When the two disagree, both render, which is the honest answer:
-  // "this may be stuck — recover it, or stop it."
-  const canPause = liveStatus === "running" || liveStatus === "waiting_for_user"
+  // always be stopped. When the two disagree over a quiet stream (idle), both render,
+  // which is the honest answer: "this may be stuck — recover it, or stop it."
+  //
+  // Failed is the exception. The raw state still says running while a dependency it
+  // needs is dead (the runtime phase is what knows that), and Pause beside the
+  // "Resume" of the recovery cluster read as a contradiction on a pipeline whose
+  // badge says Failed (prod retest). A failed stream is not moving data to pause; its
+  // actions are the recovery ones.
+  const canPause =
+    (liveStatus === "running" || liveStatus === "waiting_for_user") && effectiveStatus !== "failed"
   // Unhealthy = the change stream broke (failed) or went stale (idle). These states
   // get the "Restart CDC" rung (bounce the connector without touching data).
   const isUnhealthy = effectiveStatus === "failed" || effectiveStatus === "idle"
@@ -486,7 +493,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
             <AlertDialogAction
               onClick={handleReloadConfirmed}
               disabled={isLoading}
-              className="bg-amber-600 hover:bg-amber-700 text-white font-medium"
+              className="bg-amber-700 hover:bg-amber-800 text-white font-medium"
             >
               <RefreshCw className="h-4 w-4 mr-2" />
               Reload
@@ -517,7 +524,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
                   <dl className="rounded-lg border border-zinc-200 dark:border-zinc-800 divide-y divide-zinc-100 dark:divide-zinc-800 text-sm">
                     {recoverPlan.connector_name ? (
                       <div className="flex justify-between gap-4 px-3 py-2">
-                        <dt className="text-zinc-500">Connector</dt>
+                        <dt className="text-zinc-500 dark:text-zinc-400">Connector</dt>
                         <dd className="font-medium text-zinc-800 dark:text-zinc-200 truncate">
                           {recoverPlan.connector_name}
                         </dd>
@@ -525,7 +532,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
                     ) : null}
                     {recoverPlan.connector_state ? (
                       <div className="flex justify-between gap-4 px-3 py-2">
-                        <dt className="text-zinc-500">Current state</dt>
+                        <dt className="text-zinc-500 dark:text-zinc-400">Current state</dt>
                         <dd className="font-medium text-zinc-800 dark:text-zinc-200">
                           {recoverPlan.connector_state}
                         </dd>
@@ -533,7 +540,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
                     ) : null}
                     {recoverPlan.snapshot_mode ? (
                       <div className="flex justify-between gap-4 px-3 py-2">
-                        <dt className="text-zinc-500">Snapshot mode</dt>
+                        <dt className="text-zinc-500 dark:text-zinc-400">Snapshot mode</dt>
                         <dd className="font-medium text-zinc-800 dark:text-zinc-200">
                           {recoverPlan.snapshot_mode}
                         </dd>
@@ -541,14 +548,14 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
                     ) : null}
                     {typeof recoverPlan.table_count === "number" ? (
                       <div className="flex justify-between gap-4 px-3 py-2">
-                        <dt className="text-zinc-500">Tables</dt>
+                        <dt className="text-zinc-500 dark:text-zinc-400">Tables</dt>
                         <dd className="font-medium text-zinc-800 dark:text-zinc-200">
                           {recoverPlan.table_count}
                         </dd>
                       </div>
                     ) : null}
                     <div className="flex justify-between gap-4 px-3 py-2">
-                      <dt className="text-zinc-500">Reset offsets</dt>
+                      <dt className="text-zinc-500 dark:text-zinc-400">Reset offsets</dt>
                       <dd className="font-medium text-zinc-800 dark:text-zinc-200">
                         {recoverPlan.reset_offsets ? "Yes" : "No"}
                       </dd>
@@ -588,6 +595,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
           }
         }}
         report={assessmentReport}
+        assessmentTabHref={`/pipelines/${pipelineId}?tab=assessment`}
         submitting={submittingProceed}
         onProceed={async (nominatedKeys) => {
           setSubmittingProceed(true)

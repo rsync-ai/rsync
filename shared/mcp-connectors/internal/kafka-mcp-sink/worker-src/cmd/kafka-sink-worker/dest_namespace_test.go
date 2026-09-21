@@ -204,7 +204,7 @@ func batchMessage(destType, namespace string, destCfg map[string]interface{}) (*
 func TestBatchWriteForwardsDestinationNamespace(t *testing.T) {
 	client, ct := nsTestClient()
 	cfg, sm, rows := batchMessage("mongodb", "postgres_test", map[string]interface{}{"database": "appdb"})
-	if _, _, err := writeToDestination(context.Background(), client, cfg, nil, sm, rows, "", ""); err != nil {
+	if _, _, err := writeToDestination(context.Background(), client, cfg, nil, sm, rows, "", "", nil); err != nil {
 		t.Fatalf("writeToDestination errored: %v", err)
 	}
 	tool, args := ct.lastArgs(t)
@@ -229,7 +229,7 @@ func TestBatchWriteOmitsNamespaceWhenNotReal(t *testing.T) {
 	for _, ns := range []string{"", "   ", "default", "DEFAULT"} {
 		client, ct := nsTestClient()
 		cfg, sm, rows := batchMessage("mongodb", ns, map[string]interface{}{"database": "appdb"})
-		if _, _, err := writeToDestination(context.Background(), client, cfg, nil, sm, rows, "", ""); err != nil {
+		if _, _, err := writeToDestination(context.Background(), client, cfg, nil, sm, rows, "", "", nil); err != nil {
 			t.Fatalf("writeToDestination(ns=%q) errored: %v", ns, err)
 		}
 		_, args := ct.lastArgs(t)
@@ -249,7 +249,7 @@ func TestBatchObjectStorageStillDoesNotForwardNamespace(t *testing.T) {
 	client, ct := nsTestClient()
 	cfg, sm, rows := batchMessage("gcs", "postgres_test",
 		map[string]interface{}{"bucket": "b", "path_prefix": "bronze"})
-	if _, _, err := writeToDestination(context.Background(), client, cfg, nil, sm, rows, "", ""); err != nil {
+	if _, _, err := writeToDestination(context.Background(), client, cfg, nil, sm, rows, "", "", nil); err != nil {
 		t.Fatalf("writeToDestination(gcs) errored: %v", err)
 	}
 	_, args := ct.lastArgs(t)

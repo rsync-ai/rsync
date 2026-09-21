@@ -304,11 +304,12 @@ already sets the value explicitly, and the in-chart broker below is knowable.
 {{/* ── Shared env blocks ───────────────────────────────────────────────────── */}}
 
 {{/*
-Every service. ENVIRONMENT is set explicitly and never left to default: the Go
-default is "development" (connector-deployer/internal/config/config.go:61) and
-that default unlocks a warn-and-allow branch on the deploy path. A hand-written
-Deployment that omits it re-opens that branch silently, which is exactly why it
-is spelled out here rather than inherited.
+Every service. ENVIRONMENT is set explicitly and never left to default. The
+deploy path's warn-and-allow branch (secret unset) opens only for an explicit
+ENVIRONMENT=development/dev (connector-deployer config.IsDev, llm-service
+routes.py _DEV_ENVIRONMENTS); an omitted ENVIRONMENT fails closed there, but
+other services still read it (CSRF, requirePrincipal), so it is spelled out here
+rather than inherited.
 */}}
 {{- define "rsync-ai.commonEnv" -}}
 - name: ENVIRONMENT
@@ -381,12 +382,13 @@ about how to authenticate against the same cluster.
 `fail` rather than a default, because every wrong answer here is silent at
 render time and surfaces as a login-module error deep in a broker handshake.
 
-This is also the chart's mechanism ALLOWLIST, and templates/validate.yaml
-invokes it for exactly that -- discarding the output -- so an unsupported
-mechanism is rejected even when the CDC plane is disabled and nothing else
-would have called it. One definition, one message, no ordering dependence:
-helm renders connectors/cdc.yaml before validate.yaml, so a duplicate guard
-in validate.yaml would never be the one the operator sees.
+Its only caller is templates/validate.yaml, which invokes it as the chart's
+mechanism ALLOWLIST -- discarding the output -- so an unsupported mechanism is
+rejected at render time rather than by a pod at runtime. The module names are
+applied in the containers: the kafka-connect image's entrypoint
+(shared/internal/infra/kafka-connect/connect-entrypoint.sh) and the kafka-init
+job each carry their own copy, and test_kafka_init_builders_stay_in_lockstep.py
+pins every copy to the same mapping.
 */}}
 {{- define "rsync-ai.kafka.saslLoginModule" -}}
 {{- $m := .Values.kafka.external.saslMechanism | upper -}}
@@ -408,11 +410,55 @@ a username/password pair. Non-empty for true, empty for false, so it composes
 with `if`/`and` like the TLS predicates above.
 
 Worth a helper rather than an inline `eq`: the distinction changes what the env
-block emits, what validate.yaml demands, and the shape of the JAAS line in two
-shell preludes. Five inline comparisons is five places to forget one.
+block emits, what validate.yaml demands, and the shape of the JAAS line kafka-init
+builds. Five inline comparisons is five places to forget one.
 */}}
 {{- define "rsync-ai.kafka.isTokenMechanism" -}}
 {{- if eq (.Values.kafka.external.saslMechanism | default "" | upper) "OAUTHBEARER" -}}true{{- end -}}
+{{- end -}}
+
+{{/*
+Is the configured OAuth token endpoint one that would put the client secret on
+a wire? Returns "insecure" (truthy) or "" (falsy); the caller supplies the URL.
+
+The client-credentials grant POSTs clientSecret as a form field on EVERY token
+fetch, so an http hop does not merely leak the short-lived bearer token it buys
+-- it hands out the long-lived credential that mints them, to anyone on the
+path, and no broker-side setting can repair that. Hence a refusal and not a
+warning.
+
+Loopback is exempt because the request never leaves the pod: it is what
+Google's Workload Identity token sidecar (localhost:14293) needs. The exemption
+is by PARSED HOST, not by substring -- `http://127.0.0.1.evil.example.com/` and
+`http://localhost.evil.example.com/` are ordinary public names that merely read
+as loopback, and both are refused.
+
+Mirrored by four other implementations, which is why the behaviour is pinned by
+a lockstep test rather than trusted to review:
+  * Go     shared/go/kafkaclient/config.go tokenEndpointIsInsecure
+  * Python llm-service/src/utils/kafka_security.py _token_endpoint_is_insecure
+  *        shared/mcp-connectors/internal/debezium/versions/v1.0.0/connector.py
+  * shell  scripts/kafka-init-new-topics.sh, docker-compose.quickstart.yml,
+           jobs/kafka-init.yaml, kafka-connect/connect-entrypoint.sh
+Assumes an http(s) scheme; validate.yaml rejects any other scheme first.
+*/}}
+{{- define "rsync-ai.kafka.insecureTokenEndpoint" -}}
+{{- $lower := . | lower -}}
+{{- if not (hasPrefix "http://" $lower) -}}
+{{- else -}}
+{{- $hostport := $lower | trimPrefix "http://" | splitList "/" | first | splitList "?" | first | splitList "@" | last -}}
+{{- $host := "" -}}
+{{- if hasPrefix "[" $hostport -}}
+{{- $host = $hostport | trimPrefix "[" | splitList "]" | first -}}
+{{- else -}}
+{{- $host = $hostport | splitList ":" | first -}}
+{{- end -}}
+{{- $host = $host | trimSuffix "." -}}
+{{- if or (eq $host "localhost") (hasSuffix ".localhost" $host) (eq $host "::1") (eq $host "0:0:0:0:0:0:0:1") (regexMatch "^127(\\.[0-9]{1,3}){3}$" $host) -}}
+{{- else -}}
+insecure
+{{- end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -600,6 +646,17 @@ environment -- see debezium_schema_history_security().
 */}}
 - name: KAFKA_SASL_OAUTHBEARER_LOGIN_CALLBACK_HANDLER
   value: {{ include "rsync-ai.kafka.oauthLoginCallbackHandler" . | quote }}
+{{/*
+Emitted ONLY when the operator opted in, so the common case ships no variable
+at all and the containers' own refusal stays armed. validate.yaml has already
+refused this combination at render time; this carries the same decision to the
+runtime check, which is the one that sees an endpoint injected through
+secrets.existingSecret or extraEnv.
+*/}}
+{{- if (.Values.kafka.external.oauth | default dict).allowInsecureTokenEndpoint }}
+- name: KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT
+  value: "true"
+{{- end }}
 {{- else }}
 - name: KAFKA_SASL_USERNAME
   value: {{ .Values.kafka.external.saslUsername | quote }}

@@ -243,7 +243,9 @@ def test_debezium_history_presents_the_client_keypair_as_one_PEM_file(monkeypatc
     (ssl_certfile + ssl_keyfile). A JVM cannot: there is no way to hand it the
     halves separately. So the chart mounts a third file -- cert and key
     concatenated -- and names it in KAFKA_SSL_KEYSTORE_LOCATION, and this is the
-    only consumer of that variable.
+    only consumer of that variable. (Given only the pair, the kafka-connect
+    image builds that file itself; test_debezium_schema_history_parity.py pins
+    that path.)
 
     Getting this wrong is silent in the direction that matters: with no keystore
     the Connect worker presents no certificate, the REST API still reports the
@@ -279,7 +281,10 @@ def test_debezium_history_omits_the_keystore_when_the_chart_did_not_mount_one(mo
     monkeypatch.setenv("KAFKA_SASL_USERNAME", "u")
     monkeypatch.setenv("KAFKA_SASL_PASSWORD", "p")
     monkeypatch.setenv("KAFKA_SSL_CA_LOCATION", "/etc/rsync-ai/kafka-tls/ca.crt")
-    monkeypatch.delenv("KAFKA_SSL_KEYSTORE_LOCATION", raising=False)
+    # The pair counts too: with it, the history client is pointed at the file the
+    # Connect image builds from it (test_debezium_schema_history_parity.py).
+    for var in ("KAFKA_SSL_KEYSTORE_LOCATION", "KAFKA_SSL_CERT_LOCATION", "KAFKA_SSL_KEY_LOCATION"):
+        monkeypatch.delenv(var, raising=False)
 
     props = debezium_schema_history_security()
     assert not [k for k in props if "keystore" in k], (

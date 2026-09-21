@@ -1,0 +1,33 @@
+{
+  "_comment": "Source types that use PostgreSQL logical replication: the orchestrator creates the publication before the slot and Debezium publication.autocreate.mode stays 'disabled' for every one of them (CLAUDE.md CDC rule). 'members' are the normalised names (lower case, '-' -> '_'); 'aliases' are raw names that normalise onto a member. Go postgresFamilyTypes (backend-orchestrator/internal/agents/executor/hybrid_cdc.go) must equal 'members'; Python CDCConfigGenerator.POSTGRES_FAMILY must equal members + alias keys, since it lower-cases but does not map aliases. Tests: executor/postgres_family_golden_test.go, llm-service/tests/test_postgres_family_golden.py.",
+  "members": [
+    "postgresql",
+    "cockroachdb",
+    "cockroach_db",
+    "aurora_postgresql",
+    "alloydb",
+    "neon",
+    "supabase"
+  ],
+  "aliases": {
+    "postgres": "postgresql"
+  },
+  "raw_members": [
+    "PostgreSQL",
+    "postgres",
+    "aurora-postgresql",
+    "cockroach-db",
+    "AlloyDB",
+    "Neon",
+    "Supabase"
+  ],
+  "non_members": [
+    "mysql",
+    "mariadb",
+    "mongodb",
+    "oracle",
+    "sqlserver",
+    "snowflake",
+    ""
+  ]
+}

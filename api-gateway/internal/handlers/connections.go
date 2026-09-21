@@ -466,6 +466,9 @@ type UpdateConnectionRequest struct {
 	Config           map[string]interface{} `json:"config"`
 	Status           string                 `json:"status"`
 	ConnectorVersion string                 `json:"connector_version"` // Optional: upgrade connector version
+	// ForceSave skips the pre-save connectivity test that runs when the edit
+	// changes the config — the same opt-out CreateConnectionRequest offers.
+	ForceSave bool `json:"force_save"`
 }
 
 // TestConnectionRequest for testing a connection
@@ -890,6 +893,12 @@ func CreateConnection(c *gin.Context) {
 		return
 	}
 
+	// A config copied from a GET response carries placeholders, not secrets.
+	if path := findMaskedPlaceholder(req.Config, ""); path != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("%s still holds the masked placeholder; enter the real value", path)})
+		return
+	}
+
 	// Convert config to JSON
 	configJSON, err := json.Marshal(req.Config)
 	if err != nil {
@@ -987,6 +996,17 @@ func CreateConnection(c *gin.Context) {
 					"message":  "Connectivity test could not complete (request cancelled or timed out). Retry, or set force_save=true to bypass.",
 					"trace_id": traceID,
 				})
+				return
+			}
+			// The connector's container is still being built/started on demand:
+			// not a verdict on the credentials, so answer retryable, not 422.
+			if isConnectorDeployingMessage(testErr) {
+				log.WithFields(log.Fields{
+					"trace_id":       traceID,
+					"user_id":        userID,
+					"connector_type": req.ConnectorType,
+				}).Warn("CreateConnection not saved: connector still deploying, returning a retryable response")
+				respondConnectorDeployingOnSave(c, traceID, testErr)
 				return
 			}
 			// OAuth activation grace. When the connection was just authorized via
@@ -1191,7 +1211,7 @@ func UpdateConnection(c *gin.Context) {
 	argIdx := 1
 
 	if req.Name != "" {
-		updates = append(updates, "name = $"+string(rune('0'+argIdx)))
+		updates = append(updates, "name = $"+strconv.Itoa(argIdx))
 		args = append(args, req.Name)
 		argIdx++
 	}
@@ -1200,67 +1220,60 @@ func UpdateConnection(c *gin.Context) {
 	// Field omitted in JSON → leave existing; field present → write the value
 	// (including empty string).
 	if req.Description != nil {
-		updates = append(updates, "description = $"+string(rune('0'+argIdx)))
+		updates = append(updates, "description = $"+strconv.Itoa(argIdx))
 		args = append(args, *req.Description)
 		argIdx++
 	}
 
+	// configChanged / testConfig drive the pre-save connectivity test below.
+	// They are only set when the edit actually changes the stored config, so a
+	// rename or description edit never re-tests (or blocks on) the connection.
+	configChanged := false
+	var testConfig map[string]interface{}
 	if req.Config != nil {
-		// Fetch existing config to merge with new config (preserve empty password fields)
+		// Fetch the existing config so secrets the API masked can be carried over.
 		var existingConfigEncrypted string
-		err := database.QueryRow("SELECT config FROM connections WHERE id = $1 AND workspace_id = $2", connectionID, wsID).Scan(&existingConfigEncrypted)
-
-		mergedConfig := req.Config
-		if err == nil {
-			// Decrypt existing config
-			existingConfigJSON, err := crypto.DecryptString(existingConfigEncrypted)
-			if err == nil {
-				// Log credential access for config update/merge
-				logConnectionAccess(c, connectionID, "update_config", true, "")
-
-				var existingConfig map[string]interface{}
-				json.Unmarshal([]byte(existingConfigJSON), &existingConfig)
-
-				// Merge: keep existing values for empty password/secret fields
-				// IMPORTANT:
-				// The API response masks secrets as "••••••••" (see maskSensitiveFields()).
-				// When users edit a connection, the UI often sends these masked values back.
-				// We must treat masked placeholders as "unchanged" and preserve the existing secret.
-				isMaskedOrEmpty := func(v interface{}) bool {
-					s, ok := v.(string)
-					if !ok {
-						return false
-					}
-					s = strings.TrimSpace(s)
-					return s == "" || s == "********" || s == "••••••••"
-				}
-
-				sensitiveFields := []string{
-					"password",
-					"secret_key",
-					"api_key",
-					"token",
-					"security_token",
-					"credentials_json",
-					// OAuth
-					"client_secret",
-					"access_token",
-					"refresh_token",
-					// Cloud creds (some UIs mask these too)
-					"secret_access_key",
-					"access_key_id",
-				}
-				for _, field := range sensitiveFields {
-					if newVal, exists := req.Config[field]; !exists || isMaskedOrEmpty(newVal) {
-						if existingVal, hasExisting := existingConfig[field]; hasExisting {
-							mergedConfig[field] = existingVal
-						}
-					}
-				}
-			} else {
-				logConnectionAccess(c, connectionID, "update_config", false, "decrypt_failed")
+		var storedConnectorVersion sql.NullString
+		if err := database.QueryRow("SELECT config, connector_version FROM connections WHERE id = $1 AND workspace_id = $2", connectionID, wsID).Scan(&existingConfigEncrypted, &storedConnectorVersion); err != nil {
+			if err == sql.ErrNoRows {
+				c.JSON(http.StatusNotFound, gin.H{"error": "Connection not found"})
+				return
 			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to load connection"})
+			return
 		}
+
+		var existingConfig map[string]interface{}
+		if existingConfigJSON, err := crypto.DecryptString(existingConfigEncrypted); err == nil {
+			// Log credential access for config update/merge
+			logConnectionAccess(c, connectionID, "update_config", true, "")
+			if err := json.Unmarshal([]byte(existingConfigJSON), &existingConfig); err != nil {
+				log.WithError(err).Warnf("UpdateConnection: stored config for %s is not a JSON object", connectionID)
+			}
+		} else {
+			logConnectionAccess(c, connectionID, "update_config", false, "decrypt_failed")
+		}
+
+		// The API masks every secret as "••••••••" (maskSensitiveFields) and the
+		// edit form sends those placeholders back, or blanks for "leave blank to
+		// keep existing". Carry the stored value over for every key the masking
+		// hides — decided by the same isSensitiveConfigKey, at every depth — so an
+		// edit can never overwrite a secret with its own placeholder or with "".
+		mergedConfig := mergePreservingMaskedSecrets(existingConfig, req.Config)
+
+		// If a placeholder survived the merge (stored config unreadable, or the
+		// secret was never stored), persisting it would replace a credential with
+		// the literal mask glyph. Refuse instead.
+		if path, found := findUnresolvedMaskedSecret(mergedConfig, ""); found {
+			c.JSON(http.StatusUnprocessableEntity, gin.H{
+				"error":   "secret_required",
+				"message": fmt.Sprintf("The saved value for %q could not be kept. Re-enter it and save again.", path),
+				"field":   path,
+			})
+			return
+		}
+
+		configChanged = !configsEquivalent(existingConfig, mergedConfig)
 
 		// When the caller provides an explicit oauth_token_id (not masked/empty),
 		// clear stale token fields before enrichment so the new oauth_token_id
@@ -1269,7 +1282,7 @@ func UpdateConnection(c *gin.Context) {
 		if tokenIDVal, exists := req.Config["oauth_token_id"]; exists {
 			if s, ok := tokenIDVal.(string); ok {
 				s = strings.TrimSpace(s)
-				if s != "" && s != "••••••••" && s != "********" {
+				if s != "" && !isMaskedPlaceholder(s) {
 					delete(mergedConfig, "access_token")
 					delete(mergedConfig, "refresh_token")
 				}
@@ -1286,13 +1299,29 @@ func UpdateConnection(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to encrypt config"})
 			return
 		}
-		updates = append(updates, "config = $"+string(rune('0'+argIdx)))
+		updates = append(updates, "config = $"+strconv.Itoa(argIdx))
 		args = append(args, configEncrypted)
 		argIdx++
+
+		if configChanged {
+			// Test a copy: connector_version routes the test to the MCP container
+			// the connection is pinned to, and must not be persisted into config.
+			testConfig = make(map[string]interface{}, len(mergedConfig)+1)
+			for k, v := range mergedConfig {
+				testConfig[k] = v
+			}
+			if _, has := testConfig["connector_version"]; !has {
+				if req.ConnectorVersion != "" {
+					testConfig["connector_version"] = req.ConnectorVersion
+				} else if storedConnectorVersion.Valid && strings.TrimSpace(storedConnectorVersion.String) != "" {
+					testConfig["connector_version"] = storedConnectorVersion.String
+				}
+			}
+		}
 	}
 
 	if req.Status != "" {
-		updates = append(updates, "status = $"+string(rune('0'+argIdx)))
+		updates = append(updates, "status = $"+strconv.Itoa(argIdx))
 		args = append(args, req.Status)
 		argIdx++
 	}
@@ -1332,12 +1361,108 @@ func UpdateConnection(c *gin.Context) {
 			return
 		}
 
-		updates = append(updates, "connector_version = $"+string(rune('0'+argIdx)))
+		updates = append(updates, "connector_version = $"+strconv.Itoa(argIdx))
 		args = append(args, req.ConnectorVersion)
 		argIdx++
 	}
 
-	updates = append(updates, "updated_at = $"+string(rune('0'+argIdx)))
+	// Pre-save connectivity test for an edited config, mirroring CreateConnection.
+	// Without it an edit that breaks the credentials saved silently and kept the
+	// old last_test_status='success', so the connection still read as healthy.
+	// The stored verdict describes the OLD config, so a changed config always
+	// rewrites it: 'success' on a clean pass, NULL when the test was skipped
+	// (force_save, internal connector, OAuth soft-pass).
+	if configChanged {
+		traceID := getTraceID(c)
+		testPassed := false
+		if req.ForceSave {
+			log.WithFields(log.Fields{
+				"trace_id":       traceID,
+				"user_id":        userID,
+				"connection_id":  connectionID,
+				"connector_type": existingConnectorType,
+			}).Info("UpdateConnection: force_save=true, skipping pre-save connectivity test")
+		} else if !isInternalConnectorType(existingConnectorType) {
+			// 90s: must outlast the orchestrator's 60s cold-start container wait
+			// (see CreateConnection).
+			ctx, cancel := context.WithTimeout(c.Request.Context(), 90*time.Second)
+			ok, testErr := performConnectionTest(ctx, existingConnectorType, testConfig)
+			ctxErr := ctx.Err()
+			cancel()
+			if !ok {
+				if ctxErr != nil {
+					log.WithError(ctxErr).WithFields(log.Fields{
+						"trace_id":       traceID,
+						"connection_id":  connectionID,
+						"connector_type": existingConnectorType,
+					}).Warn("UpdateConnection: pre-save test interrupted by ctx cancellation")
+					c.JSON(http.StatusServiceUnavailable, gin.H{
+						"error":    "connection_test_interrupted",
+						"message":  "Connectivity test could not complete (request cancelled or timed out). Retry, or set force_save=true to bypass.",
+						"trace_id": traceID,
+					})
+					return
+				}
+				// Connector still deploying — retryable, same as CreateConnection.
+				if isConnectorDeployingMessage(testErr) {
+					log.WithFields(log.Fields{
+						"trace_id":       traceID,
+						"connection_id":  connectionID,
+						"connector_type": existingConnectorType,
+					}).Warn("UpdateConnection not saved: connector still deploying, returning a retryable response")
+					respondConnectorDeployingOnSave(c, traceID, testErr)
+					return
+				}
+				// OAuth activation grace — same soft-pass as CreateConnection.
+				oauthBacked := false
+				if v, exists := testConfig["oauth_token_id"]; exists {
+					if s, ok2 := v.(string); ok2 && strings.TrimSpace(s) != "" {
+						oauthBacked = true
+					}
+				}
+				if oauthBacked && isOAuthAuthError(fmt.Sprintf("%v", testErr)) {
+					log.WithFields(log.Fields{
+						"trace_id":       traceID,
+						"connection_id":  connectionID,
+						"connector_type": existingConnectorType,
+						"error":          llmscrub.Scrub(testErr),
+					}).Warn("UpdateConnection: OAuth pre-save test returned an auth error — saving anyway (likely provider token-activation lag)")
+				} else {
+					log.WithFields(log.Fields{
+						"trace_id":       traceID,
+						"connection_id":  connectionID,
+						"connector_type": existingConnectorType,
+						"error":          llmscrub.Scrub(testErr),
+					}).Warn("UpdateConnection rejected: pre-save connectivity test failed")
+					c.JSON(http.StatusUnprocessableEntity, gin.H{
+						"error":      "connection_test_failed",
+						"message":    "Connectivity test failed, so the changes were not saved. Fix the settings and try again, or set force_save=true to save anyway.",
+						"test_error": llmscrub.Scrub(testErr),
+						"trace_id":   traceID,
+					})
+					return
+				}
+			}
+			testPassed = ok
+		}
+
+		var lastTestStatus, lastTestedAt interface{}
+		if testPassed {
+			lastTestStatus = "success"
+			lastTestedAt = time.Now()
+		}
+		updates = append(updates, "last_tested_at = $"+strconv.Itoa(argIdx))
+		args = append(args, lastTestedAt)
+		argIdx++
+		updates = append(updates, "last_test_status = $"+strconv.Itoa(argIdx))
+		args = append(args, lastTestStatus)
+		argIdx++
+		updates = append(updates, "last_test_error = $"+strconv.Itoa(argIdx))
+		args = append(args, nil)
+		argIdx++
+	}
+
+	updates = append(updates, "updated_at = $"+strconv.Itoa(argIdx))
 	args = append(args, time.Now())
 	argIdx++
 
@@ -1355,7 +1480,7 @@ func UpdateConnection(c *gin.Context) {
 		}
 		query += update
 	}
-	query += " WHERE id = $" + string(rune('0'+argIdx)) + " AND workspace_id = $" + string(rune('0'+argIdx+1))
+	query += " WHERE id = $" + strconv.Itoa(argIdx) + " AND workspace_id = $" + strconv.Itoa(argIdx+1)
 
 	result, err := database.Exec(query, args...)
 	if err != nil {
@@ -1367,6 +1492,17 @@ func UpdateConnection(c *gin.Context) {
 	if rowsAffected == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Connection not found"})
 		return
+	}
+
+	// The persisted verdict changed, so the connector_type's cached lifecycle
+	// (draft vs preview, KI-CONN-TEST-DRAFT) may be stale either way. The cached
+	// schema belongs to the old settings too: without dropping it, fixing a bad
+	// host would keep showing the old table list for the cache TTL.
+	if configChanged {
+		invalidateLifecycleCache(existingConnectorType)
+		if schemaCache != nil {
+			_ = schemaCache.Invalidate(c.Request.Context(), connectionID)
+		}
 	}
 
 	// Log audit with old/new version if connector_version was changed
@@ -1410,7 +1546,140 @@ func UpdateConnection(c *gin.Context) {
 	})
 }
 
-// DeleteConnection deletes a connection
+// pipelineNeedsConnection is the WHERE predicate, over pipelines with the connection id
+// as $1, for a pipeline that blocks deleting that connection. An archived pipeline does
+// not, unless it still holds CDC resources that were never dropped ('failed' is a drop
+// that did not happen): cdc_resources rows cascade with the connection, so deleting it
+// would erase the only record of the slot to drop. Deleting the pipeline runs cleanup
+// and clears the block.
+const pipelineNeedsConnection = `(source_connection_id = $1 OR destination_connection_id = $1)
+			AND (status != 'archived' OR EXISTS (
+				SELECT 1 FROM cdc_resources r
+				WHERE r.pipeline_id = pipelines.id AND r.status <> 'deleted'))`
+
+// cdcSourceObjectUnreleased is the WHERE predicate, over cdc_resources aliased cr with
+// the connection id as $1, for a replication slot or publication created on this
+// connection's source database that nothing has dropped yet. Only 'deleted' means
+// dropped: 'failed' is a drop that did not happen, and 'active', 'inactive' and
+// 'orphaned' were never dropped. The CDC reconciler drops leftovers every few minutes,
+// but it finds them through these rows, and the rows cascade away with the connection
+// (cdc_resources.connection_id ON DELETE CASCADE, migration 026). Deleting the
+// connection first leaves the slot on the source holding WAL with no record left of it.
+//
+// Only these two types hold anything on the source. Bookkeeping rows (the MySQL
+// server_id reservation, the hybrid backfill marker) have nothing to drop, and sources
+// without slots, such as MongoDB, never get these rows, so they are never blocked.
+const cdcSourceObjectUnreleased = `cr.connection_id = $1
+			AND cr.resource_type IN ('replication_slot', 'publication')
+			AND cr.status <> 'deleted'`
+
+// deleteConnectionGuardedSQL deletes the connection only if, in the same statement, no
+// pipeline needs it and no replication slot or publication is still undropped. $1
+// connection id, $2 active workspace.
+//
+// The FOR UPDATE NOWAIT sub-select closes the race with a transaction that is adding a
+// pipeline or a cdc_resources row for this connection right now. Such a transaction
+// holds a key-share lock on the connection row. A plain DELETE would wait for it, and
+// once it committed, delete anyway (the checks above ran on the snapshot taken before
+// the wait) and cascade the new cdc_resources row away. NOWAIT makes the statement fail
+// with SQLSTATE 55P03 instead, and nothing is deleted.
+const deleteConnectionGuardedSQL = `
+		DELETE FROM connections
+		WHERE id = $1 AND workspace_id = $2
+			AND id IN (SELECT id FROM connections WHERE id = $1 FOR UPDATE NOWAIT)
+			AND NOT EXISTS (SELECT 1 FROM pipelines WHERE ` + pipelineNeedsConnection + `)
+			AND NOT EXISTS (SELECT 1 FROM cdc_resources cr WHERE ` + cdcSourceObjectUnreleased + `)`
+
+// deleteConnectionForceSQL is the force delete: pipelines still block it, undropped
+// replication slots and publications do not. It runs in a transaction after the
+// connection row is locked, so the list of undropped objects read just before it is
+// exactly what the delete erases.
+const deleteConnectionForceSQL = `
+		DELETE FROM connections
+		WHERE id = $1 AND workspace_id = $2
+			AND NOT EXISTS (SELECT 1 FROM pipelines WHERE ` + pipelineNeedsConnection + `)`
+
+// cdcSourceObject is one replication slot or publication left on a source database.
+type cdcSourceObject struct {
+	ResourceType string `json:"resource_type"` // "replication_slot" | "publication"
+	ResourceName string `json:"resource_name"`
+	Status       string `json:"status"`
+}
+
+// label is the plain name shown to a user, e.g. `replication slot "debezium_slot_x"`.
+func (o cdcSourceObject) label() string {
+	if o.ResourceType == "replication_slot" {
+		return `replication slot "` + o.ResourceName + `"`
+	}
+	return o.ResourceType + ` "` + o.ResourceName + `"`
+}
+
+// dropWarning says exactly what to run on the source database to drop the object.
+func (o cdcSourceObject) dropWarning() string {
+	if o.ResourceType == "replication_slot" {
+		return "Replication slot \"" + o.ResourceName + "\" was not dropped on the source database " +
+			"and keeps it from freeing disk space. Drop it on the source with: SELECT pg_drop_replication_slot('" +
+			strings.ReplaceAll(o.ResourceName, "'", "''") + "'); If that says the slot is active, " +
+			"stop whatever still reads from it first."
+	}
+	return "Publication \"" + o.ResourceName + "\" was not dropped on the source database. " +
+		"Drop it on the source with: DROP PUBLICATION IF EXISTS \"" +
+		strings.ReplaceAll(o.ResourceName, `"`, `""`) + "\";"
+}
+
+type cdcResourceQueryer interface {
+	QueryContext(ctx context.Context, query string, args ...interface{}) (*sql.Rows, error)
+}
+
+// listUnreleasedCDCSourceObjects returns the connection's undropped replication slots
+// and publications (cdcSourceObjectUnreleased).
+func listUnreleasedCDCSourceObjects(ctx context.Context, q cdcResourceQueryer, connectionID string) ([]cdcSourceObject, error) {
+	rows, err := q.QueryContext(ctx, `
+		SELECT cr.resource_type, cr.resource_name, cr.status
+		FROM cdc_resources cr
+		WHERE `+cdcSourceObjectUnreleased+`
+		ORDER BY cr.resource_type DESC, cr.resource_name`, connectionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []cdcSourceObject{}
+	for rows.Next() {
+		var o cdcSourceObject
+		if err := rows.Scan(&o.ResourceType, &o.ResourceName, &o.Status); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
+// unreleasedCDCMessage is the 409 text for a connection whose source still has
+// undropped replication slots or publications.
+func unreleasedCDCMessage(objects []cdcSourceObject) string {
+	labels := make([]string, 0, len(objects))
+	for _, o := range objects {
+		labels = append(labels, o.label())
+	}
+	list := strings.Join(labels, ", ")
+	if len(labels) > 1 {
+		list = strings.Join(labels[:len(labels)-1], ", ") + " and " + labels[len(labels)-1]
+	}
+	return "This connection can't be deleted yet: its source database still has " + list +
+		", created for its pipelines and not dropped yet. Deleting the connection now would erase " +
+		"the only record of them, and a replication slot left behind keeps the source database from " +
+		"freeing disk space. They are dropped automatically, so try again in a few minutes. " +
+		"They can only be dropped while the source database can be reached: if it can't, this " +
+		"connection stays blocked until you delete it anyway with force=true and then drop them " +
+		"on the source yourself."
+}
+
+// DeleteConnection deletes a connection.
+//
+// It refuses (409) while a pipeline needs the connection, and while a replication slot
+// or publication created on its source is still undropped. ?force=true deletes despite
+// undropped slots and publications (same authorization) and returns warnings naming
+// each one and how to drop it; pipelines still block a forced delete.
 func DeleteConnection(c *gin.Context) {
 	rawID := strings.TrimSpace(c.Param("id"))
 	if rawID == "" {
@@ -1445,20 +1714,24 @@ func DeleteConnection(c *gin.Context) {
 		return
 	}
 
-	// Check if connection is used by any pipelines
-	var pipelineCount int
-	err = database.QueryRow(`
-		SELECT COUNT(*) FROM pipelines 
-		WHERE (source_connection_id = $1 OR destination_connection_id = $1)
-		AND status != 'archived'
-	`, connectionID).Scan(&pipelineCount)
+	// refusedForPipelines writes the 409 (or the 500 when the check itself fails) and
+	// returns true when any pipeline still needs the connection. It runs before the
+	// delete, and again when a guarded delete removed nothing, to say why.
+	refusedForPipelines := func() bool {
+		// Check if connection is used by any pipelines
+		var pipelineCount int
+		err := database.QueryRow(`
+		SELECT COUNT(*) FROM pipelines
+		WHERE `+pipelineNeedsConnection, connectionID).Scan(&pipelineCount)
 
-	if err != nil && err != sql.ErrNoRows {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check connection usage"})
-		return
-	}
+		if err != nil && err != sql.ErrNoRows {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to check connection usage"})
+			return true
+		}
+		if pipelineCount == 0 {
+			return false
+		}
 
-	if pipelineCount > 0 {
 		// Include a small, actionable list so the UI can tell the user exactly what to fix.
 		type blockingPipeline struct {
 			ID     string `json:"id"`
@@ -1478,8 +1751,7 @@ func DeleteConnection(c *gin.Context) {
 					ELSE 'unknown'
 				END AS role
 			FROM pipelines
-			WHERE (source_connection_id = $1 OR destination_connection_id = $1)
-				AND status != 'archived'
+			WHERE `+pipelineNeedsConnection+`
 			ORDER BY updated_at DESC
 			LIMIT 25
 		`, connectionID)
@@ -1499,22 +1771,53 @@ func DeleteConnection(c *gin.Context) {
 			"pipelines":      pipelines,
 			"hint":           "Detach this connection from these pipelines (or delete/archive them) and try again.",
 		})
+		return true
+	}
+
+	if refusedForPipelines() {
 		return
 	}
 
-	// Delete connection
-	result, err := database.Exec(`
-		DELETE FROM connections
-		WHERE id = $1 AND workspace_id = $2
-	`, connectionID, wsID)
+	force, _ := strconv.ParseBool(c.Query("force"))
+	if force {
+		forceDeleteConnection(c, database, connectionID, wsID, refusedForPipelines)
+		return
+	}
+
+	// Delete connection. The pipeline and CDC checks are part of this one statement.
+	result, err := database.Exec(deleteConnectionGuardedSQL, connectionID, wsID)
 
 	if err != nil {
+		if pgdriver.SQLState(err) == "55P03" { // lock_not_available, see deleteConnectionGuardedSQL
+			c.JSON(http.StatusConflict, gin.H{
+				"error": "This connection is being used by another change right now, such as a pipeline " +
+					"starting, so it was not deleted. Try again in a moment.",
+			})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete connection"})
 		return
 	}
 
 	rowsAffected, _ := result.RowsAffected()
 	if rowsAffected == 0 {
+		// Nothing deleted: say which guard held, or that the connection is gone.
+		if refusedForPipelines() {
+			return
+		}
+		undropped, lErr := listUnreleasedCDCSourceObjects(c.Request.Context(), database, connectionID)
+		if lErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete connection"})
+			return
+		}
+		if len(undropped) > 0 {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":         unreleasedCDCMessage(undropped),
+				"cdc_resources": undropped,
+				"hint":          "Try again in a few minutes. To delete now, repeat the request with force=true and drop the listed objects on the source database.",
+			})
+			return
+		}
 		c.JSON(http.StatusNotFound, gin.H{"error": "Connection not found"})
 		return
 	}
@@ -1523,6 +1826,81 @@ func DeleteConnection(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{
 		"message": "Connection deleted successfully",
+	})
+}
+
+// forceDeleteConnection is DeleteConnection with ?force=true: it deletes even though
+// replication slots or publications on the source are undropped, and returns a warning
+// for each one saying how to drop it. The connection row is locked first, so no new
+// slot, publication or pipeline can reference it between reading the list and the
+// delete; the list returned is exactly what the delete erased. Pipelines still block.
+func forceDeleteConnection(c *gin.Context, database *sql.DB, connectionID, wsID string, refusedForPipelines func() bool) {
+	ctx := c.Request.Context()
+	tx, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete connection"})
+		return
+	}
+	defer func() { _ = tx.Rollback() }() // no-op once committed
+
+	var locked int
+	err = tx.QueryRowContext(ctx,
+		`SELECT 1 FROM connections WHERE id = $1 AND workspace_id = $2 FOR UPDATE`,
+		connectionID, wsID).Scan(&locked)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Connection not found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete connection"})
+		return
+	}
+
+	undropped, err := listUnreleasedCDCSourceObjects(ctx, tx, connectionID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete connection"})
+		return
+	}
+
+	result, err := tx.ExecContext(ctx, deleteConnectionForceSQL, connectionID, wsID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete connection"})
+		return
+	}
+	if n, _ := result.RowsAffected(); n == 0 {
+		_ = tx.Rollback()
+		if refusedForPipelines() {
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "Connection not found"})
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete connection"})
+		return
+	}
+
+	warnings := make([]string, 0, len(undropped))
+	for _, o := range undropped {
+		warnings = append(warnings, o.dropWarning())
+	}
+	if len(undropped) > 0 {
+		log.WithFields(log.Fields{
+			"connection_id":           connectionID,
+			"undropped_cdc_resources": undropped,
+		}).Warn("connection force-deleted with undropped replication slots or publications on the source")
+	}
+	// The audit row is the durable record of what was left on the source, now that
+	// the cdc_resources rows are gone.
+	logAudit(c, "delete_connection", "connection", connectionID, map[string]interface{}{
+		"force":                   true,
+		"undropped_cdc_resources": undropped,
+	})
+
+	c.JSON(http.StatusOK, gin.H{
+		"message":                 "Connection deleted successfully",
+		"warnings":                warnings,
+		"undropped_cdc_resources": undropped,
 	})
 }
 
@@ -2349,9 +2727,18 @@ func TestConnection(c *gin.Context) {
 	// error before it is persisted to last_test_error or echoed to the client.
 	// The raw testError is retained only for in-process auth-error classification.
 	scrubbedTestError := llmscrub.Scrub(testError)
+	// "Still being set up" is not a verdict on the connection — the connector's
+	// container is being built/started on demand. Don't record it as a failed test.
+	connectorDeploying := !success && isConnectorDeployingMessage(testError)
 
-	// Update connection with test result if it's an existing connection
-	if connectionID != "test" && database != nil {
+	// Update connection with test result — only when this request actually
+	// addresses a STORED connection. Reuse shouldLoadFromDB (:2154) instead of
+	// re-deriving the predicate: POST /connections/test (the CREATE dialog,
+	// main.go:987) leaves c.Param("id") == "", and a local `connectionID !=
+	// "test"` check lets that empty string reach `WHERE id = $4`, where the
+	// uuid primary key rejects it with SQLSTATE 22P02 `invalid input syntax
+	// for type uuid: ""`. One predicate cannot drift from the other.
+	if shouldLoadFromDB && !connectorDeploying {
 		testStatus := "success"
 		if !success {
 			testStatus = "failed"
@@ -2389,6 +2776,16 @@ func TestConnection(c *gin.Context) {
 			"message":   "Connection test successful",
 			"tested_at": time.Now(),
 		})
+	} else if connectorDeploying {
+		// Retryable: the UI shows this as "wait and try again", not as a failure.
+		c.JSON(http.StatusOK, gin.H{
+			"success":   false,
+			"status":    "connector_deploying",
+			"retryable": true,
+			"message":   "Connector is still being set up",
+			"error":     scrubbedTestError,
+			"tested_at": time.Now(),
+		})
 	} else {
 		// Ensure we have a meaningful error message
 		errorMessage := scrubbedTestError
@@ -2412,6 +2809,35 @@ func TestConnection(c *gin.Context) {
 			"tested_at": time.Now(),
 		})
 	}
+}
+
+// connectorDeployingMarker is the stable phrase in the orchestrator's "still being set
+// up" connection-test result. Lockstep with backend-orchestrator
+// internal/mcp.ConnectorDeployingMarker (not importable: internal package) and the
+// frontend's src/lib/errors/connector-deploying.ts.
+const connectorDeployingMarker = "connector is still being set up"
+
+// isConnectorDeployingMessage reports whether a connection-test error means the
+// connector's container is still being built/started (retryable), not that the
+// connection is bad. See KI-FIRST-CONNECTION-TEST-FALLS-BACK-TO-AN-UNUSABLE-STDIO-INTERPRETER.
+func isConnectorDeployingMessage(s string) bool {
+	return strings.Contains(s, connectorDeployingMarker)
+}
+
+// respondConnectorDeployingOnSave answers a create/update whose pre-save test hit a
+// connector that is still being set up. Nothing was saved; the caller should retry
+// shortly. 503 + Retry-After (not 422, which means "the credentials failed"), with
+// the same status/retryable fields the Test Connection response carries.
+func respondConnectorDeployingOnSave(c *gin.Context, traceID, testErr string) {
+	c.Header("Retry-After", "30")
+	c.JSON(http.StatusServiceUnavailable, gin.H{
+		"error":      "connector_deploying",
+		"status":     "connector_deploying",
+		"retryable":  true,
+		"message":    "The connector is still being set up, so nothing was saved. Try again in a minute.",
+		"test_error": llmscrub.Scrub(testErr),
+		"trace_id":   traceID,
+	})
 }
 
 // isOAuthAuthError reports whether a connection-test error string looks like a
@@ -2737,7 +3163,7 @@ func maskSensitiveFields(config map[string]interface{}) map[string]interface{} {
 	masked := make(map[string]interface{}, len(config))
 	for key, value := range config {
 		if isSensitiveConfigKey(key) {
-			masked[key] = "••••••••"
+			masked[key] = connectionSecretMask
 		} else {
 			masked[key] = maskSensitiveValue(value)
 		}
@@ -2761,6 +3187,50 @@ func maskSensitiveValue(value interface{}) interface{} {
 	default:
 		return value
 	}
+}
+
+// connectionSecretMask is what maskSensitiveFields shows in place of a secret.
+const connectionSecretMask = "••••••••"
+
+// isMaskedPlaceholder reports whether s is a mask the API handed out rather
+// than a value someone typed: this handler's mask, or security.MaskedValue.
+func isMaskedPlaceholder(s string) bool {
+	s = strings.TrimSpace(s)
+	return s == connectionSecretMask || s == "********"
+}
+
+// findMaskedPlaceholder returns the dotted path of the first value that is
+// still a mask placeholder, or "" when there is none. Keys are visited in
+// sorted order so the path named in an error is stable.
+func findMaskedPlaceholder(value interface{}, path string) string {
+	switch v := value.(type) {
+	case string:
+		if isMaskedPlaceholder(v) {
+			return path
+		}
+	case map[string]interface{}:
+		keys := make([]string, 0, len(v))
+		for k := range v {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			p := k
+			if path != "" {
+				p = path + "." + k
+			}
+			if found := findMaskedPlaceholder(v[k], p); found != "" {
+				return found
+			}
+		}
+	case []interface{}:
+		for i, item := range v {
+			if found := findMaskedPlaceholder(item, fmt.Sprintf("%s[%d]", path, i)); found != "" {
+				return found
+			}
+		}
+	}
+	return ""
 }
 
 // sensitiveExactKeys lists every config field name known to carry a secret.
@@ -2793,6 +3263,13 @@ var sensitiveExactKeys = map[string]struct{}{
 	"sas_token":            {}, // Azure
 	"account_key":          {}, // Azure
 	"connection_string":    {},
+	// The MongoDB connector also takes the whole URI (user:password@hosts) under
+	// these three names (connector.py _build_uri; the orchestrator's topology
+	// check reads the same list). Missing them returned the password verbatim
+	// from GET/List/Create for any connection saved with one of them.
+	"mongodb_connection_string": {},
+	"mongodb_uri":               {},
+	"uri":                       {},
 }
 
 // sensitiveSuffixes / sensitiveSubstrings catch fields not in the exact list so
@@ -2817,6 +3294,167 @@ func isSensitiveConfigKey(key string) bool {
 		}
 	}
 	return false
+}
+
+// isMaskPlaceholder reports whether v is a mask glyph the API emits in place of
+// a secret ("••••••••" today, "********" from older clients).
+func isMaskPlaceholder(v interface{}) bool {
+	s, ok := v.(string)
+	if !ok {
+		return false
+	}
+	s = strings.TrimSpace(s)
+	return s == "••••••••" || s == "********"
+}
+
+// isBlankConfigValue reports whether v carries no value (JSON null or "").
+func isBlankConfigValue(v interface{}) bool {
+	if v == nil {
+		return true
+	}
+	s, ok := v.(string)
+	return ok && strings.TrimSpace(s) == ""
+}
+
+// mergePreservingMaskedSecrets builds the config to persist on a connection
+// edit. incoming wins for every key, except a key the API masks
+// (isSensitiveConfigKey — the exact rule maskSensitiveFields uses) whose incoming
+// value is absent, blank, or a mask placeholder: that key keeps its stored value.
+// It recurses into nested objects and same-length lists of objects, mirroring
+// maskSensitiveValue, so a secret masked below the top level survives too.
+//
+// Consequence: a stored secret cannot be cleared to empty through an edit —
+// blank means "keep existing", which is what the edit form promises.
+func mergePreservingMaskedSecrets(existing, incoming map[string]interface{}) map[string]interface{} {
+	merged := make(map[string]interface{}, len(incoming))
+	for k, v := range incoming {
+		merged[k] = v
+	}
+	for k, oldVal := range existing {
+		newVal, present := incoming[k]
+		if isSensitiveConfigKey(k) {
+			if !present || isBlankConfigValue(newVal) || isMaskPlaceholder(newVal) {
+				merged[k] = oldVal
+			}
+			continue
+		}
+		if !present {
+			continue
+		}
+		switch nv := newVal.(type) {
+		case map[string]interface{}:
+			if ov, ok := oldVal.(map[string]interface{}); ok {
+				merged[k] = mergePreservingMaskedSecrets(ov, nv)
+			}
+		case []interface{}:
+			ov, ok := oldVal.([]interface{})
+			if !ok || len(ov) != len(nv) {
+				continue
+			}
+			out := make([]interface{}, len(nv))
+			for i := range nv {
+				nm, nIsMap := nv[i].(map[string]interface{})
+				om, oIsMap := ov[i].(map[string]interface{})
+				if nIsMap && oIsMap {
+					out[i] = mergePreservingMaskedSecrets(om, nm)
+				} else {
+					out[i] = nv[i]
+				}
+			}
+			merged[k] = out
+		}
+	}
+	return merged
+}
+
+// findUnresolvedMaskedSecret returns the dotted path of the first sensitive key
+// whose value is still a mask placeholder after the merge — i.e. the stored
+// secret could not be recovered. Persisting it would store the glyph as the
+// credential.
+func findUnresolvedMaskedSecret(config map[string]interface{}, prefix string) (string, bool) {
+	keys := make([]string, 0, len(config))
+	for k := range config {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		path := k
+		if prefix != "" {
+			path = prefix + "." + k
+		}
+		v := config[k]
+		if isSensitiveConfigKey(k) {
+			if isMaskPlaceholder(v) {
+				return path, true
+			}
+			continue
+		}
+		switch tv := v.(type) {
+		case map[string]interface{}:
+			if p, found := findUnresolvedMaskedSecret(tv, path); found {
+				return p, true
+			}
+		case []interface{}:
+			for i, item := range tv {
+				if m, ok := item.(map[string]interface{}); ok {
+					if p, found := findUnresolvedMaskedSecret(m, fmt.Sprintf("%s[%d]", path, i)); found {
+						return p, true
+					}
+				}
+			}
+		}
+	}
+	return "", false
+}
+
+// configsEquivalent reports whether two connection configs would reach the
+// connector identically. Blank values (null / "") equal an absent key, and
+// scalars compare by their string form because performConnectionTest sends
+// every value as a string (so 5432 == "5432").
+func configsEquivalent(a, b map[string]interface{}) bool {
+	for k, av := range a {
+		bv, ok := b[k]
+		if !ok {
+			if isBlankConfigValue(av) {
+				continue
+			}
+			return false
+		}
+		if !configValuesEquivalent(av, bv) {
+			return false
+		}
+	}
+	for k, bv := range b {
+		if _, ok := a[k]; !ok && !isBlankConfigValue(bv) {
+			return false
+		}
+	}
+	return true
+}
+
+func configValuesEquivalent(a, b interface{}) bool {
+	if isBlankConfigValue(a) && isBlankConfigValue(b) {
+		return true
+	}
+	am, aIsMap := a.(map[string]interface{})
+	bm, bIsMap := b.(map[string]interface{})
+	if aIsMap || bIsMap {
+		return aIsMap && bIsMap && configsEquivalent(am, bm)
+	}
+	as, aIsList := a.([]interface{})
+	bs, bIsList := b.([]interface{})
+	if aIsList || bIsList {
+		if !aIsList || !bIsList || len(as) != len(bs) {
+			return false
+		}
+		for i := range as {
+			if !configValuesEquivalent(as[i], bs[i]) {
+				return false
+			}
+		}
+		return true
+	}
+	return fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)
 }
 
 // TableMetadata represents discovered table schema
@@ -3079,9 +3717,10 @@ func GetConnectionMetadata(c *gin.Context) {
 			"connection_id": connectionID,
 			"status":        resp.StatusCode,
 		}).Warn("GetConnectionMetadata schema discovery failed")
+		// Not cached: only a successful discovery reaches schemaCache.Set below.
 		c.JSON(resp.StatusCode, gin.H{
 			"error":   "Schema discovery failed",
-			"details": string(body),
+			"details": orchestratorErrorDetail(resp.StatusCode, body),
 		})
 		return
 	}
@@ -3138,8 +3777,8 @@ func GetConnectionMetadata(c *gin.Context) {
 			limit = v
 		}
 	}
-	if limit > 200 {
-		limit = 200
+	if limit > maxMetadataPageSize {
+		limit = maxMetadataPageSize
 	}
 	offset := 0
 	if s := strings.TrimSpace(offsetStr); s != "" {
@@ -3409,6 +4048,15 @@ func GetRecommendedTables(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		c.JSON(resp.StatusCode, gin.H{
+			"error":   "Schema discovery failed",
+			"details": orchestratorErrorDetail(resp.StatusCode, body),
+		})
+		return
+	}
+
 	var agentResponse struct {
 		Tables []TableMetadata `json:"tables"`
 	}
@@ -3449,6 +4097,65 @@ type TableRecommendation struct {
 	HasPII     bool     `json:"has_pii"`     // Does it contain PII?
 }
 
+// maxMetadataPageSize is the largest /metadata page. Source discovery returns up
+// to 5000 tables (the orchestrator's sourceDiscoveryMaxTables), and the table
+// picker loads them in one page.
+const maxMetadataPageSize = 5000
+
+// The LLM ranker sees at most rankInputCap tables and rankColumnsPerTable
+// columns each (the prompt uses 10). A 5000-table source would otherwise make
+// a ~200k-token prompt that fails every call. The heuristic fallback still
+// scores every table.
+const (
+	rankInputCap        = 300
+	rankColumnsPerTable = 10
+)
+
+// shortlistForRanking keeps the limit tables most likely to matter: names that
+// contain a word of the intent first, then the largest, then by name.
+func shortlistForRanking(tables []TableMetadata, intent string, limit int) []TableMetadata {
+	if len(tables) <= limit {
+		return tables
+	}
+	var words []string
+	for _, w := range strings.FieldsFunc(strings.ToLower(intent), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	}) {
+		if len(w) >= 3 {
+			words = append(words, strings.TrimSuffix(w, "s"))
+		}
+	}
+	type candidate struct {
+		t    TableMetadata
+		hits int
+	}
+	cands := make([]candidate, len(tables))
+	for i, t := range tables {
+		name := strings.ToLower(t.Schema + "." + t.Name)
+		cands[i].t = t
+		for _, w := range words {
+			if strings.Contains(name, w) {
+				cands[i].hits++
+			}
+		}
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if a.hits != b.hits {
+			return a.hits > b.hits
+		}
+		if a.t.RowCount != b.t.RowCount {
+			return a.t.RowCount > b.t.RowCount
+		}
+		return a.t.Schema+"."+a.t.Name < b.t.Schema+"."+b.t.Name
+	})
+	out := make([]TableMetadata, limit)
+	for i := range out {
+		out[i] = cands[i].t
+	}
+	return out
+}
+
 // rankTablesByLLM calls the llm-service /agents/rank-tables endpoint to produce
 // semantic table rankings. Returns an error if the service is unreachable or
 // returns a non-200 status, so the caller can fall back to heuristics.
@@ -3475,10 +4182,14 @@ func rankTablesByLLM(ctx context.Context, tables []TableMetadata, intent string,
 		MaxTables int         `json:"max_tables"`
 	}
 
-	reqTables := make([]tableInfo, 0, len(tables))
-	for _, t := range tables {
+	shortlist := shortlistForRanking(tables, intent, rankInputCap)
+	reqTables := make([]tableInfo, 0, len(shortlist))
+	for _, t := range shortlist {
 		cols := make([]columnInfo, 0, len(t.Columns))
 		for _, c := range t.Columns {
+			if len(cols) == rankColumnsPerTable {
+				break
+			}
 			cols = append(cols, columnInfo{Name: c.Name, DataType: c.Type})
 		}
 		reqTables = append(reqTables, tableInfo{

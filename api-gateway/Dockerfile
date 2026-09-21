@@ -61,4 +61,12 @@ USER appuser
 
 EXPOSE 8080
 
+# Build info for GET /version, which the admin drift check compares across
+# services. docker-compose.yml passes these as build args (from the caller's env;
+# scripts/deploy-service.sh exports them) and docker-publish.yml passes the
+# release sha. Declared last so a new commit rebuilds only this metadata layer.
+ARG GIT_COMMIT=dev
+ARG BUILD_TIME=unknown
+ENV GIT_COMMIT=${GIT_COMMIT} BUILD_TIME=${BUILD_TIME}
+
 CMD ["./server"]

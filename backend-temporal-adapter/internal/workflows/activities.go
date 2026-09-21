@@ -12,6 +12,7 @@ import (
 
 	"github.com/IBM/sarama"
 	log "github.com/sirupsen/logrus"
+	"go.temporal.io/sdk/client"
 )
 
 // ==============================================================================
@@ -37,6 +38,12 @@ type KafkaProducer interface {
 type ActivityContext struct {
 	KafkaProducer KafkaProducer
 	DB            interface{} // *sql.DB, stored as interface{} to avoid import cycles
+	// Temporal is the worker's own client, handed back to the activities that have to
+	// address Temporal itself rather than the outside world. Only one does today:
+	// SignalModelRefreshActivity, which signal-with-starts a model's refresh loop —
+	// an operation the workflow API cannot express, because signal-with-start is
+	// atomic only on the client.
+	Temporal client.Client
 }
 
 var activityCtx *ActivityContext
@@ -53,6 +60,26 @@ func SetDB(db interface{}) {
 	if activityCtx != nil {
 		activityCtx.DB = db
 	}
+}
+
+// SetTemporalClient gives activities the worker's own Temporal client.
+//
+// Left nil, SignalModelRefreshActivity fails and retries rather than silently doing
+// nothing: a fan-out that quietly delivered no signals would look exactly like an
+// upstream with no downstream models.
+func SetTemporalClient(c client.Client) {
+	if activityCtx != nil {
+		activityCtx.Temporal = c
+	}
+}
+
+// activityTemporalClient reads the client back, nil-safe so a test that never called
+// InitActivityContext gets a clear error from the activity instead of a panic.
+func activityTemporalClient() client.Client {
+	if activityCtx == nil {
+		return nil
+	}
+	return activityCtx.Temporal
 }
 
 // ==============================================================================

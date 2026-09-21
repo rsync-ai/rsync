@@ -151,7 +151,7 @@ def test_fallback_denylist_filters_system_owners_on_old_oracle():
     # Python denylist must still drop SYS.
     result = _discover({}, fail_oracle_maintained=True)
     owners = {t["schema"] for t in result["tables"]}
-    assert owners == {"APP", "SALES"}  # SYS dropped by the _is_system_owner denylist
+    assert owners == {"APP", "SALES"}  # SYS dropped by the _is_oracle_system_owner denylist
     assert result["total_tables_available"] == 3
 
 

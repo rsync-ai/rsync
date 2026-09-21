@@ -44,6 +44,20 @@ import { usePipelineRuntime, type RuntimeDep, type RuntimeHealth } from '@/lib/h
 import { authFetch } from '@/lib/api/auth-fetch'
 import { API_ENDPOINTS } from '@/lib/config/api'
 import { stageDurationMs } from '@/components/pipeline/dagHelpers'
+import { formatDuration as sharedFormatDuration } from '@/lib/duration'
+import { cdcConnectorState, cdcPreProvisionLabel } from '@/components/chat/cdcChipStatus'
+import {
+  executorRunningMessage,
+  findConnectionNames,
+  positiveDurationMs,
+  runningStageTimeLabel,
+} from './runningStageLabel'
+import { dependencyStatusLabel } from '@/lib/pipeline/dependencyStatus'
+import {
+  normalizePipelineStatus,
+  RUNTIME_PHASE_WAITING_FOR_DATA,
+  WAITING_FOR_FIRST_DATA_LABEL,
+} from '@/lib/pipeline/statusNormalization'
 
 // Interface matching backend PipelineState shape
 export interface PipelineState {
@@ -99,6 +113,10 @@ export interface PipelineState {
   stale_reason?: string
   stale_elapsed_seconds?: number
   cancel_recommended?: boolean
+  // True for a CDC pipeline past the streaming hand-off (gateway pipeline_state.go
+  // applyStreamingLiveness). Its is_stale comes from stream liveness, and cancel is never
+  // recommended for it.
+  streaming?: boolean
   // New error field
   error_message?: string
 }
@@ -117,14 +135,14 @@ interface PipelineAccordionViewProps {
   resumingFromHITL?: boolean
 }
 
+/**
+ * `null`, not "0ms", when there is nothing to show: callers render this inline
+ * beside a stage name and drop the element entirely when it is null. The words
+ * themselves come from the shared formatter.
+ */
 function formatDuration(ms: number | undefined): string | null {
-  if (typeof ms !== 'number' || ms < 0) return null
-  if (ms < 1000) return `${Math.round(ms)}ms`
-  const sec = Math.floor(ms / 1000)
-  if (sec < 60) return `${sec}s`
-  const min = Math.floor(sec / 60)
-  const rem = sec % 60
-  return `${min}m ${rem}s`
+  if (typeof ms !== 'number' || !Number.isFinite(ms) || ms < 0) return null
+  return sharedFormatDuration(ms)
 }
 
 function elapsedSince(iso?: string): string | null {
@@ -167,19 +185,19 @@ function StageIcon({ status }: { status: string }) {
 function PipelineStatusBadge({ status }: { status: string }) {
   switch (status) {
     case 'completed':
-      return <Badge className="bg-green-600 text-white text-xs">Completed</Badge>
+      return <Badge className="bg-green-700 text-white text-xs">Completed</Badge>
     case 'failed':
       return <Badge className="bg-red-600 text-white text-xs">Failed</Badge>
     case 'processing':
       return <Badge className="bg-blue-600 text-white text-xs">Running</Badge>
     case 'waiting_for_user':
-      return <Badge className="bg-amber-500 text-white text-xs">Waiting</Badge>
+      return <Badge className="bg-amber-500 text-amber-950 text-xs">Waiting</Badge>
     case 'cancelled':
     case 'cancelling':
-      return <Badge className="bg-gray-500 text-white text-xs">Cancelled</Badge>
+      return <Badge className="bg-gray-600 text-white text-xs">Cancelled</Badge>
     case 'pending':
     default:
-      return <Badge className="bg-gray-400 text-white text-xs">Pending</Badge>
+      return <Badge className="bg-gray-500 text-white text-xs">Pending</Badge>
   }
 }
 
@@ -469,13 +487,9 @@ function StageActivityPanel({
   useEffect(() => {
     const base = startedAt ? new Date(startedAt).getTime() : Date.now()
     const tick = () => {
-      const secs = Math.max(0, Math.floor((Date.now() - base) / 1000))
-      if (secs < 60) setElapsed(`${secs}s`)
-      else {
-        const m = Math.floor(secs / 60)
-        const s = secs % 60
-        setElapsed(`${m}m ${s}s`)
-      }
+      // The shared formatter, so a stage's live ticker and the figure frozen
+      // beside it when the stage finishes are in the same units.
+      setElapsed(sharedFormatDuration(Math.max(0, Date.now() - base)))
     }
     tick()
     const t = setInterval(tick, 1000)
@@ -545,7 +559,7 @@ function StageActivityPanel({
           {label ?? (isExecutor ? 'Preparing data transfer' : 'Agent working…')}
         </div>
         {elapsed && (
-          <span className="text-xs text-zinc-500 tabular-nums">{elapsed} elapsed</span>
+          <span className="text-xs text-zinc-500 dark:text-zinc-400 tabular-nums">{elapsed} elapsed</span>
         )}
       </div>
       {/* Indeterminate animated bar */}
@@ -560,12 +574,12 @@ function StageActivityPanel({
         <style>{`@keyframes rsync-slide { 0%{transform:translateX(-100%)} 100%{transform:translateX(400%)} }`}</style>
       </div>
       {lastEvent && (
-        <p className="text-xs text-zinc-500 truncate">
+        <p className="text-xs text-zinc-500 dark:text-zinc-400 truncate">
           <span className="font-medium">Latest:</span> {lastEvent}
         </p>
       )}
       {!lastEvent && isExecutor && (
-        <p className="text-xs text-zinc-500">
+        <p className="text-xs text-zinc-500 dark:text-zinc-400">
           Data is transferring in the background. Large tables may take several minutes.
         </p>
       )}
@@ -750,7 +764,7 @@ export function PipelineAccordionView({
     // API returns: { success, pipeline_id, connector_name, result?, error? }
     const success = Boolean(cdcInfo?.success)
     const connectorName = String(cdcInfo?.connector_name || '')
-    const connectorState = String(cdcInfo?.result?.connector_state || '')
+    const connectorState = cdcConnectorState(cdcInfo?.result)
     const healthy = Boolean(cdcInfo?.result?.healthy)
     const rawErr = String(cdcInfo?.error || '')
     // "connect_unavailable" means Kafka Connect is not running — not a connector failure.
@@ -758,15 +772,38 @@ export function PipelineAccordionView({
     // "not_found" during pipeline setup is expected — Debezium connector is registered at the
     // end of the workflow (step ~7/8). Suppress it as an error while setup is in progress.
     // Use runtime.phase when available; fall back to pipeline status not being terminal.
-    const isLiveStreaming = runtime?.phase === 'streaming' || runtime?.phase === 'idle'
+    // waiting_for_data is past the streaming handoff too: the connector should exist,
+    // so a not_found there is a real error, not "Setting up connector…".
+    const isLiveStreaming =
+      runtime?.phase === 'streaming' ||
+      runtime?.phase === 'idle' ||
+      runtime?.phase === RUNTIME_PHASE_WAITING_FOR_DATA
     const isTerminal = ['completed', 'failed', 'cancelled'].includes(
       String(normalizedState.status || '').toLowerCase()
     )
     const isSettingUp = !isTerminal && !isLiveStreaming
     const err = connectUnavailable || (rawErr === 'not_found' && isSettingUp) ? '' : rawErr
     const settingUp = rawErr === 'not_found' && isSettingUp
-    return { success, connectorName, connectorState, healthy, err, connectUnavailable, settingUp }
-  }, [cdcInfo, normalizedState.status, runtime?.phase])
+    // Issue #19: while planning or waiting on the user no connector can exist yet, so
+    // "Setting up connector…" (or a not_found / Connect-down line) is wrong. A real
+    // connector state still wins.
+    const preProvisionLabel = connectorState
+      ? null
+      : cdcPreProvisionLabel({
+          status: normalizedState.status,
+          blockingType: normalizedState.blocking_reason?.type,
+          currentStage: normalizedState.current_stage,
+          stageGroup: normalizedState.stage_group,
+        })
+    return { success, connectorName, connectorState, healthy, err, connectUnavailable, settingUp, preProvisionLabel }
+  }, [
+    cdcInfo,
+    normalizedState.status,
+    normalizedState.blocking_reason?.type,
+    normalizedState.current_stage,
+    normalizedState.stage_group,
+    runtime?.phase,
+  ])
 
   const error = extractErrorMessage({
     errorMessage: normalizedState.error_message,
@@ -792,7 +829,16 @@ export function PipelineAccordionView({
     ? runtimePhase === 'streaming' || runtimePhase === 'idle'
     : localProgress.showCDCLiveBanner)
   const showRuntimeFailureBanner = runtimeOverridesBanners && runtimePhase === 'failed'
-  const { percent, text: progressText } = localProgress
+  // The stream was handed off but nothing has reached the destination past the grace
+  // period (/runtime waiting_for_data). The card used to show no banner at all and a
+  // "LIVE (streaming)" badge. A CDC run reads "completed" here once setup finishes, so
+  // both it and running are relabelled; a paused, failed or cancelled run is not.
+  const waitingForFirstData =
+    runtimePhase === RUNTIME_PHASE_WAITING_FOR_DATA &&
+    !awaitingUserInput &&
+    ['running', 'completed'].includes(normalizePipelineStatus(normalizedState.status))
+  const { percent } = localProgress
+  const progressText = waitingForFirstData ? WAITING_FOR_FIRST_DATA_LABEL : localProgress.text
   const blockingType = String(normalizedState.blocking_reason?.type || '')
   const blockingDetails = (normalizedState.blocking_reason?.details && typeof normalizedState.blocking_reason.details === 'object')
     ? (normalizedState.blocking_reason.details as Record<string, unknown>)
@@ -906,7 +952,11 @@ export function PipelineAccordionView({
                   <Badge variant="secondary" className="text-xs">
                     CDC
                   </Badge>
-                  {cdcLoading ? (
+                  {cdcStatus.preProvisionLabel ? (
+                    <span className="text-xs text-muted-foreground" data-testid="cdc-chip-pre-provision">
+                      {cdcStatus.preProvisionLabel}
+                    </span>
+                  ) : cdcLoading ? (
                     <span className="text-xs text-muted-foreground flex items-center gap-1">
                       <Loader2 className="h-3 w-3 animate-spin" />
                       Checking…
@@ -988,7 +1038,7 @@ export function PipelineAccordionView({
         {normalizedState.status !== 'completed' && normalizedState.status !== 'failed' && normalizedState.is_stale && normalizedState.stale_reason && (
           <Alert variant="default" className="border-amber-500/50 bg-amber-50/50 dark:bg-amber-950/20">
             <AlertCircle className="h-4 w-4" />
-            <AlertTitle>Pipeline May Be Stuck</AlertTitle>
+            <AlertTitle>{normalizedState.streaming ? 'Stream May Not Be Delivering Changes' : 'Pipeline May Be Stuck'}</AlertTitle>
             <AlertDescription>
               <p className="text-sm mb-3">{normalizedState.stale_reason}</p>
               <div className="flex gap-2">
@@ -1002,7 +1052,10 @@ export function PipelineAccordionView({
                     Refresh Status
                   </Button>
                 )}
-                {showCancelButton && onCancel && (
+                {/* A streaming CDC pipeline is not offered "Cancel Pipeline" as the fix for a
+                    stall (issue #7): the reason says what to check, and the header's Cancel
+                    remains the normal way to stop it. */}
+                {showCancelButton && onCancel && !normalizedState.streaming && (
                   <Button
                     variant="outline"
                     size="sm"
@@ -1057,9 +1110,11 @@ export function PipelineAccordionView({
               // This view was the one reader that had the adapter's unit right.
               // It now goes through the same helper as every other reader, so
               // there is one place that knows which unit a stage carries.
+              // A zero is "not measured yet" (a running stage carries
+              // actual_duration_ms: 0), never "took 0ms".
               const durationLabel =
-                formatDuration(stageDurationMs(stage) ?? undefined) ||
-                formatDuration(stage.metadata?.duration_ms as number | undefined) ||
+                formatDuration(positiveDurationMs(stageDurationMs(stage)) ?? undefined) ||
+                formatDuration(positiveDurationMs(stage.metadata?.duration_ms) ?? undefined) ||
                 null
               const elapsedLabel =
                 stage.status === "running"
@@ -1154,12 +1209,15 @@ export function PipelineAccordionView({
                           )}
                           {stage.status === 'running' && !isBlockingHere && (() => {
                             const stageId = stage.id
-                            const timeStr = durationLabel || (elapsedLabel && elapsedLabel !== '0s' ? elapsedLabel : null)
-                            // Pull connection names from stage metadata (emitted by connection_validator worker)
-                            const srcName = typeof stage.metadata?.source_connection_name === 'string'
-                              ? stage.metadata.source_connection_name : null
-                            const dstName = typeof stage.metadata?.destination_connection_name === 'string'
-                              ? stage.metadata.destination_connection_name : null
+                            // Live elapsed time first: see runningStageTimeLabel.
+                            const timeStr = runningStageTimeLabel(elapsedLabel, durationLabel)
+                            // Connection names are emitted on the connection_validator
+                            // stage (and merged into state metadata), not on the stage
+                            // that is running now, so look across all of them.
+                            const { srcName, dstName } = findConnectionNames(stage, [
+                              ...(state.execution_plan?.stages ?? []),
+                              { id: '__state__', metadata: state.metadata },
+                            ])
                             // Also check top-level pipeline state metadata for connector types
                             const srcType = typeof state.metadata?.source_connector_type === 'string'
                               ? (state.metadata.source_connector_type as string).replace(/-/g, ' ') : null
@@ -1209,15 +1267,17 @@ export function PipelineAccordionView({
                               // Use a phase-neutral "Preparing…" fallback that is truthful
                               // whether the executor is about to request table selection or
                               // about to transfer; only switch to "Syncing X → Y…" once we
-                              // have evidence the transfer is past prep (connection names
-                              // emitted by the connection_validator stage upstream).
-                              if (state.current_stage === 'infra_preflight') {
-                                msg = 'Waiting for infrastructure…'
-                              } else if (srcName && dstName) {
-                                msg = `Syncing "${srcName}" → "${dstName}"…`
-                              } else {
-                                msg = 'Preparing…'
-                              }
+                              // have evidence the transfer is past prep (progress, rows, or
+                              // the per-table "Transferred N of M" message). Connection
+                              // names alone are not that evidence: they exist before the
+                              // table selection. See executorRunningMessage.
+                              msg = executorRunningMessage({
+                                currentStage: state.current_stage,
+                                stateMessage: state.message,
+                                stage,
+                                srcName,
+                                dstName,
+                              })
                             }
                             return (
                               <p className="text-xs text-blue-600 dark:text-blue-400">
@@ -1343,9 +1403,9 @@ export function PipelineAccordionView({
                                                 </div>
                                               </div>
                                               {r.isMissing ? (
-                                                <Badge className="bg-amber-500 text-white text-xs shrink-0">Missing</Badge>
+                                                <Badge className="bg-amber-500 text-amber-950 text-xs shrink-0">Missing</Badge>
                                               ) : (
-                                                <Badge className="bg-green-600 text-white text-xs shrink-0">Available</Badge>
+                                                <Badge className="bg-green-700 text-white text-xs shrink-0">Available</Badge>
                                               )}
                                             </div>
                                           ))
@@ -1599,6 +1659,29 @@ export function PipelineAccordionView({
           </div>
         )}
 
+        {/* Waiting-for-first-data banner — set up, but nothing delivered yet. Amber,
+            never the green "live" banner. */}
+        {waitingForFirstData && (
+          <div
+            data-testid="cdc-waiting-for-data-banner"
+            className="bg-amber-50 rounded-lg p-4 border border-amber-200 dark:bg-amber-950/20 dark:border-amber-900/40"
+          >
+            <div className="flex items-center gap-2">
+              <Clock className="h-5 w-5 text-amber-600" />
+              <p className="font-medium text-amber-900 dark:text-amber-200">{WAITING_FOR_FIRST_DATA_LABEL}</p>
+            </div>
+            <p className="text-sm text-amber-800 dark:text-amber-300 mt-1 ml-7">
+              {String(runtime?.message || 'Streaming is set up, but no data has reached the destination yet').replace(/[.\s]+$/, '')}.
+              {' '}Check that the source has changes to capture, and the connector state above.
+            </p>
+            <div className="flex gap-2 mt-3 ml-7">
+              <Button asChild size="sm" variant="outline">
+                <Link href={`/pipelines/${state.pipeline_id}`}>View Pipeline</Link>
+              </Button>
+            </div>
+          </div>
+        )}
+
         {/* Success banner - ONLY if explicitly completed (non-CDC) */}
         {showSuccessBanner && (
           <div className="bg-green-50 rounded-lg p-4 border border-green-200 dark:bg-green-950/20 dark:border-green-900/40">
@@ -1664,7 +1747,7 @@ function DependencyHealthPanel({ deps, aggregate }: { deps: RuntimeDep[]; aggreg
             <div className="min-w-0 flex-1">
               <div className="flex items-center justify-between gap-2">
                 <span className="truncate text-foreground">{depLabel(dep)}</span>
-                <span className="text-muted-foreground capitalize shrink-0">{dep.status}</span>
+                <span className="text-muted-foreground capitalize shrink-0">{dependencyStatusLabel(dep)}</span>
               </div>
               {dep.status !== 'healthy' && dep.last_error ? (
                 <p className="text-[11px] text-muted-foreground mt-0.5 break-words">{dep.last_error}</p>

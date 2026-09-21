@@ -434,7 +434,7 @@ func checkMySQLTablePrimaryKeys(ctx context.Context, db *sql.DB, cfg map[string]
 			dbName = defaultDB
 			tableName = strings.Trim(t, "`\"")
 		}
-		out = append(out, oneMySQLTablePKCheck(ctx, db, dbName, tableName, cdcMode, cdcBlocks, nominatedColsFor(nominated, dbName, tableName)))
+		out = append(out, withObject(oneMySQLTablePKCheck(ctx, db, dbName, tableName, cdcMode, cdcBlocks, nominatedColsFor(nominated, dbName, tableName)), dbName+"."+tableName))
 	}
 	return out
 }

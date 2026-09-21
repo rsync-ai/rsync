@@ -124,10 +124,57 @@ func ProvisionCDCResources(db *sql.DB) gin.HandlerFunc {
 	}
 }
 
+// cdcCleanupBudgets gives each phase of CleanupCDCResources its own time.
+//
+// The phases used to share one 60s context, with the sink stops first. A stop that never
+// answered spent the time the connector delete and the slot drop needed, and api-gateway
+// stops waiting after 30s and deletes the pipeline row; after that the slot drop cannot
+// find its cdc_resources rows (pipeline_id is ON DELETE SET NULL) and the slot leaks until
+// the reconciler. Separate budgets bound each phase alone.
+//
+// Together they stay under that 30s wait with room for the reply. api-gateway gives up on
+// a slower answer, reports "did not run (orchestrator unreachable)" and deletes the row, so
+// whatever this handler found after the wait is never reported.
+// TestDeleteBudgetsFitTheGatewayWaits reads the wait from api-gateway and holds the sum.
+type cdcCleanupBudgets struct {
+	resolve   time.Duration // reading which sink workers to stop
+	connector time.Duration // Debezium connector delete
+	sources   time.Duration // per-database slot / publication / capture cleanup
+	sinkStop  time.Duration // every stop_sink call
+}
+
+var defaultCDCCleanupBudgets = cdcCleanupBudgets{
+	resolve:   2 * time.Second,
+	connector: 8 * time.Second,
+	sources:   12 * time.Second,
+	sinkStop:  5 * time.Second,
+}
+
+// cdcSourceCleanup removes a pipeline's source-database CDC resources and returns one
+// error per failure.
+type cdcSourceCleanup func(ctx context.Context, db *sql.DB, pipelineID string) []string
+
 // CleanupCDCResources cleans up CDC resources for a pipeline.
 // Also stops any kafka-mcp-sink worker associated with the pipeline so the
 // per-pipeline sink process doesn't linger after the pipeline is deleted.
 func CleanupCDCResources(db *sql.DB, mcpManager *mcp.ServerManager) gin.HandlerFunc {
+	return cleanupCDCResources(db, newSinkStopExecutor(mcpManager), cleanupCDCSources, defaultCDCCleanupBudgets)
+}
+
+// cleanupCDCResources is CleanupCDCResources with the sink service, the source cleanup and
+// the phase budgets passed in, so tests can replace them.
+//
+// PHASE ORDER. Its only caller is api-gateway DeletePipeline (runCDCCleanupSync), which
+// deletes the pipeline row once this returns or its 30s wait runs out. So:
+//
+//  1. Sink worker names are read first, while the pipeline row and its manifest rows
+//     still exist; they cascade away with the row.
+//  2. The Debezium connector is deleted, so the replication slot goes inactive.
+//  3. Source cleanup drops the slot / publication. It reads cdc_resources by
+//     pipeline_id, so it has to finish before the row delete clears that column.
+//  4. Sink workers are stopped last. They only write what the connector already
+//     produced, and the Kafka teardown after the row delete stops them again.
+func cleanupCDCResources(db *sql.DB, sinks sinkStopExecutor, cleanupSources cdcSourceCleanup, budgets cdcCleanupBudgets) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req CDCCleanupRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -140,88 +187,50 @@ func CleanupCDCResources(db *sql.DB, mcpManager *mcp.ServerManager) gin.HandlerF
 			return
 		}
 
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-		defer cancel()
-
 		log.WithField("pipeline_id", req.PipelineID).Info("Cleaning up CDC resources")
-
-		// Best-effort: stop the kafka-mcp-sink worker for this pipeline.
-		// The orchestrator only starts the worker (start_sink); without an
-		// explicit stop_sink call on delete, the subprocess inside the sink
-		// MCP container lingers until the container restarts.
-		if mcpManager != nil && strings.TrimSpace(req.PipelineID) != "" {
-			// Teardown must target the group the sink actually registered, or the
-			// subprocess survives the delete and keeps holding the destination.
-			consumerGroup := ResolveSinkConsumerGroup(ctx, db, req.PipelineID)
-			client := mcp.NewClient(mcpManager)
-			if stopResp, _ := client.ExecuteWithContext(ctx, mcp.ExecuteRequest{
-				Connector: "kafka-mcp-sink",
-				Operation: "stop_sink",
-				Config:    map[string]string{},
-				Params: map[string]interface{}{
-					"config": map[string]interface{}{
-						"consumer_group": consumerGroup,
-					},
-				},
-			}); stopResp != nil && !stopResp.Success {
-				log.WithFields(log.Fields{
-					"pipeline_id":     req.PipelineID,
-					"consumer_group":  consumerGroup,
-					"stop_sink_error": stopResp.Error,
-				}).Debug("stop_sink on cleanup returned failure (likely no worker running; continuing)")
-			}
-		}
 
 		errors := []string{}
 
-		// ALWAYS delete the Debezium connector first — independent of the
+		// Phase 1: which kafka-mcp-sink workers to stop. The orchestrator only starts
+		// them (start_sink); without an explicit stop_sink on delete the subprocess
+		// inside the sink container keeps consuming and writing until it restarts.
+		// Lower-cased because the derived names and the id8 check compare against
+		// pipelines.id::text.
+		var sinkGroups []string
+		if sinks != nil && strings.TrimSpace(req.PipelineID) != "" {
+			resolveCtx, cancelResolve := context.WithTimeout(context.Background(), budgets.resolve)
+			defer cancelResolve()
+			groups, warnings := sinkGroupsForCleanup(resolveCtx, db, strings.ToLower(strings.TrimSpace(req.PipelineID)))
+			sinkGroups = groups
+			errors = append(errors, warnings...)
+		}
+
+		// Phase 2: ALWAYS delete the Debezium connector — independent of the
 		// cdc_resources table (which is frequently empty for MySQL pipelines,
 		// so gating teardown on it silently skipped connector deletion). Doing
 		// this before the per-DB managers also lets the PG replication slot go
 		// inactive so it can be dropped (otherwise DROP_REPLICATION_SLOT fails
 		// on the still-active slot held by a running connector).
 		if strings.TrimSpace(req.PipelineID) != "" {
-			if err := deleteDebeziumConnector(ctx, db, req.PipelineID); err != nil {
+			connectorCtx, cancelConnector := context.WithTimeout(context.Background(), budgets.connector)
+			defer cancelConnector()
+			if err := deleteDebeziumConnector(connectorCtx, db, req.PipelineID); err != nil {
 				log.WithError(err).WithField("pipeline_id", req.PipelineID).
 					Warn("Debezium connector delete on cleanup failed (continuing)")
 				errors = append(errors, "connector delete: "+err.Error())
 			}
 		}
 
-		// Get all resources to determine which managers to use
-		resources, err := cdc.GetCDCResources(ctx, db, req.PipelineID)
-		if err != nil {
-			log.WithError(err).Error("Failed to get CDC resources for cleanup")
-			c.JSON(http.StatusInternalServerError, gin.H{
-				"success": false,
-				"errors":  []string{err.Error()},
-			})
-			return
-		}
+		// Phase 3: source-database resources.
+		sourcesCtx, cancelSources := context.WithTimeout(context.Background(), budgets.sources)
+		defer cancelSources()
+		errors = append(errors, cleanupSources(sourcesCtx, db, req.PipelineID)...)
 
-		// Group by database type. Always include every registered CDC family so
-		// slot/publication/capture-instance cleanup runs even when cdc_resources
-		// has no rows for this pipeline (the common case for MySQL pipelines).
-		// Each provider's CleanupResources is idempotent/best-effort: if there is
-		// nothing for this pipeline it no-ops, so running all of them is safe.
-		dbTypes := map[string]bool{}
-		for _, t := range cdc.RegisteredDBTypes() {
-			dbTypes[t] = true
-		}
-		for _, res := range resources {
-			dbTypes[res.DatabaseType] = true
-		}
-
-		// Cleanup for each database type via the shared provider registry.
-		for dbType := range dbTypes {
-			mgr, ok := cdc.NewProvider(dbType, db)
-			if !ok {
-				continue
-			}
-			if err := mgr.CleanupResources(ctx, req.PipelineID); err != nil {
-				errors = append(errors, fmt.Sprintf("%s cleanup: %s", mgr.Family(), err.Error()))
-			}
-		}
+		// Phase 4: stop the sink workers. A failure is reported, not logged and
+		// dropped: the worker may still be writing to the destination.
+		sinkStopCtx, cancelSinkStop := context.WithTimeout(context.Background(), budgets.sinkStop)
+		defer cancelSinkStop()
+		errors = append(errors, stopSinkWorkers(sinkStopCtx, sinks, req.PipelineID, sinkGroups)...)
 
 		if len(errors) > 0 {
 			log.WithField("errors", errors).Warn("CDC cleanup completed with errors")
@@ -240,6 +249,46 @@ func CleanupCDCResources(db *sql.DB, mcpManager *mcp.ServerManager) gin.HandlerF
 			"message": "CDC resources cleaned up successfully",
 		})
 	}
+}
+
+// cleanupCDCSources runs every registered CDC provider's cleanup for a pipeline.
+//
+// A failed cdc_resources read is returned as an error rather than ending the request with
+// a 500: the handler still has to stop the sink workers after this. api-gateway reports a
+// 500 and a success:false the same way, as a delete warning.
+func cleanupCDCSources(ctx context.Context, db *sql.DB, pipelineID string) []string {
+	// Get all resources to determine which managers to use
+	resources, err := cdc.GetCDCResources(ctx, db, pipelineID)
+	if err != nil {
+		log.WithError(err).Error("Failed to get CDC resources for cleanup")
+		return []string{err.Error()}
+	}
+
+	// Group by database type. Always include every registered CDC family so
+	// slot/publication/capture-instance cleanup runs even when cdc_resources
+	// has no rows for this pipeline (the common case for MySQL pipelines).
+	// Each provider's CleanupResources is idempotent/best-effort: if there is
+	// nothing for this pipeline it no-ops, so running all of them is safe.
+	dbTypes := map[string]bool{}
+	for _, t := range cdc.RegisteredDBTypes() {
+		dbTypes[t] = true
+	}
+	for _, res := range resources {
+		dbTypes[res.DatabaseType] = true
+	}
+
+	// Cleanup for each database type via the shared provider registry.
+	var errs []string
+	for dbType := range dbTypes {
+		mgr, ok := cdc.NewProvider(dbType, db)
+		if !ok {
+			continue
+		}
+		if err := mgr.CleanupResources(ctx, pipelineID); err != nil {
+			errs = append(errs, fmt.Sprintf("%s cleanup: %s", mgr.Family(), err.Error()))
+		}
+	}
+	return errs
 }
 
 // UpdateCDCTables updates the table.include.list for a CDC connector
@@ -523,7 +572,38 @@ func getKafkaConnectURL() string {
 	return url
 }
 
-// updateConnectorTableList updates the table.include.list for a Debezium connector
+// isMongoDebeziumConfig reports whether a Kafka Connect config is a Debezium
+// MongoDB source connector.
+func isMongoDebeziumConfig(config map[string]interface{}) bool {
+	class := strings.ToLower(connectorConfigString(config, "connector.class"))
+	if strings.Contains(class, "mongodb") {
+		return true
+	}
+	return class == "" && connectorConfigString(config, "collection.include.list") != ""
+}
+
+// qualifyMongoCollections turns bare collection names into "db.collection"
+// when the connector captures exactly one database, as the connector create
+// path does (debezium connector.py). Qualified names pass through unchanged.
+func qualifyMongoCollections(config map[string]interface{}, tables []string) []string {
+	dbs := splitCommaList(connectorConfigString(config, "database.include.list"))
+	out := make([]string, 0, len(tables))
+	for _, t := range tables {
+		tt := strings.TrimSpace(t)
+		if tt == "" {
+			continue
+		}
+		if !strings.Contains(tt, ".") && len(dbs) == 1 {
+			tt = dbs[0] + "." + tt
+		}
+		out = append(out, tt)
+	}
+	return out
+}
+
+// updateConnectorTableList updates the captured table list of a Debezium
+// connector: table.include.list for relational sources, collection.include.list
+// for MongoDB.
 func updateConnectorTableList(ctx context.Context, kafkaConnectURL, connectorName string, tables []string) error {
 	// Build table.include.list (format: db1.table1,db1.table2,...)
 	tableIncludeList := strings.Join(tables, ",")
@@ -548,8 +628,17 @@ func updateConnectorTableList(ctx context.Context, kafkaConnectURL, connectorNam
 		return fmt.Errorf("failed to decode connector config: %w", err)
 	}
 
-	// Update table.include.list
-	config["table.include.list"] = tableIncludeList
+	// The MongoDB connector ignores table.include.list and captures
+	// collection.include.list, which the sink respawn also reads
+	// (connectorIncludeList). Writing only table.include.list left Debezium on
+	// the old collections while a respawned sink followed the new ones (#26).
+	if isMongoDebeziumConfig(config) {
+		tableIncludeList = strings.Join(qualifyMongoCollections(config, tables), ",")
+		config["collection.include.list"] = tableIncludeList
+		delete(config, "table.include.list")
+	} else {
+		config["table.include.list"] = tableIncludeList
+	}
 
 	// Send updated config back to Kafka Connect
 	putURL := fmt.Sprintf("%s/connectors/%s/config", kafkaConnectURL, connectorName)
@@ -581,9 +670,27 @@ func updateConnectorTableList(ctx context.Context, kafkaConnectURL, connectorNam
 	return nil
 }
 
-// BackfillCDCTables triggers an ad-hoc snapshot for the requested tables using Debezium signaling.
-// Currently supported for MySQL Debezium connectors (signal via <db>.debezium_signal).
-func BackfillCDCTables(db *sql.DB) gin.HandlerFunc {
+// cdcSignalProducer is the slice of the Kafka manager the backfill needs. It is
+// an interface so the handler can be tested without a broker, and so the
+// orchestrator keeps exactly one Kafka client.
+type cdcSignalProducer interface {
+	EnsureTopicExists(topic string, partitions int32) error
+	ProduceWithContext(ctx context.Context, topic string, key, value []byte) error
+}
+
+// BackfillCDCTables triggers an ad-hoc Debezium snapshot for the requested tables.
+//
+// There are two signalling channels, and which one a connector has is decided
+// when it is created:
+//
+//   - Kafka signal channel (snapshot_strategy=incremental — PostgreSQL, MySQL):
+//     the signal is a Kafka message, so NOTHING is written to the customer's
+//     source database. Preferred whenever the connector has it.
+//   - Source signal table (<db>.debezium_signal): MySQL only, because it needs a
+//     writable signal table in the source.
+//
+// Engines with neither are refused with cdc_backfill_not_supported.
+func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		pipelineID := strings.TrimSpace(c.Param("pipeline_id"))
 		if pipelineID == "" {
@@ -642,10 +749,80 @@ func BackfillCDCTables(db *sql.DB) gin.HandlerFunc {
 		}
 
 		connectorClass := strings.ToLower(strings.TrimSpace(fmt.Sprint(connCfg["connector.class"])))
+
+		// Find the source connection up front: both channels validate primary keys
+		// against the source before signalling.
+		sourceConnID, err := findPipelineSourceConnectionID(ctx, db, pipelineID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
+			return
+		}
+
+		dbType := inferDebeziumDatabaseType(connCfg)
+		defaultDB, defaultSchema := inferDefaultDBAndSchema(connCfg)
+
+		// Prefer the Kafka signal channel when the connector has one: it works for
+		// every engine that wires it, and it writes nothing to the source.
+		if signalTopic := connCfgString(connCfg, "signal.kafka.topic"); signalTopic != "" &&
+			strings.Contains(strings.ToLower(connCfgString(connCfg, "signal.enabled.channels")), "kafka") {
+			if signals == nil {
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"error":   "signal_channel_unavailable",
+					"message": "The connector signals over Kafka but this orchestrator has no Kafka producer",
+				})
+				return
+			}
+			if halt := backfillMissingPKs(ctx, c, db, pipelineID, sourceConnID, dbType, defaultDB, defaultSchema, tables); halt {
+				return
+			}
+
+			collections := normalizeDebeziumCollections(pkNamespaceFor(dbType, defaultDB, defaultSchema), tables)
+			// Per the Debezium signalling contract the message KEY is the
+			// connector's topic.prefix; the connector name is the prefix here, and
+			// the explicit property wins when present.
+			key := connCfgString(connCfg, "topic.prefix")
+			if key == "" {
+				key = connectorName
+			}
+			value, merr := buildExecuteSnapshotSignal(mode, collections)
+			if merr != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "signal_encode_failed", "message": merr.Error()})
+				return
+			}
+			if terr := signals.EnsureTopicExists(signalTopic, 1); terr != nil {
+				// Non-fatal: the produce below is the authoritative delivery check
+				// (broker auto-create may still succeed).
+				log.WithError(terr).WithField("topic", signalTopic).Warn("⚠️  CDC backfill: could not ensure the signal topic exists (producing anyway)")
+			}
+			if perr := signals.ProduceWithContext(ctx, signalTopic, []byte(key), value); perr != nil {
+				c.JSON(http.StatusBadGateway, gin.H{
+					"error":   "signal_emit_failed",
+					"message": perr.Error(),
+				})
+				return
+			}
+			log.WithFields(log.Fields{
+				"pipeline_id":  pipelineID,
+				"signal_topic": signalTopic,
+				"tables":       len(collections),
+			}).Info("📸 CDC backfill triggered over the Kafka signal channel")
+			c.JSON(http.StatusOK, gin.H{
+				"success":          true,
+				"pipeline_id":      pipelineID,
+				"connector_name":   connectorName,
+				"signal_channel":   "kafka",
+				"signal_topic":     signalTopic,
+				"snapshot_mode":    mode,
+				"data_collections": collections,
+				"message":          "CDC backfill triggered (Debezium ad-hoc snapshot over the Kafka signal channel).",
+			})
+			return
+		}
+
 		if !strings.Contains(connectorClass, "mysql") {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":           "cdc_backfill_not_supported",
-				"message":         "CDC backfill is currently supported for MySQL Debezium connectors only",
+				"message":         "CDC backfill needs either a Kafka signal channel (create the pipeline with snapshot_strategy=incremental) or a MySQL source signal table",
 				"connector_class": connectorClass,
 			})
 			return
@@ -676,13 +853,6 @@ func BackfillCDCTables(db *sql.DB) gin.HandlerFunc {
 				c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
 				return
 			}
-		}
-
-		// Find source connection ID (to connect to MySQL for signaling).
-		sourceConnID, err := findPipelineSourceConnectionID(ctx, db, pipelineID)
-		if err != nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
-			return
 		}
 
 		// P0 guard: for relational destinations, ensure PKs exist before emitting snapshot signals.
@@ -816,6 +986,88 @@ func deriveDebeziumDatabaseName(connCfg map[string]interface{}, tables []string)
 		}
 	}
 	return ""
+}
+
+// buildExecuteSnapshotSignal encodes the VALUE of a Debezium execute-snapshot
+// signal for the Kafka signal channel. The shape is Debezium's, not ours: the
+// snapshot type lives under "data", and Debezium silently ignores a signal it
+// cannot parse — so getting this wrong means "no backfill" with no error
+// anywhere. The message KEY is the connector's topic.prefix, supplied by the
+// caller.
+func buildExecuteSnapshotSignal(mode string, collections []string) ([]byte, error) {
+	if len(collections) == 0 {
+		return nil, fmt.Errorf("execute-snapshot signal: no data collections")
+	}
+	snapshotType := "INCREMENTAL"
+	if strings.EqualFold(strings.TrimSpace(mode), "blocking") {
+		snapshotType = "BLOCKING"
+	}
+	return json.Marshal(map[string]interface{}{
+		"type": "execute-snapshot",
+		"data": map[string]interface{}{
+			"type":             snapshotType,
+			"data-collections": collections,
+		},
+	})
+}
+
+// connCfgString reads a Kafka Connect config value as a trimmed string. A
+// missing key must read as "" — fmt.Sprint(nil) yields "<nil>", which would make
+// an absent signal topic look configured.
+func connCfgString(connCfg map[string]interface{}, key string) string {
+	v, ok := connCfg[key]
+	if !ok || v == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprint(v))
+}
+
+// pkNamespaceFor picks the default namespace that qualifies an unqualified table
+// name for an engine (database for MySQL, schema for PostgreSQL, …), falling
+// back to the schema when the engine is unknown.
+func pkNamespaceFor(dbType, defaultDB, defaultSchema string) string {
+	if mgr, ok := cdc.NewProvider(dbType, nil); ok {
+		return mgr.PrimaryKeyNamespace(defaultDB, defaultSchema)
+	}
+	if defaultSchema != "" {
+		return defaultSchema
+	}
+	return defaultDB
+}
+
+// backfillMissingPKs applies the same primary-key policy as UpdateCDCTables
+// before a snapshot is signalled: a relational destination needs a PK for
+// upsert/delete. It answers the request itself on any failure and reports
+// halt=true, so the caller just returns. The refusal shape is identical to
+// UpdateCDCTables' — CDC auto-pickup reads {"error":"missing_primary_key",
+// "tables":[…]} from both.
+func backfillMissingPKs(ctx context.Context, c *gin.Context, db *sql.DB, pipelineID, sourceConnID, dbType, defaultDB, defaultSchema string, tables []string) (halt bool) {
+	requiresPK, _, derr := pipelineDestinationRequiresPKValidation(ctx, db, pipelineID)
+	if derr != nil || !requiresPK {
+		return false
+	}
+	mgr, ok := cdc.NewProvider(dbType, db)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "cdc_pk_validation_unsupported",
+			"message": fmt.Sprintf("PK validation is not supported for Debezium connector type %q", dbType),
+		})
+		return true
+	}
+	missing, verr := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, mgr.PrimaryKeyNamespace(defaultDB, defaultSchema), tables)
+	if verr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": verr.Error()})
+		return true
+	}
+	if len(missing) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "missing_primary_key",
+			"message": "CDC requires PRIMARY KEY for relational destinations (upsert/delete). Add PKs or remove these tables.",
+			"tables":  missing,
+		})
+		return true
+	}
+	return false
 }
 
 func normalizeDebeziumCollections(dbName string, tables []string) []string {

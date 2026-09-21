@@ -1,9 +1,10 @@
 "use client"
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import Link from "next/link"
 import { usePathname, useRouter, useSearchParams } from "next/navigation"
 import { toast } from "sonner"
-import { Edit, Pencil, Square, Trash2, MoreHorizontal, Loader2, AlertTriangle } from "lucide-react"
+import { BellRing, Download, Edit, FileText, Pencil, Square, Trash2, MoreHorizontal, Loader2, AlertTriangle } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -36,6 +37,8 @@ import {
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
 import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import { readResponseErrorMessage } from "@/lib/utils/error-handling"
+import { deleteWarningToast, readDeleteWarnings } from "@/lib/utils/delete-warnings"
+import { exportPipelineConfig, pipelineLogsHref } from "@/lib/pipeline/pipelineMenuActions"
 
 export function PipelineHeaderOverflowMenu(props: {
   pipelineId: string
@@ -46,8 +49,10 @@ export function PipelineHeaderOverflowMenu(props: {
   pipelineType?: string
   // Best-effort initial status from the server render; reconciled against /state.
   status?: string
+  // The latest execution, for View Logs; none yet opens the Monitor tab.
+  lastExecutionId?: string | null
 }) {
-  const { pipelineId, pipelineName, pipelineType, status } = props
+  const { pipelineId, pipelineName, pipelineType, status, lastExecutionId } = props
   const router = useRouter()
   const pathname = usePathname()
   const searchParams = useSearchParams()
@@ -58,8 +63,10 @@ export function PipelineHeaderOverflowMenu(props: {
   // confirm dialog opens — the dialog is the one place it matters, and an
   // "active schedule" is the consequence users are most surprised by.
   const [activeScheduleCount, setActiveScheduleCount] = useState<number | null>(null)
-  const [renameOpen, setRenameOpen] = useState(false)
-  const [renameValue, setRenameValue] = useState("")
+  // The Pipelines list's row menu opens Rename here with ?rename=1 (#52).
+  const renameOnLoad = searchParams?.get("rename") === "1"
+  const [renameOpen, setRenameOpen] = useState(renameOnLoad)
+  const [renameValue, setRenameValue] = useState(renameOnLoad ? pipelineName || "" : "")
   const [renaming, setRenaming] = useState(false)
   const [stopping, setStopping] = useState(false)
 
@@ -128,8 +135,12 @@ export function PipelineHeaderOverflowMenu(props: {
   // Stop is offered only while the CDC pipeline is actually running (mirrors the
   // old CDCPipelineActions "Stop Pipeline" gate: running or waiting_for_user). A
   // dead stream (failed/idle) no longer qualifies — recovery lives in the inline
-  // actions cluster instead.
-  const canStop = isCDC && (effectiveStatus === "running" || effectiveStatus === "waiting_for_user")
+  // actions cluster instead. The one exception is a stream /runtime calls failed
+  // while /state still has it running: it is still up, and a failed pipeline has
+  // no inline Pause (CDCPipelineActions), so Stop here is its non-destructive way
+  // down. Without it, Delete would be the only one.
+  const canStop =
+    isCDC && (runIsInFlight || (effectiveStatus === "failed" && liveStatus === "running"))
 
   const handleStop = useCallback(async () => {
     if (inFlightRef.current) return
@@ -177,6 +188,16 @@ export function PipelineHeaderOverflowMenu(props: {
     setRenameOpen(true)
   }, [pipelineName])
 
+  // The dialog opened from ?rename=1 starts open; drop the param so a refresh or
+  // Back doesn't reopen it.
+  useEffect(() => {
+    if (!renameOnLoad) return
+    const next = new URLSearchParams(searchParams?.toString() || "")
+    next.delete("rename")
+    const qs = next.toString()
+    router.replace(qs ? `${pathname}?${qs}` : pathname)
+  }, [renameOnLoad, searchParams, router, pathname])
+
   const handleRename = useCallback(async () => {
     const next = renameValue.trim()
     if (!next) {
@@ -216,7 +237,16 @@ export function PipelineHeaderOverflowMenu(props: {
         toast.error("Delete failed", { description: await readResponseErrorMessage(res) })
         return
       }
-      toast.success("Pipeline deleted")
+      // Same as the pipelines list: a 200 may still report cleanup that did not
+      // finish, and the user is about to navigate away from the only page that
+      // could have shown it.
+      const warnings = await readDeleteWarnings(res)
+      if (warnings.length > 0) {
+        const { title, description } = deleteWarningToast(warnings)
+        toast.warning(title, { description, duration: 12000 })
+      } else {
+        toast.success("Pipeline deleted")
+      }
       setDeleteOpen(false)
       router.push("/pipelines")
     } catch (e) {
@@ -245,6 +275,15 @@ export function PipelineHeaderOverflowMenu(props: {
             <Edit className="h-4 w-4 mr-2" />
             Edit Tables
           </DropdownMenuItem>
+          {/* The drift policy lives on the schema-changes page, above the changes it
+              decides about; this is the one route to it when nothing is pending
+              (the header's drift badge only renders while something is). */}
+          <DropdownMenuItem asChild>
+            <Link href={`/pipelines/${pipelineId}/schema-changes`}>
+              <BellRing className="h-4 w-4 mr-2" />
+              Schema change alerts…
+            </Link>
+          </DropdownMenuItem>
           {/* Stop is owned here for CDC pipelines (they have no inline Stop button —
               their primary control is Pause). ETL pipelines keep their inline Stop
               in PipelineActions, so this item never renders for them. */}
@@ -260,6 +299,18 @@ export function PipelineHeaderOverflowMenu(props: {
               Stop Pipeline
             </DropdownMenuItem>
           )}
+          {/* The list's row menu carries these same items (#52). */}
+          <DropdownMenuSeparator />
+          <DropdownMenuItem asChild>
+            <Link href={pipelineLogsHref(pipelineId, lastExecutionId)}>
+              <FileText className="h-4 w-4 mr-2" />
+              View Logs
+            </Link>
+          </DropdownMenuItem>
+          <DropdownMenuItem onSelect={() => void exportPipelineConfig(pipelineId)}>
+            <Download className="h-4 w-4 mr-2" />
+            Export Config
+          </DropdownMenuItem>
           <DropdownMenuSeparator />
           <DropdownMenuItem
             className="text-red-600 focus:text-red-600"

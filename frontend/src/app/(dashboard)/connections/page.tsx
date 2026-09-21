@@ -14,7 +14,6 @@ import {
   Search,
   Edit,
   Trash2,
-  CheckCircle2,
   RefreshCw,
   Cloud,
   Server,
@@ -44,8 +43,16 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog"
 import { toast } from "sonner"
+import {
+  connectorDeployingErrorMessage,
+  connectorDeployingMessage,
+  isConnectorDeployingResponse,
+} from "@/lib/errors/connector-deploying"
 import { ConnectionLogo } from "@/components/connectors/ConnectionLogo"
+import { ConnectionTestBadge, LastTestErrorLine } from "@/components/connectors/ConnectionTestStatus"
+import { formatAbsoluteTime, formatRelativeTime } from "@/lib/utils"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { getConnectorDisplayName } from "@/lib/types/mcp-connector"
 import { httpErrorFromResponse, parseApiError, classifyError, type AppError } from "@/lib/utils/error-handling"
 import type { ApiErrorBody } from "@/lib/api/types"
 import { authFetch } from "@/lib/api/auth-fetch"
@@ -60,9 +67,11 @@ interface Connection {
   connector_type: string
   sync_mode?: "batch" | "cdc"
   cdc_mode?: "initial" | "streaming_only"
+  // Derived by the gateway from the stored last_test_status (connections.go).
   is_connected: boolean
   last_tested_at?: string
-  connection_error?: string
+  last_test_status?: string
+  last_test_error?: string
   config?: Record<string, unknown>
   created_at: string
   updated_at: string
@@ -159,16 +168,7 @@ export default function ConnectionsPage() {
 
       const data = await response.json()
       if (isStale()) return
-      const fresh: Connection[] = data.connections || []
-      // Overlay optimistic test-success results so the list reflects what was tested
-      // in the detail page (workaround: backend doesn't persist is_connected on test).
-      setConnections(
-        fresh.map((c) =>
-          sessionStorage.getItem(`connection_tested_${c.id}`) === "true"
-            ? { ...c, is_connected: true }
-            : c
-        )
-      )
+      setConnections(data.connections || [])
       setError(null)
     } catch (err) {
       if (isStale()) return
@@ -273,6 +273,21 @@ export default function ConnectionsPage() {
     }
   }
 
+  // Re-read one connection after a test, so its badge and error line show the
+  // stored result (the test persists it) without reloading the whole list.
+  const refreshConnection = async (connectionId: string) => {
+    const isStale = captureWorkspace()
+    try {
+      const response = await authFetch(API_ENDPOINTS.CONNECTIONS.GET(connectionId), { cache: "no-store" })
+      if (!response.ok) return
+      const fresh = (await response.json()) as Connection
+      if (isStale()) return
+      setConnections((prev) => prev.map((c) => (c.id === connectionId ? { ...c, ...fresh } : c)))
+    } catch {
+      // Non-critical: the toast already reported the result.
+    }
+  }
+
   const handleTestConnection = async (connection: Connection) => {
     try {
       setTestingId(connection.id)
@@ -289,13 +304,19 @@ export default function ConnectionsPage() {
         toast.success("Connection test successful", {
           description: result.message || "Connection is working properly",
         })
-        // Persist test result so list page retains "Connected" badge after re-fetch
-        sessionStorage.setItem(`connection_tested_${connection.id}`, "true")
-        await fetchConnections() // Refresh to update status (overlay applied inside)
+        await refreshConnection(connection.id)
+      } else if (isConnectorDeployingResponse(result)) {
+        // Connector container is still being set up on first use — not a failure.
+        toast.info("Connector is still being set up", {
+          description:
+            connectorDeployingErrorMessage(result.error || result.message) ?? connectorDeployingMessage(),
+        })
       } else {
         toast.error("Connection test failed", {
           description: result.error || result.message || "Unable to connect",
         })
+        // The failure is stored too; show it under the connection.
+        await refreshConnection(connection.id)
       }
     } catch (err) {
       const e = classifyError(err, "connections.test")
@@ -467,21 +488,7 @@ export default function ConnectionsPage() {
                         )}
                         {connection.type}
                       </Badge>
-                      {connection.is_connected ? (
-                        <Badge className="bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">
-                          <CheckCircle2 className="h-3 w-3 mr-1" />
-                          Connected
-                        </Badge>
-                      ) : connection.is_expired ? (
-                        <Badge className="bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
-                          <AlertTriangle className="h-3 w-3 mr-1" />
-                          Token expired
-                        </Badge>
-                      ) : (
-                        <Badge variant="secondary">
-                          Not tested
-                        </Badge>
-                      )}
+                      <ConnectionTestBadge connection={connection} />
                       {/* Sync Mode Badge - Only for sources */}
                       {connection.type === "source" && connection.sync_mode && (
                         <Badge
@@ -521,11 +528,17 @@ export default function ConnectionsPage() {
                       })()}
                     </div>
                     <p className="text-sm text-zinc-500 dark:text-zinc-400 mb-2">
-                      {connection.description || `${connection.connector_type} connection`}
+                      {connection.description || `${getConnectorDisplayName(connection.connector_type)} connection`}
                     </p>
+                    <LastTestErrorLine connection={connection} />
                     <div className="flex items-center gap-4 text-xs text-zinc-400">
-                      <span>Type: {connection.connector_type}</span>
+                      <span>Type: {getConnectorDisplayName(connection.connector_type)}</span>
                       <span>Created: {formatDate(connection.created_at)}</span>
+                      {connection.last_tested_at && (
+                        <span title={formatAbsoluteTime(connection.last_tested_at)}>
+                          Tested: {formatRelativeTime(connection.last_tested_at)}
+                        </span>
+                      )}
                     </div>
                   </div>
                 </div>

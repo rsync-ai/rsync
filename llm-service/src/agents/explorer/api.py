@@ -18,7 +18,9 @@ from src.utils.openai_client import (
     # build, so an explicit groq silently became an OpenAI client.
     make_async_client as _create_async_client,
     client_egress_host as _client_egress_host,
+    explorer_llm_configured as _explorer_llm_configured,
 )
+from src.utils.llm_gate import require_explorer_llm
 
 logger = logging.getLogger("llm-explorer")
 
@@ -233,6 +235,7 @@ async def resolve_tables(request: TableLinkRequest):
         # Explorer is offline-only.
         if EXPLORER_OFFLINE_ONLY and USE_MOCK:
             return _mock_table_link(request)
+        require_explorer_llm()
         if explorer_client is None:
             raise HTTPException(status_code=503, detail="Explorer LLM client unavailable (offline-only)")
 
@@ -271,6 +274,8 @@ async def resolve_tables(request: TableLinkRequest):
             hitl_reason=result.get("hitl_reason"),
             suggested_join_keys=result.get("suggested_join_keys"),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Table link failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -309,6 +314,7 @@ async def resolve_columns(request: ColumnLinkRequest):
         # Explorer is offline-only.
         if EXPLORER_OFFLINE_ONLY and USE_MOCK:
             return _mock_column_link(request)
+        require_explorer_llm()
         if explorer_client is None:
             raise HTTPException(status_code=503, detail="Explorer LLM client unavailable (offline-only)")
 
@@ -353,6 +359,8 @@ async def resolve_columns(request: ColumnLinkRequest):
             hitl_reason=result.get("hitl_reason"),
             ambiguous_columns=result.get("ambiguous_columns"),
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Column link failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
@@ -389,6 +397,11 @@ async def get_next_steps(request: NextStepsRequest):
         # Explorer is offline-only.
         if EXPLORER_OFFLINE_ONLY and USE_MOCK:
             return _mock_next_steps(request)
+        if not USE_MOCK and not _explorer_llm_configured():
+            # Next steps are offered after every query, including raw SQL, so
+            # without an LLM they fall back to the rule-based list rather than
+            # turning a successful query into an error.
+            return _mock_next_steps(request)
         if explorer_client is None:
             raise HTTPException(status_code=503, detail="Explorer LLM client unavailable (offline-only)")
 
@@ -421,13 +434,15 @@ async def get_next_steps(request: NextStepsRequest):
             suggestions.append(NextStepSuggestion(**s))
 
         return NextStepsResponse(suggestions=suggestions)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Next steps failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e))
 
 
 def _mock_next_steps(request: NextStepsRequest) -> NextStepsResponse:
-    """Mock next steps for testing."""
+    """Rule-based next steps: mock mode, and installs without an LLM."""
     suggestions = []
     row_count = request.result_profile.row_count
 

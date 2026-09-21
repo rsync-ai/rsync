@@ -78,9 +78,9 @@ async def run_pii_kafka_consumer() -> None:
         return
 
     try:
-        from src.utils.kafka_security import KafkaSecurityError
+        from src.utils.kafka_security import KafkaSecurityError, explain_failure
     except ImportError:  # pragma: no cover - import path differs under some runners
-        from ...utils.kafka_security import KafkaSecurityError
+        from ...utils.kafka_security import KafkaSecurityError, explain_failure
 
     service = PIIScannerService()
 
@@ -117,13 +117,15 @@ async def run_pii_kafka_consumer() -> None:
             )
             break
         except Exception as exc:
+            # explain_failure, not exc: a wrong password, an untrusted CA and a
+            # broker that is simply down all raise the same KafkaTimeoutError.
             if attempt == CONNECT_ATTEMPTS:
                 logger.error(
                     "PII Kafka consumer DISABLED: could not connect to %s after %d attempts: %s. "
                     "Async PII scan requests will be accepted and never processed.",
                     brokers,
                     CONNECT_ATTEMPTS,
-                    exc,
+                    explain_failure(exc),
                 )
                 return
             logger.warning(
@@ -131,7 +133,7 @@ async def run_pii_kafka_consumer() -> None:
                 brokers,
                 attempt,
                 CONNECT_ATTEMPTS,
-                exc,
+                explain_failure(exc),
                 CONNECT_RETRY_SECONDS,
             )
             await asyncio.sleep(CONNECT_RETRY_SECONDS)

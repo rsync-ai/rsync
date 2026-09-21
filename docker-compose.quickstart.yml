@@ -75,6 +75,18 @@ x-kafka-security: &kafka-security
   KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT: ${KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT:-}
   KAFKA_SASL_OAUTHBEARER_SCOPE: ${KAFKA_SASL_OAUTHBEARER_SCOPE:-}
   KAFKA_SASL_OAUTHBEARER_EXTENSIONS: ${KAFKA_SASL_OAUTHBEARER_EXTENSIONS:-}
+  # Re-permits a plain-http token endpoint off loopback, which every runtime
+  # otherwise refuses at start-up (the client-credentials grant POSTs
+  # CLIENT_SECRET on every fetch). Carried here for ONE reason: kafka-connect
+  # and the kafka-init job read their whole security profile from this anchor,
+  # so without a passthrough a rig with a throwaway http IdP can configure the
+  # Go and Python services but not the JVM ones -- the same image behaving
+  # differently under compose than under the chart, which does make it
+  # reachable. The default is empty, i.e. unset, i.e. the refusal stays armed;
+  # a passthrough is not a setting. Never give it a value in this file --
+  # llm-service/tests/test_insecure_token_endpoint_rule_is_one_rule.py fails if
+  # any file but the Kafka security matrix harness sets it to true.
+  KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT: ${KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT:-}
   # JVM-only, and only the CDC profile has a JVM in it (kafka-connect). Carried
   # here anyway because Debezium's schema-history client is configured from the
   # connector container's environment, so the name has to survive the trip.
@@ -90,10 +102,10 @@ x-kafka-security: &kafka-security
   KAFKA_SSL_CERT_LOCATION: ${KAFKA_SSL_CERT_LOCATION:-}
   KAFKA_SSL_KEY_LOCATION: ${KAFKA_SSL_KEY_LOCATION:-}
   # The SAME keypair in the shape a JVM can load: ONE file holding chain + key.
-  # A JVM PEM keystore cannot take the cert and the key as two paths, so this is
-  # not derivable from the pair above -- `cat tls.crt tls.key > client.pem`.
-  # Inert in the Go and Python services; kafka-init and kafka-connect need it,
-  # and kafka-init refuses to start a half-configured mTLS handshake without it.
+  # Optional -- kafka-init and kafka-connect build that file from the pair above
+  # when this is unset (the connect image's connect-entrypoint.sh). Set it only
+  # to use a combined file you already have; it then wins over the pair. Inert
+  # in the Go and Python services.
   KAFKA_SSL_KEYSTORE_LOCATION: ${KAFKA_SSL_KEYSTORE_LOCATION:-}
   # Disables certificate verification, and is logged unconditionally when set: a
   # self-signed lab, not prod.
@@ -372,22 +384,41 @@ services:
           { echo "ssl.truststore.type=PEM";
             echo "ssl.truststore.location=$$KAFKA_SSL_CA_LOCATION"; } >> "$$CFG";
         fi;
-        # mTLS. KAFKA_SSL_KEYSTORE_LOCATION, NOT KAFKA_SSL_CERT_LOCATION: a JVM
-        # PEM keystore is ONE file holding chain + key, and it cannot take the
-        # two paths the Go and Python clients read. Pointing it at the cert half
-        # alone yields "Failed to load PEM keystore" -- a message that names the
-        # file, so it reads like a bad certificate rather than a missing key.
-        if [ -n "$${KAFKA_SSL_KEYSTORE_LOCATION:-}" ]; then
+        # mTLS. A JVM PEM keystore is ONE file holding chain + key; it cannot
+        # take the two paths the Go and Python clients read, and pointing it at
+        # the cert half alone yields "Failed to load PEM keystore" -- a message
+        # naming the file, so it reads like a bad certificate, not a missing key.
+        # An explicit KAFKA_SSL_KEYSTORE_LOCATION wins; otherwise the file is
+        # built here from the pair, with the same checks the kafka-connect
+        # image's entrypoint (connect-entrypoint.sh) makes on the same input.
+        KS="$${KAFKA_SSL_KEYSTORE_LOCATION:-}";
+        CRT="$${KAFKA_SSL_CERT_LOCATION:-}";
+        KEY="$${KAFKA_SSL_KEY_LOCATION:-}";
+        if [ -z "$$KS" ] && [ -n "$$CRT$$KEY" ]; then
+          # Half a pair is a config error, not "no mTLS": the broker would
+          # reject the handshake anyway, with an alert naming neither variable.
+          if [ -z "$$CRT" ] || [ -z "$$KEY" ]; then
+            echo "FATAL: KAFKA_SSL_CERT_LOCATION and KAFKA_SSL_KEY_LOCATION must be set together (mTLS needs both halves of the keypair)." >&2;
+            exit 1;
+          fi;
+          for f in "$$CRT" "$$KEY"; do
+            [ -r "$$f" ] || { echo "FATAL: $$f (from KAFKA_SSL_CERT_LOCATION / KAFKA_SSL_KEY_LOCATION) is not a readable file in this container." >&2; exit 1; };
+          done;
+          grep -q -- '-----BEGIN CERTIFICATE-----' "$$CRT" || {
+            echo "FATAL: KAFKA_SSL_CERT_LOCATION=$$CRT holds no PEM certificate (-----BEGIN CERTIFICATE-----)." >&2; exit 1; };
+          grep -q -- '-----BEGIN PRIVATE KEY' "$$KEY" || {
+            echo "FATAL: KAFKA_SSL_KEY_LOCATION=$$KEY must be an unencrypted PKCS#8 key (BEGIN PRIVATE KEY)." >&2;
+            echo "       The Kafka CLI is a JVM and cannot load PKCS#1, SEC1 or encrypted keys. Convert once:" >&2;
+            echo "         openssl pkcs8 -topk8 -nocrypt -in client.key -out client.pk8.key" >&2;
+            echo "       The Go and Python services read the PKCS#8 file unchanged." >&2;
+            exit 1; };
+          # umask 077 above: owner-only, like the properties file beside it.
+          KS=/tmp/kafka-client.pem;
+          { cat "$$CRT"; echo; cat "$$KEY"; } > "$$KS";
+        fi;
+        if [ -n "$$KS" ]; then
           { echo "ssl.keystore.type=PEM";
-            echo "ssl.keystore.location=$$KAFKA_SSL_KEYSTORE_LOCATION"; } >> "$$CFG";
-        elif [ -n "$${KAFKA_SSL_CERT_LOCATION:-}" ]; then
-          # Fail here rather than connect without the client certificate: the
-          # broker would reject the handshake anyway, and this says why.
-          echo "FATAL: KAFKA_SSL_CERT_LOCATION is set but KAFKA_SSL_KEYSTORE_LOCATION is not." >&2;
-          echo "       The Kafka CLI is a JVM and needs the keypair as ONE PEM file:" >&2;
-          echo "         cat \$$KAFKA_SSL_CERT_LOCATION \$$KAFKA_SSL_KEY_LOCATION > /certs/client.pem" >&2;
-          echo "       then set KAFKA_SSL_KEYSTORE_LOCATION=/certs/client.pem." >&2;
-          exit 1;
+            echo "ssl.keystore.location=$$KS"; } >> "$$CFG";
         fi;
         # KAFKA_SSL_SKIP_VERIFY is the spelling every service reads; the anchor
         # at the top of this file fills it in from either name.
@@ -418,6 +449,25 @@ services:
           # C:\Users\svc arrives as C:Userssvc and the broker reports an ordinary
           # auth failure, so the password looks wrong rather than mangled.
           esc() { printf '%s' "$$1" | sed 's/\\/\\\\/g; s/"/\\"/g' | sed 's/\\/\\\\/g'; };
+          # True when fetching a token from $$1 would put the client secret on
+          # a wire. Loopback is exempt because the request never leaves the
+          # host. Mirrors _insecure_token_endpoint in
+          # scripts/kafka-init-new-topics.sh -- change both.
+          _ins_tok() {
+            case "$$1" in https://*|HTTPS://*) return 1 ;; esac;
+            H=$${1#*://}; H=$${H%%/*}; H=$${H%%\?*}; H=$${H##*@};
+            case "$$H" in
+              \[*) H=$${H#\[}; H=$${H%%]*} ;;
+              *) H=$${H%%:*} ;;
+            esac;
+            H=$$(printf '%s' "$$H" | tr '[:upper:]' '[:lower:]'); H=$${H%.};
+            [ -n "$$H" ] || return 1;
+            case "$$H" in
+              localhost|*.localhost|::1|0:0:0:0:0:0:0:1) return 1 ;;
+              127.*) case "$$H" in *[!0-9.]*) return 0 ;; *) return 1 ;; esac ;;
+            esac;
+            return 0;
+          };
           if [ "$$KAFKA_SASL_MECHANISM" = "OAUTHBEARER" ]; then
             for v in KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT KAFKA_SASL_OAUTHBEARER_CLIENT_ID KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET; do
               eval "set_to=\$${$$v:-}";
@@ -425,6 +475,22 @@ services:
                 echo "FATAL: sasl.mechanism=OAUTHBEARER but $$v is empty." >&2; exit 1;
               fi;
             done;
+            # The client-credentials grant POSTs the client secret to the token
+            # endpoint on every fetch, so http off loopback hands a credential
+            # that never expires to anyone on the path. Same rule and opt-out
+            # as the Go, Python and Kafka Connect halves.
+            if [ "$${KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT:-}" != "true" ] && _ins_tok "$$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT"; then
+              echo "FATAL: KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT=$$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT is http and its host is not loopback." >&2;
+              echo "       KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET would be sent in the clear on every token fetch." >&2;
+              echo "       Use https, a loopback address, or set KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT=true for a disposable test rig." >&2;
+              exit 1;
+            fi;
+            # kafka-clients 3.9.2 gates the token endpoint on a JVM system
+            # property, and UNSET MEANS ALLOW ANY URL.
+            case "$${KAFKA_OPTS:-}" in
+              *org.apache.kafka.sasl.oauthbearer.allowed.urls*) ;;
+              *) export KAFKA_OPTS="$${KAFKA_OPTS:+$$KAFKA_OPTS }-Dorg.apache.kafka.sasl.oauthbearer.allowed.urls=$$KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT" ;;
+            esac;
             OPTS=$$(printf ' clientId="%s" clientSecret="%s"' "$$(esc "$$KAFKA_SASL_OAUTHBEARER_CLIENT_ID")" "$$(esc "$$KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET")");
             if [ -n "$${KAFKA_SASL_OAUTHBEARER_EXTENSIONS:-}" ]; then
               OLDIFS=$$IFS; IFS=,;
@@ -623,9 +689,8 @@ services:
     # OLLAMA_URL below defaults to host.docker.internal, which Docker Desktop
     # (macOS/Windows) resolves for free and Linux Docker does NOT -- so without
     # this line the offline provider fails to resolve its own default on exactly
-    # the platform every server install runs. install.sh picks Ollama
-    # automatically for an unattended install with no OPENAI_API_KEY, so the
-    # default path and the broken platform are the same path.
+    # the platform every server install runs, and an operator who sets
+    # LLM_PROVIDER=ollama for an Ollama on the host is on exactly that path.
     #
     # Note this only makes the NAME resolve; Ollama must also be listening off
     # loopback (OLLAMA_HOST=0.0.0.0), since host-gateway is the bridge address,
@@ -653,8 +718,23 @@ services:
       # their key is not for. docker-compose.prod.yml:585 already passes it, which
       # is what makes the omission here an oversight rather than a policy.
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      # gcp-metadata = take the bearer from this VM's service account and refresh it
+      # before its hour is up, which is what Vertex AI needs. Empty = OPENAI_API_KEY
+      # as written.
+      OPENAI_API_KEY_SOURCE: ${OPENAI_API_KEY_SOURCE:-}
+      # LLM_PROVIDER=groq and LLM_PROVIDER=azure read these. Until they were listed
+      # here neither provider could be set up from .env: the key never reached the
+      # container and the service quietly fell back to Ollama.
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      # Empty, not gpt-4o. Empty lets each provider use its own default model
+      # (openai_client.py get_default_model); gpt-4o is a name only OpenAI's catalog
+      # has, so a Groq, Azure or Ollama stack with no LLM_MODEL got 404 on every call.
+      LLM_MODEL: ${LLM_MODEL:-}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       # OLLAMA_BASE_URL wins over OLLAMA_URL (openai_client.py _ollama_base_url).
       # docs/deployment/env-vars.md tells operators to set this one, so it needs a
@@ -702,13 +782,13 @@ services:
       REDIS_PORT: 6379
       REDIS_DB: 0
       REDIS_PASSWORD: ${REDIS_PASSWORD}
-      # This bundle ships no OTLP collector. The gRPC exporter connects lazily,
-      # so an absent collector is not a startup error: the BatchSpanProcessor just
-      # queues and retries every batch at localhost:4317 for the life of the
-      # process, blocking a worker for the full export timeout each time. The code
-      # default is true (cloud exports to a collector); only this file turns it
-      # off, per the OSS/cloud split rule in CLAUDE.md. Spans are still created,
-      # they are simply not shipped — observability here is `docker logs`.
+      # This bundle ships no OTLP collector. The gRPC exporter connects lazily, so an absent collector is not a
+      # startup error: the BatchSpanProcessor just queues and retries every batch
+      # at localhost:4317 for the life of the process, blocking a worker for the
+      # full export timeout each time. The code default is true (cloud runs
+      # a collector); only this file turns it off, per the OSS/cloud split rule in
+      # CLAUDE.md. Spans are still created, they are simply not shipped —
+      # observability here is `docker logs`.
       OTEL_ENABLED: "false"
       LOG_FORMAT: json
       LOG_LEVEL: info
@@ -877,9 +957,20 @@ services:
       # the planner talks to api.openai.com no matter what the operator set, so a
       # stack pointed at Vertex/Azure/vLLM would answer chat and fail planning.
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      # The rest of the provider settings, for the same reason as on llm-service:
+      # the planner builds its client with the same helper, and a variable not
+      # listed here never reaches it.
+      OPENAI_API_KEY_SOURCE: ${OPENAI_API_KEY_SOURCE:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      AZURE_OPENAI_ENDPOINT: ${AZURE_OPENAI_ENDPOINT:-}
+      AZURE_OPENAI_API_KEY: ${AZURE_OPENAI_API_KEY:-}
+      AZURE_OPENAI_API_VERSION: ${AZURE_OPENAI_API_VERSION:-}
+      AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
-      LLM_MODEL: ${LLM_MODEL:-gpt-4o}
+      LLM_MODEL: ${LLM_MODEL:-}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-}
       TOOL_GENERATOR_URL: http://tool-generator:5010
       API_GATEWAY_URL: http://api-gateway:8080
       LLM_GATEWAY_URL: http://llm-service:5000
@@ -908,6 +999,9 @@ services:
       LOG_FORMAT: json
       LOG_LEVEL: info
       ENVIRONMENT: production
+      # Plan-time topic sizing posts to the orchestrator's /topology group, which
+      # sits behind requirePrincipal (strategies.py _create_topic_via_topology_agent).
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
     command: ["python", "-m", "src.agents.planner.service"]
     volumes:
       - mcp_connectors:/app/shared/mcp-connectors:ro
@@ -984,6 +1078,15 @@ services:
       REDIS_DB: 0
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       TOOL_GENERATOR_URL: http://tool-generator:5010
+      # Object-storage-to-object-storage runs stage bytes in MinIO using these
+      # (executor/blob_lane.go buildStagingConfig). Unset, the endpoint defaults
+      # to rsync-ai-minio, a container that does not exist in this file (it is
+      # rsync-minio here), with minioadmin credentials this MinIO was never
+      # given. Same values minio-mcp gets below.
+      MINIO_ENDPOINT_URL: http://minio:9000
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+      MINIO_BUCKET: pipeline-data
       CORRELATION_CLAIM_TTL: 1h
       ENABLE_SCHEDULER: "false"
       ENABLE_CDC_TABLE_STATS: "true"
@@ -997,7 +1100,7 @@ services:
       EXECUTOR_TABLE_CONCURRENCY: ${EXECUTOR_TABLE_CONCURRENCY:-}
       EXECUTOR_TABLE_BATCH_ROWS: ${EXECUTOR_TABLE_BATCH_ROWS:-}
       DOCKER_NETWORK: rsync-ai-mcp
-      # No collector in this bundle — same reason as the llm-service block above.
+      # No collector in this bundle — same reason as OTEL_ENABLED below.
       # internal/config/config.go:231 defaults this to true for cloud; the OSS
       # compose is the only place it is turned off.
       OTEL_ENABLED: "false"
@@ -1064,6 +1167,14 @@ services:
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       LOG_LEVEL: info
       ENVIRONMENT: production
+      # Scheduled saved queries and the model-freshness sweep call the gateway's
+      # internal endpoints and return "INTERNAL_SERVICE_SECRET is not configured"
+      # without this (scheduled_model_workflow.go:123-128,
+      # model_freshness_workflow.go:209-214). The Schedules page still shows
+      # them active; they just never run. docker-compose.yml has always passed
+      # both; this standalone file never did.
+      API_GATEWAY_URL: http://api-gateway:8080
+      INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
     volumes:
       # REQUIRED, and this file is the only one that ever missed it: this is the
       # container that runs ConnectorAvailabilityActivityV2, and that activity
@@ -1186,16 +1297,19 @@ services:
       # attacker-controllable. Disable Cloudflare client-IP trust here; cloud
       # leaves this unset => enabled. See trustCloudflareClientIP() in api-gateway.
       RSYNC_TRUST_CLOUDFLARE: "false"
-      # This bundle ships no OTLP collector to export spans to.
-      # LoadTelemetryConfig defaults this to true (cloud runs one), and until now
-      # InitTracerWithConfig ignored the flag entirely, so every self-host retried
-      # gRPC exports at localhost:4317 forever. Only this file turns it off, per
-      # the OSS/cloud split rule in CLAUDE.md; the tracer falls back to a no-op
-      # provider, so instrumented paths keep working. Observability in this
-      # bundle is `docker compose logs`.
+      # This stack ships no OTLP collector to export spans to.
+      # LoadTelemetryConfig defaults this to true (cloud runs
+      # one), and until now InitTracerWithConfig ignored the flag entirely, so
+      # every self-host retried gRPC exports at localhost:4317 forever. Only this
+      # file turns it off, per the OSS/cloud split rule in CLAUDE.md; the tracer
+      # falls back to a no-op provider, so instrumented paths keep working.
       OTEL_ENABLED: "false"
       RSYNC_ADMIN_EMAILS: ${RSYNC_ADMIN_EMAILS:-}
       OAUTH_CALLBACK_URL: ${OAUTH_CALLBACK_URL:-}
+      # Left empty, OAUTH_CALLBACK_URL is derived from this (oauth_byo.go
+      # oauthCallbackBase); without it a server install redirected every OAuth
+      # consent back to localhost:5001.
+      PUBLIC_URL: ${PUBLIC_URL:-}
       GITHUB_CLIENT_ID: ${GITHUB_CLIENT_ID:-}
       GITHUB_CLIENT_SECRET: ${GITHUB_CLIENT_SECRET:-}
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
@@ -1264,6 +1378,9 @@ services:
       - api-gateway
     environment:
       API_GATEWAY_INTERNAL_URL: http://api-gateway:8080
+      # The dashboard's server-side CDC fetch (app/(dashboard)/page.tsx) falls back
+      # to localhost:8081 without this, which inside this container is nothing.
+      ORCHESTRATOR_INTERNAL_URL: http://orchestrator:8080
       # The NEXT_PUBLIC_* pair below is inert on a published image -- the Next.js
       # compiler substituted those names at `docker build` time, so nothing set
       # here can reach the browser through them. They stay for a locally built
@@ -1416,11 +1533,18 @@ services:
       KAFKA_HEAP_OPTS: "-Xms256M -Xmx768M"
 
       # ── BYO-Kafka security ───────────────────────────────────────────────
-      # The x-kafka-security anchor is NOT usable here. This image's entrypoint
-      # turns every ^CONNECT_ variable into one connect-distributed.properties
-      # line (strip CONNECT_, lowercase, '_' -> '.') and DISCARDS everything
-      # else in silence, so the KAFKA_* names the Go and Python services read
-      # reach this container and then evaporate.
+      # The base image's entrypoint turns every ^CONNECT_ variable into one
+      # connect-distributed.properties line (strip CONNECT_, lowercase, '_' ->
+      # '.') and DISCARDS everything else in silence. The KAFKA_* names the Go
+      # and Python services read still work here, because this image runs its
+      # own entrypoint first (connect-entrypoint.sh, the same code Helm runs)
+      # and it derives the CONNECT_* lines from them:
+      #   * KAFKA_SASL_USERNAME/PASSWORD, or the KAFKA_SASL_OAUTHBEARER_* set,
+      #     become the JAAS line for the mechanism;
+      #   * KAFKA_SSL_CERT_LOCATION + KAFKA_SSL_KEY_LOCATION become the one-file
+      #     PEM keystore a JVM needs (KAFKA_SSL_KEYSTORE_LOCATION, if set, wins).
+      # Mount the certificate files into this container too, at the same paths.
+      <<: *kafka-security
       #
       # Connect needs the profile in THREE places. The worker's own admin client
       # is a different client from the producer each source task writes with and
@@ -1439,21 +1563,14 @@ services:
       CONNECT_CONSUMER_SECURITY_PROTOCOL: "${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}"
       CONNECT_CONSUMER_SASL_MECHANISM: "${KAFKA_SASL_MECHANISM:-PLAIN}"
       #
-      # ONE string, not the username/password pair the other clients take: a
-      # Java client wants the login module class inline, and which class depends
-      # on the mechanism. Compose interpolation cannot choose between them.
-      #
-      #   PLAIN        org.apache.kafka.common.security.plain.PlainLoginModule
-      #   SCRAM-SHA-*  org.apache.kafka.common.security.scram.ScramLoginModule
-      #
-      # e.g. in your .env, on ONE line:
-      #   KAFKA_SASL_JAAS_CONFIG=org.apache.kafka.common.security.scram.ScramLoginModule required username="alice" password="s3cret";
-      #
-      # A password containing " or \\ needs BOTH escapes -- the value crosses a
-      # properties grammar and then a JAAS StreamTokenizer -- so `p"w` is
-      # written `p\\"w`. Escaping it once corrupts it identically to not
-      # escaping it at all. If that is your password, kafka-init prints the
-      # correctly escaped line for you (it builds its own).
+      # An OVERRIDE, normally left unset: the entrypoint builds the JAAS line
+      # from KAFKA_SASL_USERNAME/PASSWORD (or the OAuth set), choosing the login
+      # module the mechanism needs and escaping the values for the two grammars
+      # they cross. Set KAFKA_SASL_JAAS_CONFIG only for a login module it has no
+      # arm for; a non-empty value is used as-is and nothing is built. It then
+      # needs BOTH escapes -- a properties grammar, then a JAAS StreamTokenizer
+      # -- so `p"w` is written `p\\"w`; escaping once corrupts it identically
+      # to not escaping at all.
       CONNECT_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"
       CONNECT_PRODUCER_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"
       CONNECT_CONSUMER_SASL_JAAS_CONFIG: "${KAFKA_SASL_JAAS_CONFIG:-}"

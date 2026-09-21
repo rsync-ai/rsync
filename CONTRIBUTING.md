@@ -16,7 +16,8 @@ Thank you for your interest in contributing. This guide covers how to set up a l
 git clone https://github.com/rsync-ai/rsync.git
 cd rsync
 cp .env.example .env
-# Add your OPENAI_API_KEY to .env
+# Optional: add your OPENAI_API_KEY to .env, or set LLM_PROVIDER=none to run
+# without an LLM (see docs/deployment/self-hosting.md, "Which LLM is used")
 make dev
 ```
 

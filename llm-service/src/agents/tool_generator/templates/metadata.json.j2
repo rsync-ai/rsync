@@ -1,0 +1,242 @@
+{
+  "id": "{{ spec.connector_type }}",
+  "name": "{{ spec.display_name }}",
+  "display_name": "{{ spec.display_name }}",
+  "aliases": [
+    "{{ spec.connector_type }}",
+    "{{ spec.name }}",
+    "{{ spec.display_name }}",
+    "{{ spec.display_name | lower | replace(' ', '-') }}"
+  ],
+  "version": "{{ spec.version }}",
+  "description": {{ (spec.description or 'MCP connector for ' + spec.display_name) | tojson }},
+  "connector_type": "{{ spec.connector_type }}",
+  "category": "{{ spec.category.value }}",
+  "runtime": "python",
+  "entrypoint": "connector.py",
+  "supports_source": {{ spec.supports_source | tojson }},
+  "supports_destination": {{ spec.supports_destination | tojson }},
+  "destination_modes": {{ (spec.destination_modes or []) | tojson }},
+  "supports_cdc": {{ spec.supports_cdc | tojson }},
+  "supports_ddl": {{ spec.supports_ddl | tojson }},
+  "auto_create_destination_tables": {{ spec.auto_create_destination_tables | tojson }},
+  "spec_version": "{{ spec.spec_version }}",
+  "generated_at": "{{ generation_timestamp }}",
+  "status": "{{ spec.status or 'active' if (spec.quality_tier and spec.quality_tier != 'draft') else (spec.status or 'draft') }}",{% if spec.quality_tier %}
+  "quality_tier": "{{ spec.quality_tier }}",{% endif %}{% if spec.quality_score is not none %}
+  "quality_score": {{ spec.quality_score | tojson }},{% endif %}{% if spec.authoritativeness_score is not none %}
+  "authoritativeness_score": {{ spec.authoritativeness_score | tojson }},{% endif %}{% if spec.api_category_hint %}
+  "api_category_hint": "{{ spec.api_category_hint }}",{% endif %}{% if spec.api_category_hint_source %}
+  "api_category_hint_source": "{{ spec.api_category_hint_source }}",{% endif %}{% if spec.api_category_hint_confidence is not none %}
+  "api_category_hint_confidence": {{ spec.api_category_hint_confidence | tojson }},{% endif %}{% if spec.qa_warnings %}
+  "qa_warnings": {{ spec.qa_warnings | tojson }},{% endif %}{% if spec.qa_metadata %}
+  "qa_metadata": {{ spec.qa_metadata | tojson }},{% endif %}{% if spec.metadata and spec.metadata.resource_cap_dropped %}
+  "resource_cap": {"max": {{ spec.metadata.resource_cap_original_count | default(0) }}, "original_count": {{ spec.metadata.resource_cap_original_count | default(0) }}, "dropped": {{ spec.metadata.resource_cap_dropped | tojson }}},{% endif %}{% if spec.metadata and spec.metadata.vendor_id %}
+  "vendor_id": "{{ spec.metadata.vendor_id }}",
+  "api_variant_id": "{{ spec.metadata.api_variant_id }}",
+  "source_hash": "{{ spec.metadata.source_hash }}",{% endif %}
+  "default_headers": {{ spec.default_headers | default({}) | tojson }},
+  "header_config_keys": {{ spec.header_config_keys | default([]) | tojson }},
+  "base_url": {{ spec.base_url | tojson }},
+  "auth_type": "{{ spec.auth.type.value }}",{% if spec.auth.oauth_provider %}
+  "oauth_provider": "{{ spec.auth.oauth_provider }}",{% endif %}{% if spec.auth.authorize_url %}
+  "authorize_url": {{ spec.auth.authorize_url | tojson }},{% endif %}{% if spec.auth.token_url %}
+  "token_url": {{ spec.auth.token_url | tojson }},{% endif %}{% if spec.auth.refresh_url %}
+  "refresh_url": {{ spec.auth.refresh_url | tojson }},{% endif %}{% if spec.auth.grant_type %}
+  "grant_type": "{{ spec.auth.grant_type }}",{% endif %}{% if spec.auth.oauth_scopes %}
+  "oauth_scopes": {{ spec.auth.oauth_scopes | tojson }},{% endif %}{% if spec.auth.declared_methods %}
+  "supported_auth_methods": [{% for m in spec.auth.declared_methods %}
+    {
+      "method": "{{ m.method.value }}",
+      "header_name": {{ m.header_name | tojson }},
+      "header_prefix": {{ m.header_prefix | tojson }},
+      "config_keys": {{ m.config_keys | tojson }},{% if m.query_param %}
+      "query_param": {{ m.query_param | tojson }},{% endif %}
+      "description": {{ m.description | tojson }}{% if m.label %},
+      "label": {{ m.label | tojson }}{% endif %}{% if m.oauth_provider %},
+      "oauth_provider": {{ m.oauth_provider | tojson }}{% endif %}{% if m.credentials_optional %},
+      "credentials_optional": true{% endif %}
+    }{% if not loop.last %},{% endif %}{% endfor %}
+  ],{% endif %}
+  "required_config": [
+{% for field in spec.config_fields if field.required %}
+    "{{ field.name }}"{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ],
+  "config_aliases": {{ spec.config_aliases | tojson }},
+  "optional_config": [
+{% for field in spec.config_fields if not field.required %}
+    "{{ field.name }}"{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ],
+  "configuration_schema": {
+    "type": "object",
+    "properties": {
+{% for field in spec.config_fields %}
+      "{{ field.name }}": {
+        "type": "{{ field.type.value }}",
+        "description": {{ (field.description or "") | tojson }}{% if field.secret %},
+        "secret": true{% endif %}{% if field.default is not none %},
+        "default": {{ field.default | tojson }}{% endif %}{% if field.enum_values %},
+        "enum": {{ field.enum_values | tojson }}{% endif %}{% if field.ui_widget %},
+        "ui_widget": {{ field.ui_widget | tojson }}{% endif %}{% if field.ui_order is not none %},
+        "ui_order": {{ field.ui_order }}{% endif %}{% if field.ui_placeholder %},
+        "ui_placeholder": {{ field.ui_placeholder | tojson }}{% endif %}{% if field.ui_help_text %},
+        "ui_help_text": {{ field.ui_help_text | tojson }}{% endif %}{% if field.pattern %},
+        "pattern": {{ field.pattern | tojson }}{% endif %}{% if field.min_length is not none %},
+        "minLength": {{ field.min_length }}{% endif %}{% if field.max_length is not none %},
+        "maxLength": {{ field.max_length }}{% endif %}{% if field.minimum is not none %},
+        "minimum": {{ field.minimum }}{% endif %}{% if field.maximum is not none %},
+        "maximum": {{ field.maximum }}{% endif %}{% if field.depends_on %},
+        "depends_on": {{ field.depends_on | tojson }}{% endif %}
+      }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+    },
+    "required": [
+{% for field in spec.config_fields if field.required %}
+      "{{ field.name }}"{% if not loop.last %},{% endif %}
+
+{% endfor %}
+    ]
+  },
+  "config_schema": {
+    "type": "object",
+    "properties": {
+{% for field in spec.config_fields %}
+      "{{ field.name }}": {
+        "type": "{{ field.type.value }}",
+        "description": {{ (field.description or "") | tojson }}{% if field.secret %},
+        "secret": true{% endif %}{% if field.default is not none %},
+        "default": {{ field.default | tojson }}{% endif %}{% if field.enum_values %},
+        "enum": {{ field.enum_values | tojson }}{% endif %}{% if field.ui_widget %},
+        "ui_widget": {{ field.ui_widget | tojson }}{% endif %}{% if field.ui_order is not none %},
+        "ui_order": {{ field.ui_order }}{% endif %}{% if field.ui_placeholder %},
+        "ui_placeholder": {{ field.ui_placeholder | tojson }}{% endif %}{% if field.ui_help_text %},
+        "ui_help_text": {{ field.ui_help_text | tojson }}{% endif %}{% if field.pattern %},
+        "pattern": {{ field.pattern | tojson }}{% endif %}{% if field.min_length is not none %},
+        "minLength": {{ field.min_length }}{% endif %}{% if field.max_length is not none %},
+        "maxLength": {{ field.max_length }}{% endif %}{% if field.minimum is not none %},
+        "minimum": {{ field.minimum }}{% endif %}{% if field.maximum is not none %},
+        "maximum": {{ field.maximum }}{% endif %}{% if field.depends_on %},
+        "depends_on": {{ field.depends_on | tojson }}{% endif %}
+      }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+    },
+    "required": [
+{% for field in spec.config_fields if field.required %}
+      "{{ field.name }}"{% if not loop.last %},{% endif %}
+
+{% endfor %}
+    ]
+  },
+  "capabilities": {
+    "max_batch_size": {{ spec.max_batch_size }},
+    "supported_formats": {{ spec.supported_formats | tojson }},
+    "supported_modalities": {{ (spec.supported_modalities or ['structured']) | tojson }},{% if spec._supported_compressions %}
+    "supported_compressions": {{ spec._supported_compressions | tojson }},{% endif %}
+    "supports_cdc": {{ spec.supports_cdc | tojson }},
+    "supports_ddl": {{ spec.supports_ddl | tojson }},
+    "auto_create_destination_tables": {{ spec.auto_create_destination_tables | tojson }}{% if spec._capability_inference or spec._write_detector %},
+    "inference": {
+{% if spec._capability_inference %}      "capability_inference": {{ spec._capability_inference | tojson }}{% if spec._write_detector %},{% endif %}
+{% endif %}
+{% if spec._write_detector %}      "write_detector": {{ spec._write_detector | tojson }}
+{% endif %}
+    }{% endif %}
+  },
+  "operations": [
+{% for op in spec.operations %}
+    {
+      "name": "{{ op.name }}",
+      "type": "{{ op.type.value }}",
+      "description": {{ (op.description or "") | tojson }},
+      "method": "{{ spec.connector_type }}_{{ op.name }}"{% if op.parameters %},
+      "parameters": [
+{% for param in op.parameters %}
+        {
+          "name": "{{ param.name }}",
+          "type": "{{ param.type.value }}",
+          "required": {{ param.required | tojson }}{% if param.default is not none %},
+          "default": {{ param.default | tojson }}{% endif %}{% if param.description %},
+          "description": {{ param.description | tojson }}{% endif %}
+
+        }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+      ]{% endif %}
+
+    }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+{% if spec.supports_destination and spec.category.value == "relational_db" %}    ,
+    {
+      "name": "ensure_schema",
+      "type": "destination",
+      "description": "Ensure schema/database exists (DDL)",
+      "method": "{{ spec.connector_type }}_ensure_schema",
+      "parameters": [
+        { "name": "schema", "type": "string", "required": true, "description": "Schema name (or database for MySQL)" }
+      ]
+    },
+    {
+      "name": "ensure_table",
+      "type": "destination",
+      "description": "Ensure destination table exists (DDL). Creates schema/table and adds missing columns when supported.",
+      "method": "{{ spec.connector_type }}_ensure_table",
+      "parameters": [
+        { "name": "table", "type": "string", "required": true, "description": "Target table (schema.table)" },
+        { "name": "columns", "type": "array", "required": false, "description": "List of column names to ensure" },
+        { "name": "key_fields", "type": "array", "required": false, "description": "Optional primary/unique key columns for upsert/index" }
+      ]
+    }
+{% endif %}
+  ]{% if spec.resources %},
+  "resources": [
+{% for resource in spec.resources %}
+    {
+      "name": "{{ resource.name }}",
+      "endpoint": "{{ resource.endpoint }}",
+      "path_params": {{ resource.path_params | default([]) | tojson }},
+      "id_field": "{{ resource.id_field }}",
+      "pagination_type": "{{ resource.pagination_type }}",
+      "cursor_mode": "{{ resource.cursor_mode }}",
+      "cursor_path": "{{ resource.cursor_path }}",
+      "pagination_param": "{{ resource.pagination_param }}",
+      "limit_param": "{{ resource.limit_param }}",
+      "response_data_key": "{{ resource.response_data_key | default('') }}",
+      "max_page_size": {{ resource.max_page_size }},
+      "supports": [
+{% if resource.supports_list %}
+        "list"{% if resource.supports_get or resource.supports_create or resource.supports_update or resource.supports_delete %},{% endif %}
+
+{% endif %}
+{% if resource.supports_get %}
+        "get"{% if resource.supports_create or resource.supports_update or resource.supports_delete %},{% endif %}
+
+{% endif %}
+{% if resource.supports_create %}
+        "create"{% if resource.supports_update or resource.supports_delete %},{% endif %}
+
+{% endif %}
+{% if resource.supports_update %}
+        "update"{% if resource.supports_delete %},{% endif %}
+
+{% endif %}
+{% if resource.supports_delete %}
+        "delete"
+{% endif %}
+      ]
+    }{% if not loop.last %},{% endif %}
+
+{% endfor %}
+  ]{% endif %}{% if spec.author %},
+  "author": "{{ spec.author }}"{% endif %}{% if spec.license %},
+  "license": "{{ spec.license }}"{% endif %}{% if spec.documentation_url %},
+  "documentation": "{{ spec.documentation_url }}"{% endif %}
+
+}
+

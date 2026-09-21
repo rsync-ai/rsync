@@ -147,7 +147,8 @@ def discover_router(tables: Dict[str, Dict[str, Any]],
 
     ``tables`` maps table name -> {"row_estimate": int, "columns": [(name, dtype,
     is_nullable), ...]}. Routes @@VERSION, the sys.tables COUNT, the sys.partitions
-    table list, and the per-table sys.columns query (keyed on the tname param).
+    table list, and the per-schema sys.columns query (one row per column, led by
+    its table name; every table here is in the one schema asked for).
     """
     def route(sql: str, params):
         if "@@VERSION" in sql:
@@ -155,9 +156,9 @@ def discover_router(tables: Dict[str, Dict[str, Any]],
         if "COUNT(*)" in sql and "sys.tables" in sql:
             return [(len(tables),)]
         if "sys.columns c" in sql:
-            tname = params[1] if params and len(params) > 1 else None
-            spec = tables.get(tname) or {}
-            return list(spec.get("columns", []))
+            return [(tname, *col, None, None)
+                    for tname, spec in tables.items()
+                    for col in spec.get("columns", [])]
         if "sys.tables" in sql and "FETCH NEXT" in sql:
             return [(name, spec.get("row_estimate", 0)) for name, spec in tables.items()]
         return []

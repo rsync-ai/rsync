@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from kafka import KafkaProducer, KafkaConsumer
 from kafka.errors import KafkaError
 
-from .kafka_security import kafka_security_kwargs, parse_brokers
+from .kafka_security import explain_failure, kafka_security_kwargs, parse_brokers
 from .kafka_topics import (
     topic as qualify_topic,
     topics as qualify_topics,
@@ -171,7 +171,10 @@ class AvroKafkaProducer:
             return True
             
         except Exception as e:
-            logger.error(f"Failed to send message to {topic}: {e}")
+            # explain_failure, not e: a send that fails because the broker
+            # rejected our credentials or our CA surfaces as the same
+            # KafkaTimeoutError as a broker that is merely down.
+            logger.error(f"Failed to send message to {topic}: {explain_failure(e)}")
             return False
     
     def send_pipeline_request(
@@ -416,7 +419,7 @@ class AvroKafkaConsumer:
                     for msg in messages:
                         yield self._decode_message(msg)
             except Exception as e:
-                logger.error(f"Error consuming messages: {e}")
+                logger.error(f"Error consuming messages: {explain_failure(e)}")
                 time.sleep(1)
     
     def consume_once(self, timeout_ms: int = 5000) -> List[DecodedMessage]:
@@ -436,7 +439,7 @@ class AvroKafkaConsumer:
                 for msg in msgs:
                     messages.append(self._decode_message(msg))
         except Exception as e:
-            logger.error(f"Error consuming messages: {e}")
+            logger.error(f"Error consuming messages: {explain_failure(e)}")
         return messages
     
     def commit(self):

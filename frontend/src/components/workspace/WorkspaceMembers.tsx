@@ -409,7 +409,7 @@ export function WorkspaceMembers({ workspaceId, workspaceName, currentRole, isPe
         )}
         <CardContent>
           {loading ? (
-            <div className="flex items-center gap-2 py-6 text-sm text-zinc-500">
+            <div className="flex items-center gap-2 py-6 text-sm text-zinc-500 dark:text-zinc-400">
               <Loader2 className="h-4 w-4 animate-spin" />
               Loading members…
             </div>
@@ -421,7 +421,7 @@ export function WorkspaceMembers({ workspaceId, workspaceName, currentRole, isPe
               </Button>
             </div>
           ) : members.length === 0 ? (
-            <p className="py-6 text-sm text-zinc-500">No members yet.</p>
+            <p className="py-6 text-sm text-zinc-500 dark:text-zinc-400">No members yet.</p>
           ) : (
             <Table>
               <TableHeader>
@@ -443,7 +443,7 @@ export function WorkspaceMembers({ workspaceId, workspaceName, currentRole, isPe
                     <TableCell>
                       <Badge variant={roleBadgeVariant(m.role)}>{m.role}</Badge>
                     </TableCell>
-                    <TableCell className="text-zinc-500">{formatDate(m.created_at)}</TableCell>
+                    <TableCell className="text-zinc-500 dark:text-zinc-400">{formatDate(m.created_at)}</TableCell>
                     {canManage && (
                       <TableCell className="text-right">
                         {canActOnMember(m) && (
@@ -529,7 +529,7 @@ export function WorkspaceMembers({ workspaceId, workspaceName, currentRole, isPe
                     <TableCell>
                       <Badge variant="outline">{inv.status}</Badge>
                     </TableCell>
-                    <TableCell className="text-zinc-500">{formatDate(inv.expires_at)}</TableCell>
+                    <TableCell className="text-zinc-500 dark:text-zinc-400">{formatDate(inv.expires_at)}</TableCell>
                     {canManage && (
                       <TableCell className="text-right">
                         <DropdownMenu>
@@ -642,7 +642,7 @@ export function WorkspaceMembers({ workspaceId, workspaceName, currentRole, isPe
 
             {lastAcceptUrl && (
               <div className="space-y-1.5 rounded-md border border-zinc-200 bg-zinc-50 p-3 dark:border-zinc-800 dark:bg-zinc-900">
-                <Label htmlFor="invite-accept-url" className="text-xs text-zinc-500">
+                <Label htmlFor="invite-accept-url" className="text-xs text-zinc-500 dark:text-zinc-400">
                   Shareable invite link
                 </Label>
                 <div className="flex items-center gap-2">

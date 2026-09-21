@@ -319,6 +319,23 @@ def test_no_history_permalink_was_repointed_at_the_public_repo():
     and a reader following a citation lands on unrelated work with no indication
     anything is wrong. (This test exists because exactly that happened during the
     sweep it now guards.)
+
+    The gate stays a flat ban, but its ORIGINAL reason has expired and the
+    replacement is narrower, so read this before widening it. It was first
+    written when the public repo had no history to cite -- a fresh orphan commit,
+    no PRs -- which made every such URL a sweep artefact by construction. That is
+    no longer true: `rsync` now has its own merged PRs, and a private document
+    about the two-repo split has legitimate reason to name one. What has NOT
+    changed is that the two numbering schemes are indistinguishable inside a URL,
+    so admitting the deliberate case would also admit every swept one.
+
+    The convention that keeps both working: cite the other repository the way a
+    cross-repo reference is written everywhere else, `owner/repo#N` as plain
+    text, not as a `/pull/N` URL. It survives this gate, it cannot be produced by
+    a slug sweep (a sweep rewrites URLs, it does not reshape them), and a reader
+    can still resolve it. If a future change needs real links, replace the ban
+    with an explicit allowlist of URLs plus a freshness test that fails when a
+    listed URL leaves the tree -- do not simply drop the assertion.
     """
     pattern = re.compile(
         re.escape(PUBLIC_SLUG)
@@ -337,8 +354,10 @@ def test_no_history_permalink_was_repointed_at_the_public_repo():
 
     assert not offenders, (
         "These links cite a specific PR, issue or commit under the PUBLIC repo. "
-        "That history lives in the private repo -- the public one starts from a "
-        f"fresh orphan commit -- so they must stay on {PRIVATE_SLUG}:\n"
+        "A citation of THIS repo's history must stay on the private slug. A "
+        "deliberate reference to the public repo's own history is written "
+        f"{PUBLIC_SLUG}#N as plain text, not as a URL -- see this test's "
+        "docstring for why the distinction cannot be made from the URL:\n"
         + "\n".join(f"    {rel}:{n}: {line}" for rel, n, line in offenders)
     )
 

@@ -19,6 +19,15 @@ func ParseDebeziumChange(payload map[string]interface{}, topic string) (TableUpd
 	if payload == nil {
 		return TableUpdate{}, false
 	}
+	// Debezium runs with JsonConverter schemas.enable=true (the sink needs the type
+	// envelope), so every message is {"schema": {...}, "payload": {"op": ...}}. Reading
+	// op off the outer object found nothing, every message was dropped, and no CDC
+	// pipeline ever got a captured count or last_event_ts ("Last Captured" empty).
+	if _, flat := payload["op"]; !flat {
+		if inner, ok := payload["payload"].(map[string]interface{}); ok && inner != nil {
+			payload = inner
+		}
+	}
 	op, _ := payload["op"].(string)
 	op = strings.TrimSpace(op)
 	if op == "" {

@@ -140,7 +140,9 @@ def test_prod_overlay_sets_skip_db_create():
         "prod.yml's temporal no longer takes POSTGRES_SEEDS from ${POSTGRES_HOST} -- "
         "re-check this test's premise that prod is an external-database path"
     )
-    assert env.get("SKIP_DB_CREATE") == "true", (
+    # The single-VM bundled-postgres opt-out is a knob whose DEFAULT is the
+    # external-database behaviour; an unset .env.prod must still skip the create.
+    assert env.get("SKIP_DB_CREATE") in ("true", "${TEMPORAL_SKIP_DB_CREATE:-true}"), (
         f"docker-compose.prod.yml points Temporal at an external database but "
         f"SKIP_DB_CREATE is {env.get('SKIP_DB_CREATE')!r}"
     )

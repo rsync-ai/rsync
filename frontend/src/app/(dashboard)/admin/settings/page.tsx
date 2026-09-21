@@ -97,7 +97,7 @@ export default function AdminSettingsPage() {
           <Card>
             <CardHeader>
               <CardTitle className="flex items-center gap-2">
-                <UserPlus className="h-5 w-5 text-zinc-500" />
+                <UserPlus className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
                 Registration
               </CardTitle>
               <CardDescription>
@@ -110,14 +110,14 @@ export default function AdminSettingsPage() {
                   <RadioGroupItem value="open" id="reg-open" className="mt-1" />
                   <div>
                     <Label htmlFor="reg-open" className="font-medium cursor-pointer">Open Registration</Label>
-                    <p className="text-sm text-zinc-500">Anyone can create an account.</p>
+                    <p className="text-sm text-zinc-500 dark:text-zinc-400">Anyone can create an account.</p>
                   </div>
                 </div>
                 <div className="flex items-start gap-3">
                   <RadioGroupItem value="invite_only" id="reg-invite" className="mt-1" />
                   <div>
                     <Label htmlFor="reg-invite" className="font-medium cursor-pointer">Invite Only</Label>
-                    <p className="text-sm text-zinc-500">
+                    <p className="text-sm text-zinc-500 dark:text-zinc-400">
                       New users must have a valid invite link to register. Admins can create invite links from the Invitations tab.
                     </p>
                   </div>

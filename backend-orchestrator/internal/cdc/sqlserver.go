@@ -192,40 +192,145 @@ func (m *SQLServerManager) CleanupResources(ctx context.Context, pipelineID stri
 		decryptedConfig, err := m.getDecryptedConnectionConfig(ctx, connID)
 		if err != nil {
 			log.WithError(err).WithField("connection_id", connID).
-				Warn("SQL Server cleanup: failed to load connection config (marking resources deleted anyway)")
-			for _, r := range group {
-				_ = MarkResourceDeleted(ctx, m.db, r.ResourceName, r.ResourceType)
-			}
+				Warn("SQL Server cleanup: failed to load connection config (marking failed for the reaper)")
+			markSQLServerGroupFailed(ctx, m.db, group)
 			continue
 		}
 		targetDB, err := connectToSQLServer(decryptedConfig)
 		if err != nil {
 			log.WithError(err).WithField("connection_id", connID).
-				Warn("SQL Server cleanup: failed to connect (marking resources deleted anyway)")
-			for _, r := range group {
-				_ = MarkResourceDeleted(ctx, m.db, r.ResourceName, r.ResourceType)
-			}
+				Warn("SQL Server cleanup: failed to connect (marking failed for the reaper)")
+			markSQLServerGroupFailed(ctx, m.db, group)
 			continue
 		}
 
 		for _, r := range group {
 			schema, table := sqlServerResourceSchemaTable(r)
-			if table != "" {
-				if err := disableTableCDC(ctx, targetDB, schema, table, r.ResourceName); err != nil {
-					// Best-effort: already-disabled / dropped table is not fatal.
-					log.WithError(err).WithFields(log.Fields{
-						"schema": schema, "table": table, "capture_instance": r.ResourceName,
-					}).Warn("SQL Server cleanup: sp_cdc_disable_table failed (continuing)")
-				}
+			disabled := false
+			if table == "" {
+				// No derivable source schema/table means sp_cdc_disable_table cannot
+				// be called at all — so the capture instance is certainly still
+				// enabled. Never record that as 'deleted'.
+				log.WithField("capture_instance", r.ResourceName).
+					Warn("SQL Server cleanup: cannot derive source schema/table; capture instance left enabled")
+			} else if err := disableTableCDC(ctx, targetDB, schema, table, r.ResourceName); err != nil {
+				// Best-effort: an already-disabled / dropped table is not fatal, but it
+				// is NOT proof the capture instance is gone either.
+				log.WithError(err).WithFields(log.Fields{
+					"schema": schema, "table": table, "capture_instance": r.ResourceName,
+				}).Warn("SQL Server cleanup: sp_cdc_disable_table failed (will retry via reaper)")
+			} else {
+				disabled = true
 			}
-			if err := MarkResourceDeleted(ctx, m.db, r.ResourceName, r.ResourceType); err != nil {
-				log.WithError(err).WithField("resource", r.ResourceName).Warn("Failed to mark resource as deleted")
+
+			// Only mark 'deleted' when sp_cdc_disable_table actually ran. On failure
+			// mark 'failed' so GetReapableCaptureInstances still returns the row and
+			// ReapOrphanedCaptureInstances retries — marking 'deleted' unconditionally
+			// permanently hid a capture instance whose disable never happened, leaving
+			// the SQL Server capture job writing change tables forever. This mirrors
+			// the PostgreSQL slot/publication contract in postgresql.go.
+			if disabled {
+				if err := MarkResourceDeleted(ctx, m.db, r.ResourceName, r.ResourceType); err != nil {
+					log.WithError(err).WithField("resource", r.ResourceName).Warn("Failed to mark resource as deleted")
+				}
+			} else {
+				if err := MarkResourceFailed(ctx, m.db, r.ResourceName, r.ResourceType); err != nil {
+					log.WithError(err).WithField("resource", r.ResourceName).Warn("Failed to mark resource as failed")
+				}
 			}
 		}
 		targetDB.Close()
 	}
 
 	return nil
+}
+
+// markSQLServerGroupFailed records that nothing was disabled for a whole
+// connection group (config load / connect failed), so the reaper retries.
+func markSQLServerGroupFailed(ctx context.Context, db *sql.DB, group []CDCResource) {
+	for _, r := range group {
+		if err := MarkResourceFailed(ctx, db, r.ResourceName, r.ResourceType); err != nil {
+			log.WithError(err).WithField("resource", r.ResourceName).Warn("Failed to mark resource as failed")
+		}
+	}
+}
+
+// ReapOrphanedCaptureInstances is the SQL Server safety-net, mirroring
+// PostgreSQLManager.ReapOrphanedSlots/ReapOrphanedPublications: it calls
+// sys.sp_cdc_disable_table for every capture_instance cdc_resources row whose
+// owning pipeline no longer exists, and marks the row 'deleted' only when that
+// call actually succeeded. Idempotent and meant to be called periodically by the
+// CDC reconciler. Returns the number of capture instances disabled.
+//
+// This closes the leak where a capture instance whose synchronous pre-delete
+// cleanup did not run (orchestrator down, source unreachable, or a swallowed
+// sp_cdc_disable_table error) survived forever, leaving the SQL Server capture
+// job scanning the log and growing cdc.<instance>_CT for a pipeline that no
+// longer exists.
+//
+// It NEVER touches a merely 'stopped' pipeline's capture instances — see the
+// note on GetReapableCaptureInstances — and it NEVER calls sp_cdc_disable_db,
+// which is database-wide and shared with every other pipeline on that source.
+func (m *SQLServerManager) ReapOrphanedCaptureInstances(ctx context.Context) (int, error) {
+	resources, err := GetReapableCaptureInstances(ctx, m.db)
+	if err != nil {
+		return 0, err
+	}
+	if len(resources) == 0 {
+		return 0, nil
+	}
+
+	// One connection per source, not per capture instance.
+	byConn := map[string][]CDCResource{}
+	for _, r := range resources {
+		byConn[r.ConnectionID] = append(byConn[r.ConnectionID], r)
+	}
+
+	disabled := 0
+	for connID, group := range byConn {
+		cfg, err := m.getDecryptedConnectionConfig(ctx, connID)
+		if err != nil {
+			log.WithError(err).WithField("connection_id", connID).
+				Warn("reaper: failed to get SQL Server connection config")
+			continue
+		}
+		targetDB, err := connectToSQLServer(cfg)
+		if err != nil {
+			log.WithError(err).WithField("connection_id", connID).
+				Warn("reaper: failed to connect to SQL Server source for capture-instance disable")
+			continue
+		}
+
+		for _, r := range group {
+			schema, table := sqlServerResourceSchemaTable(r)
+			if table == "" {
+				// Nothing to call sp_cdc_disable_table with. Log at Debug: this
+				// row is returned on every tick, and a Warn here would spam the
+				// log forever for a row that can never be reaped automatically.
+				log.WithField("capture_instance", r.ResourceName).
+					Debug("reaper: capture instance has no derivable source schema/table; skipping")
+				continue
+			}
+			if err := disableTableCDC(ctx, targetDB, schema, table, r.ResourceName); err != nil {
+				log.WithError(err).WithFields(log.Fields{
+					"schema": schema, "table": table, "capture_instance": r.ResourceName,
+				}).Warn("reaper: failed to disable orphaned capture instance")
+				_ = MarkResourceFailed(ctx, m.db, r.ResourceName, r.ResourceType)
+				continue
+			}
+			disabled++
+			log.WithFields(log.Fields{
+				"capture_instance": r.ResourceName,
+				"pipeline_id":      derefStr(r.PipelineID),
+			}).Info("reaper: disabled orphaned SQL Server capture instance")
+			if err := MarkResourceDeleted(ctx, m.db, r.ResourceName, r.ResourceType); err != nil {
+				log.WithError(err).WithField("resource", r.ResourceName).
+					Warn("reaper: failed to mark capture instance deleted")
+			}
+		}
+		targetDB.Close()
+	}
+	return disabled, nil
 }
 
 // ValidatePrerequisites checks that the connection can drive SQL Server CDC:

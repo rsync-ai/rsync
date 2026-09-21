@@ -84,8 +84,14 @@ var cteWriteVerbs = []struct {
 }
 
 // cteWriteClass reports the class a WITH-led statement needs, or ClassRead if it
-// writes nothing. Comments and string/identifier literals are stripped first so
+// writes nothing. strippedSQL must already have had removeComments applied (the
+// caller has); string/identifier literals are blanked here so
 // `SELECT 'MERGE INTO x' AS note` and `/* DROP TABLE t */` stay reads.
+//
+// Never strip comments a second time. Removing `/**/` from `1 -/**/- 1` leaves
+// `1 -- 1`, and a second pass reads that as a line comment and hides whatever
+// follows on the line — `WITH s AS (SELECT 1 -/**/- 1) DELETE FROM t` classified
+// as a read. Pinned by shared/explorer_statement_class_golden.json.
 //
 // This scans the whole statement rather than parsing the CTE list, and that is a
 // deliberate choice. Both shapes are dangerous — the write can sit in a CTE body
@@ -99,8 +105,8 @@ var cteWriteVerbs = []struct {
 // Known over-match: `WITH s AS (…) SELECT … FOR UPDATE` is a locking read and now
 // classifies as dml_write. It takes row locks, so admin is defensible, and the
 // bare-SELECT form is untouched.
-func cteWriteClass(sqlText string) StatementClass {
-	scanned := stripStringLiterals(removeComments(sqlText))
+func cteWriteClass(strippedSQL string) StatementClass {
+	scanned := stripStringLiterals(strippedSQL)
 	for _, v := range cteWriteVerbs {
 		if v.re.MatchString(scanned) {
 			return v.class

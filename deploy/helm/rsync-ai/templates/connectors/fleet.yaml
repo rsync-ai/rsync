@@ -46,6 +46,7 @@ metadata:
     rsync.ai/connector-id: {{ $c.id | quote }}
 spec:
   replicas: {{ $c.replicaCount | default 1 }}
+  progressDeadlineSeconds: {{ $.Values.global.progressDeadlineSeconds }}
   selector:
     matchLabels:
       {{- include "rsync-ai.selectorLabels" $root | nindent 6 }}

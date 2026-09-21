@@ -143,6 +143,18 @@ func (s *CDCSentinel) ensureSinkWorkerPresent(ctx context.Context, pipelineID, p
 		return
 	}
 
+	// A sink that was never started cannot be ABSENT. A chat-created CDC pipeline is
+	// 'running' with sync_mode='cdc' from the moment it is planned, long before the
+	// user answers the table-selection HITL and the executor provisions Debezium and
+	// issues start_sink. In that window the container truthfully answers not_found,
+	// and without this gate the rung re-issued start_sink against a connector that
+	// does not exist yet ("Connector cdc-<pid8> not found") and burned an attempt
+	// toward a terminal escalation on a perfectly healthy, still-planning pipeline.
+	// Not-yet-provisioned and could-not-tell both leave the budget untouched.
+	if !s.cdcStreamProvisioned(ctx, pipelineID) {
+		return
+	}
+
 	// Must be the group the sink ACTUALLY registered, not the derived default — see
 	// resolveSinkConsumerGroup. This probe asks the container "do you hold a worker for
 	// this group?", so a wrong name is not a silent no-op here: the container correctly
@@ -158,6 +170,51 @@ func (s *CDCSentinel) ensureSinkWorkerPresent(ctx context.Context, pipelineID, p
 		dbType:        dbType,
 		consumerGroup: consumerGroup,
 	}, now)
+}
+
+// cdcStreamProvisionedQuery answers "did the executor ever get as far as provisioning this
+// pipeline's CDC stream?" from the facts it records on the way:
+//
+//   - kafka_sink_worker — written only after start_sink succeeds (executor.go
+//     registerSinkWorker), so it is exact.
+//   - debezium_task — written just before startKafkaMCPSink (executor.go, "Register the
+//     Debezium connector as a runtime dependency"). Kept so a sink whose manifest upsert
+//     failed (upsertDependency only logs) is still healed after a container restart.
+//   - an active connector row in cdc_resources — the pre-manifest record findConnectorName
+//     reads, so a legacy pipeline with no manifest rows is not silently dropped.
+//
+// None of the three exists while a pipeline is still planning or awaiting table selection.
+const cdcStreamProvisionedQuery = `
+	SELECT EXISTS (
+		SELECT 1 FROM pipeline_dependencies
+		WHERE pipeline_id = $1::uuid
+		  AND kind IN ('kafka_sink_worker', 'debezium_task')
+	) OR EXISTS (
+		SELECT 1 FROM cdc_resources
+		WHERE pipeline_id = $1::uuid
+		  AND resource_type IN ('connector', 'debezium_connector')
+		  AND status = 'active'
+	)
+`
+
+// cdcStreamProvisioned reports whether the absent-worker rung may act on this pipeline.
+// A failed lookup returns false: like an unknown sink_status answer, it is not evidence
+// of absence, so the rung does nothing and changes nothing.
+func (s *CDCSentinel) cdcStreamProvisioned(ctx context.Context, pipelineID string) bool {
+	if s.db == nil || pipelineID == "" {
+		return false
+	}
+	var provisioned bool
+	if err := s.db.QueryRowContext(ctx, cdcStreamProvisionedQuery, pipelineID).Scan(&provisioned); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).
+			Debug("🛡️ sink presence: could not tell whether the CDC stream was provisioned — skipping this tick")
+		return false
+	}
+	if !provisioned {
+		log.WithField("pipeline_id", pipelineID).
+			Debug("🛡️ sink presence: CDC stream not provisioned yet (planning / awaiting table selection) — not a dead sink")
+	}
+	return provisioned
 }
 
 // sinkPresenceTarget is the pipeline one probe+decision cycle is about. Bundled so the

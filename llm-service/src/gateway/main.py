@@ -52,9 +52,16 @@ from src.utils.openai_client import (  # noqa: E402
     # were found to disagree with the shared ones — see the note above
     # DEFAULT_LLM_PROVIDER below.
     resolve_provider as _resolve_provider,
+    get_default_model as _get_default_model,
     make_async_client as _create_async_client,
     client_egress_host as _client_egress_host,
     _ollama_base_url,
+    llm_configured as _llm_configured,
+)
+from src.utils.llm_gate import (  # noqa: E402
+    register_llm_gate,
+    require_llm,
+    require_sql_llm,
 )
 
 
@@ -756,6 +763,8 @@ async def safety_middleware(request: Request, call_next):
 app.include_router(suggestions_router)
 app.include_router(explorer_router)
 app.include_router(rank_tables_router)
+# LLM-only routes answer 503 llm_not_configured when no LLM is set up (see llm_gate).
+register_llm_gate(app)
 
 # Mount PII scanner HTTP endpoints
 try:
@@ -811,10 +820,11 @@ default_client = None if USE_MOCK else _create_async_client(DEFAULT_LLM_PROVIDER
 DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "").strip()
 
 
-def resolve_model(config: dict, override: str | None = None) -> str:
+def resolve_model(config: dict, override: str | None = None, provider: str | None = None) -> str:
     """Pick the model to call for a prompt-registry prompt.
 
-    Resolution order: per-request override → LLM_MODEL env var → prompt YAML default.
+    Resolution order: per-request override → LLM_MODEL env var → the prompt YAML
+    default on the OpenAI protocol, the provider's own default everywhere else.
 
     Every prompt YAML hard-codes `model: gpt-4o`, and `PromptRegistry.get_config`
     has no environment awareness at all, so that literal is what any caller
@@ -823,8 +833,20 @@ def resolve_model(config: dict, override: str | None = None) -> str:
     site, not the config, is what decides whether the deployment's own
     LLM_MODEL is honoured. Route every call site through here so a new endpoint
     cannot reintroduce that by reading the config key directly.
+
+    The YAML default is an OpenAI catalog name. Groq, Azure (whose model is a
+    deployment the operator named) and Ollama have no `gpt-4o`, so with LLM_MODEL
+    unset they get get_default_model's answer for their provider instead.
+    ``provider`` is the one the calling client was built for; it defaults to
+    DEFAULT_LLM_PROVIDER, which built default_client.
     """
-    return override or DEFAULT_LLM_MODEL or config["model"]
+    chosen = override or DEFAULT_LLM_MODEL
+    if chosen:
+        return chosen
+    provider = provider or DEFAULT_LLM_PROVIDER
+    if provider == "openai":
+        return config["model"]
+    return _get_default_model(provider)
 
 # Explorer offline mode.
 # Default is now False — Explorer uses the same LLM_PROVIDER as the rest of the stack
@@ -1802,7 +1824,13 @@ class PromptRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "llm-gateway"}
+    # An install without an LLM is healthy: only the LLM-only features are off,
+    # and they say so when used. llm_configured lets the UI say it up front.
+    return {
+        "status": "ok",
+        "service": "llm-gateway",
+        "llm_configured": bool(USE_MOCK or _llm_configured()),
+    }
 
 
 # /version — canonical "what code is actually running" answer for the
@@ -1848,6 +1876,8 @@ async def diagnose_pipeline(request: DiagnoseRequest):
         raise HTTPException(status_code=400, detail="pipeline_id required")
     if not isinstance(request.evidence, dict) or not request.evidence:
         raise HTTPException(status_code=400, detail="evidence must be a non-empty object")
+
+    require_llm()
 
     # Mock mode: return a deterministic stub so the UI is exercisable in dev
     # without burning API tokens.
@@ -1955,7 +1985,10 @@ async def completion(request: PromptRequest):
             else:
                 # Tier 2: Escalate to OpenAI for complex questions
                 logger.info(f"Chat: Escalating to OpenAI for: {user_msg[:50]}...")
-        
+
+        # Everything past local knowledge needs a model.
+        require_llm()
+
         # 2. Call LLM or use mock
         if USE_MOCK or default_client is None:
             # Mock response for testing - bypass prompt registry
@@ -2110,6 +2143,8 @@ async def completion(request: PromptRequest):
                 }
             }
 
+    except HTTPException:
+        raise
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail=f"Prompt '{request.prompt_name}' not found")
     except Exception as e:
@@ -2381,6 +2416,8 @@ async def generate_sql(request: SQLGenerateRequest):
                 warnings=["Mock mode enabled"],
             )
 
+        require_sql_llm()
+
         if sql_client is None:
             raise HTTPException(status_code=503, detail="SQL LLM client unavailable")
 
@@ -2645,7 +2682,9 @@ async def generate_sql(request: SQLGenerateRequest):
 
         model = _explorer_model_for_sql(request.dialect)
         if sql_provider_resolved == "openai":
-            model = (os.getenv("EXPLORER_SQL_OPENAI_MODEL") or cfg.get("model") or model).strip()
+            # The YAML names gpt-4o. Read directly, it beat LLM_MODEL, so Groq-,
+            # Vertex- or OpenRouter-style endpoints got a model their catalog lacks.
+            model = resolve_model(cfg, os.getenv("EXPLORER_SQL_OPENAI_MODEL"), sql_provider_resolved).strip()
 
         temperature = cfg["parameters"].get("temperature", request.temperature)
         max_tokens = cfg["parameters"].get("max_tokens", request.max_tokens)
@@ -3161,6 +3200,9 @@ async def interpret_hitl_input(request: HITLInterpretRequest):
             hitl_prompt=request.hitl_prompt,
             user_response=request.user_response,
             node_context=request.node_context,
+            # Without an LLM only the heuristics run. This also keeps the route
+            # from calling /v1/completion on itself just to be told 503.
+            allow_llm=bool(USE_MOCK or _llm_configured()),
         )
         
         return HITLInterpretResponse(

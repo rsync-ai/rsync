@@ -30,9 +30,18 @@ type ExecutionSummary struct {
 }
 
 type PipelineTrends struct {
-	PipelineID       string             `json:"pipeline_id"`
-	TotalRuns        int                `json:"total_runs"`
-	SuccessRate      float64            `json:"success_rate"`
+	PipelineID string `json:"pipeline_id"`
+	// TotalRuns counts every run this pipeline ever had; the rest of the fields
+	// describe only the RecentExecutions window (?limit=, default 10).
+	TotalRuns int `json:"total_runs"`
+	// SuccessRate is SucceededRuns / FinishedRuns over the window. A run still in
+	// flight has no outcome yet, so it counts toward neither side.
+	SuccessRate float64 `json:"success_rate"`
+	// FinishedRuns is how many runs in the window reached completed or failed;
+	// SucceededRuns is how many of those completed. They let a client say
+	// "9 of the last 10 finished runs succeeded" instead of a bare percentage.
+	FinishedRuns     int                `json:"finished_runs"`
+	SucceededRuns    int                `json:"succeeded_runs"`
 	AvgDurationMs    *int64             `json:"avg_duration_ms,omitempty"`
 	RecentExecutions []ExecutionSummary `json:"recent_executions"`
 }
@@ -105,6 +114,14 @@ func ComparePipelineRuns(c *gin.Context) {
 	c.JSON(http.StatusOK, comparison)
 }
 
+// trendRunsWhere selects the rows that belong to a run. A CDC pipeline's stream
+// stats carry execution_id = pipeline_id, a key that stays stable across
+// restarts, so that id is the stream and not a run. Counted as one, it became
+// the newest "run", and the comparison card compared the latest run against it
+// ("— → —").
+const trendRunsWhere = `e.pipeline_id = $1 AND e.execution_id IS NOT NULL AND e.execution_id <> e.pipeline_id
+	`
+
 // GetPipelineTrends returns historical trends for a pipeline
 // GET /api/v1/pipelines/:id/trends?limit=10
 func GetPipelineTrends(c *gin.Context) {
@@ -138,8 +155,7 @@ func GetPipelineTrends(c *gin.Context) {
 	execListQuery := `
 		SELECT e.execution_id::text, MAX(e.received_at) as last_seen
 		FROM pipeline_run_events e
-		WHERE e.pipeline_id = $1 AND e.execution_id IS NOT NULL
-	`
+		WHERE ` + trendRunsWhere
 	execListQuery += " GROUP BY e.execution_id ORDER BY last_seen DESC LIMIT " + strconv.Itoa(limit)
 
 	rows, err := database.Query(execListQuery, args...)
@@ -167,54 +183,57 @@ func GetPipelineTrends(c *gin.Context) {
 	totalRunsQuery := `
 		SELECT COUNT(DISTINCT e.execution_id)
 		FROM pipeline_run_events e
-		WHERE e.pipeline_id = $1 AND e.execution_id IS NOT NULL
-	`
+		WHERE ` + trendRunsWhere
 	totalArgs := []interface{}{pipelineID}
 	var totalRuns int
 	_ = database.QueryRow(totalRunsQuery, totalArgs...).Scan(&totalRuns)
 
 	// 3) Build summaries
 	executions := make([]ExecutionSummary, 0, len(executionIDs))
-	successCount := 0
 	for _, execID := range executionIDs {
 		summary, err := getExecutionSummary(database, pipelineID, execID)
 		if err != nil {
 			continue
 		}
 		executions = append(executions, *summary)
-		if summary.Status == "completed" || summary.Status == "success" {
-			successCount++
-		}
 	}
 
-	// Calculate success rate
-	successRate := 0.0
-	if totalRuns > 0 {
-		successRate = float64(successCount) / float64(totalRuns)
-	}
+	trends := summarizeTrendWindow(executions)
+	trends.PipelineID = pipelineID
+	trends.TotalRuns = totalRuns
+	c.JSON(http.StatusOK, trends)
+}
 
-	// Calculate average duration
-	var avgDurationMs *int64
-	durationCount := 0
+// summarizeTrendWindow computes the success rate and average duration over one
+// window of runs. Both sides of the rate come from the same window: the old code
+// divided the window's successes by every run the pipeline ever had, so a
+// pipeline with 100 runs whose last 10 all succeeded reported 10%. Runs still in
+// flight are left out of both sides — they have no outcome yet.
+func summarizeTrendWindow(executions []ExecutionSummary) PipelineTrends {
+	t := PipelineTrends{RecentExecutions: executions}
 	var totalDuration int64
+	durationCount := 0
 	for _, exec := range executions {
+		switch exec.Status {
+		case "completed", "success":
+			t.FinishedRuns++
+			t.SucceededRuns++
+		case "failed":
+			t.FinishedRuns++
+		}
 		if exec.DurationMs != nil {
 			totalDuration += *exec.DurationMs
 			durationCount++
 		}
 	}
+	if t.FinishedRuns > 0 {
+		t.SuccessRate = float64(t.SucceededRuns) / float64(t.FinishedRuns)
+	}
 	if durationCount > 0 {
 		avg := totalDuration / int64(durationCount)
-		avgDurationMs = &avg
+		t.AvgDurationMs = &avg
 	}
-
-	c.JSON(http.StatusOK, PipelineTrends{
-		PipelineID:       pipelineID,
-		TotalRuns:        totalRuns,
-		SuccessRate:      successRate,
-		AvgDurationMs:    avgDurationMs,
-		RecentExecutions: executions,
-	})
+	return t
 }
 
 // Helper: fetch summary for a single execution. Takes no user id: both callers

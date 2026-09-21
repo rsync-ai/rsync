@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"api-gateway/internal/db"
@@ -21,12 +22,16 @@ type serviceHealth struct {
 	Status    string `json:"status"`
 	LatencyMs int64  `json:"latency_ms"`
 	Error     string `json:"error,omitempty"`
+	// Detail carries whatever a check knows beyond up/down. Every other check here is a
+	// socket that either opens or does not, and for those it stays empty. The freshness
+	// sweep is the one subject where reachability is not the question being asked.
+	Detail map[string]any `json:"detail,omitempty"`
 }
 
 // AdminSystemHealth checks connectivity to core infrastructure services.
 // GET /api/v1/admin/health
 func AdminSystemHealth(c *gin.Context) {
-	services := make([]serviceHealth, 0, 4)
+	services := make([]serviceHealth, 0, 8)
 
 	// PostgreSQL
 	services = append(services, checkPostgres())
@@ -39,6 +44,18 @@ func AdminSystemHealth(c *gin.Context) {
 
 	// Temporal
 	services = append(services, checkTemporal())
+
+	// The services a CDC pipeline runs through past Kafka. Each answers a plain HTTP
+	// GET when it is up; the page listed none of them (#53).
+	services = append(services,
+		probeHTTPService("orchestrator", strings.TrimRight(orchestratorBaseURL(), "/")+"/health"),
+		probeHTTPService("kafka-connect", strings.TrimRight(kafkaConnectURL(), "/")+"/"),
+		probeHTTPService("kafka-mcp-sink", strings.TrimRight(kafkaSinkURL(), "/")+"/health"),
+	)
+
+	// The freshness sweep. Not infrastructure — a singleton workflow — but it belongs
+	// beside them because it fails the same way they do and nothing else reports it.
+	services = append(services, checkFreshnessSweep())
 
 	c.JSON(http.StatusOK, gin.H{"services": services})
 }
@@ -192,4 +209,31 @@ func checkTemporal() serviceHealth {
 	}
 	conn.Close()
 	return serviceHealth{Service: "temporal", Status: "up", LatencyMs: latency}
+}
+
+// kafkaSinkURL is the kafka-mcp-sink's base URL. The compose service name, not the
+// container name, which carries the connector version.
+func kafkaSinkURL() string {
+	if v := strings.TrimSpace(os.Getenv("KAFKA_SINK_URL")); v != "" {
+		return v
+	}
+	return "http://kafka-mcp-sink-mcp:8000"
+}
+
+var healthProbeClient = &http.Client{Timeout: 3 * time.Second}
+
+// probeHTTPService reports service up when url answers a GET with any 2xx.
+func probeHTTPService(service, url string) serviceHealth {
+	start := time.Now()
+	resp, err := healthProbeClient.Get(url)
+	latency := time.Since(start).Milliseconds()
+	if err != nil {
+		return serviceHealth{Service: service, Status: "down", LatencyMs: latency, Error: err.Error()}
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return serviceHealth{Service: service, Status: "down", LatencyMs: latency,
+			Error: fmt.Sprintf("health check returned HTTP %d", resp.StatusCode)}
+	}
+	return serviceHealth{Service: service, Status: "up", LatencyMs: latency}
 }

@@ -8,6 +8,7 @@ helm install rsync ./deploy/helm/rsync-ai \
   --namespace rsync --create-namespace \
   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
+  --set secrets.internalServiceSecret="$(openssl rand -hex 24)" \
   --set secrets.postgresPassword="$(openssl rand -hex 24)" \
   --set secrets.minioAccessKey="$(openssl rand -hex 16)" \
   --set secrets.minioSecretKey="$(openssl rand -base64 32)" \
@@ -85,8 +86,11 @@ Two workloads are single-replica **by design**, not by omission:
   a second worker. Its Deployment uses `strategy: Recreate` for the same reason.
 - **kafka-connect + debezium-mcp share one pod.** debezium writes source-DB
   credentials into `/connect-secrets`, which kafka-connect reads through
-  `FileConfigProvider`. One pod with an `emptyDir` keeps those credentials off
-  the Kafka config topic and needs no RWX volume; two pods would need one.
+  `FileConfigProvider`. One pod means a plain ReadWriteOnce claim
+  (`connectors.cdc.kafkaConnect.secretsPersistence`) is enough, so those
+  credentials stay off the Kafka config topic and survive a pod restart; two
+  pods would need a RWX volume. (An `emptyDir` was wiped on every restart and
+  left every CDC connector in `RESTARTING`.)
 
 ## BYO matrix
 
@@ -216,8 +220,8 @@ login-callback handler class. Value-by-value annotations live in
 |---|---|---|
 | `PLAINTEXT` | — | `bootstrapServers` only |
 | `SASL_PLAINTEXT` / `SASL_SSL` | `PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512` | `saslMechanism` + `saslUsername` + `saslPassword` |
-| `SASL_SSL` / `SASL_PLAINTEXT` | `OAUTHBEARER` | `saslMechanism` + `oauth.tokenEndpoint` + `oauth.clientId` + `oauth.clientSecret`. **No username** — setting `saslUsername` here is a render error, not a silent no-op |
-| `SASL_SSL` / `SSL` | any of the above | plus `tls.caCert` **only if** your broker's certificate does not chain to a public root. MSK, Confluent Cloud and Aiven need nothing here |
+| `SASL_SSL` / `SASL_PLAINTEXT` | `OAUTHBEARER` | `saslMechanism` + `oauth.tokenEndpoint` + `oauth.clientId` + `oauth.clientSecret`. **No username** — setting `saslUsername` here is a render error, not a silent no-op. The endpoint must be `https://` unless its host is loopback |
+| `SASL_SSL` / `SSL` | any of the above | plus `tls.caCert` **only if** your broker's certificate does not chain to a public root. MSK, Confluent Cloud, Aiven and Google Managed Kafka need nothing here — setting `caCert` to your own CA *replaces* the public trust and breaks the handshake. mTLS: `clientCert` + `clientKey` only |
 
 Both secrets can come from `secrets.existingSecret` instead of the values file, under
 the keys `KAFKA_SASL_PASSWORD` and `KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET`.
@@ -229,6 +233,15 @@ id, half an mTLS keypair, and `tls.insecureSkipVerify` with no CA bundle are eac
 `helm template` failure naming the value. The reason they are fatal rather than
 warnings is that every one of them otherwise produces a platform that comes up
 **healthy and moves zero rows**.
+
+A plain-`http://` `oauth.tokenEndpoint` is a render failure too, for a different reason:
+it comes up healthy and moves rows *while disclosing the client secret*. The
+client-credentials grant POSTs `oauth.clientSecret` to that URL on every token fetch, so
+one http hop off loopback hands a credential that never expires to anyone on the path.
+A loopback host (`localhost`, `*.localhost`, `127.0.0.0/8`, `::1`) is exempt — that is
+GCP Workload Identity's `http://localhost:14293` sidecar — and
+`oauth.allowInsecureTokenEndpoint=true` re-permits the rest for a disposable rig, which
+is also the only thing that emits the matching env var into the pods.
 
 **Verified**, on a broker outside the cluster with `auto.create.topics.enable=false`,
 across `PLAINTEXT` → `SASL_PLAINTEXT`+SCRAM-SHA-512 → `SASL_SSL`+SCRAM-SHA-512 with a
@@ -325,6 +338,11 @@ consecutive failed `helm install` attempts if you meet them by trial. Each
 overlay's own header carries the paste-ready skeleton with that provider's
 service names filled in.
 
+A seventh key does not abort the render but breaks the product: leave
+`secrets.internalServiceSecret` empty and the pods start, then every pipeline run
+is refused with "authentication required" (the api-gateway cannot authenticate to
+the orchestrator). Set it to `openssl rand -hex 24`. `install-k8s.sh` generates it.
+
 ## Secrets
 
 `secrets.*` values end up in the release Secret in cleartext, and `helm get
@@ -363,10 +381,11 @@ connection in a surviving external database.
   given here ("never minted for any image in this repo") expired on 2026-08-19 —
   [docker-publish.yml](../../../.github/workflows/docker-publish.yml) pushes
   `type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}`, and both
-  `v0.1.0`, `v0.1.1` and `v0.1.2` were tag refs, so `latest` does now exist —
+  `v0.1.0`, `v0.1.1`, `v0.1.2` and `v0.1.3` were tag refs, so `latest` does now exist —
   all 34 packages carry it, confirmed by an anonymous manifest fetch. The chart
   resolves `.tag | default global.image.tag | default .Chart.AppVersion`, which
-  is **0.1.2** today; move it with `global.image.tag`, not with `latest`.
+  is **0.1.3** today (the first tag built for both `amd64` and `arm64`); move it with
+  `global.image.tag`, not with `latest`.
 
 ## Troubleshooting
 

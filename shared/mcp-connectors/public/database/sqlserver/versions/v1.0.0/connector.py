@@ -3107,22 +3107,9 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 schemas = [explicit_schema]
             else:
                 try:
-                    # sys.schemas minus the built-in system schemas (sys,
-                    # INFORMATION_SCHEMA, guest) and the fixed database-role
-                    # schemas (db_owner, db_datareader, ...). dbo IS a user
-                    # schema and is kept; a user schema like "db_custom" is kept
-                    # too (an explicit NOT IN list avoids a `db_%` LIKE that
-                    # would also strip dbo). Names are SQL Server built-ins.
-                    cursor.execute(
-                        "SELECT name FROM sys.schemas "
-                        "WHERE name NOT IN ("
-                        "'sys', 'INFORMATION_SCHEMA', 'guest', "
-                        "'db_owner', 'db_accessadmin', 'db_securityadmin', "
-                        "'db_ddladmin', 'db_backupoperator', 'db_datareader', "
-                        "'db_datawriter', 'db_denydatareader', 'db_denydatawriter') "
-                        "ORDER BY name"
-                    )
-                    schemas = [row[0] for row in (cursor.fetchall() or []) if row and row[0]]
+                    # sys.schemas minus the system and fixed database-role
+                    # schemas (_sqlserver_user_schemas); dbo is kept.
+                    schemas = self._sqlserver_user_schemas(cursor)
                 except Exception:
                     schemas = []
                 if not schemas:
@@ -3174,29 +3161,35 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
 
             result["total_tables_available"] = total_available
 
-            # Every catalog lookup below is scoped to each table's OWN
-            # (schema, name) and assigned directly to that table object, so
-            # same-named tables in different schemas never cross-assign
-            # columns/keys (the old `by_name = {t["name"]: t}` collided).
+            # Columns and keys are read once per schema, not per table (three
+            # round trips per table ran past the 30s discovery timeout at a few
+            # thousand tables). Each row is assigned by its own (schema, name),
+            # so same-named tables in different schemas never cross-assign
+            # columns/keys (the old `by_name = {t["name"]: t}` collided), and
+            # rows for tables past max_tables are skipped.
+            by_key = {(t["schema"], t["name"]): t for t in tables}
+            schemas_found = sorted({t["schema"] for t in tables})
 
             # Columns
             if include_columns and tables:
                 try:
-                    for t in tables:
-                        _sch, tname = t["schema"], t["name"]
+                    for _sch in schemas_found:
                         cursor.execute(
-                            "SELECT c.name, ty.name AS data_type, c.is_nullable, "
+                            "SELECT t.name AS table_name, c.name, ty.name AS data_type, c.is_nullable, "
                             "c.precision, c.scale "
                             "FROM sys.columns c "
                             "JOIN sys.types ty ON c.user_type_id = ty.user_type_id "
                             "JOIN sys.tables t ON c.object_id = t.object_id "
                             "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                            "WHERE s.name = ? AND t.name = ? "
-                            "ORDER BY c.column_id",
-                            (_sch, tname),
+                            "WHERE s.name = ? "
+                            "ORDER BY t.name, c.column_id",
+                            (_sch,),
                         )
-                        rows = cursor.fetchall() or []
-                        for cr in rows:
+                        for _row in (cursor.fetchall() or []):
+                            t = by_key.get((_sch, _row[0]))
+                            if t is None:
+                                continue
+                            cr = tuple(_row)[1:]
                             # Emit canonical (not the raw T-SQL type) so the
                             # sink/destination maps a single vocabulary. Preserve
                             # decimal/numeric precision+scale so the dest DDL keeps
@@ -3231,33 +3224,38 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             if include_relationships and tables:
                 # PK columns
                 try:
-                    for t in tables:
-                        _sch, tname = t["schema"], t["name"]
+                    for _sch in schemas_found:
                         cursor.execute(
-                            "SELECT c.name "
+                            "SELECT t.name, c.name "
                             "FROM sys.key_constraints kc "
                             "JOIN sys.index_columns ic ON kc.parent_object_id = ic.object_id AND kc.unique_index_id = ic.index_id "
                             "JOIN sys.columns c ON ic.object_id = c.object_id AND ic.column_id = c.column_id "
                             "JOIN sys.tables t ON kc.parent_object_id = t.object_id "
                             "JOIN sys.schemas s ON t.schema_id = s.schema_id "
-                            "WHERE kc.type = 'PK' AND s.name = ? AND t.name = ? "
-                            "ORDER BY ic.key_ordinal",
-                            (_sch, tname),
+                            "WHERE kc.type = 'PK' AND s.name = ? "
+                            "ORDER BY t.name, ic.key_ordinal",
+                            (_sch,),
                         )
-                        pk_cols = [row[0] for row in (cursor.fetchall() or [])]
-                        t["primary_keys"] = pk_cols
-                        for c in t.get("columns", []):
-                            if c.get("name") in pk_cols:
-                                c["is_primary_key"] = True
+                        pks_by_table = {}
+                        for row in (cursor.fetchall() or []):
+                            pks_by_table.setdefault(row[0], []).append(row[1])
+                        for tname, pk_cols in pks_by_table.items():
+                            t = by_key.get((_sch, tname))
+                            if t is None:
+                                continue
+                            t["primary_keys"] = pk_cols
+                            for c in t.get("columns", []):
+                                if c.get("name") in pk_cols:
+                                    c["is_primary_key"] = True
                 except Exception as e:
                     add_warning("catalog_error", "warning", f"Could not retrieve primary keys: {e}", subsystem="relationships")
 
                 # FK columns
                 try:
-                    for t in tables:
-                        _sch, tname = t["schema"], t["name"]
+                    for _sch in schemas_found:
                         cursor.execute(
                             "SELECT "
+                            "pt.name AS table_name, "
                             "pc.name AS column_name, "
                             "rt.name AS ref_table, "
                             "rc.name AS ref_column, "
@@ -3271,12 +3269,15 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                             "JOIN sys.columns pc ON fkc.parent_object_id = pc.object_id AND fkc.parent_column_id = pc.column_id "
                             "JOIN sys.tables rt ON fkc.referenced_object_id = rt.object_id "
                             "JOIN sys.columns rc ON fkc.referenced_object_id = rc.object_id AND fkc.referenced_column_id = rc.column_id "
-                            "WHERE ps.name = ? AND pt.name = ? "
-                            "ORDER BY fk.name",
-                            (_sch, tname),
+                            "WHERE ps.name = ? "
+                            "ORDER BY pt.name, fk.name",
+                            (_sch,),
                         )
-                        fk_rows = cursor.fetchall() or []
-                        for fr in fk_rows:
+                        for _row in (cursor.fetchall() or []):
+                            t = by_key.get((_sch, _row[0]))
+                            if t is None:
+                                continue
+                            fr = tuple(_row)[1:]
                             fk_obj = {
                                 "column": fr[0],
                                 "references_table": fr[1],
@@ -3664,6 +3665,191 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         
         return {"success": False, "error": "Schema discovery not supported for this NoSQL database"}
     
+    # =========================================================================
+    # BEGIN list_namespaces block
+    # The same text sits in the postgresql, mysql, oracle and sqlserver
+    # connectors and in connector_database.py.j2;
+    # llm-service/tests/test_list_namespaces_block_in_lockstep.py fails when one
+    # copy changes alone. discover_schema resolves schemas through the same
+    # helpers, so the list and discovery never disagree about what is a system
+    # namespace.
+    # =========================================================================
+
+    # Databases MySQL and MongoDB keep for themselves; never user data.
+    _MYSQL_SYSTEM_DATABASES = frozenset({"information_schema", "mysql", "performance_schema", "sys"})
+    _MONGO_SYSTEM_DATABASES = frozenset({"admin", "config", "local"})
+
+    # Oracle-maintained / internal owners we never surface as user data.
+    # Under-filtering is safe (the user still picks the tables to sync);
+    # over-filtering would hide a real schema, so this list stays
+    # conservative + explicit and matches on exact name or a known prefix.
+    _ORACLE_SYSTEM_OWNERS = frozenset({
+        "SYS", "SYSTEM", "XDB", "OUTLN", "DBSNMP", "APPQOSSYS",
+        "GSMADMIN_INTERNAL", "GSMCATUSER", "GSMUSER", "GSMROOTUSER",
+        "CTXSYS", "MDSYS", "MDDATA", "ORDSYS", "ORDDATA", "ORDPLUGINS",
+        "OLAPSYS", "WMSYS", "EXFSYS", "AUDSYS", "LBACSYS", "DVSYS", "DVF",
+        "DBSFWUSER", "GGSYS", "ANONYMOUS", "REMOTE_SCHEDULER_AGENT",
+        "SYSBACKUP", "SYSDG", "SYSKM", "SYSRAC", "SYS$UMF", "OJVMSYS",
+        "SI_INFORMTN_SCHEMA", "SPATIAL_CSW_ADMIN_USR",
+        "SPATIAL_WFS_ADMIN_USR", "FLOWS_FILES", "APEX_PUBLIC_USER",
+        "ORACLE_OCM", "XS$NULL", "PDBADMIN", "DGPDB_INT", "DIP",
+        "VECSYS", "GGSHAREDCAP",
+    })
+
+    @classmethod
+    def _is_oracle_system_owner(cls, owner) -> bool:
+        ou = str(owner).upper()
+        return (ou in cls._ORACLE_SYSTEM_OWNERS
+                or ou.startswith("APEX_")
+                or ou.startswith("FLOWS_")
+                or ou.startswith("SYS$"))
+
+    def _postgres_user_schemas(self, cursor) -> List[str]:
+        """Every PostgreSQL schema except the catalogs and the temp/toast schemas."""
+        cursor.execute(
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE schema_name NOT IN ('pg_catalog', 'information_schema') "
+            "AND schema_name NOT LIKE 'pg_temp%' "
+            "AND schema_name NOT LIKE 'pg_toast%' "
+            "ORDER BY schema_name"
+        )
+        return [row[0] for row in (cursor.fetchall() or []) if row and row[0]]
+
+    def _sqlserver_user_schemas(self, cursor) -> List[str]:
+        """sys.schemas minus the built-in system schemas (sys,
+        INFORMATION_SCHEMA, guest) and the fixed database-role schemas
+        (db_owner, db_datareader, ...). dbo IS a user schema and is kept; a user
+        schema like "db_custom" is kept too (an explicit NOT IN list avoids a
+        `db_%` LIKE that would also strip dbo). Names are SQL Server built-ins.
+        """
+        cursor.execute(
+            "SELECT name FROM sys.schemas "
+            "WHERE name NOT IN ("
+            "'sys', 'INFORMATION_SCHEMA', 'guest', "
+            "'db_owner', 'db_accessadmin', 'db_securityadmin', "
+            "'db_ddladmin', 'db_backupoperator', 'db_datareader', "
+            "'db_datawriter', 'db_denydatareader', 'db_denydatawriter') "
+            "ORDER BY name"
+        )
+        return [row[0] for row in (cursor.fetchall() or []) if row and row[0]]
+
+    def _oracle_user_owners(self, cursor) -> List[str]:
+        """Every Oracle owner with tables that is not Oracle's own.
+
+        Prefers the Oracle-sanctioned all_users.oracle_maintained flag (present
+        since 12.1): it excludes EVERY Oracle-internal schema, including ones no
+        static list would know (e.g. 23ai's VECSYS / GGSHAREDCAP). The explicit
+        denylist is a belt-and-braces secondary filter and the fallback for
+        older Oracle that lacks the column. Last resort is the connection's
+        current schema, so a normal single-schema login never regresses to
+        zero tables.
+        """
+        owners = []
+        try:
+            cursor.execute(
+                "SELECT DISTINCT t.owner FROM all_tables t "
+                "JOIN all_users u ON u.username = t.owner "
+                "WHERE u.oracle_maintained = 'N' ORDER BY t.owner"
+            )
+            owners = [
+                row[0] for row in (cursor.fetchall() or [])
+                if row and row[0] and not self._is_oracle_system_owner(row[0])
+            ]
+        except Exception:
+            owners = []
+        if not owners:
+            try:
+                cursor.execute("SELECT DISTINCT owner FROM all_tables ORDER BY owner")
+                owners = [
+                    row[0] for row in (cursor.fetchall() or [])
+                    if row and row[0] and not self._is_oracle_system_owner(row[0])
+                ]
+            except Exception:
+                owners = []
+        if not owners:
+            try:
+                cursor.execute("SELECT SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') FROM dual")
+                cur_schema = (cursor.fetchone() or [None])[0]
+                owners = [cur_schema] if cur_schema else []
+            except Exception:
+                owners = []
+        return owners
+
+    def _mysql_user_databases(self, cursor) -> List[str]:
+        """Every MySQL database the login can see, minus MySQL's own."""
+        cursor.execute("SELECT schema_name FROM information_schema.schemata ORDER BY schema_name")
+        return [
+            row[0] for row in (cursor.fetchall() or [])
+            if row and row[0] and str(row[0]).lower() not in self._MYSQL_SYSTEM_DATABASES
+        ]
+
+    def list_namespaces(self, params: Dict = None) -> Dict[str, Any]:
+        """List the names one level above a table: the level metadata.json's
+        namespace_model.table_namespace names. Schemas on PostgreSQL and SQL
+        Server, owners on Oracle, databases on MySQL and MongoDB, datasets on a
+        warehouse adapter. System namespaces are left out.
+
+        Returns {"success": True, "namespaces": [sorted names], "current": the
+        namespace the connection itself names, or "" when it names none}, or
+        {"success": False, "error": ...}.
+        """
+        params = params or {}
+        config = self._get_config(params)
+        adapter = getattr(self, "_warehouse_adapter", None)
+        if adapter is not None:
+            if not hasattr(adapter, "list_namespaces"):
+                return {"success": False, "error": "Listing namespaces is not supported by this warehouse adapter"}
+            return adapter.list_namespaces(config)
+        pattern = self.driver_pattern
+        module = pattern.get("module") or ""
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            if pattern.get("is_nosql"):
+                if "mongo" not in module:
+                    return {"success": False, "error": f"Listing namespaces is not supported for {module}"}
+                names = [n for n in conn.list_database_names() if n not in self._MONGO_SYSTEM_DATABASES]
+                current = config.get("database")
+            elif "sqlite" in module:
+                names, current = ["main"], "main"
+            else:
+                cursor = self._get_cursor(conn, as_dict=False)
+                try:
+                    if "mysql" in module:
+                        names = self._mysql_user_databases(cursor)
+                        current = config.get("database")
+                    elif "psycopg2" in module:
+                        names = self._postgres_user_schemas(cursor)
+                        current = config.get("schema")
+                    elif "pyodbc" in module:
+                        names = self._sqlserver_user_schemas(cursor)
+                        current = config.get("schema")
+                    elif "oracledb" in module:
+                        names = self._oracle_user_owners(cursor)
+                        current = str(config.get("owner") or config.get("schema") or "").upper()
+                    else:
+                        return {"success": False, "error": f"Listing namespaces is not supported for {module or 'this driver'}"}
+                finally:
+                    try:
+                        cursor.close()
+                    except Exception:
+                        pass
+            return {
+                "success": True,
+                "namespaces": sorted({str(n) for n in names if n}),
+                "current": str(current or "").strip(),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Listing namespaces failed: {e}"}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # END list_namespaces block
+
     # =========================================================================
     # SOURCE OPERATIONS
     # =========================================================================

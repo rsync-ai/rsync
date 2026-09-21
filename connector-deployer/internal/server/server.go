@@ -191,17 +191,17 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 // requireInternalSecret mirrors tool_generator routes.py::require_internal_secret:
-// secret set + header matches ⇒ allow; mismatch/absent ⇒ 401; secret unset ⇒ 503 in
-// prod (fail-closed), allow+warn in dev.
+// secret set + header matches ⇒ allow; mismatch/absent ⇒ 401; secret unset ⇒ 503
+// unless ENVIRONMENT is explicitly development/dev, where it allows and warns.
 func (s *Server) requireInternalSecret(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		secret := s.cfg.InternalSecret // already trimmed in config.Load
 		if secret == "" {
-			if s.cfg.IsProd() {
+			if !s.cfg.IsDev() {
 				writeError(w, http.StatusServiceUnavailable, "internal_secret_not_configured")
 				return
 			}
-			s.log.Warn("INTERNAL_SERVICE_SECRET unset — allowing request (non-production only)", "path", r.URL.Path)
+			s.log.Warn("INTERNAL_SERVICE_SECRET unset — allowing request (ENVIRONMENT=development only)", "path", r.URL.Path)
 			next(w, r)
 			return
 		}

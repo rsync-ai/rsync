@@ -92,7 +92,7 @@ def _server_with_recording_cursor():
     }
     srv._get_connection = lambda config: conn
     srv._get_cursor = lambda c, as_dict=True: rec
-    srv._split_mysql_db_table = lambda config, table, params: (None, table)
+    srv._split_mysql_db_table = lambda config, table, params: ("d", table)
     srv._write_cdc_offsets = lambda cursor, params: None
     return srv, rec
 

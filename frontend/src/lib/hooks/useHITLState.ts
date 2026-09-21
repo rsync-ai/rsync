@@ -3,6 +3,7 @@
 import { useCallback, useRef, useState } from "react"
 import { resumePipelineConnectors, resumePipelineNodeInput, resumePipelineTables, type DestinationConfig } from "@/lib/api/pipelines"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { truncatedTableTotal } from "@/lib/api/connections"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { useOptimisticAction } from "@/lib/pipeline/usePipelineState"
 import type { TransformSuggestion } from "@/lib/api/suggestions"
@@ -65,6 +66,8 @@ export function useHITLState({
     "ok" | "empty" | "failed" | undefined
   >(undefined)
   const [tableSourceDatabase, setTableSourceDatabase] = useState<string>("")
+  const [tableSourceServerLevel, setTableSourceServerLevel] = useState(false)
+  const [tableTruncatedTotal, setTableTruncatedTotal] = useState<number | undefined>(undefined)
   const [tableDiscoveryReason, setTableDiscoveryReason] = useState<string>("")
 
   // Suggestions HITL
@@ -189,6 +192,8 @@ export function useHITLState({
       const ds = String(details["discovery_status"] || "")
       setTableDiscoveryStatus(ds === "empty" || ds === "failed" || ds === "ok" ? ds : undefined)
       setTableSourceDatabase(String(details["source_database"] || ""))
+      setTableSourceServerLevel(details["source_server_level"] === true)
+      setTableTruncatedTotal(truncatedTableTotal(details))
       setTableDiscoveryReason(String(details["reason"] || ""))
       setTableSelectorOpen(true)
     },
@@ -399,6 +404,8 @@ export function useHITLState({
     setTableHitlNodeId,
     tableDiscoveryStatus,
     tableSourceDatabase,
+    tableSourceServerLevel,
+    tableTruncatedTotal,
     tableDiscoveryReason,
     // suggestions HITL
     suggestionsReviewOpen,

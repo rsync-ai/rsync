@@ -14,8 +14,29 @@ import {
   X,
   CheckCircle2,
 } from "lucide-react"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { cn } from "@/lib/utils"
 import { displayConnectorName } from "@/lib/connector-display"
+
+/** Where the rows land in the destination, as the gateway's confirmation reports it. */
+export interface DestinationNamespaceHint {
+  /** The name the request gave ("… database datingapp_pg3"), or "". */
+  requested?: string
+  /** The destination's own default, or "" when it has none (object storage, BigQuery). */
+  defaultName?: string
+  /** schema | database | dataset | path | prefix */
+  kind?: string
+}
+
+// Same rule as the gateway's naming.ValidateNamespace charset: the name reaches
+// CREATE SCHEMA / CREATE DATABASE unquoted on some engines.
+const NAMESPACE_RE = /^[A-Za-z_][A-Za-z0-9_]{0,62}$/
+
+function namespaceNoun(kind?: string): string {
+  if (kind === "path" || kind === "prefix") return "path prefix"
+  return kind || "schema"
+}
 
 interface SyncModeOption {
   id: string
@@ -32,6 +53,18 @@ interface SyncModeChoiceInlineProps {
   destConnectionId?: string
   tables?: string[]
   initialChosenLabel?: string
+  /**
+   * Option the user's own request already named (e.g. "CDC with snapshot +
+   * streaming" → initial_plus_cdc). Pre-selected so the card confirms instead
+   * of asking "Choose Sync Mode" again; the user can still change it.
+   */
+  requestedOptionId?: string
+  /**
+   * Shown as an editable "Destination database/schema" field. The card used to have
+   * none, so a request naming the destination database gave no sign of where the
+   * rows would go (#45).
+   */
+  destinationNamespace?: DestinationNamespaceHint
   onChoice: (choiceId: string, context: any, label: string) => void
   onCancel?: () => void
 }
@@ -46,16 +79,24 @@ export function SyncModeChoiceInline({
   destConnectionId,
   tables,
   initialChosenLabel,
+  requestedOptionId,
+  destinationNamespace,
   onChoice,
   onCancel,
 }: SyncModeChoiceInlineProps) {
+  const [namespace, setNamespace] = useState(destinationNamespace?.requested ?? "")
+  const trimmedNamespace = namespace.trim()
+  const namespaceInvalid = trimmedNamespace !== "" && !NAMESPACE_RE.test(trimmedNamespace)
+  const requested = requestedOptionId && options.some((o) => o.id === requestedOptionId)
+    ? requestedOptionId
+    : null
   // Do NOT pre-select a mode when the user has a real choice. Previously this
   // defaulted to options[0] (batch), so a user who explicitly asked for CDC could
   // click "Start pipeline" and silently launch a BATCH pipeline. Pre-select only
-  // when there is a single option; otherwise force an explicit pick (the Start
-  // button is disabled while nothing is selected).
+  // when there is a single option or the request itself named the mode;
+  // otherwise force an explicit pick (Start is disabled while nothing is selected).
   const [selectedOption, setSelectedOption] = useState<string | null>(
-    () => (options.length === 1 ? options[0]?.id ?? null : null)
+    () => requested ?? (options.length === 1 ? options[0]?.id ?? null : null)
   )
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [chosenLabel, setChosenLabel] = useState<string | null>(initialChosenLabel ?? null)
@@ -65,7 +106,7 @@ export function SyncModeChoiceInline({
   }
 
   const handleConfirm = async () => {
-    if (!selectedOption) return
+    if (!selectedOption || namespaceInvalid) return
     setIsSubmitting(true)
     const label = options.find((o) => o.id === selectedOption)?.label ?? selectedOption
     try {
@@ -78,6 +119,7 @@ export function SyncModeChoiceInline({
           source_connection_id: sourceConnectionId,
           dest_connection_id: destConnectionId,
           tables: tables,
+          destination_namespace: destinationNamespace && !namespaceInvalid ? trimmedNamespace : "",
         },
         label,
       )
@@ -156,15 +198,17 @@ export function SyncModeChoiceInline({
             </div>
             <div>
               <CardTitle className="text-lg">
-                {options.length > 1 ? "Choose Sync Mode" : "Confirm Pipeline"}
+                {options.length > 1 && !requested ? "Choose Sync Mode" : "Confirm Pipeline"}
               </CardTitle>
               <p className="text-sm text-zinc-500 dark:text-zinc-400">
-                {message}
+                {requested
+                  ? "Sync mode taken from your request. Pick another below to change it."
+                  : message}
               </p>
             </div>
           </div>
           {onCancel && (
-            <Button variant="ghost" size="icon" onClick={onCancel}>
+            <Button variant="ghost" size="icon" onClick={onCancel} aria-label="Cancel">
               <X className="h-4 w-4" />
             </Button>
           )}
@@ -187,18 +231,59 @@ export function SyncModeChoiceInline({
             </Badge>
           )}
         </div>
+
+        {destinationNamespace && (() => {
+          const noun = namespaceNoun(destinationNamespace.kind)
+          const placeholder = destinationNamespace.defaultName
+            ? `Default: ${destinationNamespace.defaultName}`
+            : destinationNamespace.kind === "path"
+              ? "Default: the source's database name"
+              : "Default: the connection's own"
+          return (
+            <div className="mt-3 space-y-1.5">
+              <Label htmlFor="sync-mode-destination-namespace" className="text-sm">
+                Destination {noun}
+              </Label>
+              <Input
+                id="sync-mode-destination-namespace"
+                value={namespace}
+                onChange={(e) => setNamespace(e.target.value)}
+                placeholder={placeholder}
+                disabled={isSubmitting}
+                aria-invalid={namespaceInvalid || undefined}
+                aria-describedby="sync-mode-destination-namespace-help"
+                autoComplete="off"
+                spellCheck={false}
+              />
+              <p
+                id="sync-mode-destination-namespace-help"
+                className={cn("text-xs", namespaceInvalid ? "text-red-600 dark:text-red-400" : "text-zinc-500 dark:text-zinc-400")}
+              >
+                {namespaceInvalid
+                  ? "Use letters, digits and underscores, not starting with a digit."
+                  : `Leave empty to use the default. It is created if it does not exist.`}
+              </p>
+            </div>
+          )
+        })()}
       </CardHeader>
       
       <CardContent className="space-y-3">
-        {options.map((option) => (
+        <div role="group" aria-label="Sync mode" className="space-y-3">
+        {options.map((option) => {
+          const isSelected = selectedOption === option.id
+          return (
           <button
             key={option.id}
+            type="button"
+            aria-pressed={isSelected}
+            data-selected={isSelected ? "true" : undefined}
             onClick={() => handleSelect(option.id)}
             disabled={isSubmitting}
             className={cn(
-              "w-full flex items-center gap-4 p-4 rounded-xl border-2 transition-all text-left",
-              selectedOption === option.id
-                ? "border-violet-500 bg-violet-50 dark:bg-violet-950/30"
+              "w-full flex items-center gap-4 p-4 rounded-xl border-2 transition-all text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-500",
+              isSelected
+                ? "border-violet-600 bg-violet-100 ring-2 ring-violet-500/40 dark:border-violet-400 dark:bg-violet-900/40"
                 : "border-zinc-200 dark:border-zinc-700 hover:border-violet-300 hover:bg-violet-50/50 dark:hover:border-violet-800 dark:hover:bg-violet-950/20",
               isSubmitting && "opacity-50 cursor-not-allowed"
             )}
@@ -217,11 +302,17 @@ export function SyncModeChoiceInline({
                 {getOptionDescription(option.id)}
               </p>
             </div>
-            {selectedOption === option.id && isSubmitting && (
+            {isSelected && isSubmitting ? (
               <div className="animate-spin h-5 w-5 border-2 border-violet-500 border-t-transparent rounded-full" />
+            ) : isSelected ? (
+              <CheckCircle2 aria-hidden="true" className="h-5 w-5 shrink-0 text-violet-600 dark:text-violet-300" />
+            ) : (
+              <span aria-hidden="true" className="h-5 w-5 shrink-0 rounded-full border-2 border-zinc-300 dark:border-zinc-600" />
             )}
           </button>
-        ))}
+          )
+        })}
+        </div>
 
         <div className="pt-2 flex items-center justify-end gap-2">
           <Button
@@ -235,7 +326,7 @@ export function SyncModeChoiceInline({
           <Button
             type="button"
             onClick={() => void handleConfirm()}
-            disabled={!selectedOption || isSubmitting}
+            disabled={!selectedOption || isSubmitting || namespaceInvalid}
             className="bg-gradient-to-r from-violet-600 to-indigo-600"
           >
             Start pipeline

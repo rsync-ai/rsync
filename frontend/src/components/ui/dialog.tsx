@@ -221,7 +221,7 @@ const DialogContent = React.forwardRef<
             type="button"
             onClick={close}
             aria-label="Close"
-            className="pointer-events-auto -mr-2 flex h-8 w-8 items-center justify-center rounded-full bg-white/90 text-zinc-500 backdrop-blur transition-colors hover:bg-zinc-100 hover:text-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400 dark:bg-zinc-900/90 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
+            className="pointer-events-auto -mr-2 flex h-8 w-8 items-center justify-center rounded-full bg-white/90 text-zinc-500 dark:text-zinc-400 backdrop-blur transition-colors hover:bg-zinc-100 hover:text-zinc-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-zinc-400 dark:bg-zinc-900/90 dark:hover:bg-zinc-800 dark:hover:text-zinc-100"
           >
             <X className="h-4 w-4" />
           </button>

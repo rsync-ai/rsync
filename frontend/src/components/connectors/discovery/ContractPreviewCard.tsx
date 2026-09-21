@@ -156,7 +156,7 @@ export function ContractPreviewCard({
                   </span>
                 )}
                 {f.description && (
-                  <span className="text-zinc-500 truncate">— {f.description}</span>
+                  <span className="text-zinc-500 dark:text-zinc-400 truncate">— {f.description}</span>
                 )}
               </li>
             ))}
@@ -252,7 +252,7 @@ function FactRow({
           )}
         </div>
         {fact.evidence && (
-          <div className="text-[10px] text-zinc-500 truncate mt-0.5">{fact.evidence}</div>
+          <div className="text-[10px] text-zinc-500 dark:text-zinc-400 truncate mt-0.5">{fact.evidence}</div>
         )}
       </div>
     </div>
@@ -312,7 +312,7 @@ function QuestionField({
         />
       )}
       {question.help_text && question.kind !== "free_text" && (
-        <div className="text-[10px] text-zinc-500 mt-1">{question.help_text}</div>
+        <div className="text-[10px] text-zinc-500 dark:text-zinc-400 mt-1">{question.help_text}</div>
       )}
     </div>
   )

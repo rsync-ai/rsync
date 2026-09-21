@@ -72,6 +72,7 @@ class HITLInterpreter:
         user_response: str,
         node_context: Optional[Dict[str, Any]] = None,
         required_fields: Optional[List[Dict[str, Any]]] = None,
+        allow_llm: bool = True,
     ) -> InterpretResult:
         """
         Interpret a user's natural language response into a config patch.
@@ -83,6 +84,9 @@ class HITLInterpreter:
             user_response: User's natural language response
             node_context: Current node configuration context
             required_fields: Schema of required fields (optional)
+            allow_llm: False when no LLM is set up. The heuristics still run;
+                a response they can't read asks the user to rephrase instead
+                of calling a model that isn't there.
             
         Returns:
             InterpretResult with config_patch or error
@@ -100,7 +104,25 @@ class HITLInterpreter:
         if heuristic_result.success and heuristic_result.confidence >= 0.9:
             logger.info(f"✅ Heuristic interpretation succeeded (confidence: {heuristic_result.confidence})")
             return heuristic_result
-        
+
+        if not allow_llm:
+            # A lower-confidence heuristic match is still the best reading
+            # available, and it is what the temporal-adapter's own fallback
+            # would accept.
+            if heuristic_result.success:
+                return heuristic_result
+            return InterpretResult(
+                success=False,
+                error="llm_not_configured",
+                confidence=0.0,
+                needs_clarification=True,
+                clarification_prompt=(
+                    "I couldn't read that without an LLM. Reply with the exact "
+                    "table names separated by commas, or yes / no. To answer in "
+                    "free text, set up an LLM first."
+                ),
+            )
+
         # Fall back to LLM interpretation for complex cases
         return self._llm_interpretation(
             node_id=node_id,
@@ -340,6 +362,7 @@ def interpret_node_input(
     hitl_prompt: str,
     user_response: str,
     node_context: Optional[Dict[str, Any]] = None,
+    allow_llm: bool = True,
 ) -> Dict[str, Any]:
     """
     Convenience function for interpreting HITL node input.
@@ -354,6 +377,7 @@ def interpret_node_input(
         hitl_prompt: Question asked to user
         user_response: User's response
         node_context: Current node context
+        allow_llm: False when no LLM is set up (heuristics only)
         
     Returns:
         Dict with:
@@ -370,6 +394,7 @@ def interpret_node_input(
         hitl_prompt=hitl_prompt,
         user_response=user_response,
         node_context=node_context,
+        allow_llm=allow_llm,
     )
     
     return {

@@ -81,7 +81,7 @@ export function ActivePipelinesList({
       <DropdownMenuContent align="end" className="w-72">
         {activePipelines.length > 0 && (
           <>
-            <DropdownMenuLabel className="text-xs text-zinc-500">
+            <DropdownMenuLabel className="text-xs text-zinc-500 dark:text-zinc-400">
               Active Pipelines
             </DropdownMenuLabel>
             {activePipelines.map((pipeline) => (
@@ -96,7 +96,7 @@ export function ActivePipelinesList({
                     <div className="text-sm font-medium truncate">
                       {pipeline.name || `Pipeline ${pipeline.id.slice(0, 8)}`}
                     </div>
-                    <div className="text-xs text-zinc-500">
+                    <div className="text-xs text-zinc-500 dark:text-zinc-400">
                       {formatRelativeTime(new Date(pipeline.startedAt))}
                     </div>
                   </div>
@@ -114,7 +114,7 @@ export function ActivePipelinesList({
         {completedPipelines.length > 0 && (
           <>
             <DropdownMenuSeparator />
-            <DropdownMenuLabel className="text-xs text-zinc-500 flex items-center justify-between">
+            <DropdownMenuLabel className="text-xs text-zinc-500 dark:text-zinc-400 flex items-center justify-between">
               <span>Recent</span>
               <Button
                 variant="ghost"
@@ -141,7 +141,7 @@ export function ActivePipelinesList({
                     <div className="text-sm truncate">
                       {pipeline.name || `Pipeline ${pipeline.id.slice(0, 8)}`}
                     </div>
-                    <div className="text-xs text-zinc-500">
+                    <div className="text-xs text-zinc-500 dark:text-zinc-400">
                       {formatRelativeTime(new Date(pipeline.lastUpdated))}
                     </div>
                   </div>

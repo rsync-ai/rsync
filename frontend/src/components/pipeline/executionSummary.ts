@@ -57,6 +57,14 @@ export function rowsWrittenForTable(t: TableStatRow): number {
   return Math.max(batch, cdc)
 }
 
+/**
+ * Status of a selected CDC table the stats projector has no row for yet: nothing
+ * has been captured or applied, and its counters are absent rather than zero.
+ * api-gateway (table_stats.go buildCDCTableStatsResponse) counts these in
+ * `tables_waiting_for_data`, NOT in `tables_running`.
+ */
+export const TABLE_STATUS_WAITING_FOR_DATA = "waiting_for_data"
+
 export type TableStatsRollup = {
   tableCount: number
   /**
@@ -71,6 +79,8 @@ export type TableStatsRollup = {
   failedTables: number
   degradedTables: number
   runningTables: number
+  /** Tables that have reported nothing yet. Not part of runningTables. */
+  waitingForDataTables: number
 }
 
 export function rollupTableStats(tables: TableStatRow[]): TableStatsRollup {
@@ -81,6 +91,7 @@ export function rollupTableStats(tables: TableStatRow[]): TableStatsRollup {
   let failedTables = 0
   let degradedTables = 0
   let runningTables = 0
+  let waitingForDataTables = 0
 
   for (const t of tables) {
     rowsWritten += rowsWrittenForTable(t)
@@ -92,6 +103,7 @@ export function rollupTableStats(tables: TableStatRow[]): TableStatsRollup {
     if (t.status === "failed") failedTables++
     else if (t.status === "degraded") degradedTables++
     else if (t.status === "running") runningTables++
+    else if (t.status === TABLE_STATUS_WAITING_FOR_DATA) waitingForDataTables++
   }
 
   return {
@@ -103,15 +115,19 @@ export function rollupTableStats(tables: TableStatRow[]): TableStatsRollup {
     failedTables,
     degradedTables,
     runningTables,
+    waitingForDataTables,
   }
 }
 
 /** The server-computed `summary` object from GET /pipelines/:id/table-stats. */
 export type TableStatsSummaryPayload = {
   total_tables?: number
+  tables_completed?: number
   tables_failed?: number
   tables_degraded?: number
   tables_running?: number
+  /** Absent from gateways older than the waiting_for_data table status. */
+  tables_waiting_for_data?: number
   total_read_rows?: number
   total_inserted_rows?: number
   total_applied_inserts?: number
@@ -150,7 +166,62 @@ export function rollupFromSummary(s: TableStatsSummaryPayload | null | undefined
     failedTables: s.tables_failed ?? 0,
     degradedTables: s.tables_degraded ?? 0,
     runningTables: s.tables_running ?? 0,
+    waitingForDataTables: s.tables_waiting_for_data ?? 0,
   }
+}
+
+export type TableStatusKey = "completed" | "failed" | "degraded" | "running" | "waiting_for_data" | "other"
+
+export type TableStatusCount = { key: TableStatusKey; label: string; count: number }
+
+export type TableStatusBreakdown = {
+  total: number
+  completed: number
+  /**
+   * Every non-completed bucket with at least one table, in display order.
+   * `completed` plus these counts always equals `total`.
+   */
+  rows: TableStatusCount[]
+}
+
+/**
+ * Table counts by status that add up to `total_tables`.
+ *
+ * The Monitor tab showed completed / failed / running only. Once the gateway
+ * stopped calling a table that has reported nothing "running" (it is now
+ * `waiting_for_data`), a new CDC pipeline read "Tables completed 0 / 3" and no
+ * other line: three tables accounted for nowhere. Degraded tables had the same
+ * gap. Whatever the named buckets do not cover — a status this client does not
+ * know yet — is shown as "another state" rather than dropped, so the lines on
+ * screen always sum to the total.
+ */
+export function tableStatusBreakdown(
+  s: Pick<
+    TableStatsSummaryPayload,
+    | "total_tables"
+    | "tables_completed"
+    | "tables_failed"
+    | "tables_degraded"
+    | "tables_running"
+    | "tables_waiting_for_data"
+  >,
+): TableStatusBreakdown {
+  const total = Math.max(0, s.total_tables ?? 0)
+  const completed = Math.max(0, s.tables_completed ?? 0)
+  const named: TableStatusCount[] = [
+    { key: "failed", label: "Tables failed", count: Math.max(0, s.tables_failed ?? 0) },
+    { key: "degraded", label: "Tables degraded", count: Math.max(0, s.tables_degraded ?? 0) },
+    { key: "running", label: "Tables running", count: Math.max(0, s.tables_running ?? 0) },
+    {
+      key: TABLE_STATUS_WAITING_FOR_DATA,
+      label: "Tables with no data yet",
+      count: Math.max(0, s.tables_waiting_for_data ?? 0),
+    },
+  ]
+  const accounted = named.reduce((sum, r) => sum + r.count, completed)
+  const other = Math.max(0, total - accounted)
+  const rows = [...named, { key: "other" as const, label: "Tables in another state", count: other }]
+  return { total, completed, rows: rows.filter((r) => r.count > 0) }
 }
 
 /**
@@ -174,6 +245,10 @@ export type DataMovement =
 
 export function dataMovementVerdict(rollup: TableStatsRollup | null): DataMovement {
   if (!rollup || rollup.tableCount === 0) return { kind: "unmeasured" }
+  // Rows written or read are evidence on their own, whatever the per-table
+  // statuses say (the dialog feeds the server's records_processed in here), so
+  // they are judged first: hiding them behind "no statistics" would bury data
+  // that moved, or data that was read and never landed.
   if (rollup.rowsWritten > 0) {
     return {
       kind: "moved",
@@ -185,6 +260,11 @@ export function dataMovementVerdict(rollup: TableStatsRollup | null): DataMoveme
   if ((rollup.rowsRead ?? 0) > 0) {
     return { kind: "read-not-written", read: rollup.rowsRead as number, tables: rollup.tableCount }
   }
+  // "Nothing to move" is a claim about every table. A table still waiting for
+  // data has not reported anything — on a large first sync it may simply not have
+  // been reached yet — so with nothing moved and any table unreported, how much
+  // data there is stays unknown rather than zero.
+  if (rollup.waitingForDataTables > 0) return { kind: "unmeasured" }
   return { kind: "empty-source", tables: rollup.tableCount }
 }
 

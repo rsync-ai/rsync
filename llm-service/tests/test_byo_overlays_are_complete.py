@@ -64,98 +64,14 @@ def parked_services():
     return parked
 
 
-def _install_sh_assignment(name):
-    """Lift a global's assignment line out of install.sh, verbatim.
+def added_services(overlay_path):
+    """{service} an overlay DEFINES that the base file does not.
 
-    Restating it here would test the restatement. Taking the real line means the
-    harness resolves the same default the installer resolves, and a change to
-    that default shows up as a behaviour change in these cases.
+    Derived from the two files, never hand-listed, so a new one-shot in an
+    overlay tightens the reachability check below instead of tripping it.
     """
-    with open(INSTALL_SH) as fh:
-        lines = [ln for ln in fh if ln.startswith(name + "=")]
-    assert len(lines) == 1, f"expected exactly one {name}= line in install.sh; got {lines}"
-    return lines[0]
-
-
-def _install_sh_int(name):
-    """Read a numeric global out of install.sh rather than restating it here."""
-    line = _install_sh_assignment(name)
-    value = line.split("=", 1)[1].strip().strip('"')
-    assert value.isdigit(), f"{name} is not a bare integer in install.sh: {line!r}"
-    return int(value)
-
-
-def _install_sh_default_profiles():
-    """The profile set an install activates when the operator sets nothing."""
-    line = _install_sh_assignment("RSYNC_PROFILES")
-    m = re.search(r"\$\{RSYNC_PROFILES-([^}]*)\}", line)
-    assert m, f"RSYNC_PROFILES is not a `${{RSYNC_PROFILES-...}}` default: {line!r}"
-    return [p for p in m.group(1).replace(",", " ").split() if p]
-
-
-def _install_sh_ram_floor_block():
-    """Lift the floor resolver -- the profile default through its case -- verbatim.
-
-    It starts at the RSYNC_PROFILES assignment because the floor is a function of
-    that variable, and ends at the case's esac. Restating the logic here would
-    test the restatement; running the real lines means a change to either half
-    shows up as a behaviour change in the cases below.
-    """
-    lines = open(INSTALL_SH).read().splitlines(True)
-    starts = [i for i, ln in enumerate(lines) if ln.startswith("RSYNC_PROFILES=")]
-    assert len(starts) == 1, (
-        f"expected exactly one RSYNC_PROFILES= line in install.sh; got {len(starts)}"
-    )
-    ends = [i for i, ln in enumerate(lines) if i > starts[0] and ln.rstrip() == "esac"]
-    assert ends, "no esac follows the RSYNC_PROFILES assignment -- the block moved"
-    block = "".join(lines[starts[0]:ends[0] + 1])
-    # install.sh has one top-level esac today, so `ends` either points at this
-    # case or is empty and the assertion above fires. Bound the lift anyway: a
-    # second top-level case added after this one would silently widen the span,
-    # and the span is executed.
-    heads = [ln for ln in block.splitlines() if ln.startswith("case ")]
-    assert len(heads) == 1 and "RSYNC_PROFILES" in heads[0], (
-        "the lifted span is not the profile case -- install.sh's floor resolver "
-        f"moved, and running this span would execute the installer:\n{block}"
-    )
-    assert "MIN_RAM_GB=" in block, f"the lifted block assigns no MIN_RAM_GB:\n{block}"
-    return block
-
-
-def _install_sh_function(name):
-    """Lift a function body out of install.sh so the cases run the real code."""
-    body = []
-    with open(INSTALL_SH) as fh:
-        capture = False
-        for line in fh:
-            if line.startswith(name + "()"):
-                capture = True
-            if capture:
-                body.append(line)
-                if line.rstrip() == "}":
-                    break
-    assert body, f"{name}() not found in install.sh"
-    return "".join(body)
-
-
-def _install_sh_env_backfill(key):
-    """Lift the append-once block that records `key` in the generated .env.
-
-    Two lines of logic, and both matter: the grep decides whether an operator's
-    own edit survives a re-run, and the redirect decides what a hand-typed
-    compose command in the install directory resolves. Running the real block
-    is the only way to check either.
-    """
-    lines = open(INSTALL_SH).read().splitlines(True)
-    starts = [i for i, ln in enumerate(lines) if f"grep -q '^{key}=' " in ln]
-    assert len(starts) == 1, f"expected one {key} backfill in install.sh; got {len(starts)}"
-    ends = [i for i, ln in enumerate(lines) if i > starts[0] and ln.rstrip() == "  fi"]
-    assert ends, f"no `fi` closes the {key} backfill"
-    block = "".join(lines[starts[0]:ends[0] + 1])
-    assert f"{key}=" in block and ">>" in block, (
-        f"the lifted {key} block does not append anything:\n{block}"
-    )
-    return block
+    base = set(_load(BASE)["services"])
+    return {n for n in (_load(overlay_path).get("services") or {}) if n not in base}
 
 
 def test_overlays_park_at_least_kafka_and_postgres():
@@ -220,36 +136,100 @@ def test_overlay_removes_exactly_its_own_service(tmp_path, overlay):
     assert base - with_overlay == expected, (
         f"{overlay} should remove exactly {expected}; it removed {base - with_overlay}"
     )
-    assert with_overlay - base == set(), f"{overlay} unexpectedly ADDED {with_overlay - base}"
+    introduced = added_services(os.path.join(REPO_ROOT, overlay))
+    assert with_overlay - base == introduced, (
+        f"{overlay} should add exactly the services it declares ({introduced}); "
+        f"the render added {with_overlay - base}"
+    )
 
 
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
-def test_installer_overlay_selection_survives_a_default_env(tmp_path):
-    """install.sh runs under `set -o pipefail`, where a no-match grep is fatal.
+def _install_sh_function(name):
+    """Lift one shell function out of install.sh, verbatim.
 
-    Neither POSTGRES_HOST nor KAFKA_BROKERS appears in a default .env, so a bare
-    `grep | tail | cut` aborts the installer on the single most common path --
-    every standard install -- while the BYO paths this function exists for are
-    the only ones that survive. Exactly inverted from what a smoke test would
-    catch.
-
-    The bundled-LLM overlay is selected by the same function and is checked here
-    for the same reason, plus one of its own: unlike the two BYO overlays it is
-    layered on a POSITIVE condition, so getting it wrong starts an extra Ollama
-    and downloads several GB into it rather than merely leaving a service out.
+    Copying the logic into the test instead would test the copy. Extraction
+    means a change to the real function either keeps these cases passing or
+    breaks them, which is the only arrangement worth having.
     """
     body = []
     with open(INSTALL_SH) as fh:
         capture = False
         for line in fh:
-            if line.startswith("build_compose_args()"):
+            if line.startswith(name + "()"):
                 capture = True
             if capture:
                 body.append(line)
                 if line.rstrip() == "}":
                     break
-    assert body, "build_compose_args() not found in install.sh"
+    assert body, f"{name}() not found in install.sh"
+    return "".join(body)
 
+
+def _install_sh_assignment(name):
+    """Lift a global's assignment line out of install.sh, verbatim.
+
+    Restating it here would test the restatement. Taking the real line means the
+    harness resolves the same default the installer resolves, and a change to
+    that default shows up as a behaviour change in these cases.
+    """
+    with open(INSTALL_SH) as fh:
+        lines = [ln for ln in fh if ln.startswith(name + "=")]
+    assert len(lines) == 1, f"expected exactly one {name}= line in install.sh; got {lines}"
+    return lines[0]
+
+
+def _install_sh_default_profiles():
+    """The profile set an install activates when the operator sets nothing."""
+    line = _install_sh_assignment("RSYNC_PROFILES")
+    m = re.search(r"\$\{RSYNC_PROFILES-([^}]*)\}", line)
+    assert m, f"RSYNC_PROFILES is not a `${{RSYNC_PROFILES-...}}` default: {line!r}"
+    return [p for p in m.group(1).replace(",", " ").split() if p]
+
+
+def _install_sh_ram_floor_block():
+    """Lift the floor resolver -- the profile default through its case -- verbatim.
+
+    It starts at the RSYNC_PROFILES assignment because the floor is a function of
+    that variable, and ends at the case's esac. Restating the logic here would
+    test the restatement; running the real lines means a change to either half
+    shows up as a behaviour change in the cases below.
+    """
+    lines = open(INSTALL_SH).read().splitlines(True)
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("RSYNC_PROFILES=")]
+    assert len(starts) == 1, (
+        f"expected exactly one RSYNC_PROFILES= line in install.sh; got {len(starts)}"
+    )
+    ends = [i for i, ln in enumerate(lines) if i > starts[0] and ln.rstrip() == "esac"]
+    assert ends, "no esac follows the RSYNC_PROFILES assignment -- the block moved"
+    block = "".join(lines[starts[0]:ends[0] + 1])
+    # install.sh has one top-level esac today, so `ends` either points at this
+    # case or is empty and the assertion above fires. Bound the lift anyway: a
+    # second top-level case added after this one would silently widen the span,
+    # and the span is executed.
+    heads = [ln for ln in block.splitlines() if ln.startswith("case ")]
+    assert len(heads) == 1 and "RSYNC_PROFILES" in heads[0], (
+        "the lifted span is not the profile case -- install.sh's floor resolver "
+        f"moved, and running this span would execute the installer:\n{block}"
+    )
+    assert "MIN_RAM_GB=" in block, f"the lifted block assigns no MIN_RAM_GB:\n{block}"
+    return block
+
+
+def _install_sh_int(name):
+    """Read a numeric global out of install.sh rather than restating it here."""
+    with open(INSTALL_SH) as fh:
+        m = re.search(rf"^{re.escape(name)}=(\d+)\s*$", fh.read(), re.M)
+    assert m, f"{name} is not a bare integer assignment in install.sh"
+    return int(m.group(1))
+
+
+def _overlay_harness(tmp_path, detected_ram_gb=16):
+    """A runnable install.sh fragment: the two functions plus the globals they read.
+
+    Everything named here is a global the real script sets before calling
+    build_compose_args. `set -u` turns a forgotten one into a hard failure
+    rather than an empty string, which is the point -- a global added to the
+    function without being added to its caller would pass silently otherwise.
+    """
     harness = tmp_path / "h.sh"
     harness.write_text(
         "set -euo pipefail\n"
@@ -257,75 +237,253 @@ def test_installer_overlay_selection_survives_a_default_env(tmp_path):
         'COMPOSE_FILE="docker-compose.quickstart.yml"\n'
         'BYO_PG_FILE="docker-compose.byo-postgres.yml"\n'
         'BYO_KAFKA_FILE="docker-compose.byo-kafka.yml"\n'
-        + _install_sh_assignment("OLLAMA_FILE")
-        # The bundled-LLM branch reads both of these and runs under `set -u`.
-        # DETECTED_RAM_GB is pinned at the floor rather than read off this
-        # machine so the cases assert overlay SELECTION and never turn red on a
-        # small CI box -- the low-RAM warning is a warning, not a decision.
-        + f"MIN_RAM_GB_WITH_LLM={_install_sh_int('MIN_RAM_GB_WITH_LLM')}\n"
-        + f"DETECTED_RAM_GB={_install_sh_int('MIN_RAM_GB_WITH_LLM')}\n"
-        + "OLLAMA_BUNDLED=0\n"
-        + "COMPOSE_ARGS=(); COMPOSE_CMD=\"\"\ninfo(){ :; }\nwarn(){ :; }\n"
-        # build_compose_args reads RSYNC_PROFILES, and this harness runs under
-        # `set -u`, where an unset variable inside a pattern substitution aborts
-        # on bash 5 while bash 3.2 quietly expands it to nothing. Lift the real
-        # assignment so the two behave the same and so this case exercises the
-        # installer's own default rather than an accident of the host's bash.
+        'OLLAMA_FILE="docker-compose.ollama.yml"\n'
+        "COMPOSE_ARGS=(); COMPOSE_CMD=\"\"\nOLLAMA_BUNDLED=0\n"
+        f"MIN_RAM_GB_WITH_LLM={_install_sh_int('MIN_RAM_GB_WITH_LLM')}\n"
+        f"DETECTED_RAM_GB={detected_ram_gb}\n"
+        "info(){ echo \"INFO $*\"; }\nwarn(){ echo \"WARN $*\"; }\n"
         + _install_sh_assignment("RSYNC_PROFILES")
-        + "".join(body)
-        + '\nbuild_compose_args\necho "${COMPOSE_ARGS[*]}"\necho "BUNDLED=${OLLAMA_BUNDLED}"\n'
+        + _install_sh_function("write_compose_helper")
+        + _install_sh_function("build_compose_args")
+        + '\nbuild_compose_args\necho "ARGS ${COMPOSE_ARGS[*]}"\n'
+        'echo "BUNDLED $OLLAMA_BUNDLED"\n'
+    )
+    return harness
+
+
+# Every case below is (label, .env body, overlays expected, OLLAMA_BUNDLED expected).
+# The LLM rows are the interesting ones: LLM_PROVIDER=ollama says the tier speaks
+# Ollama, it does not say WHICH Ollama, and every .env written before the bundled
+# overlay existed names the operator's own at host.docker.internal. Layering on
+# one of those would start a second, empty server, download several GB into it,
+# and leave the operator's own Ollama serving exactly as before.
+_OVERLAY_CASES = (
+    ("default (neither key)", "POSTGRES_USER=rsync\n", [], 0),
+    ("explicit bundled", "POSTGRES_HOST=postgres\nKAFKA_BROKERS=kafka:29092\n", [], 0),
+    ("external postgres", "POSTGRES_HOST=db.example.com\n", ["docker-compose.byo-postgres.yml"], 0),
+    ("external kafka", "KAFKA_BROKERS=b-1.example.com:9096\n", ["docker-compose.byo-kafka.yml"], 0),
+    ("empty value", "POSTGRES_HOST=\n", [], 0),
+    (
+        "internal llm",
+        "LLM_PROVIDER=ollama\nOLLAMA_URL=http://ollama:11434\n",
+        ["docker-compose.ollama.yml"],
+        1,
+    ),
+    (
+        "internal llm, url unset by hand",
+        "LLM_PROVIDER=ollama\nOLLAMA_URL=\n",
+        ["docker-compose.ollama.yml"],
+        1,
+    ),
+    (
+        "operator's own ollama on the host",
+        "LLM_PROVIDER=ollama\nOLLAMA_URL=http://host.docker.internal:11434\n",
+        [],
+        0,
+    ),
+    (
+        "operator's own ollama on another machine",
+        "LLM_PROVIDER=ollama\nOLLAMA_URL=http://203.0.113.10:11434\n",
+        [],
+        0,
+    ),
+    # The condition matches `//ollama:` -- a whole word, scheme separator and
+    # port colon included -- so a host that merely ends in the same characters
+    # is somebody else's server and gets no overlay.
+    (
+        "a host whose name ends in ollama",
+        "LLM_PROVIDER=ollama\nOLLAMA_URL=http://myollama:11434\n",
+        [],
+        0,
+    ),
+    # A hand-edited .env can delete the line rather than blank it. Both reach
+    # the same `-z` branch, but by different routes: a grep that matches
+    # nothing versus a grep whose match has an empty value.
+    (
+        "internal llm, url line deleted by hand",
+        "LLM_PROVIDER=ollama\n",
+        ["docker-compose.ollama.yml"],
+        1,
+    ),
+    ("cloud provider", "LLM_PROVIDER=openai\nOPENAI_API_KEY=sk-FAKEPLACEHOLDER\n", [], 0),
+    # What install.sh writes for "3) None": no key, and an OLLAMA_URL left empty so
+    # a later switch to LLM_PROVIDER=ollama bundles the overlay. Until that switch,
+    # the empty URL must not be read as a request for the bundled server.
+    ("no llm", "LLM_PROVIDER=none\nLLM_MODEL=\nOLLAMA_URL=\nOPENAI_API_KEY=\n", [], 0),
+    (
+        "internal llm beside an external postgres",
+        "LLM_PROVIDER=ollama\nOLLAMA_URL=http://ollama:11434\nPOSTGRES_HOST=db.example.com\n",
+        ["docker-compose.byo-postgres.yml", "docker-compose.ollama.yml"],
+        1,
+    ),
+)
+
+_ALL_OVERLAYS = (
+    "docker-compose.byo-postgres.yml",
+    "docker-compose.byo-kafka.yml",
+    "docker-compose.ollama.yml",
+)
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize("label,env_body,expect,bundled", _OVERLAY_CASES)
+def test_installer_layers_exactly_the_overlays_the_env_asks_for(
+    tmp_path, label, env_body, expect, bundled
+):
+    """install.sh runs under `set -o pipefail`, where a no-match grep is fatal.
+
+    Neither POSTGRES_HOST nor KAFKA_BROKERS appears in a default .env, so a bare
+    `grep | tail | cut` aborts the installer on the single most common path --
+    every standard install -- while the BYO paths this function exists for are
+    the only ones that survive. Exactly inverted from what a smoke test would
+    catch. LLM_PROVIDER and OLLAMA_URL are read the same way and carry the same
+    hazard, plus one of their own: the two BYO overlays layer when a value
+    DIFFERS from the bundled default, while this one layers when a value
+    MATCHES. Getting it wrong therefore starts an extra Ollama and downloads
+    several gigabytes into it, rather than merely leaving a service out.
+    """
+    harness = _overlay_harness(tmp_path)
+    (tmp_path / ".env").write_text(env_body)
+    out = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
+    assert out.returncode == 0, f"[{label}] build_compose_args exited {out.returncode}: {out.stderr}"
+
+    args_line = [ln for ln in out.stdout.splitlines() if ln.startswith("ARGS ")]
+    assert args_line, f"[{label}] harness printed no ARGS line: {out.stdout}"
+    got = args_line[0][len("ARGS "):].split()
+    assert "docker-compose.quickstart.yml" in " ".join(got), f"[{label}] base file dropped: {got}"
+    for overlay in _ALL_OVERLAYS:
+        layered = any(overlay in g for g in got)
+        assert layered == (overlay in expect), (
+            f"[{label}] expected {overlay} layered={overlay in expect}, got {layered}: {got}"
+        )
+    assert f"BUNDLED {bundled}" in out.stdout, (
+        f"[{label}] expected OLLAMA_BUNDLED={bundled}; start_stack reads this flag to warn "
+        f"that the first `up` blocks on a multi-gigabyte download:\n{out.stdout}"
     )
 
-    all_overlays = (
-        "docker-compose.byo-postgres.yml",
-        "docker-compose.byo-kafka.yml",
-        "docker-compose.ollama.yml",
-    )
-    for label, env_body, expect in (
-        ("default (neither key)", "POSTGRES_USER=rsync\n", []),
-        ("explicit bundled", "POSTGRES_HOST=postgres\nKAFKA_BROKERS=kafka:29092\n", []),
-        ("external postgres", "POSTGRES_HOST=db.example.com\n", ["docker-compose.byo-postgres.yml"]),
-        ("external kafka", "KAFKA_BROKERS=b-1.example.com:9096\n", ["docker-compose.byo-kafka.yml"]),
-        ("empty value", "POSTGRES_HOST=\n", []),
-        # What install.sh's own option 2 writes today.
-        (
-            "internal llm",
-            "LLM_PROVIDER=ollama\nOLLAMA_URL=http://ollama:11434\n",
-            ["docker-compose.ollama.yml"],
-        ),
-        # What every .env written before the overlay grew a pull job carries.
-        # Layering here would start a second, empty Ollama beside the
-        # operator's own and download several GB into it.
-        (
-            "host ollama",
-            "LLM_PROVIDER=ollama\nOLLAMA_URL=http://host.docker.internal:11434\n",
-            [],
-        ),
-        ("remote ollama", "LLM_PROVIDER=ollama\nOLLAMA_URL=http://203.0.113.10:11434\n", []),
-        # A hand-edited .env can leave the URL off entirely; the in-code default
-        # is the bundled service, so this is a bundled install.
-        ("llm provider, no url", "LLM_PROVIDER=ollama\n", ["docker-compose.ollama.yml"]),
-        ("openai", "LLM_PROVIDER=openai\nOLLAMA_URL=http://ollama:11434\n", []),
-        # The substring must not match a host that merely ends in the same
-        # characters -- `//ollama:` is the whole word, with its scheme separator.
-        ("lookalike host", "LLM_PROVIDER=ollama\nOLLAMA_URL=http://myollama:11434\n", []),
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_small_machine_is_warned_before_it_downloads_a_model(tmp_path):
+    """Three outcomes, not two: a reading we could not take must not certify the
+    machine. 0 means "this platform's RAM is unreadable", never "no RAM"."""
+    floor = _install_sh_int("MIN_RAM_GB_WITH_LLM")
+    for stack_floor in ("MIN_RAM_GB_BATCH", "MIN_RAM_GB_CDC"):
+        assert floor > _install_sh_int(stack_floor), (
+            "the bundled model is resident ON TOP of the stack, so its floor must "
+            f"be higher than {stack_floor} -- the stack's own floor, whichever "
+            "profile set the operator chose"
+        )
+    env_body = "LLM_PROVIDER=ollama\nOLLAMA_URL=http://ollama:11434\n"
+    for label, ram, expect_warning in (
+        ("ample", floor + 4, False),
+        ("too small", floor - 4, True),
+        ("unreadable", 0, True),
     ):
+        harness = _overlay_harness(tmp_path, detected_ram_gb=ram)
         (tmp_path / ".env").write_text(env_body)
         out = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
-        assert out.returncode == 0, f"[{label}] build_compose_args exited {out.returncode}: {out.stderr}"
-        got = out.stdout.split()
-        assert "docker-compose.quickstart.yml" in " ".join(got), f"[{label}] base file dropped: {got}"
-        for overlay in all_overlays:
-            layered = any(overlay in g for g in got)
-            assert layered == (overlay in expect), (
-                f"[{label}] expected {overlay} layered={overlay in expect}, got {layered}: {got}"
-            )
-        # start_stack prints the multi-gigabyte-download warning off this flag,
-        # so it has to track the -f list rather than merely correlate with it.
-        expect_bundled = "docker-compose.ollama.yml" in expect
-        assert f"BUNDLED={1 if expect_bundled else 0}" in got, (
-            f"[{label}] OLLAMA_BUNDLED disagrees with the overlay list: {got}"
+        assert out.returncode == 0, f"[{label}] exited {out.returncode}: {out.stderr}"
+        warned = any(
+            ln.startswith("WARN") and str(floor) in ln for ln in out.stdout.splitlines()
         )
+        assert warned == expect_warning, (
+            f"[{label}] RAM={ram}GB against a {floor}GB floor: expected "
+            f"warning={expect_warning}, got {warned}:\n{out.stdout}"
+        )
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_the_installer_leaves_behind_a_helper_that_repeats_its_own_f_set(tmp_path):
+    """The `-f` set is computed, and for a long time it was computed only inside
+    install.sh. An operator who edited .env and then ran a bare `docker compose
+    up -d` in the install dir got the quickstart file ALONE -- no overlay, and no
+    error either, just a stack quietly missing whatever the overlays add.
+    """
+    harness = _overlay_harness(tmp_path)
+    (tmp_path / ".env").write_text(
+        "LLM_PROVIDER=ollama\nOLLAMA_URL=http://ollama:11434\nPOSTGRES_HOST=db.example.com\n"
+    )
+    out = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
+    assert out.returncode == 0, out.stderr
+
+    helper = tmp_path / "compose.sh"
+    assert helper.exists(), f"no compose.sh written:\n{out.stdout}"
+    assert os.access(helper, os.X_OK), "compose.sh is not executable"
+
+    syntax = subprocess.run(["bash", "-n", str(helper)], capture_output=True, text=True)
+    assert syntax.returncode == 0, f"compose.sh does not parse:\n{syntax.stderr}"
+
+    text = helper.read_text()
+    exec_lines = [ln for ln in text.splitlines() if ln.startswith("exec docker compose")]
+    assert len(exec_lines) == 1, f"expected exactly one exec line:\n{text}"
+    line = exec_lines[0]
+    for overlay in ("docker-compose.quickstart.yml", "docker-compose.byo-postgres.yml", "docker-compose.ollama.yml"):
+        assert overlay in line, f"compose.sh dropped {overlay}:\n{line}"
+    assert "docker-compose.byo-kafka.yml" not in line, f"compose.sh invented an overlay:\n{line}"
+    assert "--env-file" in line and line.rstrip().endswith('"$@"'), (
+        f"compose.sh must forward its own arguments and name the .env:\n{line}"
+    )
+
+def test_a_service_an_overlay_adds_is_reachable_from_the_default_up():
+    """An added one-shot nothing depends on never runs, and says nothing about it.
+
+    `docker compose up` starts the dependency closure of the services it is
+    asked for. A bootstrap job that no service names is therefore inert on the
+    one path it exists to protect, while `config` still renders it and every
+    static check that merely looks for the service still passes.
+    """
+    checked = 0
+    orphans = []
+    for path in overlay_paths():
+        introduced = added_services(path)
+        if not introduced:
+            continue
+        merged = dict(_load(BASE)["services"])
+        merged.update(_load(path)["services"])
+        for name in sorted(introduced):
+            checked += 1
+            depended_on = [
+                s for s, b in merged.items()
+                if name in ((b or {}).get("depends_on") or {})
+            ]
+            if not depended_on:
+                orphans.append(f"{os.path.basename(path)} adds {name}, nothing depends_on it")
+    assert checked > 0, "no overlay added a service -- the check was vacuous"
+    assert not orphans, "\n  ".join(["services added by an overlay that nothing waits for:"] + orphans)
+
+
+def test_a_completion_gate_is_never_marked_optional():
+    """`required: false` turns a FAILED completion gate into a warning.
+
+    Measured on Compose 2.x rather than read from the docs: with the flag, a
+    dependency that exits non-zero logs `optional dependency "..." didn't
+    complete successfully: exit 7`, the dependent starts anyway and `up` still
+    exits 0. Without it, `up` fails and the dependent never runs. That flag is
+    right for a service a profile can REMOVE from the project (see the parked
+    services above) and wrong for a bootstrap job that is always present: it
+    silently restores the very startup the gate exists to prevent.
+    """
+    checked = 0
+    optional = []
+    for path in [BASE] + overlay_paths():
+        for svc, body in (_load(path).get("services") or {}).items():
+            deps = (body or {}).get("depends_on") or {}
+            if not isinstance(deps, dict):
+                continue
+            for dep, cond in deps.items():
+                if not isinstance(cond, dict):
+                    continue
+                if cond.get("condition") != "service_completed_successfully":
+                    continue
+                checked += 1
+                if cond.get("required") is False:
+                    optional.append(f"{os.path.basename(path)}: {svc} -> {dep}")
+    assert checked > 0, "no completion gate found anywhere -- the check was vacuous"
+    assert not optional, (
+        "these depends_on entries wait for a service to COMPLETE but mark it "
+        "optional, so a failure degrades to a warning and the dependent starts "
+        "anyway:\n  " + "\n  ".join(optional)
+    )
 
 
 # The compose profiles the installer is expected NOT to activate, each with the
@@ -337,8 +495,8 @@ _DELIBERATELY_INERT_PROFILES = {
     "generate": (
         "the connector generator probes context7-mcp with a 3s timeout inside a "
         "try/except and carries on without it (llm-service/src/agents/"
-        "tool_generator/service.py), so its absence costs a documentation "
-        "lookup, not a run"
+        "tool_generator/service.py:869-928), so its absence costs a "
+        "documentation lookup, not a run"
     ),
 }
 
@@ -403,19 +561,7 @@ def test_the_installer_activates_the_profiles_it_says_it_does(
     if value is not None:
         env["RSYNC_PROFILES"] = value
 
-    harness = tmp_path / "profiles.sh"
-    harness.write_text(
-        "set -euo pipefail\n"
-        f'INSTALL_DIR="{tmp_path}"\nENV_FILE=".env"\n'
-        'COMPOSE_FILE="docker-compose.quickstart.yml"\n'
-        'BYO_PG_FILE="docker-compose.byo-postgres.yml"\n'
-        'BYO_KAFKA_FILE="docker-compose.byo-kafka.yml"\n'
-        'COMPOSE_ARGS=(); COMPOSE_CMD=""\ninfo(){ :; }\n'
-        + _install_sh_assignment("RSYNC_PROFILES")
-        + _install_sh_function("build_compose_args")
-        + '\nbuild_compose_args\necho "ARGS ${COMPOSE_ARGS[*]}"\n'
-        + 'echo "CMD ${COMPOSE_CMD}"\n'
-    )
+    harness = _overlay_harness(tmp_path)
     (tmp_path / ".env").write_text("POSTGRES_USER=rsync\n")
     out = subprocess.run(["bash", str(harness)], capture_output=True, text=True, env=env)
     assert out.returncode == 0, f"[{label}] exited {out.returncode}: {out.stderr}"
@@ -428,75 +574,20 @@ def test_the_installer_activates_the_profiles_it_says_it_does(
     for name in absent:
         assert name not in got, f"[{label}] {name} should not be activated: {got}"
 
-    # COMPOSE_CMD is what the operator is told to run afterwards -- the status,
-    # logs, retry and stop lines at the end of an install are built from it. It
-    # is derived from COMPOSE_ARGS, so it inherits these flags; assert that
-    # rather than assume it, because a command that starts fewer services than
-    # the install did is the same defect wearing a different hat.
-    cmd_line = [ln for ln in out.stdout.splitlines() if ln.startswith("CMD ")]
-    assert cmd_line, f"[{label}] harness printed no CMD line: {out.stdout}"
+    # The resolved set has to survive the installer exiting. An operator who
+    # edits .env and re-runs compose by hand gets whatever compose.sh carries,
+    # and an exported COMPOSE_PROFILES would have died with the process.
+    helper = (tmp_path / "compose.sh").read_text()
+    exec_lines = [ln for ln in helper.splitlines() if ln.startswith("exec docker compose")]
+    assert len(exec_lines) == 1, f"[{label}] expected one exec line:\n{helper}"
     for name in expect:
-        assert f"--profile {name}" in cmd_line[0], (
-            f"[{label}] the printed compose command dropped --profile {name}:\n{cmd_line[0]}"
+        assert f"--profile {name}" in exec_lines[0], (
+            f"[{label}] compose.sh dropped --profile {name}:\n{exec_lines[0]}"
         )
     for name in absent:
-        assert f"--profile {name}" not in cmd_line[0], (
-            f"[{label}] the printed compose command invented --profile {name}:\n{cmd_line[0]}"
+        assert f"--profile {name}" not in exec_lines[0], (
+            f"[{label}] compose.sh invented --profile {name}:\n{exec_lines[0]}"
         )
-
-
-@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
-@pytest.mark.parametrize("label,value,expect", (
-    ("default", None, "cdc"),
-    ("opted out", "", ""),
-    ("both", "cdc,generate", "cdc,generate"),
-))
-def test_the_resolved_profile_set_survives_the_installer_exiting(
-    tmp_path, label, value, expect
-):
-    """A compose command typed by hand must start what the install started.
-
-    The installer passes `--profile` flags, and those die with the process. An
-    operator who later runs `docker compose up -d` in the install directory
-    gets whatever the .env says, so the resolved set is recorded there. Compose
-    reads .env from the project directory, which for an absolute `-f` path is
-    the directory holding the compose file -- the install directory.
-    """
-    env = {k: v for k, v in os.environ.items() if k != "RSYNC_PROFILES"}
-    if value is not None:
-        env["RSYNC_PROFILES"] = value
-
-    harness = tmp_path / "backfill.sh"
-    harness.write_text(
-        "set -euo pipefail\n"
-        f'INSTALL_DIR="{tmp_path}"\nENV_FILE=".env"\n'
-        + _install_sh_assignment("RSYNC_PROFILES")
-        + _install_sh_env_backfill("COMPOSE_PROFILES").replace("\n  ", "\n").lstrip()
-    )
-    (tmp_path / ".env").write_text("POSTGRES_USER=rsync\n")
-    out = subprocess.run(["bash", str(harness)], capture_output=True, text=True, env=env)
-    assert out.returncode == 0, f"[{label}] exited {out.returncode}: {out.stderr}"
-
-    written = [
-        ln for ln in (tmp_path / ".env").read_text().splitlines()
-        if ln.startswith("COMPOSE_PROFILES=")
-    ]
-    assert written == [f"COMPOSE_PROFILES={expect}"], (
-        f"[{label}] RSYNC_PROFILES={value!r} recorded {written} in the .env; "
-        f"expected exactly ['COMPOSE_PROFILES={expect}']"
-    )
-
-    # Append-once, the way INTERNAL_SERVICE_SECRET is: a re-run must not append
-    # a second line, and must not overwrite an operator's edit. The cost of that
-    # choice is documented in install.sh rather than hidden -- opting out on a
-    # re-run leaves the earlier value in the file.
-    out = subprocess.run(["bash", str(harness)], capture_output=True, text=True, env=env)
-    assert out.returncode == 0, f"[{label}] re-run exited {out.returncode}: {out.stderr}"
-    again = [
-        ln for ln in (tmp_path / ".env").read_text().splitlines()
-        if ln.startswith("COMPOSE_PROFILES=")
-    ]
-    assert again == written, f"[{label}] a second run changed the .env: {written} -> {again}"
 
 
 _RAM_FLOOR_CASES = (
@@ -521,7 +612,7 @@ def test_the_ram_floor_tracks_the_profiles_the_install_activates(
     The defect the profile cases above cover is a run that failed on a container
     nothing had started. One unconditional floor ships that same shape at install
     time from the other side: an operator who sets RSYNC_PROFILES= runs exactly
-    the unprofiled services 6GB has always sized, and warning them about a JVM
+    the 18 unprofiled services 6GB has always sized, and warning them about a JVM
     they excluded is again a message about a container that will never exist.
 
     README.md and docs/getting-started/quickstart.md both tell that operator the

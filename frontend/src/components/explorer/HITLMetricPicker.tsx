@@ -72,7 +72,7 @@ export function HITLMetricPicker({
 
         <div className="space-y-4 py-4">
           <div className="p-3 bg-zinc-50 dark:bg-zinc-900 rounded-lg">
-            <div className="text-[10px] text-zinc-500 uppercase tracking-wider mb-1">Your Question</div>
+            <div className="text-[10px] text-zinc-500 dark:text-zinc-400 uppercase tracking-wider mb-1">Your Question</div>
             <p className="text-sm text-zinc-700 dark:text-zinc-300 whitespace-pre-wrap">{question}</p>
           </div>
 
@@ -105,7 +105,7 @@ export function HITLMetricPicker({
                           </Badge>
                         ) : null}
                       </div>
-                      <p className="text-xs text-zinc-500 mt-1">{opt.description}</p>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400 mt-1">{opt.description}</p>
                     </div>
                   </div>
                 </button>

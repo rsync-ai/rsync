@@ -1,6 +1,10 @@
 "use client"
 
 import { BaseEdge, EdgeLabelRenderer, getBezierPath, type EdgeProps } from "@xyflow/react"
+// The edge tooltip reports the same per-stage number the Steps graph and the
+// Overview do, so it uses their formatter. Its own copy rounded the seconds
+// remainder — the "2m 60s" of #37 — and had no hours branch.
+import { formatDuration } from "@/lib/duration"
 
 export type SchemaField = { name: string; type: string; nullable?: boolean }
 
@@ -87,7 +91,7 @@ export function AnimatedEdge(props: EdgeProps) {
           {/* Hover popover — shows full flow detail */}
           <div className="absolute top-full left-1/2 -translate-x-1/2 mt-2 z-50 hidden group-hover:block pointer-events-none">
             <div className="rounded-md border border-zinc-200 dark:border-zinc-700 bg-white dark:bg-zinc-900 shadow-lg p-2.5 min-w-[180px] max-w-[240px]">
-              <div className="text-[10px] uppercase tracking-wide text-zinc-500 mb-1">
+              <div className="text-[10px] uppercase tracking-wide text-zinc-500 dark:text-zinc-400 mb-1">
                 Data flow
               </div>
               {ed.sourceLabel && ed.targetLabel && (
@@ -100,7 +104,7 @@ export function AnimatedEdge(props: EdgeProps) {
                   <Row label="Source status" value={ed.sourceStatus} />
                 )}
                 {typeof ed.sourceDuration === "number" && ed.sourceDuration > 0 && (
-                  <Row label="Source took" value={formatMs(ed.sourceDuration)} />
+                  <Row label="Source took" value={formatDuration(ed.sourceDuration)} />
                 )}
               </div>
               {ed.outputSchema && ed.outputSchema.length > 0 ? (
@@ -134,14 +138,8 @@ export function AnimatedEdge(props: EdgeProps) {
 function Row({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex items-center justify-between gap-3">
-      <span className="text-zinc-500">{label}</span>
+      <span className="text-zinc-500 dark:text-zinc-400">{label}</span>
       <span className="text-zinc-800 dark:text-zinc-100 font-medium">{value}</span>
     </div>
   )
-}
-
-function formatMs(ms: number): string {
-  if (ms < 1000) return `${ms}ms`
-  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
-  return `${Math.floor(ms / 60000)}m ${Math.round((ms % 60000) / 1000)}s`
 }

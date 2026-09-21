@@ -122,6 +122,18 @@ export default function ConnectorsPage() {
     prevConfigModalOpen.current = configModalOpen
   }, [configModalOpen])
 
+  // Shown as written: CSS `capitalize` turned "api" into "Api" (#50).
+  const categoryLabels: Record<ConnectorCategory, string> = {
+    database: "Database",
+    storage: "Storage",
+    api: "API",
+    analytics: "Analytics",
+    messaging: "Messaging",
+    streaming: "Streaming",
+    file: "File",
+    other: "Other",
+  }
+
   // Define category display order: Database → Streaming → Storage → File → API → Other
   const categoryOrder: ConnectorCategory[] = ["database", "streaming", "storage", "file", "api", "other"]
 
@@ -351,10 +363,9 @@ export default function ConnectorsPage() {
                       variant={selectedCategory === category ? "default" : "outline"}
                       size="sm"
                       onClick={() => setSelectedCategory(category)}
-                      className="capitalize"
                     >
                       <Icon className="h-4 w-4 mr-1" />
-                      {category} ({count})
+                      {categoryLabels[category] ?? category} ({count})
                     </Button>
                   )
                 })}
@@ -410,9 +421,9 @@ export default function ConnectorsPage() {
                       exit={{ opacity: 0, y: -20 }}
                     >
                       <div className="flex items-center gap-2 mb-4">
-                        <Icon className="h-5 w-5 text-zinc-500" />
-                        <h3 className="text-lg font-semibold capitalize text-zinc-900 dark:text-white">
-                          {category}
+                        <Icon className="h-5 w-5 text-zinc-500 dark:text-zinc-400" />
+                        <h3 className="text-lg font-semibold text-zinc-900 dark:text-white">
+                          {categoryLabels[category as ConnectorCategory] ?? category}
                         </h3>
                         <Badge variant="secondary">{items.length}</Badge>
                       </div>
@@ -431,7 +442,12 @@ export default function ConnectorsPage() {
                             <div className="flex items-start gap-3 mb-3">
                               <ConnectionLogo connector={connector} size="md" />
                               <div className="flex-1 min-w-0">
-                                <h4 className="font-semibold text-zinc-900 dark:text-white truncate">
+                                {/* Wraps to two lines before clipping: one-line `truncate`
+                                    cut names that had room below them (#50). */}
+                                <h4
+                                  title={connector.display_name}
+                                  className="font-semibold leading-snug text-zinc-900 dark:text-white line-clamp-2 break-words"
+                                >
                                   {connector.display_name}
                                 </h4>
                                 {/* Canonical connector id/slug — disambiguates same-titled

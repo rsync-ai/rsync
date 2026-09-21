@@ -284,6 +284,9 @@ func stageGroupFor(stage string) string {
 		return "discovering"
 	case "planner":
 		return "planning"
+	case "infra_preflight":
+		// Its own lane: under the "planning" default it read as a second Planning.
+		return "infra_preflight"
 	case "validator", "policy_check", "schema_validation":
 		return "validating"
 	case "executor":

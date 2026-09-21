@@ -188,7 +188,7 @@ function SensitivityCard({
         <div className="flex items-center gap-2">
           <Icon className={cn("h-4 w-4", color)} />
           <span className={cn("font-medium text-sm", color)}>{label}</span>
-          <span className="text-xs text-zinc-500">({items.length} columns)</span>
+          <span className="text-xs text-zinc-500 dark:text-zinc-400">({items.length} columns)</span>
         </div>
         {expanded ? (
           <ChevronDown className="h-4 w-4 text-zinc-400" />
@@ -215,7 +215,7 @@ function SensitivityCard({
                     <span className="font-mono text-sm">
                       {item.table}.{item.column}
                     </span>
-                    <p className="text-xs text-zinc-500">{item.type.replace("_", " ")}</p>
+                    <p className="text-xs text-zinc-500 dark:text-zinc-400">{item.type.replace("_", " ")}</p>
                   </div>
                   <div className="flex items-center gap-1">
                     <Button
@@ -275,7 +275,7 @@ function TransformCard({
             <p className="font-medium text-sm text-zinc-900 dark:text-white">
               {transform.description}
             </p>
-            <p className="text-xs text-zinc-500 font-mono">
+            <p className="text-xs text-zinc-500 dark:text-zinc-400 font-mono">
               {transform.table}.{transform.column}
             </p>
           </div>
@@ -288,7 +288,7 @@ function TransformCard({
       {/* Config options based on type */}
       {transform.type === "mask" && (
         <div className="mt-3 flex items-center gap-2 pl-11">
-          <Label className="text-xs text-zinc-500">Pattern:</Label>
+          <Label className="text-xs text-zinc-500 dark:text-zinc-400">Pattern:</Label>
           <select
             value={transform.config.pattern || "partial"}
             onChange={(e) => onUpdate({ ...transform.config, pattern: e.target.value })}
@@ -303,7 +303,7 @@ function TransformCard({
 
       {transform.type === "filter" && (
         <div className="mt-3 pl-11">
-          <Label className="text-xs text-zinc-500">Condition:</Label>
+          <Label className="text-xs text-zinc-500 dark:text-zinc-400">Condition:</Label>
           <Input
             value={transform.config.predicate || ""}
             onChange={(e) => onUpdate({ ...transform.config, predicate: e.target.value })}
@@ -315,7 +315,7 @@ function TransformCard({
 
       {transform.type === "rename" && (
         <div className="mt-3 pl-11 flex items-center gap-2">
-          <Label className="text-xs text-zinc-500">New name:</Label>
+          <Label className="text-xs text-zinc-500 dark:text-zinc-400">New name:</Label>
           <Input
             value={transform.config.newName || ""}
             onChange={(e) => onUpdate({ ...transform.config, newName: e.target.value })}
@@ -328,7 +328,7 @@ function TransformCard({
       {transform.type === "computed" && (
         <div className="mt-3 pl-11 space-y-2">
           <div className="flex items-center gap-2">
-            <Label className="text-xs text-zinc-500">Column name:</Label>
+            <Label className="text-xs text-zinc-500 dark:text-zinc-400">Column name:</Label>
             <Input
               value={transform.config.columnName || ""}
               onChange={(e) => onUpdate({ ...transform.config, columnName: e.target.value })}
@@ -337,7 +337,7 @@ function TransformCard({
             />
           </div>
           <div className="flex items-center gap-2">
-            <Label className="text-xs text-zinc-500">Expression:</Label>
+            <Label className="text-xs text-zinc-500 dark:text-zinc-400">Expression:</Label>
             <Input
               value={transform.config.expression || ""}
               onChange={(e) => onUpdate({ ...transform.config, expression: e.target.value })}
@@ -447,7 +447,7 @@ export function TransformationConfigurator({
               </Button>
             )}
           </div>
-          <p className="text-sm text-zinc-500 mt-2">
+          <p className="text-sm text-zinc-500 dark:text-zinc-400 mt-2">
             Configure data transformations before syncing to destination
           </p>
         </CardHeader>
@@ -516,7 +516,7 @@ export function TransformationConfigurator({
 
           {/* Empty State */}
           {transforms.length === 0 && !sensitivityAnalysis && (
-            <div className="text-center py-8 text-zinc-500">
+            <div className="text-center py-8 text-zinc-500 dark:text-zinc-400">
               <Settings className="h-12 w-12 mx-auto mb-3 text-zinc-300" />
               <p>No transformations configured</p>
               <p className="text-xs mt-1">

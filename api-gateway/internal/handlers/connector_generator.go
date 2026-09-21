@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -207,6 +208,9 @@ type ValidateConnectorResponse struct {
 	// passed straight through (unmarshal above → marshal below). Without this field
 	// the value is silently dropped at this DTO boundary and never reaches the UI.
 	NearDuplicateConnectors []string `json:"near_duplicate_connectors,omitempty"`
+	// True when the name could not be checked (the generator was unreachable or
+	// failed). Valid and CanGenerate are then false, and Warning says why.
+	ValidationUnavailable bool `json:"validation_unavailable,omitempty"`
 }
 
 // GenerateConnectorRequest represents the request to generate a new connector
@@ -473,6 +477,12 @@ func GenerateConnector(c *gin.Context) {
 
 	// Normalize error field for UI: always provide error_message on failures
 	if !success {
+		if h, ok := llmNotConfiguredBody(resp.StatusCode, body); ok {
+			// The agentic generator needs a model; say what to set up, not the code.
+			payload["error"] = h["error"]
+			payload["error_message"] = h["message"]
+			payload["error_stage"] = llmNotConfiguredCode
+		}
 		if _, ok := payload["error_message"]; !ok {
 			// Prefer legacy 'error' then 'message'
 			if e, ok := payload["error"].(string); ok && e != "" {
@@ -493,6 +503,30 @@ func GenerateConnector(c *gin.Context) {
 
 // Note: Legacy V1 endpoint and separate V2 function have been removed.
 // All connector generation now uses the unified GenerateConnector endpoint with V2 agentic pipeline.
+
+// respondValidationUnavailable answers when the connector name could not be
+// checked. A failed check never reports the connector valid: valid and
+// can_generate are false, so the wizard keeps Discover disabled and shows the
+// warning. The status stays 200 because the wizard (DiscoveryFlow.tsx) reads
+// the body only for a 2xx answer.
+func respondValidationUnavailable(c *gin.Context, connectorName, normalized, warning string) {
+	c.JSON(http.StatusOK, ValidateConnectorResponse{
+		Valid:                 false,
+		ConnectorName:         connectorName,
+		NormalizedName:        normalized,
+		SimilarConnectors:     []string{},
+		Suggestions:           []string{},
+		Warning:               warning,
+		CanGenerate:           false,
+		ValidationUnavailable: true,
+	})
+}
+
+const validationUnreachableWarning = "Could not check this connector name: the connector generator did not answer. " +
+	"Check that the tool-generator service is running, then type the name again."
+
+const validationUnreadableWarning = "Could not check this connector name: the connector generator's answer could not be read. " +
+	"Try again in a moment; if it keeps happening, check the tool-generator service logs."
 
 // ValidateConnector validates a connector name before generation
 func ValidateConnector(c *gin.Context) {
@@ -579,12 +613,9 @@ func ValidateConnector(c *gin.Context) {
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, toolGeneratorURL+"/v1/validate", bytes.NewBuffer(reqBody))
 	if err != nil {
 		log.Errorf("Failed to build tool-generator validate request: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"valid":          true,
-			"can_generate":   true,
-			"warning":        "Validation request build failed - proceeding without validation",
-			"connector_name": req.ConnectorName,
-		})
+		respondValidationUnavailable(c, req.ConnectorName, normalized,
+			"Could not check this connector name: the connector generator address (TOOL_GENERATOR_URL) is not a valid URL. "+
+				"Fix it in .env, then restart rsync.")
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
@@ -592,12 +623,7 @@ func ValidateConnector(c *gin.Context) {
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		log.Errorf("Failed to call tool-generator validate: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"valid":          true,
-			"can_generate":   true,
-			"warning":        "Validation service unavailable - proceeding without validation",
-			"connector_name": req.ConnectorName,
-		})
+		respondValidationUnavailable(c, req.ConnectorName, normalized, validationUnreachableWarning)
 		return
 	}
 	defer resp.Body.Close()
@@ -606,22 +632,36 @@ func ValidateConnector(c *gin.Context) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		log.Errorf("Failed to read validation response: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{
-			"valid":          true,
-			"can_generate":   true,
-			"connector_name": req.ConnectorName,
-		})
+		respondValidationUnavailable(c, req.ConnectorName, normalized, validationUnreadableWarning)
+		return
+	}
+
+	// No LLM set up: relay the standard body. valid/can_generate ride along as
+	// false so a caller that reads the body never takes the name as checked.
+	if gated, ok := llmNotConfiguredBody(resp.StatusCode, body); ok {
+		gated["valid"] = false
+		gated["can_generate"] = false
+		gated["connector_name"] = req.ConnectorName
+		gated["normalized_name"] = normalized
+		gated["warning"] = gated["message"]
+		c.JSON(http.StatusServiceUnavailable, gated)
+		return
+	}
+
+	// An error body decodes into zero values, which read as "invalid name" with
+	// no reason. Say the check itself failed.
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		log.Errorf("tool-generator validate returned status %d", resp.StatusCode)
+		respondValidationUnavailable(c, req.ConnectorName, normalized, fmt.Sprintf(
+			"Could not check this connector name: the connector generator answered with status %d. "+
+				"Check the tool-generator service logs, then type the name again.", resp.StatusCode))
 		return
 	}
 
 	var validateResp ValidateConnectorResponse
 	if err := json.Unmarshal(body, &validateResp); err != nil {
 		log.Errorf("Failed to parse validation response: %v", err)
-		c.JSON(http.StatusOK, gin.H{
-			"valid":          true,
-			"can_generate":   true,
-			"connector_name": req.ConnectorName,
-		})
+		respondValidationUnavailable(c, req.ConnectorName, normalized, validationUnreadableWarning)
 		return
 	}
 

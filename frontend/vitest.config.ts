@@ -26,6 +26,7 @@ export default defineConfig({
     hookTimeout: 30_000,
     include: [
       "src/__tests__/**/*.{test,spec}.{ts,tsx}",
+      "src/lib/errors/**/*.{test,spec}.{ts,tsx}",
       "src/lib/events/**/*.{test,spec}.{ts,tsx}",
       "src/lib/explorer/**/*.{test,spec}.{ts,tsx}",
       "src/lib/pipeline/**/*.{test,spec}.{ts,tsx}",

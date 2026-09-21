@@ -41,6 +41,17 @@ import pytest
 CHART = pathlib.Path(__file__).resolve().parents[2] / "deploy" / "helm" / "rsync-ai"
 TEMPLATES = CHART / "templates"
 HELPERS = TEMPLATES / "_helpers.tpl"
+# Kafka Connect's JAAS line, OAuth settings and combined mTLS keystore are built by
+# the kafka-connect IMAGE's entrypoint, not by the chart: compose runs the same
+# image and needs the same logic, and one script cannot drift from itself.
+CONNECT_ENTRYPOINT = (CHART.parents[2] / "shared" / "internal" / "infra"
+                      / "kafka-connect" / "connect-entrypoint.sh")
+
+# Every shell site that builds a `sasl.jaas.config` line.
+_JAAS_BUILDERS = {
+    "connect-entrypoint.sh": CONNECT_ENTRYPOINT,
+    "jobs/kafka-init.yaml": TEMPLATES / "jobs" / "kafka-init.yaml",
+}
 
 # A container is `- name: x` whose next meaningful line is `image:`. An env entry is
 # `- name: X` whose next meaningful line is `value:`/`valueFrom:`. That one-line
@@ -280,27 +291,36 @@ def test_connect_configures_all_three_client_levels():
             f"`CONNECT_*` keys are NOT inherited by task clients, so a secured cluster "
             f"gives you RUNNING connectors that move nothing."
         )
-    # The JAAS half is asserted on `export`, not on `- name:`, because these three can
-    # no longer be env vars. Their value embeds the password, and a JAAS password must
-    # be escaped for two nested grammars (Java .properties, then Kafka's
-    # StreamTokenizer). Helm cannot do that escaping: the chart only ever writes the
-    # kubelet substitution `$(KAFKA_SASL_PASSWORD)`, and the real password is spliced
-    # in AFTER rendering, downstream of anything a template could quote. So the chart
-    # ships an entrypoint prelude that escapes and exports them inside the container
-    # instead -- see the comment block in cdc.yaml.
+    # The JAAS half cannot be an env var in the chart. Its value embeds the password,
+    # and a JAAS password must be escaped for two nested grammars (Java .properties,
+    # then Kafka's StreamTokenizer). Helm cannot do that escaping: the chart only ever
+    # writes the kubelet substitution `$(KAFKA_SASL_PASSWORD)`, and the real password
+    # is spliced in AFTER rendering, downstream of anything a template could quote. So
+    # the image's entrypoint (CONNECT_ENTRYPOINT) escapes and exports it inside the
+    # container, through `setall`, which writes one key at all three levels.
     #
     # The invariant is unchanged and still the point of this test: all THREE levels, or
     # the tasks dial anonymously under a green worker.
+    script = CONNECT_ENTRYPOINT.read_text()
+    setall = re.search(r"^setall\(\) \{(.+?)^\}", script, re.S | re.M)
+    assert setall, "connect-entrypoint.sh no longer defines setall()"
+    assert re.search(r'for L in "" PRODUCER_ CONSUMER_; do', setall.group(1)), (
+        "setall() no longer writes the worker, task-producer AND task-consumer "
+        "levels -- a secured cluster gives RUNNING connectors that move nothing"
+    )
+    assert re.search(r'export "CONNECT_\$\{L\}\$1=\$2"', setall.group(1)), (
+        "setall() iterates the three levels but no longer exports CONNECT_<level><key>"
+    )
+    assert re.search(r'^\s*setall SASL_JAAS_CONFIG "\$JAAS"\s*$', script, re.M), (
+        "connect-entrypoint.sh builds a JAAS line but never hands it to setall -- "
+        "Connect would attempt SASL with no credentials."
+    )
     for level, var in (
         ("worker", "CONNECT_SASL_JAAS_CONFIG"),
         ("task producer", "CONNECT_PRODUCER_SASL_JAAS_CONFIG"),
         ("task consumer", "CONNECT_CONSUMER_SASL_JAAS_CONFIG"),
     ):
-        assert re.search(rf"^\s*export {var}=", cdc, re.M), (
-            f"Connect's {level} has a security protocol but nothing exports `{var}` -- "
-            f"it would attempt SASL with no credentials."
-        )
-        # And it must NOT come back as a plain env var: that form cannot escape the
+        # It must NOT come back as a plain env var in the chart: that form cannot escape the
         # password, and it fails as an ordinary authentication error that points at the
         # credential rather than at the encoding.
         assert not re.search(rf"^\s*- name: {var}\s*$", cdc, re.M), (
@@ -309,6 +329,44 @@ def test_connect_configures_all_three_client_levels():
             f"afterwards, so any password containing a backslash or a quote is silently "
             f"corrupted before Kafka ever parses it."
         )
+
+
+def test_the_chart_does_not_bypass_the_connect_image_entrypoint():
+    """Everything above lives in the image's ENTRYPOINT, so a `command:` skips all of it.
+
+    A Kubernetes `command:` replaces the image ENTRYPOINT. The old chart default was
+    `/docker-entrypoint.sh start` -- Debezium's own script -- which, rendered now,
+    would ship a worker with no JAAS line, no OAuth handler and no keystore: it
+    connects anonymously and every connector still reports RUNNING. So the value is
+    empty by default, the legacy string is treated as empty, and the only `command:`
+    in the Connect container sits behind that guard.
+    """
+    connect = next(
+        block for path, name, block in _container_blocks()
+        if (path, name) == ("connectors/cdc.yaml", "kafka-connect")
+    )
+    commands = [m.start() for m in re.finditer(r"^\s*command:", connect, re.M)]
+    guard = '{{- if and $ep (ne $ep "/docker-entrypoint.sh start") }}'
+    for pos in commands:
+        preceding = connect[:pos].rstrip().splitlines()[-1].strip()
+        assert preceding == guard, (
+            "kafka-connect has a `command:` that is not behind the deprecated-"
+            f"entrypoint guard (preceded by {preceding!r}). It replaces "
+            "connect-entrypoint.sh, and the worker then starts with no Kafka security."
+        )
+    values = (CHART / "values.yaml").read_text()
+    kc = values[values.index("\n    kafkaConnect:"):]
+    m = re.search(r"^      entrypoint: (.*)$", kc, re.M)
+    assert m and m.group(1).strip() in ('""', "''"), (
+        "connectors.cdc.kafkaConnect.entrypoint has a non-empty default "
+        f"({m.group(1) if m else 'missing'}); it would replace the image entrypoint "
+        "that builds the Connect client's security settings"
+    )
+    assert "ENTRYPOINT [\"/opt/rsync/connect-entrypoint.sh\"]" in (
+        CONNECT_ENTRYPOINT.parent / "Dockerfile").read_text(), (
+        "the kafka-connect image no longer runs connect-entrypoint.sh -- the chart "
+        "sets KAFKA_* for Connect and nothing would translate them"
+    )
 
 
 # --------------------------------------------------------------------------
@@ -428,19 +486,17 @@ def test_every_jvm_truststore_and_keystore_is_declared_PEM():
                 )
 
 
-@pytest.mark.parametrize(
-    "rel", ["connectors/cdc.yaml", "jobs/kafka-init.yaml"]
-)
+@pytest.mark.parametrize("rel", sorted(_JAAS_BUILDERS))
 def test_every_shell_built_jaas_line_escapes_for_both_grammars(rel):
     """A SASL password reaches Kafka through two nested grammars, not one.
 
-    Both of these templates build `sasl.jaas.config` in shell, and in both the value
+    Both of these sites build `sasl.jaas.config` in shell, and in both the value
     then crosses a Java .properties file before Kafka's JAAS parser sees it:
 
       * kafka-init writes it to the file it passes as `--command-config`;
-      * cdc.yaml exports it as `CONNECT_*`, and the Debezium image's
-        docker-entrypoint.sh appends every `CONNECT_*` variable to
-        connect-distributed.properties and loads that.
+      * the kafka-connect image's entrypoint exports it as `CONNECT_*`, and the
+        Debezium base image's docker-entrypoint.sh appends every `CONNECT_*`
+        variable to connect-distributed.properties and loads that.
 
     `Properties.load` consumes one level of backslash and the JAAS
     StreamTokenizer consumes another, so the value has to be escaped TWICE. Escaping
@@ -454,7 +510,7 @@ def test_every_shell_built_jaas_line_escapes_for_both_grammars(rel):
     Counting `sed` invocations is crude, but it is the property that actually broke:
     the shipped kafka-init had exactly one.
     """
-    text = (TEMPLATES / rel).read_text()
+    text = _JAAS_BUILDERS[rel].read_text()
     esc = re.search(r"esc\(\) \{(.+?)\n\s*\}", text, re.S)
     assert esc, f"{rel} no longer defines esc() -- nothing escapes the password"
     assert esc.group(1).count("sed") == 2, (
@@ -583,10 +639,9 @@ def test_the_login_module_is_derived_from_the_mechanism_and_fails_closed():
 #
 # These are static because reading the table off the templates needs no `helm`
 # binary and no render, so it holds on any checkout. It used to say CI has none
-# and cite the lane's Python-only setup; the setup steps are Python-only, but
-# ci.yml now sets helm up for that job and asserts it before pytest, so the
-# render-based chart tests run there too. See the `helm is present` step in
-# .github/workflows/ci.yml.
+# and cite the lane's Python-only setup; the setup steps are Python-only, but the
+# runners are developer Macs that already carry helm, so the render-based chart
+# tests have been running there all along. the `helm is present` step in .github/workflows/ci.yml carries the correction.
 
 _OAUTH_ENV = (
     "KAFKA_SASL_OAUTHBEARER_TOKEN_ENDPOINT",
@@ -702,7 +757,7 @@ def test_the_oauth_client_secret_is_not_gated_on_the_scram_password():
     )
 
 
-@pytest.mark.parametrize("rel", ["connectors/cdc.yaml", "jobs/kafka-init.yaml"])
+@pytest.mark.parametrize("rel", sorted(_JAAS_BUILDERS))
 def test_every_shell_that_builds_an_oauthbearer_jaas_line_is_complete(rel):
     """Three settings, and each one is silent on its own when missing.
 
@@ -710,7 +765,7 @@ def test_every_shell_that_builds_an_oauthbearer_jaas_line_is_complete(rel):
     other two are quiet: no token endpoint and the JVM cannot fetch anything; no
     callback handler and it happily mints an unsecured self-signed token instead.
     """
-    text = (TEMPLATES / rel).read_text()
+    text = _JAAS_BUILDERS[rel].read_text()
     assert "OAuthBearerLoginModule" in text, (
         f"{rel} builds JAAS in shell but has no OAUTHBEARER arm -- a chart that "
         "renders saslMechanism=OAUTHBEARER would hit its unsupported-mechanism "
@@ -736,14 +791,16 @@ def test_every_shell_that_builds_an_oauthbearer_jaas_line_is_complete(rel):
     )
 
 
-# The OAUTHBEARER branch, delimited per template. Anchoring on the module name
+# The OAUTHBEARER branch, delimited per site. Anchoring on the module name
 # instead does not work: kafka-init names it in its `case` statement long before
 # the emit, so the "branch" swallowed the whole file and the assertion below passed
-# for the wrong reason -- which it did, on the first run.
+# for the wrong reason -- which it did, on the first run. The entrypoint's arm is
+# the `if` after its mapping `case`, closed by the `else` at that `if`'s own
+# indentation; the nested `if`s inside the arm have no `else` of their own.
 _OAUTH_BRANCH = {
-    "connectors/cdc.yaml": (
-        '{{- if include "rsync-ai.kafka.isTokenMechanism" . }}',
-        "{{- else }}",
+    "connect-entrypoint.sh": (
+        'if [ "$MECH" = OAUTHBEARER ]; then',
+        "\n      else\n",
     ),
     "jobs/kafka-init.yaml": (
         'if [ "$KAFKA_SASL_MECHANISM" = "OAUTHBEARER" ]; then',
@@ -756,10 +813,10 @@ _OAUTH_BRANCH = {
 def test_the_oauthbearer_jaas_line_carries_no_username_or_password(rel):
     """A username on an OAUTHBEARER line is not ignored -- it is a config error.
 
-    Both templates still build a `username=`/`password=` line for PLAIN and SCRAM,
+    Both sites still build a `username=`/`password=` line for PLAIN and SCRAM,
     so the assertion has to be scoped to the OAUTHBEARER arm specifically.
     """
-    text = (TEMPLATES / rel).read_text()
+    text = _JAAS_BUILDERS[rel].read_text()
     open_, close = _OAUTH_BRANCH[rel]
     assert open_ in text, f"{rel}: OAUTHBEARER branch opener not found -- {open_!r}"
     arm = text[text.index(open_) + len(open_):]

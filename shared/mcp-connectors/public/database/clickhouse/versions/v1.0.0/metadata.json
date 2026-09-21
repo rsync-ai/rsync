@@ -5,7 +5,8 @@
   "aliases": [
     "clickhouse",
     "clickhouse-server",
-    "yandex-clickhouse"
+    "yandex-clickhouse",
+    "clickhouse-cloud"
   ],
   "version": "1.0.0",
   "description": "Connector for ClickHouse (OLAP columnar warehouse) as a batch source and destination. Uses the official clickhouse-connect HTTP driver (port 8123). Optimized reads (offset/keyset pagination) and optimized writes (INSERT ... FORMAT JSONEachRow with best-effort type coercion; ensure_table creates ReplacingMergeTree/MergeTree with an explicit sort key; keyed upsert converges via OPTIMIZE ... FINAL).",
@@ -19,6 +20,11 @@
   "supports_source": true,
   "supports_destination": true,
   "supports_cdc": false,
+  "namespace_model": {
+    "table_namespace": "database",
+    "destination_namespace": "database",
+    "destination_default": "default"
+  },
   "spec_version": "1.0",
   "status": "active",
   "quality_tier": "bronze",
@@ -37,10 +43,10 @@
   ],
   "required_config": [
     "host",
-    "database",
     "user"
   ],
   "optional_config": [
+    "database",
     "port",
     "password",
     "secure"
@@ -50,24 +56,24 @@
     "properties": {
       "host": {"type": "string", "description": "ClickHouse host (e.g. my-clickhouse.example.com or a ClickHouse Cloud endpoint)"},
       "port": {"type": "integer", "description": "HTTP interface port (8123 plain / 8443 secure)", "default": 8123},
-      "database": {"type": "string", "description": "Database name (ClickHouse single namespace)", "default": "default"},
+      "database": {"type": "string", "description": "Database to connect to. Leave empty for a server-level connection: every database the login can see (except system and information_schema), narrowed by Scope. Writes without a destination database go to default.","ui_tier": "basic"},
       "user": {"type": "string", "description": "ClickHouse user", "default": "default"},
       "password": {"type": "string", "description": "ClickHouse password", "secret": true},
       "secure": {"type": "boolean", "description": "Use HTTPS (TLS) for the HTTP interface", "default": false}
     },
-    "required": ["host", "database", "user"]
+    "required": ["host", "user"]
   },
   "configuration_schema": {
     "type": "object",
     "properties": {
       "host": {"type": "string", "description": "ClickHouse host (e.g. my-clickhouse.example.com or a ClickHouse Cloud endpoint)"},
       "port": {"type": "integer", "description": "HTTP interface port (8123 plain / 8443 secure)", "default": 8123},
-      "database": {"type": "string", "description": "Database name (ClickHouse single namespace)", "default": "default"},
+      "database": {"type": "string", "description": "Database to connect to. Leave empty for a server-level connection: every database the login can see (except system and information_schema), narrowed by Scope. Writes without a destination database go to default.","ui_tier": "basic"},
       "user": {"type": "string", "description": "ClickHouse user", "default": "default"},
       "password": {"type": "string", "description": "ClickHouse password", "secret": true},
       "secure": {"type": "boolean", "description": "Use HTTPS (TLS) for the HTTP interface", "default": false}
     },
-    "required": ["host", "database", "user"]
+    "required": ["host", "user"]
   },
   "capabilities": {
     "max_batch_size": 100000,

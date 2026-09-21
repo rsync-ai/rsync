@@ -164,89 +164,11 @@ func (e *SimpleTransformEngine) applyFilter(ctx context.Context, data []Row, con
 	return result, nil
 }
 
-// applyMask masks PII fields
+// applyMask masks PII fields. The implementation, including nested (`deep` /
+// `path`) targeting and per-target match accounting, lives in mask_nested.go.
 func (e *SimpleTransformEngine) applyMask(ctx context.Context, data []Row, config map[string]interface{}) ([]Row, error) {
-	// Accept either:
-	// - config.column: "email"
-	// - config.columns: ["email","phone"]
-	parseCols := func(v interface{}) []string {
-		out := make([]string, 0, 4)
-		switch t := v.(type) {
-		case string:
-			s := strings.TrimSpace(t)
-			if s != "" {
-				out = append(out, s)
-			}
-		case []string:
-			for _, it := range t {
-				s := strings.TrimSpace(it)
-				if s != "" {
-					out = append(out, s)
-				}
-			}
-		case []interface{}:
-			for _, it := range t {
-				s := strings.TrimSpace(fmt.Sprint(it))
-				if s != "" {
-					out = append(out, s)
-				}
-			}
-		default:
-			// ignore
-		}
-		return out
-	}
-
-	cols := parseCols(config["columns"])
-	if len(cols) == 0 {
-		cols = parseCols(config["column"])
-	}
-	if len(cols) == 0 {
-		return nil, fmt.Errorf("mask_pii requires 'column' or 'columns' config")
-	}
-
-	// Normalize: allow table-qualified column names (e.g. "users.email").
-	colSet := make(map[string]struct{}, len(cols))
-	for _, c := range cols {
-		cc := c
-		if parts := strings.Split(cc, "."); len(parts) > 1 {
-			cc = parts[len(parts)-1]
-		}
-		cc = strings.TrimSpace(cc)
-		if cc != "" {
-			colSet[cc] = struct{}{}
-		}
-	}
-	if len(colSet) == 0 {
-		return nil, fmt.Errorf("mask_pii requires non-empty column names")
-	}
-
-	maskType := "hash"
-	if mt, ok := config["mask_type"].(string); ok {
-		maskType = mt
-	}
-
-	// hash_function selects the digest used when mask_type=hash.
-	// Defaults to sha256 for backward compatibility.
-	hashFunc := "sha256"
-	if hf, ok := config["hash_function"].(string); ok && strings.TrimSpace(hf) != "" {
-		hashFunc = strings.ToLower(strings.TrimSpace(hf))
-	}
-
-	result := make([]Row, len(data))
-	for i, row := range data {
-		newRow := make(Row)
-		for k, v := range row {
-			if _, ok := colSet[k]; ok {
-				newRow[k] = applyMask(v, maskType, hashFunc)
-			} else {
-				newRow[k] = v
-			}
-		}
-		result[i] = newRow
-	}
-
-	return result, nil
+	out, _, err := e.ApplyMaskWithStats(ctx, data, config)
+	return out, err
 }
 
 // applySelect selects specific columns

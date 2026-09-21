@@ -141,8 +141,9 @@ connectors:
 
   # The CDC plane. All three or none. kafka-connect + debezium-mcp share one
   # pod: debezium writes source-DB credentials into a directory kafka-connect
-  # reads through FileConfigProvider, and an emptyDir in one pod keeps those
-  # credentials off the Kafka config topic without needing an RWX volume.
+  # reads through FileConfigProvider, and a ReadWriteOnce claim shared by the
+  # two containers keeps those credentials off the Kafka config topic, across
+  # pod restarts, without needing an RWX volume.
   cdc:
     enabled: true
 

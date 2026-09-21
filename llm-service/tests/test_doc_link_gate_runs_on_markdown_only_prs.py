@@ -61,7 +61,23 @@ GUARDS = (SCRIPT, MERGE_GUARD, "test_doc_links_resolve.py",
           # different tree -- so the PR that makes it true is a code PR and
           # the PR that repairs the sentence is a docs-only one. Both must
           # reach it.
-          "test_docs_do_not_call_built_connectors_unbuilt.py")
+          "test_docs_do_not_call_built_connectors_unbuilt.py",
+          # Added 2026-09-07. Its subject is the DDL and `ollama pull`
+          # commands the deployment docs hand the operator, now that
+          # db-init and the model-pull hook run them. A docs-only PR
+          # re-adding a step the product performs is exactly the change
+          # it exists to catch, and the marker vocabulary it enforces
+          # only ever changes in markdown.
+          "test_deployment_docs_do_not_hand_the_operator_a_step_the_product_runs.py",
+          # Added 2026-09-16, when CAPABILITIES.md became a one-line index over
+          # CAPABILITIES-ARCHIVE.md. Its subject is the two files' shape and the
+          # anchors between them; pasting evidence back into a row, or rewording
+          # a heading a write-up link lands on, is a docs-only PR.
+          "test_capabilities_stays_an_index.py",
+          # Its subject is the whole tree, name and content: no
+          # bundled observability vendor may come back, and a paragraph pasted
+          # into a doc is as much a regression as a compose file.
+          "test_no_bundled_observability_vendor.py")
 
 # The half of the ref promise that lives in the test module. Named in both files;
 # asserted equal below, because a rename on one side disarms the other silently.

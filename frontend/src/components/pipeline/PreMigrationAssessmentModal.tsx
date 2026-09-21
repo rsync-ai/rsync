@@ -1,6 +1,7 @@
 "use client"
 
 import * as React from "react"
+import Link from "next/link"
 import { AlertTriangle, AlertCircle, Info, Loader2 } from "lucide-react"
 import {
   Dialog,
@@ -12,6 +13,7 @@ import {
 } from "@/components/ui/dialog"
 import { Button } from "@/components/ui/button"
 import { cn } from "@/lib/utils"
+import { getConnectorDisplayName } from "@/lib/types/mcp-connector"
 import type {
   AssessmentFinding,
   AssessmentReport,
@@ -31,6 +33,9 @@ interface PreMigrationAssessmentModalProps {
   // Submission spinner. Disables the Proceed button while the parent
   // re-issues the run.
   submitting?: boolean
+  // Link to the pipeline's Assessment tab (every check, passes included, and
+  // the run history). Omitted where there is no pipeline page to link to.
+  assessmentTabHref?: string
 }
 
 // Stable identity for a table across renders and for the nominated-keys map.
@@ -95,18 +100,20 @@ function FindingRemediation({ details }: { details?: Record<string, unknown> }) 
   if (!details) return null
   const steps = asStringArray(details.steps)
   const sql = asStringArray(details.sql_to_run)
+  // Shell / mongosh commands (e.g. rs.initiate()) — not SQL, same treatment.
+  const commands = asStringArray(details.commands_to_run)
   const docURL = asString(details.doc_url)
   const minutes =
     typeof details.estimated_minutes === "number" && details.estimated_minutes > 0
       ? details.estimated_minutes
       : 0
-  if (steps.length === 0 && sql.length === 0 && !docURL) return null
+  if (steps.length === 0 && sql.length === 0 && commands.length === 0 && !docURL) return null
 
   return (
     <div className="mt-1.5 space-y-1.5 border-l-2 border-zinc-300 dark:border-zinc-700 pl-2.5">
       {steps.length > 0 && (
         <div>
-          <p className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+          <p className="text-[10px] font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
             What to do{minutes > 0 ? ` · ~${minutes} min` : ""}
           </p>
           <ol className="mt-0.5 list-decimal list-inside space-y-0.5 text-xs text-zinc-700 dark:text-zinc-300">
@@ -121,6 +128,11 @@ function FindingRemediation({ details }: { details?: Record<string, unknown> }) 
       {sql.length > 0 && (
         <pre className="overflow-x-auto rounded bg-zinc-100 dark:bg-zinc-900 p-2 text-[11px] font-mono text-zinc-800 dark:text-zinc-200">
           {sql.join("\n")}
+        </pre>
+      )}
+      {commands.length > 0 && (
+        <pre className="overflow-x-auto rounded bg-zinc-100 dark:bg-zinc-900 p-2 text-[11px] font-mono text-zinc-800 dark:text-zinc-200">
+          {commands.join("\n")}
         </pre>
       )}
       {docURL && (
@@ -159,9 +171,9 @@ function KeyColumnPicker({
     <div className="mt-2 rounded-md border border-zinc-200 dark:border-zinc-800 bg-zinc-50/60 dark:bg-zinc-900/40 p-2.5">
       <p className="text-[11px] font-medium text-zinc-700 dark:text-zinc-300">
         Nominate key column(s) for in-place updates{" "}
-        <span className="font-normal text-zinc-500">(optional)</span>
+        <span className="font-normal text-zinc-500 dark:text-zinc-400">(optional)</span>
       </p>
-      <p className="text-[10px] text-zinc-500 leading-snug mt-0.5">
+      <p className="text-[10px] text-zinc-500 dark:text-zinc-400 leading-snug mt-0.5">
         Pick the column(s) that uniquely identify a row. Leave empty to use a
         content-hash surrogate key (updates keep the prior row version).
       </p>
@@ -215,6 +227,7 @@ export function PreMigrationAssessmentModal({
   report,
   onProceed,
   submitting,
+  assessmentTabHref,
 }: PreMigrationAssessmentModalProps) {
   // Ack state: { findingKey -> true } for every warning the user has
   // checked. Resets whenever a new report arrives.
@@ -276,7 +289,7 @@ export function PreMigrationAssessmentModal({
               <>
                 {" — "}
                 <span className="font-mono text-xs">
-                  {report.source_connector_type} → {report.destination_connector_type}
+                  {getConnectorDisplayName(report.source_connector_type)} → {getConnectorDisplayName(report.destination_connector_type)}
                 </span>
               </>
             )}
@@ -305,7 +318,7 @@ export function PreMigrationAssessmentModal({
                   <h3 className="font-mono text-sm">
                     {table.schema ? `${table.schema}.${table.name}` : table.name}
                   </h3>
-                  <span className="text-xs text-zinc-500">
+                  <span className="text-xs text-zinc-500 dark:text-zinc-400">
                     {table.column_count} columns
                     {table.json_column_count > 0 && (
                       <> · {table.json_column_count} JSON</>
@@ -315,7 +328,7 @@ export function PreMigrationAssessmentModal({
                 </header>
 
                 {sortedFindings.length === 0 ? (
-                  <p className="text-xs text-zinc-500">No findings.</p>
+                  <p className="text-xs text-zinc-500 dark:text-zinc-400">No findings.</p>
                 ) : (
                   <ul className="space-y-2">
                     {sortedFindings.map((finding, idx) => {
@@ -337,7 +350,7 @@ export function PreMigrationAssessmentModal({
                           {severityIcon(finding.severity)}
                           <div className="flex-1 space-y-1">
                             <div className="flex items-baseline gap-2">
-                              <span className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+                              <span className="text-[10px] font-medium uppercase tracking-wide text-zinc-500 dark:text-zinc-400">
                                 {severityLabel(finding.severity)}
                               </span>
                               <span className="text-[10px] font-mono text-zinc-400">
@@ -387,6 +400,15 @@ export function PreMigrationAssessmentModal({
         </div>
 
         <DialogFooter>
+          {assessmentTabHref && (
+            <Link
+              href={assessmentTabHref}
+              onClick={() => onOpenChange(false)}
+              className="sm:mr-auto self-center text-xs text-blue-600 dark:text-blue-400 underline underline-offset-2"
+            >
+              View every check in the Assessment tab →
+            </Link>
+          )}
           <Button
             variant="outline"
             onClick={() => onOpenChange(false)}

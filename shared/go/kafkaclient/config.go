@@ -26,6 +26,7 @@ package kafkaclient
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -94,6 +95,11 @@ const (
 	EnvOAuthClientSecret  = "KAFKA_SASL_OAUTHBEARER_CLIENT_SECRET"
 	EnvOAuthScope         = "KAFKA_SASL_OAUTHBEARER_SCOPE"
 	EnvOAuthExtensions    = "KAFKA_SASL_OAUTHBEARER_EXTENSIONS"
+
+	// EnvOAuthAllowInsecureTokenEndpoint re-permits an http:// token endpoint
+	// that is not on loopback. It exists for test rigs that run a throwaway
+	// IdP; see tokenEndpointIsInsecure for why the default is a refusal.
+	EnvOAuthAllowInsecureTokenEndpoint = "KAFKA_SASL_OAUTHBEARER_ALLOW_INSECURE_TOKEN_ENDPOINT"
 )
 
 // Accepted spellings that are not the canonical one.
@@ -147,6 +153,10 @@ type Config struct {
 	OAuthClientSecret  string
 	OAuthScope         string
 	OAuthExtensions    map[string]string
+
+	// OAuthAllowInsecureTokenEndpoint carries the operator's explicit decision
+	// to post the client secret to an unencrypted, non-loopback URL.
+	OAuthAllowInsecureTokenEndpoint bool
 
 	CACertFile         string // PEM bundle used to verify the broker
 	ClientCertFile     string // mTLS client certificate
@@ -211,27 +221,29 @@ func FromEnvForService(service, defaultBrokers string) (Config, error) {
 	}
 
 	skip, skipVar := truthyEnv(EnvSSLSkipVerify, EnvSSLSkipVerifyAlias)
+	allowInsecureToken, _ := truthyEnv(EnvOAuthAllowInsecureTokenEndpoint)
 	clientID, clientIDSet := lookupEnv(EnvClientID)
 
 	c := Config{
-		Brokers:                  ParseBrokers(raw),
-		SecurityProtocol:         strings.ToUpper(strings.TrimSpace(os.Getenv(EnvSecurityProtocol))),
-		SASLMechanism:            strings.ToUpper(strings.TrimSpace(os.Getenv(EnvSASLMechanism))),
-		Username:                 os.Getenv(EnvSASLUsername),
-		Password:                 os.Getenv(EnvSASLPassword),
-		ClientID:                 sanitizeClientIDChars(clientID),
-		AWSRegion:                firstEnv(EnvAWSRegion, EnvAWSRegionFallback, EnvAWSRegionFallbackLegacy),
-		OAuthTokenEndpoint:       firstEnv(EnvOAuthTokenEndpoint),
-		OAuthClientID:            firstEnv(EnvOAuthClientID, EnvSASLUsername),
-		OAuthClientSecret:        firstEnv(EnvOAuthClientSecret, EnvSASLPassword),
-		OAuthScope:               firstEnv(EnvOAuthScope),
-		CACertFile:               firstEnv(EnvSSLCALocation, EnvTLSCAAlias),
-		ClientCertFile:           firstEnv(EnvSSLCertLocation, EnvTLSCertAlias),
-		ClientKeyFile:            firstEnv(EnvSSLKeyLocation, EnvTLSKeyAlias),
-		InsecureSkipVerify:       skip,
-		InsecureSkipVerifySource: skipVar,
-		UsingDefaultBrokers:      usingDefault,
-		clientIDFromEnv:          clientIDSet,
+		Brokers:                         ParseBrokers(raw),
+		SecurityProtocol:                strings.ToUpper(strings.TrimSpace(os.Getenv(EnvSecurityProtocol))),
+		SASLMechanism:                   strings.ToUpper(strings.TrimSpace(os.Getenv(EnvSASLMechanism))),
+		Username:                        os.Getenv(EnvSASLUsername),
+		Password:                        os.Getenv(EnvSASLPassword),
+		ClientID:                        sanitizeClientIDChars(clientID),
+		AWSRegion:                       firstEnv(EnvAWSRegion, EnvAWSRegionFallback, EnvAWSRegionFallbackLegacy),
+		OAuthTokenEndpoint:              firstEnv(EnvOAuthTokenEndpoint),
+		OAuthClientID:                   firstEnv(EnvOAuthClientID, EnvSASLUsername),
+		OAuthClientSecret:               firstEnv(EnvOAuthClientSecret, EnvSASLPassword),
+		OAuthScope:                      firstEnv(EnvOAuthScope),
+		OAuthAllowInsecureTokenEndpoint: allowInsecureToken,
+		CACertFile:                      firstEnv(EnvSSLCALocation, EnvTLSCAAlias),
+		ClientCertFile:                  firstEnv(EnvSSLCertLocation, EnvTLSCertAlias),
+		ClientKeyFile:                   firstEnv(EnvSSLKeyLocation, EnvTLSKeyAlias),
+		InsecureSkipVerify:              skip,
+		InsecureSkipVerifySource:        skipVar,
+		UsingDefaultBrokers:             usingDefault,
+		clientIDFromEnv:                 clientIDSet,
 	}
 	if c.ClientID == "" {
 		c.ClientID = DefaultClientID(service)
@@ -264,6 +276,18 @@ func FromEnvForService(service, defaultBrokers string) (Config, error) {
 				"Any host that can intercept the connection can impersonate the broker and read every record, "+
 				"including the credentials this client presents. Unset it outside of local testing.",
 			c.InsecureSkipVerifySource)
+	}
+
+	// Same reasoning for the token-endpoint opt-out: it is the one setting
+	// that turns a refusal back into a silent secret disclosure, and the
+	// connection it enables comes up normally, so nothing else says it is on.
+	if c.OAuthAllowInsecureTokenEndpoint && c.SASLMechanism == MechanismOAuthBearer &&
+		tokenEndpointIsInsecure(c.OAuthTokenEndpoint) {
+		warnOnce(EnvOAuthAllowInsecureTokenEndpoint,
+			"kafkaclient: %s is enabled — %s is http and not loopback, so %s is POSTed in the clear "+
+				"to every token fetch. Anyone on the path keeps a credential that does not expire. "+
+				"Use https outside of a disposable test rig.",
+			EnvOAuthAllowInsecureTokenEndpoint, EnvOAuthTokenEndpoint, EnvOAuthClientSecret)
 	}
 
 	// Credentials that will never be used are the same class of problem, and
@@ -482,12 +506,57 @@ func (c Config) validateOAuthBearer() error {
 		return fmt.Errorf("kafkaclient: %s=%q is not an absolute URL (want https://issuer/oauth2/token)",
 			EnvOAuthTokenEndpoint, c.OAuthTokenEndpoint)
 	}
+	if s := strings.ToLower(u.Scheme); s != "https" && s != "http" {
+		return fmt.Errorf("kafkaclient: %s=%q has scheme %q; the client-credentials grant is an HTTP POST (want https://issuer/oauth2/token)",
+			EnvOAuthTokenEndpoint, c.OAuthTokenEndpoint, u.Scheme)
+	}
+	// The client-credentials grant POSTs the secret to this URL. Over http on
+	// a network hop anyone on the path reads it, and unlike a captured token a
+	// client secret does not expire -- yet the connection still comes up, so
+	// nothing in a log says the secret was disclosed. https is therefore
+	// required, with one exception and one opt-out:
+	//
+	//   - loopback, because a token helper on the same host (GCP's metadata-
+	//     backed server at 127.0.0.1:14293 is the case this platform ships
+	//     for) never puts the secret on a network;
+	//   - EnvOAuthAllowInsecureTokenEndpoint, for a rig running a throwaway
+	//     IdP, where the secret is worth nothing.
+	if !c.OAuthAllowInsecureTokenEndpoint && tokenEndpointIsInsecure(c.OAuthTokenEndpoint) {
+		return fmt.Errorf("kafkaclient: %s=%q is http and %q is not loopback, so %s would be sent in the clear on every token fetch; use https, a loopback address, or set %s=true for a disposable test rig",
+			EnvOAuthTokenEndpoint, c.OAuthTokenEndpoint, u.Hostname(),
+			EnvOAuthClientSecret, EnvOAuthAllowInsecureTokenEndpoint)
+	}
 	if c.OAuthClientID == "" || c.OAuthClientSecret == "" {
 		return fmt.Errorf("kafkaclient: %s=%s requires a client id and secret (set %s and %s, or reuse %s and %s)",
 			EnvSASLMechanism, MechanismOAuthBearer,
 			EnvOAuthClientID, EnvOAuthClientSecret, EnvSASLUsername, EnvSASLPassword)
 	}
 	return validateSASLExtensions(c.OAuthExtensions)
+}
+
+// tokenEndpointIsInsecure reports whether fetching a token from raw would put
+// the client secret on a network in the clear: anything that is not https and
+// not loopback. An endpoint that does not parse is rejected by the caller with
+// a message about the URL, so it is not this function's verdict to give.
+func tokenEndpointIsInsecure(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || strings.EqualFold(u.Scheme, "https") {
+		return false
+	}
+	return !isLoopbackHost(u.Hostname())
+}
+
+// isLoopbackHost reports whether host can only be this machine. RFC 6761
+// reserves "localhost" and everything under it for loopback, and a literal is
+// checked numerically rather than by prefix so that 127.0.0.1, ::1 and the
+// rest of 127.0.0.0/8 are all recognised.
+func isLoopbackHost(host string) bool {
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // Warnings lists configurations that work but are probably not what the
@@ -502,9 +571,15 @@ func (c Config) Warnings() []string {
 		w = append(w, fmt.Sprintf("%s=%s sends a bearer token but %s=%s is unencrypted, so anyone on the path can capture and replay it",
 			EnvSASLMechanism, c.SASLMechanism, EnvSecurityProtocol, c.SecurityProtocol))
 	}
+	// Validate() refuses an http endpoint outright unless it is loopback or
+	// the opt-out is set, so what is left to warn about is those two cases.
 	if c.SASLMechanism == MechanismOAuthBearer && c.OAuthTokenEndpoint != "" &&
 		!strings.HasPrefix(strings.ToLower(c.OAuthTokenEndpoint), "https://") {
-		w = append(w, fmt.Sprintf("%s is not https, so the client secret is sent in the clear", EnvOAuthTokenEndpoint))
+		reason := "it is loopback, so the secret stays on this host"
+		if c.OAuthAllowInsecureTokenEndpoint && tokenEndpointIsInsecure(c.OAuthTokenEndpoint) {
+			reason = fmt.Sprintf("%s is set, so the client secret is POSTed in the clear", EnvOAuthAllowInsecureTokenEndpoint)
+		}
+		w = append(w, fmt.Sprintf("%s is not https: %s", EnvOAuthTokenEndpoint, reason))
 	}
 	if ignored := c.ignoredSASLSettings(); len(ignored) > 0 {
 		w = append(w, fmt.Sprintf("%s are set but %s=%s does not use SASL, so the credentials are ignored",

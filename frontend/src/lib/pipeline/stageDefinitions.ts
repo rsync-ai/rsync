@@ -93,6 +93,11 @@ export interface StageExecution {
   attempts: StageAttempt[]
   startedAt?: number
   completedAt?: number
+  /**
+   * How long the stage took, in milliseconds — the same number the Steps graph
+   * shows for it. Absent when the stage was never timed.
+   */
+  durationMs?: number
   progress?: number
   estimatedDuration?: number // seconds
   metadata?: Record<string, any>
@@ -136,14 +141,14 @@ export interface HITLState {
  *
  * Pure and exported, because `stageRegistry.get()` REGISTERS on miss — calling
  * it just to read a label mutates a module singleton from inside a render.
- * Callers that only need the words (the Live events feed) use this; the registry
+ * Callers that only need the words (the Activity feed) use this; the registry
  * delegates to it, so there is a single map rather than a second one that drifts.
  */
 export function stageLabel(stageKey: string): string {
   // Known stage mappings (optional, for better UX)
   const knownLabels: Record<string, string> = {
     'intent': 'Understanding Request',
-    'capability_resolver': 'Checking Capabilities',
+    'capability_resolver': 'Resolving Connectors',
     'connector_check': 'Checking Connectors',
     'connector_generation': 'Generating Connectors',
     'connection_validation': 'Validating Connections',
@@ -372,4 +377,71 @@ export function canRetryStage(stage: StageExecution): boolean {
   // and honest rather than being quietly deleted alongside an unrelated fix.)
   if (stage.currentAttempt === undefined || stage.maxAttempts === undefined) return false
   return stage.status === 'failed' && stage.currentAttempt < stage.maxAttempts
+}
+
+/**
+ * The agent pipeline's stages in run order. connection_validation and
+ * connection_validator are one step under the two names builds have emitted.
+ * infra_preflight is not in the execution plan; the Steps tab adds it from the
+ * run's events.
+ */
+export const AGENT_STAGE_ORDER = [
+  'intent',
+  'capability_resolver',
+  'connector_check',
+  'connector_generation',
+  'connection_validation',
+  'connection_validator',
+  'planner',
+  'validator',
+  'infra_preflight',
+  'executor',
+] as const
+
+/**
+ * Agent stages the run went past without reporting: connector_generation when
+ * the connector already exists, and whichever connection_validation /
+ * connection_validator alias this build does not emit. A stage after the
+ * furthest reported one is still to come, not skipped.
+ *
+ * The Overview checklist and the Steps graph both leave these out, so they
+ * count the same steps (UI #41, #42).
+ */
+export function passedOverAgentStages(reported: ReadonlySet<string>): Set<string> {
+  const furthest = AGENT_STAGE_ORDER.reduce((max, k, i) => (reported.has(k) ? i : max), -1)
+  return new Set(AGENT_STAGE_ORDER.filter((k, i) => i < furthest && !reported.has(k)))
+}
+
+/**
+ * Drops the execution-plan stages the run passed over (see
+ * passedOverAgentStages). A stage that depended on a dropped one depends on
+ * that stage's own parents instead, so no edge points at a missing node.
+ */
+export function withoutPassedOverStages<T extends { id: string; status?: string; dependencies?: string[] }>(
+  stages: T[]
+): T[] {
+  const reported = new Set(
+    stages
+      .filter((s) => !['', 'pending', 'skipped'].includes(String(s.status || '').toLowerCase()))
+      .map((s) => s.id)
+  )
+  const drop = passedOverAgentStages(reported)
+  if (drop.size === 0) return stages
+
+  const depsOf = new Map(stages.map((s) => [s.id, s.dependencies || []]))
+  const parents = (deps: string[], seen: Set<string>): string[] =>
+    deps.flatMap((d) => {
+      if (!drop.has(d)) return [d]
+      if (seen.has(d)) return []
+      seen.add(d)
+      return parents(depsOf.get(d) || [], seen)
+    })
+
+  return stages
+    .filter((s) => !drop.has(s.id))
+    .map((s) =>
+      s.dependencies?.some((d) => drop.has(d))
+        ? { ...s, dependencies: Array.from(new Set(parents(s.dependencies, new Set()))) }
+        : s
+    )
 }

@@ -152,6 +152,12 @@ class BigqueryMCPServer(DestinationLoadMixin, BaseMCPConnector):
         params = params or {}
         return self._warehouse_adapter.discover_schema(self._get_config(params), params)
 
+    def list_namespaces(self, params: Dict = None) -> Dict[str, Any]:
+        err = self._require_adapter()
+        if err:
+            return err
+        return self._warehouse_adapter.list_namespaces(self._get_config(params or {}))
+
     def export(self, params: Dict = None) -> Dict[str, Any]:
         """Optimized paginated read (keyset/offset) — delegated to the adapter."""
         err = self._require_adapter()

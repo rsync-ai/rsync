@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -595,7 +597,12 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 		if waitTimeout <= 0 {
 			waitTimeout = 60 * time.Second
 		}
-		if building {
+		if building && config.NoStdioWhileDeploying {
+			// Interactive caller (Test Connection): answer within its own HTTP budget
+			// with a retryable "still being set up" instead of holding the request for
+			// a multi-minute build. The build carries on server-side regardless.
+			log.Infof("🏗️  Connector %s@%s building on demand — interactive caller waits up to %.0fs", config.Name, config.Version, waitTimeout.Seconds())
+		} else if building {
 			// A cold JIT build is running on tool-generator (a pinned version whose image
 			// wasn't pre-built — e.g. it was pruned after a newer version was promoted).
 			// Builds can take minutes, so extend the poll deadline well beyond the normal
@@ -645,6 +652,22 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 	// "container appears stopped, writes silently fail" failure mode. Bail loudly instead.
 	if config.RequireHTTP {
 		return finish(nil, fmt.Errorf("connector %s@%s requires Docker HTTP transport but no container is reachable (no stdio fallback)", config.Name, config.Version))
+	}
+
+	// Honor NoStdioWhileDeploying: a deploy was requested (or is still running on the
+	// deployer) but the container is not up yet. The stdio fallback below would run the
+	// connector on the orchestrator's own interpreter, which carries none of the
+	// connector's dependencies in a containerized install, so its only possible answer
+	// is "No module named 'X'". Return a retryable "still being set up" instead. When no
+	// deploy was possible (deployed=false: no tool-generator, e.g. Docker-less Helm
+	// batch), stdio is the supported transport and is still used.
+	if config.NoStdioWhileDeploying && deployed {
+		log.Warnf("⏳ Connector %s@%s is still deploying — returning a retryable result instead of the stdio fallback", config.Name, config.Version)
+		return finish(nil, &ConnectorDeployingError{
+			Connector:   config.Name,
+			Version:     config.Version,
+			DisplayName: sm.ConnectorDisplayName(config.Name, config.Version),
+		})
 	}
 
 	// Build paths for local stdio mode
@@ -802,9 +825,11 @@ func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version stri
 	body, _ := json.Marshal(payload)
 
 	url := strings.TrimRight(toolGenURL, "/") + "/v1/deploy"
-	// 15s is enough to receive the fast start/202 response. The build itself runs in the
-	// background on tool-generator, so this timeout does NOT need to cover build time.
-	client := &http.Client{Timeout: 15 * time.Second}
+	// 15s is enough to receive the fast start/202 response on the local-Docker path. It
+	// is NOT enough in deployer mode (DEPLOYER_URL set, as prod compose sets it): there
+	// tool-generator's /v1/deploy blocks until the deployer finishes a cold image build,
+	// so a timeout below is handled as "deploy still in progress", not as failure.
+	client := &http.Client{Timeout: deployCallTimeout}
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
 	if err != nil {
 		return false, false
@@ -816,6 +841,19 @@ func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version stri
 
 	resp, err := client.Do(req)
 	if err != nil {
+		if isTimeoutError(err) {
+			// The request reached tool-generator and is still being served — in deployer
+			// mode that means the image is being built synchronously, and the build
+			// continues after we stop waiting for the response. Report it as deployed so
+			// the caller polls for the container instead of skipping straight to stdio
+			// (KI-FIRST-CONNECTION-TEST-FALLS-BACK-TO-AN-UNUSABLE-STDIO-INTERPRETER).
+			// building stays false: the poll uses the caller's own wait, not the 5-minute
+			// cold-build extension, so a hung tool-generator cannot stall callers longer
+			// than they asked for.
+			log.Warnf("Tool-generator deploy call for %s@%s did not answer within %s — treating the deploy as in progress: %v",
+				connectorName, version, deployCallTimeout, err)
+			return true, false
+		}
 		log.Warnf("Tool-generator deploy call failed: %v", err)
 		return false, false
 	}
@@ -838,6 +876,39 @@ func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version stri
 	}
 
 	return true, building
+}
+
+// deployCallTimeout bounds the tool-generator /v1/deploy request. A var so tests can
+// shorten it.
+var deployCallTimeout = 15 * time.Second
+
+// isTimeoutError reports whether an HTTP client error is a timeout (the server accepted
+// the request but did not answer in time) rather than a refusal or DNS failure.
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
+// ConnectorDisplayName returns the connector's metadata display_name (e.g. "MongoDB")
+// for user-facing messages, falling back to the connector id.
+func (sm *ServerManager) ConnectorDisplayName(name, version string) string {
+	if dir, err := sm.resolveConnectorDir(name, version); err == nil {
+		if b, rerr := os.ReadFile(filepath.Join(sm.toolsDir, dir, "metadata.json")); rerr == nil {
+			var m struct {
+				DisplayName string `json:"display_name"`
+			}
+			if json.Unmarshal(b, &m) == nil && strings.TrimSpace(m.DisplayName) != "" {
+				return strings.TrimSpace(m.DisplayName)
+			}
+		}
+	}
+	return name
 }
 
 // runtimePlan is how StartServer will spawn a stdio connector.
@@ -1039,6 +1110,42 @@ func (sm *ServerManager) GetServer(connectorType string, version string) (*Serve
 	server, exists := sm.servers[key]
 	return server, exists
 }
+
+// FindRunningServer returns the server registered for connectorType@version or,
+// when this process never started it, a Docker container already serving it (which
+// it then registers, as StartServer does). It never deploys a container or spawns a
+// stdio process, so a health probe may call it on every tick.
+//
+// GetServer alone only sees servers this process started. After an orchestrator
+// restart, a long-running container nobody has called since (kafka-mcp-sink) was
+// reported "not registered" on the Data flow tab while it was healthy.
+// version must be concrete: container discovery does not resolve "latest".
+func (sm *ServerManager) FindRunningServer(connectorType, version string) (*ServerInfo, bool) {
+	if server, ok := sm.GetServer(connectorType, version); ok && server != nil {
+		return server, true
+	}
+	key := makeServerKey(connectorType, version)
+	for _, candidate := range connectorNameCandidates(connectorType) {
+		for _, containerName := range containerNameCandidates(candidate, version) {
+			found := checkDockerContainerFn(sm, containerName, strings.ToLower(connectorType))
+			if found == nil {
+				continue
+			}
+			sm.mu.Lock()
+			defer sm.mu.Unlock()
+			if cur := sm.servers[key]; cur != nil {
+				return cur, true
+			}
+			sm.servers[key] = found
+			return found, true
+		}
+	}
+	return nil, false
+}
+
+// checkDockerContainerFn is the container liveness check FindRunningServer uses.
+// Tests replace it: the real one needs Docker DNS.
+var checkDockerContainerFn = (*ServerManager).checkDockerContainer
 
 // GetServerLegacy returns info about a running server (backward compatible, assumes "latest")
 func (sm *ServerManager) GetServerLegacy(name string) (*ServerInfo, bool) {

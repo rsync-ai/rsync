@@ -33,6 +33,8 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/telemetry"
 	"github.com/rsync-ai/backend-orchestrator/internal/utils"
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
+	"github.com/rsync-ai/backend-orchestrator/pkg/namespacefilter"
+	"github.com/rsync-ai/backend-orchestrator/pkg/namespacemodel"
 	"github.com/rsync-ai/shared/naming"
 	"github.com/rsync-ai/shared/transforms"
 )
@@ -349,37 +351,36 @@ func distinctSourceSchemas(tables []interface{}) map[string]struct{} {
 // EXISTS for a namespace, so nothing else is needed).
 //
 // Policy (first match wins):
-//   - A real, user-chosen destination namespace  -> flatten (honor the single target).
 //   - pipelines.config.destination_schema_mode = "preserve"/"mirror" -> preserve.
 //   - pipelines.config.destination_schema_mode = "flatten"           -> flatten.
+//   - A server-level source -> preserve, unless the user typed a namespace.
+//   - A real, user-chosen destination namespace  -> flatten (honor the single target).
 //   - Auto: preserve when the selection spans more than one source schema.
 //     Single-schema selections keep the historical flatten behavior for backward
 //     compatibility.
 func (a *Agent) preserveSourceSchemaLayout(ctx context.Context, task ExecutorTask, tables []interface{}, destinationNamespace string) bool {
 	// 1. Explicit per-pipeline override wins over everything.
-	if a.db != nil && strings.TrimSpace(task.PipelineID) != "" {
-		var mode sql.NullString
-		_ = a.db.QueryRowContext(ctx,
-			`SELECT NULLIF(TRIM(LOWER(COALESCE(config->>'destination_schema_mode',''))),'') FROM pipelines WHERE id = $1`,
-			task.PipelineID,
-		).Scan(&mode)
-		if mode.Valid {
-			switch mode.String {
-			case "preserve", "mirror":
-				return true
-			case "flatten":
-				return false
-			}
-		}
+	switch SchemaModeOverride(ctx, a.db, task.PipelineID) {
+	case "preserve":
+		return true
+	case "flatten":
+		return false
 	}
-	// 2. A DELIBERATE, non-default destination namespace means "put everything
+	// 2. A server-level source (a MySQL/MongoDB/ClickHouse connection naming no
+	//    database) mirrors its databases even when the selection holds one, so a
+	//    batch run and its CDC sink agree (MirrorSourceNamespaces) — unless the
+	//    user typed a destination namespace.
+	if task.Source != nil && serverLevelSource(task.Source.Type, task.Source.Config) {
+		return a.mirrorSourceNamespacesFor(ctx, task, destinationNamespace)
+	}
+	// 3. A DELIBERATE, non-default destination namespace means "put everything
 	//    here" -> flatten. The engine-default seed (public/dbo/empty/"default")
 	//    is applied automatically to every pipeline, so it is NOT a deliberate
 	//    choice and must not silently defeat multi-schema mirroring.
 	if isRealNamespace(destinationNamespace) && !isEngineDefaultNamespace(destinationNamespace) {
 		return false
 	}
-	// 3. Auto: mirror when the source genuinely spans multiple schemas.
+	// 4. Auto: mirror when the source genuinely spans multiple schemas.
 	return len(distinctSourceSchemas(tables)) > 1
 }
 
@@ -418,6 +419,13 @@ type Agent struct {
 	cancel               context.CancelFunc
 	streamingPipelines   map[string]*StreamingPipelineInfo // Track long-running pipelines
 	streamingPipelinesMu sync.RWMutex                      // Protects streamingPipelines map
+
+	// discoverSchemaStub, when set, answers DiscoverSchema instead of a
+	// connector. Tests only; NewAgent never sets it, so it is nil in production.
+	discoverSchemaStub func(ctx context.Context, connectorType string, config map[string]interface{}) ([]TableMetadata, error)
+	// discoverTotalsStub is discoverSchemaStub plus the connector's table totals,
+	// for tests of the "N of M tables" path. Tests only; checked first.
+	discoverTotalsStub func(ctx context.Context, connectorType string, config map[string]interface{}) ([]TableMetadata, discoveryTotals, error)
 }
 
 // NewAgent creates a new Executor agent
@@ -1299,20 +1307,15 @@ func (a *Agent) executeTask(ctx context.Context, task ExecutorTask) ExecutorResp
 								cfg[k] = v
 							}
 						}
-						discovered, err := a.DiscoverSchema(ctx, task.Source.Type, cfg)
+						discovered, totals, err := a.discoverSchemaWithTotals(ctx, task.Source.Type, cfg)
 						if err != nil {
 							return ExecutorResponse{
 								TaskID:     task.TaskID,
 								PipelineID: task.PipelineID,
 								Status:     "waiting_for_table_selection",
 								Error:      "We couldn't list tables automatically. Please enter the source table/resource to sync.",
-								Result: map[string]interface{}{
-									"available_tables":   []map[string]interface{}{},
-									"source_type":        task.Source.Type,
-									"action_needed":      "table_selection",
-									"reason":             fmt.Sprintf("Schema discovery failed (%v). Enter a table/resource name manually (e.g. `users` or `mydb.users`).", err),
-									"allow_manual_entry": true,
-								},
+								Result: tableSelectionResult(task.Source.Type, task.Source.Config, nil,
+									fmt.Sprintf("Schema discovery failed (%v). Enter a table/resource name manually (e.g. `users` or `mydb.users`).", err)),
 							}
 						}
 						// Drop rsync's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
@@ -1324,36 +1327,18 @@ func (a *Agent) executeTask(ctx context.Context, task ExecutorTask) ExecutorResp
 								PipelineID: task.PipelineID,
 								Status:     "waiting_for_table_selection",
 								Error:      "No tables were discovered. Please enter the source table/resource to sync.",
-								Result: map[string]interface{}{
-									"available_tables":   []map[string]interface{}{},
-									"source_type":        task.Source.Type,
-									"action_needed":      "table_selection",
-									"reason":             fmt.Sprintf("No tables found in %s. Select/enter what to sync.", task.Source.Type),
-									"allow_manual_entry": true,
-								},
+								Result: tableSelectionResult(task.Source.Type, task.Source.Config, nil,
+									fmt.Sprintf("No tables found in %s. Select/enter what to sync.", task.Source.Type)),
 							}
 						}
 
-						tableOptions := make([]map[string]interface{}, 0, len(discovered))
-						for _, tbl := range discovered {
-							tableOptions = append(tableOptions, map[string]interface{}{
-								"name":      tbl.Name,
-								"schema":    tbl.Schema,
-								"row_count": tbl.RowCount,
-								"columns":   len(tbl.Columns),
-							})
-						}
 						return ExecutorResponse{
 							TaskID:     task.TaskID,
 							PipelineID: task.PipelineID,
 							Status:     "waiting_for_table_selection",
 							Error:      fmt.Sprintf("Select which table(s)/resource(s) to sync (%d available).", len(discovered)),
-							Result: map[string]interface{}{
-								"available_tables": tableOptions,
-								"source_type":      task.Source.Type,
-								"action_needed":    "table_selection",
-								"reason":           fmt.Sprintf("Select what to sync from %s before execution.", task.Source.Type),
-							},
+							Result: withDiscoveryTotals(tableSelectionResult(task.Source.Type, task.Source.Config, discovered,
+								fmt.Sprintf("Select what to sync from %s before execution.", task.Source.Type)), totals),
 						}
 					}
 					// Inject tables into Params for CDC execution.
@@ -1473,23 +1458,18 @@ func (a *Agent) executeTask(ctx context.Context, task ExecutorTask) ExecutorResp
 						}
 					}
 
-					discovered, err := a.DiscoverSchema(ctx, task.Source.Type, cfg)
+					discovered, totals, err := a.discoverSchemaWithTotals(ctx, task.Source.Type, cfg)
 					if err != nil {
 						return ExecutorResponse{
 							TaskID:     task.TaskID,
 							PipelineID: task.PipelineID,
 							Status:     "waiting_for_table_selection",
 							Error:      "We couldn't list tables automatically. Please enter the source table/resource to sync.",
-							Result: map[string]interface{}{
-								"available_tables": []map[string]interface{}{},
-								"source_type":      task.Source.Type,
-								"action_needed":    "table_selection",
-								"reason": fmt.Sprintf(
+							Result: tableSelectionResult(task.Source.Type, task.Source.Config, nil,
+								fmt.Sprintf(
 									"Schema discovery failed (%v). Enter a table/resource name manually (e.g. `users` or `mydb.users`).",
 									err,
-								),
-								"allow_manual_entry": true,
-							},
+								)),
 						}
 					}
 					// Drop rsync's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
@@ -1501,27 +1481,12 @@ func (a *Agent) executeTask(ctx context.Context, task ExecutorTask) ExecutorResp
 							PipelineID: task.PipelineID,
 							Status:     "waiting_for_table_selection",
 							Error:      "No tables were discovered. Please enter the source table/resource to sync.",
-							Result: map[string]interface{}{
-								"available_tables": []map[string]interface{}{},
-								"source_type":      task.Source.Type,
-								"action_needed":    "table_selection",
-								"reason": fmt.Sprintf(
+							Result: tableSelectionResult(task.Source.Type, task.Source.Config, nil,
+								fmt.Sprintf(
 									"No tables found in %s. Ensure the connection points to a database/schema with tables and has permissions. You can also enter a qualified name like `db.table`.",
 									task.Source.Type,
-								),
-								"allow_manual_entry": true,
-							},
+								)),
 						}
-					}
-
-					tableOptions := make([]map[string]interface{}, 0, len(discovered))
-					for _, tbl := range discovered {
-						tableOptions = append(tableOptions, map[string]interface{}{
-							"name":      tbl.Name,
-							"schema":    tbl.Schema,
-							"row_count": tbl.RowCount,
-							"columns":   len(tbl.Columns),
-						})
 					}
 
 					return ExecutorResponse{
@@ -1529,12 +1494,8 @@ func (a *Agent) executeTask(ctx context.Context, task ExecutorTask) ExecutorResp
 						PipelineID: task.PipelineID,
 						Status:     "waiting_for_table_selection",
 						Error:      fmt.Sprintf("Select which table(s)/resource(s) to sync (%d available).", len(discovered)),
-						Result: map[string]interface{}{
-							"available_tables": tableOptions,
-							"source_type":      task.Source.Type,
-							"action_needed":    "table_selection",
-							"reason":           fmt.Sprintf("You didn’t specify a table. Found %d tables/resources in %s. Select what to sync.", len(discovered), task.Source.Type),
-						},
+						Result: withDiscoveryTotals(tableSelectionResult(task.Source.Type, task.Source.Config, discovered,
+							fmt.Sprintf("You didn’t specify a table. Found %d tables/resources in %s. Select what to sync.", len(discovered), task.Source.Type)), totals),
 					}
 				}
 
@@ -1965,7 +1926,7 @@ func (a *Agent) executePlan(ctx context.Context, task ExecutorTask, planData map
 				for k, v := range toolConfig {
 					cfg[k] = v
 				}
-				tables, derr := a.DiscoverSchema(ctx, step.Tool, cfg)
+				tables, totals, derr := a.discoverSchemaWithTotals(ctx, step.Tool, cfg)
 				// Drop rsync's own bookkeeping/staging tables so single-table
 				// auto-selection and the multi-table HITL pause below both act on
 				// real user tables only (never `_rsync_*`/`flat_*`).
@@ -1984,28 +1945,18 @@ func (a *Agent) executePlan(ctx context.Context, task ExecutorTask, planData map
 						}
 						preview = fmt.Sprintf(" Available tables include: %s", strings.Join(names, ", "))
 					}
+					if derr != nil {
+						preview = fmt.Sprintf(" Listing tables failed: %s", llmscrub.ScrubMax(derr.Error(), 500))
+					}
 					// If multiple tables exist, pause for user selection (agentic HITL).
 					if derr == nil && len(tables) > 1 {
-						tableOptions := make([]map[string]interface{}, 0, len(tables))
-						for _, tbl := range tables {
-							tableOptions = append(tableOptions, map[string]interface{}{
-								"name":      tbl.Name,
-								"schema":    tbl.Schema,
-								"row_count": tbl.RowCount,
-								"columns":   len(tbl.Columns),
-							})
-						}
 						return ExecutorResponse{
 							TaskID:     task.TaskID,
 							PipelineID: task.PipelineID,
 							Status:     "waiting_for_table_selection",
 							Error:      fmt.Sprintf("Found %d tables in %s. Please select which table(s) to sync.", len(tables), step.Tool),
-							Result: map[string]interface{}{
-								"available_tables": tableOptions,
-								"source_type":      step.Tool,
-								"action_needed":    "table_selection",
-								"reason":           fmt.Sprintf("Found %d tables in %s. Select which table(s) to sync.", len(tables), step.Tool),
-							},
+							Result: withDiscoveryTotals(tableSelectionResult(step.Tool, toolConfig, tables,
+								fmt.Sprintf("Found %d tables in %s. Select which table(s) to sync.", len(tables), step.Tool)), totals),
 						}
 					}
 
@@ -2424,6 +2375,23 @@ func (a *Agent) executeDataTransfer(ctx context.Context, task ExecutorTask) Exec
 		}
 	}
 
+	// MongoDB CDC/streaming cannot mask yet (KI-MONGO-CDC-MASK-SILENT-NOOP): the
+	// sink lands each document as one packed field, so a column mask matches
+	// nothing and PII lands in plaintext. Refuse the run before any connector
+	// starts. Runs after the sync-mode backfill so plan-less reruns are covered.
+	if err := a.mongoCDCMaskBlockError(ctx, task, syncMode); err != nil {
+		log.WithFields(log.Fields{
+			"pipeline_id": task.PipelineID,
+			"sync_mode":   syncMode,
+		}).Error("⛔ Refusing MongoDB CDC run with an enabled mask transform")
+		return ExecutorResponse{
+			TaskID:     task.TaskID,
+			PipelineID: task.PipelineID,
+			Status:     "failed",
+			Error:      err.Error(),
+		}
+	}
+
 	// ==========================================================================
 	// PHASE 2 & 3: Use pre-provisioned topic from plan (not hardcoded)
 	// ==========================================================================
@@ -2645,25 +2613,56 @@ func schemaHistoryTopicFor(connectorName string) string {
 	return kafkaclient.Topic("schemahistory." + debeziumSafeName(connectorName, 80))
 }
 
+// heartbeatTopicsPrefix is the Go copy of _DEFAULT_HEARTBEAT_TOPICS_PREFIX passed through
+// _qualify_topic in the Debezium connector's MongoDB branch. It is product-namespaced so
+// the heartbeat topic lands inside the `rsync.*` grant a BYO-Kafka cluster gives us;
+// Debezium's own default (`__debezium-heartbeat`) would be refused by that ACL.
+//
+// The connector writes this value to BOTH `topic.heartbeat.prefix` (the key the
+// topic-naming strategy reads, and therefore the one that decides the name) and the
+// legacy `heartbeat.topics.prefix`. #1098 set only the legacy key, which is why the
+// heartbeat landed on `__debezium-heartbeat.*` while this pre-created topic stayed
+// empty — KI-CDC-HEARTBEAT-TOPIC-PREFIX-KEY-IGNORED.
+func heartbeatTopicsPrefix() string {
+	return kafkaclient.Topic("heartbeat")
+}
+
+// debeziumTopicPrefixFor predicts the topic.prefix the Debezium connector will set, so
+// the orchestrator can pre-create the topics named after it. It mirrors
+// connector.py:825 — `_qualify_topic(args.topic_prefix or connector_name)`.
+func debeziumTopicPrefixFor(params map[string]interface{}) string {
+	prefix := ""
+	if v, ok := params["topic_prefix"].(string); ok {
+		prefix = strings.TrimSpace(v)
+	}
+	if prefix == "" {
+		if v, ok := params["connector_name"].(string); ok {
+			prefix = strings.TrimSpace(v)
+		}
+	}
+	if prefix == "" {
+		return ""
+	}
+	return kafkaclient.Topic(prefix)
+}
+
+// heartbeatTopicFor returns the topic a heartbeating Debezium connector writes to.
+// Debezium composes it as <topic.heartbeat.prefix>.<topic.prefix> — prefix FIRST, which
+// is the opposite of what the name suggests and is the detail worth pinning in a test.
+func heartbeatTopicFor(topicPrefix string) string {
+	topicPrefix = strings.TrimSpace(topicPrefix)
+	if topicPrefix == "" {
+		return ""
+	}
+	return heartbeatTopicsPrefix() + "." + topicPrefix
+}
+
 // executeStreamingDataTransfer handles CDC/streaming mode via dynamic CDC provider
 //
 // FULLY GENERIC: Uses CDC provider from plan params (set by Planner's CDCProviderRegistry)
 // instead of hardcoding "debezium". Supports future CDC providers like native replication.
 func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorTask, kafkaTopic string, traceID string) ExecutorResponse {
 	log.Infof("Starting CDC streaming pipeline: %s", task.PipelineID)
-
-	normalizeDBType := func(s string) string {
-		v := strings.ToLower(strings.TrimSpace(s))
-		v = strings.ReplaceAll(v, "-", "_")
-		switch v {
-		case "postgres":
-			return "postgresql"
-		case "mariadb":
-			return "mysql"
-		default:
-			return v
-		}
-	}
 
 	getTablesList := func(v interface{}) []string {
 		out := []string{}
@@ -2784,6 +2783,21 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 
 	normalizedSource := normalizeDBType(sourceConnector)
 	normalizedDest := normalizeDBType(destConnector)
+
+	// A standalone mongod has no change streams, but Debezium accepts the connector
+	// anyway and retries forever — the run would show Running and write nothing. Fail
+	// here, before anything is provisioned, when the source's own connector reports a
+	// standalone. Unknown topology proceeds. mongodb_topology_check_wiring_test.go pins
+	// the ordering.
+	if msg := checkMongoDBCDCSource(ctx, a.TestConnectionResult, normalizedSource, sourceConnectorVersion(task.Source), task.Source.Config); msg != "" {
+		log.Errorf("❌ CDC source topology check failed for pipeline %s: %s", task.PipelineID, msg)
+		return ExecutorResponse{
+			TaskID:     task.TaskID,
+			PipelineID: task.PipelineID,
+			Status:     "failed",
+			Error:      msg,
+		}
+	}
 
 	// Hard-block: relational destinations require PKs for CDC correctness.
 	if normalizedDest == "postgresql" || normalizedDest == "mysql" {
@@ -2981,7 +2995,7 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 	// measure size/PKs, discovery fails) → blocking (safe, == today's behavior). Only
 	// relevant when an initial snapshot was going to run at all (cdc_mode=initial).
 	snapshotStrategy := snapshotStrategyBlocking
-	if cdcMode == "initial" && hybridIsPostgresFamily(sourceConnector) {
+	if cdcMode == "initial" && isPostgresFamily(sourceConnector) {
 		est := a.estimateCDCSourceSize(ctx, task, tablesForRouting)
 		threshold := incrementalSnapshotRowThreshold()
 		if est.measured {
@@ -3152,22 +3166,10 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 	//      tries to create its own resources (it would create slot first).
 	//
 	// When adding a new PostgreSQL-compatible source (CockroachDB, Aurora PG,
-	// AlloyDB, Neon, Supabase …), add its normalised name to the isPostgresFamily
-	// check below. Never rely on Debezium's autocreate modes for these sources.
+	// AlloyDB, Neon, Supabase …), add its normalised name to postgresFamilyTypes
+	// (hybrid_cdc.go) and shared/postgres_family_golden.json. Never rely on
+	// Debezium's autocreate modes for these sources.
 	// ─────────────────────────────────────────────────────────────────────────
-	isPostgresFamily := func(t string) bool {
-		// normalizeDBType lower-cases and replaces "-" with "_".
-		switch normalizeDBType(t) {
-		case "postgresql",
-			"cockroachdb", "cockroach_db", // CockroachDB
-			"aurora_postgresql", // AWS Aurora PostgreSQL
-			"alloydb",           // GCP AlloyDB
-			"neon",              // Neon serverless Postgres
-			"supabase":          // Supabase (Postgres under the hood)
-			return true
-		}
-		return false
-	}
 	if isPostgresFamily(sourceConnector) {
 		if strings.TrimSpace(sourceConnID) == "" || sourceConnID == "auto" {
 			return ExecutorResponse{
@@ -3429,6 +3431,39 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 	// first restart.
 	params["schema_history_topic"] = shTopic
 
+	// Pre-create the Debezium HEARTBEAT topic, for the same reason and on the same terms
+	// as the schema-history topic above: nothing else creates it, and a customer-managed
+	// broker with auto-create off (or an ACL scoped to `rsync.*`) would otherwise leave
+	// the connector unable to publish heartbeats at all.
+	//
+	// MongoDB only, because that is where the connector enables heartbeats. A heartbeat
+	// commits a FRESH resume token on a timer even when the source is idle, which is what
+	// keeps the token younger than the oplog window
+	// (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL) and what gives the Sentinel's freshness
+	// watchdog a liveness beacon to measure against.
+	//
+	// The prefix is passed to the connector rather than left to a second, independent
+	// derivation — the same anti-drift rule as schema_history_topic: two copies of a
+	// naming rule that disagree create one topic and write to another.
+	if strings.EqualFold(normalizedSource, "mongodb") {
+		hbPrefix := heartbeatTopicsPrefix()
+		hbTopic := heartbeatTopicFor(debeziumTopicPrefixFor(params))
+		if a.kafkaManager != nil && strings.TrimSpace(hbTopic) != "" {
+			// Ordinary retention: a heartbeat is a liveness tick, worthless once read.
+			// Deliberately NOT retention.ms=-1 — unlike the schema history, nothing
+			// replays this topic.
+			if err := a.kafkaManager.EnsureTopicExistsWithConfig(hbTopic, 1, map[string]string{
+				"cleanup.policy": "delete",
+			}); err != nil {
+				log.WithError(err).WithField("topic", hbTopic).
+					Warn("⚠️  Could not pre-create the Debezium heartbeat topic — if the broker does not auto-create it, the MongoDB connector cannot refresh its resume token while the source is idle, and the stream will die on a later reconnect")
+			}
+		}
+		if strings.TrimSpace(hbPrefix) != "" {
+			params["heartbeat_topics_prefix"] = hbPrefix
+		}
+	}
+
 	cdcReq := mcp.ExecuteRequest{
 		Connector: cdcProvider,
 		Operation: "start_sync",
@@ -3483,6 +3518,28 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 		} else if nested, ok := startResp.Result["result"].(map[string]interface{}); ok {
 			if cn, ok := nested["connector_name"].(string); ok && strings.TrimSpace(cn) != "" {
 				debeziumConnName = strings.TrimSpace(cn)
+			}
+		}
+	}
+
+	// #19: start_sync only proves Kafka Connect accepted the config. Confirm the
+	// Debezium task actually started before the sink is attached and the run is
+	// reported as "running" — a task that FAILED on its first source connection used
+	// to leave the pipeline Running while it wrote nothing.
+	if cdcProvider == "debezium" {
+		if reason := verifyCDCConnectorStarted(ctx, kafkaConnectStatusURL(debeziumConnName), startResultBool(startResp.Result, "already_running")); reason != "" {
+			log.WithFields(log.Fields{
+				"pipeline_id":  task.PipelineID,
+				"cdc_provider": cdcProvider,
+				"connector":    debeziumConnName,
+				"error":        reason,
+				"sync_mode":    "cdc",
+			}).Error("❌ CDC connector did not start")
+			return ExecutorResponse{
+				TaskID:     task.TaskID,
+				PipelineID: task.PipelineID,
+				Status:     "failed",
+				Error:      fmt.Sprintf("%s connector did not start: %s", cdcProvider, reason),
 			}
 		}
 	}
@@ -3616,10 +3673,10 @@ func (a *Agent) validateCDCSourcePrerequisites(ctx context.Context, normalizedSo
 	case "sqlserver":
 		vErrs, err = cdc.NewSQLServerManager(a.db).ValidatePrerequisites(ctx, sourceConnID)
 	case "mongodb":
-		// MongoDB defers the replica-set/privilege check to Debezium connector
-		// start (dependency-free provider); ValidatePrerequisites returns no
-		// blocking errors. Wire it so mongodb is a known source, not the fail-
-		// closed default.
+		// ValidatePrerequisites returns no blocking errors (dependency-free
+		// provider). The replica-set check is checkMongoDBCDCSource, which
+		// executeStreamingDataTransfer runs before calling this. Wire it so mongodb
+		// is a known source, not the fail-closed default.
 		vErrs, err = cdc.NewMongoDBManager(a.db).ValidatePrerequisites(ctx, sourceConnID)
 	case "oracle":
 		// Oracle LogMiner CDC pre-flight: ARCHIVELOG mode, DB-level supplemental
@@ -3778,6 +3835,22 @@ func resolveDestTableName(tableName, destinationNamespace string, destIsObjectSt
 	return tableName
 }
 
+// sourceTableForStats is the SOURCE-side name sent to the sink as "source_table",
+// used only to label TABLE_STATS. The "table" field is the destination identifier
+// (resolveDestTableName), so with a destination namespace the stats row for a
+// MongoDB datingapp.matches collection read "demo.matches". A bare name (MongoDB
+// collections) is qualified with the source database; a qualified name is kept.
+func sourceTableForStats(tableName, sourceDatabase string) string {
+	name := strings.TrimSpace(tableName)
+	if name == "" || strings.Contains(name, ".") {
+		return name
+	}
+	if db := strings.TrimSpace(sourceDatabase); db != "" {
+		return db + "." + name
+	}
+	return name
+}
+
 // resolveBatchDataset picks the top-level object-key prefix segment ("dataset")
 // a table's batch output must land under.
 //
@@ -3793,11 +3866,11 @@ func resolveDestTableName(tableName, destinationNamespace string, destIsObjectSt
 // prefix — splitting one pipeline's batch output in two. Pinning the id slug here
 // makes claim-check, inline, EOF, and the reload delete-prefix all agree.
 //
-// NOTE: this governs the BATCH bronze layout only. Streaming CDC output is a
-// SEPARATE, deliberately different layout — the AWS DMS S3 target style
-// ({path_prefix}/{schema}/{table}/{date}/…, no pipeline-id segment; see #585
-// kafka-sink-worker cdcObjectKey). Batch (pipeline-scoped bronze) and CDC (DMS)
-// prefixes are intentionally distinct; this helper does not touch CDC.
+// NOTE: this governs the BATCH bronze layout only. Streaming CDC keys are built by
+// the kafka-sink-worker (cdcObjectKey), which since #14 uses the same
+// {path_prefix}/{slug(pipeline_id)}/{namespace or source schema}/{table}/ root
+// (the #585 no-pipeline-segment layout let two pipelines collide). Keep the two
+// slug rules equivalent for pipeline UUIDs; this helper does not touch CDC.
 //
 // Relational destinations ignore `dataset` entirely (they key by the db_or_schema
 // namespace), so their resolved value is passed through unchanged.
@@ -4008,6 +4081,20 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		})
 	}
 
+	// A reload cleans and rewrites every table, so it is the one point a pipeline
+	// already on object-storage layout v1 moves to v2 (object_layout_v2.go). It runs
+	// before the sink start, which then reads the recorded version.
+	if runModeGlobal == storage.RunModeReload {
+		if _, err := resolveObjectLayout(ctx, a.db, objectLayoutInputFor(task, resolveDestinationNamespace(ctx, a.db, task)), objectLayoutReload); err != nil {
+			return ExecutorResponse{
+				TaskID:     task.TaskID,
+				PipelineID: task.PipelineID,
+				Status:     "failed",
+				Error:      err.Error(),
+			}
+		}
+	}
+
 	// Step 1: Start Kafka-MCP-Sink so it can consume while we export.
 	// This avoids the UX of "pipeline executing but no data written yet" for large tables.
 	// If sink cannot start, fail fast (otherwise we'd produce to Kafka but never write to destination).
@@ -4039,10 +4126,18 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		for k, v := range task.Source.Config {
 			srcCfg[k] = v
 		}
-		discovered, err := a.DiscoverSchema(ctx, task.Source.Type, srcCfg)
+		discovered, totals, err := a.discoverSchemaWithTotals(ctx, task.Source.Type, srcCfg)
 		if err != nil {
 			log.Warnf("⚠️  Could not discover schema for PK/type metadata (continuing without PKs/types): %v", err)
 		} else {
+			// A selected table past the discovery cap gets no PK (the sink falls
+			// back to a content-hash key) and untyped columns. Say so by name.
+			if totals.truncated() {
+				if missing := missingSelectedTables(task.Params["tables"], discovered); len(missing) > 0 {
+					log.Warnf("⚠️  Source has %d tables, discovery returned %d: no PK/type metadata for %d selected table(s): %v",
+						totals.Available, totals.Discovered, len(missing), missing)
+				}
+			}
 			for _, tbl := range discovered {
 				full := strings.TrimSpace(tbl.Name)
 				if strings.TrimSpace(tbl.Schema) != "" {
@@ -4145,16 +4240,28 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 	// multi-schema source no longer collides on same-named tables. See
 	// preserveSourceSchemaLayout.
 	pipelineDestNamespace := resolveDestinationNamespace(ctx, a.db, task)
+	// The layout the sink start recorded. v2 stamps an object_layout block on every
+	// batch and EOF message of each table (objectLayoutV2Message).
+	objectLayout, objectLayoutErr := resolveObjectLayout(ctx, a.db, objectLayoutInputFor(task, pipelineDestNamespace), objectLayoutRead)
+	if objectLayoutErr != nil {
+		return ExecutorResponse{
+			TaskID:     task.TaskID,
+			PipelineID: task.PipelineID,
+			Status:     "failed",
+			Error:      objectLayoutErr.Error(),
+		}
+	}
 	preserveSchemas := a.preserveSourceSchemaLayout(ctx, task, tables, pipelineDestNamespace)
 	if preserveSchemas {
 		log.Infof("🗂️ Destination schema layout: PRESERVE — mirroring %d source schema(s) at the destination (per-table namespace = source schema)", len(distinctSourceSchemas(tables)))
 	}
 
-	var accMu sync.Mutex           // guards: totalRows, totalBytes, minioFilesCreated, directKafkaMessages, hadExportError, lastExportError, perTableStats
-	var fatalErrMu sync.Mutex      // guards fatalErr
-	var fatalErr *ExecutorResponse // first fatal per-table error (transform / checkpoint)
-	var contMu sync.Mutex          // guards needsContinuation
-	needsContinuation := false     // set when any table hit its per-dispatch chunk budget with more data
+	var accMu sync.Mutex              // guards: totalRows, totalBytes, minioFilesCreated, directKafkaMessages, hadExportError, lastExportError, perTableStats
+	var lastLiveMetricsEmit time.Time // guarded by accMu; throttles live DATA_PLANE_METRICS (see liveBatchMetricsDue)
+	var fatalErrMu sync.Mutex         // guards fatalErr
+	var fatalErr *ExecutorResponse    // first fatal per-table error (transform / checkpoint)
+	var contMu sync.Mutex             // guards needsContinuation
+	needsContinuation := false        // set when any table hit its per-dispatch chunk budget with more data
 	sem := make(chan struct{}, tableConcurrency)
 	var wg sync.WaitGroup
 
@@ -4241,7 +4348,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		// batch path and the reload delete-prefix (see resolveBatchDataset). Without
 		// this, claim-checked (large) tables leaked the human-readable
 		// pipelines.dataset name slug and split off under a second top-level prefix.
-		// (Streaming CDC uses the separate DMS-style layout, #585 — not touched here.)
+		// (Streaming CDC keys are built in the sink with the same pipeline-id root, #14.)
 		// Relational dests are unchanged.
 		dataset = resolveBatchDataset(destIsObjectStorage, task.PipelineID, dataset)
 		dbOrSchema := ""
@@ -4271,7 +4378,34 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		// namespace → BARE table (connector resolves its own database/public schema, so
 		// the source schema never leaks); object storage → source-derived name unchanged.
 		destTableName := resolveDestTableName(tableName, destinationNamespace, destIsObjectStorage)
+		sourceDB := ""
+		if task.Source != nil && task.Source.Config != nil {
+			sourceDB = task.Source.Config["database"]
+		}
+		statsSourceTable := sourceTableForStats(tableName, sourceDB)
 		runMode := string(runModeGlobal)
+
+		// Layout v2: this table's object_layout block, nil on v1. A table the layout
+		// cannot name fails instead of writing under a v1 key.
+		var srcCfgForLayout map[string]string
+		if task.Source != nil {
+			srcCfgForLayout = task.Source.Config
+		}
+		objectLayoutMsg, layoutErr := objectLayoutV2Message(objectLayout, srcCfgForLayout, tableName, runDate)
+		if layoutErr != nil {
+			fatalErrMu.Lock()
+			if fatalErr == nil {
+				fatalErr = &ExecutorResponse{
+					TaskID:     task.TaskID,
+					PipelineID: task.PipelineID,
+					Status:     "failed",
+					Error:      layoutErr.Error(),
+				}
+			}
+			fatalErrMu.Unlock()
+			log.Errorf("❌ %v", layoutErr)
+			return
+		}
 
 		// run_mode=reload: eagerly clean destination scope before producing
 		// any batches. Two sink kinds:
@@ -4286,7 +4420,9 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		// Without this, a reload re-runs INSERT/UPSERT into a populated table
 		// and either silently appends duplicates or hits unique-key conflicts
 		// (the bug observed on Shopify→Postgres pipelines pre-fix).
-		if runModeGlobal == storage.RunModeReload && task.Destination != nil {
+		// Layout v2 skips this block: the sink cleans the table folder itself when the
+		// reload's first batch arrives (a new LOAD generation).
+		if runModeGlobal == storage.RunModeReload && task.Destination != nil && objectLayoutMsg == nil {
 			destType := strings.TrimSpace(task.Destination.Type)
 			looksLikeObjectStorage := destType == "minio" || strings.Contains(destType, "s3")
 			destConfig := task.Destination.Config
@@ -4722,6 +4858,15 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			if len(rows) == 0 {
 				if batchIdx == 0 {
 					log.Infof("  Table %s: no rows to export", tableName)
+				} else if cursor != nil {
+					// A full page followed by an empty keyset page is a normal end
+					// when the table size is an exact multiple of the batch size, but
+					// it is also exactly what a cursor that no longer matches the key
+					// type looks like (MongoDB int64 _id resumed as "10000" stopped at
+					// 10,000 rows and reported Completed). Say so, with the numbers,
+					// so a short copy is visible in the logs.
+					log.Warnf("  Table %s: keyset page %d returned 0 rows after a full page (rows this dispatch=%d); treating as end of table — if the source holds more rows, the connector's cursor did not match its key type",
+						tableName, batchIdx, dispatchRows)
 				}
 				break
 			}
@@ -4891,7 +5036,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 				if err != nil {
 					log.Warnf("MinIO staging failed after retry: %v - falling back to Kafka chunks", err)
 					// Fallback to chunked Kafka
-					a.sendChunkedToKafka(ctx, rows, tableName, destTableName, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode)
+					a.sendChunkedToKafka(ctx, rows, tableName, destTableName, statsSourceTable, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode, objectLayoutMsg)
 					accMu.Lock()
 					directKafkaMessages++
 					accMu.Unlock()
@@ -4901,6 +5046,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 						"pipeline_id":     task.PipelineID,
 						"execution_id":    executionID,
 						"table":           destTableName,
+						"source_table":    statsSourceTable, // stats label only; see sourceTableForStats
 						"primary_keys":    primaryKeys,
 						"key_fields":      primaryKeys, // alias for sink compatibility
 						"dataset":         dataset,
@@ -4917,6 +5063,9 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					}
 					if len(colTypesForTable) > 0 {
 						message["column_types"] = colTypesForTable
+					}
+					if objectLayoutMsg != nil {
+						message["object_layout"] = objectLayoutMsg
 					}
 
 					msgBytes, _ := json.Marshal(message)
@@ -4960,7 +5109,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			} else {
 				// INLINE PATH: Send directly to Kafka
 				log.Infof("  📨 Inline payload (%d KB, inline_max=%d KB), sending directly to Kafka", dataSize/1024, inlineMax/1024)
-				a.sendChunkedToKafka(ctx, rows, tableName, destTableName, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode)
+				a.sendChunkedToKafka(ctx, rows, tableName, destTableName, statsSourceTable, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode, objectLayoutMsg)
 				accMu.Lock()
 				directKafkaMessages++
 				accMu.Unlock()
@@ -4974,11 +5123,19 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			tableS.bytesRead += dataSize
 			snapshotTotalRows := totalRows
 			snapshotTotalBytes := totalBytes
+			emitLive := liveBatchMetricsDue(os.Getenv("ENABLE_REALTIME_DATA_PLANE_METRICS"), lastLiveMetricsEmit, time.Now())
+			if emitLive {
+				lastLiveMetricsEmit = time.Now()
+			}
 			accMu.Unlock()
 
-			// Emit periodic DATA_PLANE_METRICS for live UI updates (after each batch)
-			// This is optional and gated behind ENABLE_REALTIME_DATA_PLANE_METRICS (default: off)
-			if os.Getenv("ENABLE_REALTIME_DATA_PLANE_METRICS") == "true" {
+			// Emit DATA_PLANE_METRICS for live UI updates while the copy runs.
+			// This used to be opt-in only (ENABLE_REALTIME_DATA_PLANE_METRICS,
+			// default off), so a batch run's only DATA_PLANE_METRICS row was the
+			// final one written after completion and Monitoring -> Overview showed
+			// "Rows 0 / 0 B" for the whole copy. Now throttled by default; the
+			// env var set to "true" still emits after every batch.
+			if emitLive {
 				a.emitBatchMetrics(ctx, task.PipelineID, executionID, snapshotTotalRows, snapshotTotalBytes, tableName)
 			}
 			if fileMetrics != nil {
@@ -5148,6 +5305,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			"pipeline_id":      task.PipelineID,
 			"execution_id":     executionID,
 			"table":            destTableName,
+			"source_table":     statsSourceTable, // stats label only; see sourceTableForStats
 			"dataset":          dataset,
 			"db_or_schema":     dbOrSchema,
 			"dt":               runDate,
@@ -5158,6 +5316,11 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			"total_bytes_read": tableS.bytesRead,
 			"trace_id":         traceID,
 			"timestamp":        time.Now().UTC().Format(time.RFC3339),
+		}
+		// Layout v2 writes the table's _MANIFEST.json / _SUCCESS from the EOF, so it
+		// needs the same block as the data messages.
+		if objectLayoutMsg != nil {
+			eofMsg["object_layout"] = objectLayoutMsg
 		}
 		if b, err := json.Marshal(eofMsg); err == nil {
 			_ = a.kafkaManager.ProduceWithHeaders(kafkaTopic, []byte(tableName), b, map[string]string{
@@ -5469,7 +5632,7 @@ func (a *Agent) stageDataToMinIO(ctx context.Context, data []map[string]interfac
 }
 
 // sendChunkedToKafka sends data directly to Kafka in chunks
-func (a *Agent) sendChunkedToKafka(ctx context.Context, rows []map[string]interface{}, tableName string, destTableName string, dbOrSchema string, primaryKeys []string, columnTypes map[string]string, kafkaTopic string, traceID string, pipelineID string, executionID string, exportBatchIdx int, exportBatchOffset int, runMode string) {
+func (a *Agent) sendChunkedToKafka(ctx context.Context, rows []map[string]interface{}, tableName string, destTableName string, sourceTable string, dbOrSchema string, primaryKeys []string, columnTypes map[string]string, kafkaTopic string, traceID string, pipelineID string, executionID string, exportBatchIdx int, exportBatchOffset int, runMode string, objectLayout map[string]interface{}) {
 	// Target <= ~750KB per Kafka message to reduce overhead while staying below typical broker limits.
 	// (Kafka defaults vary; 1MB is common.)
 	const targetBytes = 750 * 1024
@@ -5511,6 +5674,7 @@ func (a *Agent) sendChunkedToKafka(ctx context.Context, rows []map[string]interf
 			"pipeline_id":  pipelineID,
 			"execution_id": executionID,
 			"table":        destTableName,
+			"source_table": sourceTable, // stats label only; see sourceTableForStats
 			"primary_keys": primaryKeys,
 			"key_fields":   primaryKeys, // alias for sink compatibility
 			"data":         batch,
@@ -5528,6 +5692,9 @@ func (a *Agent) sendChunkedToKafka(ctx context.Context, rows []map[string]interf
 		// config["database"] (e.g. "pipeline_test") — silent wrong-DB landing.
 		if dbOrSchema != "" {
 			message["db_or_schema"] = dbOrSchema
+		}
+		if objectLayout != nil {
+			message["object_layout"] = objectLayout
 		}
 		if runMode != "" {
 			message["run_mode"] = runMode
@@ -5563,6 +5730,25 @@ func (a *Agent) sendChunkedToKafka(ctx context.Context, rows []map[string]interf
 
 		start = end
 	}
+}
+
+// liveBatchMetricsInterval is the minimum gap between two live (mid-copy)
+// DATA_PLANE_METRICS events for one execution when per-batch emission is not
+// explicitly enabled.
+const liveBatchMetricsInterval = 5 * time.Second
+
+// liveBatchMetricsDue reports whether a mid-copy DATA_PLANE_METRICS event should
+// be emitted now. envFlag is ENABLE_REALTIME_DATA_PLANE_METRICS: "true" emits after
+// every batch, "false" disables live metrics entirely, anything else (the default,
+// unset) emits at most once per liveBatchMetricsInterval. Pure, for unit tests.
+func liveBatchMetricsDue(envFlag string, last, now time.Time) bool {
+	switch strings.ToLower(strings.TrimSpace(envFlag)) {
+	case "true":
+		return true
+	case "false":
+		return false
+	}
+	return last.IsZero() || now.Sub(last) >= liveBatchMetricsInterval
 }
 
 // emitBatchMetrics emits DATA_PLANE_METRICS for batch pipelines (periodic + final).
@@ -5951,6 +6137,179 @@ func buildCDCSinkTopics(prefix, dbQualifier, sourceType string, tablesList []str
 	return topics
 }
 
+// cdcDataTopicPartitions is the partition count rsync asks for when it pre-creates a
+// CDC data topic ("{ns}{prefix}.{db}.{table}") for the streaming sink.
+//
+// It must be 1 because rsync is not the only thing that creates these topics. The
+// pre-create runs AFTER start_sync, so Debezium can produce the first change event
+// first, and then the broker auto-creates the topic with its own num.partitions (1 on
+// the bundled broker; the Debezium connector sets no topic.creation.* override).
+// Whichever side wins keeps its count, because the pre-create leaves an existing topic
+// alone. Asking for 3 here made the partition count depend on timing: the same
+// pipeline got 1 partition on one run and 3 on the next.
+//
+// One partition is also the only count that keeps every change on a topic in a single
+// order. Changes to one row share a message key and so share a partition at any
+// stable count, but rows without a key do not, and adding partitions later moves keys.
+// Existing topics are never shrunk here; Kafka cannot reduce a topic's partitions.
+const cdcDataTopicPartitions int32 = 1
+
+// sinkTopicPreCreator is the part of *kafka.Manager the CDC sink topic pre-create
+// needs, so a test can record what is created, with how many partitions, and when.
+type sinkTopicPreCreator interface {
+	EnsureTopicExists(topic string, partitions int32) error
+	GetTopicMetadata(topic string) (*kafka.TopicMetadata, error)
+}
+
+// sinkTopicInputs is what startKafkaMCPSink knows when it picks the sink's topics.
+type sinkTopicInputs struct {
+	kafkaTopic    string   // the topic the CDC provider reported, or the batch topic
+	syncMode      string   // lower-cased pipeline sync mode
+	tables        []string // the selected tables
+	unifiedTopic  string   // params["cdc_unified_topic"], trimmed
+	sourceType    string   // task.Source.Type
+	pipelineID    string   // for log fields only
+	batchBackfill bool     // kafkaTopic is the hybrid batch topic "pipeline.<id>.data"
+}
+
+// deriveCDCSinkTopics rebuilds one Debezium topic per selected table for the CDC
+// streaming sink. It returns nil when the rebuild does not apply, and the sink then
+// keeps the single provider-reported topic.
+//
+// The batch-backfill sink is started through the same function with the BATCH topic
+// "pipeline.<id>.data" while the pipeline's sync_mode is "cdc"; rebuilding from that
+// name would derive a "pipeline.<db>.<table>" topic that does not exist, so the sink
+// would subscribe to nothing and the backfilled rows would never be applied.
+func deriveCDCSinkTopics(in sinkTopicInputs) []string {
+	if in.syncMode != "cdc" || len(in.tables) == 0 || in.batchBackfill {
+		return nil
+	}
+	// Derive the namespace-qualified prefix (e.g. "rsync.cdc-4631bd14") and the
+	// database/schema qualifier from the live topic. Splitting the raw name on its first
+	// dot is what broke MongoDB multi-collection CDC: it took the "rsync" namespace as
+	// the prefix. See deriveCDCTopicParts.
+	prefix, dbQualifier := deriveCDCTopicParts(in.kafkaTopic)
+	if prefix == "" {
+		return nil
+	}
+	return buildCDCSinkTopics(prefix, dbQualifier, in.sourceType, in.tables, in.unifiedTopic)
+}
+
+// preCreateCDCSinkTopics creates each sink topic that does not exist yet, with
+// cdcDataTopicPartitions partitions, and warns about an existing topic that has more.
+//
+// Debezium only creates a CDC topic on its first change event; with
+// snapshot.mode=recovery/no_data (hybrid CDC, no snapshot) that can be much later, so
+// a sink started against a missing topic gets 0 partitions and consumes nothing. The
+// CDC sink rejects non-Debezium messages, so the topic is created empty through the
+// admin API rather than with a bootstrap marker. Best-effort: a failure is logged and
+// never blocks the sink start.
+//
+// The partition count is read only after EnsureTopicExists succeeds. Reading metadata
+// for a topic that does not exist can make a broker with auto-create on create it
+// with its default count, which is the race this function exists to avoid.
+func preCreateCDCSinkTopics(km sinkTopicPreCreator, topicsParam interface{}, pipelineID string) {
+	var names []string
+	switch tp := topicsParam.(type) {
+	case string:
+		names = []string{tp}
+	case []string:
+		names = tp
+	}
+	for _, name := range names {
+		if strings.TrimSpace(name) == "" {
+			continue
+		}
+		if err := km.EnsureTopicExists(name, cdcDataTopicPartitions); err != nil {
+			// Deliberately not "will rely on auto-create": auto-creation is a broker
+			// setting this platform does not control on a customer-managed cluster,
+			// and when it is off the sink simply consumes nothing forever while the
+			// pipeline reports running. Say what actually happens.
+			log.WithError(err).WithField("topic", name).
+				Warn("⚠️  Could not pre-create CDC topic for sink — the sink will consume nothing unless the broker auto-creates it")
+			continue
+		}
+		md, err := km.GetTopicMetadata(name)
+		if err != nil || md == nil {
+			log.WithError(err).WithField("topic", name).
+				Debug("Could not read the partition count of the CDC topic; skipping the partition check")
+			continue
+		}
+		if md.NumPartitions > int(cdcDataTopicPartitions) {
+			log.WithFields(log.Fields{
+				"pipeline_id": pipelineID,
+				"topic":       name,
+				"partitions":  md.NumPartitions,
+			}).Warnf("⚠️  CDC topic %q already exists with %d partitions; rsync creates CDC topics with %d. "+
+				"It was left as it is, because Kafka cannot reduce a topic's partitions. "+
+				"Changes to one row still arrive in order when the table has a primary key (MongoDB always has _id). "+
+				"Do not add partitions to this topic while the pipeline runs: that moves rows between partitions "+
+				"and older versions of a row can then overwrite newer ones in the destination.",
+				name, md.NumPartitions, cdcDataTopicPartitions)
+		}
+	}
+}
+
+// prepareSinkTopics returns the value for the sink's "topics" config and pre-creates
+// those topics.
+//
+// The provider-topic backstop MUST run before the pre-create. When the derivation is
+// wrong, every derived name is a topic nobody writes to, and pre-creating them first
+// makes them real on the broker, so the sink looks healthy while delivering nothing.
+func prepareSinkTopics(km sinkTopicPreCreator, in sinkTopicInputs) interface{} {
+	topicsParam := interface{}(in.kafkaTopic)
+	if topics := deriveCDCSinkTopics(in); len(topics) > 0 {
+		// Skipped when a unified topic is configured: that mode deliberately remaps
+		// dimension tables away from their own Debezium topic, so the provider topic may
+		// be absent by design.
+		if in.unifiedTopic == "" {
+			topics = ensureProviderTopicSubscribed(topics, in.kafkaTopic, in.pipelineID)
+		}
+		topicsParam = topics
+	}
+	// Skip the batch-backfill sink: its topic already exists from the bootstrap marker.
+	if !in.batchBackfill && km != nil {
+		preCreateCDCSinkTopics(km, topicsParam, in.pipelineID)
+	}
+	return topicsParam
+}
+
+// sinkTopicCreatorFor returns m as a sinkTopicPreCreator, or a nil interface when m is
+// nil. Storing a nil *kafka.Manager in the interface would make it non-nil, so
+// prepareSinkTopics would call it and panic instead of skipping the pre-create.
+func sinkTopicCreatorFor(m *kafka.Manager) sinkTopicPreCreator {
+	if m == nil {
+		return nil
+	}
+	return m
+}
+
+// sinkTopicInputsFor gathers what prepareSinkTopics needs for one sink start.
+//
+// syncMode, tables and batchBackfill are passed in, not re-read from the task, because
+// startKafkaMCPSink has already resolved them: syncMode falls back to the pipelines row
+// when the task has none, tables come from either "tables" or "selected_tables" with
+// blank names dropped, and batchBackfill is the same value that picks the consumer
+// group. Reading them again here would put a second copy of those rules in play. The
+// unified topic and the source type come only from the task.
+func sinkTopicInputsFor(task ExecutorTask, kafkaTopic, syncMode string, tables []string, batchBackfill bool) sinkTopicInputs {
+	in := sinkTopicInputs{
+		kafkaTopic:    kafkaTopic,
+		syncMode:      syncMode,
+		tables:        tables,
+		pipelineID:    task.PipelineID,
+		batchBackfill: batchBackfill,
+	}
+	// A nil Params map reads as empty, so no nil check is needed here.
+	if v, ok := task.Params["cdc_unified_topic"].(string); ok {
+		in.unifiedTopic = strings.TrimSpace(v)
+	}
+	if task.Source != nil {
+		in.sourceType = task.Source.Type
+	}
+	return in
+}
+
 func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaTopic string, executionID string, traceID string) *mcp.ExecuteResponse {
 	log.Infof("🔌 Starting Kafka-MCP-Sink for destination: %s", task.Destination.Type)
 
@@ -5974,6 +6333,15 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 	// to the destination connector so BOTH batch and CDC land in <namespace>.<table>.
 	// Empty for non-namespaced pipelines (connector falls back to config["database"]).
 	destinationNamespace := resolveDestinationNamespace(ctx, a.db, task)
+
+	// Object-storage layout: decided here, once, at the first sink start (0 → 1 or
+	// 2), then read. The sink builds CDC keys from these fields; a pipeline whose
+	// layout cannot be established does not start a sink.
+	objectLayout, err := resolveObjectLayout(ctx, a.db, objectLayoutInputFor(task, destinationNamespace), objectLayoutDecide)
+	if err != nil {
+		log.WithField("pipeline_id", task.PipelineID).Errorf("❌ %v", err)
+		return &mcp.ExecuteResponse{Success: false, Error: err.Error()}
+	}
 
 	// Runtime is versioned-only; resolve destination version to a concrete vX.Y.Z so the sink can
 	// route to `rsync-ai-<dest>-vX-Y-Z-mcp` (no stable `rsync-ai-<dest>-mcp` container).
@@ -6059,7 +6427,7 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 			task.PipelineID,
 			executionID,
 			"mcp_source",
-			task.Source.Type+"@"+strings.TrimSpace(task.Source.Version),
+			task.Source.Type+"@"+concreteVersionOrRequested(a.mcpManager, task.Source.Type, task.Source.Version),
 			[]string{"validating", "syncing"},
 			nil,
 		)
@@ -6342,76 +6710,16 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 	// Debezium emits one topic per table: <topic_prefix>.<db>.<table>.
 	// Historically we passed only the first returned kafka_topic, which meant only one table would be applied
 	// (others would show captured activity but applied_* stayed at 0).
-	topicsParam := interface{}(kafkaTopic)
-	// Only rebuild per-table Debezium topics for the actual CDC STREAMING sink, whose
-	// kafkaTopic is a Debezium topic (e.g. "cdc-<id>.<db>.<table>"). The hybrid-CDC
-	// batch-backfill sink is started via this same function but with the BATCH topic
-	// "pipeline.<id>.data" — and the pipeline's sync_mode is "cdc" — so without this
-	// guard the rebuild derives a bogus "pipeline.<db>.<table>" topic (prefix taken from
-	// "pipeline.<id>.data") that does not exist. The sink then subscribes to nothing and
-	// the backfilled rows in "pipeline.<id>.data" are never applied to the destination.
+	//
+	// prepareSinkTopics rebuilds those topics (not for the batch-backfill sink; see
+	// deriveCDCSinkTopics), runs the provider-topic backstop, and only THEN pre-creates
+	// the topics with cdcDataTopicPartitions partitions.
 	// (isBatchBackfillTopic is computed once above, near the consumer-group selection.)
-	if syncMode == "cdc" && tablesCount > 0 && !isBatchBackfillTopic {
-		// Derive the namespace-qualified topic prefix (e.g. "rsync.cdc-4631bd14") and the
-		// database/schema qualifier from the first table's live topic. Splitting the raw
-		// name on its first dot here is what broke MongoDB multi-collection CDC: it took
-		// the "rsync" namespace as the prefix. See deriveCDCTopicParts.
-		prefix, dbQualifier := deriveCDCTopicParts(kafkaTopic)
-
-		// Build topic list from selected tables.
-		if prefix != "" && len(tablesList) > 0 {
-			unifiedTopic := ""
-			if task.Params != nil {
-				if v, ok := task.Params["cdc_unified_topic"].(string); ok {
-					unifiedTopic = strings.TrimSpace(v)
-				}
-			}
-			srcType := ""
-			if task.Source != nil {
-				srcType = task.Source.Type
-			}
-			if topics := buildCDCSinkTopics(prefix, dbQualifier, srcType, tablesList, unifiedTopic); len(topics) > 0 {
-				// Backstop before the pre-create below. Skipped when a unified topic is
-				// configured: that mode deliberately remaps dimension tables away from
-				// their own Debezium topic, so the provider topic may be absent by design.
-				if unifiedTopic == "" {
-					topics = ensureProviderTopicSubscribed(topics, kafkaTopic, task.PipelineID)
-				}
-				topicsParam = topics
-			}
-		}
-	}
-
-	// Pre-create the CDC topic(s) before starting the sink. Debezium only creates a CDC
-	// topic on its first change event; with snapshot.mode=recovery/no_data (hybrid CDC,
-	// no snapshot) that can be much later, so a sink started against a not-yet-existent
-	// topic gets 0 partitions and never consumes. The batch topic is pre-created via its
-	// bootstrap marker; the CDC sink rejects non-Debezium messages, so we create the CDC
-	// topic empty via the admin API instead. Skip for the batch-backfill sink (its topic
-	// already exists from the bootstrap marker). Best-effort — never block the sink start.
-	if !isBatchBackfillTopic && a.kafkaManager != nil {
-		ensureTopic := func(name string) {
-			if strings.TrimSpace(name) == "" {
-				return
-			}
-			if err := a.kafkaManager.EnsureTopicExists(name, 3); err != nil {
-				// Deliberately not "will rely on auto-create": auto-creation is a broker
-				// setting this platform does not control on a customer-managed cluster,
-				// and when it is off the sink simply consumes nothing forever while the
-				// pipeline reports running. Say what actually happens.
-				log.WithError(err).WithField("topic", name).
-					Warn("⚠️  Could not pre-create CDC topic for sink — the sink will consume nothing unless the broker auto-creates it")
-			}
-		}
-		switch tp := topicsParam.(type) {
-		case string:
-			ensureTopic(tp)
-		case []string:
-			for _, t := range tp {
-				ensureTopic(t)
-			}
-		}
-	}
+	// Pass the resolved locals as they are: TestStartKafkaMCPSinkPreCreatesOnlyThroughPrepareSinkTopics
+	// checks this call, because a wrong value here (no tables, no topic) makes the sink
+	// subscribe to too few topics while the pipeline still shows running.
+	topicsParam := prepareSinkTopics(sinkTopicCreatorFor(a.kafkaManager),
+		sinkTopicInputsFor(task, kafkaTopic, syncMode, tablesList, isBatchBackfillTopic))
 
 	sinkReq := mcp.ExecuteRequest{
 		Connector: "kafka-mcp-sink",
@@ -6446,9 +6754,17 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 				"destination_version":   destConcreteVer,
 				"destination_config":    destCfg,
 				"destination_namespace": destinationNamespace,
+				// A server-level source spans several databases: each lands in a
+				// same-named destination namespace unless the user typed one.
+				"mirror_source_namespace": a.mirrorSourceNamespacesFor(ctx, task, destinationNamespace),
 			},
 			"trace_id": traceID,
 		},
+	}
+	if sinkCfg, ok := sinkReq.Params["config"].(map[string]interface{}); ok {
+		for k, v := range objectLayout.SinkConfigFields() {
+			sinkCfg[k] = v
+		}
 	}
 
 	// Fix #15 (Resilience): retry sink startup with exponential backoff
@@ -6790,6 +7106,18 @@ func (a *Agent) executeStartStreaming(ctx context.Context, task ExecutorTask) Ex
 		}
 	}
 
+	// Same standalone-MongoDB check as executeStreamingDataTransfer, before the connector
+	// is created. mongodb_topology_check_wiring_test.go pins the ordering.
+	if msg := checkMongoDBCDCSource(ctx, a.TestConnectionResult, dbType, sourceConnectorVersion(task.Source), dbConfig); msg != "" {
+		log.Errorf("❌ CDC source topology check failed for pipeline %s: %s", task.PipelineID, msg)
+		return ExecutorResponse{
+			TaskID:     task.TaskID,
+			PipelineID: task.PipelineID,
+			Status:     "failed",
+			Error:      msg,
+		}
+	}
+
 	// Build Debezium start_sync request
 	params := map[string]interface{}{
 		"table":         table,
@@ -6891,6 +7219,23 @@ func (a *Agent) executeStartStreaming(ctx context.Context, task ExecutorTask) Ex
 	}
 	if kt, ok := resp.Result["kafka_topic"].(string); ok {
 		kafkaTopic = kt
+	}
+
+	// #19: same check as executeStreamingDataTransfer — an accepted config is not a started task.
+	if cdcProvider == "debezium" && strings.TrimSpace(actualConnectorName) != "" {
+		if reason := verifyCDCConnectorStarted(ctx, kafkaConnectStatusURL(actualConnectorName), startResultBool(resp.Result, "already_running")); reason != "" {
+			log.WithFields(log.Fields{
+				"pipeline_id": task.PipelineID,
+				"connector":   actualConnectorName,
+				"error":       reason,
+			}).Error("❌ CDC connector did not start")
+			return ExecutorResponse{
+				TaskID:     task.TaskID,
+				PipelineID: task.PipelineID,
+				Status:     "failed",
+				Error:      fmt.Sprintf("CDC connector did not start: %s", reason),
+			}
+		}
 	}
 
 	// Track the streaming pipeline with dynamic CDC provider
@@ -7420,9 +7765,21 @@ func (a *Agent) getConnectionConfigForTask(ctx context.Context, task ExecutorTas
 	return a.connectionMgr.Get(ctx, connID)
 }
 
+// testConnectionDeployWait is how long a connection test waits for a connector container
+// that is being deployed on demand before answering "still being set up — try again".
+const testConnectionDeployWait = 45 * time.Second
+
 // TestConnection tests a connection by invoking the MCP connector's test/health functionality.
 // If connectorVersion is empty, defaults to "latest".
 func (a *Agent) TestConnection(ctx context.Context, connectorType string, connectorVersion string, config map[string]string) (bool, string) {
+	ok, msg, _ := a.TestConnectionResult(ctx, connectorType, connectorVersion, config)
+	return ok, msg
+}
+
+// TestConnectionResult is TestConnection plus the connector's result map, for callers
+// that read what the connector reported beyond pass/fail (e.g. the mongodb topology
+// fields read by checkMongoDBCDCSource). The map is nil when the call itself failed.
+func (a *Agent) TestConnectionResult(ctx context.Context, connectorType string, connectorVersion string, config map[string]string) (bool, string, map[string]interface{}) {
 	traceID := telemetry.TraceIDFromContext(ctx)
 	// SECURITY: Never log config values, only key count
 	log.WithField("trace_id", traceID).Infof("Testing connection for connector: %s (config_keys=%d)", connectorType, len(config))
@@ -7445,6 +7802,15 @@ func (a *Agent) TestConnection(ctx context.Context, connectorType string, connec
 		Params: map[string]interface{}{
 			"config": configParams, // Pass config as params so connector can test actual connection
 		},
+		// A never-deployed connector's container is built/started on demand. Wait for it
+		// briefly, and if it is still not up, answer "still being set up — try again"
+		// rather than falling back to a stdio subprocess on the orchestrator's own
+		// interpreter, which lacks the connector's dependencies and can only fail with
+		// "No module named 'X'". 45s + the 15s deploy call stays inside the api-gateway's
+		// 90s client timeout (connections.go performConnectionTest).
+		// See KI-FIRST-CONNECTION-TEST-FALLS-BACK-TO-AN-UNUSABLE-STDIO-INTERPRETER.
+		NoStdioWhileDeploying: true,
+		DeployWaitTimeout:     testConnectionDeployWait,
 	}
 
 	// For connection testing, use executeWithOAuthRetry (no retries on connection failures)
@@ -7452,7 +7818,12 @@ func (a *Agent) TestConnection(ctx context.Context, connectorType string, connec
 	// OAuth refresh is still supported for API connectors that need it.
 	resp, err := a.executeWithOAuthRetry(ctx, req)
 	if err != nil {
-		return false, fmt.Sprintf("Connection test failed: %v", err)
+		errorMsg := fmt.Sprintf("Connection test failed: %v", err)
+		if friendly, ok := mcp.FriendlyTestConnectionError(a.mcpClient.ConnectorDisplayName(connectorType, connectorVersion), errorMsg); ok {
+			log.Warnf("test_connection for %s: connector not ready yet (raw: %s)", connectorType, errorMsg)
+			return false, friendly, nil
+		}
+		return false, errorMsg, nil
 	}
 
 	// Return the actual result from the connector
@@ -7461,12 +7832,19 @@ func (a *Agent) TestConnection(ctx context.Context, connectorType string, connec
 		if errorMsg == "" {
 			errorMsg = "Connection test failed - check credentials and network connectivity"
 		}
+		// A stdio run that could not import the connector's dependencies, or a container
+		// that is still deploying, is never the user's to fix — show the retryable
+		// message, and keep the raw error in the log for operators.
+		if friendly, ok := mcp.FriendlyTestConnectionError(a.mcpClient.ConnectorDisplayName(connectorType, connectorVersion), errorMsg); ok {
+			log.Warnf("test_connection for %s: connector not ready yet (raw: %s)", connectorType, errorMsg)
+			return false, friendly, resp.Result
+		}
 		log.Warnf("test_connection failed: %s", errorMsg)
-		return false, errorMsg
+		return false, errorMsg, resp.Result
 	}
 
 	log.Infof("✅ Connection test passed for %s", connectorType)
-	return true, ""
+	return true, "", resp.Result
 }
 
 // TableMetadata represents discovered table schema
@@ -7540,10 +7918,14 @@ func (a *Agent) DiscoverSchemaEnvelope(ctx context.Context, connectorType string
 		// Always request PKs so every caller (assessor, batch executor, UI explorer)
 		// gets primary_keys populated without needing to pass the flag explicitly.
 		"include_relationships": true,
-		"max_tables":            100,
+		"max_tables":            sourceDiscoveryMaxTables,
 	}
 	for k, v := range params {
 		mergedParams[k] = v
+	}
+	// A Scope that does not parse fails closed before the connector is asked.
+	if _, _, err := connectionScope(connectorType, stringConfig); err != nil {
+		return nil, scopeError(connectorType, err)
 	}
 
 	req := mcp.ExecuteRequest{
@@ -7566,6 +7948,12 @@ func (a *Agent) DiscoverSchemaEnvelope(ctx context.Context, connectorType string
 	}
 	if resp.Result == nil {
 		return nil, fmt.Errorf("schema discovery returned empty result")
+	}
+	if err := discoveryFailure(connectorType, resp.Result); err != nil {
+		return nil, err
+	}
+	if err := scopeEnvelope(connectorType, stringConfig, resp.Result); err != nil {
+		return nil, err
 	}
 	return resp.Result, nil
 }
@@ -7687,6 +8075,67 @@ func (a *Agent) SampleRows(ctx context.Context, connectorType string, config map
 	}
 
 	return rows, columns, nil
+}
+
+// ListNamespaces asks a connector for the names one level above its tables:
+// the level its metadata.json names as namespace_model.table_namespace
+// (schemas on PostgreSQL, databases on MySQL and MongoDB, datasets on
+// BigQuery). System namespaces are already left out by the connector. current
+// is the namespace the connection itself names, "" when it names none.
+//
+// It runs the connector's list_namespaces operation, honouring the
+// connector_version pin the way SampleRows does.
+func (a *Agent) ListNamespaces(ctx context.Context, connectorType string, config map[string]interface{}) ([]string, string, error) {
+	traceID := telemetry.TraceIDFromContext(ctx)
+	log.WithField("trace_id", traceID).Infof("🗂️ List namespaces for %s (config_keys=%d)", connectorType, len(config))
+
+	stringConfig := make(map[string]string)
+	for k, v := range config {
+		stringConfig[k] = fmt.Sprintf("%v", v)
+	}
+	version := strings.TrimSpace(stringConfig["connector_version"])
+	if version == "" {
+		version = strings.TrimSpace(stringConfig["version"])
+	}
+
+	resp, err := a.executeWithRetry(ctx, mcp.ExecuteRequest{
+		Connector: connectorType,
+		Version:   version,
+		Operation: "list_namespaces",
+		Config:    stringConfig,
+		Params:    map[string]interface{}{"config": stringConfig},
+	})
+	if err != nil {
+		return nil, "", fmt.Errorf("list_namespaces failed for %s: %w", connectorType, err)
+	}
+	if resp == nil || !resp.Success {
+		msg := ""
+		if resp != nil {
+			msg = resp.Error
+		}
+		if msg == "" {
+			msg = "list_namespaces reported failure"
+		}
+		return nil, "", errors.New(msg)
+	}
+	names, current := namespacesFromResult(resp.Result)
+	return names, current, nil
+}
+
+// namespacesFromResult reads a list_namespaces result:
+// {"namespaces": [names], "current": name}. Blank and non-string names are
+// dropped; a missing list is an empty one.
+func namespacesFromResult(result map[string]interface{}) ([]string, string) {
+	names := []string{}
+	if raw, ok := result["namespaces"].([]interface{}); ok {
+		for _, n := range raw {
+			if s, ok := n.(string); ok && strings.TrimSpace(s) != "" {
+				names = append(names, s)
+			}
+		}
+	}
+	current, _ := result["current"].(string)
+	return names, strings.TrimSpace(current)
 }
 
 // explorerQueryMaxRows caps how many rows a delegated Data Explorer query may
@@ -7986,8 +8435,187 @@ func filterInternalTables(tables []TableMetadata) []TableMetadata {
 	return out
 }
 
+// tableNamespaceIsDatabase reports whether a source's discovered table
+// `schema` field names a DATABASE rather than a schema inside one: the
+// connector's namespace_model declares table_namespace "database" (MySQL and
+// MariaDB have no schema level, a MongoDB connector reports each collection's
+// database as its schema, and ClickHouse databases play the same role). The
+// table picker reads the same block (PipelineTableSelector.tsx).
+func tableNamespaceIsDatabase(sourceType string) bool {
+	return namespacemodel.For(sourceType).TableNamespace == "database"
+}
+
+// tableSelectionSourceDatabase names the database a table-selection request is
+// listing, so the picker can say "Tables in orders_db" instead of leaving a user
+// with one connection per database to guess. It only reads data already at hand
+// (the connection config and the discovered tables) and never calls out.
+//
+// The configured database comes from the same keys the connectors read
+// (`database`, then `db_name`, then `db`). For a source whose table schema IS the
+// database, the discovered tables win: one shared value is where the tables
+// really live, and more than one means the list spans databases, so this returns
+// "" rather than guessing one and the picker labels each group instead.
+func tableSelectionSourceDatabase(sourceType string, cfg map[string]string, tables []TableMetadata) string {
+	configured := ""
+	for _, k := range []string{"database", "db_name", "db"} {
+		if v := strings.TrimSpace(cfg[k]); v != "" {
+			configured = v
+			break
+		}
+	}
+	if !tableNamespaceIsDatabase(sourceType) {
+		return configured
+	}
+	seen := map[string]struct{}{}
+	only := ""
+	for _, t := range tables {
+		s := strings.TrimSpace(t.Schema)
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; !ok {
+			seen[s] = struct{}{}
+			only = s
+		}
+	}
+	switch len(seen) {
+	case 0:
+		return configured
+	case 1:
+		return only
+	default:
+		return ""
+	}
+}
+
+// tableSelectionOptions is the `available_tables` payload of a table-selection
+// request: one entry per discovered table, in discovery order.
+func tableSelectionOptions(tables []TableMetadata) []map[string]interface{} {
+	options := make([]map[string]interface{}, 0, len(tables))
+	for _, tbl := range tables {
+		options = append(options, map[string]interface{}{
+			"name":      tbl.Name,
+			"schema":    tbl.Schema,
+			"row_count": tbl.RowCount,
+			"columns":   len(tbl.Columns),
+		})
+	}
+	return options
+}
+
+// tableSelectionResult is the Result of every `waiting_for_table_selection`
+// response. It is forwarded verbatim as the wait's details (adapter
+// classifyExecutorResponse → PolicyError metadata → PIPELINE_WAITING), and the
+// gateway MERGES those details into the stored metadata, so `source_database` is
+// always written, even as "", or a value from an earlier wait would survive into
+// this one. With no tables to offer the user may type a name instead.
+func tableSelectionResult(sourceType string, cfg map[string]string, tables []TableMetadata, reason string) map[string]interface{} {
+	result := map[string]interface{}{
+		"available_tables": tableSelectionOptions(tables),
+		"source_type":      sourceType,
+		"source_database":  tableSelectionSourceDatabase(sourceType, cfg, tables),
+		"action_needed":    "table_selection",
+		"reason":           reason,
+		// A server-level source (a connection naming no database) mirrors each
+		// source database at the destination even when one is picked
+		// (preserveSourceSchemaLayout), so the picker leaves the destination
+		// name blank. Always written, like source_database.
+		"source_server_level": serverLevelSource(sourceType, cfg),
+	}
+	if len(tables) == 0 {
+		result["allow_manual_entry"] = true
+	}
+	// Written on every wait, like source_database: the gateway merges details
+	// into stored metadata, so a "truncated" flag from an earlier wait would
+	// otherwise survive into this one. withDiscoveryTotals sets the real values.
+	result["total_tables_available"] = len(tables)
+	result["tables_truncated"] = false
+	return result
+}
+
+// withDiscoveryTotals records on a table-selection result that the connector
+// returned only part of the source, so the picker can say "N of M tables"
+// instead of presenting a cut list as the whole database.
+func withDiscoveryTotals(result map[string]interface{}, totals discoveryTotals) map[string]interface{} {
+	if totals.truncated() {
+		result["total_tables_available"] = totals.Available
+		result["tables_truncated"] = true
+	}
+	return result
+}
+
+// sourceDiscoveryMaxTables is how many tables a source discovery asks the
+// connector for. It used to be the connectors' default of 100, which silently
+// cut the table picker AND the pre-run discovery that supplies primary keys and
+// column types, so table 101+ ran with no PK and untyped columns. 5000 PostgreSQL
+// tables (10 columns each, PKs included) discover in under a second as ~7 MB of
+// JSON; past this, the picker says "N of M" and the rest is reachable through
+// "All tables", "<schema>.*" or typing a name (the gateway resolver's ceiling
+// for those is selectAllMaxTables, 10000).
+const sourceDiscoveryMaxTables = 5000
+
+// discoveryTotals is what a connector reported about the list it returned:
+// Discovered is how many tables came back, Available how many exist (0 when the
+// connector did not report it, e.g. a v1 envelope).
+type discoveryTotals struct {
+	Discovered int
+	Available  int
+}
+
+// truncated reports whether the connector returned fewer tables than exist.
+func (t discoveryTotals) truncated() bool {
+	return t.Available > t.Discovered
+}
+
+// missingSelectedTables returns the selected tables (task.Params["tables"]) that
+// no discovered table matches by qualified or bare name, in selection order.
+func missingSelectedTables(selectedRaw interface{}, discovered []TableMetadata) []string {
+	found := make(map[string]bool, 2*len(discovered))
+	for _, t := range discovered {
+		found[baselineKey(t.Schema, t.Name)] = true
+		found[strings.TrimSpace(t.Name)] = true
+	}
+	var names []string
+	switch v := selectedRaw.(type) {
+	case []string:
+		names = v
+	case []interface{}:
+		for _, e := range v {
+			if s, ok := e.(string); ok {
+				names = append(names, s)
+			}
+		}
+	}
+	var missing []string
+	for _, n := range names {
+		n = strings.TrimSpace(n)
+		if n == "" || found[n] {
+			continue
+		}
+		if i := strings.LastIndex(n, "."); i >= 0 && found[strings.TrimSpace(n[i+1:])] {
+			continue
+		}
+		missing = append(missing, n)
+	}
+	return missing
+}
+
 // DiscoverSchema discovers tables and schemas from a connection using MCP
 func (a *Agent) DiscoverSchema(ctx context.Context, connectorType string, config map[string]interface{}) ([]TableMetadata, error) {
+	tables, _, err := a.discoverSchemaWithTotals(ctx, connectorType, config)
+	return tables, err
+}
+
+// discoverSchemaWithTotals is DiscoverSchema plus the connector's table totals,
+// for the callers that must tell a partial list from the whole source.
+func (a *Agent) discoverSchemaWithTotals(ctx context.Context, connectorType string, config map[string]interface{}) ([]TableMetadata, discoveryTotals, error) {
+	if a.discoverTotalsStub != nil {
+		return a.discoverTotalsStub(ctx, connectorType, config)
+	}
+	if a.discoverSchemaStub != nil {
+		tables, err := a.discoverSchemaStub(ctx, connectorType, config)
+		return tables, discoveryTotals{Discovered: len(tables), Available: len(tables)}, err
+	}
 	traceID := telemetry.TraceIDFromContext(ctx)
 	// SECURITY: Never log config values, only key count
 	log.WithField("trace_id", traceID).Infof("🔍 Discovering schema for connector: %s (config_keys=%d)", connectorType, len(config))
@@ -8005,6 +8633,12 @@ func (a *Agent) DiscoverSchema(ctx context.Context, connectorType string, config
 	if version == "" {
 		version = strings.TrimSpace(stringConfig["version"])
 	}
+	// The connection's Scope (#31). One that does not parse fails closed here,
+	// before the connector is asked; an active one narrows the list below.
+	scope, scopeActive, scopeErr := connectionScope(connectorType, stringConfig)
+	if scopeErr != nil {
+		return nil, discoveryTotals{}, scopeError(connectorType, scopeErr)
+	}
 
 	// Construct a discover_schema request
 	// The config needs to be in Params for the MCP connector to use it
@@ -8020,12 +8654,14 @@ func (a *Agent) DiscoverSchema(ctx context.Context, connectorType string, config
 			"include_relationships": true,
 			// Needed for column type propagation to destination (ensures typed columns instead of TEXT).
 			"include_columns": true,
+			// Without it every connector falls back to its own default of 100.
+			"max_tables": sourceDiscoveryMaxTables,
 		},
 	}
 
 	resp, err := a.executeWithRetry(ctx, req)
 	if err != nil {
-		return nil, fmt.Errorf("schema discovery failed: %w", err)
+		return nil, discoveryTotals{}, fmt.Errorf("schema discovery failed: %w", err)
 	}
 
 	if !resp.Success {
@@ -8033,7 +8669,10 @@ func (a *Agent) DiscoverSchema(ctx context.Context, connectorType string, config
 		if errorMsg == "" {
 			errorMsg = "Schema discovery failed"
 		}
-		return nil, errors.New(errorMsg)
+		return nil, discoveryTotals{}, errors.New(errorMsg)
+	}
+	if err := discoveryFailure(connectorType, resp.Result); err != nil {
+		return nil, discoveryTotals{}, err
 	}
 
 	// Parse the result into TableMetadata
@@ -8044,28 +8683,40 @@ func (a *Agent) DiscoverSchema(ctx context.Context, connectorType string, config
 		// Convert to JSON and back to parse properly
 		jsonData, err := json.Marshal(tablesData)
 		if err != nil {
-			return nil, fmt.Errorf("failed to marshal tables data: %w", err)
+			return nil, discoveryTotals{}, fmt.Errorf("failed to marshal tables data: %w", err)
 		}
 
 		if err := json.Unmarshal(jsonData, &tables); err != nil {
-			return nil, fmt.Errorf("failed to parse tables data: %w", err)
+			return nil, discoveryTotals{}, fmt.Errorf("failed to parse tables data: %w", err)
 		}
 	} else {
 		// Fallback: connector might return direct schema info
 		log.Warn("No 'tables' key in response, attempting direct schema parse")
-		return nil, fmt.Errorf("connector did not return table information")
+		return nil, discoveryTotals{}, fmt.Errorf("connector did not return table information")
 	}
 
 	// Surface the distinction between "discovery failed" and "discovery
 	// succeeded but database is empty" — they look identical to the caller
 	// and produce the same misleading "We couldn't list tables" UI message.
+	totalAvail, _ := resp.Result["total_tables_available"].(float64)
+	totals := discoveryTotals{Discovered: len(tables), Available: int(totalAvail)}
+	if scopeActive {
+		before := len(tables)
+		tables = scopeTables(tables, scope)
+		totals = applyScopeToTotals(totals, before-len(tables))
+		if len(tables) == 0 && before > 0 {
+			log.Warnf("⚠️  discover_schema: %s — %s", connectorType, namespacefilter.NoMatchWarning)
+		}
+	}
 	if len(tables) == 0 {
-		totalAvail, _ := resp.Result["total_tables_available"].(float64)
 		log.Infof("ℹ️  discover_schema: %s returned 0 tables (total_available=%v) — database may be empty or contain no BASE TABLEs", connectorType, totalAvail)
+	}
+	if totals.truncated() {
+		log.Warnf("⚠️  discover_schema: %s returned %d of %d tables (cap %d); the rest are missing from this list", connectorType, totals.Discovered, totals.Available, sourceDiscoveryMaxTables)
 	}
 
 	log.Infof("✅ Discovered %d tables from %s", len(tables), connectorType)
-	return tables, nil
+	return tables, totals, nil
 }
 
 // isRelationalDB checks if a connector type is a relational database

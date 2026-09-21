@@ -116,6 +116,7 @@ describe("SavedQueryModelDialog", () => {
         return res(404, { error: "no schedule for this saved query" })
       }
       if (url.includes("/pipelines")) return res(200, { pipelines: [] })
+      if (url.endsWith("/explorer/saved")) return res(200, { saved_queries: [] })
       calls.push({ url, method })
       if (url.endsWith("/materialization")) {
         // The server normalises the name; the dialog must adopt THIS value.
@@ -198,7 +199,7 @@ describe("SavedQueryModelDialog", () => {
     expect(screen.getByRole("button", { name: /delete/i })).toBeDisabled()
     // Still READABLE: a viewer may see what is scheduled, which is why the editor
     // renders at all rather than being hidden behind the role.
-    expect(screen.getByText(/0 2 \* \* \*/)).toBeInTheDocument()
+    expect(screen.getByText("Every day at 02:00 (UTC)")).toBeInTheDocument()
   })
 
   it("leaves the controls usable for an admin", async () => {
@@ -324,6 +325,7 @@ describe("SavedQueryModelDialog", () => {
         return res(404, { error: "no schedule for this saved query" })
       }
       if (url.includes("/pipelines")) return res(200, { pipelines: [] })
+      if (url.endsWith("/explorer/saved")) return res(200, { saved_queries: [] })
       calls.push({ url, method, body: init?.body ? JSON.parse(String(init.body)) : null })
       if (url.endsWith("/materialization")) {
         return res(200, { materialization: "statement", target_table: "" })
@@ -482,20 +484,22 @@ describe("SavedQueryModelDialog", () => {
     })
   })
 
-  // "After a pipeline runs" is the trigger that makes this an ELT tool rather than a
+  // "After an upstream runs" is the trigger that makes this an ELT tool rather than a
   // cron runner: the model rebuilds from the data a load just delivered, instead of
-  // from whatever happened to be in the table when a clock struck.
+  // from whatever happened to be in the table when a clock struck. An upstream is a
+  // pipeline OR another model, and a model may wait on several of either.
   //
   // What the tests below protect is the shape of the request. An event trigger carries
-  // a pipeline and no cadence; a cron carries a cadence and no pipeline. Sending a
+  // upstreams and no cadence; a cron carries a cadence and no upstreams. Sending a
   // half-and-half — a leftover cron beside a type that never reads it, or a type with
-  // no upstream — is either refused by the server or stored as a trigger that never
-  // fires, and the second failure is silent.
-  describe("after a pipeline runs", () => {
+  // no upstream at all — is either refused by the server or stored as a trigger that
+  // never fires, and the second failure is silent.
+  describe("after an upstream runs", () => {
     const PIPELINE_ID = "3c9a1e77-8b44-4f21-a0d6-5e2b7c1d9f30"
+    const MODEL_ID = "9a2e4c81-7d63-4b90-8f12-3c6d5e0a1b74"
 
-    /** No schedule yet, and one pipeline available to point at. */
-    function mockNoScheduleWithPipelines(
+    /** No schedule yet, with one pipeline and one model available to point at. */
+    function mockNoScheduleWithProducers(
       onMutate?: (call: { url: string; method: string; body: unknown }) => void
     ) {
       mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
@@ -503,10 +507,19 @@ describe("SavedQueryModelDialog", () => {
         if (url.includes("/pipelines")) {
           return res(200, { pipelines: [{ id: PIPELINE_ID, name: "Daily orders load" }] })
         }
+        // endsWith, not includes: this query's own schedule lives at
+        // /explorer/saved/<id>/schedule, so a looser match here would answer the
+        // schedule GET with a list of saved queries and the dialog would decide the
+        // query already has a schedule.
+        if (url.endsWith("/explorer/saved")) {
+          return res(200, {
+            saved_queries: [{ id: MODEL_ID, name: "Customer dim", materialization: "table" }],
+          })
+        }
         if (url.endsWith("/schedule") && method === "GET") {
           return res(404, { error: "no schedule for this saved query" })
         }
-        // A read, like the two above, and answered with nothing to suggest. It is
+        // A read, like the three above, and answered with nothing to suggest. It is
         // matched here rather than falling through so `onMutate` keeps meaning
         // "something was submitted" — the assertion in several tests below.
         if (url.includes("/upstreams")) {
@@ -520,14 +533,14 @@ describe("SavedQueryModelDialog", () => {
       })
     }
 
-    async function chooseAfterPipeline(user: ReturnType<typeof userEvent.setup>) {
+    async function chooseAfterUpstream(user: ReturnType<typeof userEvent.setup>) {
       await user.click(screen.getByRole("combobox", { name: /runs/i }))
-      await user.click(await screen.findByRole("option", { name: /after a pipeline runs/i }))
+      await user.click(await screen.findByRole("option", { name: /after a pipeline or model runs/i }))
     }
 
-    it("sends the pipeline and no cadence", async () => {
+    it("sends every chosen upstream, of either kind, and no cadence", async () => {
       const calls: Array<{ url: string; method: string; body: unknown }> = []
-      mockNoScheduleWithPipelines((c) => calls.push(c))
+      mockNoScheduleWithProducers((c) => calls.push(c))
 
       const user = userEvent.setup()
       renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
@@ -536,28 +549,35 @@ describe("SavedQueryModelDialog", () => {
         expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
       })
 
-      await chooseAfterPipeline(user)
-      await user.click(screen.getByRole("combobox", { name: /pipeline/i }))
-      await user.click(await screen.findByRole("option", { name: /daily orders load/i }))
+      await chooseAfterUpstream(user)
+      await user.click(await screen.findByRole("checkbox", { name: "Daily orders load" }))
+      await user.click(screen.getByRole("checkbox", { name: "Customer dim" }))
       await user.click(screen.getByRole("button", { name: /create schedule/i }))
 
       await waitFor(() => {
         expect(calls.filter((c) => c.method === "POST")).toHaveLength(1)
       })
       const posted = calls.find((c) => c.method === "POST")!.body as Record<string, unknown>
-      expect(posted.schedule_type).toBe("after_pipeline")
-      expect(posted.trigger_pipeline_id).toBe(PIPELINE_ID)
+      expect(posted.schedule_type).toBe("after_upstream")
+      // The kind travels with the id. Pipelines and models are separate tables with
+      // independent id spaces, so an id on its own does not say what to wait for.
+      // toEqual rather than a containment check: the display name must NOT be sent —
+      // it is the producer's to change, and a copy stored here goes stale silently.
+      expect(posted.upstreams).toEqual([
+        { kind: "pipeline", id: PIPELINE_ID },
+        { kind: "model", id: MODEL_ID },
+      ])
       // Not `toBeUndefined`: the field is sent, and what matters is that it carries no
       // cadence. A cron left over from the default would be stored beside a type that
       // never reads it, and would resurface the moment someone switched back to a clock.
       expect(posted.schedule_spec).toEqual({})
     })
 
-    // The server answers 400 for a trigger with no pipeline. Catching it here turns a
-    // failed request into a button that says what is missing.
-    it("will not submit a trigger that names no pipeline", async () => {
+    // The server answers 400 for a trigger with an empty upstream set. Catching it here
+    // turns a failed request into a button that says what is missing.
+    it("will not submit a trigger that names no upstream", async () => {
       const calls: Array<{ url: string; method: string; body: unknown }> = []
-      mockNoScheduleWithPipelines((c) => calls.push(c))
+      mockNoScheduleWithProducers((c) => calls.push(c))
 
       const user = userEvent.setup()
       renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
@@ -566,17 +586,19 @@ describe("SavedQueryModelDialog", () => {
         expect(screen.getByRole("button", { name: /create schedule/i })).toBeEnabled()
       })
 
-      await chooseAfterPipeline(user)
+      await chooseAfterUpstream(user)
 
       expect(screen.getByRole("button", { name: /create schedule/i })).toBeDisabled()
-      expect(screen.getByText(/choose the pipeline this query should follow/i)).toBeInTheDocument()
+      expect(
+        await screen.findByText(/choose at least one pipeline or model this query should follow/i)
+      ).toBeInTheDocument()
       expect(calls).toHaveLength(0)
     })
 
     // An event trigger has no clock, so a timezone would be a control with no effect —
     // and, worse, would suggest the trigger fires at a time.
     it("offers no timezone", async () => {
-      mockNoScheduleWithPipelines()
+      mockNoScheduleWithProducers()
 
       const user = userEvent.setup()
       renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
@@ -585,28 +607,72 @@ describe("SavedQueryModelDialog", () => {
         expect(screen.getByRole("combobox", { name: /timezone/i })).toBeInTheDocument()
       })
 
-      await chooseAfterPipeline(user)
+      await chooseAfterUpstream(user)
 
       expect(screen.queryByRole("combobox", { name: /timezone/i })).not.toBeInTheDocument()
+    })
+
+    // A model that writes nowhere never runs on its own, so it never finishes, so a
+    // trigger pointing at it is silent by construction. And a model cannot follow
+    // itself — the server calls that a cycle and refuses it. Both are filtered before
+    // the box is drawn rather than explained after the save fails.
+    it("offers other models that run, but not itself and not a query that writes nowhere", async () => {
+      const SCRATCH_ID = "6b0f8d24-1a5c-4e37-9d80-7c2a4f6b3e15"
+      mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.includes("/pipelines")) return res(200, { pipelines: [] })
+        if (url.endsWith("/explorer/saved")) {
+          return res(200, {
+            saved_queries: [
+              { id: QUERY_ID, name: "Daily MRR", materialization: "table" },
+              { id: MODEL_ID, name: "Customer dim", materialization: "table" },
+              { id: SCRATCH_ID, name: "Scratch query", materialization: "none" },
+            ],
+          })
+        }
+        if (url.endsWith("/schedule") && (init?.method ?? "GET") === "GET") {
+          return res(404, { error: "no schedule for this saved query" })
+        }
+        return res(200, {})
+      })
+
+      const user = userEvent.setup()
+      renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
+      })
+
+      await chooseAfterUpstream(user)
+
+      expect(await screen.findByRole("checkbox", { name: "Customer dim" })).toBeInTheDocument()
+      expect(screen.queryByRole("checkbox", { name: "Daily MRR" })).not.toBeInTheDocument()
+      expect(screen.queryByRole("checkbox", { name: "Scratch query" })).not.toBeInTheDocument()
     })
 
     // Editing an existing trigger has to start from the trigger that is running. Seeding
     // the editor with the cron default instead would turn an unrelated edit — a pause, a
     // target change — into a silent conversion back to a clock schedule.
-    it("opens an existing trigger on its own pipeline, not on the cron default", async () => {
+    it("opens an existing trigger on the upstreams it has, not on the cron default", async () => {
       mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.includes("/pipelines")) {
           return res(200, { pipelines: [{ id: PIPELINE_ID, name: "Daily orders load" }] })
         }
+        if (url.endsWith("/explorer/saved")) {
+          return res(200, {
+            saved_queries: [{ id: MODEL_ID, name: "Customer dim", materialization: "table" }],
+          })
+        }
         if (url.endsWith("/schedule") && (init?.method ?? "GET") === "GET") {
           return res(
             200,
             schedule({
-              schedule_type: "after_pipeline",
+              schedule_type: "after_upstream",
               schedule_spec: {},
               status: "active",
-              trigger_pipeline_id: PIPELINE_ID,
-              trigger_pipeline_name: "Daily orders load",
+              upstreams: [
+                { kind: "pipeline", id: PIPELINE_ID, name: "Daily orders load" },
+                { kind: "model", id: MODEL_ID, name: "Customer dim" },
+              ],
             })
           )
         }
@@ -615,29 +681,119 @@ describe("SavedQueryModelDialog", () => {
 
       renderDialog()
 
-      // The summary line, and the picker beneath it, both say the same pipeline.
-      expect(await screen.findByText(/after daily orders load runs/i)).toBeInTheDocument()
+      // "any of", not a bare list: the fan-in fires on the first producer to finish, and
+      // a comma list reads as a set that all has to land before anything happens.
+      expect(
+        await screen.findByText(/after any of daily orders load, customer dim runs/i)
+      ).toBeInTheDocument()
       await waitFor(() => {
-        expect(screen.getByRole("combobox", { name: /pipeline/i })).toHaveTextContent(/daily orders load/i)
+        expect(screen.getByRole("checkbox", { name: "Daily orders load" })).toBeChecked()
       })
+      expect(screen.getByRole("checkbox", { name: "Customer dim" })).toBeChecked()
       expect(screen.getByRole("button", { name: /update schedule/i })).toBeEnabled()
     })
 
-    // A pipeline deleted out from under a live trigger drops out of the list. Rendering
-    // an empty picker for a trigger that is still stored reads as "nothing selected",
-    // and the next Update would look like a no-op while actually rewriting the row.
-    it("still shows the upstream a live trigger points at when it is gone from the list", async () => {
+    // The server reads a missing policy as "any". An Update that left it out would turn
+    // a fan-in the user set to wait for every upstream back into one that fires on each,
+    // with nothing on screen having changed.
+    it("keeps a wait-for-all trigger waiting for all when it is updated", async () => {
+      const calls: Array<{ method: string; body: Record<string, unknown> }> = []
+      mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        const method = init?.method ?? "GET"
+        if (url.includes("/pipelines")) {
+          return res(200, { pipelines: [{ id: PIPELINE_ID, name: "Daily orders load" }] })
+        }
+        if (url.endsWith("/explorer/saved")) {
+          return res(200, {
+            saved_queries: [{ id: MODEL_ID, name: "Customer dim", materialization: "table" }],
+          })
+        }
+        if (url.includes("/upstreams")) {
+          return res(200, { references: [], unresolved: [], candidates: [], ambiguous: false })
+        }
+        if (url.endsWith("/schedule") && method === "GET") {
+          return res(
+            200,
+            schedule({
+              schedule_type: "after_upstream",
+              schedule_spec: {},
+              status: "active",
+              upstream_policy: "all",
+              upstreams: [
+                { kind: "pipeline", id: PIPELINE_ID, name: "Daily orders load" },
+                { kind: "model", id: MODEL_ID, name: "Customer dim" },
+              ],
+            })
+          )
+        }
+        if (url.endsWith("/schedule")) {
+          calls.push({ method, body: JSON.parse(String(init?.body ?? "{}")) })
+        }
+        return res(200, {})
+      })
+
+      const user = userEvent.setup()
+      renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
+
+      expect(
+        await screen.findByText(/after all of daily orders load, customer dim run/i)
+      ).toBeInTheDocument()
+      await waitFor(() => {
+        expect(screen.getByRole("radio", { name: /all of them have finished/i })).toBeChecked()
+      })
+
+      await user.click(screen.getByRole("button", { name: /update schedule/i }))
+      await waitFor(() => {
+        expect(calls.filter((c) => c.method === "PUT")).toHaveLength(1)
+      })
+      expect(calls.find((c) => c.method === "PUT")!.body.upstream_policy).toBe("all")
+    })
+
+    it("sends the policy the user picks, and offers the choice only with two upstreams", async () => {
+      const calls: Array<{ url: string; method: string; body: unknown }> = []
+      mockNoScheduleWithProducers((c) => calls.push(c))
+
+      const user = userEvent.setup()
+      renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
+      })
+
+      await chooseAfterUpstream(user)
+      await user.click(await screen.findByRole("checkbox", { name: "Daily orders load" }))
+      // With one upstream "any" and "all" are the same trigger — a choice between them
+      // would be a control with no effect.
+      expect(screen.queryByRole("radio", { name: /all of them have finished/i })).toBeNull()
+
+      await user.click(screen.getByRole("checkbox", { name: "Customer dim" }))
+      const any = screen.getByRole("radio", { name: /any of them finishes/i })
+      expect(any).toBeChecked()
+      await user.click(screen.getByRole("radio", { name: /all of them have finished/i }))
+      await user.click(screen.getByRole("button", { name: /create schedule/i }))
+
+      await waitFor(() => {
+        expect(calls.filter((c) => c.method === "POST")).toHaveLength(1)
+      })
+      const posted = calls.find((c) => c.method === "POST")!.body as Record<string, unknown>
+      expect(posted.upstream_policy).toBe("all")
+    })
+
+    // A producer deleted out from under a live trigger drops out of both lists. Drawing
+    // only the boxes the lists returned would render nothing checked for a trigger that
+    // is still stored, and the next Update would look like a no-op while actually
+    // dropping an upstream the user never touched.
+    it("still shows an upstream a live trigger points at when it is gone from the list", async () => {
       mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.includes("/pipelines")) return res(200, { pipelines: [] })
+        if (url.endsWith("/explorer/saved")) return res(200, { saved_queries: [] })
         if (url.endsWith("/schedule") && (init?.method ?? "GET") === "GET") {
           return res(
             200,
             schedule({
-              schedule_type: "after_pipeline",
+              schedule_type: "after_upstream",
               schedule_spec: {},
               status: "active",
-              trigger_pipeline_id: PIPELINE_ID,
-              trigger_pipeline_name: "Retired loader",
+              upstreams: [{ kind: "pipeline", id: PIPELINE_ID, name: "Retired loader" }],
             })
           )
         }
@@ -647,18 +803,19 @@ describe("SavedQueryModelDialog", () => {
       renderDialog()
 
       await waitFor(() => {
-        expect(screen.getByRole("combobox", { name: /pipeline/i })).toHaveTextContent(/retired loader/i)
+        expect(screen.getByRole("checkbox", { name: "Retired loader" })).toBeChecked()
       })
       // And the button stays live: the trigger is complete, so this must not be
-      // mistaken for the "no pipeline chosen" case above.
+      // mistaken for the "no upstream chosen" case above.
       expect(screen.getByRole("button", { name: /update schedule/i })).toBeEnabled()
     })
 
-    // Offering the option against an empty list produces a dead end: the picker has
-    // nothing in it and the button never enables, with nothing on screen saying why.
-    it("says why when the workspace has no pipelines to follow", async () => {
+    // Offering the option against two empty lists produces a dead end: nothing to tick
+    // and a button that never enables, with nothing on screen saying why.
+    it("says why when the workspace has nothing to follow", async () => {
       mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.includes("/pipelines")) return res(200, { pipelines: [] })
+        if (url.endsWith("/explorer/saved")) return res(200, { saved_queries: [] })
         if (url.endsWith("/schedule") && (init?.method ?? "GET") === "GET") {
           return res(404, { error: "no schedule for this saved query" })
         }
@@ -672,17 +829,29 @@ describe("SavedQueryModelDialog", () => {
         expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
       })
 
-      await chooseAfterPipeline(user)
+      await chooseAfterUpstream(user)
 
-      expect(screen.getByText(/this workspace has no pipelines yet/i)).toBeInTheDocument()
+      expect(
+        screen.getByText(/this workspace has no pipelines, and no other model that runs/i)
+      ).toBeInTheDocument()
       expect(screen.getByRole("button", { name: /create schedule/i })).toBeDisabled()
     })
 
-    // A failed list is not an empty list. Telling someone "you have no pipelines" when
-    // the request 500'd sends them off to create one they already have.
-    it("distinguishes a list that failed to load from a workspace with none", async () => {
+    // A failed list is not an empty list. Telling someone "you have nothing to follow"
+    // when the request 500'd sends them off to create something they already have.
+    //
+    // And the two lists fail independently, which is why there are two messages rather
+    // than one "something failed". A picker showing every model and no pipeline looks
+    // complete; without a line naming the half that is missing, the user picks from
+    // what is there and never learns the rest existed.
+    it("names the source that failed, and keeps the other one usable", async () => {
       mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
         if (url.includes("/pipelines")) return res(500, { error: "boom" })
+        if (url.endsWith("/explorer/saved")) {
+          return res(200, {
+            saved_queries: [{ id: MODEL_ID, name: "Customer dim", materialization: "table" }],
+          })
+        }
         if (url.endsWith("/schedule") && (init?.method ?? "GET") === "GET") {
           return res(404, { error: "no schedule for this saved query" })
         }
@@ -696,10 +865,87 @@ describe("SavedQueryModelDialog", () => {
         expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
       })
 
-      await chooseAfterPipeline(user)
+      await chooseAfterUpstream(user)
 
-      expect(screen.getByText(/could not load this workspace's pipelines/i)).toBeInTheDocument()
-      expect(screen.queryByText(/this workspace has no pipelines yet/i)).not.toBeInTheDocument()
+      expect(
+        await screen.findByText(/could not load this workspace's pipelines/i)
+      ).toBeInTheDocument()
+      expect(screen.queryByText(/could not load this workspace's other models/i)).not.toBeInTheDocument()
+      // The half that arrived is still pickable, and the empty-state copy must not
+      // claim the workspace has nothing.
+      expect(screen.getByRole("checkbox", { name: "Customer dim" })).toBeEnabled()
+      expect(
+        screen.queryByText(/this workspace has no pipelines, and no other model that runs/i)
+      ).not.toBeInTheDocument()
+    })
+
+    it("names the models list when that is the half that failed", async () => {
+      mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.includes("/pipelines")) {
+          return res(200, { pipelines: [{ id: PIPELINE_ID, name: "Daily orders load" }] })
+        }
+        if (url.endsWith("/explorer/saved")) return res(500, { error: "boom" })
+        if (url.endsWith("/schedule") && (init?.method ?? "GET") === "GET") {
+          return res(404, { error: "no schedule for this saved query" })
+        }
+        return res(200, {})
+      })
+
+      const user = userEvent.setup()
+      renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
+
+      await waitFor(() => {
+        expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
+      })
+
+      await chooseAfterUpstream(user)
+
+      expect(
+        await screen.findByText(/could not load this workspace's other models/i)
+      ).toBeInTheDocument()
+      expect(screen.queryByText(/could not load this workspace's pipelines/i)).not.toBeInTheDocument()
+      expect(screen.getByRole("checkbox", { name: "Daily orders load" })).toBeEnabled()
+    })
+
+    // The server refuses a seventeenth upstream, so the seventeenth box has to be
+    // unavailable rather than refused after the click. The half that is easy to lose is
+    // the other one: at the cap the CHECKED boxes must stay live, or the only way out of
+    // a full set is to delete the schedule.
+    it("stops at sixteen upstreams without trapping the set", async () => {
+      const full = Array.from({ length: 16 }, (_, i) => ({
+        kind: "model" as const,
+        id: `0000000${i.toString(16)}-0000-4000-8000-000000000000`,
+        name: `Model ${i + 1}`,
+      }))
+      mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.includes("/pipelines")) {
+          return res(200, { pipelines: [{ id: PIPELINE_ID, name: "Daily orders load" }] })
+        }
+        if (url.endsWith("/explorer/saved")) return res(200, { saved_queries: [] })
+        if (url.endsWith("/schedule") && (init?.method ?? "GET") === "GET") {
+          return res(
+            200,
+            schedule({
+              schedule_type: "after_upstream",
+              schedule_spec: {},
+              status: "active",
+              upstreams: full,
+            })
+          )
+        }
+        return res(200, {})
+      })
+
+      renderDialog()
+
+      await waitFor(() => {
+        expect(screen.getByRole("checkbox", { name: "Model 1" })).toBeChecked()
+      })
+      expect(screen.getByText(/16 is the most one model can wait on/i)).toBeInTheDocument()
+      // Nothing new can be added...
+      expect(screen.getByRole("checkbox", { name: "Daily orders load" })).toBeDisabled()
+      // ...but what is already chosen can still be given up.
+      expect(screen.getByRole("checkbox", { name: "Model 1" })).toBeEnabled()
     })
 
     // The dialog can infer which pipeline produces this query's inputs by reading its
@@ -719,6 +965,7 @@ describe("SavedQueryModelDialog", () => {
         upstreams: unknown,
         opts: {
           pipelines?: { id: string; name: string }[]
+          models?: { id: string; name: string; materialization: string }[]
           onCall?: (call: { url: string; method: string; body: unknown }) => void
         } = {}
       ) {
@@ -731,6 +978,7 @@ describe("SavedQueryModelDialog", () => {
             return res(200, upstreams)
           }
           if (url.includes("/pipelines")) return res(200, { pipelines: list })
+          if (url.endsWith("/explorer/saved")) return res(200, { saved_queries: opts.models ?? [] })
           if (url.endsWith("/schedule") && method === "GET") {
             return res(404, { error: "no schedule for this saved query" })
           }
@@ -743,10 +991,28 @@ describe("SavedQueryModelDialog", () => {
         unresolved: [],
         candidates: [
           {
-            pipeline_id: PIPELINE_ID,
-            pipeline_name: "Daily orders load",
+            kind: "pipeline",
+            id: PIPELINE_ID,
+            name: "Daily orders load",
             table: "analytics.orders",
             matched_reference: "analytics.orders",
+            qualified: true,
+          },
+        ],
+        ambiguous: false,
+      }
+
+      const customerDim = { id: MODEL_ID, name: "Customer dim", materialization: "table" }
+      const modelProducer = {
+        references: ["analytics.customer_dim"],
+        unresolved: [],
+        candidates: [
+          {
+            kind: "model",
+            id: MODEL_ID,
+            name: "Customer dim",
+            table: "analytics.customer_dim",
+            matched_reference: "analytics.customer_dim",
             qualified: true,
           },
         ],
@@ -761,7 +1027,7 @@ describe("SavedQueryModelDialog", () => {
         await waitFor(() => {
           expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
         })
-        await chooseAfterPipeline(user)
+        await chooseAfterUpstream(user)
 
         expect(await screen.findByRole("button", { name: /follow daily orders load/i })).toBeInTheDocument()
         expect(screen.getByText(/writes analytics\.orders/i)).toBeInTheDocument()
@@ -769,7 +1035,7 @@ describe("SavedQueryModelDialog", () => {
         // The whole point: the suggestion is visible and nothing has been chosen. If the
         // dialog pre-selected it, Create would be live and a click away from scheduling
         // against a pipeline the user never picked.
-        expect(screen.getByRole("combobox", { name: /pipeline/i })).toHaveTextContent(/choose a pipeline/i)
+        expect(screen.getByRole("checkbox", { name: "Daily orders load" })).not.toBeChecked()
         expect(screen.getByRole("button", { name: /create schedule/i })).toBeDisabled()
       })
 
@@ -782,11 +1048,11 @@ describe("SavedQueryModelDialog", () => {
         await waitFor(() => {
           expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
         })
-        await chooseAfterPipeline(user)
+        await chooseAfterUpstream(user)
         await user.click(await screen.findByRole("button", { name: /follow daily orders load/i }))
 
-        // The picker and the suggestion agree afterwards — they are one value, not two.
-        expect(screen.getByRole("combobox", { name: /pipeline/i })).toHaveTextContent(/daily orders load/i)
+        // The box and the suggestion agree afterwards — they are one value, not two.
+        expect(screen.getByRole("checkbox", { name: "Daily orders load" })).toBeChecked()
         expect(screen.getByRole("button", { name: /following daily orders load/i })).toBeDisabled()
 
         await user.click(screen.getByRole("button", { name: /create schedule/i }))
@@ -794,22 +1060,47 @@ describe("SavedQueryModelDialog", () => {
           expect(calls.filter((c) => c.method === "POST")).toHaveLength(1)
         })
         const posted = calls.find((c) => c.method === "POST")!.body as Record<string, unknown>
-        expect(posted.trigger_pipeline_id).toBe(PIPELINE_ID)
+        expect(posted.upstreams).toEqual([{ kind: "pipeline", id: PIPELINE_ID }])
       })
 
+      // The shortcut adds and never removes, so the box is the only way back. If the
+      // Follow button also un-picked, one control would carry two meanings and the
+      // "Following …" state would be a toggle nobody labelled as one.
+      it("lets the box undo what the shortcut added", async () => {
+        mockWithUpstreams(oneProducer)
+        const user = userEvent.setup()
+        renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
+
+        await waitFor(() => {
+          expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
+        })
+        await chooseAfterUpstream(user)
+        await user.click(await screen.findByRole("button", { name: /follow daily orders load/i }))
+        expect(screen.getByRole("button", { name: /create schedule/i })).toBeEnabled()
+
+        await user.click(screen.getByRole("checkbox", { name: "Daily orders load" }))
+
+        expect(screen.getByRole("checkbox", { name: "Daily orders load" })).not.toBeChecked()
+        expect(screen.getByRole("button", { name: /follow daily orders load/i })).toBeEnabled()
+        expect(screen.getByRole("button", { name: /create schedule/i })).toBeDisabled()
+      })
+
+      // `FROM orders` with analytics.orders and staging.orders both produced: two
+      // different tables answer to the name, and only the author knows which one it is.
       it("announces ambiguity instead of choosing for the user", async () => {
         mockWithUpstreams(
           {
-            references: ["analytics.orders"],
+            references: ["orders"],
             unresolved: [],
             candidates: [
-              { ...oneProducer.candidates[0] },
+              { ...oneProducer.candidates[0], matched_reference: "orders", qualified: false },
               {
-                pipeline_id: OTHER_ID,
-                pipeline_name: "Orders backfill",
-                table: "analytics.orders",
-                matched_reference: "analytics.orders",
-                qualified: true,
+                kind: "pipeline",
+                id: OTHER_ID,
+                name: "Orders staging load",
+                table: "staging.orders",
+                matched_reference: "orders",
+                qualified: false,
               },
             ],
             ambiguous: true,
@@ -817,7 +1108,7 @@ describe("SavedQueryModelDialog", () => {
           {
             pipelines: [
               { id: PIPELINE_ID, name: "Daily orders load" },
-              { id: OTHER_ID, name: "Orders backfill" },
+              { id: OTHER_ID, name: "Orders staging load" },
             ],
           }
         )
@@ -827,12 +1118,76 @@ describe("SavedQueryModelDialog", () => {
         await waitFor(() => {
           expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
         })
-        await chooseAfterPipeline(user)
+        await chooseAfterUpstream(user)
 
         expect(await screen.findByRole("button", { name: /follow daily orders load/i })).toBeInTheDocument()
-        expect(screen.getByRole("button", { name: /follow orders backfill/i })).toBeInTheDocument()
-        expect(screen.getByText(/more than one pipeline writes the same table/i)).toBeInTheDocument()
+        expect(screen.getByRole("button", { name: /follow orders staging load/i })).toBeInTheDocument()
+        expect(screen.getByText(/matches more than one table/i)).toBeInTheDocument()
         expect(screen.getByRole("button", { name: /create schedule/i })).toBeDisabled()
+      })
+
+      // Two producers of ONE table is fan-in, which a schedule can follow in full. It is
+      // not a question the user has to settle, and a warning saying it is would be wrong.
+      it("offers every producer of one table without calling it ambiguous", async () => {
+        mockWithUpstreams(
+          {
+            references: ["analytics.orders"],
+            unresolved: [],
+            candidates: [
+              { ...oneProducer.candidates[0] },
+              {
+                kind: "model",
+                id: MODEL_ID,
+                name: "Orders corrections",
+                table: "analytics.orders",
+                matched_reference: "analytics.orders",
+                qualified: true,
+              },
+            ],
+            ambiguous: false,
+          },
+          { models: [{ id: MODEL_ID, name: "Orders corrections", materialization: "table" }] }
+        )
+        const user = userEvent.setup()
+        renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
+
+        await waitFor(() => {
+          expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
+        })
+        await chooseAfterUpstream(user)
+
+        expect(await screen.findByRole("button", { name: /follow daily orders load/i })).toBeInTheDocument()
+        expect(screen.getByRole("button", { name: /follow orders corrections/i })).toBeInTheDocument()
+        expect(screen.getByText(/these pipelines and models produce/i)).toBeInTheDocument()
+        expect(screen.queryByText(/more than one table/i)).not.toBeInTheDocument()
+      })
+
+      // A model is offered the way a pipeline is, and what gets posted says it is a
+      // model: the id alone would name a row in the wrong table.
+      it("offers a model that builds the table and submits it as a model", async () => {
+        const calls: Array<{ url: string; method: string; body: unknown }> = []
+        mockWithUpstreams(modelProducer, { models: [customerDim], onCall: (c) => calls.push(c) })
+        const user = userEvent.setup()
+        renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
+
+        await waitFor(() => {
+          expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
+        })
+        await chooseAfterUpstream(user)
+
+        expect(await screen.findByText(/another model builds/i)).toBeInTheDocument()
+        expect(screen.getByText(/builds analytics\.customer_dim/i)).toBeInTheDocument()
+        expect(screen.getByRole("checkbox", { name: "Customer dim" })).not.toBeChecked()
+
+        await user.click(screen.getByRole("button", { name: /follow customer dim/i }))
+        expect(screen.getByRole("checkbox", { name: "Customer dim" })).toBeChecked()
+
+        await user.click(screen.getByRole("button", { name: /create schedule/i }))
+        await waitFor(() => {
+          expect(calls.filter((c) => c.method === "POST")).toHaveLength(1)
+        })
+        const posted = calls.find((c) => c.method === "POST")!.body as Record<string, unknown>
+        expect(posted.upstreams).toEqual([{ kind: "model", id: MODEL_ID }])
       })
 
       // A name-only match is a weaker claim than a schema-qualified one, and the user is
@@ -850,13 +1205,13 @@ describe("SavedQueryModelDialog", () => {
         await waitFor(() => {
           expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
         })
-        await chooseAfterPipeline(user)
+        await chooseAfterUpstream(user)
 
         expect(await screen.findByText(/matched on table name only/i)).toBeInTheDocument()
       })
 
-      // Clicking this would set an id the picker cannot display, so the user would press
-      // a button and watch the field stay on its placeholder.
+      // Clicking this would add an upstream with no box beside it, so the user could not
+      // take back what the click just did.
       it("does not offer a pipeline the picker has no entry for", async () => {
         mockWithUpstreams(
           {
@@ -864,8 +1219,9 @@ describe("SavedQueryModelDialog", () => {
             unresolved: [],
             candidates: [
               {
-                pipeline_id: OTHER_ID,
-                pipeline_name: "Deleted loader",
+                kind: "pipeline",
+                id: OTHER_ID,
+                name: "Deleted loader",
                 table: "analytics.orders",
                 matched_reference: "analytics.orders",
                 qualified: true,
@@ -881,9 +1237,43 @@ describe("SavedQueryModelDialog", () => {
         await waitFor(() => {
           expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
         })
-        await chooseAfterPipeline(user)
+        await chooseAfterUpstream(user)
 
         expect(screen.queryByRole("button", { name: /follow deleted loader/i })).not.toBeInTheDocument()
+      })
+
+      // Pipelines and models are separate id spaces. An id the picker lists under the
+      // OTHER kind is still not an entry for this candidate, and following it would add
+      // a "model:<pipeline id>" upstream with no box beside it.
+      it("does not offer a candidate the picker lists only under the other kind", async () => {
+        mockWithUpstreams(
+          {
+            references: ["analytics.orders"],
+            unresolved: [],
+            candidates: [
+              {
+                kind: "model",
+                id: PIPELINE_ID,
+                name: "Orders rollup",
+                table: "analytics.orders",
+                matched_reference: "analytics.orders",
+                qualified: true,
+              },
+            ],
+            ambiguous: false,
+          },
+          { pipelines: [{ id: PIPELINE_ID, name: "Daily orders load" }], models: [] }
+        )
+        const user = userEvent.setup()
+        renderDialog({ materialization: "table", targetTable: "analytics.daily_mrr" })
+
+        await waitFor(() => {
+          expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
+        })
+        await chooseAfterUpstream(user)
+
+        expect(await screen.findByRole("checkbox", { name: "Daily orders load" })).toBeInTheDocument()
+        expect(screen.queryByRole("button", { name: /follow orders rollup/i })).not.toBeInTheDocument()
       })
 
       // The picker works on its own and always has. A broken shortcut that announces
@@ -896,11 +1286,10 @@ describe("SavedQueryModelDialog", () => {
         await waitFor(() => {
           expect(screen.getByRole("button", { name: /create schedule/i })).toBeInTheDocument()
         })
-        await chooseAfterPipeline(user)
+        await chooseAfterUpstream(user)
 
         expect(screen.queryByText(/this query reads/i)).not.toBeInTheDocument()
-        await user.click(screen.getByRole("combobox", { name: /pipeline/i }))
-        await user.click(await screen.findByRole("option", { name: /daily orders load/i }))
+        await user.click(await screen.findByRole("checkbox", { name: "Daily orders load" }))
         expect(screen.getByRole("button", { name: /create schedule/i })).toBeEnabled()
       })
 

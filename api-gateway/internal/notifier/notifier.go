@@ -205,6 +205,27 @@ func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, e
 	return n, nil
 }
 
+// NewEmitter builds a Notifier that consumes nothing: Publish hands it an event
+// in-process instead of over Kafka. The gateway uses it for events it raises
+// itself — a new pre-migration assessment issue — so they get the same
+// persist → dedup → Slack/email path, and the same catalog copy, as the
+// orchestrator's alerts, without a producer round-trip through the broker.
+func NewEmitter(db *sql.DB) *Notifier {
+	return &Notifier{
+		db:                   db,
+		httpClient:           safehttp.NewClient(slackTimeout),
+		appBaseURL:           appBaseURLFromEnv(),
+		interactiveApprovals: strings.TrimSpace(os.Getenv("SLACK_SIGNING_SECRET")) != "",
+		topics:               resolveNotifierTopics(),
+	}
+}
+
+// Publish delivers one rsync.notifications-shaped event as though it had
+// arrived on the notification topic.
+func (n *Notifier) Publish(ctx context.Context, raw []byte) error {
+	return n.handleMessage(ctx, n.topics.notify, raw)
+}
+
 // appBaseURLFromEnv is the public frontend origin used to turn a persisted
 // relative action_url (e.g. /pipelines/{id}/schema-changes) into an absolute
 // link that resolves in Slack/email. Same env var + default the api-gateway
@@ -219,8 +240,8 @@ func appBaseURLFromEnv() string {
 
 // Stop gracefully shuts down the notifier consumer.
 func (n *Notifier) Stop() {
-	if n == nil {
-		return
+	if n == nil || n.cancel == nil {
+		return // nil, or an emitter (NewEmitter) that never consumed
 	}
 	n.cancel()
 	select {

@@ -47,6 +47,12 @@ type PipelineState struct {
 	StaleElapsedSeconds int64 `json:"stale_elapsed_seconds,omitempty"`
 	// CancelRecommended is server-computed guidance for when to offer a cancel action (e.g. stale > 5m).
 	CancelRecommended bool `json:"cancel_recommended,omitempty"`
+	// Streaming is true for a CDC pipeline that has handed off to continuous streaming.
+	// Its IsStale/StaleReason then come from the destination-apply liveness signal that
+	// /runtime uses (applyStreamingLiveness), never from the heartbeat age — a healthy
+	// stream with no new source changes sends no heartbeats — and CancelRecommended is
+	// always false: stopping a stream is a normal action, not a recovery step.
+	Streaming bool `json:"streaming,omitempty"`
 	// New field for explicit error message
 	ErrorMessage string `json:"error_message,omitempty"`
 }
@@ -259,11 +265,13 @@ func GetPipelineState(c *gin.Context) {
 	// In that case, the UI should reflect the explicit stop immediately.
 	var pipelineStatus sql.NullString
 	var pipelineUpdatedAt sql.NullTime
+	// sync_mode decides whether heartbeat staleness applies (applyStateStaleness).
+	var pipelineSyncMode sql.NullString
 	_ = database.QueryRow(`
-		SELECT status, updated_at
+		SELECT status, updated_at, sync_mode
 		FROM pipelines
 		WHERE id = $1
-	`, pipelineID).Scan(&pipelineStatus, &pipelineUpdatedAt)
+	`, pipelineID).Scan(&pipelineStatus, &pipelineUpdatedAt, &pipelineSyncMode)
 
 	// If the Phase 4 Healer (or any background process) marked pipeline_progress
 	// as waiting_for_user with a blocking_reason, that takes precedence over
@@ -300,10 +308,10 @@ func GetPipelineState(c *gin.Context) {
 	// handlers, two answers.
 	//
 	// Deliberately limited to failed/cancelled/stopped. A CDC pipeline's execution
-	// row is closed as 'success' at the backfill→streaming handoff
+	// row is closed as 'completed' at the backfill→streaming handoff
 	// (pipeline_status_activity.go) while the feed keeps running, so treating a
-	// closed *success* as terminal here would mask a live HITL prompt on a live
-	// stream.
+	// closed *completed/success* execution as terminal here would mask a live HITL
+	// prompt on a live stream.
 	deadParkStatus := staleParkTerminalStatus(database, state.Status, executionID)
 
 	healerHITL := state.Status == "waiting_for_user" && blockingReasonType.Valid && blockingReasonType.String != "" && !pipelineTerminallyFailed && deadParkStatus == ""
@@ -567,15 +575,9 @@ func GetPipelineState(c *gin.Context) {
 		}
 	}
 
-	// Compute staleness if pipeline is processing (server-computed so UI can stay pure/idempotent).
-	if state.Status == "processing" && state.LastHeartbeatAt != nil {
-		isStale, reason := computeStaleness(state)
-		state.IsStale = isStale
-		state.StaleReason = reason
-		state.StaleElapsedSeconds = int64(time.Since(*state.LastHeartbeatAt).Seconds())
-		// Offer cancel after 5 minutes of staleness (additive, UI may ignore).
-		state.CancelRecommended = isStale && state.StaleElapsedSeconds > 300
-	}
+	// Compute staleness (server-computed so UI can stay pure/idempotent). A streaming CDC
+	// pipeline is judged by stream liveness, not heartbeat age — see applyStateStaleness.
+	applyStateStaleness(database, pipelineID, pipelineSyncMode.String, &state)
 
 	// Normalize progress to ensure consistency (force 100% when completed, clamp values, etc.)
 	normalizeProgress(&state)
@@ -1196,6 +1198,154 @@ func staleParkTerminalStatus(database *sql.DB, progressStatus string, executionI
 		return "stopped"
 	}
 	return ""
+}
+
+// applyStateStaleness fills the /state staleness fields (is_stale, stale_reason,
+// stale_elapsed_seconds, cancel_recommended, streaming). syncMode is pipelines.sync_mode.
+//
+// Every pipeline except a streaming CDC one keeps the heartbeat rule unchanged: a
+// "processing" row whose last heartbeat is older than its stage threshold is stale, and
+// cancel is recommended once that has lasted more than 5 minutes.
+//
+// A CDC pipeline that has handed off to streaming stops heartbeating by design: the
+// orchestrator stops its heartbeat at the handoff (backend-orchestrator workers/executor.go)
+// and nothing else ticks while the source has no new changes. Judged by heartbeat age, a
+// healthy quiet stream read "Stale" with a destructive Stop after a few minutes (issue #7).
+// For those pipelines staleness comes from the same destination-apply liveness, backlog and
+// dependency health that /runtime folds into its phase (applyStreamingLiveness), so a
+// genuinely stalled, never-delivering or dependency-dead stream is still reported stale.
+func applyStateStaleness(database *sql.DB, pipelineID, syncMode string, state *PipelineState) {
+	if isStreamingCDCState(database, pipelineID, syncMode, *state) {
+		applyStreamingLiveness(database, pipelineID, state)
+		return
+	}
+	// Compute staleness if pipeline is processing (server-computed so UI can stay pure/idempotent).
+	if state.Status == "processing" && state.LastHeartbeatAt != nil {
+		isStale, reason := computeStaleness(*state)
+		state.IsStale = isStale
+		state.StaleReason = reason
+		state.StaleElapsedSeconds = int64(time.Since(*state.LastHeartbeatAt).Seconds())
+		// Offer cancel after 5 minutes of staleness (additive, UI may ignore).
+		state.CancelRecommended = isStale && state.StaleElapsedSeconds > 300
+	}
+}
+
+// isStreamingCDCState reports whether a /state row belongs to a CDC pipeline that has
+// handed off to continuous streaming. It is decided from stored data only:
+//
+//   - pipelines.sync_mode must be 'cdc' (the column /runtime reads for its mode; anything
+//     else, including NULL on a legacy row, is batch there too);
+//   - a pipeline_progress status of "running" is written only by the streaming handoff
+//     (temporal-adapter StateUpdateActivity + UpdatePipelineStatusActivity
+//     "streaming_active"; the batch path writes "processing" — see pipelines.go derived_status);
+//   - a "processing" row counts only when its execution has been closed successfully,
+//     which is exactly what the "streaming_active" handoff does while the feed keeps
+//     running. A late progress event can still put "processing" back on the row after
+//     that, so the heartbeat it carries says nothing about the stream. A CDC pipeline
+//     still in its initial load has an open execution and keeps the heartbeat rule.
+//
+// Any query error answers false, which keeps the previous heartbeat behaviour.
+func isStreamingCDCState(database *sql.DB, pipelineID, syncMode string, state PipelineState) bool {
+	if !strings.EqualFold(strings.TrimSpace(syncMode), "cdc") {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(state.Status)) {
+	case "running":
+		return true
+	case "processing":
+		return executionClosedForStreaming(database, pipelineID, state.ExecutionID)
+	}
+	return false
+}
+
+// executionClosedForStreaming reports whether the execution was closed successfully
+// (status completed/success with an end_time) — the CDC backfill-to-streaming handoff.
+func executionClosedForStreaming(database *sql.DB, pipelineID, executionID string) bool {
+	executionID = strings.TrimSpace(executionID)
+	if database == nil || executionID == "" {
+		return false
+	}
+	var closed bool
+	if err := database.QueryRow(`
+		SELECT EXISTS (
+		  SELECT 1 FROM executions
+		  WHERE id = $1 AND pipeline_id = $2
+		    AND status IN ('completed', 'success')
+		    AND end_time IS NOT NULL
+		)
+	`, executionID, pipelineID).Scan(&closed); err != nil {
+		log.Debugf("state: streaming handoff lookup failed (keeping heartbeat staleness): %v", err)
+		return false
+	}
+	return closed
+}
+
+// applyStreamingLiveness sets the staleness fields for a streaming CDC pipeline from the
+// signals GET /runtime uses — loadCDCLiveness (newest destination apply + pending backlog),
+// loadRuntimeDeps (dependency health) and loadCDCFirstDataWait — folded by the same
+// cdcLivenessPhase, so /state and /runtime cannot disagree about whether a stream is alive.
+// Cancel is never recommended: the reason says what to check instead.
+func applyStreamingLiveness(database *sql.DB, pipelineID string, state *PipelineState) {
+	state.Streaming = true
+	state.IsStale = false
+	state.StaleReason = ""
+	state.StaleElapsedSeconds = 0
+	state.CancelRecommended = false
+	if database == nil {
+		return
+	}
+
+	lastAppliedAt, pending := loadCDCLiveness(database, pipelineID)
+	var liveness *RuntimeLiveness
+	if lastAppliedAt.Valid {
+		liveness = &RuntimeLiveness{
+			LastEventAt:   &lastAppliedAt.Time,
+			StaleSeconds:  int64(time.Since(lastAppliedAt.Time).Seconds()),
+			PendingEvents: pending,
+		}
+	}
+	_, depHealth := loadRuntimeDeps(database, pipelineID)
+	var firstDataWaitSince time.Time
+	if liveness == nil && strings.TrimSpace(state.ExecutionID) != "" {
+		firstDataWaitSince = loadCDCFirstDataWait(database, pipelineID, state.ExecutionID)
+	}
+
+	const checkHealth = "Check the pipeline's health details to see what is wrong."
+	switch cdcLivenessPhase(depHealth, liveness, firstDataWaitSince) {
+	case "failed":
+		state.IsStale = true
+		if liveness != nil {
+			state.StaleElapsedSeconds = liveness.StaleSeconds
+		}
+		state.StaleReason = "A service this stream depends on is not healthy, so changes may not be reaching the destination. " + checkHealth
+	case "waiting_for_data":
+		waited := time.Since(firstDataWaitSince)
+		state.IsStale = true
+		state.StaleElapsedSeconds = int64(waited.Seconds())
+		state.StaleReason = "Streaming started " + formatDuration(waited) + " ago, but nothing has reached the destination yet. " +
+			"Make a change in the source to confirm it is picked up. If it does not arrive, " +
+			"check the pipeline's health details to see what is wrong."
+	case "idle":
+		quiet := time.Duration(liveness.StaleSeconds) * time.Second
+		state.IsStale = true
+		state.StaleElapsedSeconds = liveness.StaleSeconds
+		if liveness.PendingEvents > 0 {
+			waiting := strconv.FormatInt(liveness.PendingEvents, 10) + " changes are"
+			if liveness.PendingEvents == 1 {
+				waiting = "1 change is"
+			}
+			state.StaleReason = waiting + " waiting to be written, but nothing has reached the destination for " + formatDuration(quiet) + ". " + checkHealth
+		} else if depHealth == "unknown" {
+			// No dependency manifest (older pipelines): nothing can confirm the stream is
+			// still capturing, so /runtime reads idle too. Say what the user can check.
+			state.StaleReason = "Nothing has reached the destination for " + formatDuration(quiet) +
+				", and this stream has no health checks that confirm it is still picking up changes. " +
+				"Make a change in the source to confirm it arrives. If it does not arrive within a few minutes, the stream has stopped picking up changes."
+		} else {
+			state.StaleReason = "Nothing has reached the destination for " + formatDuration(quiet) +
+				" and the stream's health checks have not all passed, so it may have stopped picking up changes. " + checkHealth
+		}
+	}
 }
 
 // computeStaleness determines if a pipeline stage is stale based on last heartbeat

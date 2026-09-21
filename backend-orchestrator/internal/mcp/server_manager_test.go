@@ -175,12 +175,12 @@ func TestMongoAtlasConnectionStringSatisfiesRequiredConfig(t *testing.T) {
 		}
 	})
 
-	t.Run("database has no alias and is still required", func(t *testing.T) {
+	t.Run("a URI naming no database is a server-level connection and is accepted", func(t *testing.T) {
+		// database is optional: without one the connection spans every database its
+		// Scope allows (executor server_level_source.go), so the gate must not ask for it.
 		cfg := map[string]string{"connection_string": "mongodb+srv://u:p@cluster0.abcd.mongodb.net/"}
-		missing := missingRequiredConfig(md.RequiredConfig, md.ConfigAliases, cfg)
-		if len(missing) != 1 || missing[0] != "database" {
-			t.Fatalf("missing = %v, want exactly [database]; a URI does not name the database "+
-				"rsync captures collections from", missing)
+		if missing := missingRequiredConfig(md.RequiredConfig, md.ConfigAliases, cfg); len(missing) != 0 {
+			t.Fatalf("missing = %v, want none; a server-level mongodb connection names no database", missing)
 		}
 	})
 
