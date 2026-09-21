@@ -68,6 +68,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from _cut_collection import tree_is_intact
 from src.agents.tool_generator.contracts import generate_v1 as contract
 from src.lifecycle.scaffold_routes import scaffold_router
 
@@ -168,6 +169,11 @@ def test_the_wire_contract_is_defined_exactly_once(model):
 )
 def test_both_handlers_import_the_contract_rather_than_restating_it(handler):
     """Each handler must reach the shared module by an import, not by a class body."""
+    if not os.path.exists(handler) and not tree_is_intact():
+        # The agentic handler is the moat half; the public cut strips it, so the
+        # community tree has one handler to check, not two. In the private tree a
+        # missing handler is still a failure.
+        pytest.skip("handler stripped by the public cut (llm-service/oss-strip-list.txt)")
     tree = _parse(handler)
 
     redefined = [

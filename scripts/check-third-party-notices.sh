@@ -39,6 +39,13 @@ GO_MODULES=(
   shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
 )
 
+# Main packages that exist to test the product and that no image ships. Named by import
+# path, not by module: exempting a whole module would let the next real binary added
+# beside the probe ship unlisted, which is the failure the loop below exists to catch.
+TEST_ONLY_MAINS=(
+  github.com/rsync-ai/shared/kafkaclient/cmd/kmatrix-probe
+)
+
 # Guard the list itself: a new Go service that nobody adds here ships unlisted, which
 # is exactly how connector-deployer's 14 modules went unrecorded. Every go.mod that
 # builds a main package must be named above.
@@ -55,12 +62,16 @@ while IFS= read -r gomod; do
   # stderr goes to its own file rather than into `names`: `go list` writes progress
   # lines ("go: downloading ...") to stderr even on success, and merging them would
   # put them in the same stream the classification greps.
-  if ! names=$(cd "$d" && go list -f '{{.Name}}' ./... 2>"$gl_err"); then
+  if ! names=$(cd "$d" && go list -f '{{.Name}} {{.ImportPath}}' ./... 2>"$gl_err"); then
     echo "FATAL: go list failed in $d, so it cannot be classified:" >&2
     head -5 "$gl_err" >&2
     exit 2
   fi
-  if grep -qx main <<<"$names"; then
+  mains=$(awk '$1 == "main" { print $2 }' <<<"$names")
+  for t in "${TEST_ONLY_MAINS[@]}"; do
+    mains=$(grep -vxF "$t" <<<"$mains" || true)
+  done
+  if [ -n "$mains" ]; then
     echo "FAIL: $d builds a main package but is not in GO_MODULES — its dependencies"
     echo "      would ship unlisted. Add it here and in scripts/gen-third-party-notices.sh."
     missing_mod=1

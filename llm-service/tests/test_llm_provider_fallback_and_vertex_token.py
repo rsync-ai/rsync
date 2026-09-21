@@ -30,6 +30,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx2
 import pytest
 
+from _cut_collection import tree_is_intact
 from src.utils import gcp_access_token, openai_client
 from src.utils.gcp_access_token import MetadataAccessToken, MetadataTokenError, fetch_metadata_token
 from src.utils.openai_client import (
@@ -371,6 +372,10 @@ def test_the_async_client_keeps_sending_a_current_token(monkeypatch):
 
 
 def test_the_connector_generator_uses_the_same_token_source(monkeypatch):
+    if not tree_is_intact():
+        # The connector generator is the stripped half of tool_generator
+        # (llm-service/oss-strip-list.txt); the public cut has nothing to import.
+        pytest.skip("connector generator stripped by the public cut")
     from src.agents.tool_generator.agents import base
 
     meta, clock = _FakeMetadata(), _Clock()
