@@ -101,6 +101,7 @@ export default function PIIDashboardPage() {
   const [policies, setPolicies] = useState<PIIPolicy[]>([]);
   const [hashFunctions, setHashFunctions] = useState<HashFunction[]>([]);
   const [loading, setLoading] = useState(true);
+  const [loadErrors, setLoadErrors] = useState<string[]>([]);
   const [selectedRequest, setSelectedRequest] = useState<ApprovalRequest | null>(null);
   const [showDecisionDialog, setShowDecisionDialog] = useState(false);
   const [decisionNotes, setDecisionNotes] = useState("");
@@ -125,40 +126,49 @@ export default function PIIDashboardPage() {
     // Four sequential round-trips — a switch part-way through would otherwise
     // leave the page showing a mix of both workspaces' PII findings.
     const isStale = captureWorkspace();
+    const errors: string[] = [];
+
+    // Load one section. Each of these used to be `if (res.ok)` with no else, so
+    // a failing endpoint left its state at the initial empty array and the page
+    // rendered "0 PII Columns Detected" — a clean, confident, wrong answer. That
+    // is what the PII page showed for the whole period its tables were missing
+    // from the schema and every one of these endpoints was returning 500. An
+    // empty workspace and a broken backend have to look different.
+    //
+    // Returns false when the active workspace changed mid-flight, which abandons
+    // the rest of the refresh: half of one workspace's findings shown beside half
+    // of another's would be worse than showing the previous workspace's.
+    const load = async <T,>(
+      label: string,
+      path: string,
+      apply: (data: T) => void,
+    ): Promise<boolean> => {
+      try {
+        const res = await authFetch(`${API_ENDPOINTS.API_GATEWAY_URL}${path}`, { cache: "no-store" });
+        if (isStale()) return false;
+        if (!res.ok) {
+          errors.push(`${label}: HTTP ${res.status}`);
+          return true;
+        }
+        apply((await res.json()) as T);
+      } catch (error) {
+        if (isStale()) return false;
+        console.error(`Failed to fetch ${label}:`, error);
+        errors.push(`${label}: ${error instanceof Error ? error.message : "request failed"}`);
+      }
+      return true;
+    };
+
     try {
-      // Fetch PII scan results
-      const scanRes = await authFetch(`${API_ENDPOINTS.API_GATEWAY_URL}/api/v1/pii/scan/results`, { cache: "no-store" });
-      if (isStale()) return;
-      if (scanRes.ok) {
-        const data = await scanRes.json();
-        setScanResults(data.results || []);
-      }
-
-      // Fetch approval requests
-      const approvalRes = await authFetch(`${API_ENDPOINTS.API_GATEWAY_URL}/api/v1/pii/approvals?status=pending`, { cache: "no-store" });
-      if (isStale()) return;
-      if (approvalRes.ok) {
-        const data = await approvalRes.json();
-        setApprovalRequests(data.requests || []);
-      }
-
-      // Fetch policies
-      const policyRes = await authFetch(`${API_ENDPOINTS.API_GATEWAY_URL}/api/v1/pii/policies`, { cache: "no-store" });
-      if (isStale()) return;
-      if (policyRes.ok) {
-        const data = await policyRes.json();
-        setPolicies(data.policies || []);
-      }
-
-      // Fetch hash functions
-      const hashRes = await authFetch(`${API_ENDPOINTS.API_GATEWAY_URL}/api/v1/hash-functions`, { cache: "no-store" });
-      if (isStale()) return;
-      if (hashRes.ok) {
-        const data = await hashRes.json();
-        setHashFunctions(data.functions || []);
-      }
-    } catch (error) {
-      console.error("Failed to fetch PII data:", error);
+      if (!(await load<{ results?: PIIScanResult[] }>("Scan results", "/api/v1/pii/scan/results",
+        (d) => setScanResults(d.results || [])))) return;
+      if (!(await load<{ requests?: ApprovalRequest[] }>("Approval requests", "/api/v1/pii/approvals?status=pending",
+        (d) => setApprovalRequests(d.requests || [])))) return;
+      if (!(await load<{ policies?: PIIPolicy[] }>("Policies", "/api/v1/pii/policies",
+        (d) => setPolicies(d.policies || [])))) return;
+      if (!(await load<{ functions?: HashFunction[] }>("Hash functions", "/api/v1/hash-functions",
+        (d) => setHashFunctions(d.functions || [])))) return;
+      setLoadErrors(errors);
     } finally {
       setLoading(false);
     }
@@ -246,6 +256,19 @@ export default function PIIDashboardPage() {
           Refresh
         </Button>
       </div>
+
+      {/* A section that could not be loaded says so. The counts below are
+          derived from these four fetches, so a silent failure would show up as
+          a confident zero rather than as a problem. */}
+      {loadErrors.length > 0 && (
+        <Alert variant="destructive">
+          <AlertTriangle className="w-4 h-4" />
+          <AlertDescription>
+            Some PII data could not be loaded, so the figures below are incomplete:{" "}
+            {loadErrors.join("; ")}. Use Refresh to try again.
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* Stats Cards */}
       <div className="grid grid-cols-1 md:grid-cols-4 gap-4">

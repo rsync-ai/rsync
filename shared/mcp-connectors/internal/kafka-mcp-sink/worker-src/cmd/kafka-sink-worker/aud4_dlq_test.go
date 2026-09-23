@@ -91,13 +91,14 @@ func TestAUD4DLQRouting(t *testing.T) {
 
 	// If flushBatch wrongly took the no-DLQ fail-closed path, os.Exit(1) would kill the
 	// test binary here (reported as a failure). Reaching the asserts == it returned.
-	b.flushBatch(ctx, key, batch, "aud4-test")
+	// submitFlush is the production entry point and the one that seals the batch.
+	b.submitFlush(ctx, key, batch, "aud4-test")
 
 	if got := atomic.LoadUint64(&metrics.dlqRouted); got != uint64(len(msgs)) {
 		t.Fatalf("metrics.dlqRouted = %d, want %d", got, len(msgs))
 	}
 	if _, ok := b.batches[key]; ok {
-		t.Fatalf("batch was not deleted from b.batches after DLQ routing")
+		t.Fatalf("batch was not sealed out of b.batches before the DLQ flush ran")
 	}
 	if hw := atomic.LoadInt64(&metrics.lastCommittedOffset); hw != 12 {
 		t.Fatalf("lastCommittedOffset = %d, want 12 (offset advanced past failed batch)", hw)

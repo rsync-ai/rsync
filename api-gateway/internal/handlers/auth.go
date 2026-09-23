@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -20,6 +21,7 @@ import (
 
 	"api-gateway/internal/db"
 	"api-gateway/internal/email"
+	"api-gateway/internal/identity"
 )
 
 // bcryptCost is the work factor for bcrypt. 12 rounds ≈ 350ms on a modern CPU —
@@ -40,12 +42,84 @@ func EmailConfigStatus() string { return emailClient.ConfigStatus() }
 
 type AuthHandler struct {
 	db *sql.DB
+
+	// identity is the extension point Login resolves its provider through. It is
+	// never nil for a handler built by newAuthHandler, which is every handler in
+	// the running binary; identityProvider denies rather than dereferences if a
+	// caller builds one some other way.
+	identity *identity.Registry
+}
+
+// newAuthHandler is the one place an AuthHandler is assembled, so that no
+// construction path can produce one with an unwired identity registry. Tests use
+// it for the same reason.
+func newAuthHandler(database *sql.DB) *AuthHandler {
+	return &AuthHandler{
+		db: database,
+		identity: identity.NewRegistry(
+			identity.NewLocalProvider(localPasswordHashLookup(database)),
+		),
+	}
 }
 
 func NewAuthHandler() *AuthHandler {
-	return &AuthHandler{
-		db: db.GetDB(),
+	return newAuthHandler(db.GetDB())
+}
+
+// localPasswordHashLookup reads the stored bcrypt hash for an email address.
+//
+// It lives here rather than in the identity package so that package holds no SQL
+// and no database handle, which is what lets the community default be covered by
+// the ordinary `go test ./...` CI runs instead of behind the integration_pg build
+// tag that CI never compiles.
+//
+// A missing row is ErrInvalidCredentials, not a lookup failure: "no such account"
+// and "wrong password" are one answer here, and Login has already decided whether
+// the account exists by the time this runs.
+func localPasswordHashLookup(database *sql.DB) identity.PasswordHashLookup {
+	return func(ctx context.Context, email string) (string, error) {
+		if database == nil {
+			return "", identity.ErrProviderUnavailable
+		}
+		var hash string
+		err := database.QueryRowContext(ctx,
+			`SELECT password_hash FROM users WHERE email = $1`, email).Scan(&hash)
+		if err == sql.ErrNoRows {
+			return "", identity.ErrInvalidCredentials
+		}
+		if err != nil {
+			return "", err
+		}
+		return hash, nil
 	}
+}
+
+// IdentityProviderStatus reports which provider will authenticate logins, and
+// which are registered, for the startup log.
+//
+// It returns an error when resolution fails closed -- a name this build does not
+// have refuses every login, and an operator needs to learn that at boot rather
+// than from the first user who cannot get in.
+func (h *AuthHandler) IdentityProviderStatus() (string, []string, error) {
+	if h.identity == nil {
+		return "", nil, identity.ErrProviderUnavailable
+	}
+	p, err := h.identity.Active()
+	if err != nil {
+		return "", h.identity.Names(), err
+	}
+	return p.Name(), h.identity.Names(), nil
+}
+
+// identityProvider resolves the provider for this login, failing closed on every
+// error path -- an unwired registry, and a configured provider name this binary
+// does not have. Neither falls back to the local password provider: see
+// identity.Registry.Active for why that direction is the safe one.
+func (h *AuthHandler) identityProvider() (identity.Provider, error) {
+	if h.identity == nil {
+		return nil, identity.ErrProviderUnavailable
+	}
+	return h.identity.Active()
 }
 
 func setAuthCookie(c *gin.Context, token string, expiresAt time.Time) {
@@ -147,15 +221,22 @@ func (h *AuthHandler) Login(c *gin.Context) {
 	// (UI input often includes trailing spaces; email comparison should be case-insensitive in practice.)
 	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
 
-	// Query user by email
-	var userID, email, passwordHash, role, status, name string
+	// Query user by email.
+	//
+	// password_hash is deliberately NOT selected here. The credential belongs to
+	// whichever identity provider is configured, and handing the stored hash to
+	// this handler would mean handing it to every provider the contract can reach,
+	// including one that runs elsewhere. The local provider reads its own hash
+	// through localPasswordHashLookup; this row is only the account's existence,
+	// status and profile, all of which stay the gateway's to decide.
+	var userID, email, role, status, name string
 	var emailVerified bool
 	err := h.db.QueryRow(`
-		SELECT id, email, password_hash, role, COALESCE(status, 'active'), COALESCE(name, ''),
+		SELECT id, email, role, COALESCE(status, 'active'), COALESCE(name, ''),
 		       COALESCE(email_verified, true)
 		FROM users
 		WHERE email = $1
-	`, req.Email).Scan(&userID, &email, &passwordHash, &role, &status, &name, &emailVerified)
+	`, req.Email).Scan(&userID, &email, &role, &status, &name, &emailVerified)
 
 	if err == sql.ErrNoRows {
 		// Audit: failed login attempt (user not found)
@@ -181,15 +262,48 @@ func (h *AuthHandler) Login(c *gin.Context) {
 		return
 	}
 
-	// Verify password
-	err = bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(req.Password))
+	// Verify the credential through the identity extension point.
+	//
+	// The account-status check above deliberately stays ahead of this, unchanged:
+	// a deactivated account is rejected as deactivated whatever the password was,
+	// which is the behaviour this endpoint has always had.
+	provider, err := h.identityProvider()
 	if err != nil {
-		// Audit: failed login attempt (wrong password)
+		// Not a rejected password -- the gateway could not ask. Deny, and say so
+		// with a different status and a different audit reason, because an
+		// operator reading either one needs to tell a locked-out instance from a
+		// user who mistyped. No session is minted on this path and there is no
+		// fallback to the local password provider.
+		log.WithError(err).Error("identity provider could not be resolved; denying login")
 		logAudit(c, "login_failed", "auth", userID, map[string]interface{}{
 			"email":  req.Email,
-			"reason": "invalid_password",
+			"reason": "identity_provider_unavailable",
 		})
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid email or password"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Authentication is temporarily unavailable"})
+		return
+	}
+
+	if _, err := provider.Authenticate(c.Request.Context(), identity.Attempt{
+		Email:  req.Email,
+		Secret: req.Password,
+	}); err != nil {
+		if errors.Is(err, identity.ErrInvalidCredentials) {
+			// Audit: failed login attempt (wrong password)
+			logAudit(c, "login_failed", "auth", userID, map[string]interface{}{
+				"email":  req.Email,
+				"reason": "invalid_password",
+			})
+			c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid email or password"})
+			return
+		}
+
+		log.WithError(err).WithField("provider", provider.Name()).
+			Error("identity provider could not answer; denying login")
+		logAudit(c, "login_failed", "auth", userID, map[string]interface{}{
+			"email":  req.Email,
+			"reason": "identity_provider_unavailable",
+		})
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "Authentication is temporarily unavailable"})
 		return
 	}
 

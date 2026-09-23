@@ -1,4 +1,26 @@
-"""The adapter cannot start without Temporal, so the chart must wait for it -- and
+"""A service that Fatals on a missing dependency must be made to wait for it, and a
+service that tolerates one must not be. Two dependencies are covered here:
+Temporal (the adapter waits, the api-gateway must not) and Kafka (the
+orchestrator waits, nothing else does).
+
+THE KAFKA HALF
+--------------
+`cmd/orchestrator/main.go` calls log.Fatalf the moment kafka.NewManager returns
+an error, with no retry of any kind, so a broker that is not accepting
+connections yet is a crash-loop and nothing else. The wait list did not include
+Kafka: 1 restart on kind, and on a GKE node where the broker was itself waiting
+for CPU, 7 restarts and a failed `helm --wait`. Same shape as the Temporal bug
+below -- a CrashLoopBackOff that eventually resolves reads as noise rather than
+as a missing edge in the boot order.
+
+It is opt-in for the same reason the Temporal wait is, and additionally skipped
+for a BYO cluster: `kafka.external.bootstrapServers` is a CSV whose first entry
+is not necessarily the one that is up, and a broker outside this release is not
+part of its cold start.
+
+THE TEMPORAL HALF
+-----------------
+The adapter cannot start without Temporal, so the chart must wait for it -- and
 the api-gateway, which can, must not.
 
 WHAT WENT WRONG
@@ -60,6 +82,7 @@ HELPERS = REPO / "deploy/helm/rsync-ai/templates/_helpers.tpl"
 APPS = REPO / "deploy/helm/rsync-ai/templates/apps"
 ADAPTER_MAIN = REPO / "backend-temporal-adapter/cmd/adapter/main.go"
 GATEWAY_MAIN = REPO / "api-gateway/cmd/server/main.go"
+ORCHESTRATOR_MAIN = REPO / "backend-orchestrator/cmd/orchestrator/main.go"
 
 # The documented install command's flags, so a render reaches this property
 # instead of stopping at an unrelated required-value check. Fakes throughout.
@@ -85,6 +108,17 @@ WAIT_POLICY = {
         "outage into a total one",
     ),
     "orchestrator": (False, "it holds no Temporal client at all"),
+}
+
+# component -> waits for kafka, and the reason it does or does not.
+KAFKA_WAIT_POLICY = {
+    "orchestrator": (
+        True,
+        "kafka.NewManager failing is log.Fatalf with no retry, so a broker that "
+        "is not accepting yet is a crash-loop",
+    ),
+    "api-gateway": (False, "it constructs no Kafka manager at startup"),
+    "temporal-adapter": (False, "it constructs no Kafka manager at startup"),
 }
 
 
@@ -121,6 +155,56 @@ def test_exactly_the_right_deployments_ask_for_the_temporal_wait():
             assert not asks, (
                 f"{path.name} started asking for the temporal wait. Do not: {why}."
             )
+
+
+def test_the_helper_makes_the_kafka_wait_opt_in_and_in_chart_only():
+    src = HELPERS.read_text()
+    assert "$waitKafka := and (.kafka | default false) $root.Values.kafka.enabled" in src, (
+        "rsync-ai.waitForDepsInitContainer no longer gates the kafka wait on BOTH an "
+        "opt-in argument and kafka.enabled. Unconditional, it blocks every service on "
+        "a broker only one of them needs; without the kafka.enabled half, a BYO "
+        "install waits on the first entry of a bootstrapServers CSV, which is not "
+        "necessarily a broker that is up."
+    )
+    assert "{{- if $waitKafka }}" in src, "the kafka wait is no longer guarded by $waitKafka."
+
+
+def test_exactly_the_right_deployments_ask_for_the_kafka_wait():
+    for component, (should_wait, why) in KAFKA_WAIT_POLICY.items():
+        path = APPS / f"{component}.yaml"
+        src = path.read_text()
+        asks = '"kafka" true' in src
+        if should_wait:
+            assert asks, (
+                f"{path.name} stopped asking for the kafka wait, and it needs one "
+                f"because {why}. Without it the pod crash-loops through a cold boot."
+            )
+        else:
+            assert not asks, f"{path.name} started asking for the kafka wait. Do not: {why}."
+
+
+def test_the_orchestrators_intolerance_is_the_reason_it_waits():
+    """KAFKA_WAIT_POLICY makes the orchestrator wait because it dies without a broker.
+    If it grows a retry the wait is merely redundant -- but if this Fatal moves to a
+    service that does NOT wait, that service inherits the crash-loop."""
+    src = ORCHESTRATOR_MAIN.read_text()
+    assert 'log.Fatalf("Failed to initialize Kafka: %v", err)' in src, (
+        "backend-orchestrator no longer dies on a failed Kafka init. If it now retries, "
+        "the initContainer wait is harmless and can stay; if the Fatal simply moved, "
+        "find which binary owns it and make that one wait."
+    )
+    assert "kafka.NewManager(kafkaConfig)" in src
+
+
+def test_no_other_service_fatals_on_kafka_unnoticed():
+    """The wait list is only right while the orchestrator is the only binary that
+    cannot start without a broker."""
+    for main_go in (GATEWAY_MAIN, ADAPTER_MAIN):
+        assert "kafka.NewManager" not in main_go.read_text(), (
+            f"{main_go.name} now constructs a Kafka manager at startup. If it Fatals on "
+            f"failure it needs the kafka wait too -- add it to KAFKA_WAIT_POLICY with "
+            f"its reason."
+        )
 
 
 def test_the_adapter_retries_before_it_gives_up():
@@ -256,6 +340,52 @@ def test_executing_the_rendered_script_probes_all_three_dependencies(tmp_path):
     assert len(seen) == 3, (
         f"expected probes for postgres, redis and temporal; got {seen}."
     )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_render_only_the_orchestrator_waits_for_kafka():
+    docs = _render()
+    for component, (should_wait, why) in KAFKA_WAIT_POLICY.items():
+        script, _ = _wait_script(docs, component)
+        waits = "kafka" in script
+        assert waits == should_wait, (
+            f"rendered {component} {'does not wait' if should_wait else 'waits'} "
+            f"for kafka. {why}."
+        )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_executing_the_rendered_script_probes_the_broker_the_orchestrator_dials(tmp_path):
+    """The port is split out of kafka.bootstrap rather than written a second time,
+    and a split is a computation: run it."""
+    docs = _render()
+    script, dep = _wait_script(docs, "orchestrator")
+    brokers = _env(dep, "KAFKA_BROKERS")
+    assert brokers, "the orchestrator has no KAFKA_BROKERS to compare against"
+    host, _, port = brokers.rpartition(":")
+    rc, seen, err = _run_with_stub_nc(script, tmp_path)
+    assert rc == 0, f"the wait script failed: {err[-500:]}"
+    assert (host, port) in seen, (
+        f"the script probed {seen}, which does not include the broker {host}:{port} "
+        f"the orchestrator will dial. A wait on any other address proves nothing."
+    )
+    assert len(seen) == 3, f"expected probes for postgres, redis and kafka; got {seen}."
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_a_byo_broker_is_not_waited_for(tmp_path):
+    """Its first CSV entry is not necessarily the broker that is up, and a cluster
+    that predates this install is not part of its cold start."""
+    docs = _render([
+        "--set", "kafka.enabled=false",
+        "--set", "kafka.external.bootstrapServers=b1.example\\,b2.example:9093",
+        "--set", "kafka.replicationFactor=2",
+    ])
+    script, _ = _wait_script(docs, "orchestrator")
+    assert "kafka" not in script, f"a BYO broker is being waited for:\n{script}"
+    rc, seen, err = _run_with_stub_nc(script, tmp_path)
+    assert rc == 0, f"the wait script failed: {err[-500:]}"
+    assert len(seen) == 2, f"expected probes for postgres and redis only; got {seen}."
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")

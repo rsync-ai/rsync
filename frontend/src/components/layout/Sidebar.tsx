@@ -65,6 +65,9 @@ const navigation: Array<{
       { name: "Explorer", href: "/explorer", icon: Search, exact: true },
       { name: "Scheduled Queries", href: "/explorer/schedules", icon: Clock },
       { name: "Lineage", href: "/explorer/lineage", icon: Network },
+      // Not `adminOnly`: /pii carries no role gate of its own, so hiding the row
+      // would only hide a page every user can still reach by typing the URL.
+      { name: "PII Management", href: "/pii", icon: Database },
       { name: "Connections", href: "/connections", icon: Cable },
       { name: "Connectors", href: "/connectors", icon: Zap },
     ],

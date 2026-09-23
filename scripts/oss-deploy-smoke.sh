@@ -58,6 +58,21 @@ VOL="rsync-oss-smoke-connectors"
 LIFECYCLE_CN="rsync-oss-smoke-lifecycle"
 HOST_PORT="15010"                             # private host port -> lifecycle :5010
 
+# S2S gate (require_internal_secret, llm-service tool_generator/deployment/routes.py):
+# /v1/deploy builds and starts containers over docker.sock, so since #1049 it fails CLOSED --
+# with INTERNAL_SERVICE_SECRET unset it answers 503 internal_secret_not_configured unless
+# ENVIRONMENT is exactly development/dev. This smoke used to set NEITHER, so every POST below
+# was refused for the whole poll window and the nightly went red from 2026-09-19 (private) and
+# 2026-09-22 (public, once the v0.1.4 cut carried the post-#1049 llm-service across). The gate
+# has a unit test (test_s2s_gate_fails_closed_unless_dev.py); it cannot see this harness.
+#
+# Fixed by SETTING the secret and sending the matching header rather than by setting
+# ENVIRONMENT=development: the dev branch is the one path that skips the auth check outright,
+# and the point of this job is to drive the REAL /v1/deploy the shipped compose uses. Not a
+# credential -- a throwaway for a container that lives ~2 min on an isolated network behind a
+# loopback-bound port, and it never leaves this script.
+S2S_SECRET="oss-deploy-smoke-internal-secret-not-a-real-credential"
+
 # Lightweight seed connector (no DB driver, no OAuth). petstore is a flat public connector
 # whose versioned dir is a self-contained build context (Dockerfile + connector.py +
 # requirements.txt + base_connector.py) and whose Dockerfile pulls shared libs via the
@@ -149,6 +164,7 @@ docker run -d \
   -e MCP_SHARED_NETWORK="$NET" \
   -e OAUTH_TOKENS_VOLUME_NAME= \
   -e RSYNC_EDITION=community \
+  -e INTERNAL_SERVICE_SECRET="$S2S_SECRET" \
   -e LOG_LEVEL=info \
   -v "$VOL":/app/shared/mcp-connectors \
   -v /var/run/docker.sock:/var/run/docker.sock \
@@ -180,7 +196,7 @@ PAYLOAD="{\"connector_name\":\"${CONNECTOR}\",\"version\":\"latest\",\"build_if_
 # guard prevents duplicate builds) until the background build+start completes and the
 # start-only fast path reports started=true. A cold build (base image pull + pip install)
 # can take minutes, so the poll deadline is generous.
-RESP="$(curl -sS -X POST "$DEPLOY_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" 2>/dev/null)"
+RESP="$(curl -sS -X POST "$DEPLOY_URL" -H 'Content-Type: application/json' -H "X-Internal-Secret: $S2S_SECRET" -d "$PAYLOAD" 2>/dev/null)"
 printf '  first response: %s\n' "$RESP"
 
 DEADLINE=$(( $(date +%s) + 420 ))   # up to 7 min for a cold build
@@ -196,7 +212,7 @@ while :; do
   if [ "$STARTED" = "true" ] || [ "$BUILT" = "true" ]; then break; fi
   if [ "$(date +%s)" -ge "$DEADLINE" ]; then break; fi
   sleep 4
-  RESP="$(curl -sS -X POST "$DEPLOY_URL" -H 'Content-Type: application/json' -d "$PAYLOAD" 2>/dev/null)"
+  RESP="$(curl -sS -X POST "$DEPLOY_URL" -H 'Content-Type: application/json' -H "X-Internal-Secret: $S2S_SECRET" -d "$PAYLOAD" 2>/dev/null)"
 done
 printf '  final response: %s\n' "$RESP"
 

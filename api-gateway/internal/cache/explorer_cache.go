@@ -477,7 +477,9 @@ func splitToTokens(name string) []string {
 	parts := strings.Split(strings.ToLower(name), "_")
 	tokens = append(tokens, parts...)
 
-	// TODO: Add camelCase splitting if needed
+	// Only snake_case is split. Identifiers reaching this cache are snake_case by
+	// convention across the warehouses it serves, so camelCase splitting has never
+	// been needed; add it here if a source ever ships camelCase identifiers.
 
 	return tokens
 }

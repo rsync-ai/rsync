@@ -14,7 +14,7 @@ notices are reproduced here to satisfy their redistribution terms. Nothing here 
 > release tree and commit the result. A blocking [`Licenses`](.github/workflows/licenses.yml)
 > CI check independently fails any PR that introduces a new GPL / AGPL / SSPL / BUSL dependency.
 
-_Inventory: 138 Go module@version rows, 27 Python packages, 49 frontend (npm) direct
+_Inventory: 137 Go module@version rows, 27 Python packages, 49 frontend (npm) direct
 production dependencies._
 
 > **Provenance, honestly.** The Go table was rebuilt on 2026-08-25 directly from
@@ -53,7 +53,7 @@ must remain separable and replaceable.
 
 ## License distribution (shipped surface)
 
-- **Go** (138 module@version rows): Apache-2.0 x 59; MIT x 43; BSD-3-Clause x 25; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
+- **Go** (137 module@version rows): Apache-2.0 x 58; MIT x 43; BSD-3-Clause x 25; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
 - **Python** (27 packages): Apache-2.0 x 9; MIT x 7; BSD-3-Clause x 6; Apache-2.0 OR BSD-3-Clause x 2; LGPL-3.0-or-later x 1; MIT-0 x 1; UPL-1.0 OR Apache-2.0 x 1
 - **Frontend** (49 direct prod deps): MIT x 46; Apache-2.0 x 2; ISC x 1
 
@@ -103,7 +103,6 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/gabriel-vasile/mimetype](https://github.com/gabriel-vasile/mimetype) | v1.4.15 | MIT |
 | [github.com/gin-contrib/sse](https://github.com/gin-contrib/sse) | v1.1.0 | MIT |
 | [github.com/gin-gonic/gin](https://github.com/gin-gonic/gin) | v1.12.0 | MIT |
-| [github.com/go-logr/logr](https://github.com/go-logr/logr) | v1.4.3 | Apache-2.0 |
 | [github.com/go-logr/logr](https://github.com/go-logr/logr) | v1.4.4 | Apache-2.0 |
 | [github.com/go-logr/stdr](https://github.com/go-logr/stdr) | v1.2.2 | Apache-2.0 |
 | [github.com/go-playground/locales](https://github.com/go-playground/locales) | v0.14.1 | MIT |
@@ -178,18 +177,18 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [go.mongodb.org/mongo-driver/v2](https://github.com/mongodb/mongo-go-driver) | v2.5.0 | Apache-2.0 |
 | [go.opentelemetry.io/auto/sdk](https://github.com/open-telemetry/opentelemetry-go-instrumentation) | v1.2.1 | Apache-2.0 |
 | [go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp](https://go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp) | v0.69.0 | Apache-2.0 |
-| [go.opentelemetry.io/otel](https://github.com/open-telemetry/opentelemetry-go) | v1.44.0 | Apache-2.0 |
+| [go.opentelemetry.io/otel](https://github.com/open-telemetry/opentelemetry-go) | v1.45.0 | Apache-2.0 |
 | [go.opentelemetry.io/otel](https://github.com/open-telemetry/opentelemetry-go) | v1.46.0 | Apache-2.0 |
 | [go.opentelemetry.io/otel/exporters/otlp/otlptrace](https://github.com/open-telemetry/opentelemetry-go) | v1.46.0 | Apache-2.0 |
 | [go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc](https://github.com/open-telemetry/opentelemetry-go) | v1.46.0 | Apache-2.0 |
-| [go.opentelemetry.io/otel/metric](https://github.com/open-telemetry/opentelemetry-go) | v1.44.0 | Apache-2.0 |
+| [go.opentelemetry.io/otel/metric](https://github.com/open-telemetry/opentelemetry-go) | v1.45.0 | Apache-2.0 |
 | [go.opentelemetry.io/otel/metric](https://github.com/open-telemetry/opentelemetry-go) | v1.46.0 | Apache-2.0 |
 | [go.opentelemetry.io/otel/sdk](https://github.com/open-telemetry/opentelemetry-go) | v1.46.0 | Apache-2.0 |
-| [go.opentelemetry.io/otel/trace](https://github.com/open-telemetry/opentelemetry-go) | v1.44.0 | Apache-2.0 |
+| [go.opentelemetry.io/otel/trace](https://github.com/open-telemetry/opentelemetry-go) | v1.45.0 | Apache-2.0 |
 | [go.opentelemetry.io/otel/trace](https://github.com/open-telemetry/opentelemetry-go) | v1.46.0 | Apache-2.0 |
 | [go.opentelemetry.io/proto/otlp](https://github.com/open-telemetry/opentelemetry-proto-go) | v1.11.0 | Apache-2.0 |
 | [go.temporal.io/api](https://github.com/temporalio/api-go) | v1.63.6 | MIT |
-| [go.temporal.io/sdk](https://github.com/temporalio/sdk-go) | v1.48.0 | MIT |
+| [go.temporal.io/sdk](https://github.com/temporalio/sdk-go) | v1.49.0 | MIT |
 | [go.uber.org/atomic](https://github.com/uber-go/atomic) | v1.11.0 | MIT |
 | [go.yaml.in/yaml/v3](https://github.com/yaml/go-yaml) | v3.0.5 | Apache-2.0 |
 | [golang.org/x/crypto](https://cs.opensource.google/go/x/crypto) | v0.57.0 | BSD-3-Clause |

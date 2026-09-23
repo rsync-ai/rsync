@@ -3,10 +3,10 @@
 # blank_issues_enabled: false removes the "Open a blank issue" escape hatch, so
 # every new issue arrives through the bug-report or feature-request template.
 #
-# NOTE FOR MAINTAINERS: GitHub Discussions is DISABLED on this repository. There
-# is deliberately no Discussions contact link below, because a link to a disabled
-# Discussions tab 404s. Enable Discussions in Settings -> General -> Features,
-# then add the entry kept commented out at the bottom of this file.
+# NOTE FOR MAINTAINERS: a contact link to a DISABLED tab 404s, so every url below
+# has to name a feature that is actually switched on. Discussions was enabled on
+# the public repo on 2026-09-22, which is why the Questions-and-ideas entry is
+# live. If Discussions is ever turned back off, comment that entry out again.
 blank_issues_enabled: false
 
 contact_links:
@@ -26,7 +26,6 @@ contact_links:
     url: https://github.com/rsync-ai/rsync/blob/main/CONTRIBUTING.md
     about: Local dev environment, running the test suites, the DCO sign-off, and the pull request process.
 
-# Add once Discussions is enabled (see the note above):
-#  - name: Questions and ideas
-#    url: https://github.com/rsync-ai/rsync/discussions
-#    about: Ask a question or float an idea before it becomes an issue.
+  - name: Questions and ideas
+    url: https://github.com/rsync-ai/rsync/discussions
+    about: Ask a question or float an idea before it becomes an issue.

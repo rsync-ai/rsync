@@ -41,7 +41,9 @@ import (
 // `IF to_regclass('public.<table>') IS NOT NULL THEN ... END IF;` inside a DO
 // block, which is why those two apply cleanly on a schema where the tables are
 // absent. A reference to a dropped table is a finding UNLESS the same file
-// names that table in a to_regclass guard.
+// names that table in a to_regclass guard, or recreates the table earlier in
+// the same file -- the walk inside a file is positional, so a CREATE revives
+// the table for every statement that follows it.
 
 var (
 	sqlIdent = `(?:"?[a-zA-Z_][a-zA-Z0-9_]*"?\.)?"?([a-zA-Z_][a-zA-Z0-9_]*)"?`
@@ -72,6 +74,21 @@ var (
 type migrationFile struct {
 	name string
 	body string
+}
+
+// The two kinds that change the schema rather than read it. Every other kind
+// on an sqlEvent is a reference, named the way the finding reports it.
+const (
+	kindCreate = "CREATE TABLE"
+	kindDrop   = "DROP TABLE"
+)
+
+// sqlEvent is one statement's effect on (or use of) a table, tagged with the
+// byte offset that puts it in execution order within its file.
+type sqlEvent struct {
+	pos   int
+	kind  string
+	table string
 }
 
 type deadRef struct {
@@ -114,6 +131,14 @@ func guardsTable(body, table string) bool {
 // live, and reports every reference to a table the sequence itself created and
 // then dropped. Tables it never saw created (system catalogs, CTE aliases, a
 // function name after EXTRACT ... FROM) are not its business and are ignored.
+//
+// Within a file the walk is positional, because Postgres executes the
+// statements in order. A migration may revive a table an earlier migration
+// dropped and then use it -- `111_pii_detection_tables_restored.sql` recreates
+// two tables 013 dropped, then seeds and alters them -- and every statement
+// after that CREATE sees the table. A reference that sits BEFORE the CREATE
+// still sees nothing, so it stays a finding; so does one after a DROP in the
+// same file.
 func scanMigrations(files []migrationFile) lifecycleScan {
 	var scan lifecycleScan
 	live := map[string]bool{}
@@ -125,47 +150,68 @@ func scanMigrations(files []migrationFile) lifecycleScan {
 		scan.files++
 		scan.renames += len(reRenameTable.FindAllStringSubmatch(body, -1))
 
-		// References are judged against the schema as it stands BEFORE this
-		// file runs -- which is what Postgres sees when the file executes.
-		check := func(kind, table string) {
-			table = strings.ToLower(table)
-			if !known[table] {
-				return
-			}
-			scan.refsChecked++
-			if live[table] || guardsTable(body, table) {
-				return
-			}
-			d := deadRef{file: f.name, kind: kind, table: table}
-			if !seen[d] {
-				seen[d] = true
-				scan.findings = append(scan.findings, d)
-			}
-		}
-		for _, r := range tableRefs {
-			for _, m := range r.re.FindAllStringSubmatch(body, -1) {
-				check(r.kind, m[1])
-			}
-		}
-		for _, m := range reAlterTable.FindAllStringSubmatch(body, -1) {
-			if strings.TrimSpace(m[1]) != "" {
-				continue // ALTER TABLE IF EXISTS is its own guard
-			}
-			check("ALTER TABLE", m[2])
-		}
+		for _, e := range fileEvents(body) {
+			table := strings.ToLower(e.table)
 
-		for _, m := range reCreateTable.FindAllStringSubmatch(body, -1) {
-			t := strings.ToLower(m[1])
-			live[t] = true
-			known[t] = true
-		}
-		for _, m := range reDropTable.FindAllStringSubmatch(body, -1) {
-			delete(live, strings.ToLower(m[1]))
+			switch e.kind {
+			case kindCreate:
+				live[table] = true
+				known[table] = true
+			case kindDrop:
+				delete(live, table)
+			default:
+				// Judged against the schema as it stands at this point in
+				// the file -- what Postgres sees when the statement runs.
+				if !known[table] {
+					continue
+				}
+				scan.refsChecked++
+				if live[table] || guardsTable(body, table) {
+					continue
+				}
+				d := deadRef{file: f.name, kind: e.kind, table: table}
+				if !seen[d] {
+					seen[d] = true
+					scan.findings = append(scan.findings, d)
+				}
+			}
 		}
 	}
 	scan.everCreated = len(known)
 	scan.liveAtEnd = len(live)
 	return scan
+}
+
+// fileEvents returns every CREATE, DROP and table reference in one file, in the
+// byte order Postgres executes them.
+func fileEvents(body string) []sqlEvent {
+	var events []sqlEvent
+
+	add := func(re *regexp.Regexp, kind string) {
+		for _, m := range re.FindAllStringSubmatchIndex(body, -1) {
+			if lo, hi := m[2], m[3]; lo >= 0 {
+				events = append(events, sqlEvent{pos: m[0], kind: kind, table: body[lo:hi]})
+			}
+		}
+	}
+
+	add(reCreateTable, kindCreate)
+	add(reDropTable, kindDrop)
+	for _, r := range tableRefs {
+		add(r.re, r.kind)
+	}
+
+	// ALTER TABLE carries its own optional IF EXISTS, which is itself a guard,
+	// so it is captured as group 1 and the reference skipped when present.
+	for _, m := range reAlterTable.FindAllStringSubmatchIndex(body, -1) {
+		if m[2] >= 0 && strings.TrimSpace(body[m[2]:m[3]]) != "" {
+			continue
+		}
+		events = append(events, sqlEvent{pos: m[0], kind: "ALTER TABLE", table: body[m[4]:m[5]]})
+	}
+
+	sort.SliceStable(events, func(i, j int) bool { return events[i].pos < events[j].pos })
+	return events
 }
 
 func loadMigrations(t *testing.T) []migrationFile {
@@ -263,5 +309,63 @@ func TestTheScanAcceptsATo_regclassGuardedReference(t *testing.T) {
 	}
 	if scan := scanMigrations(corpus); len(scan.findings) != 0 {
 		t.Fatalf("a to_regclass-guarded reference must be accepted, got %v", scan.findings)
+	}
+}
+
+// The case that made the walk positional: a migration may bring a dropped table
+// back and then use it. `111_pii_detection_tables_restored.sql` recreates
+// `pii_scan_results` and `custom_hash_functions` -- dropped by 013 -- and then
+// seeds and alters them. Postgres runs the CREATE first, so nothing here can
+// fail on a missing relation, and a file-level scan that judged every reference
+// against the pre-file schema called all three statements findings.
+func TestTheScanAcceptsAReferenceAfterTheSameFileRecreatesTheTable(t *testing.T) {
+	corpus := []migrationFile{
+		{"001_create.sql", "CREATE TABLE widgets (id int);"},
+		{"002_drop.sql", "DROP TABLE IF EXISTS widgets CASCADE;"},
+		{"003_revive.sql", `
+			CREATE TABLE IF NOT EXISTS widgets (id int);
+			ALTER TABLE widgets ADD COLUMN IF NOT EXISTS name text;
+			INSERT INTO widgets (id) VALUES (1);`},
+	}
+	if scan := scanMigrations(corpus); len(scan.findings) != 0 {
+		t.Fatalf("a reference after the file's own CREATE must be accepted, got %v", scan.findings)
+	}
+}
+
+// The other side of that exemption, and the reason it is positional rather than
+// a blanket "this file creates the table, so let it through": a statement ABOVE
+// the CREATE still runs against a schema without the table, and still stops the
+// runner dead.
+func TestTheScanStillCatchesAReferenceBeforeTheSameFileRecreatesTheTable(t *testing.T) {
+	corpus := []migrationFile{
+		{"001_create.sql", "CREATE TABLE widgets (id int);"},
+		{"002_drop.sql", "DROP TABLE IF EXISTS widgets CASCADE;"},
+		{"003_revive_too_late.sql", `
+			INSERT INTO widgets (id) VALUES (1);
+			CREATE TABLE IF NOT EXISTS widgets (id int);`},
+	}
+	scan := scanMigrations(corpus)
+	if len(scan.findings) != 1 {
+		t.Fatalf("expected the pre-CREATE insert to be a finding, got %v", scan.findings)
+	}
+	if got := scan.findings[0]; got.file != "003_revive_too_late.sql" || got.table != "widgets" {
+		t.Fatalf("wrong finding: %+v", got)
+	}
+}
+
+// Ordering inside a file cuts both ways: before the walk was positional, a file
+// that dropped a table and then read it was judged against the pre-file schema,
+// where the table was still live, and passed.
+func TestTheScanCatchesAReferenceAfterADropInTheSameFile(t *testing.T) {
+	corpus := []migrationFile{
+		{"001_create.sql", "CREATE TABLE widgets (id int);"},
+		{"002_drop_then_touch.sql", "DROP TABLE IF EXISTS widgets CASCADE; UPDATE widgets SET id = 1;"},
+	}
+	scan := scanMigrations(corpus)
+	if len(scan.findings) != 1 {
+		t.Fatalf("expected the post-DROP update to be a finding, got %v", scan.findings)
+	}
+	if got := scan.findings[0]; got.table != "widgets" || got.kind != "UPDATE" {
+		t.Fatalf("wrong finding: %+v", got)
 	}
 }

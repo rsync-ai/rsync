@@ -45,31 +45,76 @@ Store the files somewhere that is not the repository itself.
 
 None of these can be set from a commit.
 
-- [ ] **Description.** Suggested text — it states the licence and claims only what the
-  README claims:
+Every box below is one-time state, not a per-release step, so a ticked box means the setting
+is live on the repository right now. Each ticked line names the command that reads it back,
+because a box is a claim and the API is the evidence. State confirmed 2026-09-22.
+
+- [x] **Description.** Applied — it states the licence and claims only what the README
+  claims:
 
   > Self-hosted, source-available AI data platform for batch pipelines, CDC, scheduled models, and lineage.
 
-  The description in place when this checklist was written is older wording ("AI-native data
-  pipelines for databases, APIs, warehouses and CDC…"); replace it so the repository, README
-  and website open with the same sentence.
-- [ ] **Website.** `https://rsync.ai` (this was already set when this checklist was written).
-- [ ] **Topics.** GitHub allows 20 and the repository was at 20 when this was written, so
-  adding one means removing one. Candidates to add, each backed by a shipped feature:
-  `data-lineage`, `data-observability`, `temporal`, `source-available`. Candidates to drop
-  to make room, being the least specific: `ai`, `llm`, `helm`, `kubernetes`,
-  `data-integration`. Do not add a topic for a capability the README does not claim.
-- [ ] **Social preview image.** Settings → General → Social preview, 1280×640. Use the
-  real product name and positioning line only — no invented metrics, customer logos or
-  screenshots that are not of the shipped product.
-- [ ] **Licence display.** The repository API reports the licence as `NOASSERTION`, because
-  GitHub does not detect the Elastic License 2.0 from the `LICENSE` file. That is expected;
-  the README's licence section is the plain-English statement. Call it "source-available",
-  never "open source".
-- [ ] **Discussions.** Currently disabled. If you enable it (Settings → General → Features),
-  create at least *Q&A* and *Ideas* categories, then uncomment the "Questions and ideas"
-  contact link at the bottom of `.github/ISSUE_TEMPLATE/config.yml` in a follow-up change —
-  the file explains why the link is held back until then (a link to a disabled tab 404s).
+  It replaced the older wording ("AI-native data pipelines for databases, APIs, warehouses
+  and CDC…"), which named a different set of things than the README did. Both opening lines
+  were then reworded to carry it: [README.md](../../README.md)'s is now this sentence
+  **verbatim**, and [the docs index](../README.md) **embeds** it ("rsync.ai is a
+  self-hosted, source-available AI data platform for…"), which prose requires. Compare the
+  README by stripping the blockquote markers, or a `>` from the wrapped second line reads as
+  a difference that is not there.
+
+  **Nothing tests that the four still agree** — the description lives in GitHub's settings,
+  not in the repository, so no check in this repo can read it. Change one and re-read the other
+  three. The fourth copy is the frontend's `metadata.description` in
+  `frontend/src/app/layout.tsx`, which is the running app's `<meta name="description">`: it
+  carries the sentence **verbatim** too, so a search result or a link preview for the app says
+  what a search result for the repository says. It used to be worded differently on the
+  grounds that it describes the running app rather than the repository; that distinction was
+  dropped deliberately, so do not re-introduce it. Read the description back with
+  `gh api repos/rsync-ai/rsync --jq .description`.
+- [x] **Website.** `https://rsync.ai`, confirmed live
+  (`gh api repos/rsync-ai/rsync --jq .homepage`).
+- [x] **Topics.** GitHub allows 20 and the repository sits at exactly 20, so every addition
+  costs a removal. Swapped: **added** `data-lineage` and `source-available`, **dropped** `ai`
+  (redundant beside `ai-data-pipelines`) and `data-integration` (the vaguest of the set — it
+  overlaps `data-pipeline`, `elt` and `etl`). Read the current set back with
+  `gh api repos/rsync-ai/rsync --jq '.topics | length, .'`.
+
+  Two candidates this checklist used to suggest were deliberately **not** taken, and should
+  not be re-proposed without new evidence:
+
+  - `data-observability` fails this section's own rule — do not add a topic for a capability
+    the README does not claim — on one passing mention, against seven for lineage.
+  - `helm` and `kubernetes` were listed as drop candidates, but the README mentions them
+    more than anything else on the list (7 and 10). Dropping them would have cost the
+    repository its two strongest search terms to make room for weaker ones.
+
+  `temporal` remains available if a topic slot ever frees up; it is an implementation
+  detail rather than something a user searches for, so it lost to the other two.
+- [x] **Social preview image.** Set: a 1200×630 PNG carrying the product name and positioning
+  line only — no invented metrics, customer logos or screenshots that are not of the shipped
+  product. It can be verified without opening Settings, because GitHub swaps the `og:image`
+  host: a custom image is served from `repository-images.githubusercontent.com`, the
+  generated default from `opengraph.githubassets.com`.
+
+  ```bash
+  curl -sL https://github.com/rsync-ai/rsync | grep -o 'og:image" content="[^"]*"'
+  ```
+- [x] **Licence display.** Confirmed: the repository API still reports the licence as
+  `NOASSERTION`, because GitHub does not detect the Elastic License 2.0 from the `LICENSE`
+  file. That is expected, not a misconfiguration; the README's licence section is the
+  plain-English statement. Call it "source-available", never "open source".
+- [x] **Discussions.** Enabled, with both categories this checklist requires present — *Q&A*
+  (the answerable one) and *Ideas*, alongside Announcements, General, Polls and Show and tell.
+  The "Questions and ideas" contact link at the bottom of `.github/ISSUE_TEMPLATE/config.yml`
+  is live accordingly. If Discussions is ever turned back off, comment that entry out again:
+  a contact link to a disabled tab 404s, which is why the link was held back until the tab
+  existed.
+- [x] **Branch protection on `main`.** Required approving reviews **0** — a solo maintainer
+  cannot approve their own pull request, so any non-zero count would block every merge —
+  with `enforce_admins` on and force pushes off, so the rule binds the maintainer too and
+  history cannot be rewritten. 16 required status checks, covering DCO, the doc guards, Go,
+  frontend lint/test/build, a11y, the unit suites, the moat check and the six security
+  scanners. Read it back with `gh api repos/rsync-ai/rsync/branches/main/protection`.
 - [ ] **Issue templates.** `bug_report.md`, `feature_request.md` and the chooser
   configuration already exist under `.github/ISSUE_TEMPLATE/`; confirm they render at
   *Issues → New issue* after any change to them.
@@ -159,8 +204,8 @@ workflow does not backfill them.
 ## 5. Places that must agree
 
 Before announcing a release, check that each of these names the same version and describes
-the product with the same sentence: *a self-hosted data platform for batch pipelines, CDC,
-scheduled data models, and lineage.*
+the product with the same sentence: *Self-hosted, source-available AI data platform for
+batch pipelines, CDC, scheduled models, and lineage.*
 
 | Place | Check |
 |---|---|
@@ -169,6 +214,7 @@ scheduled data models, and lineage.*
 | `install.sh` — `RSYNC_REF` default | Version |
 | `deploy/helm/rsync-ai/Chart.yaml` — `version` and `appVersion` (checked-in defaults; the published chart takes its version from the tag) | Version |
 | `docs/README.md` and `docs/solutions/README.md` | Positioning; no page claims more than its *Verification status* section |
+| `frontend/src/app/layout.tsx` — `metadata.description` | Positioning, verbatim; it is the running app's `<meta name="description">` |
 | `CHANGELOG.md` | A heading for the release |
 | GitHub Release notes | Copied from the CHANGELOG, not rewritten |
 | `https://rsync.ai` (website) | Same positioning sentence and same version; no capability the README does not claim |

@@ -12,7 +12,9 @@ import (
 	"fmt"
 	"github.com/rsync-ai/shared/kafkaclient"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"api-gateway/internal/kafka"
 	"api-gateway/internal/security"
@@ -358,8 +360,16 @@ func (h *PIIHandler) GetScanJob(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// HandlePIIScanResponse processes a pii.scan.response message from Kafka and
-// updates the corresponding scan job in the database.
+// HandlePIIScanResponse processes a pii.scan.response message from Kafka: it
+// records the outcome on the scan job, and — for a completed scan — projects the
+// findings into pii_scan_results, which is the table the PII overview reads.
+//
+// Only the job update existed before. The scanner's findings were written to
+// pii_scan_jobs.result as one opaque JSON blob and nowhere else, so GET
+// /pii/scan/results (which reads pii_scan_results) had no row to return no matter
+// how many columns a scan had flagged. Storing the blob on the job row is kept:
+// it is the raw record of what the scanner said, including its per-table errors,
+// and GetScanJob still serves it to the poller.
 func (h *PIIHandler) HandlePIIScanResponse(ctx context.Context, scanID string, status string, result map[string]interface{}, scanErr string) {
 	if status == "completed" {
 		resultJSON, _ := json.Marshal(result)
@@ -369,6 +379,9 @@ func (h *PIIHandler) HandlePIIScanResponse(ctx context.Context, scanID string, s
 		if err != nil {
 			log.WithError(err).Errorf("Failed to update pii_scan_job %s to completed", scanID)
 		}
+		// Attempted even if the status update above failed: the findings are the
+		// useful half of the message, and the two writes are independent.
+		h.projectScanResults(ctx, scanID, result)
 	} else {
 		_, err := h.db.ExecContext(ctx, `
 			UPDATE pii_scan_jobs SET status = 'failed', error = $1, updated_at = NOW()
@@ -377,6 +390,230 @@ func (h *PIIHandler) HandlePIIScanResponse(ctx context.Context, scanID string, s
 			log.WithError(err).Errorf("Failed to update pii_scan_job %s to failed", scanID)
 		}
 	}
+}
+
+// Composite keys reach the stale-row DELETE below as one delimited string,
+// split with string_to_array, because this module runs on pgx and has no
+// pq.Array — the same crossing internal/notifier makes for its arrays. The
+// delimiters are the ASCII unit and record separators, which cannot occur in a
+// table or column name coming back from a schema scan.
+const (
+	piiKeyFieldSep  = "\x1f"
+	piiKeyRecordSep = "\x1e"
+)
+
+// piiFinding is one PII-positive column, flattened out of the scanner's nested
+// tables[].columns[] payload.
+type piiFinding struct {
+	table      string
+	column     string
+	piiType    string
+	confidence float64
+	method     string
+	masking    string
+}
+
+// projectScanResults stores a completed scan's findings in pii_scan_results.
+//
+// The shape is upsert-then-prune rather than delete-then-insert, for two
+// reasons. Re-scanning must drop findings for columns that are no longer PII or
+// no longer exist, so a plain upsert would leave stale rows behind forever. But
+// approved_action / approved_by / approved_at are the seam the private
+// governance layer writes through, and a delete-then-insert would silently
+// discard a decision every time the connection was re-scanned. The conflict
+// clause below therefore refreshes the detection columns and leaves the approval
+// columns untouched.
+//
+// The prune is scoped to the tables this scan actually covered, which is not the
+// same as "every table on the connection": TriggerScan accepts a `tables` subset,
+// and the scanner reports per-table errors, so a scan is routinely a partial
+// view. Pruning by connection alone would let a one-table re-scan erase the
+// findings for every other table.
+//
+// Failures are logged, never returned: the caller is a Kafka consumer loop with
+// nowhere to surface an error, and the scan job row has already been marked
+// completed with the raw result intact.
+func (h *PIIHandler) projectScanResults(ctx context.Context, scanID string, result map[string]interface{}) {
+	findings, scanned := piiFindingsFrom(result)
+	if len(scanned) == 0 {
+		// No table entries at all: an empty or unparseable payload. Pruning here
+		// would delete every stored finding for the connection on the strength of
+		// a message that reported nothing.
+		log.Warnf("PII scan %s: response carried no tables; nothing projected", scanID)
+		return
+	}
+
+	// The job row is where the scan's connection and workspace live; the Kafka
+	// payload's own connection_id is not trusted for a write.
+	var (
+		connectionID string
+		workspaceID  sql.NullString
+	)
+	err := h.db.QueryRowContext(ctx, `
+		SELECT connection_id::text, workspace_id::text
+		FROM pii_scan_jobs WHERE id = $1`, scanID).Scan(&connectionID, &workspaceID)
+	if err != nil {
+		log.WithError(err).Errorf("PII scan %s: could not resolve its job row; %d findings not stored", scanID, len(findings))
+		return
+	}
+
+	// A job predating the 077 backfill can still have a NULL workspace. Bound as
+	// NULL rather than as the empty string, which is not a valid UUID.
+	var wsArg interface{}
+	if workspaceID.Valid {
+		wsArg = workspaceID.String
+	}
+
+	tx, err := h.db.BeginTx(ctx, nil)
+	if err != nil {
+		log.WithError(err).Errorf("PII scan %s: could not open a transaction; findings not stored", scanID)
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	keys := make([]string, 0, len(findings))
+	for _, f := range findings {
+		keys = append(keys, f.table+piiKeyFieldSep+f.column)
+		_, err := tx.ExecContext(ctx, `
+			INSERT INTO pii_scan_results (
+				connection_id, workspace_id, table_name, column_name,
+				pii_type, confidence, detection_method, suggested_masking, updated_at)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW())
+			ON CONFLICT (connection_id, table_name, column_name)
+				WHERE connection_id IS NOT NULL
+			DO UPDATE SET
+				workspace_id      = EXCLUDED.workspace_id,
+				pii_type          = EXCLUDED.pii_type,
+				confidence        = EXCLUDED.confidence,
+				detection_method  = EXCLUDED.detection_method,
+				suggested_masking = EXCLUDED.suggested_masking,
+				updated_at        = NOW()`,
+			connectionID, wsArg, f.table, f.column, f.piiType, f.confidence, f.method, f.masking)
+		if err != nil {
+			log.WithError(err).Errorf("PII scan %s: failed to store finding %s.%s; no findings stored", scanID, f.table, f.column)
+			return
+		}
+	}
+
+	// Drop what this scan looked at and did not flag. `<> ALL` over an empty key
+	// list is vacuously true, which is the wanted behaviour for a scan that
+	// covered tables and found no PII in any of them.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM pii_scan_results
+		WHERE connection_id = $1
+		  AND table_name = ANY (string_to_array($2, $3))
+		  AND table_name || $4 || column_name <> ALL (string_to_array($5, $6))`,
+		connectionID,
+		strings.Join(scanned, piiKeyRecordSep), piiKeyRecordSep,
+		piiKeyFieldSep,
+		strings.Join(keys, piiKeyRecordSep), piiKeyRecordSep,
+	); err != nil {
+		log.WithError(err).Errorf("PII scan %s: failed to prune superseded findings; no findings stored", scanID)
+		return
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.WithError(err).Errorf("PII scan %s: commit failed; findings not stored", scanID)
+		return
+	}
+	log.Infof("PII scan %s: stored %d findings across %d scanned tables", scanID, len(findings), len(scanned))
+}
+
+// piiFindingsFrom flattens the scanner's tables[].columns[] payload into the
+// PII-positive columns, and the names of every table the scan reported on.
+//
+// The two are returned separately because a table that was scanned and came back
+// clean carries no findings but still has to be pruned.
+func piiFindingsFrom(result map[string]interface{}) (findings []piiFinding, scanned []string) {
+	rawTables, _ := result["tables"].([]interface{})
+	for _, rt := range rawTables {
+		tm, ok := rt.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		tableName := piiTruncate(piiString(tm, "table_name"), 255)
+		if tableName == "" {
+			continue
+		}
+		scanned = append(scanned, tableName)
+
+		rawCols, _ := tm["columns"].([]interface{})
+		for _, rc := range rawCols {
+			cm, ok := rc.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			// The scanner reports every column it looked at, PII or not.
+			if isPII, _ := cm["is_pii"].(bool); !isPII {
+				continue
+			}
+			columnName := piiTruncate(piiString(cm, "column_name"), 255)
+			if columnName == "" {
+				continue
+			}
+			f := piiFinding{
+				table:      tableName,
+				column:     columnName,
+				piiType:    piiTruncate(piiString(cm, "pii_type"), 50),
+				confidence: piiClamp01(piiFloat(cm, "confidence")),
+				method:     piiTruncate(piiString(cm, "detection_method"), 50),
+				masking:    piiTruncate(piiString(cm, "suggested_masking"), 50),
+			}
+			// Both columns are NOT NULL and both are rendered as-is in the UI.
+			if f.piiType == "" {
+				f.piiType = "unknown"
+			}
+			if f.method == "" {
+				f.method = "unknown"
+			}
+			findings = append(findings, f)
+		}
+	}
+	return findings, scanned
+}
+
+func piiString(m map[string]interface{}, key string) string {
+	s, _ := m[key].(string)
+	return s
+}
+
+// piiFloat reads a JSON number. json.Number is handled as well as float64 so
+// that a decoder configured with UseNumber anywhere upstream does not silently
+// turn every confidence into zero.
+func piiFloat(m map[string]interface{}, key string) float64 {
+	switch v := m[key].(type) {
+	case float64:
+		return v
+	case json.Number:
+		if f, err := v.Float64(); err == nil {
+			return f
+		}
+	}
+	return 0
+}
+
+// piiClamp01 keeps confidence inside the CHECK constraint on the column. A
+// scanner returning 1.0000001 should not abort the whole scan's projection.
+func piiClamp01(f float64) float64 {
+	if f < 0 || f != f { // f != f catches NaN, which the constraint also rejects
+		return 0
+	}
+	if f > 1 {
+		return 1
+	}
+	return f
+}
+
+// piiTruncate keeps a value inside its column width. Postgres aborts the
+// statement on an over-wide value, which would cost the entire scan's findings;
+// a label clipped to fit costs one label. Counted in runes, because the columns
+// are VARCHAR(n) — n characters, not n bytes — and cutting mid-rune would
+// produce invalid UTF-8.
+func piiTruncate(s string, maxRunes int) string {
+	if utf8.RuneCountInString(s) <= maxRunes {
+		return s
+	}
+	return string([]rune(s)[:maxRunes])
 }
 
 // GetApprovals returns approval requests in the caller's active workspace.

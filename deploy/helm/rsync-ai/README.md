@@ -384,7 +384,7 @@ connection in a surviving external database.
   `v0.1.0`, `v0.1.1`, `v0.1.2`, `v0.1.3` and `v0.1.4` were tag refs, so `latest` does now exist —
   all 34 packages carry it, confirmed by an anonymous manifest fetch. The chart
   resolves `.tag | default global.image.tag | default .Chart.AppVersion`, which
-  is **0.1.4** today (the first tag built for both `amd64` and `arm64`); move it with
+  is **0.1.4** today (multi-arch: all 34 packages list `amd64` and `arm64`); move it with
   `global.image.tag`, not with `latest`.
 
 ## Troubleshooting

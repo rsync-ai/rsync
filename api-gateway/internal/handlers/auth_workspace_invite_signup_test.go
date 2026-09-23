@@ -230,7 +230,7 @@ func TestAcceptWorkspaceInviteAtSignup_BeginError(t *testing.T) {
 func registerRouter(mockDB *sql.DB) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
-	h := &AuthHandler{db: mockDB}
+	h := newAuthHandler(mockDB)
 	r.POST("/api/v1/auth/register", h.Register)
 	return r
 }

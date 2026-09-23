@@ -60,3 +60,21 @@ describe("Sidebar — fits above the fold (#56)", () => {
     expect(inManage).toEqual(expect.arrayContaining(["Workspace", "Settings", "Admin"]))
   })
 })
+
+// PII Management shipped with a working /pii page and no way to reach it: the nav
+// check above is an `arrayContaining`, so a missing row passes it. These assert the
+// row by name, which is the failure the loose check could not produce.
+describe("Sidebar — PII Management is reachable from the nav", () => {
+  it("links to /pii from the Data group", () => {
+    render(<Sidebar role="admin" />)
+    expect(screen.getByRole("link", { name: "PII Management" })).toHaveAttribute("href", "/pii")
+    const data = screen.getByRole("heading", { name: "Data" }).parentElement as HTMLElement
+    const inData = Array.from(data.querySelectorAll("a")).map((a) => a.getAttribute("aria-label"))
+    expect(inData).toContain("PII Management")
+  })
+
+  it("shows the row to a non-admin, because /pii carries no role gate of its own", () => {
+    render(<Sidebar role="viewer" />)
+    expect(screen.getByRole("link", { name: "PII Management" })).toBeInTheDocument()
+  })
+})

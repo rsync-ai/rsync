@@ -137,6 +137,45 @@ def _default_retriable_restart_wait_ms() -> str:
     return _env_or("CDC_CONNECTOR_RETRY_WAIT_MS", _DEFAULT_RETRIABLE_RESTART_WAIT_MS)
 
 
+def _topic_creation(args: Dict[str, Any]) -> Dict[str, str]:
+    """The shape Kafka Connect must create this connector's DATA topics with.
+
+    Setting nothing here is not neutral. With no topic.creation.* the Connect worker
+    does not create data topics at all: the producer writes to a topic that does not
+    exist yet and the BROKER auto-creates it, at its own num.partitions (1) and its own
+    default replication factor. On a three-broker cluster every CDC topic then had one
+    partition, one leader, and therefore one broker carrying all of its traffic.
+
+    The orchestrator derives the numbers from the live broker list (Go:
+    kafka.CDCTopicShapeForCluster) and passes them here rather than letting this side
+    derive its own. Two independent derivations that disagree are not reported
+    anywhere: whichever side creates the topic first wins and the other number is
+    silently discarded. Same anti-drift rule as schema_history_topic.
+
+    partitions and replication factor are returned together or not at all, because
+    Connect requires both for the default group and ignores an incomplete one. The
+    min.insync.replicas floor travels with them for the reason pinMinInsyncReplicas
+    documents on the Go side: an RF=1 topic on a broker whose default floor is 2 (MSK,
+    and most managed clusters) is created, listed, subscribable, and rejects every
+    acks=all produce with NOT_ENOUGH_REPLICAS.
+
+    Empty when the orchestrator passed nothing — an older orchestrator, or one that
+    could not read the broker count — which leaves auto-create exactly as it was.
+    """
+    partitions = _as_int(args.get("topic_partitions"))
+    replication = _as_int(args.get("topic_replication_factor"))
+    if not partitions or partitions < 1 or not replication or replication < 1:
+        return {}
+    out = {
+        "topic.creation.default.partitions": str(partitions),
+        "topic.creation.default.replication.factor": str(replication),
+    }
+    min_isr = _as_int(args.get("topic_min_insync_replicas"))
+    if min_isr and min_isr >= 1:
+        out["topic.creation.default.min.insync.replicas"] = str(min_isr)
+    return out
+
+
 def _parse_tables(args: Dict[str, Any]) -> List[str]:
     # Accept "tables" (list) or "table" (string)
     tables: List[str] = []
@@ -1031,6 +1070,7 @@ class DebeziumConnector:
         # Applied before the caller's overrides so an explicit override still wins.
         cfg.update(_schema_history_security())
         cfg.update(self.json_converters)
+        cfg.update(_topic_creation(args))
 
         # Allow explicitly passing any Debezium/Kafka Connect property overrides
         overrides = args.get("connector_config_overrides") or args.get("config_overrides") or {}

@@ -19,6 +19,7 @@ import (
 	"api-gateway/internal/config"
 	"api-gateway/internal/db"
 	"api-gateway/internal/handlers"
+	"api-gateway/internal/identity"
 	"api-gateway/internal/kafka"
 	"api-gateway/internal/metrics"
 	"api-gateway/internal/notifier"
@@ -634,6 +635,21 @@ func main() {
 	schemaHandler := handlers.NewSchemaRegistryHandler()
 	authHandler := handlers.NewAuthHandler()
 	log.Info("OAuth, Schema Registry, and Auth handlers initialized")
+
+	// Which identity provider authenticates logins. Resolution fails closed, so a
+	// provider name this build does not have refuses every login; that has to be
+	// visible at boot, not discovered by the first user who cannot get in.
+	if provider, registered, err := authHandler.IdentityProviderStatus(); err != nil {
+		log.WithError(err).WithField("registered", registered).Errorf(
+			"identity provider is not resolvable; every login will be refused until %s names a registered provider or is unset",
+			identity.ProviderEnvVar)
+	} else {
+		log.WithFields(log.Fields{
+			"provider":         provider,
+			"registered":       registered,
+			"contract_version": identity.ContractVersion,
+		}).Info("Identity provider resolved")
+	}
 	log.Info(handlers.EmailConfigStatus())
 
 	// Wire proactive token refresh into enrichConfigWithOAuthToken and start the

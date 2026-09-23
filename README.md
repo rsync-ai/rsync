@@ -1,4 +1,4 @@
-# rsync.ai — Self-hosted AI Data Pipelines, CDC, and Lineage
+# rsync.ai — Self-hosted AI Data Pipelines, CDC, Scheduled Models, and Lineage
 
 [![License: ELv2](https://img.shields.io/badge/license-ELv2-3b82f6)](LICENSE)
 [![Deploy: Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)](#docker--one-command)
@@ -6,9 +6,14 @@
 [![Connectors](https://img.shields.io/badge/connectors-21-16a34a)](docs/connectors/reference.md)
 [![Docs](https://img.shields.io/badge/docs-read%20the%20guides-64748b)](docs/README.md)
 
-> **A self-hosted data platform for batch pipelines, CDC, scheduled data models, and
-> lineage.** Describe a pipeline in plain English, approve the plan, and see exactly what
-> ran, failed, or became stale.
+> **Self-hosted, source-available AI data platform for batch pipelines, CDC, scheduled
+> models, and lineage.** Describe a pipeline in plain English, approve the plan, and see
+> exactly what ran, failed, or became stale.
+
+![The rsync.ai pipeline builder resolving "MySQL to PostgreSQL" and pausing on a Choose Sync Mode gate before any row moves](docs/assets/pipeline-creation.png)
+
+*You describe the pipeline in plain English. It resolves the plan, then stops for your
+approval — batch, CDC, or changes-only — before a single row moves.*
 
 rsync.ai moves data between databases, warehouses, object stores and APIs. You describe the
 job in a sentence; an agent turns it into an explicit, staged plan, pauses for you when
@@ -112,7 +117,7 @@ shipped connectors still work; the LLM features say `Set up an LLM first` until 
 the stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
-> **Which code you get.** `v0.1.4`, the current release. Both halves of the install come
+> **Which code you get.** `v0.1.5`, the current release. Both halves of the install come
 > from that one tag: the compose file is fetched from `RSYNC_REF` and the images are
 > pulled at a tag derived from it, so the file and the containers it starts are the same
 > commit. Every image the default compose starts is published at that tag and pullable
@@ -146,9 +151,13 @@ That is the whole install. It generates every secret, installs the platform, the
 warehouse and a working set of connectors, waits for the release, and prints (or, on a
 terminal, opens) the two port-forwards that put the UI at `http://localhost:3000`. Edit
 `~/rsync-ai-k8s/.env` and run it again to change anything — that is also the upgrade path.
-Back that file up: it holds `ENCRYPTION_KEY`. It needs about **8.5 GiB of memory and 3.6
-CPU** free and says so before it starts; on a smaller cluster it installs a lean set
-instead of leaving pods `Pending`. Everything it accepts is listed in the
+Back that file up: it holds `ENCRYPTION_KEY`. The default install asks for about **8.8 GiB
+of memory and 3.7 CPU** in requests, and it measures what the cluster has left before it
+starts: on a smaller cluster it trims to a set that fits — first the connectors and demo
+you did not choose, then the spare api-gateway and frontend replicas — instead of leaving
+pods `Pending`. CPU is what runs out first: **a single 4-vCPU node is not enough for the
+default** (GKE's own DaemonSets leave ~3.4 of it), and what fits there is the trimmed set
+at ~3.0 CPU. Everything it accepts is listed in the
 [Kubernetes guide](docs/deployment/kubernetes.md#one-command-recommended).
 
 Prefer to run `helm` yourself? A bare `helm install` also needs `connectors.fleet` set, or no

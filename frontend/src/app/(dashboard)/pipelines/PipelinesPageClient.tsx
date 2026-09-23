@@ -333,7 +333,8 @@ export function PipelinesPageClient() {
   }
 
   const handleEditPipeline = (id: string) => {
-    // TODO: Create draft from pipeline and open panel
+    // Edit opens the pipeline's own page rather than the draft panel. The panel
+    // builds a draft from scratch, and nothing seeds one from an existing pipeline.
     router.push(`/pipelines/${id}`)
   }
 

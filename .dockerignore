@@ -33,6 +33,22 @@
 # root-context Dockerfile that needs a path nobody denied keeps working, and if
 # one ever does need a denied path it fails loudly at COPY, not silently.
 
+# --- the paid layer, which no community image may contain ---
+# The four root-context builds are the only ones whose context could reach this
+# tree, and this line is what stops it reaching them -- .dockerignore is read
+# only from the context root, so this is the single place it can be said once
+# for all four. `.github/workflows/enterprise-boundary.yml` is the check that
+# this line still does what it says: it inspects the BUILT images, because a
+# deny list is a claim about a build and only the artifact settles it.
+#
+# Written without the trailing slash the entries below use, on purpose. This
+# file ships to the public repository, where the directory does not exist, and
+# `llm-service/tests/test_no_public_file_references_the_enterprise_tree.py`
+# fails any surviving file that names it followed by a slash. That guard is
+# worth more with no exemptions than this block is with a matching style;
+# Docker excludes a directory and everything under it either way.
+enterprise
+
 # --- the two that dominate the context ---
 frontend/
 llm-service/

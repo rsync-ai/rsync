@@ -348,8 +348,12 @@ func TestFlushBatch_UnreachableDestinationFailsClosedInsteadOfDLQCommitting(t *t
 	if n := atomic.LoadUint64(&b.metrics.dlqRouted); n != 0 {
 		t.Errorf("dlqRouted = %d, want 0 — rows the destination never saw must not be dead-lettered", n)
 	}
-	if _, still := b.batches[key]; !still {
-		t.Error("the batch was discarded; failing closed must leave it held for redelivery")
+	// Redelivery comes from the UNCOMMITTED Kafka offset, not from the in-memory
+	// map: submitFlush seals a batch out of b.batches before a lane ever runs it,
+	// so "still in b.batches" stopped being a property the product has. The
+	// fixture's only message is at offset 41, so a commit here would be visible.
+	if n := atomic.LoadInt64(&b.metrics.lastCommittedOffset); n != 0 {
+		t.Errorf("lastCommittedOffset = %d, want 0 — failing closed must leave the offsets uncommitted so Kafka redelivers the batch", n)
 	}
 	for _, want := range []string{"failing closed", "offsets NOT committed", "NO rows dead-lettered", "redelivers"} {
 		if !strings.Contains(*got, want) {
