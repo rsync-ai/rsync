@@ -196,7 +196,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > The chart is also published to the registry, so you can install without cloning:
 >
 > ```bash
-> helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.4 \
+> helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.5 \
 >   --namespace rsync --create-namespace \
 >   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
 >   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
@@ -214,7 +214,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > ingress will serve. No MinIO image override is needed: chart **0.1.2** onward was
 > repackaged after MinIO withdrew `docker.io/minio/*` and its `values.yaml` names
 > quay.io already. Both paths pull rsync's own images at `.Chart.AppVersion`
-> (**0.1.4**), and every `ghcr.io/rsync-ai` image the chart names is published at
+> (**0.1.5**), and every `ghcr.io/rsync-ai` image the chart names is published at
 > that tag for both `amd64` and `arm64` (0.1.2 and older are `amd64` only, so they will
 > not start on Apple Silicon, Graviton, Axion or Ampere nodes).
 

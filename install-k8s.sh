@@ -41,7 +41,7 @@ set -euo pipefail
 # one number names both halves. RSYNC_CHART may also be a local chart directory
 # (a checkout, or `helm pull --untar`), in which case no version is passed.
 RSYNC_CHART="${RSYNC_CHART:-oci://ghcr.io/rsync-ai/charts/rsync-ai}"
-RSYNC_CHART_VERSION="${RSYNC_CHART_VERSION:-0.1.4}"
+RSYNC_CHART_VERSION="${RSYNC_CHART_VERSION:-0.1.5}"
 
 # Used only when there is no helm on PATH. OCI charts are GA from 3.8.
 HELM_FALLBACK_VERSION="v3.16.4"

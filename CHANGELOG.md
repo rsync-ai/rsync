@@ -7,10 +7,9 @@ All notable changes to Rsync AI are documented in this file.
      this file used to open with `## [1.0.0] - December 2025`, a version no tag
      has ever pointed at, and nothing in the repo could disagree with it. -->
 
-## [Unreleased]
+## [0.1.5] - 2026-09-23
 
-Changes since the last release. They move under a version heading when that version
-is tagged.
+Everything since v0.1.4.
 
 ### Kubernetes
 - A single 4-vCPU node installs: the installer trims to a set that fits instead of leaving
