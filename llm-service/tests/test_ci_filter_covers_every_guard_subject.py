@@ -184,6 +184,25 @@ GUARDS = [
     # trigger it. That is the "genuinely reads nothing" case the assertion below
     # names, not an omission.
     "test_insecure_token_endpoint_rule_is_one_rule.py",
+    # Enrolled 2026-09-22 with the paid-layer boundary. Both guard the same
+    # boundary from opposite ends: one that no surviving file names a path into
+    # the private tree, one that no published image name can be written by the
+    # paid service. (The tree is named by neither comment on purpose: this file
+    # ships public, and the first of those two guards is what refuses a path
+    # spelled out here -- it caught this very comment on the first run.) Their subjects are scripts/flip/excludes.txt,
+    # .github/workflows/docker-publish.yml, deploy/helm/rsync-ai/values.yaml and
+    # every tracked docker-compose*.yml -- all four already covered by
+    # `scripts/flip/**`, `.github/workflows/**`, `deploy/helm/**` and the compose
+    # entries the `go` filter's quickstart comment put there. Listed anyway for
+    # the reason every entry above gives: being absent from a hand-maintained
+    # literal is indistinguishable from being covered. Measured before enrolling
+    # -- `--collect-only | grep` for either name returned 0 against this file.
+    #
+    # Both also run in doc-links.yml, which is unfiltered, so the filter is their
+    # second line and not their only one. That is deliberate: the change that
+    # breaks them is a file added anywhere, which no paths filter can predict.
+    "test_no_public_file_references_the_enterprise_tree.py",
+    "test_enterprise_images_cannot_overwrite_a_public_one.py",
 ]
 
 

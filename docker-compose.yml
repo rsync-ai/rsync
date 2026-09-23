@@ -901,6 +901,19 @@ services:
       <<: *kafka-security
       KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:29092}
       PORT: "8000"
+      # How many destination flushes this sink runs at once. Unset/empty = 4.
+      #
+      # A CDC data topic is born with min(3, brokers) partitions and Debezium gives
+      # every source table a topic of its own, so one worker is assigned tens of
+      # partitions. It consumed all of them already, but drained them one at a time
+      # because the destination write ran inline on the consume goroutine — one slow
+      # table stalled every other partition. Lanes are sharded on (topic, partition),
+      # so per-row order is untouched.
+      #
+      # Set to 0 or 1 to restore the old inline behaviour exactly; this is the kill
+      # switch. Raising it opens more concurrent connections to the DESTINATION, which
+      # is somebody else's database — 4 is deliberately modest.
+      RSYNC_SINK_FLUSH_LANES: ${RSYNC_SINK_FLUSH_LANES:-}
       MCP_PORT: "8000"
       MCP_HTTP_MODE: "true"
       DOCKER_CONTAINER: "true"
@@ -1107,6 +1120,16 @@ services:
       # Clamp regardless: on a 3.7+ broker the clamp is a no-op.
       KAFKA_REPLICATION_FACTOR: "${KAFKA_REPLICATION_FACTOR:-}"
       KAFKA_MIN_INSYNC_REPLICAS: "${KAFKA_MIN_INSYNC_REPLICAS:-}"
+      # Partition count for every CDC data topic (backend-orchestrator/internal/kafka
+      # partitions.go EnvCDCTopicPartitions). Empty means "operator stated nothing", so
+      # the derivation applies: 1 on a single broker, min(3, brokers) beyond that. Set
+      # it only to go WIDER than 3 on a large cluster.
+      #
+      # It is a birth setting, not a live one. Kafka cannot reduce a partition count at
+      # all, and RAISING one on a topic that is already streaming rehashes every key
+      # onto a different partition and breaks per-key ordering, so rsync never resizes
+      # an existing topic -- a change here reaches only topics created after it.
+      KAFKA_CDC_TOPIC_PARTITIONS: "${KAFKA_CDC_TOPIC_PARTITIONS:-}"
       # Namespace for every Kafka topic this product creates, so an operator can
       # tell them apart from other applications' topics on a shared (BYO-Kafka)
       # cluster. Every service that touches Kafka must agree on this value: a

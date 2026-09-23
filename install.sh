@@ -23,7 +23,7 @@ RSYNC_REPO="${RSYNC_REPO:-rsync-ai/rsync}"
 # compose half and a "last publish" pointer on the image half, so the two halves
 # advance at different rates and a curl-pipe install is not reproducible. A tag
 # takes both halves from the same commit. Pass RSYNC_REF=main to track the branch.
-RSYNC_REF="${RSYNC_REF:-v0.1.4}"
+RSYNC_REF="${RSYNC_REF:-v0.1.5}"
 # The image tag that pairs with RSYNC_REF. Both halves of an install have to name
 # the same code: the compose file is fetched from RSYNC_REF, and the images that
 # compose file starts are pulled at this tag. Left independent they drift, and did

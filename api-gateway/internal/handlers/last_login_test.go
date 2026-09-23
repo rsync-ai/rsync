@@ -137,11 +137,7 @@ func TestLoginStampsLastLogin(t *testing.T) {
 		t.Fatalf("bcrypt: %v", err)
 	}
 
-	mock.ExpectQuery(`SELECT id, email, password_hash`).
-		WithArgs("user@example.com").
-		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "email", "password_hash", "role", "status", "name", "email_verified"},
-		).AddRow("user-1", "user@example.com", string(hash), "admin", "active", "Test", true))
+	expectLoginLookups(mock, string(hash))
 	mock.ExpectExec(`INSERT INTO sessions`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE users SET last_login_at = NOW\(\) WHERE id = \$1`).
 		WithArgs("user-1").
@@ -153,7 +149,7 @@ func TestLoginStampsLastLogin(t *testing.T) {
 		strings.NewReader(`{"email":"user@example.com","password":"correct-horse"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	(&AuthHandler{db: dbConn}).Login(c)
+	newAuthHandler(dbConn).Login(c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("login failed: status %d body %s", w.Code, w.Body.String())

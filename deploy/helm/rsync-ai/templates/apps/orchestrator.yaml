@@ -50,7 +50,7 @@ spec:
     spec:
       {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
       initContainers:
-        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.orchestrator.image) | nindent 8 }}
+        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.orchestrator.image "kafka" true) | nindent 8 }}
         {{- include "rsync-ai.catalogInitContainer" . | nindent 8 }}
       containers:
         - name: orchestrator

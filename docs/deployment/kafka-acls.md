@@ -7,7 +7,14 @@ names it performs them on, so you can grant a least-privilege set rather than
 `--operation All --topic '*'`.
 
 Connection and authentication settings (SASL mechanism, TLS material, `client.id`)
-are in [env-vars.md](env-vars.md); this page is only about authorization.
+are in [env-vars.md](env-vars.md); this page is only about authorization. On
+Google's Managed Service for Apache Kafka, read
+[gcp-managed-kafka.md](gcp-managed-kafka.md) alongside this page: entries are
+created with `gcloud managed-kafka acls` rather than `kafka-acls.sh`, a mutual-TLS
+principal is whatever the cluster's SSL principal mapping rule extracts from the
+certificate, and **creating your first ACL there switches the whole cluster from
+"authenticated is allowed" to ACL-driven** — identities that worked before,
+including the IAM one, stop working until they are granted too.
 
 > **Why this page is long.** Nearly every authorization failure in this platform
 > is silent. A denied produce is `log.Warn` at most call sites; a denied

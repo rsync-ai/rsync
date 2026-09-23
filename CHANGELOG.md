@@ -9,7 +9,17 @@ All notable changes to Rsync AI are documented in this file.
 
 ## [Unreleased]
 
-Nothing yet: everything up to `v0.1.4` is listed under its own heading below.
+Changes since the last release. They move under a version heading when that version
+is tagged.
+
+### Kubernetes
+- A single 4-vCPU node installs: the installer trims to a set that fits instead of leaving
+  pods `Pending`, and the orchestrator waits for Kafka rather than crash-looping past it.
+
+### Change data capture
+- A CDC data topic is created with `min(3, brokers)` partitions instead of 1, so its traffic
+  is not pinned to one leader on a multi-broker cluster. `KAFKA_CDC_TOPIC_PARTITIONS` sets it
+  wider.
 
 ## [0.1.4] - 2026-09-21
 

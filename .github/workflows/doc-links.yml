@@ -189,6 +189,15 @@ jobs:
           # falsifies it is a code commit in another tree, so neither a
           # docs-filtered nor a code-filtered job would see both halves.
           #
+          # The last two have no markdown subject at all. They are here because
+          # this workflow is the only one that runs unfiltered on every PR, and the
+          # change that breaks them is not predictable from a path. A file added
+          # anywhere can import the paid tree; a compose file anywhere can pull its
+          # image; the list that strips the tree losing a line takes both down and
+          # touches nothing either would be filtered on. Being on this list also
+          # means both run against the published tree as well as this one -- and
+          # there they stop being precautions and become the assertion that nothing
+          # leaked.
           # test_capabilities_stays_an_index.py keeps CAPABILITIES.md a one-line
           # index after the 2026-09-16 split (rows <= 400 chars, no duplicate
           # headlines, <= 150 KB) and checks the #fragment links between it and
@@ -213,5 +222,7 @@ jobs:
             tests/test_docs_do_not_call_built_connectors_unbuilt.py \
             tests/test_deployment_docs_do_not_hand_the_operator_a_step_the_product_runs.py \
             tests/test_capabilities_stays_an_index.py \
-            tests/test_no_bundled_observability_vendor.py
+            tests/test_no_bundled_observability_vendor.py \
+            tests/test_no_public_file_references_the_enterprise_tree.py \
+            tests/test_enterprise_images_cannot_overwrite_a_public_one.py
 

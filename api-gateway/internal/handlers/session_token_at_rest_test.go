@@ -64,6 +64,28 @@ func assertStoredIsHashOf(t *testing.T, stored, issued string) {
 	}
 }
 
+// expectLoginLookups sets up the two reads a successful login now performs, since
+// the credential check moved behind the identity extension point: the account row,
+// which no longer selects password_hash, and then the local provider's own read of
+// that hash. Two reads rather than one because the stored credential is the
+// provider's to fetch -- a hash the handler selected would be a hash the handler
+// could hand to any provider, including one running somewhere else.
+//
+// These three tests are the community default's regression proof. They drive the
+// real Login handler with the real registry, so if the local provider ever stopped
+// being the path an ordinary password login takes, they would fail here rather
+// than in production.
+func expectLoginLookups(mock sqlmock.Sqlmock, passwordHash string) {
+	mock.ExpectQuery(`SELECT id, email, role`).
+		WithArgs("user@example.com").
+		WillReturnRows(sqlmock.NewRows(
+			[]string{"id", "email", "role", "status", "name", "email_verified"},
+		).AddRow("user-1", "user@example.com", "admin", "active", "Test", true))
+	mock.ExpectQuery(`SELECT password_hash FROM users`).
+		WithArgs("user@example.com").
+		WillReturnRows(sqlmock.NewRows([]string{"password_hash"}).AddRow(passwordHash))
+}
+
 func TestLogin_StoresHashNotPlaintextToken(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	dbConn, mock, err := sqlmock.New()
@@ -79,11 +101,7 @@ func TestLogin_StoresHashNotPlaintextToken(t *testing.T) {
 		t.Fatalf("bcrypt: %v", err)
 	}
 
-	mock.ExpectQuery(`SELECT id, email, password_hash`).
-		WithArgs("user@example.com").
-		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "email", "password_hash", "role", "status", "name", "email_verified"},
-		).AddRow("user-1", "user@example.com", string(hash), "admin", "active", "Test", true))
+	expectLoginLookups(mock, string(hash))
 
 	stored := &capturedArg{}
 	// Arg 3 is sessions.token in `INSERT INTO sessions (id, user_id, token, ...)`.
@@ -100,7 +118,7 @@ func TestLogin_StoresHashNotPlaintextToken(t *testing.T) {
 		strings.NewReader(`{"email":"user@example.com","password":"correct-horse"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	(&AuthHandler{db: dbConn}).Login(c)
+	newAuthHandler(dbConn).Login(c)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("login failed: status %d body %s", w.Code, w.Body.String())
@@ -131,11 +149,7 @@ func TestLogin_CookieCarriesThePlaintextToken(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bcrypt: %v", err)
 	}
-	mock.ExpectQuery(`SELECT id, email, password_hash`).
-		WithArgs("user@example.com").
-		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "email", "password_hash", "role", "status", "name", "email_verified"},
-		).AddRow("user-1", "user@example.com", string(hash), "admin", "active", "Test", true))
+	expectLoginLookups(mock, string(hash))
 	mock.ExpectExec(`INSERT INTO sessions`).WillReturnResult(sqlmock.NewResult(0, 1))
 	mock.ExpectExec(`UPDATE users SET last_login_at = NOW\(\)`).
 		WithArgs("user-1").WillReturnResult(sqlmock.NewResult(0, 1))
@@ -146,7 +160,7 @@ func TestLogin_CookieCarriesThePlaintextToken(t *testing.T) {
 		strings.NewReader(`{"email":"user@example.com","password":"correct-horse"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
 
-	(&AuthHandler{db: dbConn}).Login(c)
+	newAuthHandler(dbConn).Login(c)
 	if w.Code != http.StatusOK {
 		t.Fatalf("login failed: status %d body %s", w.Code, w.Body.String())
 	}
@@ -189,11 +203,7 @@ func TestSessionToken_WriteThenReadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bcrypt: %v", err)
 	}
-	mock.ExpectQuery(`SELECT id, email, password_hash`).
-		WithArgs("user@example.com").
-		WillReturnRows(sqlmock.NewRows(
-			[]string{"id", "email", "password_hash", "role", "status", "name", "email_verified"},
-		).AddRow("user-1", "user@example.com", string(hash), "admin", "active", "Test", true))
+	expectLoginLookups(mock, string(hash))
 
 	stored := &capturedArg{}
 	mock.ExpectExec(`INSERT INTO sessions`).
@@ -207,7 +217,7 @@ func TestSessionToken_WriteThenReadRoundTrip(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/api/v1/auth/login",
 		strings.NewReader(`{"email":"user@example.com","password":"correct-horse"}`))
 	c.Request.Header.Set("Content-Type", "application/json")
-	(&AuthHandler{db: dbConn}).Login(c)
+	newAuthHandler(dbConn).Login(c)
 	if w.Code != http.StatusOK {
 		t.Fatalf("login failed: status %d body %s", w.Code, w.Body.String())
 	}

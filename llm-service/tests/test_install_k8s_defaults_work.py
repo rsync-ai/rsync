@@ -411,7 +411,17 @@ case "$*" in
   *"config current-context"*) echo fake-ctx ;;
   *"get --raw"*) echo ok ;;
   *"get storageclass"*) printf 'standard\ttrue\t\n' ;;
-  *"get pods -A"*) printf '%b' "${FAKE_PODS:-}" ;;
+  *"get pods -A"*)
+    # While the cluster is still starting its own pods, the listing is short --
+    # the very window FAKE_SETTLE_AFTER models.
+    if [[ -n "${FAKE_SETTLE_AFTER:-}" && "$(cat "$FAKE_LOG.settle" 2>/dev/null || echo 0)" -le "$FAKE_SETTLE_AFTER" ]]
+    then printf '%b' "${FAKE_PODS_EARLY:-}"; else printf '%b' "${FAKE_PODS:-}"; fi ;;
+  *"get daemonsets"*)
+    if [[ -n "${FAKE_SETTLE_AFTER:-}" ]]; then
+      n=$(( $(cat "$FAKE_LOG.settle" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$FAKE_LOG.settle"
+      if (( n <= FAKE_SETTLE_AFTER )); then printf '2 0\n'; else printf '2 2\n'; fi
+    else printf '%b' "${FAKE_DAEMONSETS:-}"; fi ;;
+  *"get deployments -n kube-system"*) printf '%b' "${FAKE_DEPLOYMENTS:-}" ;;
   *"get nodes"*) [[ -z "${FAKE_NODES_FAIL:-}" ]] || exit 1
     if [[ -n "${FAKE_NODES:-}" ]]; then printf '%b\n' "$FAKE_NODES"; else printf '32Gi 8\n32Gi 8\n'; fi ;;
   *"get secret rsync-secrets -o"*)
@@ -745,7 +755,22 @@ def _requested(docs) -> tuple:
     return round(mem), round(cpu)
 
 
-def _requested_with(tmp_path, *, fleet, demo, ollama=False):
+def _tight_overrides(tmp_path):
+    """The same three values fit_to_cluster writes when not even the lean set fits."""
+    p = tmp_path / "tight.yaml"
+    p.write_text(
+        yaml.safe_dump(
+            {
+                "apiGateway": {"replicaCount": 1},
+                "frontend": {"replicaCount": 1},
+                "orchestrator": {"resources": {"requests": {"cpu": _script_var("TIGHT_ORCHESTRATOR_CPU")}}},
+            }
+        )
+    )
+    return p
+
+
+def _requested_with(tmp_path, *, fleet, demo, ollama=False, tight=False):
     extra = tmp_path / "shape.yaml"
     extra.write_text(
         yaml.safe_dump(
@@ -756,7 +781,8 @@ def _requested_with(tmp_path, *, fleet, demo, ollama=False):
             }
         )
     )
-    return _requested(_render(tmp_path, extra))
+    files = [extra] + ([_tight_overrides(tmp_path)] if tight else [])
+    return _requested(_render(tmp_path, *files))
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
@@ -794,6 +820,31 @@ def test_the_capacity_constants_are_what_the_chart_requests(tmp_path):
     ), "the in-cluster model's requests changed; update OLLAMA_* in install-k8s.sh"
 
 
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_the_tight_profile_constants_are_what_the_chart_saves(tmp_path):
+    """The last rung plans with TIGHT_*, the same way the others plan with BASE_*. If a
+    replicaCount or the orchestrator's CPU request moves in the chart, the saving moves with
+    it and the rung would promise room it does not free -- so re-measure it every run."""
+    assert _run(tmp_path, "--render-only").returncode == 0
+
+    base = _requested_with(tmp_path, fleet=[], demo=False)
+    tight = _requested_with(tmp_path, fleet=[], demo=False, tight=True)
+    assert (base[0] - tight[0], base[1] - tight[1]) == (
+        int(_script_var("TIGHT_MEM_MIB")), int(_script_var("TIGHT_CPU_M"))
+    ), f"the tight profile now saves {(base[0] - tight[0], base[1] - tight[1])} (MiB, m); update TIGHT_* in install-k8s.sh"
+
+    # The saving must come from the three things it claims, and from nothing else.
+    docs = {(d["kind"], d["metadata"]["name"]): d for d in _render(tmp_path, _tight_overrides(tmp_path))}
+    assert docs[("Deployment", "rsync-api-gateway")]["spec"]["replicas"] == 1
+    assert docs[("Deployment", "rsync-frontend")]["spec"]["replicas"] == 1
+    orch = docs[("Deployment", "rsync-orchestrator")]["spec"]["template"]["spec"]["containers"][0]
+    assert orch["resources"]["requests"]["cpu"] == _script_var("TIGHT_ORCHESTRATOR_CPU")
+    # Deep-merged, not replaced: concurrent table loads are sized against the memory LIMIT
+    # (tableConcurrency reads it back out of the cgroup), so the rung must not touch it.
+    assert orch["resources"]["limits"]["memory"] == "2Gi", "the tight rung ate the orchestrator's memory limit"
+    assert orch["resources"]["requests"]["memory"] == "1Gi"
+
+
 def _default_need() -> tuple:
     """(MiB, m) the DEFAULT install asks for, by the script's own constants."""
     n = len(_script_var("DEFAULT_CONNECTORS").split(","))
@@ -808,6 +859,11 @@ def _lean_need() -> tuple:
         int(_script_var("BASE_MEM_MIB")) + n * int(_script_var("CONNECTOR_MEM_MIB")),
         int(_script_var("BASE_CPU_M")) + n * int(_script_var("CONNECTOR_CPU_M")),
     )
+
+
+def _tight_need() -> tuple:
+    mem, cpu = _lean_need()
+    return mem - int(_script_var("TIGHT_MEM_MIB")), cpu - int(_script_var("TIGHT_CPU_M"))
 
 
 def _nodes(mem_mib, cpu_m):
@@ -852,6 +908,43 @@ def test_a_small_cluster_gets_a_lean_install_instead_of_a_pending_one(tmp_path):
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_a_single_four_vcpu_node_gets_an_install_that_fits(tmp_path):
+    """The GKE smoke test, as a test. One e2-standard-4 (3920m allocatable) with the
+    kube-system DaemonSets GKE puts on every node leaves ~3.4 CPU -- and trimming connectors
+    cannot reach that, because BASE alone asks 3410m and the whole lean fleet is worth 100m.
+    The run this encodes ended with helm 'context deadline exceeded' and four pods that never
+    scheduled. What has to fit is the install, not the fleet."""
+    free_cpu, free_mem = 3920 - 520, 13622 - 600
+    # the control: if the defaults or the lean set fitted here, this test would prove nothing
+    assert _default_need()[1] > free_cpu and _lean_need()[1] > free_cpu, "the node is no longer too small"
+    assert _tight_need()[1] <= free_cpu, "the tight rung does not fit a 4-vCPU node"
+
+    env, log = _fake_cluster(
+        tmp_path,
+        FAKE_NODES=_nodes(13622, 3920),
+        FAKE_PODS=(
+            "Running\\tkube-system\\t\\tn1\\t200Mi,100m;\\n"  # fluentbit-gke
+            "Running\\tkube-system\\t\\tn1\\t100Mi,13m;\\n"  # gke-metrics-agent
+            "Running\\tkube-system\\t\\tn1\\t110Mi,260m;\\n"  # kube-dns
+            "Running\\tkube-system\\t\\tn1\\t100Mi,100m;\\n"  # kube-proxy
+            "Running\\tkube-system\\t\\tn1\\t90Mi,47m;\\n"  # pdcsi-node + konnectivity
+        ),
+    )
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert "single-replica" in cp.stdout, cp.stdout
+    assert any(l.startswith("helm upgrade") for l in log.read_text().splitlines()), "it stopped instead of installing"
+
+    # the proof is the rendered chart, not the message: what it is about to install fits
+    mem, cpu = _requested(_render(tmp_path))
+    assert cpu <= free_cpu and mem <= free_mem, f"it still asks for {(mem, cpu)} of {(free_mem, free_cpu)}"
+
+    # and it is a fallback, not a new preference
+    persisted = _dotenv(tmp_path)
+    assert "RSYNC_CONNECTORS" not in persisted and "RSYNC_DEMO" not in persisted
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
 def test_a_choice_the_user_made_is_never_trimmed(tmp_path):
     lean_mem, lean_cpu = _lean_need()
     mem, cpu = _default_need()
@@ -868,17 +961,24 @@ def test_a_choice_the_user_made_is_never_trimmed(tmp_path):
     cp2 = _run(tmp2, "--no-port-forward", RSYNC_CONNECTORS="postgresql,mongodb", RSYNC_DEMO="true", **env2)
     assert cp2.returncode == 0, cp2.stdout + cp2.stderr
     assert _values(tmp2)["demo"]["enabled"] is True, "an explicit RSYNC_DEMO=true was overridden"
-    assert "Pending" in cp2.stdout, "nothing fits and the user was not told"
+    # Both choices are explicit, so there is nothing left to trim -- but the replicas are the
+    # installer's own default, not a choice, so it collapses those instead of giving up.
+    assert "single-replica" in cp2.stdout, "nothing was trimmed and the user was not told"
+    assert _values(tmp2)["apiGateway"]["replicaCount"] == 1
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
-def test_a_cluster_too_small_even_for_the_lean_set_is_warned_not_refused(tmp_path):
-    lean_mem, lean_cpu = _lean_need()
-    env, log = _fake_cluster(tmp_path, FAKE_NODES=_nodes(lean_mem - 1024, lean_cpu + 500))
+def test_a_cluster_too_small_even_for_the_tight_set_is_warned_not_refused(tmp_path):
+    """Below the last rung the installer still proceeds: a cluster autoscaler adds the node
+    while helm waits, and refusing would break exactly the clusters that can recover."""
+    tight_mem, tight_cpu = _tight_need()
+    env, log = _fake_cluster(tmp_path, FAKE_NODES=_nodes(tight_mem - 1024, tight_cpu + 500))
     cp = _run(tmp_path, "--no-port-forward", **env)
     assert cp.returncode == 0, cp.stdout + cp.stderr
     assert "Pending" in cp.stdout and "RSYNC_CONNECTORS=" in cp.stdout
-    assert "Installing a lean set" not in cp.stdout
+    assert "Installing a lean set" not in cp.stdout and "single-replica" not in cp.stdout
+    # the profile is rolled back with the fleet: a promise it cannot keep is not written out
+    assert "replicaCount" not in (tmp_path / "inst" / "values.generated.yaml").read_text()
     # the defaults stay: a lean install that still does not fit is no better than the full one
     assert _fleet_ids(tmp_path) == _script_var("DEFAULT_CONNECTORS").split(",")
     assert any(l.startswith("helm upgrade") for l in log.read_text().splitlines())
@@ -915,12 +1015,81 @@ def test_this_releases_own_pods_and_finished_pods_do_not_count_against_it(tmp_pa
         FAKE_PODS=(
             "Running\\trsync\\trsync\\tn1\\t8000Mi,3000m;\\n"  # this release: replaced by the upgrade
             "Succeeded\\tother\\tjob\\tn1\\t4000Mi,2000m;\\n"  # finished
-            "Pending\\tother\\tq\\t\\t4000Mi,2000m;\\n"  # not scheduled to a node
+            "Failed\\tother\\tjob2\\tn1\\t4000Mi,2000m;\\n"  # finished
         ),
     )
     cp = _run(tmp_path, "--no-port-forward", **env)
     assert cp.returncode == 0, cp.stdout + cp.stderr
     assert "Installing a lean set" not in cp.stdout, cp.stdout
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_a_pod_still_waiting_for_a_node_is_room_that_is_taken(tmp_path):
+    """A Pending pod has no .spec.nodeName, and skipping it read a starting cluster as
+    emptier than it is. It is owed room, so it counts -- the error this makes is a
+    trimmed install, and the error it prevents is one that never becomes ready."""
+    mem, cpu = _default_need()
+    env, _ = _fake_cluster(
+        tmp_path,
+        FAKE_NODES=_nodes(mem + 100, cpu + 100),
+        # Enough to put the defaults out of reach, not enough to break the lean rung.
+        FAKE_PODS="Pending\\tother\\tq\\t\\t300Mi,200m;\\n",  # no node yet
+    )
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert "Installing a lean set" in cp.stdout, cp.stdout
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_capacity_is_measured_after_the_clusters_own_pods_are_up(tmp_path):
+    """A node reports its allocatable the moment it registers; the DNS, CNI and
+    metrics pods that occupy it land over the next half-minute. Measured inside that
+    window a 4-vCPU node reads ~200m too free -- enough to pick a rung that then sits
+    Pending. The reading has to wait for the cluster's own pods."""
+    free_cpu, free_mem = 3920 - 520, 13622 - 600
+    assert _lean_need()[1] > free_cpu, "the node is no longer too small for the lean rung"
+    assert _tight_need()[1] <= free_cpu, "the tight rung does not fit a 4-vCPU node"
+    settled = (
+        "Running\\tkube-system\\t\\tn1\\t200Mi,100m;\\n"
+        "Running\\tkube-system\\t\\tn1\\t100Mi,13m;\\n"
+        "Running\\tkube-system\\t\\tn1\\t110Mi,260m;\\n"
+        "Running\\tkube-system\\t\\tn1\\t100Mi,100m;\\n"
+        "Running\\tkube-system\\t\\tn1\\t90Mi,47m;\\n"
+    )
+    env, _ = _fake_cluster(
+        tmp_path,
+        FAKE_NODES=_nodes(13622, 3920),
+        FAKE_PODS=settled,
+        FAKE_PODS_EARLY="Running\\tkube-system\\t\\tn1\\t100Mi,100m;\\n",  # DNS et al not up yet
+        FAKE_SETTLE_AFTER="2",
+        RSYNC_SETTLE_TIMEOUT_S="20",
+    )
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert "Waiting for the cluster's own system pods" in cp.stdout, cp.stdout
+    # The early listing leaves 3820m free, which the lean rung fits; the settled one
+    # leaves 3400m, which only the tight rung fits. Which rung fired says which
+    # reading was used.
+    assert "single-replica" in cp.stdout, cp.stdout
+    mem, cpu = _requested(_render(tmp_path))
+    assert cpu <= free_cpu and mem <= free_mem, (mem, cpu)
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_a_cluster_that_never_settles_is_measured_anyway(tmp_path):
+    """The wait is a wait, not a gate: a cluster whose system pods stay unready must
+    still get an install, measured with what is readable."""
+    env, _ = _fake_cluster(
+        tmp_path,
+        FAKE_NODES=_nodes(13622, 3920),
+        FAKE_PODS="Running\\tkube-system\\t\\tn1\\t100Mi,100m;\\n",
+        FAKE_PODS_EARLY="Running\\tkube-system\\t\\tn1\\t100Mi,100m;\\n",
+        FAKE_SETTLE_AFTER="9999",
+        RSYNC_SETTLE_TIMEOUT_S="4",
+    )
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert "still starting after 4s" in cp.stdout + cp.stderr, cp.stdout + cp.stderr
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")

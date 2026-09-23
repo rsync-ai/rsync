@@ -102,9 +102,36 @@ if the installer does give up it names the registry as the cause. Re-run it: lay
 pulled are cached. On a network that keeps doing this, mirror the images and set
 `RSYNC_IMAGE_REGISTRY`.
 
-**Sizing.** The default install requests about **8.5 GiB of memory and 3.6 CPU**
-(requests, not usage). The installer warns when the nodes cannot hold that. To run
-lighter: `RSYNC_CONNECTORS=postgresql` and `RSYNC_DEMO=false`.
+**Sizing.** The default install requests about **8.8 GiB of memory and 3.7 CPU**
+(requests, not usage — what the scheduler must reserve, not what the pods burn).
+Before installing, the installer sums the nodes' allocatable, subtracts what every
+other pod already requests, and if the default does not fit it steps down rather
+than leaving pods `Pending`:
+
+| rung | what it gives up | asks for |
+|---|---|---|
+| default | — | ~8.8 GiB / 3.7 CPU |
+| lean | the connectors and demo you did **not** choose (`RSYNC_CONNECTORS` / `RSYNC_DEMO` are never overridden) | ~8.4 GiB / 3.5 CPU |
+| tight | one of the two api-gateway replicas and one of the two frontend replicas, and a smaller CPU *request* for the orchestrator | ~7.8 GiB / 3.0 CPU |
+
+Below the last rung it warns and installs anyway, because a cluster autoscaler may
+add the node while `helm` waits.
+
+**CPU is what runs out first, and a single 4-vCPU node is not enough for the default.**
+A GKE `e2-standard-4` has 3920m allocatable and its kube-system DaemonSets take
+several hundred more, leaving ~3.4 CPU — less than the 3.7 the default asks for, and
+less than the 3.5 the lean set asks for, because the whole connector fleet is only
+worth 250m. That is what the tight rung exists for. Memory is not the constraint on
+that node: 16 GiB leaves ~13.3 allocatable against the 7.8 the tight rung needs.
+
+Nothing here is written to the `.env` — it is a fit to *this* cluster, so the next run
+on a bigger one installs the full default again. The tight rung lowers a CPU **request**,
+not a limit; the chart sets no CPU limits, so the pods can still use whatever the node
+has spare. What it really gives up is the second replica that would carry traffic while
+a node is being replaced — worth it on a one-node cluster, which has no such spare
+anyway. To choose for yourself instead: `RSYNC_CONNECTORS=postgresql` and
+`RSYNC_DEMO=false`, or set your own numbers in `RSYNC_EXTRA_VALUES`, which is layered
+last and wins over all of this.
 
 ### With `helm` directly
 
@@ -178,10 +205,10 @@ helm install rsync ./deploy/helm/rsync-ai \
 ```
 
 The chart resolves its image tag to `.Chart.AppVersion`, so this pulls the
-**0.1.4** images. Every `ghcr.io/rsync-ai` image the chart names is published at that tag: the
-`v0.1.4` release run built 36 of 36 jobs (one connector build was retried after a transient
-registry write error), and all 34 packages answer an anonymous pull. They are built for both `amd64` and `arm64` (checked 2026-09-21 by manifest
-fetch); `0.1.2` and older are `amd64` only and fail on Apple Silicon, Graviton, Axion or Ampere
+**0.1.4** images. Every `ghcr.io/rsync-ai` image the chart names is published at that tag: all
+34 packages — 13 service images and 21 connectors — answer an anonymous pull at
+`0.1.4`, each returning an index that lists both `amd64` and `arm64` (checked 2026-09-22 by
+manifest fetch); `0.1.2` and older are `amd64` only and fail on Apple Silicon, Graviton, Axion or Ampere
 nodes with `no match for platform in manifest`.
 
 Do not hand-audit this list. `v0.1.0` shipped the same class of defect from the
@@ -332,7 +359,10 @@ leaving you the endpoints and credentials.
 **Provision first:** Cloud SQL for PostgreSQL, Memorystore for Redis, a Kafka
 cluster (Google's Managed Service for Apache Kafka, or Confluent Cloud — both
 speak `SASL_SSL`/`PLAIN`), a GCS bucket, and an **HMAC key** for the service
-account that will reach it.
+account that will reach it. For Managed Kafka, follow
+[Google Managed Service for Apache Kafka](gcp-managed-kafka.md) — its SASL
+password expires after an hour, so mutual TLS is the path for anything
+longer-lived than a demo.
 
 ```yaml
 # my-values.yaml — layered over values-gke.yaml
@@ -352,6 +382,9 @@ redis:
   external: { host: 10.30.0.4 }        # Memorystore private IP
 kafka:
   external:
+    # Port 9092 is the SASL listener. On Managed Kafka the password is an OAuth
+    # access token that dies after ~1h — use mutual TLS on 9192 for a real
+    # deployment. See gcp-managed-kafka.md.
     bootstrapServers: "bootstrap.mycluster.europe-west1.managedkafka.myproject.cloud.goog:9092"
     saslUsername: rsync
     saslPassword: "…"
@@ -391,8 +424,9 @@ helm install rsync ./deploy/helm/rsync-ai \
   `caCert` — the natural reading of "the CA" — replaces that trust with a root the
   broker's certificate does not chain to, and every client fails the handshake.
   Set only `clientCert` and `clientKey`. (`SASL_SSL` on 9092 needs neither.)
-  Verified with a Go, a Python and a JVM client against a live Managed Kafka
-  cluster.
+  Verified 2026-09-22 with a Go, a Python and a JVM client against a live Managed
+  Kafka cluster. Full recipe — CA pool, principal mapping, ACLs — in
+  [Google Managed Service for Apache Kafka](gcp-managed-kafka.md).
 - **The `gcs` connector authenticates as the node's service account unless you
   give it a key, and that account is read-only by default.** GKE's default node
   scope is `devstorage.read_only`, so listing works and every write fails with a

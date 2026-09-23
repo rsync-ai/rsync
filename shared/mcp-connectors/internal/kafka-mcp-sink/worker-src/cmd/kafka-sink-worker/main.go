@@ -1307,6 +1307,13 @@ type cdcDBBatcher struct {
 	cdcBytes   *sync.Map
 
 	batches map[string]*cdcDBBatch // key: "topic|partition|table"
+
+	// lanes runs destination flushes off the consume goroutine, sharded so that one
+	// (topic, partition) always flushes on one lane. nil = flush inline, as before.
+	//
+	// batches itself stays single-owner and needs no lock: submitFlush removes a
+	// batch from the map BEFORE handing it to a lane, so a lane never touches it.
+	lanes *flushLanes
 }
 
 func newCDCObjectBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reader, hw *highWaterTracker, pgDB *sql.DB, httpClient *http.Client,
@@ -1410,6 +1417,7 @@ func newCDCDBBatcher(cfg *WorkerConfig, destType string, reader *kafka.Reader, h
 		cdcDeletes:   cdcDeletes,
 		cdcBytes:     cdcBytes,
 		batches:      map[string]*cdcDBBatch{},
+		lanes:        newFlushLanes(resolveFlushLaneCount()),
 	}
 }
 
@@ -1498,7 +1506,7 @@ func (b *cdcDBBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkMessa
 
 	// Flush on threshold BEFORE appending (same pattern as cdcObjectBatcher).
 	if len(batch.rows) > 0 && len(batch.rows)+1 > b.params.maxEvents {
-		b.flushBatch(ctx, key, batch, "threshold_flush")
+		b.submitFlush(ctx, key, batch, "threshold_flush")
 		// Recreate after flush.
 		batch = nil
 		if b2 := b.batches[key]; b2 != nil {
@@ -1534,11 +1542,31 @@ func (b *cdcDBBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkMessa
 
 	// Flush immediately when threshold exactly reached.
 	if len(batch.rows) >= b.params.maxEvents {
-		b.flushBatch(ctx, key, batch, "threshold_reached_flush")
+		b.submitFlush(ctx, key, batch, "threshold_reached_flush")
 	}
 }
 
+// submitFlush seals a batch and runs its destination write on the lane that owns
+// its offset space.
+//
+// Sealing is the removal from b.batches, and it happens here, on the dispatcher
+// goroutine, rather than at the end of the flush. That is what keeps b.batches an
+// unsynchronised map: by the time a lane sees the batch, nothing else can reach it.
+// It also makes add()'s post-flush "is the key gone?" check deterministic.
+//
+// With no lanes configured this is exactly the old call: delete, then flush inline.
+func (b *cdcDBBatcher) submitFlush(ctx context.Context, key string, batch *cdcDBBatch, reason string) {
+	if b == nil || batch == nil || len(batch.rows) == 0 {
+		return
+	}
+	delete(b.batches, key)
+	b.lanes.submit(key, func() { b.flushBatch(ctx, key, batch, reason) })
+}
+
 // flushDue flushes all batches that have exceeded the flush interval.
+//
+// It does not wait. Nothing downstream of a periodic tick is ordered against it,
+// and waiting here would serialise the lanes back into the consume goroutine.
 func (b *cdcDBBatcher) flushDue(ctx context.Context, now time.Time) {
 	if b == nil {
 		return
@@ -1548,7 +1576,7 @@ func (b *cdcDBBatcher) flushDue(ctx context.Context, now time.Time) {
 			continue
 		}
 		if now.Sub(batch.createdAt) >= b.params.flushInterval {
-			b.flushBatch(ctx, key, batch, "interval_flush")
+			b.submitFlush(ctx, key, batch, "interval_flush")
 		}
 	}
 }
@@ -1565,14 +1593,19 @@ func (b *cdcDBBatcher) flushTable(ctx context.Context, topic string, partition i
 		return 0
 	}
 	key := fmt.Sprintf("%s|%d|%s", topic, partition, table)
+	n := 0
 	if batch, ok := b.batches[key]; ok && batch != nil && len(batch.rows) > 0 {
-		// Read the count BEFORE flushing: flushBatch → commitFlushedBatch removes
-		// the batch from b.batches, so len(batch.rows) is not readable afterwards.
-		n := len(batch.rows)
-		b.flushBatch(ctx, key, batch, "pre_delete_flush")
-		return n
+		// Read the count BEFORE flushing: submitFlush removes the batch from
+		// b.batches, so len(batch.rows) is not readable afterwards.
+		n = len(batch.rows)
+		b.submitFlush(ctx, key, batch, "pre_delete_flush")
 	}
-	return 0
+	// Submitting is not enough, and this wait runs even when nothing was buffered:
+	// an EARLIER threshold or interval flush for this same key may still be in
+	// flight on its lane, and a delete that overtakes it resurrects the row it was
+	// supposed to remove. Wait for the whole offset space to go quiet.
+	b.lanes.waitKey(key)
+	return n
 }
 
 // flushAll flushes every pending batch (e.g. on context cancellation or worker shutdown).
@@ -1582,9 +1615,11 @@ func (b *cdcDBBatcher) flushAll(ctx context.Context) {
 	}
 	for key, batch := range b.batches {
 		if batch != nil && len(batch.rows) > 0 {
-			b.flushBatch(ctx, key, batch, "shutdown_flush")
+			b.submitFlush(ctx, key, batch, "shutdown_flush")
 		}
 	}
+	// A drain that returns while a flush is still running has drained nothing.
+	b.lanes.waitAll()
 }
 
 // flushBatch writes all buffered rows for one (topic|partition|table) key to the
@@ -1652,7 +1687,8 @@ func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch
 	noteTableStatsEmit(b.metrics, lastSM, "cdc", emitCDCTableStats(ctx, b.eventsWriter, lastSM, inserts, updates, deletes, loadCounter(b.cdcBytes, lastSM.Table), loadCounter(&b.metrics.dlqByTable, lastSM.Table)))
 
 	atomic.AddUint64(&b.metrics.processed, uint64(len(batch.rows)))
-	delete(b.batches, key)
+	// The batch left b.batches when submitFlush sealed it. Removing it here too
+	// would be a map write from a lane goroutine — a data race, not a no-op.
 }
 
 func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBBatch, reason string) {
@@ -1906,7 +1942,7 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 		}
 		logf("warning", "warn: cdc db batch routed %d message(s) to DLQ after %d failed retries (reason=%s, table=%s): %v",
 			len(batch.messages), b.params.maxRetries, reason, batch.targetTable, lastErr)
-		delete(b.batches, key)
+		// Sealed by submitFlush; see commitFlushedBatch on why this must not delete.
 		return
 	}
 
@@ -2067,7 +2103,7 @@ func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *
 	}
 	logf("warning", "warn: cdc per-row isolation recovered batch (reason=%s, table=%s): %d row(s) written, %d row(s) DLQ'd (batch error: %v)",
 		reason, batch.targetTable, good, bad, batchErr)
-	delete(b.batches, key)
+	// Sealed by submitFlush; see commitFlushedBatch on why this must not delete.
 }
 
 // sinkOpOf returns the CDC op for row i, or "?" if unavailable.
@@ -3894,6 +3930,10 @@ func main() {
 				drainCtx, drainCancel := context.WithTimeout(context.Background(), 15*time.Second)
 				if dbBatcher != nil {
 					dbBatcher.flushAll(drainCtx)
+					// flushAll already waited for every lane; this stops their
+					// goroutines. Safe here and only here: the consume loop exits
+					// below, so nothing can submit to a closed lane afterwards.
+					dbBatcher.lanes.close()
 				}
 				if cdcBatcher != nil {
 					cdcBatcher.drainForShutdown(drainCtx, time.Now().UTC())

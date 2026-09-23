@@ -18,13 +18,20 @@ import (
 )
 
 // The streaming CDC sink pre-creates the Debezium topics it subscribes to. That
-// pre-create runs AFTER start_sync, so it races Debezium: whichever side creates a
-// topic first sets its partition count, and the other side leaves it alone. Debezium's
-// side is the broker's auto-create (1 partition on the bundled broker). rsync used to
-// ask for 3, so the same pipeline got 1 partition on one run and 3 on the next.
+// pre-create runs AFTER start_sync, so it used to race Debezium: whichever side created
+// a topic first set its partition count, and the other side left it alone. Debezium's
+// side was the BROKER's auto-create (1 partition), so asking for anything else here
+// produced a count that depended on who won the race.
+//
+// The race is closed upstream now: executeStreamingDataTransfer resolves the shape from
+// the live broker list and hands it to Connect through topic.creation.*, so Connect
+// creates the topic itself — through the AdminClient, before it produces — and broker
+// auto-create never gets a turn. This pre-create is the backstop, and it asks for the
+// SAME number, which it reads off task.Params rather than deriving a second time.
 //
 // This file pins three things:
-//   - rsync asks for 1 partition for every CDC data topic it pre-creates;
+//   - the pre-create asks for the resolved count, falling back to 1 when nothing
+//     resolved it (batch pipelines, the blob lane, an older caller);
 //   - the provider-topic backstop runs BEFORE any pre-create, because a pre-create of a
 //     wrongly derived name makes that name real and hides the bug; and
 //   - an existing topic with more partitions is reported, not resized.
@@ -182,12 +189,13 @@ func mongoSinkInputs(tables ...string) sinkTopicInputs {
 	}
 }
 
-// TestCDCSinkTopicsArePreCreatedWithOnePartition: every CDC data topic rsync creates
-// asks for exactly one partition, on both the per-table path and the single-topic path.
-func TestCDCSinkTopicsArePreCreatedWithOnePartition(t *testing.T) {
+// TestCDCSinkTopicsArePreCreatedWithTheResolvedPartitionCount: every CDC data topic
+// rsync pre-creates asks for the count the caller resolved, on both the per-table path
+// and the single-topic path — and for 1 when nothing resolved one.
+func TestCDCSinkTopicsArePreCreatedWithTheResolvedPartitionCount(t *testing.T) {
 	withTopicPrefix(t, nil)
 
-	t.Run("one topic per selected table", func(t *testing.T) {
+	t.Run("unresolved count falls back to one partition", func(t *testing.T) {
 		ev := &sinkTopicEvents{}
 		km := newFakeSinkTopicManager(ev)
 		got := prepareSinkTopics(km, mongoSinkInputs("shop.customers", "shop.orders", "shop.products"))
@@ -201,8 +209,8 @@ func TestCDCSinkTopicsArePreCreatedWithOnePartition(t *testing.T) {
 		}
 		for _, topic := range km.created {
 			if p := km.requested[topic]; p != 1 {
-				t.Errorf("topic %q pre-created with %d partitions, want 1 (the broker's auto-create "+
-					"default, so the count does not depend on who creates the topic first)", topic, p)
+				t.Errorf("topic %q pre-created with %d partitions, want 1 (nothing resolved a count, "+
+					"so this must stay what every caller got before the count was derived)", topic, p)
 			}
 		}
 		if strings.Join(km.created, ",") != strings.Join(subscribed, ",") {
@@ -221,6 +229,55 @@ func TestCDCSinkTopicsArePreCreatedWithOnePartition(t *testing.T) {
 		}
 		if len(km.created) != 1 || km.requested[partitionsLiveTopic] != 1 {
 			t.Fatalf("created %v with %v, want %q with 1 partition", km.created, km.requested, partitionsLiveTopic)
+		}
+	})
+
+	// The load-balancing fix, seen from the backstop: a three-broker cluster resolved 3
+	// upstream, and the backstop has to ask for the same 3. Asking for 1 here would not
+	// shrink Connect's topic — Kafka cannot reduce a partition count — but on any topic
+	// this side wins the race to create, the cluster silently goes back to one leader.
+	t.Run("resolved count reaches every pre-created topic", func(t *testing.T) {
+		ev := &sinkTopicEvents{}
+		km := newFakeSinkTopicManager(ev)
+		in := mongoSinkInputs("shop.customers", "shop.orders")
+		in.partitions = 3
+		got := prepareSinkTopics(km, in)
+
+		if len(km.created) != 2 {
+			t.Fatalf("pre-created %d topics %v, want 2", len(km.created), km.created)
+		}
+		for _, topic := range km.created {
+			if p := km.requested[topic]; p != 3 {
+				t.Errorf("topic %q pre-created with %d partitions, want the resolved 3", topic, p)
+			}
+		}
+		assertTopicList(t, got, km.created)
+	})
+
+	t.Run("resolved count reaches the single provider topic too", func(t *testing.T) {
+		ev := &sinkTopicEvents{}
+		km := newFakeSinkTopicManager(ev)
+		in := mongoSinkInputs()
+		in.partitions = 3
+		prepareSinkTopics(km, in)
+
+		if km.requested[partitionsLiveTopic] != 3 {
+			t.Fatalf("created %v with %v, want %q with the resolved 3", km.created, km.requested, partitionsLiveTopic)
+		}
+	})
+
+	// 0 is "not resolved", but a negative or absurd value must not reach EnsureTopicExists:
+	// Kafka rejects partitions<1 outright, which would fail the pre-create of every topic.
+	t.Run("a nonsense count falls back rather than reaching the broker", func(t *testing.T) {
+		for _, bad := range []int32{0, -1} {
+			ev := &sinkTopicEvents{}
+			km := newFakeSinkTopicManager(ev)
+			in := mongoSinkInputs()
+			in.partitions = bad
+			prepareSinkTopics(km, in)
+			if p := km.requested[partitionsLiveTopic]; p != 1 {
+				t.Errorf("partitions=%d → pre-created with %d, want the fallback 1", bad, p)
+			}
 		}
 	})
 }
@@ -594,7 +651,7 @@ func TestBlankSinkTopicNamesAreNeverCreated(t *testing.T) {
 
 	t.Run("blank names in the list", func(t *testing.T) {
 		km := newFakeSinkTopicManager(&sinkTopicEvents{})
-		preCreateCDCSinkTopics(km, []string{"", "   ", partitionsLiveTopic}, "p1")
+		preCreateCDCSinkTopics(km, []string{"", "   ", partitionsLiveTopic}, "p1", 0)
 		if strings.Join(km.created, ",") != partitionsLiveTopic {
 			t.Fatalf("pre-created %q, want only %q", km.created, partitionsLiveTopic)
 		}
@@ -682,6 +739,30 @@ func TestSinkTopicInputsForReadsTheTask(t *testing.T) {
 		task := ExecutorTask{Params: map[string]interface{}{"cdc_unified_topic": 7}}
 		if got := sinkTopicInputsFor(task, partitionsLiveTopic, "cdc", tables, false); got.unifiedTopic != "" {
 			t.Fatalf("unified topic = %q, want empty", got.unifiedTopic)
+		}
+	})
+
+	// The count travels from executeStreamingDataTransfer to the backstop on the task,
+	// rather than being derived twice. A key that stops being read is silent: the
+	// backstop just goes back to asking for 1 and only the topics it wins the race for
+	// are affected, so nothing reports it.
+	t.Run("the resolved partition count is read off the task", func(t *testing.T) {
+		task := ExecutorTask{Params: map[string]interface{}{"cdc_topic_partitions": 3}}
+		if got := sinkTopicInputsFor(task, partitionsLiveTopic, "cdc", tables, false); got.partitions != 3 {
+			t.Fatalf("partitions = %d, want 3 (task.Params[\"cdc_topic_partitions\"])", got.partitions)
+		}
+	})
+
+	t.Run("an absent or unusable count leaves the fallback in place", func(t *testing.T) {
+		for _, v := range []interface{}{nil, 0, -1, "3", int32(3), 3.0} {
+			params := map[string]interface{}{}
+			if v != nil {
+				params["cdc_topic_partitions"] = v
+			}
+			task := ExecutorTask{Params: params}
+			if got := sinkTopicInputsFor(task, partitionsLiveTopic, "cdc", tables, false); got.partitions != 0 {
+				t.Errorf("cdc_topic_partitions=%#v → partitions %d, want 0 (read as the fallback)", v, got.partitions)
+			}
 		}
 	})
 }

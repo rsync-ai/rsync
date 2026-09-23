@@ -194,9 +194,13 @@ func flushDBBatch(t *testing.T, pgDB *sql.DB, c cdcTestCounters, sms []*SinkMess
 	}
 	const key = "test-batch"
 	b.batches[key] = batch
-	b.flushBatch(context.Background(), key, batch, "test_flush")
+	// submitFlush, not flushBatch: sealing the batch (removing it from b.batches) is
+	// submitFlush's job, so this is the production entry point for the DB batcher.
+	// With no lanes configured it seals and then flushes inline, exactly as before.
+	// (flushObjectBatch above stays on flushBatch: the object batcher has no lanes.)
+	b.submitFlush(context.Background(), key, batch, "test_flush")
 	if _, pending := b.batches[key]; pending {
-		t.Fatal("flushBatch did not complete the batch; the counters under test were never reached")
+		t.Fatal("submitFlush did not complete the batch; the counters under test were never reached")
 	}
 }
 

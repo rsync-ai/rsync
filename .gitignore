@@ -86,6 +86,10 @@ backend-temporal-adapter/adapter
 **/kafka-sink-worker
 !**/cmd/kafka-sink-worker/
 !**/cmd/kafka-sink-worker/**
+# ...but NOT a dev build that lands INSIDE that package dir. The negation above
+# re-includes every path under it, binary included, so `go build` in the package
+# leaves a ~30 MB executable staged-by-default. Proven with `git check-ignore -v`.
+**/cmd/kafka-sink-worker/kafka-sink-worker
 
 # Untracked local connector cruft — public/api/ holds locally-generated connector
 # dirs with no tracked files; they show up in find/ls as "connectors" that don't

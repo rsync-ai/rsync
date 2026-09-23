@@ -1,6 +1,6 @@
 # rsync.ai Documentation
 
-rsync.ai is a self-hosted data platform for batch pipelines, CDC, scheduled data models, and lineage. Describe a pipeline in plain English, approve the plan, and see exactly what ran, failed, or became stale.
+rsync.ai is a self-hosted, source-available AI data platform for batch pipelines, CDC, scheduled models, and lineage. Describe a pipeline in plain English, approve the plan, and see exactly what ran, failed, or became stale.
 
 ---
 

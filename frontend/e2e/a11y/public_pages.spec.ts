@@ -52,10 +52,9 @@ for (const { path, label } of ROUTES) {
 
     test('has at least one heading and a visible primary action', async ({ page }) => {
       await page.goto(path)
-      // TODO(a11y): pages currently start their heading hierarchy at <h3>
-      // via CardTitle. Promote the auth card title to <h1> for proper
-      // landmark structure, then tighten this assertion back to `toHaveCount(1)`
-      // on h1 specifically.
+      // Known gap: these pages start their heading hierarchy at <h3> via CardTitle.
+      // Promoting the auth card title to <h1> would give proper landmark structure
+      // and let this assertion tighten back to `toHaveCount(1)` on h1 specifically.
       const headings = page.locator('h1, h2, h3, h4, h5, h6')
       expect(await headings.count(), 'page must have at least one heading').toBeGreaterThan(0)
       await expect(page.getByRole('button', { name: /sign in|create account|sign up/i }).first())

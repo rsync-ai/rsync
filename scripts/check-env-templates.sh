@@ -58,14 +58,14 @@ anchor_kafka_vars() {
     | grep -oE '^  KAFKA_[A-Z0-9_]+:' | sed 's/^  //; s/:$//' | sort -u
 }
 
-# Three BYO variables live outside the anchor because they are not client
+# Four BYO variables live outside the anchor because they are not client
 # security: the broker ADDRESS is declared per-service (docker-compose.yml:1001,
-# :1180), and the two durability knobs are read only by the topic bootstrapper
-# and the orchestrator (:255-256, :1022-1023). They are named literally, and the
+# :1180), and the topic-shape knobs are read only by the topic bootstrapper and
+# the orchestrator (:255-256, :1022-1023). They are named literally, and the
 # self-test below proves each one is really in a shipped compose file — a
 # literal that has gone stale would otherwise demand a template document a
 # variable nothing reads.
-NON_ANCHOR_BYO_VARS="KAFKA_BROKERS KAFKA_REPLICATION_FACTOR KAFKA_MIN_INSYNC_REPLICAS"
+NON_ANCHOR_BYO_VARS="KAFKA_BROKERS KAFKA_REPLICATION_FACTOR KAFKA_MIN_INSYNC_REPLICAS KAFKA_CDC_TOPIC_PARTITIONS"
 
 byo_kafka_vars() {
   { anchor_kafka_vars docker-compose.yml; printf '%s\n' $NON_ANCHOR_BYO_VARS; } | sort -u

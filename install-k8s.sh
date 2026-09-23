@@ -71,6 +71,26 @@ OLLAMA_CPU_M=1050
 # hold the defaults. Enough for the documented PG -> Mongo CDC path.
 LEAN_CONNECTORS="postgresql,mongodb"
 
+# The rung below lean. Trimming connectors cannot rescue a 4-vCPU node: BASE
+# alone asks 3410m, and a GKE e2-standard-4 has ~3920m allocatable with several
+# hundred more taken by kube-system DaemonSets, so the lean set's 3510m still
+# does not fit and its pods sit Pending. What does fit is one replica of each
+# front-end Deployment (both default to 2) and a smaller CPU request for the
+# orchestrator. The chart sets no CPU limit anywhere, so a smaller CPU request
+# costs no achievable CPU -- only the guaranteed floor under contention. Memory
+# limits are untouched: the orchestrator's 2Gi is what tableConcurrency reads
+# itself against. Savings, re-measured every run by
+# test_install_k8s_defaults_work.py: api-gateway 2->1 (200m/384Mi), frontend
+# 2->1 (100m/256Mi), orchestrator cpu 500m->250m.
+TIGHT_ORCHESTRATOR_CPU="250m"
+TIGHT_MEM_MIB=640
+TIGHT_CPU_M=550
+# Set by fit_to_cluster when even the lean set does not fit; read by write_values.
+TIGHT=false
+# How long to wait for the cluster's OWN pods before measuring what is free.
+# Nothing is installed during this wait; see wait_for_system_pods.
+SETTLE_TIMEOUT_S="${RSYNC_SETTLE_TIMEOUT_S:-90}"
+
 # Source/destination connectors a pod can be started for, as id:version. The
 # version is part of the Service name the orchestrator resolves
 # (rsync-ai.connectorServiceName), so it must equal the connector's
@@ -507,13 +527,18 @@ measure_free() {
   nodes="$(kc get nodes -o 'jsonpath={range .items[*]}{.status.allocatable.memory}{" "}{.status.allocatable.cpu}{"\n"}{end}' 2>/dev/null || true)"
   [[ -n "$nodes" ]] || return 1
   alloc="$(printf '%s\n' "$nodes" | awk "${QTY_AWK}"' NF >= 2 { m += mib($1); c += milli($2) } END { printf "%d %d", m, c }')"
-  # One line per scheduled, still-running pod: phase, namespace, release label, node,
-  # then "memory,cpu;" for each container. Tab-separated: a request may be empty.
+  # One line per pod that still holds a claim on the cluster: phase, namespace,
+  # release label, node, then "memory,cpu;" for each container. Tab-separated: a
+  # request may be empty. A pod with no node yet is counted, not skipped -- it is
+  # owed room, and skipping it is what made a starting cluster read as emptier
+  # than it is (see wait_for_system_pods). The error this direction can make is
+  # trimming an install that would have fit; the other direction is an install
+  # that never becomes ready.
   pods="$(kc get pods -A -o 'jsonpath={range .items[*]}{.status.phase}{"\t"}{.metadata.namespace}{"\t"}{.metadata.labels.app\.kubernetes\.io/instance}{"\t"}{.spec.nodeName}{"\t"}{range .spec.containers[*]}{.resources.requests.memory}{","}{.resources.requests.cpu}{";"}{end}{"\n"}{end}' 2>/dev/null || true)"
   used="0 0"
   if [[ -n "$pods" ]]; then
     used="$(printf '%s\n' "$pods" | awk -F'\t' -v ns="$NAMESPACE" -v rel="$RELEASE" "${QTY_AWK}"'
-      $1 == "Succeeded" || $1 == "Failed" || $4 == "" { next }
+      $1 == "Succeeded" || $1 == "Failed" { next }
       $2 == ns && $3 == rel { next }
       { n = split($5, cs, ";"); for (i = 1; i <= n; i++) { if (cs[i] == "") continue; split(cs[i], r, ","); m += mib(r[1]); c += milli(r[2]) } }
       END { printf "%d %d", m, c }')"
@@ -524,6 +549,44 @@ measure_free() {
 
 need_fits() { (( FREE_MEM_MIB >= NEED_MEM_MIB && FREE_CPU_M >= NEED_CPU_M )); }
 
+# A cluster reports a node's allocatable the moment the node registers, but the
+# system workloads that occupy it -- the CNI, kube-proxy, DNS, and on a managed
+# cluster the logging and metrics DaemonSets -- are created and scheduled over
+# the following half-minute. Measured inside that window the node looks emptier
+# than it is. On a kind node pinned to a GKE e2-standard-4's headroom, free CPU
+# read 3700m five seconds after the cluster came up and 3600m at fifteen before
+# settling at its true 3400m at twenty-five -- and 3600m is enough to make the
+# lean rung's 3510m look like it fits, which is precisely the install that then
+# sits Pending for fifteen minutes and fails. Waiting for the reading to stop
+# moving would not catch it (3600m held for ten seconds); what has to be waited
+# for is the workloads. Returns how many system pods the cluster still owes
+# itself; a query that cannot be answered returns 0, because this is a wait and
+# not a gate.
+system_pods_owed() {
+  local ds dep
+  ds="$(kc get daemonsets -A -o 'jsonpath={range .items[*]}{.status.desiredNumberScheduled}{" "}{.status.numberReady}{"\n"}{end}' 2>/dev/null || true)"
+  dep="$(kc get deployments -n kube-system -o 'jsonpath={range .items[*]}{.spec.replicas}{" "}{.status.readyReplicas}{"\n"}{end}' 2>/dev/null || true)"
+  printf '%s\n%s\n' "$ds" "$dep" | awk 'NF { d = $1 + 0; r = $2 + 0; if (d > r) owed += d - r } END { print owed + 0 }'
+}
+
+wait_for_system_pods() {
+  local waited=0 owed announced=false
+  while (( waited < SETTLE_TIMEOUT_S )); do
+    owed="$(system_pods_owed)"
+    if [[ "$owed" == "0" ]]; then
+      if [[ "$announced" == "true" ]]; then info "The cluster's system pods are up (waited ${waited}s)."; fi
+      return 0
+    fi
+    if [[ "$announced" == "false" ]]; then
+      info "Waiting for the cluster's own system pods to start before measuring free capacity..."
+      announced=true
+    fi
+    sleep 2
+    waited=$((waited + 2))
+  done
+  warn "The cluster's system pods are still starting after ${SETTLE_TIMEOUT_S}s; measuring capacity anyway."
+}
+
 # A pod that cannot be scheduled never becomes ready, and `helm --wait` only says
 # so ten minutes later. So compare what the install asks for with what the
 # cluster has left BEFORE installing, and when the defaults do not fit, install a
@@ -532,6 +595,7 @@ need_fits() { (( FREE_MEM_MIB >= NEED_MEM_MIB && FREE_CPU_M >= NEED_CPU_M )); }
 # the full default again.
 fit_to_cluster() {
   estimate_need
+  wait_for_system_pods
   if ! measure_free; then
     warn "Could not read the nodes' capacity; skipping the capacity check."
     return 0
@@ -544,11 +608,13 @@ fit_to_cluster() {
   fi
 
   local was_connectors="$CONNECTORS" was_demo="$DEMO" was_fleet="$FLEET" was_need_mem="$NEED_MEM_MIB" was_need_cpu="$NEED_CPU_M"
+  local leaned=false
   [[ "$CONNECTORS_EXPLICIT" == "true" ]] || CONNECTORS="$LEAN_CONNECTORS"
   [[ "$DEMO_EXPLICIT" == "true" ]] || DEMO=false
   if [[ "$CONNECTORS" != "$was_connectors" || "$DEMO" != "$was_demo" ]]; then
     build_fleet
     estimate_need
+    leaned=true
     if need_fits; then
       warn "This cluster has ${have}; the default install requests ${want}, so pods would stay Pending."
       echo "  Installing a lean set instead: connectors ${CONNECTORS}, demo ${DEMO} (requests ~$(gib "$NEED_MEM_MIB") GiB)."
@@ -556,9 +622,33 @@ fit_to_cluster() {
       echo "  (RSYNC_CONNECTORS / RSYNC_DEMO)."
       return 0
     fi
-    CONNECTORS="$was_connectors"; DEMO="$was_demo"; FLEET="$was_fleet"
-    NEED_MEM_MIB="$was_need_mem"; NEED_CPU_M="$was_need_cpu"
   fi
+
+  # Still short -- which is every 4-vCPU node, because the fleet is not what
+  # fills it. Collapse the two front-end Deployments to one replica each and
+  # lower the orchestrator's CPU request before giving up: a cluster that
+  # reaches this line would otherwise get Pending pods and a failed helm wait,
+  # so there is no install here to regress. Not written to the .env -- the next
+  # run on a bigger cluster is the full default again.
+  TIGHT=true
+  NEED_MEM_MIB=$((NEED_MEM_MIB - TIGHT_MEM_MIB)); NEED_CPU_M=$((NEED_CPU_M - TIGHT_CPU_M))
+  if need_fits; then
+    warn "This cluster has ${have}; the default install requests ${want}, so pods would stay Pending."
+    if [[ "$leaned" == "true" ]]; then
+      echo "  Installing a lean, single-replica set instead: connectors ${CONNECTORS}, demo ${DEMO},"
+    else
+      echo "  Installing a single-replica set instead:"
+    fi
+    echo "  one api-gateway and one frontend pod, and a smaller CPU request for the orchestrator"
+    echo "  (requests ~$(gib "$NEED_MEM_MIB") GiB / $(( (NEED_CPU_M + 999) / 1000 )) CPU). The chart sets no CPU limit, so this"
+    echo "  costs no speed -- it gives up the spare replica that would carry traffic during a node failure."
+    echo "  For the full default, add nodes (or a bigger machine type) and re-run this script."
+    return 0
+  fi
+
+  TIGHT=false
+  CONNECTORS="$was_connectors"; DEMO="$was_demo"; FLEET="$was_fleet"
+  NEED_MEM_MIB="$was_need_mem"; NEED_CPU_M="$was_need_cpu"
   warn "This cluster has ${have}; this install requests ${want}."
   echo "  Pods that do not fit will sit Pending and helm will give up after its wait timeout."
   echo "  Add nodes (a cluster autoscaler will do this for you), or trim what is installed in ${INSTALL_DIR}/${ENV_FILE}:"
@@ -632,6 +722,19 @@ write_values() {
     echo "frontend:"
     echo "  apiUrl: $(yq "$API_URL")"
     echo "  publicUrl: $(yq "$APP_URL")"
+    # Set only when fit_to_cluster found that not even the lean set fits. These
+    # are the chart's defaults minus the headroom a small node cannot seat; the
+    # memory limits (and so the orchestrator's tableConcurrency) are untouched.
+    # RSYNC_EXTRA_VALUES is layered after this file, so a user's own number wins.
+    if [[ "$TIGHT" == "true" ]]; then
+      echo "  replicaCount: 1"
+      echo "apiGateway:"
+      echo "  replicaCount: 1"
+      echo "orchestrator:"
+      echo "  resources:"
+      echo "    requests:"
+      echo "      cpu: $(yq "$TIGHT_ORCHESTRATOR_CPU")"
+    fi
 
     if [[ -n "$STORAGE_CLASS" || -n "$IMAGE_REGISTRY" || -n "$IMAGE_TAG" || -n "$PULL_SECRET" ]]; then
       echo "global:"

@@ -176,8 +176,29 @@ spec:
           resources:
 {{- toYaml .Values.kafka.resources | nindent 12 }}
           volumeMounts:
+            {{/*
+              subPath, not the volume root. KAFKA_LOG_DIRS is this mount, and
+              LogManager refuses to start when the log dir holds anything that is
+              not a topic-partition directory. Every ext4 PVC arrives holding
+              exactly such a thing -- mkfs puts lost+found at the volume root --
+              so a fresh block-storage install crash-loops the broker:
+
+                Error starting LogManager
+                org.apache.kafka.common.KafkaException: Found directory
+                /var/lib/kafka/data/lost+found, 'lost+found' is not in the form
+                of topic-partition or topic-partition.uniqueId-delete
+
+              Compose never sees it, because a bind-mounted directory has no
+              lost+found -- so this is a Kubernetes-only defect that no amount of
+              docker-compose testing can reach. The two postgres StatefulSets
+              already dodge the same trap by putting $PGDATA one level down;
+              Kafka was the one component still writing to the mount root.
+              Mounting a subdirectory leaves lost+found outside the log dir.
+              (KI-CHART-KAFKA-LOSTFOUND.)
+            */}}
             - name: data
               mountPath: /var/lib/kafka/data
+              subPath: kafka-logs
   volumeClaimTemplates:
     - metadata:
         name: data

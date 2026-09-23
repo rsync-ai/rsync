@@ -357,6 +357,8 @@ shows up as a pipeline that produces nothing rather than as an error.
   value: {{ .Values.kafka.replicationFactor | quote }}
 - name: KAFKA_MIN_INSYNC_REPLICAS
   value: {{ .Values.kafka.minInsyncReplicas | quote }}
+- name: KAFKA_CDC_TOPIC_PARTITIONS
+  value: {{ .Values.kafka.cdcTopicPartitions | quote }}
 {{- include "rsync-ai.kafkaSecurityEnv" . }}
 {{- end -}}
 
@@ -952,11 +954,28 @@ moment before it is serving, so this narrows the race rather than closing it.
 The adapter's own bounded retry is what closes it; this keeps the pod from
 burning restarts on the common case.
 
-Args: root, image, temporal (bool, optional -- defaults to false).
+The kafka wait is the same argument one service down:
+
+  orchestrator      waits.      `cmd/orchestrator/main.go` calls log.Fatalf the
+                               moment kafka.NewManager returns an error, with no
+                               retry, so a broker that is not accepting yet is a
+                               crash-loop and nothing else -- 1 restart on kind,
+                               7 on GKE where the broker itself was waiting for
+                               CPU. It is the only service that constructs a
+                               Kafka manager at startup.
+
+It is skipped for a BYO cluster (kafka.enabled=false): that broker is not part
+of this install's cold start, and bootstrapServers is a CSV whose first entry is
+not necessarily the one that is up. The in-chart broker is a single Service, so
+there is exactly one address to wait for.
+
+Args: root, image, temporal (bool, optional -- defaults to false),
+      kafka (bool, optional -- defaults to false).
 */}}
 {{- define "rsync-ai.waitForDepsInitContainer" -}}
 {{- $root := .root -}}
 {{- $waitTemporal := .temporal | default false -}}
+{{- $waitKafka := and (.kafka | default false) $root.Values.kafka.enabled -}}
 - name: wait-for-deps
   image: {{ include "rsync-ai.image" (dict "root" $root "image" .image) }}
   imagePullPolicy: {{ $root.Values.global.image.pullPolicy }}
@@ -980,6 +999,13 @@ Args: root, image, temporal (bool, optional -- defaults to false).
       }
       wait_for {{ include "rsync-ai.postgres.host" $root }} {{ include "rsync-ai.postgres.port" $root }} postgres
       wait_for {{ include "rsync-ai.redis.host" $root }} {{ include "rsync-ai.redis.port" $root }} redis
+{{- if $waitKafka }}
+      # Split rather than a second copy of the port: kafka.bootstrap is the one
+      # place that decides the in-chart broker's address. Guarded by
+      # kafka.enabled above, so this is a single host:port, never a BYO CSV.
+      kafka_addr="{{ include "rsync-ai.kafka.bootstrap" $root }}"
+      wait_for "${kafka_addr%:*}" "${kafka_addr##*:}" kafka
+{{- end }}
 {{- if $waitTemporal }}
       # The address is one string everywhere else in this chart (the Go client
       # takes host:port), so it is split here rather than carried as two values

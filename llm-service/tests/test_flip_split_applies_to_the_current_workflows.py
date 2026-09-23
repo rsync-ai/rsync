@@ -24,6 +24,16 @@ THE CONTROL. ``test_a_new_self_hosted_job_is_refused_by_name`` appends a job the
 script has never heard of to a copy of a real workflow and asserts the refusal. If
 the script were changed to ignore survivors, the first test would keep passing on
 the real tree; the control is what makes it a guard rather than a status line.
+
+WHICH WORKFLOWS ARE COPIED. ``materialise-cut.sh`` applies ``excludes.txt`` at step
+2b and runs ``apply-ci-split.py`` at §4 -- after -- so the tool never sees a workflow
+the cut deletes, and neither may this test: a private-only workflow is self-hosted on
+purpose and would read as a survivor that queues forever on a public repo it will
+never be in. The copy therefore mirrors 2b's three pathspec forms. Both ways of
+getting that wrong fail loudly rather than quietly: a matcher that stops matching
+copies the private workflow back in and the script refuses by name, and one that
+over-matches empties the copy and trips the "no self-hosted job at all" assertion
+below.
 """
 
 import os
@@ -45,6 +55,7 @@ WORKFLOWS = os.path.join(REPO_ROOT, ".github", "workflows")
 # the public tree and that census fails there instead of skipping.
 CI_YML = os.path.join(WORKFLOWS, "ci.yml")
 DOC_LINKS = os.path.join(REPO_ROOT, ".github", "workflows", "doc-links.yml")
+EXCLUDES_TXT = os.path.join(REPO_ROOT, "scripts", "flip", "excludes.txt")
 
 SELF_HOSTED = "runs-on: [self-hosted, macOS, ARM64]"
 
@@ -55,12 +66,36 @@ def _only_before_the_cut():
     _flip_cut.require_a_pre_cut_tree()
 
 
+def _exclude_entries():
+    """excludes.txt as materialise-cut.sh reads it: comment stripped, blanks dropped."""
+    out = []
+    with open(EXCLUDES_TXT) as fh:
+        for line in fh:
+            entry = line.split("#", 1)[0].strip()
+            if entry:
+                out.append(entry)
+    return out
+
+
+def _the_cut_deletes(path):
+    """One repo-relative path against 2b's three pathspec forms: p, **/p, **/p/**."""
+    for entry in _exclude_entries():
+        if path == entry or path.endswith("/" + entry):
+            return True
+        if path.startswith(entry + "/") or ("/" + entry + "/") in path:
+            return True
+    return False
+
+
 def _copy_of_the_real_workflows(tmp_path):
     dest = tmp_path / "workflows"
     dest.mkdir()
     for name in os.listdir(WORKFLOWS):
-        if name.endswith((".yml", ".yaml")):
-            shutil.copy(os.path.join(WORKFLOWS, name), dest / name)
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        if _the_cut_deletes(".github/workflows/" + name):
+            continue  # never reaches the public tree; see WHICH WORKFLOWS ARE COPIED
+        shutil.copy(os.path.join(WORKFLOWS, name), dest / name)
     return dest
 
 

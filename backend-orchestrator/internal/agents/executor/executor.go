@@ -3464,6 +3464,41 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 		}
 	}
 
+	// Hand the connector the shape its DATA topics must be created with.
+	//
+	// This is what closes the creation race, and it closes it by removing the race
+	// rather than by surviving it. Nothing created these topics deliberately before:
+	// Debezium produced its first change event, the broker auto-created the topic at
+	// its own num.partitions (1 on the bundled broker), and rsync's own pre-create —
+	// which runs after start_sync — then found it already there and left it alone. The
+	// count was whatever the broker happened to default to, on every cluster, however
+	// many brokers it had.
+	//
+	// With topic.creation.* set, Kafka Connect creates the topic itself through the
+	// AdminClient BEFORE it produces to it, so auto-create never gets a turn and the
+	// count is the one rsync chose. The pre-create below is now a backstop for the case
+	// it was written for (snapshot.mode=no_data, where the first event can be hours
+	// away) rather than a second opinion about partitioning.
+	//
+	// All three numbers travel together: a replication factor without its
+	// min.insync.replicas floor produces a topic that is created, listed, subscribable,
+	// and rejects every acks=all produce.
+	//
+	// Stashed on task.Params as well, so startKafkaMCPSink's backstop uses the SAME
+	// numbers without repeating the source discovery that derived them.
+	if shape, ok := a.cdcTopicShapeFor(ctx, task, tablesForRouting); ok {
+		applyCDCTopicShapeParams(params, shape)
+		if task.Params != nil {
+			task.Params["cdc_topic_partitions"] = int(shape.Partitions)
+		}
+		log.WithFields(log.Fields{
+			"pipeline_id":        task.PipelineID,
+			"partitions":         shape.Partitions,
+			"replication_factor": shape.ReplicationFactor,
+			"min_insync":         shape.MinInsyncReplicas,
+		}).Info("🧱 CDC data topics will be created with this shape (Kafka Connect creates them; rsync's pre-create is the backstop)")
+	}
+
 	cdcReq := mcp.ExecuteRequest{
 		Connector: cdcProvider,
 		Operation: "start_sync",
@@ -6137,22 +6172,113 @@ func buildCDCSinkTopics(prefix, dbQualifier, sourceType string, tablesList []str
 	return topics
 }
 
-// cdcDataTopicPartitions is the partition count rsync asks for when it pre-creates a
-// CDC data topic ("{ns}{prefix}.{db}.{table}") for the streaming sink.
+// cdcDataTopicPartitions is the partition count rsync falls back to for a CDC data
+// topic ("{ns}{prefix}.{db}.{table}") when it cannot derive a better one.
 //
-// It must be 1 because rsync is not the only thing that creates these topics. The
-// pre-create runs AFTER start_sync, so Debezium can produce the first change event
-// first, and then the broker auto-creates the topic with its own num.partitions (1 on
-// the bundled broker; the Debezium connector sets no topic.creation.* override).
-// Whichever side wins keeps its count, because the pre-create leaves an existing topic
-// alone. Asking for 3 here made the partition count depend on timing: the same
-// pipeline got 1 partition on one run and 3 on the next.
+// This used to be the only answer, and the reason was that rsync is not the only
+// thing that creates these topics: the pre-create runs AFTER start_sync, so Debezium
+// could produce the first change event first and the broker would auto-create the
+// topic at its own num.partitions. Whichever side won kept its count, because the
+// pre-create leaves an existing topic alone. Asking for 3 here made the count depend
+// on timing — the same pipeline got 1 partition on one run and 3 on the next — so it
+// was pinned to 1, which made both outcomes identical.
 //
-// One partition is also the only count that keeps every change on a topic in a single
-// order. Changes to one row share a message key and so share a partition at any
-// stable count, but rows without a key do not, and adding partitions later moves keys.
-// Existing topics are never shrunk here; Kafka cannot reduce a topic's partitions.
+// Identical, and wrong on any cluster with more than one broker: one partition has
+// one leader, so a 3-node cluster carried all CDC produce and fetch traffic on a
+// single node. The count is now derived from the live broker count
+// (kafka.CDCTopicShapeForCluster), and the race is closed at the source instead of
+// papered over — the Debezium connector is told the same numbers through
+// topic.creation.*, so Kafka Connect creates the topic itself, at the agreed shape,
+// before it produces anything. The broker's auto-create never gets a turn.
+//
+// This value survives for the cases where no better number exists: no Kafka manager,
+// or a cluster whose broker count cannot be read. See cdcTopicShapeFor for the third
+// case, a table with no key.
 const cdcDataTopicPartitions int32 = 1
+
+// cdcTopicShapeFor resolves the partition count, replication factor and
+// min.insync.replicas that BOTH creators of this pipeline's CDC data topics must use.
+// ok is false when no shape could be derived, and the caller then leaves topic
+// creation exactly as it was.
+//
+// Two clamps sit on top of the cluster-derived shape:
+//
+// Keyless tables pin the count back to 1. Debezium keys a change event with the
+// source row's primary key, and all versions of one key hash to one partition, so a
+// keyed table is ordered correctly at any partition count. A table with no primary
+// key produces null-keyed records, which the producer spreads round-robin: two
+// versions of the same row land in different partitions, and a partition offset stops
+// being a total order over the table. CDC into a database destination already refuses
+// a keyless table outright; into object storage it is a warning, and that is the case
+// this clamp protects. It is pipeline-wide rather than per-table because one number
+// has to serve topic.creation.default.*, which Connect applies to every topic the
+// connector creates.
+//
+// Discovery that did not measure is treated as keyless. estimateCDCSourceSize returns
+// allHavePK=true on a failed discovery (it is the zero value it starts from), so
+// reading that field without checking measured would read "we could not look" as
+// "every table has a key".
+func (a *Agent) cdcTopicShapeFor(ctx context.Context, task ExecutorTask, tables []string) (kafka.CDCTopicShape, bool) {
+	if a.kafkaManager == nil {
+		return kafka.CDCTopicShape{}, false
+	}
+	shape, ok := a.kafkaManager.CDCTopicShapeForCluster()
+	if !ok {
+		return kafka.CDCTopicShape{}, false
+	}
+	if shape.Partitions > 1 && len(tables) > 0 {
+		clamped, reason := clampPartitionsForKeys(shape, a.estimateCDCSourceSize(ctx, task, tables))
+		if reason != "" {
+			log.WithFields(log.Fields{
+				"pipeline_id": task.PipelineID,
+				"partitions":  shape.Partitions,
+			}).Infof("🧮 CDC topics pinned to 1 partition (%s). Records without a key are spread across "+
+				"partitions, so two versions of one row can be applied out of order.", reason)
+		}
+		shape = clamped
+	}
+	return shape, true
+}
+
+// applyCDCTopicShapeParams writes the shape into the start_sync arguments that carry
+// it to Kafka Connect.
+//
+// These three names are the contract with the Debezium connector's _topic_creation,
+// one module and one language away. A rename on either side fails silently: the
+// connector emits no topic.creation.* at all, Connect goes back to letting the BROKER
+// auto-create the topic at 1 partition, and every log line still reads as success.
+// cdc_topic_shape_test.go checks the two sides against each other for that reason.
+//
+// min.insync.replicas is omitted rather than sent as 0 when the policy did not pin one,
+// so the broker's own default applies — which is the behaviour every topic had before.
+func applyCDCTopicShapeParams(params map[string]interface{}, shape kafka.CDCTopicShape) {
+	if params == nil {
+		return
+	}
+	params["topic_partitions"] = int(shape.Partitions)
+	params["topic_replication_factor"] = int(shape.ReplicationFactor)
+	if shape.MinInsyncReplicas > 0 {
+		params["topic_min_insync_replicas"] = shape.MinInsyncReplicas
+	}
+}
+
+// clampPartitionsForKeys is the keyless decision on its own, so it can be tested
+// without a live source to discover and a live cluster to count.
+//
+// It returns the reason as a value rather than logging it, for the same reason the
+// estimate carries noPKTables: a pipeline that silently halves its throughput is a
+// support ticket nobody can answer. An empty reason means nothing was clamped.
+func clampPartitionsForKeys(shape kafka.CDCTopicShape, est cdcSizeEstimate) (kafka.CDCTopicShape, string) {
+	if shape.Partitions <= 1 || (est.measured && est.allHavePK) {
+		return shape, ""
+	}
+	reason := "the source schema could not be measured"
+	if est.measured {
+		reason = fmt.Sprintf("these selected tables have no primary key: %v", est.noPKTables)
+	}
+	shape.Partitions = cdcDataTopicPartitions
+	return shape, reason
+}
 
 // sinkTopicPreCreator is the part of *kafka.Manager the CDC sink topic pre-create
 // needs, so a test can record what is created, with how many partitions, and when.
@@ -6170,6 +6296,10 @@ type sinkTopicInputs struct {
 	sourceType    string   // task.Source.Type
 	pipelineID    string   // for log fields only
 	batchBackfill bool     // kafkaTopic is the hybrid batch topic "pipeline.<id>.data"
+	// partitions is the count the pre-create asks for. 0 means "not resolved" and
+	// reads as cdcDataTopicPartitions, which is what every caller got before the
+	// count was derived from the cluster.
+	partitions int32
 }
 
 // deriveCDCSinkTopics rebuilds one Debezium topic per selected table for the CDC
@@ -6195,8 +6325,8 @@ func deriveCDCSinkTopics(in sinkTopicInputs) []string {
 	return buildCDCSinkTopics(prefix, dbQualifier, in.sourceType, in.tables, in.unifiedTopic)
 }
 
-// preCreateCDCSinkTopics creates each sink topic that does not exist yet, with
-// cdcDataTopicPartitions partitions, and warns about an existing topic that has more.
+// preCreateCDCSinkTopics creates each sink topic that does not exist yet, with the
+// resolved partition count, and warns about an existing topic that has more.
 //
 // Debezium only creates a CDC topic on its first change event; with
 // snapshot.mode=recovery/no_data (hybrid CDC, no snapshot) that can be much later, so
@@ -6208,7 +6338,10 @@ func deriveCDCSinkTopics(in sinkTopicInputs) []string {
 // The partition count is read only after EnsureTopicExists succeeds. Reading metadata
 // for a topic that does not exist can make a broker with auto-create on create it
 // with its default count, which is the race this function exists to avoid.
-func preCreateCDCSinkTopics(km sinkTopicPreCreator, topicsParam interface{}, pipelineID string) {
+func preCreateCDCSinkTopics(km sinkTopicPreCreator, topicsParam interface{}, pipelineID string, partitions int32) {
+	if partitions < 1 {
+		partitions = cdcDataTopicPartitions
+	}
 	var names []string
 	switch tp := topicsParam.(type) {
 	case string:
@@ -6220,7 +6353,7 @@ func preCreateCDCSinkTopics(km sinkTopicPreCreator, topicsParam interface{}, pip
 		if strings.TrimSpace(name) == "" {
 			continue
 		}
-		if err := km.EnsureTopicExists(name, cdcDataTopicPartitions); err != nil {
+		if err := km.EnsureTopicExists(name, partitions); err != nil {
 			// Deliberately not "will rely on auto-create": auto-creation is a broker
 			// setting this platform does not control on a customer-managed cluster,
 			// and when it is off the sink simply consumes nothing forever while the
@@ -6235,7 +6368,7 @@ func preCreateCDCSinkTopics(km sinkTopicPreCreator, topicsParam interface{}, pip
 				Debug("Could not read the partition count of the CDC topic; skipping the partition check")
 			continue
 		}
-		if md.NumPartitions > int(cdcDataTopicPartitions) {
+		if md.NumPartitions > int(partitions) {
 			log.WithFields(log.Fields{
 				"pipeline_id": pipelineID,
 				"topic":       name,
@@ -6245,7 +6378,7 @@ func preCreateCDCSinkTopics(km sinkTopicPreCreator, topicsParam interface{}, pip
 				"Changes to one row still arrive in order when the table has a primary key (MongoDB always has _id). "+
 				"Do not add partitions to this topic while the pipeline runs: that moves rows between partitions "+
 				"and older versions of a row can then overwrite newer ones in the destination.",
-				name, md.NumPartitions, cdcDataTopicPartitions)
+				name, md.NumPartitions, partitions)
 		}
 	}
 }
@@ -6269,7 +6402,7 @@ func prepareSinkTopics(km sinkTopicPreCreator, in sinkTopicInputs) interface{} {
 	}
 	// Skip the batch-backfill sink: its topic already exists from the bootstrap marker.
 	if !in.batchBackfill && km != nil {
-		preCreateCDCSinkTopics(km, topicsParam, in.pipelineID)
+		preCreateCDCSinkTopics(km, topicsParam, in.pipelineID, in.partitions)
 	}
 	return topicsParam
 }
@@ -6303,6 +6436,16 @@ func sinkTopicInputsFor(task ExecutorTask, kafkaTopic, syncMode string, tables [
 	// A nil Params map reads as empty, so no nil check is needed here.
 	if v, ok := task.Params["cdc_unified_topic"].(string); ok {
 		in.unifiedTopic = strings.TrimSpace(v)
+	}
+	// The partition count executeStreamingDataTransfer resolved and already handed
+	// Debezium through topic.creation.*. Read rather than re-derived: deriving it again
+	// here would repeat the source discovery, and — worse — two derivations that
+	// disagreed would not be reported anywhere. Whoever creates the topic first wins
+	// and the loser's number is silently discarded. Absent (batch pipelines, the blob
+	// lane, an older caller) leaves it 0, which preCreateCDCSinkTopics reads as the
+	// single-partition fallback this path always used.
+	if v, ok := task.Params["cdc_topic_partitions"].(int); ok && v > 0 {
+		in.partitions = int32(v)
 	}
 	if task.Source != nil {
 		in.sourceType = task.Source.Type
@@ -6713,7 +6856,7 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 	//
 	// prepareSinkTopics rebuilds those topics (not for the batch-backfill sink; see
 	// deriveCDCSinkTopics), runs the provider-topic backstop, and only THEN pre-creates
-	// the topics with cdcDataTopicPartitions partitions.
+	// the topics at the resolved partition count.
 	// (isBatchBackfillTopic is computed once above, near the consumer-group selection.)
 	// Pass the resolved locals as they are: TestStartKafkaMCPSinkPreCreatesOnlyThroughPrepareSinkTopics
 	// checks this call, because a wrong value here (no tables, no topic) makes the sink
