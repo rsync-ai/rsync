@@ -1,7 +1,7 @@
 """A service that Fatals on a missing dependency must be made to wait for it, and a
 service that tolerates one must not be. Two dependencies are covered here:
 Temporal (the adapter waits, the api-gateway must not) and Kafka (the
-orchestrator waits, nothing else does).
+orchestrator and the adapter wait, the api-gateway must not).
 
 THE KAFKA HALF
 --------------
@@ -12,6 +12,15 @@ Kafka: 1 restart on kind, and on a GKE node where the broker was itself waiting
 for CPU, 7 restarts and a failed `helm --wait`. Same shape as the Temporal bug
 below -- a CrashLoopBackOff that eventually resolves reads as noise rather than
 as a missing edge in the boot order.
+
+`cmd/adapter/main.go` has the same shape through a different door: it calls
+createKafkaProducer, not kafka.NewManager, and log.Fatalf-s on the error. That
+difference is why it was missed when the orchestrator was wired -- the guard
+below grepped for the orchestrator's constructor by name, so it went on passing
+while the adapter crash-looped. A fresh kind install of the 0.1.5 chart showed 4
+restarts, every one "Failed to create Kafka producer ... connection refused".
+The lesson is in test_no_service_fatals_on_kafka_unnoticed: match on what the
+service DOES, not on the one spelling of it that was known when it was written.
 
 It is opt-in for the same reason the Temporal wait is, and additionally skipped
 for a BYO cluster: `kafka.external.bootstrapServers` is a CSV whose first entry
@@ -117,9 +126,25 @@ KAFKA_WAIT_POLICY = {
         "kafka.NewManager failing is log.Fatalf with no retry, so a broker that "
         "is not accepting yet is a crash-loop",
     ),
-    "api-gateway": (False, "it constructs no Kafka manager at startup"),
-    "temporal-adapter": (False, "it constructs no Kafka manager at startup"),
+    "temporal-adapter": (
+        True,
+        "createKafkaProducer failing is log.Fatalf with no retry, exactly as in "
+        "the orchestrator, so a broker that is not accepting yet is a crash-loop",
+    ),
+    "api-gateway": (False, "it constructs no Kafka producer or manager at startup"),
 }
+
+# Every way a Go main has been seen to build a Kafka client at startup. The guard
+# below fails on any spelling that is not already accounted for in
+# KAFKA_WAIT_POLICY, because the previous version matched only the orchestrator's
+# and therefore proved nothing about the adapter, which dies the same way.
+KAFKA_STARTUP_CONSTRUCTORS = (
+    "kafka.NewManager",
+    "createKafkaProducer",
+    "sarama.NewSyncProducer",
+    "sarama.NewAsyncProducer",
+    "sarama.NewConsumerGroup",
+)
 
 
 # ── layer 1: static ─────────────────────────────────────────────────────────
@@ -196,15 +221,51 @@ def test_the_orchestrators_intolerance_is_the_reason_it_waits():
     assert "kafka.NewManager(kafkaConfig)" in src
 
 
-def test_no_other_service_fatals_on_kafka_unnoticed():
-    """The wait list is only right while the orchestrator is the only binary that
-    cannot start without a broker."""
-    for main_go in (GATEWAY_MAIN, ADAPTER_MAIN):
-        assert "kafka.NewManager" not in main_go.read_text(), (
-            f"{main_go.name} now constructs a Kafka manager at startup. If it Fatals on "
-            f"failure it needs the kafka wait too -- add it to KAFKA_WAIT_POLICY with "
-            f"its reason."
-        )
+def test_the_adapters_intolerance_is_the_reason_it_waits():
+    """The adapter's counterpart to the orchestrator assertion above. This is the
+    line the live kind install produced 4 times before the broker accepted."""
+    src = ADAPTER_MAIN.read_text()
+    assert 'log.Fatalf("Failed to create Kafka producer: %v", err)' in src, (
+        "backend-temporal-adapter no longer dies on a failed Kafka producer. If it "
+        "now retries, the initContainer wait is harmless and can stay; if the Fatal "
+        "moved, find which binary owns it and make that one wait."
+    )
+    assert "createKafkaProducer(kafkaBrokers)" in src
+
+
+def test_no_service_fatals_on_kafka_unnoticed():
+    """A service that builds a Kafka client at startup must be in KAFKA_WAIT_POLICY.
+
+    This used to grep each main.go for "kafka.NewManager" -- the orchestrator's
+    constructor -- and assert the other two did not contain it. The adapter builds
+    its producer with createKafkaProducer, so the string was absent, the assertion
+    passed, and the adapter crash-looped on every cold install regardless. Matching
+    one known spelling proves nothing about a service that uses another, so match
+    the whole family and let an unknown one fail loudly.
+    """
+    component_mains = {
+        "orchestrator": ORCHESTRATOR_MAIN,
+        "api-gateway": GATEWAY_MAIN,
+        "temporal-adapter": ADAPTER_MAIN,
+    }
+    for component, main_go in component_mains.items():
+        src = main_go.read_text()
+        found = [c for c in KAFKA_STARTUP_CONSTRUCTORS if c in src]
+        should_wait, why = KAFKA_WAIT_POLICY[component]
+        if found and not should_wait:
+            raise AssertionError(
+                f"{main_go.name} builds a Kafka client at startup ({', '.join(found)}) "
+                f"but KAFKA_WAIT_POLICY says it does not wait, because {why!r}. If it "
+                f"Fatals on failure it needs the kafka wait; if it truly tolerates a "
+                f"missing broker, say so here with the line that proves it."
+            )
+        if should_wait:
+            assert found, (
+                f"{main_go.name} no longer builds a Kafka client at startup, yet it "
+                f"still asks for the kafka wait. Either the constructor was renamed -- "
+                f"add it to KAFKA_STARTUP_CONSTRUCTORS -- or the wait is now dead "
+                f"weight and the policy should say False."
+            )
 
 
 def test_the_adapter_retries_before_it_gives_up():
@@ -325,7 +386,7 @@ def test_render_the_adapter_waits_on_the_address_it_will_dial():
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
-def test_executing_the_rendered_script_probes_all_three_dependencies(tmp_path):
+def test_executing_the_rendered_script_probes_all_four_dependencies(tmp_path):
     docs = _render()
     script, dep = _wait_script(docs, "temporal-adapter")
     address = _env(dep, "TEMPORAL_ADDRESS")
@@ -337,13 +398,13 @@ def test_executing_the_rendered_script_probes_all_three_dependencies(tmp_path):
         f"{host}:{port} it renders. The host/port split is not producing what the "
         f"literal suggests."
     )
-    assert len(seen) == 3, (
-        f"expected probes for postgres, redis and temporal; got {seen}."
+    assert len(seen) == 4, (
+        f"expected probes for postgres, redis, temporal and kafka; got {seen}."
     )
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
-def test_render_only_the_orchestrator_waits_for_kafka():
+def test_render_exactly_the_right_deployments_wait_for_kafka():
     docs = _render()
     for component, (should_wait, why) in KAFKA_WAIT_POLICY.items():
         script, _ = _wait_script(docs, component)
@@ -381,11 +442,23 @@ def test_a_byo_broker_is_not_waited_for(tmp_path):
         "--set", "kafka.external.bootstrapServers=b1.example\\,b2.example:9093",
         "--set", "kafka.replicationFactor=2",
     ])
-    script, _ = _wait_script(docs, "orchestrator")
-    assert "kafka" not in script, f"a BYO broker is being waited for:\n{script}"
-    rc, seen, err = _run_with_stub_nc(script, tmp_path)
-    assert rc == 0, f"the wait script failed: {err[-500:]}"
-    assert len(seen) == 2, f"expected probes for postgres and redis only; got {seen}."
+    # Both kafka waiters, not just the orchestrator: the adapter took the same
+    # argument in #1145 and inherits the same exemption, and checking only one of
+    # them would leave the other free to wait on a broker this install does not own.
+    for component, expected in (("orchestrator", 2), ("temporal-adapter", 3)):
+        script, _ = _wait_script(docs, component)
+        assert "kafka" not in script, (
+            f"{component} is waiting for a BYO broker:\n{script}"
+        )
+        # A directory each: the stub nc appends to a log inside it, so a shared
+        # tmp_path would hand the second component the first one's probes.
+        sandbox = tmp_path / component
+        sandbox.mkdir()
+        rc, seen, err = _run_with_stub_nc(script, sandbox)
+        assert rc == 0, f"{component}: the wait script failed: {err[-500:]}"
+        assert len(seen) == expected, (
+            f"{component}: expected {expected} probes with no kafka; got {seen}."
+        )
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")

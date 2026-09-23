@@ -9,7 +9,19 @@ tls:
         - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
         - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
         - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-      sniStrict: true
+      # false (Traefik's own default), not true. sniStrict refuses any TLS handshake whose
+      # SNI does not match a configured certificate, so the host becomes unreachable at
+      # `https://<ip>/` -- which is the only address an operator has before DNS points
+      # anywhere, and the one an IP-based uptime check dials. This was already set to false
+      # by hand on the deployed host; committing it so a rebuild from a clean clone does not
+      # silently reintroduce the lockout.
+      #
+      # What this does NOT change: the TLS floor (minVersion above), the cipher suites, or
+      # certificate validation. The only effect is that a client sending no/unknown SNI is
+      # served the default certificate instead of having the handshake refused, so the app
+      # can also answer on a hostname it has no certificate for. Everything here is still
+      # behind the security-headers middleware below, including HSTS.
+      sniStrict: false
 
 http:
   middlewares:

@@ -508,6 +508,15 @@ services:
       context: ./shared/internal/infra/kafka-connect
       dockerfile: Dockerfile
     container_name: kafka-connect
+    # Without this the container defaults to RestartPolicy=no, and a single OOM
+    # kill stops CDC capture PERMANENTLY: Debezium is the only producer into the
+    # rsync.cdc-* topics, so the sink drains what is already there, every topic
+    # reaches lag 0, and the pipeline still reads `running` in the control plane.
+    # A dead producer and a caught-up one are indistinguishable from lag alone.
+    # Measured on the demo VM 2026-09-23: 877k source rows silently uncaptured
+    # until the container was started by hand. kafka-mcp-sink-mcp, the consuming
+    # half of the same path, has carried this policy all along.
+    restart: unless-stopped
     logging:
       driver: json-file
       options:
