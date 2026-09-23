@@ -131,7 +131,20 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1024M
+          # 2 GiB, not 1: the JVM alone claims -Xmx768M (docker-compose.yml,
+          # KAFKA_HEAP_OPTS) plus ~100 MiB metaspace, and what overruns is NEITHER
+          # -- it is native memory held by Debezium's BufferingChangeStreamCursor
+          # while the change stream outruns the sink. At 1024M that left ~34 MiB of
+          # headroom and the container idled at 99.5% of its cap.
+          #
+          # Raising -Xmx instead would make this WORSE: the cgroup kill is on total
+          # RSS, so a bigger heap just reaches the same wall sooner.
+          #
+          # Measured on the demo VM 2026-09-23 (1M-row CDC burst at ~14k inserts/s
+          # against a lane that drains ~1k rows/s): OOMKilled twice, exit 137,
+          # kernel anon-rss 1042068kB. See docs/testing/load-and-capacity-test-plan.md
+          # section 11 F5.
+          memory: 2048M
 
   redis:
     restart: unless-stopped

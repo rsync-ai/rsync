@@ -30,8 +30,15 @@ spec:
         This is the one caller that passes `temporal`: the adapter Fatalf-s on its
         first failed Dial and every worker it registers takes that client, so a
         lost race here is a crash-loop, not a degraded mode. See the helper.
+
+        It passes `kafka` for the same reason the orchestrator does, and it was
+        missed when that one was wired: createKafkaProducer failing is log.Fatalf
+        with no retry (cmd/adapter/main.go), so a broker that is not accepting
+        yet is a crash-loop too. Measured on a fresh kind install of the 0.1.5
+        chart: 4 restarts, every one "Failed to create Kafka producer ...
+        connection refused", resolving only once the broker came up.
         */}}
-        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.temporalAdapter.image "temporal" true) | nindent 8 }}
+        {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.temporalAdapter.image "temporal" true "kafka" true) | nindent 8 }}
         {{- /*
         Same local-filesystem dependency as the api-gateway: the connector-check
         activity resolves a connector by stat-ing the catalog on THIS pod's disk

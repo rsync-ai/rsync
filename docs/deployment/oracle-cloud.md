@@ -170,7 +170,7 @@ tls:
         - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
         - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
         - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256
-      sniStrict: true
+      sniStrict: false   # keeps `https://<ip>/` reachable before DNS exists; see deploy/traefik/dynamic.yml
 
 http:
   middlewares:
