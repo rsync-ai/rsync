@@ -38,10 +38,12 @@ func BuildCDCTableStatsEvent(pipelineID string, executionID string, st TableStat
 				"inserts": st.Inserts,
 				"updates": st.Updates,
 				"deletes": st.Deletes,
-				"total":   st.TotalEvents,
+				// Snapshot reads (op "r"), kept out of inserts; the gateway stores
+				// them as snapshot_rows.
+				"reads": st.Reads,
+				"total": st.TotalEvents,
 			},
 			"last_event_ts": st.LastEventTs.UTC().Format(time.RFC3339),
 		},
 	}
 }
-

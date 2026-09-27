@@ -53,30 +53,3 @@ func GetUserRole(c *gin.Context) UserRole {
 func CanViewRawEvents(role UserRole) bool {
 	return role == RoleAdmin || role == RolePowerUser
 }
-
-// RequireRole middleware that enforces a minimum role
-func RequireRole(minRole UserRole) gin.HandlerFunc {
-	return func(c *gin.Context) {
-		userRole := GetUserRole(c)
-
-		// Simple hierarchy: admin > power_user > user
-		roleLevel := map[UserRole]int{
-			RoleUser:      1,
-			RolePowerUser: 2,
-			RoleAdmin:     3,
-		}
-
-		if roleLevel[userRole] < roleLevel[minRole] {
-			c.JSON(403, gin.H{
-				"error":         "insufficient_permissions",
-				"message":       "This operation requires elevated permissions",
-				"required_role": minRole,
-				"your_role":     userRole,
-			})
-			c.Abort()
-			return
-		}
-
-		c.Next()
-	}
-}

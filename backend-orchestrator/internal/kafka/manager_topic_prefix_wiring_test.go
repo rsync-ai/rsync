@@ -129,7 +129,7 @@ func TestProduceDoesNotDoubleQualify(t *testing.T) {
 // duplicate-subscription guard, which is the first thing ConsumeWithContext
 // does after qualifying and the last step reachable without a live broker.
 func TestConsumeQualifiesTheTopic(t *testing.T) {
-	const logical = "agent.planner.requests"
+	const logical = "pipeline.domain.events"
 	want := kafkaclient.Topic(logical)
 	if want == logical {
 		t.Fatalf("test is vacuous: kafkaclient.Topic(%q) returned it unchanged", logical)
@@ -163,28 +163,4 @@ func consumeCatchingPanic(m *Manager, topic string) (err error) {
 		}
 	}()
 	return m.ConsumeWithContext(topic, func(context.Context, *sarama.ConsumerMessage) error { return nil })
-}
-
-// TestGeneratedTopicNamesAreQualified pins the two names the orchestrator mints
-// itself. These are written to the database and handed to Debezium and the
-// sink, so they must already carry the namespace before anyone stores them.
-func TestGeneratedTopicNamesAreQualified(t *testing.T) {
-	prefix := kafkaclient.TopicPrefix()
-	if prefix == "" {
-		t.Fatal("test is vacuous: no topic prefix configured in this environment")
-	}
-
-	tm := &TopologyManager{}
-	for _, tt := range []struct{ kind, ns string }{
-		{"cdc", "cdc."},
-		{"batch", "pipeline."},
-	} {
-		got := tm.generateTopicName("abc12345-0000-0000-0000-000000000000", tt.kind)
-		if !strings.HasPrefix(got, prefix) {
-			t.Errorf("generateTopicName(%q) = %q, want the %q namespace", tt.kind, got, prefix)
-		}
-		if !kafkaclient.InNamespace(got, tt.ns) {
-			t.Errorf("generateTopicName(%q) = %q, want it inside %q", tt.kind, got, tt.ns)
-		}
-	}
 }

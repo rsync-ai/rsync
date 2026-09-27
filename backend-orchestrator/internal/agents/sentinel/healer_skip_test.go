@@ -29,16 +29,31 @@ func TestRestartConsumerDistinguishesASkipFromASuccess(t *testing.T) {
 		wantAction  string
 	}{
 		{
-			name:        "a new-architecture topic really is handled by Kafka rebalancing",
-			componentID: "task.assignments",
-			wantSkipped: false,
-			wantAction:  "kafka_auto_rebalance",
-		},
-		{
-			name:        "another new-architecture topic, so the pass arm is not a single fixture",
+			name:        "the platform event log really is handled by Kafka rebalancing",
 			componentID: "pipeline.domain.events",
 			wantSkipped: false,
 			wantAction:  "kafka_auto_rebalance",
+		},
+		// The agent-bus topics below no longer exist: nothing creates, produces to or
+		// consumes them. Grading a restart of one as a rebalance-healed success would
+		// close an issue about a topic the platform does not have.
+		{
+			name:        "the removed task.assignments topic has no restart path",
+			componentID: "task.assignments",
+			wantSkipped: true,
+			wantAction:  "skipped",
+		},
+		{
+			name:        "nor does the removed task.results topic",
+			componentID: "task.results",
+			wantSkipped: true,
+			wantAction:  "skipped",
+		},
+		{
+			name:        "nor does the removed agent telemetry topic",
+			componentID: "pipeline.agent.telemetry",
+			wantSkipped: true,
+			wantAction:  "skipped",
 		},
 		{
 			name:        "an MCP connector has no restart path at all",
@@ -90,7 +105,7 @@ func TestExecuteHealingDoesNotGradeASkipAsSuccess(t *testing.T) {
 	}{
 		{
 			name:        "a real restart path grades as a success",
-			componentID: "task.assignments",
+			componentID: "pipeline.domain.events",
 			wantSuccess: true,
 			wantSkipped: false,
 		},
@@ -159,7 +174,7 @@ func TestOnlyARealHealingSuccessClosesTheIssue(t *testing.T) {
 	}{
 		{
 			name:         "a real restart resolves the issue",
-			componentID:  "task.assignments",
+			componentID:  "pipeline.domain.events",
 			wantResolved: true,
 		},
 		{
@@ -203,10 +218,9 @@ func TestOnlyARealHealingSuccessClosesTheIssue(t *testing.T) {
 			}
 			a := &Agent{
 				config:       config,
-				components:   make(map[string]*ComponentHealth),
 				activeIssues: map[string]*Issue{issue.ID: issue},
 				healer:       NewHealer(nil, nil, config, nil, nil),
-				logger:       NewAuditLogger(nil, db, config),
+				logger:       NewAuditLogger(db, config),
 				ctx:          context.Background(),
 			}
 
@@ -424,7 +438,7 @@ func TestTriggerHealingLogsASkipAsASkipNotAFailure(t *testing.T) {
 		},
 		{
 			name:            "a component Kafka rebalancing really does heal",
-			componentID:     "task.assignments",
+			componentID:     "pipeline.domain.events",
 			wantAuditLevel:  "info",
 			wantAuditAction: string(HealingActionRestartConsumer),
 			wantSkippedFld:  false,
@@ -439,7 +453,7 @@ func TestTriggerHealingLogsASkipAsASkipNotAFailure(t *testing.T) {
 			// satisfy the skip arm, and "a skip is not a failure" would be true only
 			// because nothing is a failure any more.
 			name:            "a genuine failure is still filed as a failure",
-			componentID:     "task.assignments",
+			componentID:     "pipeline.domain.events",
 			priorAttempts:   DefaultSentinelConfig().MaxRestartAttempts,
 			wantAuditLevel:  "error",
 			wantAuditAction: string(HealingActionCircuitBreak),
@@ -474,10 +488,9 @@ func TestTriggerHealingLogsASkipAsASkipNotAFailure(t *testing.T) {
 			}
 			a := &Agent{
 				config:       config,
-				components:   make(map[string]*ComponentHealth),
 				activeIssues: map[string]*Issue{issue.ID: issue},
 				healer:       healer,
-				logger:       NewAuditLogger(nil, db, config),
+				logger:       NewAuditLogger(db, config),
 				ctx:          context.Background(),
 			}
 

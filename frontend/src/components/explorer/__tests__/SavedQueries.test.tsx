@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
 import { render, screen, waitFor } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn(), info: vi.fn() } }))
@@ -130,6 +131,37 @@ describe("SavedQueries row badges", () => {
       expect(screen.getByRole("button", { name: /edit daily mrr/i })).toBeInTheDocument()
     })
     expect(screen.getByText("Edit")).toBeInTheDocument()
+  })
+
+  // The row is itself a button (Enter loads the query), and its own buttons sit inside
+  // it. Their keydown bubbles to the row, whose preventDefault used to cancel the
+  // button's click — so Enter on Edit loaded the query into the editor instead.
+  it("lets Enter on a row's own button press that button, not load the query", async () => {
+    mockFetch.mockResolvedValue(res(200, { saved_queries: [query()], count: 1 }))
+    const onLoad = vi.fn()
+    const user = userEvent.setup()
+    render(<SavedQueries connectionId={CONNECTION_ID} currentSql="SELECT 1" onLoad={onLoad} />)
+
+    const edit = await screen.findByRole("button", { name: /edit daily mrr/i })
+    edit.focus()
+    await user.keyboard("{Enter}")
+
+    expect(await screen.findByRole("dialog", { name: "Edit query" })).toBeInTheDocument()
+    expect(onLoad).not.toHaveBeenCalled()
+  })
+
+  it("still loads the query on Enter from the row itself", async () => {
+    mockFetch.mockResolvedValue(res(200, { saved_queries: [query()], count: 1 }))
+    const onLoad = vi.fn()
+    const user = userEvent.setup()
+    render(<SavedQueries connectionId={CONNECTION_ID} currentSql="SELECT 1" onLoad={onLoad} />)
+
+    const edit = await screen.findByRole("button", { name: /edit daily mrr/i })
+    const row = edit.closest('[role="button"][tabindex="0"]') as HTMLElement
+    row.focus()
+    await user.keyboard("{Enter}")
+
+    expect(onLoad).toHaveBeenCalledWith("SELECT 1", undefined)
   })
 
   it("still reports a failed last run after its target table is cleared", async () => {

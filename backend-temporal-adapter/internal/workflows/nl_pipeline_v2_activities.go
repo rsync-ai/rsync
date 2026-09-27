@@ -28,11 +28,11 @@ import (
 // ==============================================================================
 // V2 ACTIVITIES (Phase D - Request/Reply Pattern)
 // ==============================================================================
-// These activities use Redis-based correlation instead of KafkaAdapter signals
+// These activities use Redis-based correlation instead of Kafka-driven workflow signals
 // Each activity:
 // 1. Generates a correlation ID
 // 2. Writes request to correlation store
-// 3. Publishes command to Kafka (for worker pickup)
+// 3. Leaves the request for a worker's Redis poller to claim (no Kafka hop)
 // 4. Blocks waiting for response in correlation store
 // 5. Returns typed errors for workflow branching
 
@@ -169,7 +169,7 @@ func IntentActivityV2(ctx context.Context, input NLPipelineWorkflowV2Input) (map
 
 	// V2 dispatch is Redis-correlation-only: the worker's Redis poller (claimed via
 	// SET NX) handles the request written above. We no longer also publish to Kafka —
-	// that second path caused double-execution (KI-HYBRID-1). V1 still uses Kafka.
+	// that second path caused double-execution (KI-HYBRID-1).
 
 	// Wait for response (blocking)
 	response, err := waitForResponseWithHeartbeats(ctx, "intent", correlationID, 2*time.Minute)
@@ -1178,11 +1178,6 @@ func ValidateSchemaRepairActivity(ctx context.Context, sourceConnectionID, desti
 		RepairPlan:   plan,
 	}, nil
 }
-
-// NOTE: publishAgentCommand (per-agent Kafka command publisher) was removed in Phase 2
-// of the Kafka-removal work. V2 agent dispatch is now Redis-correlation-only; the Kafka
-// command topics (agent.control.commands.*) are no longer written by the V2 path. V1
-// dispatch (if any remains) still produces to those topics from its own code path.
 
 // ==============================================================================
 // DAG NODE EXECUTION ACTIVITY

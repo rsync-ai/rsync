@@ -2,6 +2,7 @@ import { AlertTriangle } from "lucide-react"
 import { Badge } from "@/components/ui/badge"
 import { describeUpstreamSet, type RunProvenanceFields } from "@/components/explorer/runProvenance"
 import { describeCron } from "@/components/explorer/cronSentence"
+import { type ScheduleUpstream } from "@/components/explorer/liveState"
 
 // Shared by the Scheduled Queries list and the per-model page, so the two cannot
 // disagree about what a schedule's status or a run's outcome is called.
@@ -38,7 +39,7 @@ export interface ScheduledQuery {
    * landed is upstream_policy. Names are joined server-side and are empty for a producer
    * since deleted.
    */
-  upstreams?: { kind: string; id: string; name?: string }[]
+  upstreams?: ScheduleUpstream[]
   /** after_upstream only: "any" rebuilds on each landing, "all" waits for every upstream. */
   upstream_policy?: "any" | "all"
   created_by: string

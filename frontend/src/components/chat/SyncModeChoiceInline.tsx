@@ -18,6 +18,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { cn } from "@/lib/utils"
 import { displayConnectorName } from "@/lib/connector-display"
+import { isLayoutV2Destination, validatePipelinePrefix } from "@/lib/pipeline/destinationNamespace"
 
 /** Where the rows land in the destination, as the gateway's confirmation reports it. */
 export interface DestinationNamespaceHint {
@@ -86,7 +87,20 @@ export function SyncModeChoiceInline({
 }: SyncModeChoiceInlineProps) {
   const [namespace, setNamespace] = useState(destinationNamespace?.requested ?? "")
   const trimmedNamespace = namespace.trim()
-  const namespaceInvalid = trimmedNamespace !== "" && !NAMESPACE_RE.test(trimmedNamespace)
+  // GCS, S3 and Azure Blob write every file under this pipeline's folder
+  // (object layout v2), so the table step requires the prefix
+  // (validatePipelinePrefix). This card said "Leave empty to use the default" and
+  // let an empty one through, and the next step then refused it (prod 2026-09-26).
+  const prefixRequired = !!destinationNamespace && isLayoutV2Destination(destType)
+  const namespaceMissing = prefixRequired && trimmedNamespace === ""
+  const namespaceError = prefixRequired
+    ? namespaceMissing
+      ? ""
+      : validatePipelinePrefix(namespace)
+    : trimmedNamespace !== "" && !NAMESPACE_RE.test(trimmedNamespace)
+      ? "Use letters, digits and underscores, not starting with a digit."
+      : ""
+  const namespaceInvalid = namespaceError !== ""
   const requested = requestedOptionId && options.some((o) => o.id === requestedOptionId)
     ? requestedOptionId
     : null
@@ -106,7 +120,7 @@ export function SyncModeChoiceInline({
   }
 
   const handleConfirm = async () => {
-    if (!selectedOption || namespaceInvalid) return
+    if (!selectedOption || namespaceInvalid || namespaceMissing) return
     setIsSubmitting(true)
     const label = options.find((o) => o.id === selectedOption)?.label ?? selectedOption
     try {
@@ -234,7 +248,9 @@ export function SyncModeChoiceInline({
 
         {destinationNamespace && (() => {
           const noun = namespaceNoun(destinationNamespace.kind)
-          const placeholder = destinationNamespace.defaultName
+          const placeholder = prefixRequired
+            ? "Name this pipeline's folder, e.g. sales_orders"
+            : destinationNamespace.defaultName
             ? `Default: ${destinationNamespace.defaultName}`
             : destinationNamespace.kind === "path"
               ? "Default: the source's database name"
@@ -243,6 +259,7 @@ export function SyncModeChoiceInline({
             <div className="mt-3 space-y-1.5">
               <Label htmlFor="sync-mode-destination-namespace" className="text-sm">
                 Destination {noun}
+                {prefixRequired ? " (required)" : ""}
               </Label>
               <Input
                 id="sync-mode-destination-namespace"
@@ -251,6 +268,7 @@ export function SyncModeChoiceInline({
                 placeholder={placeholder}
                 disabled={isSubmitting}
                 aria-invalid={namespaceInvalid || undefined}
+                aria-required={prefixRequired || undefined}
                 aria-describedby="sync-mode-destination-namespace-help"
                 autoComplete="off"
                 spellCheck={false}
@@ -260,8 +278,10 @@ export function SyncModeChoiceInline({
                 className={cn("text-xs", namespaceInvalid ? "text-red-600 dark:text-red-400" : "text-zinc-500 dark:text-zinc-400")}
               >
                 {namespaceInvalid
-                  ? "Use letters, digits and underscores, not starting with a digit."
-                  : `Leave empty to use the default. It is created if it does not exist.`}
+                  ? namespaceError
+                  : prefixRequired
+                    ? "Required: every file of this pipeline is written under this folder. Lowercase letters, digits and underscores, starting with a letter."
+                    : `Leave empty to use the default. It is created if it does not exist.`}
               </p>
             </div>
           )
@@ -326,7 +346,10 @@ export function SyncModeChoiceInline({
           <Button
             type="button"
             onClick={() => void handleConfirm()}
-            disabled={!selectedOption || isSubmitting || namespaceInvalid}
+            disabled={!selectedOption || isSubmitting || namespaceInvalid || namespaceMissing}
+            aria-describedby={
+              namespaceInvalid || namespaceMissing ? "sync-mode-destination-namespace-help" : undefined
+            }
             className="bg-gradient-to-r from-violet-600 to-indigo-600"
           >
             Start pipeline

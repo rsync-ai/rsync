@@ -18,6 +18,7 @@ import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/compo
 import { authFetch } from "@/lib/api/auth-fetch"
 import type { AdminUsageResponse } from "@/lib/api/usage"
 import { UsagePanelGate } from "@/components/usage/UsagePanelGate"
+import { planOptionsFrom, WorkspacePlanCell } from "@/components/admin/WorkspacePlanCell"
 
 const nf = new Intl.NumberFormat()
 const fmt = (n: number) => nf.format(n)
@@ -93,6 +94,8 @@ function AdminUsagePageContent() {
     load()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  const planOptions = planOptionsFrom(data?.workspaces || [])
 
   return (
     <div className="space-y-6">
@@ -191,33 +194,7 @@ function AdminUsagePageContent() {
                             ) : null}
                           </TableCell>
                           <TableCell>
-                            <Badge variant="outline" className="capitalize">
-                              {w.plan || "—"}
-                            </Badge>
-                            {/* The stored plan has lapsed and something else is
-                                being enforced. Show both — the stored value is
-                                what an admin edits, the effective one is what
-                                the limit beside it refers to. */}
-                            {w.effective_plan && w.effective_plan !== w.plan ? (
-                              <span className="ml-1 text-xs text-amber-600 dark:text-amber-500">
-                                → <span className="capitalize">{w.effective_plan}</span>
-                              </span>
-                            ) : null}
-                            <span className="ml-2 text-xs text-zinc-500 dark:text-zinc-400">
-                              {w.plan_limit == null ? "∞" : `${fmt(w.pipelines)}/${fmt(w.plan_limit)}`}
-                            </span>
-                            {/* An override is invisible otherwise: the number
-                                to its left is the override's, and an admin
-                                reading the table could not tell which
-                                workspaces had been granted one. */}
-                            {w.pipeline_limit_override != null ? (
-                              <span
-                                className="ml-1 text-xs text-sky-600 dark:text-sky-400"
-                                title="Pipeline limit override — this workspace's limit is set per-workspace, not by its plan"
-                              >
-                                override
-                              </span>
-                            ) : null}
+                            <WorkspacePlanCell w={w} options={planOptions} onSaved={load} />
                           </TableCell>
                           <TableCell className="text-right tabular-nums">{fmt(w.pipelines)}</TableCell>
                           <TableCell className="text-right tabular-nums font-medium">{w.transfer_gb.toFixed(2)}</TableCell>

@@ -80,6 +80,9 @@ interface SuggestionsReviewDialogProps {
   // If the parent already fetched schema (pre-fetch on table selection), pass it here
   // to skip the schema fetch step and jump straight to LLM suggestions.
   prefetchedSchema?: TableMetadata[]
+  // The destination connector type (gcs, postgresql, ...). The service gives
+  // index advice only for a destination it knows has indexes.
+  destinationType?: string
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +236,7 @@ export function SuggestionsReviewDialog({
   selectedTables,
   onApplyContinue,
   prefetchedSchema,
+  destinationType,
 }: SuggestionsReviewDialogProps) {
   const [loading, setLoading] = useState(false)
   const [loadStep, setLoadStep] = useState<"schema" | "suggestions">("schema")
@@ -453,7 +457,9 @@ export function SuggestionsReviewDialog({
             use_case: "sync",
             description: "Data pipeline sync",
             source_type: "database",
-            destination_type: "storage",
+            // Not in the deps below: a late value must not re-run the model call.
+            // An unknown destination gets no index advice, which is the safe side.
+            destination_type: destinationType || "unknown",
           },
         })
 
@@ -750,8 +756,8 @@ export function SuggestionsReviewDialog({
               AI Suggestions &amp; Transforms
             </DialogTitle>
             <DialogDescription>
-              Review and customize AI-suggested transforms before continuing. These will be applied to
-              your data during pipeline execution.
+              Review and customize AI-suggested transforms before continuing. Selected PII rules and
+              transforms are applied to your data during pipeline execution; optimizations are advice only.
             </DialogDescription>
           </DialogHeader>
 
@@ -1196,7 +1202,11 @@ export function SuggestionsReviewDialog({
                         </CardContent>
                       </Card>
                     ) : (
-                      (suggestions?.optimizations || []).map((opt, idx) => (
+                      <>
+                      <p className="text-xs text-zinc-500 dark:text-zinc-400">
+                        Advice only: Apply &amp; Continue does not change any of these.
+                      </p>
+                      {(suggestions?.optimizations || []).map((opt, idx) => (
                         <Card key={idx} className="border-blue-200 dark:border-blue-800">
                           <CardContent className="pt-4">
                             <div className="flex items-start gap-3">
@@ -1214,7 +1224,8 @@ export function SuggestionsReviewDialog({
                             </div>
                           </CardContent>
                         </Card>
-                      ))
+                      ))}
+                      </>
                     )}
                   </TabsContent>
                 </div>

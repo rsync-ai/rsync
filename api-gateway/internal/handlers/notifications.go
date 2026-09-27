@@ -71,13 +71,19 @@ const audienceFilter = `AND COALESCE(metadata->>'audience', 'user') <> 'develope
 // workspaceScope narrows the bell to the caller's ACTIVE workspace.
 //
 // pipeline_notifications has no workspace_id of its own; the workspace is a
-// property of the pipeline the notification is about (pipeline_id is NOT NULL
-// with ON DELETE CASCADE, so the join can never miss). Scoping here rather than
+// property of the pipeline the notification is about. Scoping here rather than
 // leaving the inbox user-global matters for more than tidiness: an unscoped bell
 // deep-links to /pipelines/{id} for a pipeline in a workspace the user is not
 // currently in, and the gateway then 404s that id — the alert was visible but
 // unopenable. Scoped, every row in the bell is one the current workspace can act
 // on.
+//
+// Instance-level alerts (pipeline_id IS NULL, migration 112) have no pipeline
+// and therefore no workspace, so they are shown in whichever workspace the
+// recipient is in — they are about the whole install, and an alert visible from
+// only one workspace is one nobody reliably sees. This is why all three queries
+// LEFT JOIN: an inner join drops every NULL-pipeline row on the floor, which
+// would persist those alerts and then hide them.
 //
 // Fails closed: with no active workspace the middleware leaves the context
 // unset, and callers return an empty inbox rather than every workspace's rows.
@@ -94,8 +100,9 @@ func countUnreadNotifications(ctx context.Context, database *sql.DB, userID, wor
 	err := database.QueryRowContext(ctx, `
 		SELECT COUNT(*)
 		FROM pipeline_notifications n
-		JOIN pipelines p ON p.id = n.pipeline_id
-		WHERE n.user_id = $1 AND n.read_at IS NULL AND p.workspace_id = $2
+		LEFT JOIN pipelines p ON p.id = n.pipeline_id
+		WHERE n.user_id = $1 AND n.read_at IS NULL
+		  AND (n.pipeline_id IS NULL OR p.workspace_id = $2)
 		  AND COALESCE(n.metadata->>'audience', 'user') <> 'developer'
 	`, userID, workspaceID).Scan(&count)
 	return count, err
@@ -130,7 +137,7 @@ func ListNotifications(c *gin.Context) {
 	// migration. COALESCE against the pipeline name keeps rows renderable even
 	// if the join misses.
 	rows, err := database.QueryContext(c.Request.Context(), `
-		SELECT n.id, n.pipeline_id, n.type, n.severity, n.title, n.message,
+		SELECT n.id, COALESCE(n.pipeline_id::text, ''), n.type, n.severity, n.title, n.message,
 		       COALESCE(n.action_url, ''),
 		       COALESCE(p.name, n.metadata->>'pipeline_name', ''),
 		       COALESCE(n.metadata->>'impact', ''),
@@ -140,9 +147,9 @@ func ListNotifications(c *gin.Context) {
 		       COALESCE(n.metadata->>'source_topic', ''),
 		       n.read_at, n.created_at
 		FROM pipeline_notifications n
-		JOIN pipelines p ON p.id = n.pipeline_id
+		LEFT JOIN pipelines p ON p.id = n.pipeline_id
 		WHERE n.user_id = $1
-		  AND p.workspace_id = $2
+		  AND (n.pipeline_id IS NULL OR p.workspace_id = $2)
 		  AND COALESCE(n.metadata->>'audience', 'user') <> 'developer'
 		ORDER BY n.created_at DESC
 		LIMIT $3
@@ -327,13 +334,17 @@ func MarkAllNotificationsRead(c *gin.Context) {
 		return
 	}
 
+	// The NULL-pipeline arm is not optional: without it an instance alert could
+	// never be marked read, and the unread badge would stick at a count the
+	// user has no way to clear. It must clear exactly what the bell displays.
 	res, err := database.ExecContext(c.Request.Context(), `
 		UPDATE pipeline_notifications n
 		SET read_at = NOW()
-		FROM pipelines p
-		WHERE p.id = n.pipeline_id
-		  AND n.user_id = $1 AND n.read_at IS NULL
-		  AND p.workspace_id = $2
+		WHERE n.user_id = $1 AND n.read_at IS NULL
+		  AND (
+		        n.pipeline_id IS NULL
+		     OR EXISTS (SELECT 1 FROM pipelines p WHERE p.id = n.pipeline_id AND p.workspace_id = $2)
+		      )
 	`, userID, workspaceID)
 	if err != nil {
 		respondError(c, http.StatusInternalServerError, "mark_all_read_failed", "Failed to mark notifications read", err)

@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react"
 import { Eye, EyeOff, Lock } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { formatConfigLabel } from "@/lib/utils/config-label"
 import { type SupportedAuthMethod, splitMethodCredentialKeys } from "@/lib/types/mcp-connector"
 
 interface Props {
@@ -32,6 +33,13 @@ interface Props {
    * behaviour) when omitted.
    */
   schemaKeys?: Set<string>
+  /**
+   * Lowercased keys the parent refuses to Test/Save without (create mode). Each
+   * gets a `*` and aria-required; once the user leaves one empty it is marked
+   * invalid with a message. Omitted in edit mode, where a blank keeps the stored
+   * value.
+   */
+  requiredKeys?: Set<string>
 }
 
 /**
@@ -51,6 +59,7 @@ export function AuthMethodPicker({
   onValueChange,
   oauthProvider,
   schemaKeys,
+  requiredKeys,
 }: Props) {
   // Auto-pick the first method when nothing is selected
   useEffect(() => {
@@ -135,6 +144,7 @@ export function AuthMethodPicker({
             name={key}
             value={values[key] || ""}
             secret={!isUsernameField(key)}
+            required={requiredKeys?.has(key.toLowerCase()) ?? false}
             onChange={(v) => onValueChange(key, v)}
             helpText={
               aliasKeys.length > 0 && key === renderedKeys[0]
@@ -171,17 +181,23 @@ function CredentialField({
   name,
   value,
   secret,
+  required,
   onChange,
   helpText,
 }: {
   name: string
   value: string
   secret: boolean
+  required: boolean
   onChange: (v: string) => void
   helpText?: string
 }) {
   const [reveal, setReveal] = useState(false)
-  const labelText = humanLabel(name)
+  const [touched, setTouched] = useState(false)
+  // Same label the form's "Still required: …" line uses for this key.
+  const labelText = formatConfigLabel(name)
+  const invalid = required && touched && !value.trim()
+  const errorId = `credential-${name}-error`
   return (
     <div>
       <label
@@ -190,6 +206,7 @@ function CredentialField({
       >
         {secret && <Lock className="h-3 w-3 text-zinc-400" />}
         {labelText}
+        {required && <span className="text-red-500">*</span>}
       </label>
       <div className="relative">
         <input
@@ -198,6 +215,10 @@ function CredentialField({
           type={secret && !reveal ? "password" : "text"}
           value={value}
           onChange={(e) => onChange(e.target.value)}
+          onBlur={() => setTouched(true)}
+          aria-required={required || undefined}
+          aria-invalid={invalid || undefined}
+          aria-describedby={invalid ? errorId : undefined}
           // Never use bullet dots as a secret placeholder — an empty field then
           // looks identical to a saved/masked value. Use an explicit hint.
           placeholder={`Enter ${labelText}`}
@@ -205,6 +226,7 @@ function CredentialField({
             "w-full text-sm px-3 py-2 rounded-md border border-zinc-300 dark:border-zinc-700",
             "bg-white dark:bg-zinc-900 focus:outline-none focus:ring-2 focus:ring-violet-500",
             secret && "pr-9 font-mono",
+            invalid && "border-red-500 dark:border-red-500 focus:ring-red-500",
           )}
           // "new-password" (not "off") is the only value Chrome honors for a
           // password field — it stops the saved localhost login from being
@@ -226,6 +248,11 @@ function CredentialField({
       </div>
       {helpText && (
         <div className="mt-1 text-[11px] text-zinc-500 dark:text-zinc-400">{helpText}</div>
+      )}
+      {invalid && (
+        <div id={errorId} className="mt-1 text-[11px] text-red-600 dark:text-red-400">
+          {labelText} is required.
+        </div>
       )}
     </div>
   )
@@ -250,13 +277,6 @@ function labelFor(m: SupportedAuthMethod): string {
     return `${base} (${m.header_name})`
   }
   return base
-}
-
-function humanLabel(snakeKey: string): string {
-  return snakeKey
-    .split("_")
-    .map((s) => s.charAt(0).toUpperCase() + s.slice(1))
-    .join(" ")
 }
 
 /** Treat fields whose name suggests a username/identifier as non-secret. */

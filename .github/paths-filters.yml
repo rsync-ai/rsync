@@ -1,0 +1,531 @@
+# Change-detection filters for .github/workflows/ci.yml.
+#
+# These used to live inline in a `changes` job that every filtered job waited on
+# through `needs:`. They were lifted out verbatim so each job can run the filter
+# itself and stop queueing behind that job -- see "Why there is no `changes` job"
+# in ci.yml for the measurement. This file is the ONE definition; no job may
+# restate a rule from it.
+#
+# Every filter below ends with this file and ci.yml. That is load-bearing, not
+# tidiness: a filter that does not list the file defining it cannot fire on a
+# change to itself, so a PR that broke a rule here would skip the very jobs that
+# would have caught it and report green -- the failure mode recorded as
+# KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW. `llm` and `frontend` were missing the
+# ci.yml entry before this file existed; both are listed now.
+go:
+  - 'api-gateway/**'
+  - 'backend-orchestrator/**'
+  - 'backend-temporal-adapter/**'
+  - 'connector-deployer/**'
+  - 'shared/go/**'
+  # The compose files are here because connector-deployer's
+  # quickstart_deployability_test.go PARSES them: it derives which
+  # connectors the self-host stack actually pre-starts and asserts
+  # that everything composeManagedConnectors refuses to build is
+  # started by somebody. Without these paths the guard would be dead
+  # on half its subject -- deleting a connector service from
+  # docker-compose.quickstart.yml is exactly the change that
+  # re-opens the bug (postgresql refused by the deployer AND started
+  # by nobody, which 502'd the bundled demo), and it touches no Go
+  # file, so this job would report `skipping` and look identical to
+  # a pass. Same failure mode as the Helm paths on the `llm` filter
+  # below.
+  - 'docker-compose.quickstart.yml'
+  - 'docker-compose.mcp.yml'
+  # api-gateway's handlers/admin_drift_test.go reads these too: every
+  # deployment-drift target must name a host, port and /version route
+  # its service serves (the llm-service one lives in Python), and
+  # match config/services.yaml. Moving a port in one of these touches
+  # no Go file, and that is how the drift check probed a port nothing
+  # listened on.
+  - 'docker-compose.yml'
+  - 'docker-compose.prod.yml'
+  - 'docker-compose.staging.yml'
+  - 'config/services.yaml'
+  - 'llm-service/src/gateway/main.py'
+  # backend-orchestrator/internal/kafka/stop_grace_test.go reads the
+  # orchestrator's grace period from the two compose files above and from
+  # the Helm chart. Lowering it in the chart touches no Go file.
+  - 'deploy/helm/rsync-ai/values.yaml'
+  - 'deploy/helm/rsync-ai/templates/apps/orchestrator.yaml'
+  # Connector metadata is here for the same reason: the orchestrator's
+  # registry tests (backend-orchestrator/internal/registry) load the real
+  # connector tree and assert that every alias a connector declares
+  # resolves back to that connector. Editing a metadata.json `aliases`
+  # array is exactly the change that breaks name resolution -- the chat
+  # path could not reach the gcs connector by its catalog name for
+  # months -- and it touches no Go file, so without this path the guard
+  # is dead on its own subject and the job reports `skipping`, which
+  # looks identical to a pass.
+  - 'shared/mcp-connectors/**'
+  # backend-orchestrator/internal/storage/layout_test.go reads this
+  # fixture; a PR changing only the object-storage key contract must
+  # run it (same for the sink and llm filters below).
+  - 'shared/object_layout_golden.json'
+  # api-gateway validators/statement_class_golden_test.go reads this; the
+  # frontend filter below lists it too (the vitest copy reads it).
+  - 'shared/explorer_statement_class_golden.json'
+  # Duplicate-logic goldens, each pinned from both languages:
+  # security/masking_golden_test.go (gateway + orchestrator),
+  # executor/postgres_family_golden_test.go and
+  # handlers/data_loading_strategy_golden_test.go. The llm and frontend
+  # filters below list the ones their tests read.
+  - 'shared/sensitive_keys_golden.json'
+  - 'shared/postgres_family_golden.json'
+  - 'shared/data_loading_strategy_golden.json'
+  # handlers/pii_scan_contract_test.go pins pii.scan.request/response
+  # to it; llm-service's test_pii_scan_names_only.py reads the same file.
+  - 'shared/pii_scan_contract_golden.json'
+  # pkg/namespacemodel/model_test.go and the frontend's
+  # namespaceModel.test.ts pin namespacemodel.For to the same cases.
+  - 'shared/namespace_model_golden.json'
+  # handlers/chat_insight_chip_prompts_golden_test.go and the frontend's
+  # PipelineInsightsBar.chipPrompts.test.tsx pin the chat chips' prompts.
+  - 'shared/chat_insight_chip_prompts_golden.json'
+  - '.github/workflows/ci.yml'
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+go-shared:
+  - 'shared/go/**'
+  - '.github/workflows/ci.yml'
+# kafka-mcp-sink worker is its own Go module (NOT under shared/go,
+# so neither the `go` nor `go-shared` module list covers it). Add it
+# to the Go job on the worker module itself AND on shared/go/transforms
+# — the worker `replace`s that path, so a transforms API change can
+# break the sink build/tests and must be caught on the PR.
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+sink:
+  - 'shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/**'
+  - 'shared/go/transforms/**'
+  # The worker `replace`s memlimit too (its startup soft memory limit).
+  - 'shared/go/memlimit/**'
+  # compression_default_test.go reads these to keep the sink's
+  # compression defaults in lockstep with the storage connectors'
+  # schema defaults; a PR changing only a schema must run it.
+  - 'shared/mcp-connectors/public/storage/*/latest.json'
+  - 'shared/mcp-connectors/public/storage/*/versions/*/metadata.json'
+  # object_layout_test.go pins the sink's key builders to this fixture.
+  - 'shared/object_layout_golden.json'
+  - '.github/workflows/ci.yml'
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+llm:
+  - 'llm-service/**'
+  - 'shared/mcp-connectors/**'
+  # tests/test_object_layout_golden.py pins rsync_protocol to it.
+  - 'shared/object_layout_golden.json'
+  # test_sensitive_keys_golden.py / test_postgres_family_golden.py pin
+  # the masking list and POSTGRES_FAMILY to these (Go reads them too).
+  - 'shared/sensitive_keys_golden.json'
+  - 'shared/postgres_family_golden.json'
+  # test_pii_scan_names_only.py pins the PII scanner's Kafka answer to
+  # it (the gateway's pii_scan_contract_test.go reads it too).
+  - 'shared/pii_scan_contract_golden.json'
+  # The Helm chart is here because llm-service/tests holds the chart
+  # guards (test_chart_service_hostnames_resolve.py,
+  # test_chart_kafka_security_env.py) -- they parse deploy/helm as
+  # text and need no cluster. Without this path the guards were dead
+  # on exactly the change they exist to catch: PR #836 rewrote six
+  # chart templates and this job reported `skipping`, so the test
+  # written to catch a chart hostname bug never ran against a chart
+  # PR. A guard gated on a filter that excludes its own subject is
+  # not a guard.
+  - 'deploy/helm/**'
+  # Same reasoning one step further out: this filter gates the
+  # oss-leak-proof job, whose subject IS this script. Without the
+  # path, editing the moat-leak proof itself would not run it.
+  - 'scripts/oss-leak-proof-test.sh'
+  # And once more, one directory over. test_validate_connector_script_
+  # finds_connectors.py guards scripts/mcp-connectors/validate_connector.py
+  # -- the contributor gate the developer guide points at, which spent its
+  # whole life resolving connectors under its OWN directory and therefore
+  # examined zero of them. The guard lives here because its fixture is the
+  # connector tree; its subject does not, so without this path a PR fixing
+  # (or re-breaking) the script alone would skip the job.
+  - 'scripts/mcp-connectors/**'
+  # And the three Go service trees, for the same reason a fourth
+  # time. test_chart_sets_every_service_url_env.py reads these
+  # sources to find env vars whose fallback is a bare compose
+  # service name, then asserts the chart sets them. Its subject is
+  # therefore Go code as much as the chart -- and every one of the
+  # four instances of that defect (KAFKA_CONNECT_URL,
+  # TOOL_GENERATOR_URL, LLM_SERVICE_URL/PLANNER_URL, the internal
+  # URL pairs) ORIGINATED in a Go change, not a chart change. Gated
+  # on 'deploy/helm/**' alone, the guard would skip on precisely the
+  # PR shape that introduces the bug: a new os.Getenv with a
+  # compose-shaped default and no chart edit.
+  - 'api-gateway/**'
+  - 'backend-orchestrator/**'
+  - 'backend-temporal-adapter/**'
+  # And once more, for the same reason. test_kafka_init_builders_
+  # stay_in_lockstep.py compares SEVEN copies of the SASL
+  # mechanism -> JAAS login module mapping. Five live under paths
+  # already listed above; these two do not, and the compose one is
+  # the likeliest drift vector of the lot -- it is the file
+  # install.sh downloads. Without these paths, a PR editing only
+  # the Docker install path would not run the guard written to
+  # catch exactly that.
+  # A sixth time, same shape, and the widest yet.
+  # test_shipped_images_are_pinned.py reads EVERY root compose file --
+  # a floating image tag anywhere on the delivery surface is the bug
+  # it exists to catch. Scoped to the two compose files this filter
+  # used to name, it was dead on the other 18, including
+  # docker-compose.yml itself: the base stack the prod overlay merges
+  # onto, and where the docker-socket-proxy pin lives. A PR floating a
+  # tag there would have skipped this job entirely, and a skipped
+  # check is not a passing one. The glob is what makes the guard's
+  # reach equal its subject; test_the_ci_filter_covers_every_file_this
+  # _guard_reads asserts they stay equal. It subsumes
+  # docker-compose.quickstart.yml (needed by test_kafka_init_builders_
+  # stay_in_lockstep.py, the file install.sh downloads) and
+  # docker-compose.mcp.yml (the independently generated census
+  # test_mcp_compose_generation.py cross-checks against), so neither
+  # is listed separately.
+  - 'docker-compose*.yml'
+  # Same shape again -- and this one a census found rather than a
+  # reader. The compose glob above is anchored at the repo root, so
+  # the compose file under shared/internal/infra/kafka-connect/ --
+  # tracked, shipped, and read by test_shipped_images_are_pinned.py
+  # -- was matched by no pattern here. Two successive widenings of
+  # that guard's own pattern list had already missed it, which is
+  # why the guard now discovers compose files from `git ls-files`
+  # instead of from a list, and this path is what the discovery
+  # turned up. A directory glob rather than the one file, because
+  # the Dockerfile beside it is this component's build context and
+  # was equally uncovered.
+  - 'shared/internal/infra/kafka-connect/**'
+  - 'scripts/kafka-init-new-topics.sh'
+  # test_every_kafka_init_creates_the_same_platform_topics.py runs this
+  # creator too; without the path a change to it alone skips that guard.
+  - 'scripts/create_kafka_topics.sh'
+  # A fourth time, same shape. test_mcp_compose_generation.py now reads
+  # the release workflow's OWN connector pathspec and re-runs it
+  # against the tree, so that narrowing that pathspec fails a PR
+  # instead of silently publishing a partial image set. That guard is
+  # only worth having if editing docker-publish.yml is what runs it --
+  # and the one edit it exists to catch is an edit to that file alone.
+  # (docker-compose.mcp.yml -- the independently generated census
+  # those guards cross-check against -- is covered by the
+  # docker-compose*.yml glob above.)
+  # Every workflow file, not just ci.yml and docker-publish.yml, because
+  # llm-service/tests also holds the fork-guard census
+  # (test_self_hosted_jobs_are_fork_guarded.py) and its subject is all
+  # four workflows. Scoped to one file, an unguarded job added to
+  # security.yml or licenses.yml would never run the test written to
+  # catch it -- the same dead-guard shape PR #836 hit with the chart
+  # tests, one file over. This glob subsumes the two specific workflow
+  # paths the guards above need, so neither is listed separately.
+  - '.github/workflows/**'
+  # A fifth time, same shape. test_connector_metadata_matches_cdc_policy.py
+  # asserts that no connector's metadata claims CDC the policy denies,
+  # and that the Go allowlist in tools.go still equals the YAML one --
+  # a promise tools.go:586 makes in a comment and nothing enforced.
+  # Grading metadata against a policy the product does not run is worse
+  # than not checking, so the Go file and the generator that mirrors it
+  # both have to be able to trigger this job.
+  - 'api-gateway/internal/handlers/tools.go'
+  # test_connector_reference_matches_disk.py (#888) imports this script
+  # and re-runs it; without the path, editing the generator itself was
+  # the one change that could not run its own guard.
+  - 'scripts/generate_connector_reference.py'
+  # A sixth time, and this one was already dead rather than
+  # hypothetical. test_sarif_findings_have_a_destination.py exists to
+  # stop the SARIF destinations being silently removed, and these two
+  # scripts ARE two of the three -- but neither path was listed, so a
+  # PR that deleted or broke scripts/summarize-sarif.sh and touched
+  # nothing else ran no guard at all. The glob above covers
+  # security.yml, which CALLS them; it does not cover them.
+  - 'scripts/summarize-sarif.sh'
+  - 'scripts/report-sarif-sinks.sh'
+  # test_security_scan_scope.py drives this script, which picks the Go
+  # modules and files security.yml scans on a PR. Listed for the same
+  # reason as the two above: the security.yml glob does not cover it.
+  - 'scripts/security/ci-scan.py'
+  # Same guard, third subject. test_retired_claims_are_not_quoted_verbatim
+  # sweeps this report for two sentences retired from security.yml's
+  # header, so the report is an INPUT to the guard and has to be able to
+  # trigger it. Caveat recorded honestly: `pull_request` above carries
+  # `paths-ignore: '**.md'`, so a REPORT.md-ONLY PR still runs nothing --
+  # this only helps a mixed PR, and `push: [main]` (unfiltered) after it.
+  # Second caveat, for the public repo: security-audit-results/ is on
+  # scripts/flip/excludes.txt, so there this glob matches nothing and is a
+  # silent no-op. Kept anyway rather than deleted -- it is load-bearing
+  # HERE, and the guard it triggers (test_retired_claims_are_not_quoted_
+  # verbatim) loses its subject in the same cut, so filter and guard die
+  # together rather than leaving a live check with a dead trigger.
+  - 'security-audit-results/**'
+  # A seventh time, same shape -- and this one arrived with the very
+  # guards it would have killed. The self-host fixes added five guards
+  # whose subjects are the root compose files (already covered by the
+  # docker-compose*.yml glob above), the prod env template, the
+  # preflight script, the flip runbook and the flip tooling. The last
+  # four matched no pattern here: a PR that re-broke
+  # scripts/preflight-prod-config.sh -- the file whose SIGPIPE defect
+  # the guard exists to catch -- would have skipped llm-service-unit
+  # and reported green.
+  # Same honest caveat as security-audit-results above: `pull_request`
+  # carries `paths-ignore: '**.md'`, so a runbook-ONLY PR still runs
+  # nothing; the markdown path helps a mixed PR and the unfiltered
+  # `push: [main]` after it. The three non-markdown paths are not
+  # subject to that.
+  # test_ci_filter_covers_every_guard_subject.py derives each guard's
+  # subjects from the guard's own source and asserts this list still
+  # matches them, so the next subject added to one of those guards
+  # cannot quietly land dead.
+  - '.env.prod.example'
+  - 'scripts/preflight-prod-config.sh'
+  - 'docs/internal/public-flip-runbook.md'
+  - 'scripts/flip/**'
+  # A seventh time, and this one's subject cannot be read out of the guard's
+  # source at all. test_doc_links_into_the_moat_are_delinked.py sweeps EVERY
+  # tracked *.md for links into the paths llm-service/oss-strip-list.txt
+  # strips -- the three that survived un-de-linked aborted the cut at
+  # check-doc-links.sh -- and test_doc_links_resolve.py reads ARCHITECTURE.md,
+  # the one pinned doc the cut keeps. Both subjects are computed from
+  # `git ls-files '*.md'`, so the census in
+  # test_ci_filter_covers_every_guard_subject.py sees no literal to match and
+  # stays green while the guards sit dead on exactly the PR shape that breaks
+  # them: a docs-only edit adding a fourth link into the moat.
+  - 'docs/**'
+  - '*.md'
+  # Same shape again, and the widest subject of any guard here.
+  # test_no_doc_promises_a_silent_gateway_db_failure.py sweeps EVERY
+  # tracked file -- not `git ls-files '*.md'` like every other doc
+  # guard -- because that markdown restriction is exactly how the
+  # retired claim survived an earlier sweep in 10 of the 12 files
+  # that carried it, all .tpl/.yaml/.sh/.py. It declares no literal
+  # path, so the census in
+  # test_ci_filter_covers_every_guard_subject.py cannot see it either.
+  # No new pattern is added for it: every tree that has ever carried
+  # the claim is already matched above (`deploy/helm/**`, `docs/**`,
+  # `*.md`, `llm-service/**`). Recorded rather than left implicit,
+  # because that coverage is a fact about today's tree, not a
+  # property of the guard -- the same claim written into, say,
+  # `api-gateway/internal/handlers/` would land on a PR this filter
+  # does not match. The unfiltered `push: [main]` after the PR is
+  # what still sweeps it.
+  # `install.sh` is the whole Docker-install acceptance path and is read by four
+  # guards (test_install_reachability, test_byo_overlays_are_complete,
+  # test_repo_slug_is_publishable, test_shipped_images_are_publishable -- 18
+  # references in the last alone). It matched no pattern here, so an
+  # install.sh-only PR ran none of them.
+  - 'install.sh'
+  # install-k8s.sh is the Kubernetes counterpart and has its own guard
+  # (test_install_k8s_defaults_work.py), which also compares its embedded
+  # connector list with shared/mcp-connectors/public/**/latest.json.
+  - 'install-k8s.sh'
+  - 'scripts/mcp_generate_compose.py'
+  # An eighth time, and the two paths are a matched pair rather than two
+  # separate subjects. test_chart_waits_for_the_dependency_that_is_fatal_to_miss.py
+  # asserts that the chart's dependency wait is opt-in, that
+  # backend-temporal-adapter opts in because it dies without Temporal, and
+  # that api-gateway does NOT because it serves the whole UI without one.
+  # The chart half is already covered by `deploy/helm/**` above; these two
+  # Go files are the halves that say WHY each side is what it is, and a PR
+  # deleting the adapter's retry -- or the gateway's tolerance that earns
+  # its exemption -- would otherwise touch nothing this filter matches.
+  - 'backend-temporal-adapter/cmd/adapter/main.go'
+  - 'api-gateway/cmd/server/main.go'
+  # A ninth time, same shape.
+  # test_both_install_paths_start_the_cdc_plane.py holds the docker
+  # and kubernetes installs to one promise: a default install can
+  # run the sync modes the UI offers. The reason there is no
+  # degraded path lives in this Go file -- the pre-flight builds its
+  # required-service list from sync_mode and demands all three CDC
+  # services together. Rename one there and the guard's premise is
+  # stale, which is precisely when it must run; every other subject
+  # it reads is already matched, so without this path that PR would
+  # skip the job.
+  - 'backend-orchestrator/internal/workers/infra_preflight.go'
+  # A tenth time, same shape, and this one spans three Go modules.
+  # test_otel_export_errors_are_collapsed.py asserts that every Go
+  # service building an OTLP exporter installs the rate-limiting
+  # error handler, and that the three byte-identical copies of that
+  # handler do not drift. They are separate modules with no shared
+  # telemetry package, so the copies stay in lockstep by that guard
+  # and nothing else -- and without these paths a PR editing one
+  # copy alone would run neither the guard nor anything else that
+  # could notice.
+  - 'backend-orchestrator/internal/telemetry/**'
+  - 'api-gateway/internal/telemetry/**'
+  - 'backend-temporal-adapter/internal/telemetry/**'
+  # An eleventh time, same shape, and the subjects are whole test
+  # trees rather than single files.
+  # test_shipped_images_are_anonymously_pullable.py sweeps every
+  # tracked file for an image behind a registry auth wall -- the
+  # defect that killed a `curl | bash` install outright when MinIO
+  # withdrew anonymous pulls from docker.io/minio/*. Most of its
+  # subjects are compose files and the chart, already matched above,
+  # but five are shell and Python scripts under these two trees that
+  # `docker run` the `mc` client directly, and neither tree matched
+  # any pattern here: the `e2e:` filter below is scoped to
+  # e2e/_support/** and gates a different job. So a PR reverting one
+  # of those lines to the Docker Hub name would have skipped
+  # llm-service-unit and reported green.
+  - 'e2e/**'
+  - 'tests/**'
+  # A twelfth time, same shape, and this one is a Go file guarded
+  # from Python. test_insecure_token_endpoint_rule_is_one_rule.py
+  # holds ALL EIGHT places that decide whether a plain-http Kafka
+  # OAuth token endpoint is refused to one rule -- the Go tier, the
+  # Python tier, the Debezium connector, the Connect entrypoint, the
+  # kafka-init script, the quickstart compose and two chart
+  # templates. Seven are matched above; shared/go/kafkaclient is not
+  # under any pattern here, and it is the tier the rule was written
+  # in first. A PR that deleted the refusal from config.go alone --
+  # the single edit that re-opens the hole this guard exists to
+  # close -- would have skipped llm-service-unit and reported green.
+  - 'shared/go/kafkaclient/**'
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+  - '.github/workflows/ci.yml'
+e2e:
+  - 'e2e/_support/**'
+  - '.github/workflows/ci.yml'
+# Data-fidelity surface: any hop that schema metadata (column_types,
+# primary_keys) must survive on its way from source to destination.
+# When any of these change, run the data-pipeline correctness gate
+# (batch + CDC). Covers every hop that source->destination data
+# fidelity, CDC ordering, and reload/resume correctness flow through.
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+datapath:
+  - 'backend-orchestrator/internal/agents/executor/**'
+  - 'backend-orchestrator/internal/agents/sentinel/**'
+  - 'backend-orchestrator/internal/cdc/**'
+  # The orchestrator packages EVERY batch run passes through between the
+  # adapter's Redis correlation hop and a connector's reply. The three above
+  # were the only orchestrator entries until 2026-09-24, so #1184 (the MCP
+  # client's StartServer cache fast path + executeViaHTTP), #1186 and #1187
+  # all changed the call every row goes through and the smoke gate reported
+  # SKIPPING -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW one module over.
+  #   workers/   executor_redis_polling.go:79 processCorrelationRequest ->
+  #              :134 w.Execute -> executor.go:95 Execute -> :165 infra
+  #              preflight -> the executor agent. Whole package, not a file
+  #              list: a file list re-creates this bug one level down.
+  #   mcp/       client.go:161 serverManager.StartServer -> :324
+  #              executeViaHTTP -- every tool call the executor makes.
+  #   kafka/     manager.go:321 kafkaclient.Topic -- qualifies the batch
+  #              data topic the sink subscribes to.
+  #   connections/     executor.go:1233 GetForUser -- src/dest configs.
+  #   connectorpaths/  server_manager.go:170 -- which connector version runs.
+  #   storage/   executor.go:3992 ParseRunMode, ExtractSchemaAndTable.
+  #   cmd/orchestrator/  main.go:569/:687 -- wires the agent and worker.
+  # Deliberately NOT listed: temporalworker/ (parked, main.go:723-731),
+  # heal/ healer/ healthwatch/ (the heal note below), intent/ registry/
+  # idempotency/ (plan a pipeline, move no rows), security/ utils/ (log
+  # redaction + SafeID only), and billing/auth/handlers/metrics/telemetry.
+  # The CDC smoke test never enters the orchestrator (it drives Kafka
+  # Connect and the sink /mcp directly), so these buy BATCH coverage.
+  # Cost over the 90 days to 2026-09-24: 18 extra smoke runs on top of 276
+  # of 805 main commits (workers 7, cmd 6, mcp 4, kafka 1). The `svc` filter's `orchestrator:
+  # backend-orchestrator/**` already rebuilds the image for all of them.
+  - 'backend-orchestrator/internal/workers/**'
+  - 'backend-orchestrator/internal/mcp/**'
+  - 'backend-orchestrator/internal/kafka/**'
+  - 'backend-orchestrator/internal/connections/**'
+  - 'backend-orchestrator/internal/connectorpaths/**'
+  - 'backend-orchestrator/internal/storage/**'
+  - 'backend-orchestrator/cmd/orchestrator/**'
+  - 'api-gateway/internal/projector/**'
+  # Pipeline WORKFLOW module. Scoped whole-module on purpose, unlike the
+  # orchestrator above: the orchestrator is a large repo with genuinely
+  # unrelated surfaces (billing, auth, registry) so it is subpath-scoped,
+  # whereas every package here exists to run pipeline workflows —
+  # workflows/ (nl_pipeline_v2_workflow.go: park/resume/chunk-continuation,
+  # i.e. reload+resume correctness), adapter/ + correlation/ (the Kafka ->
+  # workflow-signal return path; break it and every run hangs waiting for a
+  # signal that never arrives), cmd/ (worker registration — an unregistered
+  # activity is invisible to unit tests and fatal at runtime). A subpath
+  # allowlist inside this module would just re-create THIS bug one level
+  # down, which is how the module got omitted in the first place.
+  # Cost measured over the 90 days to 2026-08-08: 45 commits touched it, 15
+  # already tripped datapath via another dir, and only 10 touched none of
+  # workflows/adapter/correlation/cmd — so whole-module scoping costs ~1
+  # extra smoke run per 9 days over a narrower filter. Added 2026-08-08
+  # after #758 changed control flow at all 6 HITL park sites and the smoke
+  # gate reported SKIPPING (KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW).
+  # A skipped check is not a passing one.
+  # NB: this needs the matching `temporal_adapter` entry in the `svc`
+  # filter in data-pipeline-smoke — triggering the gate without rebuilding
+  # the image runs it against a STALE adapter (the #682 -> #687 trap below).
+  - 'backend-temporal-adapter/**'
+  # DELIBERATELY NOT LISTED: backend-orchestrator/internal/agents/heal/**.
+  # The healer is out-of-band failure recovery, not a source->destination
+  # hop: sweepCandidatesQuery (heal/worker.go:343-347) only selects
+  # executions whose status is already failed/error/silent_drop_detected/
+  # silent_partial_drop_detected/credential_check_failed, so a GREEN smoke
+  # run exercises none of it and the gate would burn 25 min of the shared
+  # serialized stack for zero signal. Its coverage is the real-Postgres
+  # suite (heal/issue_sweep_pg_test.go) plus the nightly full gate.
+  - 'shared/mcp-connectors/internal/kafka-mcp-sink/**'
+  # Debezium/Kafka-Connect SOURCE image: a change here must trigger the
+  # smoke gate so the fast PR path both tests it and refreshes the warm
+  # rsync-ci kafka-connect image (see the `kafka_connect` svc filter in
+  # data-pipeline-smoke). Omitting it let a kafka-connect-only fix merge
+  # without ever refreshing the CI warm stack (#682 -> stale image -> #687).
+  - 'shared/internal/infra/kafka-connect/**'
+  - 'shared/mcp-connectors/public/postgresql/**'
+  - 'shared/mcp-connectors/public/database/mysql/**'
+  # templates/ SHIPS publicly now -- it was promoted out of
+  # oss-strip-list.txt with the rest of the deterministic renderer, so it
+  # is the connector source a self-hosted user's scaffolder renders from.
+  # This glob is still a no-op in the public repo, but for a different
+  # reason than security-audit-results/** above: the split drops the whole
+  # data-pipeline-smoke job, so nothing there reads this filter output.
+  - 'llm-service/src/agents/tool_generator/templates/**'
+  # The PLANNER names the batch data topic, and the orchestrator hands
+  # that name to the sink as its SUBSCRIPTION -- so this directory is on
+  # the data path even though nothing in it moves a row. It is also the
+  # Python half of the two-language naming contract with
+  # shared/go/kafkaclient (src/utils/kafka_topics.py); a divergence there
+  # does not raise, it just subscribes the sink to a topic nobody writes.
+  # NB: needs the matching `planner` entry in the `svc` filter below --
+  # triggering the gate without rebuilding the image runs it against a
+  # STALE planner, which is the same trap as temporal_adapter / kafka_connect.
+  - 'llm-service/src/agents/planner/**'
+  - 'llm-service/src/utils/kafka_topics.py'
+  - 'e2e/run_gate.sh'
+  - 'e2e/test_*'
+  - '.github/workflows/ci.yml'
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+frontend:
+  - 'frontend/**'
+  # statementClassGolden.test.ts pins the Explorer classifier to the
+  # api-gateway's; a PR changing only the shared fixture must run it.
+  - 'shared/explorer_statement_class_golden.json'
+  # dataLoadingStrategyGolden.test.ts pins computeStrategySteps to the
+  # api-gateway's step builder the same way.
+  - 'shared/data_loading_strategy_golden.json'
+  # namespaceModel.test.ts pins the frontend's namespace lookup to
+  # backend-orchestrator/pkg/namespacemodel the same way, and builds
+  # its models from every connector's latest.json + metadata.json.
+  - 'shared/namespace_model_golden.json'
+  # PipelineInsightsBar.chipPrompts.test.tsx pins the chat chips' prompts
+  # to the api-gateway's diagnose routing the same way.
+  - 'shared/chat_insight_chip_prompts_golden.json'
+  - 'shared/mcp-connectors/**/latest.json'
+  - 'shared/mcp-connectors/**/versions/*/metadata.json'
+# Everything the Kafka security matrix (kafka-security-matrix job) builds,
+# mounts or renders: the three client libraries under test, the pins its
+# Python image copies, the kafka-connect image and the compose env it is
+# started with, and the harness itself.
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+  - '.github/workflows/ci.yml'
+kafkasec:
+  - 'shared/go/kafkaclient/**'
+  - 'llm-service/src/utils/kafka_security.py'
+  - 'llm-service/requirements.txt'
+  - 'llm-service/Dockerfile'
+  - 'shared/mcp-connectors/internal/debezium/**'
+  - 'shared/internal/infra/kafka-connect/**'
+  - 'docker-compose.yml'
+  - 'docker-compose.quickstart.yml'
+  - 'deploy/helm/rsync-ai/test/kind/kafka-matrix/**'
+  - 'deploy/helm/rsync-ai/test/kind/oidc/**'
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+  - '.github/workflows/ci.yml'

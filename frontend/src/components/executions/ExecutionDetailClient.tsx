@@ -19,6 +19,7 @@ import {
 } from "@/lib/api/pipelines"
 import { PreMigrationAssessmentModal } from "@/components/pipeline/PreMigrationAssessmentModal"
 import Link from "next/link"
+import { toast } from "sonner"
 
 interface Props {
   execution: {
@@ -52,7 +53,14 @@ export function ExecutionDetailClient({ execution }: Props) {
       await cancelExecution(execution.id)
       router.refresh()
     } catch (error) {
+      // A cancel that failed used to log to the console and stop. The spinner
+      // cleared, the page refreshed, and the run carried on -- which reads
+      // exactly like a cancel that worked and has not propagated yet. The one
+      // thing the user must know is that the run is STILL RUNNING.
       console.error("Failed to cancel execution:", error)
+      toast.error("Could not cancel this execution", {
+        description: `${error instanceof Error ? error.message : "The request never reached the server."} The run is still going.`,
+      })
     } finally {
       setIsCancelling(false)
     }

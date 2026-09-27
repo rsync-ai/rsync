@@ -1,6 +1,6 @@
 # CDC Exactly-Once Offset Tracking — Per-Destination Implementation Guide
 
-**Status:** Tier A implemented (PostgreSQL, MySQL, relational template) · Tier B reference impl (BigQuery adapter) · Tier C documented (implement when first object-store destination lands)
+**Status:** Tier A implemented (PostgreSQL, MySQL, relational template) · Tier B implemented (BigQuery adapter — the reference; MongoDB since 2026-09-23) · Tier C implemented (gcs, aws-s3, azure-blob)
 **Author:** AI-assisted (rahulv8)
 **Audience:** Any agent adding a **new destination connector** (data warehouse, REST/API sink, or cloud object store) that must participate in CDC exactly-once recovery.
 **Replaces:** Redis-based CDC dedup. Redis is removed from CDC correctness — the destination is the sole durable source of truth for replication progress.
@@ -180,7 +180,21 @@ skips the already-applied batch — no double-apply, even for non-idempotent sta
 
 **REFERENCE (implemented): the BigQuery adapter in**
 `shared/mcp-connectors/public/warehouse_adapters.py`. Use it as the model for Snowflake,
-Redshift, Databricks, and MongoDB adapters.
+Redshift, and Databricks adapters.
+
+**MongoDB (implemented 2026-09-23)** is the document-store worked example, and it is NOT an
+adapter — it is hand-curated, so the three offset members live directly on the connector:
+`_write_cdc_offsets` / `get_cdc_offsets` in
+`shared/mcp-connectors/public/database/mongodb/versions/v1.0.0/connector.py`, backed by an
+`_rsync_cdc_offsets` collection whose `_id` folds the `(pipeline_id, topic, kafka_partition)`
+key so Mongo's own unique index carries it, merged with `$max`. Two cautions it makes
+concrete: read `kafka_offset` from RAW `params` (`prepare_import_data` has a fixed key
+whitelist that drops out-of-band params), and keep the offsets in the CONNECTION's database
+rather than `destination_namespace` — the seed call forwards no namespace, exactly as the
+BigQuery adapter notes for its dataset. Its residual is the honest limit of Tier B: the
+keyless `import_data` append is not idempotent, so a crash between the insert and the
+best-effort offset write still duplicates that batch
+(`KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES`).
 
 Warehouse destination connectors delegate `load`/`merge`/`discover_schema`/`get_cdc_offsets`
 to `self._warehouse_adapter` (obtained via

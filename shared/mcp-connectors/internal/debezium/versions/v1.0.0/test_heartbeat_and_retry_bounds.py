@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A Debezium SOURCE must bound its retries, and a MongoDB source must heartbeat.
+"""A Debezium SOURCE must bound its retries, and MongoDB and PostgreSQL sources must heartbeat.
 
 KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL. Two independent defaults combined into a
 pipeline that reported "healthy" for three days while moving zero rows:
@@ -18,6 +18,14 @@ pipeline that reported "healthy" for three days while moving zero rows:
    MONGODB_RESUME_TOKEN_INVALID) hangs off a task reaching FAILED, so none of it
    ever ran. Measured on the live connector: 0 FAILED transitions in 24h while the
    error fired roughly ten times a minute.
+
+3. (#12) A PostgreSQL connector only commits an LSN when it emits a record. The
+   publication is FOR ALL TABLES, so writes to tables outside the pipeline are
+   decoded and filtered out; while the pipeline's own tables are quiet the slot
+   acknowledges none of it and pins that WAL on the source. On prod the committed
+   LSN stayed at 0/1F585C18 for 3.5 h over about 14.8 MB of decoded WAL, and
+   Debezium itself logged that the events "were all filtered out" and to enable
+   heartbeats. A heartbeat commits the last LSN received, filtered or not.
 
 This file is the live path. `cdc_config_generator.py` also emits a MongoDB config
 but is explicitly advisory; the config that actually starts a connector is the one
@@ -44,6 +52,7 @@ _OWNED_ENV = (
     "CDC_CONNECTOR_MAX_RETRIES",
     "CDC_CONNECTOR_RETRY_WAIT_MS",
     "CDC_MONGO_HEARTBEAT_INTERVAL_MS",
+    "CDC_PG_HEARTBEAT_INTERVAL_MS",
 )
 
 
@@ -85,7 +94,7 @@ def _relational_cfg(db_type, **overrides):
 
 
 # --------------------------------------------------------------------------
-# Heartbeats (MongoDB only)
+# Heartbeats (MongoDB and PostgreSQL)
 # --------------------------------------------------------------------------
 
 
@@ -149,17 +158,48 @@ def test_heartbeat_interval_is_a_positive_integer_of_minutes_not_hours():
     )
 
 
-@pytest.mark.parametrize("db_type", ["postgresql", "mysql", "sqlserver"])
-def test_relational_sources_get_no_heartbeat(db_type):
-    # Deliberately MongoDB-only. A PostgreSQL replication slot pins WAL on the
-    # server, so an idle Postgres source cannot lose its position the way a capped
-    # oplog does. MySQL's time-based binlog expiry is the same class of risk and is
+@pytest.mark.parametrize("db_type", ["mysql", "sqlserver"])
+def test_mysql_and_sqlserver_get_no_heartbeat(db_type):
+    # MySQL's time-based binlog expiry is the same class of risk as the oplog and is
     # tracked in BACKLOG.md rather than changed blind here. Enabling heartbeats for
-    # a relational source would also mean a topic nothing pre-creates.
+    # a source the orchestrator does not pre-create a heartbeat topic for
+    # (executor.go) would publish to a topic nothing created.
     cfg = _relational_cfg(db_type)
     assert "heartbeat.interval.ms" not in cfg
     assert "topic.heartbeat.prefix" not in cfg
     assert "heartbeat.topics.prefix" not in cfg
+
+
+@pytest.mark.parametrize("db_type", ["postgresql", "postgres"])
+def test_postgresql_source_heartbeats_by_default(db_type):
+    # #12: without a heartbeat the slot never acknowledges WAL that was decoded and
+    # filtered out, so a pipeline whose own tables are quiet pins it on the source.
+    cfg = _relational_cfg(db_type, tables=["public.orders"])
+    assert cfg["heartbeat.interval.ms"] == "300000"
+    # Both keys, one value: the naming key decides the topic (see the two-key test).
+    assert cfg["topic.heartbeat.prefix"] == "rsync.heartbeat"
+    assert cfg["heartbeat.topics.prefix"] == "rsync.heartbeat"
+
+
+def test_postgresql_heartbeat_never_writes_to_the_source():
+    # heartbeat.action.query would advance an idle slot, but it runs a write on the
+    # customer's database. rsync reads the source and nothing else.
+    cfg = _relational_cfg("postgresql")
+    assert "heartbeat.action.query" not in cfg
+
+
+def test_postgresql_heartbeat_uses_its_own_interval_variable(monkeypatch):
+    monkeypatch.setenv("CDC_PG_HEARTBEAT_INTERVAL_MS", "60000")
+    monkeypatch.setenv("CDC_MONGO_HEARTBEAT_INTERVAL_MS", "120000")
+    assert _relational_cfg("postgresql")["heartbeat.interval.ms"] == "60000"
+    assert _cfg()["heartbeat.interval.ms"] == "120000"
+
+
+def test_postgresql_takes_the_orchestrator_supplied_prefix(monkeypatch):
+    monkeypatch.setenv("KAFKA_TOPIC_PREFIX", "acme.")
+    cfg = _relational_cfg("postgresql", heartbeat_topics_prefix="acme.heartbeat")
+    assert cfg["topic.heartbeat.prefix"] == "acme.heartbeat"
+    assert cfg["heartbeat.topics.prefix"] == "acme.heartbeat"
 
 
 def test_heartbeat_prefix_is_namespaced_under_a_custom_kafka_topic_prefix(monkeypatch):

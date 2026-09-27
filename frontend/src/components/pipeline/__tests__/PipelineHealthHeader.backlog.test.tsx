@@ -63,6 +63,21 @@ describe("backlogVital", () => {
     expect(backlogVital(cdc({}, { stale_seconds: 5, pending_events: 1 }))?.text).toBe("1 change waiting")
   })
 
+  it("calls a full load's waiting rows rows, not changes", () => {
+    const load = { status: "completed", mode: "blocking", tables_total: 6, tables_done: 6, reloading_tables: 0 } as const
+    const v = backlogVital(cdc({ load: { ...load, snapshot_rows_waiting: 67_200 } }, { stale_seconds: 5, pending_events: 67_200 }))
+    expect(v?.text).toBe("67.2K rows waiting")
+    expect(v?.title).toContain("67,200 rows")
+    expect(v?.title).not.toContain("change")
+    expect(backlogVital(cdc({ load: { ...load, status: "started" } }, { stale_seconds: 5, pending_events: 1 }))?.text).toBe(
+      "1 row waiting",
+    )
+    // Once the load's rows are written, what waits is changes again.
+    expect(backlogVital(cdc({ load: { ...load, snapshot_rows_waiting: 0 } }, { stale_seconds: 5, pending_events: 12 }))?.text).toBe(
+      "12 changes waiting",
+    )
+  })
+
   it("says nothing for a zero while health is not healthy (the zero may be frozen)", () => {
     for (const health of ["degraded", "unhealthy", "unknown"] as const) {
       expect(backlogVital(cdc({ health }, { stale_seconds: 900, pending_events: 0 }))).toBeNull()

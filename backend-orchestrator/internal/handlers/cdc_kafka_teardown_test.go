@@ -35,12 +35,14 @@ func TestOwnsTopic(t *testing.T) {
 		"cdc-" + testPipelineID8 + ".inventory.orders.dlq",
 		// Debezium schema history.
 		"schemahistory.cdc-" + testPipelineID8,
-		// Incremental-snapshot signal channel (executor name and connector fallback).
+		// Incremental-snapshot signal channel (executor.go cdcSignalTopicFor).
 		"signals." + testPipelineID8,
-		"signals.cdc-" + testPipelineID8,
 		// Batch backfill.
 		"pipeline." + testPipelineID8 + ".data",
 		"pipeline." + testPipelineID8 + ".data.dlq",
+		// Debezium heartbeat (MongoDB and PostgreSQL sources), prefix first.
+		kafkaclient.Topic("heartbeat") + "." + kafkaclient.Topic("cdc-"+testPipelineID8),
+		kafkaclient.Topic("heartbeat") + ".cdc-" + testPipelineID8,
 	}
 	for _, topic := range owned {
 		if !n.ownsTopic(topic) {
@@ -61,8 +63,14 @@ func TestOwnsTopic(t *testing.T) {
 		"schemahistory.cdc-" + testPipelineID8 + "e",
 		"pipeline." + testPipelineID8 + "e.data",
 		"signals." + testPipelineID8 + "e",
-		"signals.cdc-" + testPipelineID8 + "e",
 		"signals." + otherPipelineID8,
+		// No producer mints "signals.cdc-<id8>" (connector.py refuses an incremental
+		// snapshot without a named signal topic), so teardown must not claim it either.
+		"signals.cdc-" + testPipelineID8,
+		kafkaclient.Topic("signals.cdc-" + testPipelineID8),
+		kafkaclient.Topic("heartbeat") + "." + kafkaclient.Topic("cdc-"+otherPipelineID8),
+		kafkaclient.Topic("heartbeat") + "." + kafkaclient.Topic("cdc-"+testPipelineID8+"e"),
+		kafkaclient.Topic("heartbeat") + "." + kafkaclient.Topic("cdc-"+testPipelineID8) + ".x",
 		// Missing the "." terminator entirely.
 		"pipeline." + testPipelineID8,
 		// Shared cluster infrastructure — never ours to delete.
@@ -178,7 +186,6 @@ func TestOwnsMatchesNamespaceQualifiedNames(t *testing.T) {
 		"rsync.pipeline." + testPipelineID8 + ".data",
 		"rsync.pipeline." + testPipelineID8 + ".data.dlq",
 		"rsync.signals." + testPipelineID8,
-		"rsync.signals.cdc-" + testPipelineID8,
 	}
 	for _, topic := range ownedTopics {
 		if !n.ownsTopic(topic) {

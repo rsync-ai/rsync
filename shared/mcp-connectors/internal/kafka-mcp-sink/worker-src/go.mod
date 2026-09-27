@@ -35,6 +35,7 @@ require (
 	github.com/aws/smithy-go v1.22.0 // indirect
 	github.com/klauspost/compress v1.19.1 // indirect
 	github.com/pierrec/lz4/v4 v4.1.27 // indirect
+	github.com/rsync-ai/shared/memlimit v0.0.0
 	github.com/rsync-ai/shared/pgdriver v0.0.0
 	github.com/xdg-go/pbkdf2 v1.0.0 // indirect
 	github.com/xdg-go/scram v1.2.0 // indirect
@@ -47,3 +48,5 @@ replace github.com/rsync-ai/shared/transforms => ../../../../go/transforms
 replace github.com/rsync-ai/shared/kafkaclient => ../../../../go/kafkaclient
 
 replace github.com/rsync-ai/shared/pgdriver => ../../../../go/pgdriver
+
+replace github.com/rsync-ai/shared/memlimit => ../../../../go/memlimit

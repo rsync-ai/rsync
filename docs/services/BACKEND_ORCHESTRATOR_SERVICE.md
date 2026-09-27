@@ -8,7 +8,7 @@
 
 ## Overview
 
-The Backend Orchestrator is the brain of rsync-ai - it manages pipeline state machines, coordinates worker execution, and ensures reliable data movement. It uses an event-driven architecture with Kafka for task distribution and Redis for state management.
+The Backend Orchestrator is the brain of rsync-ai - it manages pipeline state machines, coordinates worker execution, and ensures reliable data movement. Agent stages hand off through the Redis correlation store: the Temporal adapter writes one request per stage and each worker polls for its own. Kafka carries pipeline domain events and batch/CDC data, not agent requests.
 
 ---
 
@@ -16,42 +16,44 @@ The Backend Orchestrator is the brain of rsync-ai - it manages pipeline state ma
 
 ```
                      ┌─────────────────────┐
-                     │   Control Plane     │
-                     │   (Orchestrator)    │
+                     │   Temporal adapter  │
+                     │  (workflow stages)  │
                      └──────────┬──────────┘
-                                │
-              ┌─────────────────┼─────────────────┐
-              │                 │                 │
-              ▼                 ▼                 ▼
-    ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐
-    │  Kafka Broker   │ │     Redis       │ │   PostgreSQL    │
-    │ (Task Queue)    │ │ (State Store)   │ │ (Persistence)   │
-    └────────┬────────┘ └─────────────────┘ └─────────────────┘
-             │
-    ┌────────┴────────┬────────┬────────┬────────┬────────┐
-    ▼                 ▼        ▼        ▼        ▼        ▼
-┌────────┐      ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐ ┌────────┐
-│ Intent │      │Resolver│ │Discover│ │Planner │ │Validate│ │Executor│
-│ Worker │      │ Worker │ │ Worker │ │ Worker │ │ Worker │ │ Worker │
-└────────┘      └────────┘ └────────┘ └────────┘ └────────┘ └────────┘
+                                │ one request per stage
+                                ▼
+                     ┌─────────────────────┐
+                     │ Redis correlation   │
+                     │ store               │
+                     └──────────┬──────────┘
+                                │ polled by
+    ┌────────┬──────────┬───────┴──┬─────────┬─────────┬─────────┐
+    ▼        ▼          ▼          ▼         ▼         ▼         ▼
+┌──────┐ ┌──────────┐ ┌─────────┐ ┌───────┐ ┌───────┐ ┌───────┐ ┌────────┐
+│Intent│ │Capability│ │Connect- │ │Planner│ │Valid- │ │Cost   │ │Executor│
+│      │ │resolver  │ │ion val. │ │       │ │ator   │ │estim. │ │        │
+└──────┘ └──────────┘ └─────────┘ └───────┘ └───────┘ └───────┘ └────────┘
+
+Kafka (events + batch/CDC data) · PostgreSQL (persistence)
 ```
 
 ---
 
 ## Key Features
 
-### 1. Event-Driven Task Distribution
+### 1. Stage Hand-off
 
-**Kafka Topics**:
-- `task.assignments` - Control plane publishes tasks
-- `task.results` - Workers publish results
+Each worker polls the Redis correlation store for requests of its own agent type
+(the `*_redis_polling.go` files in `backend-orchestrator/internal/workers/`) and
+claims one before working on it. No worker joins a Kafka consumer group: the agent
+Kafka bus (`task.assignments`, `task.results`, `pipeline.agent.telemetry`) was removed in
+[#1227](https://github.com/rsync-ai/rsync-ai/pull/1227).
+
+**Kafka Topics** the orchestrator still uses:
 - `pipeline.domain.events` - UI real-time updates
-- `pipeline.agent.telemetry` - Debug/trace logs
+- `rsync.notifications` - Slack and email alerts
+- per-pipeline batch and CDC data topics
 
-**Consumer Groups**:
-- Each worker type has its own consumer group
-- Automatic load balancing across instances
-- At-least-once delivery guarantee
+Full catalogue: [kafka-topics.md](../architecture/kafka-topics.md).
 
 ### 2. Stateless Worker Architecture
 
@@ -60,11 +62,15 @@ Workers are stateless and horizontally scalable:
 | Worker | Responsibility | LLM Dependency |
 |--------|----------------|----------------|
 | **Intent** | Parse NL to structured intent | Yes |
-| **Resolver** | Validate connections | No |
-| **Discovery** | Fetch schemas from sources | No |
+| **Capability resolver** | Resolve connector types and the workspace | No |
+| **Connection validator** | Select and probe saved connections | No |
 | **Planner** | Generate execution plans | Yes |
 | **Validator** | Validate configurations | No |
+| **Cost estimator** | Estimate run cost | No |
 | **Executor** | Move data between systems | No |
+
+There is no separate Resolver or Discovery worker. Live schema discovery is the executor
+agent's `DiscoverSchema`, served over HTTP as `POST /agent/discover-schema`.
 
 ### 3. State Management
 
@@ -148,6 +154,9 @@ kafka.Publish("pipeline.domain.events", event)
 
 ### Resolver Worker
 
+> There is no `resolver.go` worker any more: this work is split between
+> `capability_resolver.go` and `connection_validator.go` (see the table above).
+
 **Purpose**: Validate and resolve connection references.
 
 **Input**:
@@ -179,6 +188,9 @@ kafka.Publish("pipeline.domain.events", event)
 ---
 
 ### Discovery Worker
+
+> There is no `discovery.go` worker any more: schema discovery is the executor agent's
+> `DiscoverSchema`, served as `POST /agent/discover-schema`.
 
 **Purpose**: Auto-discover schemas from data sources.
 
@@ -388,7 +400,6 @@ PORT=8081
 
 # Kafka
 KAFKA_BROKERS=localhost:9092
-KAFKA_CONSUMER_GROUP=orchestrator
 
 # Redis
 REDIS_URL=redis://localhost:6379
@@ -399,13 +410,7 @@ DATABASE_URL=postgres://user:pass@localhost:5432/rsync_db
 # LLM Service
 LLM_SERVICE_URL=http://localhost:5010
 
-# Workers
-INTENT_WORKER_COUNT=2
-RESOLVER_WORKER_COUNT=2
-DISCOVERY_WORKER_COUNT=4
-PLANNER_WORKER_COUNT=2
-VALIDATOR_WORKER_COUNT=2
-EXECUTOR_WORKER_COUNT=4
+# Workers: all 7 run in-process; there is no per-worker count variable
 
 # Observability
 OTEL_EXPORTER_ENDPOINT=localhost:14317
@@ -427,7 +432,7 @@ OTEL_EXPORTER_ENDPOINT=localhost:14317
         │               │               │
         └───────────────┼───────────────┘
                         │
-                   Kafka Broker
+              Redis correlation store
                         │
         ┌───────────────┼───────────────┐
         │               │               │
@@ -441,7 +446,7 @@ OTEL_EXPORTER_ENDPOINT=localhost:14317
 **Scaling Rules**:
 - Add orchestrator instances for API capacity
 - Add workers for processing capacity
-- Kafka partitions determine parallelism
+- Each request in the Redis correlation store is claimed by one poller
 
 ---
 
@@ -462,8 +467,8 @@ OTEL_EXPORTER_ENDPOINT=localhost:14317
 # Check worker logs
 docker-compose logs -f backend-orchestrator
 
-# Check Kafka consumer lag
-docker-compose exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --describe --group orchestrator
+# Check the stage pollers started (workers poll Redis, not Kafka)
+docker-compose logs backend-orchestrator | grep "Redis poller started"
 ```
 
 ### Workers not processing

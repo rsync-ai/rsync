@@ -735,3 +735,144 @@ func TestAssetGraph_StatementModelProducesWhatItsSQLWrites(t *testing.T) {
 		t.Errorf("m1 upstreams = %v, want [pipeline:p1]", m1.Upstreams)
 	}
 }
+
+// pipeWroteUnnamed is a stats row as the loader reads it when destination_qualified_name
+// is NULL: the captured-side qualified_name is all it can say about the table.
+func pipeWroteUnnamed(pipelineID, name, conn, sourceQualified, table string) tableProducer {
+	tp := pipeWrites(pipelineID, name, conn, "", table)
+	tp.SourceQualified = sourceQualified
+	tp.Unplaced = true
+	return tp
+}
+
+func writesFrom(g assetGraph, from string) []assetEdge {
+	var out []assetEdge
+	for _, e := range edgeKinds(g, assetEdgeWrites) {
+		if e.From == from {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+func tableNames(g assetGraph) []string {
+	var out []string
+	for _, n := range g.Nodes {
+		if n.Kind == assetKindTable {
+			out = append(out, n.Name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// KI-LINEAGE-WRITES-0-TABLES-WHEN-DEST-NAME-NULL, cause 1: an object-storage
+// destination has no namespace, so the sink never names one. The MongoDB->GCS
+// pipeline that was landing parquet read as "Writes 0 tables".
+func TestAssetGraph_ObjectStoragePipelineWritesItsTables(t *testing.T) {
+	g := buildAssetGraph(assetGraphInput{
+		Pipelines: []pipelineAsset{{ID: "p1", Name: "Mongo to GCS", ConnectionID: connB}},
+		Produced: []tableProducer{
+			pipeWroteUnnamed("p1", "Mongo to GCS", connB, "shop.orders", "orders"),
+			pipeWroteUnnamed("p1", "Mongo to GCS", connB, "shop.customers", "customers"),
+		},
+	})
+	if got := len(writesFrom(g, "pipeline:p1")); got != 2 {
+		t.Fatalf("pipeline writes %d tables, want 2 (%+v)", got, g.Edges)
+	}
+	if g.Stats.Tables != 2 {
+		t.Fatalf("Stats.Tables = %d, want 2", g.Stats.Tables)
+	}
+	if got := tableNames(g); !reflect.DeepEqual(got, []string{"shop.customers", "shop.orders"}) {
+		t.Errorf("table names = %v, want the captured names", got)
+	}
+	for _, e := range writesFrom(g, "pipeline:p1") {
+		if e.Evidence != assetEvidenceObserved {
+			t.Errorf("writes edge %+v: evidence %q, want observed", e, e.Evidence)
+		}
+	}
+}
+
+// Cause 2: a relational destination whose namespace is empty or literally "default".
+// The table is drawn, but a model on the same warehouse must not be told it reads it:
+// `orders` there is a destination-side name, and the row only knows the captured one.
+func TestAssetGraph_UnnamedTableIsDrawnButNeverMatchedByAModel(t *testing.T) {
+	g := buildAssetGraph(assetGraphInput{
+		Pipelines: []pipelineAsset{{ID: "p1", Name: "Orders CDC", ConnectionID: connA}},
+		Produced:  []tableProducer{pipeWroteUnnamed("p1", "Orders CDC", connA, "shop.orders", "orders")},
+		Models: []modelAsset{
+			{ID: "m1", Name: "Daily orders", ConnectionID: connA, SQLText: "SELECT * FROM orders"},
+			// A model that builds a bare `orders` on the same connection stays a
+			// different table: nothing proves the pipeline's rows are in it.
+			{ID: "m2", Name: "Orders copy", ConnectionID: connA, Materialization: matTable,
+				TargetTable: "orders", SQLText: "SELECT 1"},
+		},
+	})
+	if got := len(writesFrom(g, "pipeline:p1")); got != 1 {
+		t.Fatalf("pipeline writes %d tables, want 1", got)
+	}
+	if g.Stats.Tables != 2 {
+		t.Fatalf("Stats.Tables = %d, want 2 (the captured table and m2's, kept apart): %v", g.Stats.Tables, tableNames(g))
+	}
+	// m1's `orders` resolves to the table m2 builds, which is a real name on this
+	// connection — and not to the pipeline's unnamed one.
+	m1 := modelByID(t, g, "m1")
+	if !reflect.DeepEqual(m1.Upstreams, []string{"model:m2"}) {
+		t.Errorf("m1 upstreams = %v, want [model:m2]; the unnamed table must not be offered", m1.Upstreams)
+	}
+	unnamed := writesFrom(g, "pipeline:p1")[0].To
+	for _, e := range edgeKinds(g, assetEdgeReads) {
+		if e.From == unnamed {
+			t.Errorf("reads edge %+v comes from the pipeline's unnamed table", e)
+		}
+	}
+}
+
+// Cause 3: the orchestrator's cdcstats agent reports a table before the sink has
+// written it, and its events carry no destination fields. The pipeline's other,
+// named table is drawn as before, and the two are both counted.
+func TestAssetGraph_UnnamedRowBesideNamedOnesIsStillCounted(t *testing.T) {
+	named := pipeWrites("p1", "Shop CDC", connA, "analytics.orders", "orders")
+	named.SourceQualified = "shop.orders"
+	g := buildAssetGraph(assetGraphInput{
+		Pipelines: []pipelineAsset{{ID: "p1", Name: "Shop CDC", ConnectionID: connA}},
+		Produced: []tableProducer{
+			named,
+			pipeWroteUnnamed("p1", "Shop CDC", connA, "shop.customers", "customers"),
+		},
+		Models: []modelAsset{{
+			ID: "m1", Name: "Daily orders", ConnectionID: connA,
+			SQLText: "SELECT * FROM analytics.orders",
+		}},
+	})
+	if got := len(writesFrom(g, "pipeline:p1")); got != 2 {
+		t.Fatalf("pipeline writes %d tables, want 2", got)
+	}
+	if got := tableNames(g); !reflect.DeepEqual(got, []string{"analytics.orders", "shop.customers"}) {
+		t.Errorf("table names = %v", got)
+	}
+	// The named table still resolves exactly as it did before this change.
+	if m1 := modelByID(t, g, "m1"); !reflect.DeepEqual(m1.Upstreams, []string{"pipeline:p1"}) {
+		t.Errorf("m1 upstreams = %v, want [pipeline:p1]", m1.Upstreams)
+	}
+}
+
+// Cause 4: a row older than migration 089 has no destination name, and a later run
+// of the same pipeline recorded one for the same table. That is one table, not two.
+func TestAssetGraph_OldUnnamedRunDoesNotDuplicateANamedTable(t *testing.T) {
+	named := pipeWrites("p1", "Shop CDC", connA, "analytics.orders", "orders")
+	named.SourceQualified = "shop.orders"
+	g := buildAssetGraph(assetGraphInput{
+		Pipelines: []pipelineAsset{{ID: "p1", Name: "Shop CDC", ConnectionID: connA}},
+		Produced: []tableProducer{
+			pipeWroteUnnamed("p1", "Shop CDC", connA, "shop.orders", "orders"),
+			named,
+		},
+	})
+	if got := tableNames(g); !reflect.DeepEqual(got, []string{"analytics.orders"}) {
+		t.Fatalf("table names = %v, want only the named one", got)
+	}
+	if got := len(writesFrom(g, "pipeline:p1")); got != 1 {
+		t.Errorf("pipeline writes %d tables, want 1", got)
+	}
+}

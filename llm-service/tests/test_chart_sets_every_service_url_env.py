@@ -21,6 +21,24 @@ This has now happened four times (KAFKA_CONNECT_URL, TOOL_GENERATOR_URL, then
 LLM_SERVICE_URL/PLANNER_URL across three deployments, then the api-gateway and
 orchestrator internal-URL pairs). Hence a guard rather than a fourth patch.
 
+THE FALLBACK IS OFTEN RETURNED, NOT ASSIGNED
+--------------------------------------------
+A small accessor is the other common shape:
+
+    func toolGeneratorBaseURL() string {
+        if v := strings.TrimSpace(os.Getenv("TOOL_GENERATOR_URL")); v != "" {
+            return strings.TrimRight(v, "/")
+        }
+        return "http://tool-generator:5010"    // <-- no assignment target
+    }
+
+The guard first recognised only the assigned literal, so every one of these was
+invisible to it. Two got through that way: the api-gateway's KAFKA_CONNECT_URL
+and KAFKA_SINK_URL (#1185), and the temporal-adapter's TOOL_GENERATOR_URL. A
+returned literal has no variable to match on, so it closes the chain that was
+read most recently, within the same _CHAIN_GAP.
+test_the_scan_sees_return_shaped_fallbacks keeps that path from going quiet.
+
 WHY test_chart_service_hostnames_resolve.py DOES NOT COVER THIS
 ---------------------------------------------------------------
 That guard checks the inverse direction and is structurally blind here twice
@@ -87,6 +105,8 @@ _INCLUDE = re.compile(r'include\s+"([^"]+)"')
 _GETENV = re.compile(r'(\w+)\s*(?::=|=)\s*.*os\.Getenv\("([A-Z0-9_]+)"\)')
 # var = "http://host:port"               -- the terminal literal
 _BARE = re.compile(r'(\w+)\s*(?::=|=)\s*"(https?)://([A-Za-z0-9_.-]+):(\d+)')
+# return "http://host:port"              -- the terminal literal, returned
+_RETURN = re.compile(r'\breturn\s+"(https?)://([A-Za-z0-9_.-]+):(\d+)')
 # How far the literal may sit from the last Getenv and still be the same chain.
 _CHAIN_GAP = 6
 
@@ -152,9 +172,15 @@ def _chains() -> list:
                         acc[var] = (names + [name], first, i + 1)
                         continue
                     b = _BARE.search(ln)
-                    if not b:
-                        continue
-                    var, host, port = b.group(1), b.group(3), b.group(4)
+                    if b:
+                        var, host, port = b.group(1), b.group(3), b.group(4)
+                    else:
+                        r = _RETURN.search(ln)
+                        if not r or not acc:
+                            continue
+                        # No target to match on: close the chain read last.
+                        var = max(acc, key=lambda k: acc[k][2])
+                        host, port = r.group(2), r.group(3)
                     if var not in acc:
                         continue
                     names, first, last = acc.pop(var)
@@ -168,6 +194,7 @@ def _chains() -> list:
                             "chain": tuple(names),
                             "host": f"{host}:{port}",
                             "where": f"{os.path.relpath(path, REPO_ROOT)}:{first}",
+                            "shape": "assigned" if b else "returned",
                         })
     return found
 
@@ -199,6 +226,21 @@ def test_the_scan_is_not_vacuous():
         assert by_service.get(template), f"no chains found for {template}"
     multi = [c for c in CHAINS if len(c["chain"]) > 1]
     assert multi, "no multi-name chains found -- chain grouping is not working"
+
+
+def test_the_scan_sees_return_shaped_fallbacks():
+    """A floor for the returned-literal path, which the floors above cannot see.
+
+    Seven non-localhost `return "http://host:port"` fallbacks exist across the
+    three services today. If _RETURN stops matching, they all drop out of CHAINS
+    while the total stays above 30, and every test above still passes.
+    """
+    returned = [c for c in CHAINS if c["shape"] == "returned"]
+    assert len(returned) >= 5, (
+        f"only {len(returned)} return-shaped fallbacks found -- _RETURN broken? "
+        f"List them with: git grep -n -E 'return \"https?://[A-Za-z0-9_-]+:[0-9]+' "
+        f"-- '*.go' ':!*_test.go'"
+    )
 
 
 @pytest.mark.parametrize(

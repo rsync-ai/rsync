@@ -278,34 +278,6 @@ func TestTableSuggestParsePersistedSuggestions(t *testing.T) {
 	})
 }
 
-func TestTableSuggestExtractIntentText(t *testing.T) {
-	cases := []struct {
-		name string
-		in   map[string]interface{}
-		want string
-	}{
-		{"nil map", nil, ""},
-		{"empty map", map[string]interface{}{}, ""},
-		{"intent string", map[string]interface{}{"intent": "sync customer orders"}, "sync customer orders"},
-		{"user_request", map[string]interface{}{"user_request": " move users to warehouse "}, "move users to warehouse"},
-		{"prefers intent over description", map[string]interface{}{"intent": "a", "description": "b"}, "a"},
-		{"whitespace-only skipped", map[string]interface{}{"intent": "  ", "description": "fallback"}, "fallback"},
-		{
-			"nested CachedIntent shape",
-			map[string]interface{}{"intent": map[string]interface{}{"user_request": "replicate billing tables"}},
-			"replicate billing tables",
-		},
-		{"non-string values ignored", map[string]interface{}{"intent": 42, "description": true}, ""},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := extractIntentText(tc.in); got != tc.want {
-				t.Errorf("extractIntentText(%v) = %q, want %q", tc.in, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestTableSuggestAttachTableSuggestionsReusesPersistedResult(t *testing.T) {
 	// A ready result persisted by an earlier poll must be surfaced verbatim
 	// (as details.suggested_tables + suggestions_source) with the internal

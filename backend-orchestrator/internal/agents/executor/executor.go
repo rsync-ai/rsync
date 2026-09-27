@@ -18,12 +18,9 @@ import (
 	"math/rand"
 	"time"
 
-	"github.com/IBM/sarama"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
-	"go.opentelemetry.io/otel/attribute"
 
-	"github.com/rsync-ai/backend-orchestrator/internal/agents/common"
 	"github.com/rsync-ai/backend-orchestrator/internal/cdc"
 	"github.com/rsync-ai/backend-orchestrator/internal/connections"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
@@ -219,9 +216,9 @@ func loadNominatedKeys(ctx context.Context, db *sql.DB, pipelineID string) map[s
 
 // cdcInitialLoadChoice returns the EXPLICIT cdc_initial_load selection, normalized to
 // "batch", "debezium", or "" when unset. Precedence mirrors sync_mode/cdc_mode resolution:
-// task.Params["cdc_initial_load"] → pipelines.cdc_initial_load → "". Unlike
-// resolveCDCInitialLoad it does not collapse the value to a bool, so callers can distinguish
-// "explicitly debezium" (honor it) from "unset" (eligible for the resumable auto-default).
+// task.Params["cdc_initial_load"] → pipelines.cdc_initial_load → "". It returns the string,
+// not a bool, so callers can distinguish "explicitly debezium" (honor it) from "unset"
+// (eligible for the resumable auto-default).
 func cdcInitialLoadChoice(ctx context.Context, db *sql.DB, task ExecutorTask) string {
 	v := ""
 	if task.Params != nil {
@@ -233,12 +230,6 @@ func cdcInitialLoadChoice(ctx context.Context, db *sql.DB, task ExecutorTask) st
 		v = strings.ToLower(strings.TrimSpace(loadPipelineCDCInitialLoad(ctx, db, task.PipelineID)))
 	}
 	return v
-}
-
-// resolveCDCInitialLoad determines whether a CDC pipeline should use the hybrid
-// batch historical load. Returns true only for the explicit "batch" value.
-func resolveCDCInitialLoad(ctx context.Context, db *sql.DB, task ExecutorTask) bool {
-	return cdcInitialLoadChoice(ctx, db, task) == "batch"
 }
 
 // isRealNamespace reports whether s is a usable per-pipeline destination
@@ -414,7 +405,6 @@ type Agent struct {
 	mcpClient            *mcp.Client
 	mcpManager           *mcp.ServerManager
 	connectionMgr        *connections.Manager
-	heartbeatPublisher   *common.HeartbeatPublisher
 	ctx                  context.Context
 	cancel               context.CancelFunc
 	streamingPipelines   map[string]*StreamingPipelineInfo // Track long-running pipelines
@@ -426,6 +416,11 @@ type Agent struct {
 	// discoverTotalsStub is discoverSchemaStub plus the connector's table totals,
 	// for tests of the "N of M tables" path. Tests only; checked first.
 	discoverTotalsStub func(ctx context.Context, connectorType string, config map[string]interface{}) ([]TableMetadata, discoveryTotals, error)
+	// produceBatchStub answers the Kafka produce inside produceBatchWithOutbox
+	// instead of the broker, so a test can make a produce FAIL and check what the
+	// run then reports. Tests only; NewAgent never sets it, so it is nil in
+	// production.
+	produceBatchStub func(topic string, key, value []byte, headers map[string]string) error
 }
 
 // NewAgent creates a new Executor agent
@@ -442,7 +437,6 @@ func NewAgent(kafkaManager *kafka.Manager, db *sql.DB, toolsDir string) *Agent {
 		mcpClient:          mcpClient,
 		mcpManager:         mcpManager,
 		connectionMgr:      connectionMgr,
-		heartbeatPublisher: common.NewHeartbeatPublisher("executor", kafkaManager),
 		ctx:                ctx,
 		cancel:             cancel,
 		streamingPipelines: make(map[string]*StreamingPipelineInfo),
@@ -522,41 +516,6 @@ type StreamingPipelineInfo struct {
 	StartedAt       time.Time `json:"started_at"`
 	LastHealthCheck time.Time `json:"last_health_check"`
 	HealthStatus    string    `json:"health_status"` // "healthy", "unhealthy", "unknown"
-}
-
-func extractFirstTableFromPlan(planAny interface{}) string {
-	// planAny shape (common):
-	// { "plan": { "steps": [ { "method": "start_export", "params": { "table": "..." } }, ... ] } }
-	if planAny == nil {
-		return ""
-	}
-	outer, ok := planAny.(map[string]interface{})
-	if !ok || outer == nil {
-		return ""
-	}
-	// Unwrap optional "plan" wrapper
-	planObj := outer
-	if inner, ok := outer["plan"].(map[string]interface{}); ok && inner != nil {
-		planObj = inner
-	}
-	stepsAny, ok := planObj["steps"].([]interface{})
-	if !ok || stepsAny == nil {
-		return ""
-	}
-	for _, s := range stepsAny {
-		step, ok := s.(map[string]interface{})
-		if !ok || step == nil {
-			continue
-		}
-		params, ok := step["params"].(map[string]interface{})
-		if !ok || params == nil {
-			continue
-		}
-		if tbl, ok := params["table"].(string); ok && strings.TrimSpace(tbl) != "" {
-			return strings.TrimSpace(tbl)
-		}
-	}
-	return ""
 }
 
 func inferTablesFromUserRequest(userReq string, sourceConnector string, destConnector string) (sourceTable string, destTable string) {
@@ -671,19 +630,6 @@ func inferTablesFromUserRequest(userReq string, sourceConnector string, destConn
 // destination-mapping namespace validation (PR #130 / PR-C single source).
 func isStopwordTableToken(s string) bool {
 	return naming.IsSuspiciousIdentifier(s)
-}
-
-func splitQualifiedTable(table string) (schema string, name string) {
-	t := strings.TrimSpace(table)
-	if t == "" {
-		return "", ""
-	}
-	parts := strings.Split(t, ".")
-	if len(parts) < 2 {
-		return "", t
-	}
-	// Support db.schema.table etc by treating everything except the last token as "schema-ish"
-	return strings.Join(parts[:len(parts)-1], "."), parts[len(parts)-1]
 }
 
 // qualifySelectedTablesForSource normalizes the selected/`tables` list on a task
@@ -977,94 +923,6 @@ func (a *Agent) injectPlanMetadataToTask(task *ExecutorTask, meta PlanMetadata) 
 
 	log.Debugf("📋 Injected plan metadata into task: cdc_provider=%s, topic=%s",
 		meta.CDCProvider, meta.TopicName)
-}
-
-// Start starts the executor agent
-func (a *Agent) Start() error {
-	log.Info("🚀 Starting Executor Agent (Go)")
-
-	// Start heartbeat publisher
-	a.heartbeatPublisher.Start(a.ctx)
-	log.Info("📡 Executor Agent heartbeat publisher started")
-
-	// Subscribe to executor requests (consistent with other agents)
-	err := a.kafkaManager.Consume("agent.executor.requests", a.handleMessage)
-	if err != nil {
-		return fmt.Errorf("failed to start consuming: %w", err)
-	}
-
-	log.Info("✅ Executor Agent started, listening to agent.executor.requests")
-	return nil
-}
-
-// handleMessage processes incoming Kafka messages
-func (a *Agent) handleMessage(message *sarama.ConsumerMessage) error {
-	// Track message for heartbeat
-	a.heartbeatPublisher.IncrementMessagesProcessed()
-
-	// Extract headers for tracing
-	headers := make(map[string]string)
-	for _, h := range message.Headers {
-		headers[string(h.Key)] = string(h.Value)
-	}
-
-	// Create span from headers
-	ctx, span := telemetry.CreateSpanFromKafkaHeaders(context.Background(), headers, "executor.handle_message")
-	defer span.End()
-
-	log.Infof("📩 Received executor task (offset: %d) [trace_id=%s]", message.Offset, telemetry.TraceIDFromContext(ctx))
-
-	// Use smart deserialization that handles both Avro and JSON formats
-	var task ExecutorTask
-	if err := a.deserializeMessage(message.Value, &task); err != nil {
-		a.heartbeatPublisher.IncrementErrorCount()
-		log.Errorf("Failed to parse task: %v", err)
-		telemetry.RecordError(ctx, err)
-		return err
-	}
-
-	// Add task attributes to span
-	telemetry.AddSpanAttributes(ctx,
-		attribute.String("task.id", task.TaskID),
-		attribute.String("pipeline.id", task.PipelineID),
-		attribute.String("operation", task.Operation),
-	)
-
-	log.Infof("Task ID: %s, Pipeline: %s, Operation: %s", task.TaskID, task.PipelineID, task.Operation)
-
-	// Execute task with trace context propagation
-	// Context is passed through to all inner operations (MCP calls, DB queries, etc.)
-	response := a.executeTask(ctx, task)
-
-	// Publish response with trace context
-	responseJSON, _ := json.Marshal(response)
-
-	// Inject trace context into headers
-	responseHeaders := telemetry.InjectTraceToHeaders(ctx)
-
-	if err := a.kafkaManager.ProduceWithHeaders("agent.executor.responses", []byte(task.TaskID), responseJSON, responseHeaders); err != nil {
-		log.Errorf("Failed to publish response: %v", err)
-		telemetry.RecordError(ctx, err)
-		return err
-	}
-
-	if response.Status == "success" {
-		log.Infof("✅ Task %s completed successfully", task.TaskID)
-	} else {
-		// Scrub row values / PII from the connector/DB error before it hits the
-		// log stream (ships to the telemetry backend). Raw driver errors embed offending row
-		// data (e.g. "Duplicate entry 'jane@acme.com'", "Failing row contains …").
-		log.Errorf("❌ Task %s failed: %s", task.TaskID, llmscrub.Scrub(response.Error))
-	}
-
-	return nil
-}
-
-// deserializeMessage handles both Avro and JSON message formats
-// It uses the shared kafka.SmartDeserialize function which automatically
-// detects the format and deserializes accordingly
-func (a *Agent) deserializeMessage(data []byte, task *ExecutorTask) error {
-	return kafka.SmartDeserialize(data, task)
 }
 
 // executeWithOAuthRetry wraps MCP execution with OAuth token refresh on 401
@@ -2596,12 +2454,14 @@ func debeziumSafeName(s string, maxLen int) string {
 }
 
 // schemaHistoryTopicFor predicts the topic the Debezium connector configures as
-// schema.history.internal.kafka.topic for a given connector name.
+// schema.history.internal.kafka.topic for a given connector name. Only historized
+// engines have one (cdc.HistorizedEngine); PostgreSQL and MongoDB connectors never set
+// the property, so the executor creates this topic only for the others.
 //
 // This exists so the orchestrator can CREATE that topic before the connector starts.
 // Nothing else in the repo creates it: the connector sets the property but has no Kafka
 // client in its image (requirements.txt is fastapi/uvicorn/httpx), no topic.creation.*
-// policy is configured on it, and EnsureAgentControlTopics does not know the name. Until
+// policy is configured on it, and EnsurePlatformTopics does not know the name. Until
 // now it existed only because the broker auto-created it on first write — a setting this
 // platform does not own on a customer-managed cluster, and one that also decides the
 // topic's retention and cleanup policy, both of which Debezium is strict about.
@@ -2614,7 +2474,7 @@ func schemaHistoryTopicFor(connectorName string) string {
 }
 
 // heartbeatTopicsPrefix is the Go copy of _DEFAULT_HEARTBEAT_TOPICS_PREFIX passed through
-// _qualify_topic in the Debezium connector's MongoDB branch. It is product-namespaced so
+// _qualify_topic in the Debezium connector's _enable_heartbeat. It is product-namespaced so
 // the heartbeat topic lands inside the `rsync.*` grant a BYO-Kafka cluster gives us;
 // Debezium's own default (`__debezium-heartbeat`) would be refused by that ACL.
 //
@@ -2799,8 +2659,13 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 		}
 	}
 
-	// Hard-block: relational destinations require PKs for CDC correctness.
-	if normalizedDest == "postgresql" || normalizedDest == "mysql" {
+	// Hard-block: database destinations require PKs for CDC correctness —
+	// relational ones upsert/delete on the key, and so does MongoDB (a keyless
+	// table there gets a guessed key that collapses rows, or duplicates on every
+	// re-snapshot). Object storage is append-only and only warns. Keep this list
+	// in lockstep with assessor.CDCBlocksWithoutPrimaryKey and the orchestrator
+	// handler's cdcDestinationRequiresPrimaryKeys.
+	if normalizedDest == "postgresql" || normalizedDest == "mysql" || normalizedDest == "mongodb" {
 		if strings.TrimSpace(sourceConnID) == "" || sourceConnID == "auto" {
 			return ExecutorResponse{
 				TaskID:     task.TaskID,
@@ -3025,10 +2890,13 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 			log.WithFields(fields).Warn("📸 CDC snapshot strategy = blocking (non-resumable) — incremental not used; see blocking_reason")
 		}
 	}
-	incrementalSignalTopic := ""
-	if snapshotStrategy == snapshotStrategyIncremental {
-		incrementalSignalTopic = kafkaclient.Topic(fmt.Sprintf("signals.%s", utils.SafeID8(task.PipelineID)))
-	}
+	// Every PostgreSQL-family and MongoDB connector gets a Kafka signal channel, whichever
+	// snapshot strategy it starts with: it is what Re-snapshot and "backfill newly added
+	// tables" send their execute-snapshot signal through (BackfillCDCTables). The size gate
+	// above decides only how the INITIAL load runs; before this, a blocking-snapshot
+	// pipeline had no channel and both controls were refused with cdc_backfill_not_supported.
+	// MongoDB's channel only ever carries BLOCKING signals (cdcSignalTopicFor).
+	signalTopic := cdcSignalTopicFor(sourceConnector, task.PipelineID)
 
 	params := map[string]interface{}{
 		"connector_name": fmt.Sprintf("cdc-%s", utils.SafeID8(task.PipelineID)),
@@ -3038,12 +2906,14 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 		"snapshot_mode": cdcMode,
 		"tables":        tablesArg,
 	}
-	// Incremental strategy: the Debezium MCP overrides snapshot.mode=no_data and wires the
-	// Kafka signal channel; the orchestrator sends the execute-snapshot signal below, once
-	// the connector task is RUNNING.
-	if snapshotStrategy == snapshotStrategyIncremental {
-		params["snapshot_strategy"] = "incremental"
-		params["signal_kafka_topic"] = incrementalSignalTopic
+	applyCDCSignalParams(params, snapshotStrategy, signalTopic)
+	if signalTopic != "" && a.kafkaManager != nil {
+		// Create it before the connector's signal consumer first looks for it, with the
+		// short retention that keeps old signals from re-running (#23). Non-fatal: the
+		// backfill handler ensures it again before it produces.
+		if err := a.kafkaManager.EnsureSignalTopic(signalTopic); err != nil {
+			log.WithError(err).WithField("topic", signalTopic).Warn("⚠️  CDC: could not pre-create the signal topic (Re-snapshot will create it on first use)")
+		}
 	}
 	log.WithFields(log.Fields{
 		"pipeline_id":       task.PipelineID,
@@ -3415,37 +3285,61 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 	//
 	// Best-effort, matching the other two pre-creation sites in this file: a broker that
 	// still auto-creates behaves exactly as it did before.
-	shTopic := schemaHistoryTopicFor(fmt.Sprint(params["connector_name"]))
-	if a.kafkaManager != nil && strings.TrimSpace(shTopic) != "" {
-		if err := a.kafkaManager.EnsureTopicExistsWithConfig(shTopic, 1, map[string]string{
-			"cleanup.policy": "delete",
-			"retention.ms":   "-1",
-		}); err != nil {
-			log.WithError(err).WithField("topic", shTopic).
-				Warn("⚠️  Could not pre-create the Debezium schema-history topic — if the broker auto-creates it, it will inherit the broker's retention and cleanup policy, and the connector will fail on a later RESTART rather than now")
+	//
+	// Historized engines only (cdc.HistorizedEngine: MySQL/MariaDB, SQL Server, Oracle,
+	// Db2). A PostgreSQL-family or MongoDB connector keeps no schema history and emits no
+	// DDL; connector.py _HISTORIZED_ENGINES gives only the historized engines the
+	// schema.history.internal.* keys, so a history topic pre-created for any other
+	// engine is one no connector ever writes.
+	if cdc.HistorizedEngine(sourceConnector) {
+		shTopic := schemaHistoryTopicFor(fmt.Sprint(params["connector_name"]))
+		if a.kafkaManager != nil && strings.TrimSpace(shTopic) != "" {
+			if err := a.kafkaManager.EnsureTopicExistsWithConfig(shTopic, 1, map[string]string{
+				"cleanup.policy": "delete",
+				"retention.ms":   "-1",
+			}); err != nil {
+				log.WithError(err).WithField("topic", shTopic).
+					Warn("⚠️  Could not pre-create the Debezium schema-history topic — if the broker auto-creates it, it will inherit the broker's retention and cleanup policy, and the connector will fail on a later RESTART rather than now")
+			}
+		}
+		// Tell the connector the name rather than letting it re-derive one. Two independent
+		// implementations of the same naming rule that disagree would have the orchestrator
+		// create one topic and Connect write to another — a connector that works until its
+		// first restart.
+		params["schema_history_topic"] = shTopic
+
+		// And the bare topic.prefix topic (rsync.cdc-<id8>), where a historized connector
+		// publishes source DDL (include.schema.changes) and the cdcstats schema-change
+		// consumer reads it. Pre-created at 1 partition with DDLTopicConfig so neither the
+		// connector's first DDL record nor the consumer's subscription creates it at the
+		// broker's defaults. Best effort, like the history topic above.
+		if ddlTopic := debeziumTopicPrefixFor(params); a.kafkaManager != nil && ddlTopic != "" {
+			if err := a.kafkaManager.EnsureDDLTopic(ddlTopic); err != nil {
+				log.WithError(err).WithField("topic", ddlTopic).
+					Warn("⚠️  Could not pre-create the Debezium DDL topic — if the broker auto-creates it, it gets the broker's partition count and retention")
+			}
 		}
 	}
-	// Tell the connector the name rather than letting it re-derive one. Two independent
-	// implementations of the same naming rule that disagree would have the orchestrator
-	// create one topic and Connect write to another — a connector that works until its
-	// first restart.
-	params["schema_history_topic"] = shTopic
 
 	// Pre-create the Debezium HEARTBEAT topic, for the same reason and on the same terms
 	// as the schema-history topic above: nothing else creates it, and a customer-managed
 	// broker with auto-create off (or an ACL scoped to `rsync.*`) would otherwise leave
 	// the connector unable to publish heartbeats at all.
 	//
-	// MongoDB only, because that is where the connector enables heartbeats. A heartbeat
-	// commits a FRESH resume token on a timer even when the source is idle, which is what
-	// keeps the token younger than the oplog window
-	// (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL) and what gives the Sentinel's freshness
-	// watchdog a liveness beacon to measure against.
+	// MongoDB and PostgreSQL, because those are the sources the connector enables
+	// heartbeats for (connector.py _enable_heartbeat). For MongoDB a heartbeat commits a
+	// FRESH resume token on a timer even when the source is idle, which keeps the token
+	// younger than the oplog window (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL) and gives
+	// the Sentinel's freshness watchdog a liveness beacon. For PostgreSQL it commits the
+	// last LSN received, so the slot acknowledges WAL that was decoded and filtered out
+	// instead of pinning it on the source while the pipeline's own tables are quiet
+	// (#12). normalizedSource is "postgresql" for "postgres" too; the other
+	// PostgreSQL-family types are not ones connector.py builds a config for.
 	//
 	// The prefix is passed to the connector rather than left to a second, independent
 	// derivation — the same anti-drift rule as schema_history_topic: two copies of a
 	// naming rule that disagree create one topic and write to another.
-	if strings.EqualFold(normalizedSource, "mongodb") {
+	if normalizedSource == "mongodb" || normalizedSource == "postgresql" {
 		hbPrefix := heartbeatTopicsPrefix()
 		hbTopic := heartbeatTopicFor(debeziumTopicPrefixFor(params))
 		if a.kafkaManager != nil && strings.TrimSpace(hbTopic) != "" {
@@ -3456,7 +3350,7 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 				"cleanup.policy": "delete",
 			}); err != nil {
 				log.WithError(err).WithField("topic", hbTopic).
-					Warn("⚠️  Could not pre-create the Debezium heartbeat topic — if the broker does not auto-create it, the MongoDB connector cannot refresh its resume token while the source is idle, and the stream will die on a later reconnect")
+					Warn("⚠️  Could not pre-create the Debezium heartbeat topic — if the broker does not auto-create it, the connector cannot commit its position while the source is idle: a MongoDB stream dies on a later reconnect, a PostgreSQL slot keeps WAL on the source")
 			}
 		}
 		if strings.TrimSpace(hbPrefix) != "" {
@@ -3637,9 +3531,14 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 	// RUNNING first so the signal isn't dropped. This signal is the ONLY historical-backfill
 	// path for the incremental strategy, so a failure means history would be silently
 	// missing — fail the run loudly rather than reporting "running" (mirrors the sink-start
-	// failure branch above). The connector reports whether it configured this.
-	if inc, _ := startResp.Result["incremental_snapshot"].(bool); inc {
-		sigTopic := incrementalSignalTopic
+	// failure branch above). The connector reports whether it configured this, and the
+	// strategy must be ours too: every PG connector now carries a signal channel, and a
+	// connector that read "has a signal topic" as "incremental" (the Debezium MCP did,
+	// until this channel was wired for every strategy) would have a blocking-snapshot
+	// pipeline load its history twice.
+	incrementalTriggered := false
+	if inc, _ := startResp.Result["incremental_snapshot"].(bool); inc && snapshotStrategy == snapshotStrategyIncremental {
+		sigTopic := signalTopic
 		if v, _ := startResp.Result["signal_topic"].(string); strings.TrimSpace(v) != "" {
 			sigTopic = strings.TrimSpace(v)
 		}
@@ -3655,6 +3554,22 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 				PipelineID: task.PipelineID,
 				Status:     "failed",
 				Error:      fmt.Sprintf("CDC started but historical backfill (incremental snapshot) could not be triggered — history would be silently missing: %v", err),
+			}
+		}
+		incrementalTriggered = true
+	}
+
+	// Reload: re-read every table the connector captures (cdc_reload.go). An
+	// incremental snapshot this start already triggered is that full read.
+	if cdcReloadNeeded(incrementalTriggered, cdcProvider, func() storage.RunMode { return taskRunMode(ctx, a.db, task) }) {
+		if _, err := a.queueCDCReload(ctx, task, debeziumConnName, stringSliceFromResult(startResp.Result["data_collections"])); err != nil {
+			log.WithError(err).WithField("pipeline_id", task.PipelineID).
+				Error("❌ CDC Reload: re-snapshot not queued; failing the run")
+			return ExecutorResponse{
+				TaskID:     task.TaskID,
+				PipelineID: task.PipelineID,
+				Status:     "failed",
+				Error:      fmt.Sprintf("CDC restarted but the Reload could not queue its re-snapshot, so no table would be re-read: %v", err),
 			}
 		}
 	}
@@ -3938,6 +3853,13 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 	totalBytes := int64(0)
 	minioFilesCreated := 0
 	directKafkaMessages := 0
+	// Rows this run read from the source, staged, and then FAILED to put on the
+	// bus. Nothing re-reads them: produceBatchWithOutbox marks the outbox row
+	// 'failed', sumDispatchedRows counts only ('produced','acked'), and no reaper
+	// or retry ever revisits a 'failed' row. So an undelivered row is a permanently
+	// lost row, and the run must not report success over it. Guarded by accMu.
+	undeliveredRows := int64(0)
+	undeliveredBatches := 0
 	hadExportError := false
 	lastExportError := ""
 	// Graceful partial-sync: a table the source denies by PERMISSION (e.g. a
@@ -3959,31 +3881,13 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 	// run_mode handling for batch transfers:
 	// - reload: rebuild from scratch (ignore checkpoints)
 	// - resume: continue from checkpoints
-	runModeStr := ""
-	runModeProvided := false
-	if task.Params != nil {
-		if v, ok := task.Params["run_mode"].(string); ok && strings.TrimSpace(v) != "" {
-			runModeStr = v
-			runModeProvided = true
-		}
-	}
-	if !runModeProvided && task.Payload != nil {
-		if v, ok := task.Payload["run_mode"].(string); ok && strings.TrimSpace(v) != "" {
-			runModeStr = v
-			runModeProvided = true
-		}
-	}
-	if !runModeProvided && a.db != nil && task.PipelineID != "" {
-		var dbRunMode string
-		_ = a.db.QueryRow("SELECT COALESCE(default_run_mode,'') FROM pipelines WHERE id = $1", task.PipelineID).Scan(&dbRunMode)
-		if strings.TrimSpace(dbRunMode) != "" {
-			runModeStr = dbRunMode
-		}
-	}
-	runModeGlobal := storage.ParseRunMode(runModeStr)
+	runModeGlobal := taskRunMode(ctx, a.db, task)
 	if runModeGlobal == storage.RunModeReload && a.db != nil {
-		// Best-effort: clear all checkpoints for this pipeline to avoid "instant success" no-op runs.
-		_ = cdc.DeleteCheckpoints(ctx, a.db, task.PipelineID)
+		// Best-effort: clear the checkpoints of earlier runs to avoid "instant success"
+		// no-op runs. This reload's own checkpoints stay: a chunk continuation
+		// re-dispatches it with the same execution_id and resumes from them
+		// (reloadContinuesTable).
+		_ = cdc.DeleteCheckpointsNotFromExecution(ctx, a.db, task.PipelineID, executionID)
 	}
 
 	// Track per-table stats for DMS-like table statistics view.
@@ -4237,7 +4141,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 	// before any data movement. We now fan out tables across a small worker
 	// pool whose size is derived from the container's CPU and memory limits
 	// (EXECUTOR_TABLE_CONCURRENCY overrides it). It is NOT a fixed 4 -- see
-	// resolveTableConcurrency; on a memory-capped orchestrator it can be 1.
+	// resolveTableConcurrencyWithReason; on a memory-capped orchestrator it can be 1.
 	//
 	// Safety constraints baked in:
 	//   - Single-table runs short-circuit and run inline (no goroutine cost).
@@ -4254,7 +4158,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 	// Resource-aware per-table worker-pool sizing: scales with the container's CPU
 	// (GOMAXPROCS, cgroup-aware on Go 1.25+) and memory limit, so a bigger box moves
 	// more tables in parallel and a small/memory-capped box does not oversubscribe.
-	// EXECUTOR_TABLE_CONCURRENCY still overrides everything. See resolveTableConcurrency.
+	// EXECUTOR_TABLE_CONCURRENCY still overrides everything. See resolveTableConcurrencyWithReason.
 	tableConcurrency, concurrencyReason := resolveTableConcurrencyWithReason()
 	if len(tables) <= 1 {
 		tableConcurrency = 1
@@ -4291,7 +4195,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		log.Infof("🗂️ Destination schema layout: PRESERVE — mirroring %d source schema(s) at the destination (per-table namespace = source schema)", len(distinctSourceSchemas(tables)))
 	}
 
-	var accMu sync.Mutex              // guards: totalRows, totalBytes, minioFilesCreated, directKafkaMessages, hadExportError, lastExportError, perTableStats
+	var accMu sync.Mutex              // guards: totalRows, totalBytes, minioFilesCreated, directKafkaMessages, undeliveredRows, undeliveredBatches, hadExportError, lastExportError, perTableStats
 	var lastLiveMetricsEmit time.Time // guarded by accMu; throttles live DATA_PLANE_METRICS (see liveBatchMetricsDue)
 	var fatalErrMu sync.Mutex         // guards fatalErr
 	var fatalErr *ExecutorResponse    // first fatal per-table error (transform / checkpoint)
@@ -4457,7 +4361,25 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		// (the bug observed on Shopify→Postgres pipelines pre-fix).
 		// Layout v2 skips this block: the sink cleans the table folder itself when the
 		// reload's first batch arrives (a new LOAD generation).
-		if runModeGlobal == storage.RunModeReload && task.Destination != nil && objectLayoutMsg == nil {
+		// A chunk continuation of this reload already cleaned the table and wrote
+		// part of it: it resumes from its checkpoint instead of cleaning again.
+		reloadContinuing := false
+		if runModeGlobal == storage.RunModeReload && a.db != nil {
+			if cp, err := cdc.GetCheckpointForTable(ctx, a.db, task.PipelineID, tableName); err == nil && cp != nil {
+				if reloadFinishedTable(cp.Position, executionID) {
+					log.WithField("trace_id", telemetry.TraceIDFromContext(ctx)).Infof(
+						"📍 Reload continuation: table %s was finished by an earlier chunk of this reload (execution %s), skipped", tableName, executionID)
+					a.emitExecutorTableProgress(task.PipelineID, executionID, traceID, int(atomic.AddInt32(&tablesCompleted, 1)), totalTables)
+					return
+				}
+				reloadContinuing = reloadContinuesTable(cp.Position, executionID)
+			}
+		}
+		if reloadContinuing {
+			log.WithField("trace_id", telemetry.TraceIDFromContext(ctx)).Infof(
+				"📍 Reload continuation: table %s resumes from this reload's checkpoint (execution %s), no second cleanup", tableName, executionID)
+		}
+		if runModeGlobal == storage.RunModeReload && !reloadContinuing && task.Destination != nil && objectLayoutMsg == nil {
 			destType := strings.TrimSpace(task.Destination.Type)
 			looksLikeObjectStorage := destType == "minio" || strings.Contains(destType, "s3")
 			destConfig := task.Destination.Config
@@ -4612,9 +4534,41 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		// already-synced row (which keeps its old PK) could never come back.
 		var sinceCursor interface{} = nil
 		var pkHighWater interface{} = nil
-		if runModeGlobal != storage.RunModeReload {
+		// Where this table stood before this run, saved with every checkpoint so a
+		// run whose batches the sink dead-lettered can be rewound to it
+		// (cdc.RewindCheckpointsOfExecution). A reload's first dispatch has just
+		// deleted every earlier checkpoint, so it starts from none.
+		runStart := cdc.RunStartPosition(nil, executionID)
+		if runModeGlobal != storage.RunModeReload || reloadContinuing {
 			// Check for existing checkpoint (resume support for batch transfers)
 			existingCheckpoint, checkpointErr := cdc.GetCheckpointForTable(ctx, a.db, task.PipelineID, tableName)
+			if errors.Is(checkpointErr, cdc.ErrCheckpointPositionUnreadable) {
+				// A checkpoint we cannot READ is not the same as no checkpoint. Falling
+				// through to the zero values below would restart this table's sweep at
+				// batch_idx 0 / offset 0 / key_ordinal 0 with no since_cursor: a full
+				// re-read that also reuses part-000000 and overwrites the objects the
+				// previous sweep wrote. Stop instead and let an operator decide - a
+				// reload deletes the checkpoints and starts a fresh sweep on purpose.
+				resumeErr := fmt.Errorf("cannot resume table %s: %w; run a reload to discard the checkpoint and start a fresh sweep",
+					tableName, checkpointErr)
+				fatalErrMu.Lock()
+				if fatalErr == nil {
+					fatalErr = &ExecutorResponse{
+						TaskID:     task.TaskID,
+						PipelineID: task.PipelineID,
+						Status:     "failed",
+						Error:      resumeErr.Error(),
+					}
+				}
+				fatalErrMu.Unlock()
+				log.Errorf("❌ %v", resumeErr)
+				return
+			}
+			if checkpointErr == nil {
+				runStart = cdc.RunStartPosition(existingCheckpoint, executionID)
+			} else {
+				runStart = nil // unknown: never rewind this table to a guess
+			}
 			if checkpointErr == nil && existingCheckpoint != nil && existingCheckpoint.Position != nil {
 				if batchIdxVal, ok := existingCheckpoint.Position["batch_idx"].(float64); ok && batchIdxVal > 0 {
 					startBatchIdx = int(batchIdxVal)
@@ -4651,7 +4605,9 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 				// it, so the first post-deploy run behaves exactly as it did
 				// before and starts emitting the marker from then on.
 				pkHighWater = maxCursorValue(existingCheckpoint.Position["pk_high_water"], resumeCursor)
-				if tableComplete, _ := existingCheckpoint.Position["table_complete"].(bool); tableComplete {
+				// A reload continuation never starts a new sweep: a table this reload
+				// already finished resumes at its end and reads nothing more.
+				if tableComplete, _ := existingCheckpoint.Position["table_complete"].(bool); tableComplete && !reloadContinuing {
 					sinceCursor = pkHighWater
 					resumeCursor = nil
 					resumeCursorJSON = ""
@@ -4678,7 +4634,10 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 				// filter. Mirrors the equivalent translation in Path A — see
 				// the now-removed direct-transfer's checkpoint block for the
 				// reference (history) and INCREMENTAL.md §4 for the contract.
-				if mode, ok := existingCheckpoint.Position["mode"].(string); ok {
+				// Not on a reload continuation: the watermark is the one this reload
+				// has reached so far, and filtering on it would skip the rest of the
+				// table.
+				if mode, ok := existingCheckpoint.Position["mode"].(string); ok && !reloadContinuing {
 					switch mode {
 					case "cloud_incremental":
 						if modifiedSince, ok := existingCheckpoint.Position["modified_since"].(string); ok {
@@ -4769,6 +4728,9 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		var currentWatermark map[string]interface{}
 
 		for batchIdx := startBatchIdx; batchIdx < startBatchIdx+chunkBatches; batchIdx++ {
+			// Rows of THIS batch that never reached the bus; see the stop below the
+			// totals.
+			batchUndelivered := int64(0)
 			// Read data from source via MCP
 			exportReq := mcp.ExecuteRequest{
 				Connector: task.Source.Type,
@@ -4922,8 +4884,18 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 				}
 			}
 
-			// Capture next_cursor if connector provides it (keyset paging).
-			if nextCursor, ok := res["next_cursor"]; ok && nextCursor != nil {
+			// Capture next_cursor if connector provides it (keyset paging). An
+			// OFFSET-paged connector's next_cursor is the next offset, not a key:
+			// drop any cursor so advancePage steps `offset` (batch_page_cursor.go).
+			page := readPageCursor(res, rows)
+			if page.offsetPaged && cursor != nil {
+				cursor = nil
+				prevCursorJSON = ""
+			}
+			if page.highWater != nil && page.next == nil {
+				pkHighWater = maxCursorValue(pkHighWater, page.highWater)
+			}
+			if nextCursor := page.next; nextCursor != nil {
 				// Detect non-advancing cursor (prevents infinite loops)
 				if b, err := json.Marshal(nextCursor); err == nil {
 					nextJSON := string(b)
@@ -4996,6 +4968,13 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			// - Pagination (offset/cursor) must advance based on the SOURCE page size, not the transformed size.
 			// - Transforms like filter/exclude can reduce row count, including to 0.
 			sourceRowCount := len(rows)
+			if kept, dropped := dropRowsAtOrBelowSinceCursor(rows, res, sinceCursor, incrementalSince); dropped > 0 {
+				// The connector pages by key but ignored since_cursor; without this
+				// every Resume re-copied the whole table into the destination.
+				log.Warnf("  Table %s: source %s ignored since_cursor; dropped %d/%d rows at or below the previous sweep's high-water",
+					tableName, task.Source.Type, dropped, sourceRowCount)
+				rows = kept
+			}
 			transformedRows, transformErr := applyTransformsToData(ctx, a.db, executionID, rows, task, tableName)
 			if transformErr != nil {
 				// PERF-ParallelTables: cannot `return` from inside a goroutine.
@@ -5071,10 +5050,19 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 				if err != nil {
 					log.Warnf("MinIO staging failed after retry: %v - falling back to Kafka chunks", err)
 					// Fallback to chunked Kafka
-					a.sendChunkedToKafka(ctx, rows, tableName, destTableName, statsSourceTable, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode, objectLayoutMsg)
+					chunkDelivered, chunkUndelivered, chunkFailures := a.sendChunkedToKafka(ctx, rows, tableName, destTableName, statsSourceTable, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode, objectLayoutMsg)
 					accMu.Lock()
-					directKafkaMessages++
+					// Only count a direct message when something actually reached the
+					// bus. Counting it unconditionally made directKafkaMessages (and
+					// through it the "did this run use the sink lane at all?" signal)
+					// report a dispatch that never happened.
+					if chunkDelivered > 0 {
+						directKafkaMessages++
+					}
+					undeliveredRows += chunkUndelivered
+					undeliveredBatches += chunkFailures
 					accMu.Unlock()
+					batchUndelivered += chunkUndelivered
 				} else {
 					// Send claim check reference to Kafka
 					message := map[string]interface{}{
@@ -5123,7 +5111,15 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					err := a.produceBatchWithOutbox(ctx, kafkaTopic, []byte(tableName), msgBytes, headers,
 						task.PipelineID, executionID, destTableName, int64(keyOrdinal), int64(len(rows)), dataSize, "minio", claimCheckURL)
 					if err != nil {
+						// The rows are in MinIO but the claim check never reached the
+						// bus, so no consumer will ever look at that object: it is an
+						// orphan, and these rows are lost unless the run says so.
 						log.Warnf("Failed to send MinIO reference to Kafka: %v", err)
+						accMu.Lock()
+						undeliveredRows += int64(len(rows))
+						undeliveredBatches++
+						accMu.Unlock()
+						batchUndelivered += int64(len(rows))
 					} else {
 						accMu.Lock()
 						minioFilesCreated++
@@ -5144,10 +5140,15 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			} else {
 				// INLINE PATH: Send directly to Kafka
 				log.Infof("  📨 Inline payload (%d KB, inline_max=%d KB), sending directly to Kafka", dataSize/1024, inlineMax/1024)
-				a.sendChunkedToKafka(ctx, rows, tableName, destTableName, statsSourceTable, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode, objectLayoutMsg)
+				chunkDelivered, chunkUndelivered, chunkFailures := a.sendChunkedToKafka(ctx, rows, tableName, destTableName, statsSourceTable, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode, objectLayoutMsg)
 				accMu.Lock()
-				directKafkaMessages++
+				if chunkDelivered > 0 {
+					directKafkaMessages++
+				}
+				undeliveredRows += chunkUndelivered
+				undeliveredBatches += chunkFailures
 				accMu.Unlock()
+				batchUndelivered += chunkUndelivered
 			}
 
 			// Accumulate shared totals + per-table stats under the mutex.
@@ -5176,6 +5177,19 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			if fileMetrics != nil {
 				fileMetrics.ObserveTotals(tableName, snapshotTotalRows, snapshotTotalBytes)
 				_ = fileMetrics.MaybeFlush(false)
+			}
+
+			// A batch that did not fully reach the bus stops the table HERE, before
+			// its checkpoint moves past it. The checkpoint used to advance anyway, so
+			// a retry or Resume started after the lost rows, and a chunk continuation
+			// dropped the per-dispatch undelivered count before the loss gate ran:
+			// the run could complete with the batch missing. Now the run fails at the
+			// loss gate (classifyUndelivered) and the next run re-reads this batch.
+			if batchUndelivered > 0 {
+				log.WithField("trace_id", telemetry.TraceIDFromContext(ctx)).Warnf(
+					"🚨 Table %s: %d row(s) of batch %d never reached Kafka — stopping the table before its checkpoint moves past them",
+					tableName, batchUndelivered, batchIdx)
+				return
 			}
 
 			// Advance source pagination position (source rows, not transformed rows),
@@ -5229,6 +5243,12 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					"table_complete": sourceRowCount < exportBatchSize,
 					"since_cursor":   sinceCursor,
 					"pk_high_water":  pkHighWater,
+					// Which run wrote this checkpoint: a reload continuation
+					// resumes only from its own (reloadContinuesTable).
+					"execution_id": executionID,
+				}
+				if runStart != nil {
+					checkpointPosition[cdc.RunStartKey] = runStart
 				}
 
 				// Persist incremental-sync state when the connector emitted a
@@ -5403,6 +5423,31 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		return *fatalErr
 	}
 
+	// Producer-side loss gate. Runs before the ack-ledger reconciliation below
+	// because it needs neither the ledger nor a deadline: a produce failure is
+	// already proof the rows never left this process, and nothing retries them.
+	// It also runs before the chunk continuation: the undelivered count lives
+	// for one dispatch only, so a continuation returned first used to drop it.
+	// See classifyUndelivered for why this is definitive and for the reconcile
+	// hole it closes.
+	if verdict := classifyUndelivered(totalRows, undeliveredRows, undeliveredBatches); verdict.Failed {
+		log.Warnf("🚨 Produce failure: %s", verdict.Reason)
+		return ExecutorResponse{
+			TaskID:     task.TaskID,
+			PipelineID: task.PipelineID,
+			Status:     verdict.Status,
+			Error:      verdict.Reason,
+			Result: map[string]interface{}{
+				"rows_processed":      totalRows,
+				"rows_transferred":    totalRows - undeliveredRows,
+				"rows_undelivered":    undeliveredRows,
+				"undelivered_batches": undeliveredBatches,
+				"bytes_processed":     totalBytes,
+				"kafka_topic":         kafkaTopic,
+			},
+		}
+	}
+
 	// Chunked continuation: at least one table hit its per-dispatch chunk budget
 	// with more data. Every batch up to here is durably checkpointed, so return
 	// a non-error continuation signal. The Temporal workflow re-dispatches the
@@ -5506,6 +5551,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			if executionID == "" {
 				log.WithField("pipeline_id", task.PipelineID).Warn("⚠️ Dispatched via sink but execution_id is empty — ack-ledger reconciliation bypassed; destination landing unverifiable")
 			}
+			a.emitExecutorProgressEvent(task.PipelineID, traceID, buildExecutorAwaitingLandingEvent(task.PipelineID, executionID, traceID, totalTables))
 			landed, received, ackRows, sinkErr := a.reconcileLandedRows(ctx, task.PipelineID, executionID, dispatchedRows, batchAckReconcileDeadline())
 			decision := classifyLandedReconcile(dispatchedRows, landed, received, ackRows, directKafkaMessages, minioFilesCreated, outboxBatches, sinkErr, executionID)
 			landedRows = decision.LandedRows
@@ -5523,7 +5569,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					TaskID:     task.TaskID,
 					PipelineID: task.PipelineID,
 					Status:     decision.Status,
-					Error:      decision.Reason,
+					Error:      decision.Reason + rewindAfterLostBatches(ctx, a.db, task.PipelineID, executionID),
 					Result: map[string]interface{}{
 						// Whole-execution counts, matching decision.Reason: on a chunked
 						// run the failure is about every row the execution dispatched,
@@ -5598,8 +5644,8 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 	// per-table skips were only logged (above) and the run fell through to
 	// "success" → the UI showed "completed" and the missing tables were invisible.
 	// Surface it as a terminal partial drop so the skipped tables reach the user.
-	// `silent_partial_drop_detected` is already wired end-to-end: status_manager
-	// maps it to "failed", and chat-diagnose / the healer / the frontend
+	// `silent_partial_drop_detected` is already wired end-to-end: the adapter's
+	// node activities fail any status but success/completed, and chat-diagnose / the healer / the frontend
 	// "Partial Silent Drop" badge all recognize the prefix. The rows that DID land
 	// stay landed; we only change how the run is reported.
 	if len(skippedTables) > 0 {
@@ -5666,13 +5712,21 @@ func (a *Agent) stageDataToMinIO(ctx context.Context, data []map[string]interfac
 	return claimCheckURL, nil
 }
 
-// sendChunkedToKafka sends data directly to Kafka in chunks
-func (a *Agent) sendChunkedToKafka(ctx context.Context, rows []map[string]interface{}, tableName string, destTableName string, sourceTable string, dbOrSchema string, primaryKeys []string, columnTypes map[string]string, kafkaTopic string, traceID string, pipelineID string, executionID string, exportBatchIdx int, exportBatchOffset int, runMode string, objectLayout map[string]interface{}) {
+// sendChunkedToKafka splits rows into broker-sized chunks and produces each one,
+// returning how many rows reached the bus and how many did not.
+//
+// It used to return nothing and log a chunk's produce failure at Warn. The caller
+// then counted the whole batch as a direct Kafka message and added every row to
+// the run's totals, so a table whose every chunk failed to produce still reported
+// success with an empty destination. The counts are returned so the caller can
+// tell "dispatched" from "attempted and lost": see undeliveredRows in
+// executeBatchDataTransfer.
+func (a *Agent) sendChunkedToKafka(ctx context.Context, rows []map[string]interface{}, tableName string, destTableName string, sourceTable string, dbOrSchema string, primaryKeys []string, columnTypes map[string]string, kafkaTopic string, traceID string, pipelineID string, executionID string, exportBatchIdx int, exportBatchOffset int, runMode string, objectLayout map[string]interface{}) (delivered int64, undelivered int64, failedChunks int) {
 	// Target <= ~750KB per Kafka message to reduce overhead while staying below typical broker limits.
 	// (Kafka defaults vary; 1MB is common.)
 	const targetBytes = 750 * 1024
 	if len(rows) == 0 {
-		return
+		return 0, 0, 0
 	}
 
 	start := 0
@@ -5761,10 +5815,15 @@ func (a *Agent) sendChunkedToKafka(ctx context.Context, rows []map[string]interf
 		if err := a.produceBatchWithOutbox(ctx, kafkaTopic, []byte(tableName), msgBytes, headers,
 			pipelineID, executionID, destTableName, int64(batchOffset), int64(len(batch)), byteSize, "inline", ""); err != nil {
 			log.Warnf("Failed to send batch to Kafka: %v", err)
+			undelivered += int64(len(batch))
+			failedChunks++
+		} else {
+			delivered += int64(len(batch))
 		}
 
 		start = end
 	}
+	return delivered, undelivered, failedChunks
 }
 
 // liveBatchMetricsInterval is the minimum gap between two live (mid-copy)
@@ -5858,21 +5917,51 @@ func executorProgressPercent(tablesDone, totalTables int) int {
 // ProgressInfo), reporting per-table transfer progress in the executor stage's
 // 80→99 band. Pure / no-IO so the percent math + schema stay unit-testable without
 // a Kafka/projector round-trip.
+//
+// The count is of tables this executor has finished reading and queued for the sink
+// (bumped after each table's EOF marker is produced), not of tables the destination
+// has written — the sink is still writing the last of them. The message says
+// "Queued", not "Transferred": on prod (2026-09-26) "Transferred 6 of 6 tables" showed
+// while the last table was still landing rows.
 func buildExecutorTableProgressEvent(pipelineID, executionID, traceID string, tablesDone, totalTables int) map[string]interface{} {
+	return buildExecutorProgressEvent(pipelineID, executionID, traceID,
+		fmt.Sprintf("Queued %d of %d tables for writing", tablesDone, totalTables),
+		executorProgressPercent(tablesDone, totalTables))
+}
+
+// executorAwaitingLandingMessage is what the run shows while the executor waits for
+// the sink's acks to cover every dispatched row (reconcileLandedRows, up to
+// batchAckReconcileDeadline) — otherwise the last "Queued N of N tables" sits there
+// for that whole wait, reading as done.
+const executorAwaitingLandingMessage = "All tables queued — waiting for the destination to confirm every row landed"
+
+// buildExecutorAwaitingLandingEvent reports that every table is queued and the run is
+// now waiting on destination confirmation. Pure, like buildExecutorTableProgressEvent.
+func buildExecutorAwaitingLandingEvent(pipelineID, executionID, traceID string, totalTables int) map[string]interface{} {
+	return buildExecutorProgressEvent(pipelineID, executionID, traceID,
+		executorAwaitingLandingMessage, executorProgressPercent(totalTables, totalTables))
+}
+
+// buildExecutorProgressEvent is the shared STAGE_PROGRESS shape. seq is stamped here
+// the way every producer of this topic derives it (kafkaclient.DomainEventSeq): left
+// out, the projector has to invent one.
+func buildExecutorProgressEvent(pipelineID, executionID, traceID, message string, percent int) map[string]interface{} {
+	now := time.Now()
 	return map[string]interface{}{
 		"schema_version": 2,
 		"event_type":     "STAGE_PROGRESS",
 		"pipeline_id":    pipelineID,
 		"execution_id":   executionID,
 		"trace_id":       traceID,
+		"seq":            kafkaclient.DomainEventSeq(now),
 		"stage":          "executor",
 		"stage_group":    "executing",
 		"status":         "processing",
 		"summary":        "Executing pipeline",
-		"message":        fmt.Sprintf("Transferred %d of %d tables", tablesDone, totalTables),
-		"timestamp":      time.Now().UTC().Format(time.RFC3339),
+		"message":        message,
+		"timestamp":      now.UTC().Format(time.RFC3339),
 		"progress": map[string]interface{}{
-			"percent":      executorProgressPercent(tablesDone, totalTables),
+			"percent":      percent,
 			"current_step": 7,
 			"total_steps":  8,
 			"stage":        "executor",
@@ -5884,10 +5973,15 @@ func buildExecutorTableProgressEvent(pipelineID, executionID, traceID string, ta
 // Best-effort: a nil manager or marshal/produce error is swallowed — progress is
 // UX only and must never affect transfer correctness.
 func (a *Agent) emitExecutorTableProgress(pipelineID, executionID, traceID string, tablesDone, totalTables int) {
+	a.emitExecutorProgressEvent(pipelineID, traceID, buildExecutorTableProgressEvent(pipelineID, executionID, traceID, tablesDone, totalTables))
+}
+
+// emitExecutorProgressEvent publishes one executor STAGE_PROGRESS event, best-effort.
+func (a *Agent) emitExecutorProgressEvent(pipelineID, traceID string, evt map[string]interface{}) {
 	if a.kafkaManager == nil {
 		return
 	}
-	b, err := json.Marshal(buildExecutorTableProgressEvent(pipelineID, executionID, traceID, tablesDone, totalTables))
+	b, err := json.Marshal(evt)
 	if err != nil {
 		return
 	}
@@ -5975,6 +6069,15 @@ func (a *Agent) markOutboxFailed(ctx context.Context, pipelineID, executionID, t
 	return err
 }
 
+// produceBatch is the single Kafka produce behind produceBatchWithOutbox, routed
+// through produceBatchStub when a test has set one.
+func (a *Agent) produceBatch(topic string, key, value []byte, headers map[string]string) error {
+	if a.produceBatchStub != nil {
+		return a.produceBatchStub(topic, key, value, headers)
+	}
+	return a.kafkaManager.ProduceWithHeaders(topic, key, value, headers)
+}
+
 // produceBatchWithOutbox writes to outbox, produces to Kafka, then marks as produced
 // This provides at-least-once delivery semantics for batch messages
 func (a *Agent) produceBatchWithOutbox(ctx context.Context, kafkaTopic string, key []byte, value []byte, headers map[string]string,
@@ -5997,7 +6100,7 @@ func (a *Agent) produceBatchWithOutbox(ctx context.Context, kafkaTopic string, k
 	}
 
 	// Step 2: Produce to Kafka
-	err := a.kafkaManager.ProduceWithHeaders(kafkaTopic, key, value, headers)
+	err := a.produceBatch(kafkaTopic, key, value, headers)
 
 	// Step 3: Update outbox status based on result
 	if err != nil {
@@ -9023,6 +9126,14 @@ func applyTransformsToData(ctx context.Context, database *sql.DB, executionID st
 	transformedRows := rows
 	for _, t := range canonical {
 		inRows := len(transformedRows)
+		// A rule naming a column no row carries can no longer delete the batch,
+		// but it still does nothing at all, so say so rather than running silent.
+		// Checked against the rows ENTERING this step, so a column an earlier
+		// rename/select/exclude removed is caught.
+		for _, w := range transforms.MissingColumnWarnings(t.EngineTransform(), transformedRows) {
+			log.Warnf("⚠️  transform %s (order %d) on %s: %s", t.Type, t.Order, currentTable, w)
+		}
+
 		start := time.Now()
 		stepOut, stepErr := coordinator.Apply(ctx, transformedRows, []transforms.Transform{t.EngineTransform()})
 		dur := time.Since(start)
@@ -9085,10 +9196,12 @@ func upsertTransformExecutionLog(
 		return
 	}
 
-	status := "success"
+	// A step that consumed rows and emitted none is recorded as empty_output,
+	// not success: see transforms.StepStatus for why that distinction is the
+	// whole point of this column.
+	status := transforms.StepStatus(inputRows, outputRows, stepErr)
 	var errMsg interface{} = nil
 	if stepErr != nil {
-		status = "failed"
 		errMsg = stepErr.Error()
 	}
 
@@ -9139,34 +9252,9 @@ func upsertTransformExecutionLog(
 	}
 }
 
-// tableMatches checks if currentTable matches the configured table name
-// (supports both qualified "schema.table" and unqualified "table" names)
-func tableMatches(current, configured string) bool {
-	current = strings.TrimSpace(current)
-	configured = strings.TrimSpace(configured)
-
-	if current == configured {
-		return true
-	}
-
-	// Try unqualified match (e.g., "users" matches "public.users")
-	currentParts := strings.Split(current, ".")
-	configuredParts := strings.Split(configured, ".")
-
-	currentName := currentParts[len(currentParts)-1]
-	configuredName := configuredParts[len(configuredParts)-1]
-
-	return strings.EqualFold(currentName, configuredName)
-}
-
 // Stop stops the executor agent
 func (a *Agent) Stop() error {
 	log.Info("Stopping Executor Agent...")
-
-	// Stop heartbeat publisher
-	if a.heartbeatPublisher != nil {
-		a.heartbeatPublisher.Stop()
-	}
 
 	a.cancel()
 

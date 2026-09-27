@@ -1,4 +1,4 @@
-import type { ExecutionPlanStage } from "./DAGVisualization"
+import type { ExecutionPlanStage } from "./dagTypes"
 import { stageDurationMs } from "./dagHelpers"
 
 /**
@@ -83,42 +83,6 @@ export type TableStatsRollup = {
   waitingForDataTables: number
 }
 
-export function rollupTableStats(tables: TableStatRow[]): TableStatsRollup {
-  let rowsRead: number | null = null
-  let bytesCommitted: number | null = null
-  let rowsWritten = 0
-  let dlqRows = 0
-  let failedTables = 0
-  let degradedTables = 0
-  let runningTables = 0
-  let waitingForDataTables = 0
-
-  for (const t of tables) {
-    rowsWritten += rowsWrittenForTable(t)
-    dlqRows += t.dlq_rows ?? 0
-
-    if (typeof t.read_rows === "number") rowsRead = (rowsRead ?? 0) + t.read_rows
-    if (typeof t.bytes_committed === "number") bytesCommitted = (bytesCommitted ?? 0) + t.bytes_committed
-
-    if (t.status === "failed") failedTables++
-    else if (t.status === "degraded") degradedTables++
-    else if (t.status === "running") runningTables++
-    else if (t.status === TABLE_STATUS_WAITING_FOR_DATA) waitingForDataTables++
-  }
-
-  return {
-    tableCount: tables.length,
-    rowsRead,
-    rowsWritten,
-    dlqRows,
-    bytesCommitted,
-    failedTables,
-    degradedTables,
-    runningTables,
-    waitingForDataTables,
-  }
-}
-
 /** The server-computed `summary` object from GET /pipelines/:id/table-stats. */
 export type TableStatsSummaryPayload = {
   total_tables?: number
@@ -130,9 +94,24 @@ export type TableStatsSummaryPayload = {
   tables_waiting_for_data?: number
   total_read_rows?: number
   total_inserted_rows?: number
+  /**
+   * CDC change counts, captured (source) and applied (destination).
+   *
+   * Every one of these is absent when NOTHING MEASURED IT, which is a different
+   * answer from zero and must be kept different: the gateway used to publish all
+   * eight as measured zeros for a pipeline whose stats agent had never written a
+   * row, and the UI rendered a wall of "0" that reads as "my pipeline moved
+   * nothing" (computeCDCSummary, api-gateway/internal/handlers/table_stats.go).
+   * Never `?? 0` these to decide whether a pipeline is caught up.
+   */
+  total_inserts?: number
+  total_updates?: number
+  total_deletes?: number
+  total_cdc_events?: number
   total_applied_inserts?: number
   total_applied_updates?: number
   total_applied_deletes?: number
+  total_applied_cdc_events?: number
   total_dlq_rows?: number
 }
 
@@ -338,9 +317,9 @@ type EventLike = {
  * stream is the run's final shape.
  *
  * Ordering is computed here rather than trusted from the caller: the stream
- * carries two independent `seq` numbering schemes (adapter counts 1..n, the
- * orchestrator emits snowflake ids), so `seq` is not comparable across
- * producers. Timestamps are.
+ * carries two `seq` scales (producers stamp UnixNano; rows the projector
+ * numbered before #1222 carry a per-execution 1..n), so `seq` is not
+ * comparable across a stored run's rows. Timestamps are.
  */
 export function planStagesFromEvents(events: EventLike[]): ExecutionPlanStage[] {
   let best: { at: number; stages: ExecutionPlanStage[] } | null = null

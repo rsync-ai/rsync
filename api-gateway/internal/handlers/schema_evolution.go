@@ -5,10 +5,10 @@ import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
+	"api-gateway/internal/config"
 	"api-gateway/internal/security"
 
 	kafkaclient "github.com/rsync-ai/shared/kafkaclient"
@@ -111,8 +111,10 @@ func schemaDriftPolicyFromJSON(raw []byte) SchemaDriftPolicy {
 // "detection is off for this installation" instead of showing a per-pipeline
 // switch that does nothing. docker-compose.yml passes the identical value to
 // both services, and test_orchestrator_feature_flags_reach_compose.py pins that.
+// The value comes from config.SchemaDriftEnabled, the one reader of the flag in
+// this module, which also gates the rsync.healer.* publish and subscription.
 func schemaDriftDetectorEnabled() bool {
-	return os.Getenv("RSYNC_SCHEMA_DRIFT_ENABLED") == "true"
+	return config.SchemaDriftEnabled()
 }
 
 var schemaEvolutionDB *sql.DB
@@ -361,25 +363,56 @@ func approveSchemaChangeCore(ctx context.Context, database *sql.DB, kafka KafkaP
 		return true, false, nil
 	}
 
-	if kafka != nil {
-		// Qualified here because api-gateway's UnifiedProducer has no chokepoint of
-		// its own -- unlike the orchestrator's kafka.Manager, it hands the topic to
-		// the client verbatim, so the call site is the only place the namespace can
-		// be applied. The healer on the other end consumes through that Manager and
-		// therefore reads the QUALIFIED name (healer.go:168 -> manager.go:920). Left
-		// bare, a deployment with a custom KAFKA_TOPIC_PREFIX publishes every
-		// approval to a topic the healer never reads: the UI records the approval,
-		// the user is told it was applied, and the DDL is never executed.
-		_ = kafka.SendPipelineRequest(kafkaclient.Topic("rsync.healer.approved-changes"), changeID, map[string]interface{}{
-			"event_type":  "schema_change_approved",
-			"approval_id": sc.ID,
+	// rsync.healer.approved-changes exists only while schema drift is on: the
+	// orchestrator creates it, and starts the healer consumer that applies what
+	// arrives on it, only when RSYNC_SCHEMA_DRIFT_ENABLED=true. With the flag off
+	// there is nobody to apply the DDL, and a publish would auto-create the topic
+	// (the UnifiedProducer allows it) on an installation that does not provision
+	// it. Record the decision and report it as not dispatched, so the user is told
+	// to run the DDL by hand rather than that it was applied.
+	if !config.SchemaDriftEnabled() {
+		log.WithFields(log.Fields{
 			"pipeline_id": sc.PipelineID,
-			"change_type": sc.ChangeType,
-			"table_name":  sc.TableName,
-			"ddl":         sc.DDL,
-			"approved_by": reviewer,
-			"approved_at": time.Now().UTC().Format(time.RFC3339),
-		})
+			"change_id":   sc.ID,
+		}).Info("approveSchemaChangeCore: schema drift is off for this installation (RSYNC_SCHEMA_DRIFT_ENABLED) — decision recorded, not dispatched to healer")
+		return true, false, nil
+	}
+
+	// No producer, or a failed publish, is the same outcome as the record-only
+	// branches above: the healer never sees the change, so report it as not
+	// dispatched and the user is told to run the DDL. This used to discard the
+	// publish error and fall through to `dispatched`, telling the user a DDL
+	// was being applied that nobody had received.
+	if kafka == nil {
+		log.WithFields(log.Fields{
+			"pipeline_id": sc.PipelineID,
+			"change_id":   sc.ID,
+		}).Warn("approveSchemaChangeCore: no Kafka producer — decision recorded, not dispatched to healer")
+		return true, false, nil
+	}
+	// Qualified here because api-gateway's UnifiedProducer has no chokepoint of
+	// its own -- unlike the orchestrator's kafka.Manager, it hands the topic to
+	// the client verbatim, so the call site is the only place the namespace can
+	// be applied. The healer on the other end consumes through that Manager and
+	// therefore reads the QUALIFIED name (healer.go:168 -> manager.go:920). Left
+	// bare, a deployment with a custom KAFKA_TOPIC_PREFIX publishes every
+	// approval to a topic the healer never reads: the UI records the approval,
+	// the user is told it was applied, and the DDL is never executed.
+	if err := kafka.SendPipelineRequest(kafkaclient.Topic("rsync.healer.approved-changes"), changeID, map[string]interface{}{
+		"event_type":  "schema_change_approved",
+		"approval_id": sc.ID,
+		"pipeline_id": sc.PipelineID,
+		"change_type": sc.ChangeType,
+		"table_name":  sc.TableName,
+		"ddl":         sc.DDL,
+		"approved_by": reviewer,
+		"approved_at": time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		log.WithError(err).WithFields(log.Fields{
+			"pipeline_id": sc.PipelineID,
+			"change_id":   sc.ID,
+		}).Error("approveSchemaChangeCore: publish to healer failed — decision recorded, not dispatched")
+		return true, false, nil
 	}
 
 	return true, true, nil

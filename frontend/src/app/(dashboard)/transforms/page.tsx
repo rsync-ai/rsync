@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -30,26 +30,47 @@ import {
   ChevronUp,
   Eye,
   EyeOff,
+  AlertTriangle,
   Copy,
   RefreshCw
 } from "lucide-react";
 import { API_ENDPOINTS } from "@/lib/config/api";
+import { authFetch } from "@/lib/api/auth-fetch";
+import { useWorkspaceRole } from "@/contexts/WorkspaceContext";
+import { meetsRole } from "@/lib/workspace/roles";
+import {
+  fromApiTransforms,
+  isSupportedOperation,
+  SUPPORTED_OPERATIONS,
+  toEngineTransform,
+  type TransformOperation,
+  type TransformRule,
+} from "@/lib/pipeline/transformOps";
+import {
+  describeReplace,
+  isPlanDirty,
+  loadPipelineTransformPlan,
+  planFingerprint,
+  savePipelineTransformPlan,
+  type PlanRule,
+} from "@/lib/pipeline/transformPlan";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { toast } from "sonner";
 
 // Types
-interface TransformRule {
+interface PipelineOption {
   id: string;
-  order: number;
-  type: "producer" | "consumer";
-  operation: TransformOperation;
-  enabled: boolean;
-  config: Record<string, any>;
-  description?: string;
+  name: string;
 }
-
-type TransformOperation = 
-  | "filter" | "select" | "exclude" | "rename" | "mask" | "hash" 
-  | "type_convert" | "null_handle" | "truncate"
-  | "aggregate" | "join" | "enrich" | "deduplicate" | "sort" | "limit" | "sql" | "python_udf";
 
 interface TransformOperationConfig {
   name: string;
@@ -119,12 +140,13 @@ const TRANSFORM_OPERATIONS: Record<TransformOperation, TransformOperationConfig>
         { value: "partial_mask", label: "Partial Mask" },
         { value: "remove", label: "Remove" },
       ]},
+      // Only the digests hashValue() implements (shared/go/transforms/engine.go).
+      // Its default branch silently falls back to SHA-256, so SHA-512, BLAKE2 and
+      // "Custom" used to claim an algorithm that was never applied.
       { name: "hash_function", label: "Hash Function", type: "select", options: [
         { value: "sha256", label: "SHA-256" },
-        { value: "sha512", label: "SHA-512" },
-        { value: "md5", label: "MD5 (Legacy)" },
-        { value: "blake2", label: "BLAKE2" },
-        { value: "hmac_sha256", label: "HMAC-SHA256" },
+        { value: "hmac_sha256", label: "HMAC-SHA256 (keyed)" },
+        { value: "md5", label: "MD5 (legacy)" },
       ]},
     ],
   },
@@ -135,10 +157,13 @@ const TRANSFORM_OPERATIONS: Record<TransformOperation, TransformOperationConfig>
     icon: <Hash className="w-4 h-4" />,
     fields: [
       { name: "column", label: "Column", type: "text", required: true },
+      // Only the digests hashValue() implements (shared/go/transforms/engine.go).
+      // Its default branch silently falls back to SHA-256, so SHA-512, BLAKE2 and
+      // "Custom" used to claim an algorithm that was never applied.
       { name: "hash_function", label: "Hash Function", type: "select", options: [
         { value: "sha256", label: "SHA-256" },
-        { value: "sha512", label: "SHA-512" },
-        { value: "custom", label: "Custom" },
+        { value: "hmac_sha256", label: "HMAC-SHA256 (keyed)" },
+        { value: "md5", label: "MD5 (legacy)" },
       ]},
     ],
   },
@@ -149,14 +174,17 @@ const TRANSFORM_OPERATIONS: Record<TransformOperation, TransformOperationConfig>
     icon: <ArrowRight className="w-4 h-4" />,
     fields: [
       { name: "column", label: "Column", type: "text", required: true },
+      // Only the targets convertValue implements (shared/go/transforms/engine.go).
+      // "Date" used to sit here and had no case at all: validateConfig rejected
+      // it outright ("unsupported target type"), so the option could be picked
+      // and never saved. Its companion "Format (for dates)" field was read by
+      // nothing in either engine and went with it.
       { name: "to_type", label: "Target Type", type: "select", options: [
         { value: "string", label: "String" },
         { value: "integer", label: "Integer" },
         { value: "float", label: "Float" },
         { value: "boolean", label: "Boolean" },
-        { value: "date", label: "Date" },
       ]},
-      { name: "format", label: "Format (for dates)", type: "text", placeholder: "YYYY-MM-DD" },
     ],
   },
   null_handle: {
@@ -166,12 +194,16 @@ const TRANSFORM_OPERATIONS: Record<TransformOperation, TransformOperationConfig>
     icon: <Settings className="w-4 h-4" />,
     fields: [
       { name: "column", label: "Column", type: "text", required: true },
+      // Only the two strategies the engine actually has (shared/go/transforms/
+      // engine.go applyNullHandle: "default"/"fill"/"fill_default", or "drop_row").
+      // A third option, "Raise Error", used to sit here and was mapped to drop_row
+      // on the way out — it silently dropped the row it promised to complain about.
       { name: "action", label: "Action", type: "select", options: [
         { value: "default", label: "Replace with Default" },
-        { value: "skip", label: "Skip Row" },
-        { value: "error", label: "Raise Error" },
+        { value: "skip", label: "Drop Row" },
       ]},
-      { name: "default_value", label: "Default Value", type: "text" },
+      // Required because strategy=default without it is rejected by the validator.
+      { name: "default_value", label: "Default Value", type: "text", required: true },
     ],
   },
   truncate: {
@@ -274,6 +306,20 @@ const TRANSFORM_OPERATIONS: Record<TransformOperation, TransformOperationConfig>
   },
 };
 
+// Producer vs consumer is WHERE a rule runs, not WHAT it can do. The batch executor
+// reads the producer rows and the CDC sink reads the consumer rows, but both build the
+// same engine (kafka-sink-worker/main.go: NewSimpleTransformEngine +
+// NewTransformCoordinator). So every supported operation is offered on both sides —
+// the old split, which reserved the "complex" operations for the consumer tab, left a
+// CDC-only pipeline with zero transforms it could actually author.
+const SUPPORTED_OPERATION_LIST = (Object.keys(TRANSFORM_OPERATIONS) as TransformOperation[])
+  .filter(isSupportedOperation);
+
+// Uses the set rather than isSupportedOperation, whose `op is TransformOperation`
+// guard would narrow the negative branch to never.
+const UNSUPPORTED_OPERATION_LIST = (Object.keys(TRANSFORM_OPERATIONS) as TransformOperation[])
+  .filter((op) => !SUPPORTED_OPERATIONS.has(op));
+
 export default function TransformBuilderPage() {
   const [transforms, setTransforms] = useState<TransformRule[]>([]);
   const [nlQuery, setNlQuery] = useState("");
@@ -295,15 +341,55 @@ export default function TransformBuilderPage() {
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  // WHICH PIPELINE THIS PLAN BELONGS TO.
+  // The builder had no answer to that question, which is why "Save Plan" had
+  // nowhere to POST and shipped with no onClick at all: the save endpoint is
+  // per-pipeline (POST /api/v1/transforms/pipeline/:pipeline_id).
+  const [pipelines, setPipelines] = useState<PipelineOption[]>([]);
+  // Arriving from a pipeline's Transforms tab, which links here as
+  // /transforms?pipeline=<id>. Held until the pipeline list arrives, then applied
+  // by the effect below — and only if the id is really in that list, so a
+  // hand-edited URL cannot aim the builder at a pipeline in another workspace.
+  const [wantedPipeline] = useState<string | null>(() =>
+    typeof window === "undefined"
+      ? null
+      : new URLSearchParams(window.location.search).get("pipeline")
+  );
+  // A ref, not state: this is a one-shot latch, and flipping state inside the
+  // effect below would just cause another render to do nothing with.
+  const appliedWantedPipeline = useRef(false);
+  const [pipelineId, setPipelineId] = useState("");
+  const [existingRules, setExistingRules] = useState<PlanRule[]>([]);
+  const [planError, setPlanError] = useState<string | null>(null);
+  const [planLoading, setPlanLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  // The plan as the server last confirmed it. Everything built since is unsaved,
+  // and the builder used to have no way to know that -- so it discarded work on
+  // a reload, a back button, or a change of pipeline without ever saying so.
+  const [savedFingerprint, setSavedFingerprint] = useState(() => planFingerprint([]));
+  // A pipeline the operator picked while the builder was dirty, held until they
+  // answer whether the unsaved plan may be thrown away.
+  const [pendingPipelineId, setPendingPipelineId] = useState<string | null>(null);
+
+  const { role } = useWorkspaceRole();
+  // Mirrors requirePipelineWorkspaceRole(..., security.WSMember) on the save
+  // handler. roleRank returns 0 for an unknown role, so this is false while the
+  // workspace context is still loading rather than briefly true.
+  const canSave = meetsRole(role, "member");
+
   const producerTransforms = transforms.filter(t => t.type === "producer");
   const consumerTransforms = transforms.filter(t => t.type === "consumer");
 
-  const addTransform = (operation: TransformOperation) => {
+  // `side` comes from the tab the operator was on, not from the operation, because the
+  // same operation is legal on both paths — see SUPPORTED_OPERATION_LIST above.
+  const addTransform = (operation: TransformOperation, side: "producer" | "consumer") => {
+    if (!isSupportedOperation(operation)) return;
     const config = TRANSFORM_OPERATIONS[operation];
     const newTransform: TransformRule = {
       id: crypto.randomUUID(),
       order: transforms.length,
-      type: config.type,
+      type: side,
       operation,
       enabled: true,
       config: {},
@@ -339,12 +425,154 @@ export default function TransformBuilderPage() {
     setTransforms(newTransforms);
   };
 
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const res = await authFetch(`${API_ENDPOINTS.PIPELINES.LIST}?limit=200&offset=0`, {
+          cache: "no-store",
+        });
+        if (cancelled || !res.ok) return;
+        const data = await res.json();
+        if (cancelled) return;
+        const list = Array.isArray(data) ? data : data.pipelines || [];
+        const options: PipelineOption[] = list.map((p: Record<string, unknown>) => ({
+          id: String(p.id ?? ""),
+          name: String(p.name ?? p.id ?? ""),
+        })).filter((p: PipelineOption) => p.id);
+        setPipelines(options);
+      } catch {
+        // The selector stays empty and Save Plan stays disabled. Building and
+        // previewing a plan still works, which is what the page did before.
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const isRenderable = (operation: string) =>
+    Object.prototype.hasOwnProperty.call(TRANSFORM_OPERATIONS, operation);
+
+  // Rules the builder has no card for — most importantly `mask_pii`, which the
+  // natural-language pipeline setup materializes and which is NOT one of this
+  // page's operations. They are carried through the save untouched instead of
+  // being dropped, because the save is a whole-plan replace: anything left out
+  // of the request is deleted, and deleting a mask makes the next run copy
+  // those columns to the destination in the clear.
+  const carryOver = existingRules.filter((r) => !isRenderable(r.operation));
+  const nextRules: PlanRule[] = [...transforms, ...carryOver];
+
+  // Choosing a pipeline REPLACES the builder contents with that pipeline's
+  // current plan. Editing has to start from what is really stored, or the first
+  // save silently deletes rows the operator never saw.
+  const selectPipeline = async (id: string) => {
+    setPipelineId(id);
+    setPlanError(null);
+    setPlanLoading(true);
+    try {
+      const out = await loadPipelineTransformPlan(id);
+      if (!out.ok) {
+        setPlanError(out.error);
+        setExistingRules([]);
+        return;
+      }
+      setExistingRules(out.data);
+      const loaded = 
+        out.data
+          .filter((r) => isRenderable(r.operation))
+          .map((r, i) => ({
+            id: r.id,
+            order: i,
+            type: r.type,
+            operation: r.operation as TransformOperation,
+            enabled: r.enabled,
+            config: r.config as Record<string, any>,
+            description: r.description,
+          }));
+      setTransforms(loaded);
+      // What is on screen now IS what is stored, so this is the baseline every
+      // later edit is measured against.
+      setSavedFingerprint(planFingerprint(loaded));
+      setEditingTransform(null);
+    } finally {
+      setPlanLoading(false);
+    }
+  };
+
+  // Picking a pipeline REPLACES the builder contents. That is correct -- editing
+  // has to start from what is really stored -- but doing it over unsaved work
+  // without asking is how a freshly generated plan disappeared.
+  const requestSelectPipeline = (id: string) => {
+    if (id === pipelineId) return;
+    if (isPlanDirty(savedFingerprint, transforms)) {
+      setPendingPipelineId(id);
+      return;
+    }
+    void selectPipeline(id);
+  };
+
+  useEffect(() => {
+    if (appliedWantedPipeline.current || !wantedPipeline) return;
+    if (!pipelines.some((p) => p.id === wantedPipeline)) return;
+    appliedWantedPipeline.current = true;
+    // selectPipeline sets state, which is the point: the builder has to be loaded
+    // with that pipeline's stored plan on arrival. The latch keeps it to one run.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    void selectPipeline(wantedPipeline);
+    // selectPipeline is re-created on every render, so naming it as a dependency
+    // would re-fire this on every render; the latch above makes that moot either
+    // way, and the operator's own selection must not be overwritten afterwards.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wantedPipeline, pipelines]);
+
+  const dirty = isPlanDirty(savedFingerprint, transforms);
+
+  // The browser's own guard. It is the only thing that can stop a reload or a
+  // closed tab, and the builder had none: everything since the last save went
+  // without a prompt. The message is the browser's -- Chrome and Firefox ignore
+  // a custom one -- so the visible "Unsaved changes" marker below carries the
+  // detail.
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
+
+  const savePlan = async () => {
+    if (!pipelineId) return;
+    setSaving(true);
+    try {
+      const out = await savePipelineTransformPlan(pipelineId, nextRules);
+      if (!out.ok) {
+        toast.error(out.error);
+        return;
+      }
+      setConfirmOpen(false);
+      toast.success(
+        `Saved ${out.data.count} ${out.data.count === 1 ? "transform" : "transforms"} to this pipeline.`
+      );
+      // Re-read: the server mints ids for new rows and renumbers transform_order,
+      // so the builder would otherwise be one save behind the stored plan.
+      await selectPipeline(pipelineId);
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const parseNaturalLanguage = async () => {
     if (!nlQuery.trim()) return;
     
     setLoading(true);
     try {
-      const res = await fetch(`${API_ENDPOINTS.API_GATEWAY_URL}/api/v1/transforms/parse`, {
+      // authFetch, not fetch: /api/v1 is behind AuthRequiredMiddleware and
+      // CSRFMiddleware, so a bare POST here was a 401/403 every time — and the
+      // `if (res.ok)` below turned that into a silent no-op.
+      const res = await authFetch(`/api/v1/transforms/parse`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ natural_language: nlQuery }),
@@ -352,102 +580,34 @@ export default function TransformBuilderPage() {
 
       if (res.ok) {
         const data = await res.json();
-        if (data.transforms) {
-          setTransforms(data.transforms);
+        const parsed = fromApiTransforms(data?.transforms);
+        if (parsed.length > 0) {
+          // Append, don't replace: the old code overwrote whatever the operator had
+          // already built, and Generate is a starting point, not a whole plan.
+          setTransforms((prev) => [
+            ...prev,
+            ...parsed.map((r, i) => ({
+              ...r,
+              order: prev.length + i,
+              description: TRANSFORM_OPERATIONS[r.operation]?.description,
+            })),
+          ]);
+          setNlQuery("");
+        } else {
+          toast.error(
+            "Nothing recognizable in that sentence. Try naming a column and one of: filter, mask, hash, rename, select, exclude."
+          );
         }
+      } else {
+        const body = await res.json().catch(() => null);
+        toast.error(body?.error || body?.message || `Could not parse that (HTTP ${res.status}).`);
       }
     } catch (error) {
+      toast.error("The API is unreachable.");
       console.error("Failed to parse NL query:", error);
     } finally {
       setLoading(false);
     }
-  };
-
-  const toEngineTransform = (t: TransformRule): Record<string, any> | null => {
-    if (!t.enabled) return null;
-
-    const cfg: Record<string, any> = { ...(t.config || {}) };
-    const op = t.operation;
-
-    // Map UI operations → engine transform types.
-    let type = "";
-    switch (op) {
-      case "filter":
-        type = "filter";
-        break;
-      case "select":
-        type = "select_columns";
-        break;
-      case "exclude":
-        type = "exclude_columns";
-        break;
-      case "rename":
-        type = "rename_columns";
-        break;
-      case "mask":
-        type = "mask_pii";
-        break;
-      case "type_convert":
-        type = "type_convert";
-        // UI uses to_type; engine expects to
-        if (cfg["to"] == null && cfg["to_type"] != null) cfg["to"] = cfg["to_type"];
-        delete cfg["to_type"];
-        break;
-      case "null_handle":
-        type = "null_handle";
-        // UI uses action; engine expects strategy
-        if (cfg["strategy"] == null && cfg["action"] != null) {
-          const action = String(cfg["action"] || "").toLowerCase();
-          if (action === "default") cfg["strategy"] = "default";
-          else cfg["strategy"] = "drop_row";
-        }
-        delete cfg["action"];
-        break;
-      case "truncate":
-        type = "truncate";
-        break;
-      default:
-        return null;
-    }
-
-    // Normalize a few config field shapes to match backend validator/engine expectations.
-    if (type === "select_columns" || type === "exclude_columns") {
-      if (typeof cfg["columns"] === "string") {
-        cfg["columns"] = String(cfg["columns"])
-          .split(",")
-          .map((s) => s.trim())
-          .filter(Boolean);
-      }
-    }
-
-    if (type === "rename_columns") {
-      // UI captures mappings as "a:b, c:d" string; engine expects map.
-      if (typeof cfg["mappings"] === "string") {
-        const mappings: Record<string, string> = {};
-        for (const pair of String(cfg["mappings"]).split(",")) {
-          const p = pair.trim();
-          if (!p) continue;
-          const [from, to] = p.split(":").map((s) => s.trim());
-          if (from && to) mappings[from] = to;
-        }
-        cfg["mappings"] = mappings;
-      }
-    }
-
-    if (type === "truncate") {
-      if (typeof cfg["max_length"] === "string") {
-        const n = Number(cfg["max_length"]);
-        if (!Number.isNaN(n)) cfg["max_length"] = n;
-      }
-    }
-
-    return {
-      id: t.id,
-      order: t.order,
-      enabled: t.enabled,
-      type,
-      config: cfg,
-    };
   };
 
   const previewTransformations = async () => {
@@ -470,7 +630,9 @@ export default function TransformBuilderPage() {
         .map(toEngineTransform)
         .filter((t0): t0 is Record<string, any> => Boolean(t0));
 
-      const res = await fetch(`${API_ENDPOINTS.API_GATEWAY_URL}/api/v1/transforms/preview`, {
+      // Same gate as /transforms/parse above — this needs the auth and CSRF
+      // headers authFetch attaches.
+      const res = await authFetch(`/api/v1/transforms/preview`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ transforms: engineTransforms, sample_data: sampleRows }),
@@ -504,38 +666,71 @@ export default function TransformBuilderPage() {
         className={`mb-3 ${transform.enabled ? "" : "opacity-50"} ${isExpanded ? "ring-2 ring-blue-500" : ""}`}
       >
         <CardContent className="pt-4">
-          <div className="flex items-center gap-3">
-            <div className="cursor-move text-muted-foreground">
+          <div className="flex items-center gap-3" data-testid="transform-card-row">
+            <div className="cursor-move text-muted-foreground shrink-0">
               <GripVertical className="w-5 h-5" />
             </div>
             
-            <div className="flex-1">
-              <div className="flex items-center gap-2">
+            {/* min-w-0 is load-bearing, not tidying. A flex child defaults to
+                min-width:auto, so this block could not shrink below the
+                intrinsic width of the badge + operation name, and the button
+                group to its right was pushed clean out of the card: measured on
+                app.rsync.ai, "Rename Columns" overflowed by 125px, which put
+                its settings and delete buttons past the card edge where no
+                pointer could reach them. The name truncates; the controls stay. */}
+            <div className="flex-1 min-w-0" data-testid="transform-card-title">
+              {/* The name has its line to itself. With the badges beside it, every
+                  sibling was shrink-0, so the name was the only thing that could
+                  give way and on a narrow card it reached 0px — worst on the card
+                  whose badge says to remove it. The badges wrap on the line below;
+                  a floor on the name instead would push the controls off-card
+                  again (#1166). The full name is on hover too. */}
+              <div className="flex items-center gap-2 min-w-0 font-medium" data-testid="transform-card-name">
+                <span className="shrink-0">{config.icon}</span>
+                <span className="truncate" title={config.name}>{config.name}</span>
+              </div>
+              <div className="mt-1 flex flex-wrap items-center gap-2" data-testid="transform-card-badges">
                 <Badge variant="outline" className={transform.type === "producer" ? "border-blue-500 text-blue-500" : "border-green-500 text-green-500"}>
                   {transform.type}
                 </Badge>
-                <span className="font-medium flex items-center gap-2">
-                  {config.icon}
-                  {config.name}
-                </span>
+                {/* A plan saved before the dialog stopped offering these still
+                    loads here, and the save now refuses the whole plan while one
+                    is present. Say which card is the problem instead of leaving
+                    the operator to guess at a 400. */}
+                {!isSupportedOperation(transform.operation) && (
+                  <Badge variant="destructive" className="text-[10px]">
+                    No engine can run this — remove it to save
+                  </Badge>
+                )}
               </div>
               {!isExpanded && Object.keys(transform.config).length > 0 && (
                 <p className="text-sm text-muted-foreground mt-1 truncate">
-                  {JSON.stringify(transform.config).slice(0, 50)}...
+                  {JSON.stringify(transform.config)}
                 </p>
               )}
             </div>
 
-            <div className="flex items-center gap-2">
+            {/* Every control here is icon-only, so without a label it has no
+                accessible name at all: a screen reader announced five bare
+                "button"s per card, and with several cards open nothing said
+                which rule any of them belonged to. The name goes IN the label
+                rather than relying on the adjacent title cell, because that
+                cell truncates. `title` carries the same string so the meaning
+                is available on hover too, not only to assistive tech. */}
+            <div className="flex items-center gap-2 shrink-0" data-testid="transform-card-controls">
               <Switch
                 checked={transform.enabled}
                 onCheckedChange={(checked) => updateTransform(transform.id, { enabled: checked })}
+                aria-label={`${transform.enabled ? "Disable" : "Enable"} ${config.name}`}
+                title={`${transform.enabled ? "Disable" : "Enable"} ${config.name}`}
               />
               <Button
                 variant="ghost"
                 size="icon"
                 onClick={() => moveTransform(transform.id, "up")}
                 disabled={index === 0}
+                aria-label={`Move ${config.name} earlier`}
+                title={`Move ${config.name} earlier`}
               >
                 <ChevronUp className="w-4 h-4" />
               </Button>
@@ -544,6 +739,8 @@ export default function TransformBuilderPage() {
                 size="icon"
                 onClick={() => moveTransform(transform.id, "down")}
                 disabled={index === transforms.filter(t => t.type === transform.type).length - 1}
+                aria-label={`Move ${config.name} later`}
+                title={`Move ${config.name} later`}
               >
                 <ChevronDown className="w-4 h-4" />
               </Button>
@@ -551,6 +748,9 @@ export default function TransformBuilderPage() {
                 variant="ghost"
                 size="icon"
                 onClick={() => setEditingTransform(isExpanded ? null : transform)}
+                aria-expanded={isExpanded}
+                aria-label={isExpanded ? `Hide ${config.name} settings` : `Edit ${config.name} settings`}
+                title={isExpanded ? `Hide ${config.name} settings` : `Edit ${config.name} settings`}
               >
                 <Settings className="w-4 h-4" />
               </Button>
@@ -559,6 +759,8 @@ export default function TransformBuilderPage() {
                 size="icon"
                 className="text-red-500 hover:text-red-600"
                 onClick={() => removeTransform(transform.id)}
+                aria-label={`Remove ${config.name}`}
+                title={`Remove ${config.name}`}
               >
                 <Trash2 className="w-4 h-4" />
               </Button>
@@ -645,17 +847,102 @@ export default function TransformBuilderPage() {
             Define data transformations using natural language or visual builder
           </p>
         </div>
-        <div className="flex gap-2">
+        <div className="flex items-center gap-2">
+          {dirty && (
+            <span
+              className="text-xs text-amber-600 dark:text-amber-500 flex items-center gap-1"
+              role="status"
+            >
+              <AlertTriangle className="w-3.5 h-3.5" />
+              Unsaved changes
+            </span>
+          )}
           <Button variant="outline" onClick={previewTransformations} disabled={loading}>
             <Eye className="w-4 h-4 mr-2" />
             Preview
           </Button>
-          <Button disabled={loading}>
-            <Save className="w-4 h-4 mr-2" />
+          <Button
+            disabled={loading || saving || planLoading || !pipelineId || !canSave}
+            onClick={() => setConfirmOpen(true)}
+            title={
+              !canSave
+                ? "Only workspace members and admins can change a pipeline's transforms."
+                : !pipelineId
+                  ? "Pick a pipeline first — transforms are saved to one pipeline."
+                  : undefined
+            }
+          >
+            {saving ? <RefreshCw className="w-4 h-4 mr-2 animate-spin" /> : <Save className="w-4 h-4 mr-2" />}
             Save Plan
           </Button>
         </div>
       </div>
+
+      {/* Pipeline selector — a plan is saved to one pipeline, so this is what
+          turns the builder from a scratchpad into something that persists. */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Pipeline</CardTitle>
+          <CardDescription>
+            Transforms are stored per pipeline. Picking one loads its current plan into the builder — and saving
+            replaces that plan with whatever is on screen.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Select value={pipelineId} onValueChange={requestSelectPipeline}>
+            <SelectTrigger className="max-w-md">
+              <SelectValue placeholder={pipelines.length === 0 ? "No pipelines available" : "Select a pipeline…"} />
+            </SelectTrigger>
+            <SelectContent>
+              {pipelines.map((p) => (
+                <SelectItem key={p.id} value={p.id}>
+                  {p.name}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          {planLoading && (
+            <p className="text-sm text-muted-foreground flex items-center gap-2">
+              <RefreshCw className="w-4 h-4 animate-spin" />
+              Loading this pipeline&apos;s transforms…
+            </p>
+          )}
+
+          {planError && (
+            <Alert variant="destructive">
+              <AlertTriangle className="w-4 h-4" />
+              <AlertDescription>{planError}</AlertDescription>
+            </Alert>
+          )}
+
+          {!planLoading && !planError && pipelineId && (
+            <p className="text-sm text-muted-foreground">
+              {existingRules.length === 0
+                ? "This pipeline has no transforms yet."
+                : `${existingRules.length} ${existingRules.length === 1 ? "rule is" : "rules are"} stored on this pipeline.`}
+            </p>
+          )}
+
+          {carryOver.length > 0 && (
+            <Alert>
+              <AlertTriangle className="w-4 h-4" />
+              <AlertDescription>
+                {carryOver.length} {carryOver.length === 1 ? "rule uses an operation" : "rules use operations"} this
+                builder cannot display ({[...new Set(carryOver.map((r) => r.operation))].join(", ")}) — typically
+                masking rules created by the pipeline&apos;s natural-language setup. They are not editable here and are
+                kept unchanged when you save.
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {!canSave && (
+            <p className="text-sm text-muted-foreground">
+              You can build and preview a plan, but only workspace members and admins can save one to a pipeline.
+            </p>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Natural Language Input */}
       <Card className="bg-gradient-to-br from-purple-500/10 to-blue-500/10 border-purple-500/20">
@@ -669,7 +956,7 @@ export default function TransformBuilderPage() {
               <Textarea
                 value={nlQuery}
                 onChange={(e) => setNlQuery(e.target.value)}
-                placeholder="e.g., Filter orders where amount > 100, mask all email addresses, aggregate sales by region and month"
+                placeholder="e.g., Filter orders where amount > 100, mask all email addresses"
                 className="min-h-[100px]"
               />
             </div>
@@ -738,7 +1025,7 @@ export default function TransformBuilderPage() {
                   <Badge className="bg-blue-500">Producer</Badge>
                   Pre-Kafka Transforms
                 </CardTitle>
-                <CardDescription>Lightweight transforms applied before Kafka</CardDescription>
+                <CardDescription>Run in the batch executor, on each scheduled run</CardDescription>
               </div>
               <Button size="sm" variant="outline" onClick={() => { setShowAddDialog(true); setSelectedOperation(null); }}>
                 <Plus className="w-4 h-4 mr-2" />
@@ -750,7 +1037,7 @@ export default function TransformBuilderPage() {
             {producerTransforms.length === 0 ? (
               <div className="text-center py-8 text-muted-foreground border-2 border-dashed rounded-lg">
                 <Filter className="w-10 h-10 mx-auto mb-2 opacity-50" />
-                <p>No producer transforms</p>
+                <p>No batch transforms</p>
                 <p className="text-sm">Add filters, masks, or column selections</p>
               </div>
             ) : (
@@ -768,7 +1055,7 @@ export default function TransformBuilderPage() {
                   <Badge className="bg-green-500">Consumer</Badge>
                   Post-Kafka Transforms
                 </CardTitle>
-                <CardDescription>Complex transforms applied after Kafka</CardDescription>
+                <CardDescription>Run in the CDC sink, on every change event</CardDescription>
               </div>
               <Button size="sm" variant="outline" onClick={() => { setShowAddDialog(true); setSelectedOperation(null); }}>
                 <Plus className="w-4 h-4 mr-2" />
@@ -780,8 +1067,8 @@ export default function TransformBuilderPage() {
             {consumerTransforms.length === 0 ? (
               <div className="text-center py-8 text-muted-foreground border-2 border-dashed rounded-lg">
                 <Table2 className="w-10 h-10 mx-auto mb-2 opacity-50" />
-                <p>No consumer transforms</p>
-                <p className="text-sm">Add aggregations, joins, or enrichments</p>
+                <p>No CDC transforms</p>
+                <p className="text-sm">Add filters, masks, or column selections</p>
               </div>
             ) : (
               consumerTransforms.map((t, i) => renderTransformCard(t, i))
@@ -835,55 +1122,134 @@ export default function TransformBuilderPage() {
           
           <Tabs defaultValue="producer" className="mt-4">
             <TabsList className="grid grid-cols-2">
-              <TabsTrigger value="producer">Producer (Pre-Kafka)</TabsTrigger>
-              <TabsTrigger value="consumer">Consumer (Post-Kafka)</TabsTrigger>
+              <TabsTrigger value="producer">Batch (Producer)</TabsTrigger>
+              <TabsTrigger value="consumer">CDC (Consumer)</TabsTrigger>
             </TabsList>
-            
-            <TabsContent value="producer" className="mt-4">
-              <div className="grid grid-cols-2 gap-3">
-                {Object.entries(TRANSFORM_OPERATIONS)
-                  .filter(([_, config]) => config.type === "producer")
-                  .map(([op, config]) => (
-                    <Button
-                      key={op}
-                      variant="outline"
-                      className="h-auto p-4 flex flex-col items-start gap-2"
-                      onClick={() => addTransform(op as TransformOperation)}
-                    >
-                      <div className="flex items-center gap-2">
-                        {config.icon}
-                        <span className="font-medium">{config.name}</span>
-                      </div>
-                      <p className="text-xs text-muted-foreground text-left">{config.description}</p>
-                    </Button>
-                  ))}
-              </div>
-            </TabsContent>
-            
-            <TabsContent value="consumer" className="mt-4">
-              <div className="grid grid-cols-2 gap-3">
-                {Object.entries(TRANSFORM_OPERATIONS)
-                  .filter(([_, config]) => config.type === "consumer")
-                  .map(([op, config]) => (
-                    <Button
-                      key={op}
-                      variant="outline"
-                      className="h-auto p-4 flex flex-col items-start gap-2"
-                      onClick={() => addTransform(op as TransformOperation)}
-                    >
-                      <div className="flex items-center gap-2">
-                        {config.icon}
-                        <span className="font-medium">{config.name}</span>
-                      </div>
-                      <p className="text-xs text-muted-foreground text-left">{config.description}</p>
-                    </Button>
-                  ))}
-              </div>
-            </TabsContent>
+
+            {/* Both tabs offer the SAME operations. The tab chooses where the rule
+                runs — the batch executor reads the producer rows, the CDC sink reads
+                the consumer rows — and both build the same engine, so an operation
+                legal on one path is legal on the other. */}
+            {(["producer", "consumer"] as const).map((side) => (
+              <TabsContent key={side} value={side} className="mt-4">
+                <p className="text-xs text-muted-foreground mb-3">
+                  {side === "producer"
+                    ? "Runs in the batch executor, on each scheduled run."
+                    : "Runs in the CDC sink, on every change event."}
+                </p>
+                <div className="grid grid-cols-2 gap-3">
+                  {SUPPORTED_OPERATION_LIST.map((op) => {
+                    const config = TRANSFORM_OPERATIONS[op];
+                    return (
+                      <Button
+                        key={op}
+                        variant="outline"
+                        className="h-auto p-4 flex flex-col items-start gap-2"
+                        onClick={() => addTransform(op, side)}
+                      >
+                        <div className="flex items-center gap-2">
+                          {config.icon}
+                          <span className="font-medium">{config.name}</span>
+                        </div>
+                        <p className="text-xs text-muted-foreground text-left">{config.description}</p>
+                      </Button>
+                    );
+                  })}
+                </div>
+
+                {/* Still listed, because they are a real roadmap and hiding them
+                    outright would look like a regression to anyone who used them —
+                    but not clickable, because no engine can run them. They are the
+                    Tier-2 (DuckDB) operations; that engine is a stub today. */}
+                {UNSUPPORTED_OPERATION_LIST.length > 0 && (
+                  <div className="mt-6">
+                    <p className="text-xs font-medium text-muted-foreground mb-2">
+                      Not available yet — no execution engine
+                    </p>
+                    <div className="grid grid-cols-2 gap-3">
+                      {UNSUPPORTED_OPERATION_LIST.map((op) => {
+                        const config = TRANSFORM_OPERATIONS[op];
+                        return (
+                          <div
+                            key={op}
+                            className="h-auto p-4 flex flex-col items-start gap-2 rounded-md border border-dashed opacity-60"
+                            aria-disabled="true"
+                          >
+                            <div className="flex items-center gap-2">
+                              {config.icon}
+                              <span className="font-medium text-sm">{config.name}</span>
+                              <Badge variant="secondary" className="text-[10px]">Coming soon</Badge>
+                            </div>
+                            <p className="text-xs text-muted-foreground text-left">{config.description}</p>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </TabsContent>
+            ))}
           </Tabs>
         </DialogContent>
       </Dialog>
+
+      {/* Saving is a REPLACE, not an append: the handler deletes every transform
+          on the pipeline inside the transaction and re-inserts the request body.
+          The dialog says so in counts, and names any masking rule that is about
+          to disappear. */}
+      {/* Switching pipelines throws the builder contents away. Over unsaved work
+          that is a deletion, so it is asked rather than done. */}
+      <AlertDialog
+        open={pendingPipelineId !== null}
+        onOpenChange={(open) => {
+          if (!open) setPendingPipelineId(null);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Discard the unsaved plan?</AlertDialogTitle>
+            <AlertDialogDescription>
+              {transforms.length} {transforms.length === 1 ? "rule is" : "rules are"} on screen that
+              {pipelineId ? " differ from what is stored on this pipeline" : " have never been saved"}. Loading another
+              pipeline replaces them, and they cannot be recovered.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Keep editing</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                const next = pendingPipelineId;
+                setPendingPipelineId(null);
+                if (next) void selectPipeline(next);
+              }}
+            >
+              Discard and load
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      <AlertDialog open={confirmOpen} onOpenChange={setConfirmOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Replace this pipeline&apos;s transforms?</AlertDialogTitle>
+            <AlertDialogDescription>{describeReplace(existingRules, nextRules)}</AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={saving}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void savePlan();
+              }}
+              disabled={saving}
+            >
+              {saving ? "Saving…" : "Replace and save"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }
-

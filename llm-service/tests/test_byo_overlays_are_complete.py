@@ -498,6 +498,15 @@ _DELIBERATELY_INERT_PROFILES = {
         "tool_generator/service.py:869-928), so its absence costs a "
         "documentation lookup, not a run"
     ),
+    "connectors": (
+        "sample-data-mcp is a catalog connector like any other: the first "
+        "connection create deploys it on demand through connector-deployer "
+        "(connector-deployer/internal/dockerx/quickstart_deployability_test.go "
+        "pins that it is JIT-deployable), and POST /demo/seed retries the 503 "
+        "connector_deploying that create answers while it builds "
+        "(api-gateway/internal/handlers/demo.go demoDeployRetryWindow). The "
+        "profile only skips that first wait"
+    ),
 }
 
 

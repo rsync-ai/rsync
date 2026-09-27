@@ -65,10 +65,7 @@ export function usePipelineState(): UsePipelineStateReturn {
       return
     }
 
-    console.log('🎬 Subscribing to WebSocket for pipeline events')
-
     const unsubscribe = subscribe((rawEvent: any) => {
-      console.log('📨 Raw WebSocket event:', rawEvent)
 
       // Filter: only accept events for the active pipeline (once set).
       // The WS bridge broadcasts many pipelines; without this, one chat session can be polluted by other runs.
@@ -88,14 +85,12 @@ export function usePipelineState(): UsePipelineStateReturn {
         rawEvent?.pipelineId
 
       if (eventPipelineId && String(eventPipelineId) !== String(activePipelineId)) {
-        console.log('⏭️  Ignoring event for different pipeline:', eventPipelineId)
         return
       }
 
       // Deduplicate: Skip if we just processed this exact event
       const eventKey = JSON.stringify(rawEvent)
       if (eventKey === lastProcessedEventRef.current) {
-        console.log('⏭️  Skipping duplicate event')
         return
       }
       lastProcessedEventRef.current = eventKey
@@ -103,27 +98,19 @@ export function usePipelineState(): UsePipelineStateReturn {
       // Step 1: Normalize raw event into typed actions
       const normalizedEvents = normalizeWebSocketEvent(rawEvent)
       if (normalizedEvents.length === 0) {
-        console.log('⚠️  No normalized events produced')
         return
       }
 
-      console.log('✅ Normalized events:', normalizedEvents)
-
       // Step 2: Add to event buffer (handles out-of-order events)
       const readyEvents = eventBufferRef.current.add(normalizedEvents)
-      console.log('📋 Ready events from buffer:', readyEvents)
 
       // Step 3: Dispatch each ready event to reducer
       readyEvents.forEach(event => {
-        console.log('🔄 Dispatching event:', event.type, event.payload)
         dispatch(event)
       })
     })
 
-    console.log('✅ WebSocket subscription active')
-
     return () => {
-      console.log('🧹 Cleaning up WebSocket subscription')
       if (unsubscribe) unsubscribe()
     }
   }, [subscribe])

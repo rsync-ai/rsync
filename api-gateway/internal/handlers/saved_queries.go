@@ -683,8 +683,10 @@ func UpdateSavedQuery(c *gin.Context) {
 	}
 
 	// updated_at is the concurrency token. It needs no new column and no API change
-	// because a trigger already maintains it on every UPDATE (084), which is exactly
-	// the property a version token needs and the reason not to invent one.
+	// because a trigger already maintains it on every change an edit could overwrite
+	// (084, narrowed in 119 so that a model run stamping last_run_* or target_owned
+	// is not a change), which is exactly the property a version token needs and the
+	// reason not to invent one.
 	//
 	// Compared as the driver's own RFC3339Nano rendering on both sides: existing
 	// came from database/sql scanning timestamptz into a string, and that conversion

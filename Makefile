@@ -12,9 +12,10 @@
 
 # Service groups for selective startup
 INFRA_SERVICES := postgres kafka schema-registry redis
-BACKEND_SERVICES := orchestrator api-gateway llm-service tool-generator planner sentinel telemetry-agent
+BACKEND_SERVICES := orchestrator api-gateway llm-service tool-generator planner
 MCP_SERVICES :=
-SUPPORT_SERVICES := fluent-bit otel-collector
+# No log shipper or collector in the default stack: `docker logs` is the log path.
+SUPPORT_SERVICES :=
 ALL_SERVICES := $(INFRA_SERVICES) $(BACKEND_SERVICES) $(MCP_SERVICES) $(SUPPORT_SERVICES) frontend
 
 # Colors for output

@@ -29,7 +29,10 @@ import { updateSavedQuery, type SavedQueryPatch } from "./savedQueryUpdate"
 //
 // It deliberately re-reads the row on open rather than trusting a list row: the SQL is
 // the field most likely to have been edited by a teammate since the list was fetched,
-// and an edit form seeded from stale text silently reverts their work on save.
+// and an edit form seeded from stale text silently reverts their work on save. The
+// same risk outlives the read — a dialog left open while a teammate saves — so the
+// save carries the updated_at the form was seeded from, and the server refuses it
+// (409 stale_write) if the query has moved on.
 
 interface SavedQueryEditDialogProps {
   savedQueryId: string
@@ -48,6 +51,7 @@ interface LoadedQuery {
   statement_class: string
   materialization: string
   schedule_status: string
+  updated_at: string
 }
 
 export function SavedQueryEditDialog({
@@ -69,10 +73,14 @@ export function SavedQueryEditDialog({
   const [sqlText, setSqlText] = useState("")
   const [shareWithWorkspace, setShareWithWorkspace] = useState(true)
   const [note, setNote] = useState("")
+  // Set when a save was refused because someone else saved first. The form keeps what
+  // was typed, so it can be copied, until the reader loads the other version.
+  const [conflict, setConflict] = useState(false)
 
   const load = useCallback(async () => {
     setLoading(true)
     setLoadError(null)
+    setConflict(false)
     try {
       const res = await authFetch(`/api/v1/explorer/saved/${savedQueryId}`, { cache: "no-store" })
       if (!res.ok) {
@@ -92,6 +100,7 @@ export function SavedQueryEditDialog({
         statement_class: String(data.statement_class ?? ""),
         materialization: String(data.materialization ?? "none"),
         schedule_status: String(data.schedule_status ?? ""),
+        updated_at: String(data.updated_at ?? ""),
       }
       setOriginal(q)
       setName(q.name)
@@ -158,10 +167,12 @@ export function SavedQueryEditDialog({
       if (trimmedSQL !== original.sql_text.trim()) body.sql_text = trimmedSQL
       if (visibility !== original.visibility) body.visibility = visibility
       if (needsApproval && note.trim()) body.note = note.trim()
+      if (original.updated_at) body.expected_updated_at = original.updated_at
 
       const result = await updateSavedQuery(savedQueryId, body)
       if (result.kind === "error") {
-        toast.error(result.message)
+        if (result.stale) setConflict(true)
+        else toast.error(result.message)
         return
       }
       if (result.kind === "proposed") {
@@ -205,6 +216,25 @@ export function SavedQueryEditDialog({
           </div>
         ) : (
           <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1">
+            {conflict && (
+              <div
+                role="alert"
+                className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2"
+              >
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                <div className="space-y-2 text-xs text-amber-700 dark:text-amber-300">
+                  <p>
+                    Someone else saved this query after you opened it, so your changes were not
+                    saved. Loading their version replaces what is in this form — copy anything
+                    you want to keep first, then re-apply it.
+                  </p>
+                  <Button size="sm" variant="outline" className="h-7 text-xs" onClick={() => void load()}>
+                    Load their version
+                  </Button>
+                </div>
+              </div>
+            )}
+
             {!canEdit && (
               <div className="flex items-start gap-2 rounded-md border bg-zinc-50 p-2 dark:bg-zinc-900">
                 <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-zinc-500 dark:text-zinc-400" />
@@ -304,7 +334,9 @@ export function SavedQueryEditDialog({
           </Button>
           <Button
             onClick={() => void handleSave()}
-            disabled={!canEdit || saving || loading || !!loadError || !dirty || !name.trim() || !sqlText.trim()}
+            disabled={
+              !canEdit || saving || loading || !!loadError || conflict || !dirty || !name.trim() || !sqlText.trim()
+            }
           >
             {saving ? (
               <>

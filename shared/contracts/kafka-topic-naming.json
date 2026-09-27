@@ -12,9 +12,9 @@
     "one implementation reddens that language's build.",
     "Adding a case here is the intended way to pin new behavior.",
     "",
-    "The rsync.-spelled inputs below are the ones worth reading twice. Five topics",
+    "The rsync.-spelled inputs below are the ones worth reading twice. Four topics",
     "spell the product name in the literal itself (rsync.notifications,",
-    "rsync.healer.{actions,results,approved-changes,schema-changes}). At the default",
+    "rsync.healer.{results,approved-changes,schema-changes}). At the default",
     "prefix, qualifying one is a no-op -- it already starts with rsync. -- so a call",
     "site that forgot to qualify is indistinguishable from one that did. Under a",
     "customer prefix the two diverge: acme.rsync.notifications vs rsync.notifications.",
@@ -25,8 +25,8 @@
   "cases": [
     {
       "prefix": null,
-      "input": "agent.planner.requests",
-      "want": "rsync.agent.planner.requests"
+      "input": "pipeline.domain.events",
+      "want": "rsync.pipeline.domain.events"
     },
     {
       "prefix": null,
@@ -90,13 +90,13 @@
     },
     {
       "prefix": "",
-      "input": "agent.planner.requests",
-      "want": "agent.planner.requests"
+      "input": "pii.scan.response",
+      "want": "pii.scan.response"
     },
     {
       "prefix": "rsync",
-      "input": "agent.x",
-      "want": "rsync.agent.x"
+      "input": "pipeline.x",
+      "want": "rsync.pipeline.x"
     },
     {
       "prefix": "acme-",
@@ -125,8 +125,8 @@
     },
     {
       "prefix": "acme.",
-      "input": "rsync.healer.actions",
-      "want": "acme.rsync.healer.actions"
+      "input": "rsync.healer.schema-changes",
+      "want": "acme.rsync.healer.schema-changes"
     },
     {
       "prefix": "acme.",

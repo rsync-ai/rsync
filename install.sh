@@ -23,7 +23,7 @@ RSYNC_REPO="${RSYNC_REPO:-rsync-ai/rsync}"
 # compose half and a "last publish" pointer on the image half, so the two halves
 # advance at different rates and a curl-pipe install is not reproducible. A tag
 # takes both halves from the same commit. Pass RSYNC_REF=main to track the branch.
-RSYNC_REF="${RSYNC_REF:-v0.1.5}"
+RSYNC_REF="${RSYNC_REF:-v0.1.6}"
 # The image tag that pairs with RSYNC_REF. Both halves of an install have to name
 # the same code: the compose file is fetched from RSYNC_REF, and the images that
 # compose file starts are pulled at this tag. Left independent they drift, and did
@@ -148,10 +148,10 @@ INSTALL_DIR="${RSYNC_INSTALL_DIR:-${_home:-$PWD}/rsync-ai}"
 # The floor tracks what the install actually starts, the same way the LLM floor
 # below does. 6 sized the 18 unprofiled services this file has always started.
 # The cdc profile adds three more containers -- one of them a JVM -- and their
-# mem_limit lines in docker-compose.quickstart.yml come to 2816MB on top of
+# mem_limit lines in docker-compose.quickstart.yml come to 3328MB on top of
 # that, so the default set needs 8.
 #
-# Two floors and not one because RSYNC_PROFILES= starts exactly the 18 services
+# Two floors and not one because RSYNC_PROFILES= starts exactly the 17 services
 # 6 was sizing. Warning that operator about a JVM they excluded would be the
 # same defect this profile change fixes: a message about a container that was
 # never started.
@@ -895,6 +895,9 @@ EOF
 #             is the other case: the generator probes context7-mcp with a 3s
 #             timeout and carries on without it, so its absence costs a
 #             documentation lookup, not a run.
+#   connectors  sample-data-mcp pre-started. OFF by default: an install starts no
+#             catalog connector, and the first connection (or "Try the demo")
+#             that needs one deploys it on demand. Only skips that first wait.
 #
 # Turn CDC off on a machine that will only ever run batch syncs:
 #

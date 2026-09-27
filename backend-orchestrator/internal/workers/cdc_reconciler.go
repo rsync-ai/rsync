@@ -31,9 +31,9 @@ import (
 // SAFETY: pipelines are HARD-deleted (DELETE FROM pipelines), so "no pipeline
 // row matches this connector" is an unambiguous orphan. The pipeline row is
 // always created BEFORE its connector, so a freshly-provisioning pipeline can
-// never be misread as an orphan. Connectors whose matching pipeline is in a
-// terminal 'stopped' state are also reaped (StopPipeline should have removed
-// them). Paused pipelines are intentionally left alone. Only connectors whose
+// never be misread as an orphan. Connectors of 'stopped' and 'paused' pipelines
+// are left alone: Stop parks the connector in Kafka Connect's STOPPED state with
+// its offsets so Start resumes from the same position. Only connectors whose
 // name matches the canonical "cdc-" prefix are ever touched.
 type CDCReconciler struct {
 	db         *sql.DB
@@ -43,11 +43,10 @@ type CDCReconciler struct {
 	stopCh     chan struct{}
 }
 
-// reapableStatuses are pipeline statuses whose connector should be torn down.
-// (Absent pipeline row is handled separately and is always reapable.)
-var cdcReapableStatuses = map[string]bool{
-	"stopped": true,
-}
+// cdcReapableStatuses are pipeline statuses whose connector should be torn
+// down. Empty on purpose: 'stopped' is resumable, so only a connector with NO
+// pipeline row (handled separately) is an orphan.
+var cdcReapableStatuses = map[string]bool{}
 
 func NewCDCReconciler(db *sql.DB) *CDCReconciler {
 	tick := 5 * time.Minute
@@ -105,7 +104,7 @@ func (r *CDCReconciler) Start(ctx context.Context) {
 }
 
 // reapSlots drops physical PostgreSQL replication slots whose owning pipeline is
-// deleted or stopped — the safety net for the slot lifecycle. It runs every tick
+// deleted — the safety net for the slot lifecycle. It runs every tick
 // INDEPENDENTLY of the connector sweep above (which bails when kafka-connect is
 // unreachable): a leaked slot retains WAL on the source regardless of connector
 // state, so it must be reaped even when Kafka Connect is down. Idempotent; all
@@ -117,12 +116,12 @@ func (r *CDCReconciler) reapSlots(ctx context.Context) {
 		return
 	}
 	if dropped > 0 {
-		log.Infof("cdc_reconciler: reaped %d orphaned/stopped PostgreSQL replication slot(s)", dropped)
+		log.Infof("cdc_reconciler: reaped %d orphaned PostgreSQL replication slot(s)", dropped)
 	}
 }
 
 // reapPublications drops physical PostgreSQL publications (debezium_pub_pipe_*)
-// whose owning pipeline is deleted or stopped — the publication analogue of
+// whose owning pipeline is deleted — the publication analogue of
 // reapSlots (BUG-3). Runs every tick, independently of the connector sweep and the
 // slot reaper. Idempotent (DROP PUBLICATION IF EXISTS); all errors logged, never
 // fatal. Also auto-reaps pre-existing orphaned publications on first run.
@@ -133,15 +132,15 @@ func (r *CDCReconciler) reapPublications(ctx context.Context) {
 		return
 	}
 	if dropped > 0 {
-		log.Infof("cdc_reconciler: reaped %d orphaned/stopped PostgreSQL publication(s)", dropped)
+		log.Infof("cdc_reconciler: reaped %d orphaned PostgreSQL publication(s)", dropped)
 	}
 }
 
 // reapCaptureInstances disables SQL Server capture instances whose owning
-// pipeline no longer exists — the SQL Server analogue of reapSlots. Unlike the
-// two PostgreSQL reapers it deliberately does NOT act on merely 'stopped'
-// pipelines: a capture instance holds the change data itself, so disabling one
-// on a resumable pipeline would discard it and force a re-snapshot. Runs every
+// pipeline no longer exists — the SQL Server analogue of reapSlots. Like the
+// PostgreSQL reapers it never acts on a merely 'stopped' pipeline: a capture
+// instance holds the change data itself, so disabling one on a resumable
+// pipeline would discard it and force a re-snapshot. Runs every
 // tick, independently of the connector sweep. Idempotent; all errors logged,
 // never fatal. SQL Server is the only non-PostgreSQL family with a physical
 // resource to reap (Oracle/MySQL cleanup is ledger-only by design).

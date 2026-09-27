@@ -10,13 +10,21 @@ package workers
 // For BATCH pipelines:
 //   - Source MCP container   (stdio fallback ok)
 //   - Destination MCP container (stdio fallback ok; HTTP attempted first)
-//   - MinIO MCP               (claim-check staging)
+//   - MinIO MCP               (large-batch staging; OPTIONAL — see below)
 //
 // For CDC pipelines:
 //   - Destination MCP container (HTTP required — kafka-mcp-sink is cross-container)
 //   - kafka-connect            (Debezium connector engine)
 //   - debezium-mcp             (MCP bridge to kafka-connect)
 //   - kafka-mcp-sink           (Kafka → destination writer)
+//
+// MinIO is checked for EVERY batch run, whatever the destination: the executor
+// stages any batch over the inline limit there (claim-check) and sends the sink
+// a URL. It is optional because the executor falls back to chunked Kafka when
+// staging fails (executor.go stageDataToMinIO callers), so an unreachable MinIO
+// degrades the run instead of failing it. Its progress lines say "large-batch
+// staging store" because a bare "minio-mcp" on a GCS run read as a check of the
+// wrong service (prod, 2026-09-26).
 //
 // MCP containers are started via the MCP server manager, which calls the
 // tool-generator deploy API and polls until the container is healthy (up to
@@ -47,26 +55,54 @@ const (
 	// that have restart: unless-stopped. kafka-connect can take 60-90s to initialize
 	// (JVM + plugin scanning). We wait up to 120s so a crash-restart doesn't fail the
 	// pipeline — Docker will bring it back, we just need patience.
-	preflightInfraRetryDelay    = 5 * time.Second
 	preflightKafkaConnectRetries = 24 // 24 × 5s = 120s total
+
+	// An optional service has a fallback, so it is not worth two minutes of the
+	// run's time: 6 × 5s = 30s, then the tool-generator start, then the fallback.
+	preflightOptionalRetries = 6
 )
+
+// preflightInfraRetryDelay is the gap between health polls. A var so tests can
+// shrink it.
+var preflightInfraRetryDelay = 5 * time.Second
 
 // preflightService describes a single service to check during pre-flight.
 type preflightService struct {
-	name        string
+	name        string // logs and the `docker compose logs` hint
+	label       string // user-facing name in progress messages; empty = name
 	kind        string // "mcp_user", "mcp_core", "kafka_connect"
 	requireHTTP bool   // relevant for mcp_user / mcp_core
 	healthURL   string // for mcp_core / kafka_connect — direct HTTP health check
 	mcpName     string // connector name passed to mcpManager.StartServer
 	mcpVersion  string
+	// fallback makes the service optional: when set and the service cannot be
+	// reached, the run continues and the user is told this instead. Empty means
+	// the service is required and an unreachable one fails the run.
+	fallback string
+}
+
+func (s preflightService) displayName() string {
+	if s.label != "" {
+		return s.label
+	}
+	return s.name
+}
+
+func (s preflightService) pollAttempts() int {
+	if s.fallback != "" {
+		return preflightOptionalRetries
+	}
+	return preflightKafkaConnectRetries
 }
 
 // preflightResult is the outcome of a single service check.
 type preflightResult struct {
 	Service string
 	OK      bool
-	Mode    string // "docker_http", "stdio", "already_healthy", "started"
+	Mode    string // "docker_http", "stdio", "already_healthy", "started", "fallback"
 	Err     error
+	// Fallback is what the run does instead, when Mode is "fallback".
+	Fallback string
 }
 
 // infraPreflightStage drives the pre-flight check for one pipeline execution.
@@ -118,23 +154,34 @@ func (p *infraPreflightStage) Run(ctx context.Context, task Task, execTask execu
 
 	results := p.checkAll(ctx, pipelineID, execID, services)
 
-	// Collect failures
-	var failures []string
-	for _, r := range results {
-		if !r.OK {
-			failures = append(failures, fmt.Sprintf("%s: %v", r.Service, r.Err))
-		}
-	}
-
+	failures, degraded := summarizePreflight(results)
 	if len(failures) > 0 {
 		msg := "Infrastructure pre-flight failed: " + strings.Join(failures, "; ")
 		p.emitProgress(ctx, pipelineID, execID, "STAGE_FAILED", 70, msg, "Infrastructure check failed")
 		return fmt.Errorf("%s", msg)
 	}
 
-	p.emitProgress(ctx, pipelineID, execID, "STAGE_COMPLETED", 78,
-		"All required services are running", "Infrastructure ready")
+	msg := "All required services are running"
+	if len(degraded) > 0 {
+		msg += " (" + strings.Join(degraded, "; ") + ")"
+	}
+	p.emitProgress(ctx, pipelineID, execID, "STAGE_COMPLETED", 78, msg, "Infrastructure ready")
 	return nil
+}
+
+// summarizePreflight splits the results into failures (a required service is
+// down: the run stops) and degradations (an optional one is down: the run goes
+// on without it, and the completion message says what it does instead).
+func summarizePreflight(results []preflightResult) (failures, degraded []string) {
+	for _, r := range results {
+		switch {
+		case !r.OK:
+			failures = append(failures, fmt.Sprintf("%s: %v", r.Service, r.Err))
+		case r.Mode == "fallback":
+			degraded = append(degraded, fmt.Sprintf("%s unavailable — %s", r.Service, r.Fallback))
+		}
+	}
+	return failures, degraded
 }
 
 // requiredServices builds the list of services to check based on pipeline config.
@@ -181,6 +228,7 @@ func (p *infraPreflightStage) requiredServices(execTask executor.ExecutorTask, i
 		services = append(services,
 			preflightService{
 				name:      "kafka-connect",
+				label:     "Kafka Connect",
 				kind:      "kafka_connect",
 				healthURL: kafkaConnectURL + "/",
 			},
@@ -200,13 +248,16 @@ func (p *infraPreflightStage) requiredServices(execTask executor.ExecutorTask, i
 			},
 		)
 	} else {
-		// Batch: verify minio-mcp is reachable (required for claim-check staging)
+		// Batch: MinIO stages any batch over the inline limit, whatever the
+		// destination. Optional — the executor falls back to chunked Kafka.
 		services = append(services, preflightService{
 			name:       "minio-mcp",
+			label:      "large-batch staging store (minio-mcp)",
 			kind:       "mcp_core",
 			healthURL:  fmt.Sprintf("http://%s-minio-v1-0-0-mcp:8000/health", mcp.StackPrefix()),
 			mcpName:    "minio",
 			mcpVersion: "v1.0.0",
+			fallback:   "large batches will be sent to Kafka in chunks instead",
 		})
 	}
 
@@ -233,22 +284,33 @@ func (p *infraPreflightStage) checkAll(
 	return results
 }
 
-// checkOne verifies and if necessary starts a single service.
+// checkOne verifies and if necessary starts a single service. An optional
+// service (fallback set) that cannot be reached is reported as a fallback, not a
+// failure.
 func (p *infraPreflightStage) checkOne(
 	ctx context.Context, pipelineID, execID string, svc preflightService,
 ) preflightResult {
-	p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("Checking %s…", svc.name))
+	p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("Checking %s…", svc.displayName()))
 
+	var r preflightResult
 	switch svc.kind {
 	case "mcp_user":
-		return p.checkMCPUser(ctx, pipelineID, execID, svc)
+		r = p.checkMCPUser(ctx, pipelineID, execID, svc)
 	case "mcp_core":
-		return p.checkMCPCore(ctx, pipelineID, execID, svc)
+		r = p.checkMCPCore(ctx, pipelineID, execID, svc)
 	case "kafka_connect":
-		return p.checkKafkaConnect(ctx, pipelineID, execID, svc)
+		r = p.checkKafkaConnect(ctx, pipelineID, execID, svc)
 	default:
 		return preflightResult{Service: svc.name, OK: true, Mode: "skip"}
 	}
+
+	if !r.OK && svc.fallback != "" {
+		log.Warnf("⚠️  Infra preflight: optional %s unavailable (%v) — %s", svc.name, r.Err, svc.fallback)
+		p.emitServiceProgress(ctx, pipelineID, execID,
+			fmt.Sprintf("%s unavailable — %s", svc.displayName(), svc.fallback))
+		return preflightResult{Service: svc.displayName(), OK: true, Mode: "fallback", Err: r.Err, Fallback: svc.fallback}
+	}
+	return r
 }
 
 // checkMCPUser starts user-connector MCP containers (mysql, postgresql, etc.)
@@ -281,7 +343,7 @@ func (p *infraPreflightStage) checkMCPUser(
 		}
 		// Batch — stdio fallback available; not a blocking failure
 		log.Warnf("⚠️  Infra preflight: %s could not start Docker HTTP container (stdio fallback will be used): %v", svc.name, err)
-		p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("%s: using stdio fallback", svc.name))
+		p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("%s: using stdio fallback", svc.displayName()))
 		return preflightResult{Service: svc.name, OK: true, Mode: "stdio_fallback"}
 	}
 
@@ -290,18 +352,19 @@ func (p *infraPreflightStage) checkMCPUser(
 		mode = "stdio"
 	}
 	log.Infof("✅ Infra preflight: %s ready (%s)", svc.name, mode)
-	p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("%s ready", svc.name))
+	p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("%s ready", svc.displayName()))
 	return preflightResult{Service: svc.name, OK: true, Mode: mode}
 }
 
 // checkMCPCore checks core infra MCP services (debezium-mcp, kafka-mcp-sink, minio-mcp).
 // These have restart: unless-stopped — Docker brings them back automatically after crashes.
-// We poll until healthy (up to 120s), emitting live progress so the user sees what's happening.
-// If still not reachable, we attempt a start via tool-generator before giving up.
+// We poll until healthy (up to 120s; 30s for an optional service), emitting live progress so
+// the user sees what's happening. If still not reachable, we attempt a start via
+// tool-generator before giving up (checkOne then decides failure vs fallback).
 func (p *infraPreflightStage) checkMCPCore(
 	ctx context.Context, pipelineID, execID string, svc preflightService,
 ) preflightResult {
-	if ok, mode := p.pollWithProgress(ctx, pipelineID, execID, svc.name, svc.healthURL); ok {
+	if ok, mode := p.pollWithProgress(ctx, pipelineID, execID, svc); ok {
 		return preflightResult{Service: svc.name, OK: true, Mode: mode}
 	}
 
@@ -312,7 +375,7 @@ func (p *infraPreflightStage) checkMCPCore(
 		if ver == "" {
 			ver = "v1.0.0"
 		}
-		p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("Starting %s via tool-generator…", svc.name))
+		p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("Starting %s via tool-generator…", svc.displayName()))
 		cfg := mcp.ServerConfig{
 			Name:              svc.mcpName,
 			Version:           ver,
@@ -321,7 +384,7 @@ func (p *infraPreflightStage) checkMCPCore(
 		}
 		if _, err := mgr.StartServer(cfg); err == nil {
 			log.Infof("✅ Infra preflight: %s started via tool-generator", svc.name)
-			p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("%s started", svc.name))
+			p.emitServiceProgress(ctx, pipelineID, execID, fmt.Sprintf("%s started", svc.displayName()))
 			return preflightResult{Service: svc.name, OK: true, Mode: "started"}
 		}
 	}
@@ -337,7 +400,7 @@ func (p *infraPreflightStage) checkMCPCore(
 func (p *infraPreflightStage) checkKafkaConnect(
 	ctx context.Context, pipelineID, execID string, svc preflightService,
 ) preflightResult {
-	if ok, mode := p.pollWithProgress(ctx, pipelineID, execID, "Kafka Connect", svc.healthURL); ok {
+	if ok, mode := p.pollWithProgress(ctx, pipelineID, execID, svc); ok {
 		return preflightResult{Service: svc.name, OK: true, Mode: mode}
 	}
 
@@ -348,14 +411,16 @@ func (p *infraPreflightStage) checkKafkaConnect(
 	return preflightResult{Service: svc.name, OK: false, Err: err}
 }
 
-// pollWithProgress polls a health URL, emitting a progress event every 5 attempts (25s)
+// pollWithProgress polls svc's health URL, emitting a progress event every 5 attempts (25s)
 // so the user sees live feedback during long restarts. Returns (true, mode) on success.
 func (p *infraPreflightStage) pollWithProgress(
-	ctx context.Context, pipelineID, execID, serviceName, url string,
+	ctx context.Context, pipelineID, execID string, svc preflightService,
 ) (bool, string) {
-	for attempt := 1; attempt <= preflightKafkaConnectRetries; attempt++ {
+	serviceName := svc.displayName()
+	attempts := svc.pollAttempts()
+	for attempt := 1; attempt <= attempts; attempt++ {
 		checkCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, url, nil)
+		req, err := http.NewRequestWithContext(checkCtx, http.MethodGet, svc.healthURL, nil)
 		if err != nil {
 			cancel()
 			return false, ""
@@ -380,13 +445,13 @@ func (p *infraPreflightStage) pollWithProgress(
 		// Emit live progress every 5 attempts so the user isn't staring at a blank spinner.
 		if attempt%5 == 0 || attempt == 1 {
 			waited := time.Duration(attempt) * preflightInfraRetryDelay
-			remaining := time.Duration(preflightKafkaConnectRetries-attempt) * preflightInfraRetryDelay
+			remaining := time.Duration(attempts-attempt) * preflightInfraRetryDelay
 			log.Warnf("⏳ Infra preflight: %s not yet ready (waited %s, up to %s remaining)", serviceName, waited, remaining)
 			p.emitServiceProgress(ctx, pipelineID, execID,
 				fmt.Sprintf("Waiting for %s to start (%.0fs elapsed)…", serviceName, waited.Seconds()))
 		}
 
-		if attempt < preflightKafkaConnectRetries {
+		if attempt < attempts {
 			select {
 			case <-ctx.Done():
 				return false, ""

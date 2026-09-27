@@ -50,6 +50,7 @@ from src.utils.openai_client import (  # noqa: E402
     _ollama_base_url,
     llm_configured as _llm_configured,
     explorer_llm_configured as _explorer_llm_configured,
+    with_reasoning_headroom,
 )
 
 
@@ -221,7 +222,7 @@ Return ONLY the JSON array, no other text."""
             model=model,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=1024,
+            max_tokens=with_reasoning_headroom(1024),
         )
         raw = response.choices[0].message.content or "[]"
         ranked_raw: list = json.loads(_extract_json_array(raw))

@@ -68,6 +68,15 @@ type DeployerConfig struct {
 	// exhausted PID space cannot be recovered from by killing the container -- the
 	// kill itself needs a PID.
 	ConnectorPidsLimit int64
+	// ConnectorLogMaxSize / ConnectorLogMaxFile rotate each connector's json-file
+	// log at the same bound every compose service carries (RSYNC_LOG_MAX_SIZE /
+	// RSYNC_LOG_MAX_FILE, default 10m x 3). Compose writes that bound on its own
+	// services; a container created through the API gets only the daemon's default,
+	// and a stock daemon's default is json-file with NO rotation -- so a chatty
+	// connector's log grows until the disk is full. Empty ConnectorLogMaxSize leaves
+	// the daemon default in place.
+	ConnectorLogMaxSize string
+	ConnectorLogMaxFile string
 }
 
 const containerPort = "8000/tcp"
@@ -176,6 +185,12 @@ func BuildContainerSpec(req DeployRequest, dc DeployerConfig) (*container.Config
 	if dc.ConnectorPidsLimit > 0 {
 		limit := dc.ConnectorPidsLimit
 		hc.Resources.PidsLimit = &limit
+	}
+	if dc.ConnectorLogMaxSize != "" {
+		hc.LogConfig = container.LogConfig{Type: "json-file", Config: map[string]string{"max-size": dc.ConnectorLogMaxSize}}
+		if dc.ConnectorLogMaxFile != "" {
+			hc.LogConfig.Config["max-file"] = dc.ConnectorLogMaxFile
+		}
 	}
 
 	// Optional OAuth-token NAMED volume (Docker-managed storage, NOT a host bind).
@@ -328,6 +343,15 @@ func ValidateHostConfigSafe(hc *container.HostConfig, dc DeployerConfig) error {
 	}
 	if dc.ConnectorPidsLimit > 0 && (hc.Resources.PidsLimit == nil || *hc.Resources.PidsLimit != dc.ConnectorPidsLimit) {
 		return fmt.Errorf("required: PidsLimit %d", dc.ConnectorPidsLimit)
+	}
+	// Log rotation is a presence check for the same reason: an unrotated log is
+	// silent until the disk fills.
+	if dc.ConnectorLogMaxSize != "" {
+		lc := hc.LogConfig
+		if lc.Type != "json-file" || lc.Config["max-size"] != dc.ConnectorLogMaxSize ||
+			(dc.ConnectorLogMaxFile != "" && lc.Config["max-file"] != dc.ConnectorLogMaxFile) {
+			return fmt.Errorf("required: json-file log rotation max-size=%s max-file=%s", dc.ConnectorLogMaxSize, dc.ConnectorLogMaxFile)
+		}
 	}
 	return nil
 }

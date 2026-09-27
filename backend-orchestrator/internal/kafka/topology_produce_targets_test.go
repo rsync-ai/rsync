@@ -25,7 +25,7 @@ import (
 // Neither failure is discoverable from a green test suite, because a produce to a
 // topic nobody provisioned looks exactly like a produce to one somebody did. So this
 // reads the produce call sites out of the source and checks them against the set that
-// EnsureAgentControlTopics actually creates. A new produce target added later fails
+// EnsurePlatformTopics actually creates. A new produce target added later fails
 // here rather than in a customer's cluster.
 
 // knownUncoveredProduceTargets are produce targets this test can see and this package
@@ -85,7 +85,7 @@ func TestEveryTopicWeProduceToIsProvisioned(t *testing.T) {
 			"exist only if the broker's auto.create.topics.enable is on — a setting this "+
 			"platform does not own on a customer-managed cluster, and one that leaves the "+
 			"topic carrying the broker's own min.insync.replicas when it is on:\n  %s\n\n"+
-			"Add them to EnsureAgentControlTopics (topology.go), or record why not in "+
+			"Add them to EnsurePlatformTopics (topology.go), or record why not in "+
 			"knownUncoveredProduceTargets.", len(missing), strings.Join(missing, "\n  "))
 	}
 }
@@ -96,7 +96,7 @@ func TestKnownUncoveredListHasNoStaleEntries(t *testing.T) {
 	provisioned := provisionedControlPlaneTopics(t)
 	for topicName := range knownUncoveredProduceTargets {
 		if provisioned[kafkaclient.Topic(topicName)] {
-			t.Errorf("%q is listed as an uncovered produce target but EnsureAgentControlTopics "+
+			t.Errorf("%q is listed as an uncovered produce target but EnsurePlatformTopics "+
 				"now creates it — drop the entry", topicName)
 		}
 	}
@@ -105,11 +105,18 @@ func TestKnownUncoveredListHasNoStaleEntries(t *testing.T) {
 // provisionedControlPlaneTopics runs the real provisioner against a fake broker and
 // reports what it actually asked Kafka to create. Reading the slice literal instead
 // would assert the test's copy of the list rather than the list that runs.
+//
+// It runs with RSYNC_SCHEMA_DRIFT_ENABLED=true, the configuration that provisions the
+// most: the rsync.healer.* produce sites the scan finds are live only under that flag
+// (config.SchemaDriftEnabled gates each of them), so with it on every one of them must
+// have a topic. With it off they are neither produced to nor created --
+// TestEnsurePlatformTopicsHealerTopicsFollowTheDriftFlag covers that half.
 func provisionedControlPlaneTopics(t *testing.T) map[string]bool {
 	t.Helper()
+	t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", "true")
 	tm, admin := newFakeManager(1)
-	if err := tm.EnsureAgentControlTopics(context.Background(), 3); err != nil {
-		t.Fatalf("EnsureAgentControlTopics: %v", err)
+	if err := tm.EnsurePlatformTopics(context.Background()); err != nil {
+		t.Fatalf("EnsurePlatformTopics: %v", err)
 	}
 	out := make(map[string]bool, len(admin.created))
 	for name := range admin.created {

@@ -29,7 +29,29 @@ export interface OnboardingCounts {
 // never renders there — no edition check on the client.
 interface DemoStatus {
   available: boolean
+  source_connector?: string
+  source_name?: string
+  destination_connector?: string
+  destination_name?: string
   destination_database?: string
+}
+
+// demoChatHref is where "Start with sample data" lands once both demo connections
+// exist: the chat, with a prompt that names the pair and both seeded connections,
+// sent on arrival. The pair is read by the chat's deterministic parser, so this
+// works on a fresh install with no LLM configured; naming the connections makes
+// the chat pick the ones just seeded rather than guess among same-type ones. The
+// chat still asks the user to confirm before it creates anything.
+function demoChatHref(
+  seeded: { source_name?: string; destination_name?: string } | null,
+  demo: DemoStatus | null,
+): string {
+  const source = demo?.source_connector || "sample-data"
+  const destination = demo?.destination_connector || "postgresql"
+  const sourceName = seeded?.source_name || demo?.source_name || "Sample data (demo)"
+  const destinationName = seeded?.destination_name || demo?.destination_name || "Demo warehouse"
+  const prompt = `Sync ${source} to ${destination}; source connection: ${sourceName}; destination connection: ${destinationName}`
+  return `/chat?prompt=${encodeURIComponent(prompt)}&autosend=1`
 }
 
 interface Step {
@@ -117,10 +139,11 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
     try {
       const res = await authFetch("/api/v1/demo/seed", {
         method: "POST",
-        // Seeding tests both connections before saving them, and the destination
-        // connector may have to be started on demand first. That is the slow
-        // path this timeout has to cover, not a round trip.
-        timeoutMs: 180_000,
+        // Seeding tests both connections before saving them, and on a fresh
+        // install both connectors are deployed on demand first; the gateway
+        // retries while they build (demo.go demoDeployRetryWindow, worst case
+        // 240s). That is the slow path this timeout has to cover, not a round trip.
+        timeoutMs: 270_000,
       })
       const body = await res.json().catch(() => null)
       if (!res.ok) {
@@ -129,13 +152,13 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
       }
       const fresh = await fetchCounts()
       if (fresh) setCounts(fresh)
-      router.push("/chat")
+      router.push(demoChatHref(body, demo))
     } catch {
       setSeedError("Could not reach the server. Check that the stack finished starting, then try again.")
     } finally {
       setSeeding(false)
     }
-  }, [fetchCounts, router])
+  }, [demo, fetchCounts, router])
 
   const steps: Step[] = useMemo(
     () => [

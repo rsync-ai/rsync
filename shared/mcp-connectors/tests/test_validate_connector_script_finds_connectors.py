@@ -245,11 +245,18 @@ def test_standalone_set_matches_the_conformance_suite(script_module):
 def test_ci_runs_this_guard_when_the_script_changes():
     """A guard whose own subject is outside the job's paths filter never runs on the
     change it exists to catch. This suite is in the `llm` lane; the script it guards is
-    under scripts/, which that lane did not list."""
-    ci = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
-    with open(ci) as fh:
-        text = fh.read()
-    assert "scripts/mcp-connectors/**" in text, (
-        "ci.yml's `llm` paths filter does not cover scripts/mcp-connectors/, so a PR "
+    under scripts/, which that lane did not list until this guard made it.
+
+    The filters used to be an inline block in ci.yml's `changes` job. They are
+    .github/paths-filters.yml now, read by each job that gates itself -- see
+    llm-service/tests/test_ci_inline_change_filters.py for why that job went away.
+    """
+    yaml = pytest.importorskip("yaml")
+    filters = os.path.join(REPO_ROOT, ".github", "paths-filters.yml")
+    with open(filters) as fh:
+        globs = yaml.safe_load(fh)["llm"]
+    assert globs, "the llm path filter parsed empty -- this check would pass vacuously"
+    assert "scripts/mcp-connectors/**" in globs, (
+        "the `llm` paths filter does not cover scripts/mcp-connectors/, so a PR "
         "editing validate_connector.py alone would skip this suite entirely."
     )

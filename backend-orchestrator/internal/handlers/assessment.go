@@ -7,9 +7,16 @@
 //	GET  /v1/pipelines/{id}/assess/{run_id}     — get a specific assessment by id
 //	GET  /v1/assess/supported-types             — list source types with registered assessors
 //
-// Authentication is handled by upstream middleware; this handler trusts
-// the connection_id passed in the request and fetches the decrypted
-// config via the orchestrator's connection manager.
+// AUTHORIZATION. These routes are mounted behind requirePrincipal
+// (cmd/orchestrator/main.go), which only AUTHENTICATES. Authentication alone is
+// not enough here: the pipeline id is a path parameter and source_connection_id
+// is caller-supplied, and the handler decrypts that connection and dials it from
+// inside rsync's network. So every entry point below ALSO applies the workspace
+// gate in cdc_authz.go before touching a resource. This comment used to read
+// "authentication is handled by upstream middleware" while no middleware was
+// mounted at all and no per-resource check existed — the routes were reachable
+// anonymously from the internet, which made POST /pipelines/:id/assess with a
+// victim's connection id a credential oracle against any tenant.
 //
 // The handler persists every run to pipeline_assessments so:
 //   - The UI can render the latest result alongside the pipeline status.
@@ -91,12 +98,28 @@ func (h *AssessmentHandler) RunAssessment(c *gin.Context) {
 		return
 	}
 
+	if !assertPipelineOwnerForHandlers(c, h.db, pipelineID) {
+		return
+	}
+
 	var body struct {
 		SourceConnectionID string   `json:"source_connection_id"`
 		Tables             []string `json:"tables"`
 		SyncMode           string   `json:"sync_mode"`
 	}
 	_ = c.ShouldBindJSON(&body) // body is optional
+
+	// A connection id supplied in the BODY is not covered by the pipeline gate
+	// above — it can name any connection in the deployment, including another
+	// tenant's. Gate it separately. The fallback path (body empty, id read from
+	// the pipeline row) is already authorized by the pipeline check, so it is
+	// deliberately not re-gated: doing so would newly refuse legacy rows whose
+	// connection predates workspaces.
+	if strings.TrimSpace(body.SourceConnectionID) != "" {
+		if !assertConnectionOwner(c, h.db, body.SourceConnectionID) {
+			return
+		}
+	}
 
 	// Look up the pipeline row for fallback source/tables when body is empty.
 	pipelineSourceConn, pipelineSourceType, pipelineSyncMode, pipelineDestType, pipelineTables, err := h.loadPipelineSource(c, pipelineID)
@@ -139,7 +162,12 @@ func (h *AssessmentHandler) RunAssessment(c *gin.Context) {
 	// Decrypt the source connection config.
 	cfg, err := h.connections.Get(c, sourceConnID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load connection: " + err.Error()})
+		// The detail stays in the log. Returning it to the caller echoed the
+		// decrypt/DSN error verbatim, which is a credential oracle on a route
+		// that takes the connection id from the request.
+		log.WithError(err).WithField("connection_id", sourceConnID).
+			Error("assessment: failed to load source connection")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load connection"})
 		return
 	}
 
@@ -160,7 +188,8 @@ func (h *AssessmentHandler) RunAssessment(c *gin.Context) {
 	if err != nil {
 		// Assessor crashed entirely (very rare — assessor implementations
 		// are supposed to convert connection errors into Check findings).
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "assessor crashed: " + err.Error()})
+		log.WithError(err).WithField("pipeline_id", pipelineID).Error("assessment: assessor crashed")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "assessor failed"})
 		return
 	}
 
@@ -185,6 +214,9 @@ func (h *AssessmentHandler) RunAssessment(c *gin.Context) {
 // Returns 404 if no assessment has ever been run.
 func (h *AssessmentHandler) GetLatest(c *gin.Context) {
 	pipelineID := c.Param("id")
+	if !assertPipelineOwnerForHandlers(c, h.db, pipelineID) {
+		return
+	}
 	row, err := h.fetchLatest(c, pipelineID)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -201,6 +233,9 @@ func (h *AssessmentHandler) GetLatest(c *gin.Context) {
 func (h *AssessmentHandler) GetOne(c *gin.Context) {
 	pipelineID := c.Param("id")
 	runID := c.Param("run_id")
+	if !assertPipelineOwnerForHandlers(c, h.db, pipelineID) {
+		return
+	}
 	row, err := h.fetchOne(c, pipelineID, runID)
 	if err != nil {
 		if err == sql.ErrNoRows {

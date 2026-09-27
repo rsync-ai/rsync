@@ -141,7 +141,9 @@ async def _infer_domain_with_llm(connector_name: str, description: str = "") -> 
         
         # Run sync OpenAI call in thread pool via shared factory (honours OPENAI_BASE_URL / Azure)
         def run_inference():
-            from src.utils.openai_client import make_sync_client, resolve_provider, get_default_model
+            from src.utils.openai_client import (
+                make_sync_client, resolve_provider, get_default_model, with_reasoning_headroom,
+            )
             provider = resolve_provider()
             client = make_sync_client(provider)
             model = get_default_model(provider)
@@ -157,7 +159,7 @@ Also, search your knowledge for "official brand assets" or "press kit" to confir
                 model=model,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=50
+                max_tokens=with_reasoning_headroom(50),
             )
             return response.choices[0].message.content.strip().lower()
 

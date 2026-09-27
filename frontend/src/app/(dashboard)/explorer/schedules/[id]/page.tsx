@@ -38,6 +38,7 @@ import { RunDurationChart } from "@/components/explorer/RunDurationChart"
 import { ModelLineageGraph } from "@/components/explorer/ModelLineageGraph"
 import { LineageCountValue, RunAsValue } from "@/components/explorer/ModelDetailRows"
 import { ModelFreshnessDeadline } from "@/components/explorer/ModelFreshnessDeadline"
+import { ModelFreshnessHistory } from "@/components/explorer/ModelFreshnessHistory"
 import {
   cadenceCron,
   describeCadence,
@@ -57,6 +58,7 @@ import {
   useRunningModels,
 } from "@/components/explorer/ModelLiveState"
 import { AFTER_UPSTREAM, liveCellFor, openBreachFor } from "@/components/explorer/liveState"
+import { runModelNow } from "@/components/explorer/runModelNow"
 
 // One model, all of it on one page. The list's inline history showed the latest 50
 // runs as lines of text with no way to reach the 51st, and every action on a model
@@ -68,9 +70,9 @@ const PAGE_SIZE = 25
 
 // The tab is in the address, so a link can open a page on its graph: each node of the
 // graph links to its model's page that way, and walking a chain stays on the graph.
-type PageTab = "runs" | "graph"
+type PageTab = "runs" | "graph" | "freshness"
 function tabFromParam(value: string | null | undefined): PageTab {
-  return value === "graph" ? "graph" : "runs"
+  return value === "graph" || value === "freshness" ? value : "runs"
 }
 
 type RunFilter = "" | "succeeded" | "failed" | "skipped"
@@ -81,9 +83,12 @@ const RUN_FILTERS: { value: RunFilter; label: string }[] = [
   { value: "succeeded", label: "Succeeded" },
 ]
 
-// What both a scheduled model and a query without a schedule can say about themselves.
-// The query's own row (GET /explorer/saved/:id) carries these under the same names; it
-// has no cadence, status or upstreams, so nothing that reads those can be handed one.
+// What the page says about the model itself, scheduled or not, read from the query's own
+// row (GET /explorer/saved/:id). The schedule row has fields of the same names, but its
+// created_by, created_at and updated_at are the schedule's — who scheduled the query, and
+// when its trigger last changed — so a SQL edit or a new freshness deadline never moves
+// them. The query row has no cadence, status or upstreams, so nothing that reads those
+// can be handed one.
 type ModelBasics = Pick<
   ScheduledQuery,
   | "name"
@@ -99,7 +104,7 @@ type ModelBasics = Pick<
 
 type ScheduleState =
   | { status: "loading" }
-  | { status: "ok"; schedule: ScheduledQuery }
+  | { status: "ok"; schedule: ScheduledQuery; query: ModelBasics }
   | { status: "unscheduled"; query: ModelBasics }
   | { status: "missing" }
   | { status: "error"; message: string }
@@ -246,6 +251,7 @@ function ModelSchedulePageBody() {
   const [editSchedule, setEditSchedule] = useState(false)
   const [graphReloadTick, setGraphReloadTick] = useState(0)
   const [graphLoading, setGraphLoading] = useState(false)
+  const [freshnessTick, setFreshnessTick] = useState(0)
 
   const router = useRouter()
   const pathname = usePathname()
@@ -274,10 +280,14 @@ function ModelSchedulePageBody() {
   const loadSchedule = useCallback(async () => {
     if (!id) return
     try {
-      const res = await authFetch(
-        `/api/v1/explorer/schedules?saved_query_id=${encodeURIComponent(id)}`,
-        { cache: "no-store" },
-      )
+      // The schedule says when and whether the model runs; the query's own row says what
+      // the model is (see ModelBasics). Asked together, so the page waits for one round
+      // trip. The query row also stands alone: a query whose schedule was deleted keeps
+      // every run it made, and those runs are what a link to this page was followed for.
+      const [res, queryRes] = await Promise.all([
+        authFetch(`/api/v1/explorer/schedules?saved_query_id=${encodeURIComponent(id)}`, { cache: "no-store" }),
+        authFetch(`/api/v1/explorer/saved/${encodeURIComponent(id)}`, { cache: "no-store" }),
+      ])
       // 400 is a malformed id in the address bar: nothing by that id can exist.
       if (res.status === 400) {
         setState({ status: "missing" })
@@ -287,17 +297,8 @@ function ModelSchedulePageBody() {
         setState({ status: "error", message: `Could not load this model (HTTP ${res.status}).` })
         return
       }
-      const data = await res.json()
-      const found = Array.isArray(data?.schedules) ? (data.schedules[0] as ScheduledQuery | undefined) : undefined
-      if (found) {
-        setState({ status: "ok", schedule: found })
-        return
-      }
-      // No live schedule. A query whose schedule was deleted keeps every run it made, and
-      // those runs are what a link to this page was followed for — so ask for the query
-      // itself before calling it missing. Its route answers 404 for a query that does not
-      // exist and for another member's private one alike, and so does this page.
-      const queryRes = await authFetch(`/api/v1/explorer/saved/${encodeURIComponent(id)}`, { cache: "no-store" })
+      // The query route answers 404 for a query that does not exist and for another
+      // member's private one alike, and so does this page.
       if (queryRes.status === 404 || queryRes.status === 403) {
         setState({ status: "missing" })
         return
@@ -306,7 +307,10 @@ function ModelSchedulePageBody() {
         setState({ status: "error", message: `Could not load this model (HTTP ${queryRes.status}).` })
         return
       }
-      setState({ status: "unscheduled", query: (await queryRes.json()) as ModelBasics })
+      const data = await res.json()
+      const found = Array.isArray(data?.schedules) ? (data.schedules[0] as ScheduledQuery | undefined) : undefined
+      const query = (await queryRes.json()) as ModelBasics
+      setState(found ? { status: "ok", schedule: found, query } : { status: "unscheduled", query })
     } catch {
       setState({ status: "error", message: "Could not reach the server to load this model." })
     }
@@ -367,6 +371,7 @@ function ModelSchedulePageBody() {
     void loadSchedule()
     showLatestRuns()
     setGraphReloadTick((t) => t + 1)
+    setFreshnessTick((t) => t + 1)
     // A no-op while nothing on the page polls it.
     void refreshRunning()
     if (schedule) void refreshFreshness()
@@ -390,29 +395,13 @@ function ModelSchedulePageBody() {
   const handleRunNow = async () => {
     if (!schedule) return
     setRunningNow(true)
-    try {
-      const res = await authFetch(`/api/v1/explorer/saved/${encodeURIComponent(id)}/run`, { method: "POST" })
-      const data = await res.json().catch(() => ({}))
-      if (res.ok) {
-        const rows = typeof data?.rows_affected === "number" ? (data.rows_affected as number) : null
-        toast.success(
-          schedule.materialization === "statement"
-            ? rows === null
-              ? "Statement ran"
-              : `Statement ran — ${rows} row${rows === 1 ? "" : "s"} affected`
-            : `Rebuilt ${data?.target_table || schedule.target_table || "the target table"}`,
-        )
-      } else {
-        toast.error(data?.error || "The run did not complete")
-      }
-    } catch {
-      toast.error("Could not run the model")
-    } finally {
-      setRunningNow(false)
-      // Either outcome wrote a run row; the newest page is where it is.
-      void loadSchedule()
-      showLatestRuns()
-    }
+    const run = await runModelNow(id, schedule.materialization, schedule.target_table)
+    if (run.ok) toast.success(run.message)
+    else toast.error(run.message)
+    setRunningNow(false)
+    // Either outcome wrote a run row; the newest page is where it is.
+    void loadSchedule()
+    showLatestRuns()
   }
 
   const setPaused = async (pause: boolean) => {
@@ -485,7 +474,7 @@ function ModelSchedulePageBody() {
   // A query without a schedule still has a page: its runs are real history, and nothing
   // else in the product lists them. Everything that acts on a schedule is left off it.
   const s = state.status === "ok" ? state.schedule : null
-  const m: ModelBasics = state.status === "ok" ? state.schedule : state.query
+  const m: ModelBasics = state.query
   const cell = s ? liveCellFor(s.schedule_type, s.saved_query_id, running) : null
   const breach = s ? openBreachFor(s.saved_query_id, freshness.status === "ok" ? freshness.data : []) : undefined
   const canEditQuery = canEditSavedQuery(workspaceRole, m.created_by, user?.id)
@@ -613,6 +602,7 @@ function ModelSchedulePageBody() {
         <TabsList>
           <TabsTrigger value="runs">Runs</TabsTrigger>
           <TabsTrigger value="graph">Graph</TabsTrigger>
+          <TabsTrigger value="freshness">Freshness</TabsTrigger>
         </TabsList>
         <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_320px]">
           <div className="min-w-0">
@@ -769,6 +759,9 @@ function ModelSchedulePageBody() {
                 onLoadingChange={setGraphLoading}
               />
             </TabsContent>
+            <TabsContent value="freshness" className="mt-0 h-full">
+              <ModelFreshnessHistory savedQueryId={id} reloadTick={freshnessTick} />
+            </TabsContent>
           </div>
 
           <Card className="p-4" data-testid="model-details-card">
@@ -862,6 +855,7 @@ function ModelSchedulePageBody() {
                       // The PUT bumps updated_at; the sweep opens or closes a breach within a minute.
                       void loadSchedule()
                       if (schedule) void refreshFreshness()
+                      setFreshnessTick((t) => t + 1)
                     }}
                   />
                 </DetailRow>

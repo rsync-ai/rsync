@@ -3,13 +3,11 @@ package workers
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -86,12 +84,8 @@ func NewCapabilityResolverWorker(kafkaManager *kafka.Manager, db *sql.DB) *Capab
 	}
 }
 
-// AgentName returns the worker name
-func (w *CapabilityResolverWorker) AgentName() string {
-	return "capability_resolver"
-}
-
-// Start begins consuming tasks
+// Start begins claiming "connector_resolver" requests from the Redis correlation
+// store (startRedisPollerCapability_resolver).
 func (w *CapabilityResolverWorker) Start() error {
 	log.Info("🚀 Starting Capability Resolver Worker")
 
@@ -103,12 +97,6 @@ func (w *CapabilityResolverWorker) Start() error {
 		log.Warn("⚠️  CapabilityResolverWorker: Correlation client not initialized - V2 workflows will not work")
 	}
 
-	// Consume from dedicated topic (no consumer group = no rebalancing)
-	err := w.kafkaManager.ConsumeWithContext("agent.control.commands.capability_resolver", w.handleTask)
-	if err != nil {
-		return fmt.Errorf("failed to consume agent.control.commands: %w", err)
-	}
-
 	log.Info("✅ Capability Resolver Worker started")
 	return nil
 }
@@ -117,42 +105,6 @@ func (w *CapabilityResolverWorker) Start() error {
 func (w *CapabilityResolverWorker) Stop() {
 	log.Info("🛑 Stopping Capability Resolver Worker")
 	w.cancel()
-	// Kafka consumer will be stopped via context cancellation
-}
-
-// handleTask processes incoming task assignments
-func (w *CapabilityResolverWorker) handleTask(ctx context.Context, msg *sarama.ConsumerMessage) error {
-	var assignment Task
-	if err := json.Unmarshal(msg.Value, &assignment); err != nil {
-		log.WithError(err).Error("Failed to unmarshal task assignment")
-		return err
-	}
-
-	// V2 tasks are handled by the Redis correlation poller; the Kafka path is V1-only.
-	// Skipping here prevents double-execution (see KI-HYBRID-1).
-	if assignment.CorrelationID != "" {
-		return nil
-	}
-
-	// Filter: only process capability resolution tasks
-	if assignment.TaskType != "resolve_capability" {
-		return nil // Not for us
-	}
-
-	log.WithFields(log.Fields{
-		"pipeline_id": assignment.PipelineID,
-		"task_id":     assignment.TaskID,
-	}).Info("🔌 Processing capability resolution task")
-
-	result, err := w.ProcessTask(ctx, assignment)
-	if err != nil {
-		log.WithError(err).Error("Capability resolution failed")
-		result.Status = "failed"
-		result.Error = err.Error()
-	}
-
-	// Route result to correlation store (V2) or Kafka (V1)
-	return RouteResult(ctx, assignment, result, w.kafkaManager)
 }
 
 // ProcessTask implements the capability resolution logic

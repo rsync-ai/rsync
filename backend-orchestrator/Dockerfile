@@ -14,6 +14,7 @@ COPY shared/go/transforms /build/shared/go/transforms
 COPY shared/go/naming /build/shared/go/naming
 COPY shared/go/kafkaclient /build/shared/go/kafkaclient
 COPY shared/go/pgdriver /build/shared/go/pgdriver
+COPY shared/go/memlimit /build/shared/go/memlimit
 
 # Copy backend-orchestrator module
 COPY backend-orchestrator/go.mod backend-orchestrator/go.sum /build/backend-orchestrator/
@@ -28,9 +29,11 @@ ARG TARGETOS
 ARG TARGETARCH
 # Build — mount Go build cache so incremental rebuilds reuse prior compiler output.
 # On the prod VM this cuts the go build step from ~180s to ~20s after the first build.
+# -trimpath keeps build-host paths out of the binary; -s -w drops the symbol table and
+# DWARF. Panics still print file:line (that is pclntab, which stays), only a debugger loses.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o bin/orchestrator ./cmd/orchestrator
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o bin/orchestrator ./cmd/orchestrator
 
 FROM alpine:3.24
 
@@ -40,9 +43,7 @@ WORKDIR /app
 # Install python3 for MCP servers that use python; curl for health checks
 RUN apk add --no-cache python3 py3-pip ca-certificates curl
 
-COPY --from=builder /build/backend-orchestrator/bin/orchestrator .
-
-RUN chown appuser:appgroup /app/orchestrator
+COPY --from=builder --chown=appuser:appgroup /build/backend-orchestrator/bin/orchestrator .
 
 USER appuser
 

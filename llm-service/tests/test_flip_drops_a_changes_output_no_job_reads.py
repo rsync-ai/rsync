@@ -199,12 +199,32 @@ def test_a_dropped_job_name_may_not_survive_in_prose():
         mod.refuse_on_surviving_job_names(cited, ["doomed"], "fixture.yml")
 
 
-def test_the_real_ci_yml_comes_out_with_no_orphan_and_no_citation():
-    """The derived invariant, on the tree the flip actually runs against."""
+def test_the_real_ci_yml_strands_nothing_because_it_publishes_no_outputs():
+    """The derived invariant, on the tree the flip actually runs against.
+
+    ci.yml no longer HAS a `changes` job -- the filters moved to
+    .github/paths-filters.yml and each job runs them itself, so no job
+    publishes `outputs:` for another to read and a drop can strand nothing to
+    sweep. The sweep stays in the tool, exercised by the synthetic fixture
+    above, because its correctness is a property of the TOOL; what this test
+    asserts is the property of THIS TREE that currently leaves it no work.
+
+    It is still armed. If a job ever republishes filter outputs for another to
+    consume, `swept` goes non-empty here and this fails -- restore the
+    measuring assertions from the `changes`-job era (see git history) rather
+    than deleting the check.
+    """
     yaml = pytest.importorskip("yaml")
     mod = _module()
     with open(CI_YML, encoding="utf-8") as fh:
         text = fh.read()
+
+    doc = yaml.safe_load(text)
+    publishers = {n: j["outputs"] for n, j in doc["jobs"].items() if j.get("outputs")}
+    assert not publishers, (
+        "ci.yml jobs publish outputs again (%s). A drop can now strand one, so "
+        "this guard must go back to measuring the orphan set." % sorted(publishers)
+    )
 
     jobs = mod.DROP_JOBS["ci.yml"]
     assert jobs, "DROP_JOBS lost its ci.yml entry; this guard has no subject"
@@ -213,21 +233,8 @@ def test_the_real_ci_yml_comes_out_with_no_orphan_and_no_citation():
         assert changed, "%s was already absent from ci.yml" % job
 
     swept_text, swept = mod.drop_orphaned_changes_outputs(text)
-    assert swept, (
-        "the drops stranded no `changes` output. Either the sweep stopped "
-        "measuring, or ci.yml changed -- read it before relaxing this.")
-    for name in swept:
-        assert "steps.filter.outputs.%s" % name in text, (
-            "%r was not an output before the sweep, so the sweep is not "
-            "measuring what this asserts" % name)
+    assert swept == [], "the drops stranded %r -- see the docstring" % (swept,)
+    assert swept_text == text, "the sweep rewrote a tree it had nothing to do in"
 
     # The reworded prose is the point: no comment may name a dropped job.
     mod.refuse_on_surviving_job_names(swept_text, jobs, "ci.yml")
-
-    doc = yaml.safe_load(swept_text)
-    outputs = doc["jobs"]["changes"]["outputs"]
-    for name in swept:
-        assert name not in outputs
-    for name in outputs:
-        assert "needs.changes.outputs.%s" % name in swept_text, (
-            "%r survived the sweep with no reader" % name)

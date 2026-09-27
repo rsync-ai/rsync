@@ -15,7 +15,7 @@ const actions = [
   {
     title: "CDC Pipeline",
     description: "Create real-time CDC pipeline with AI",
-    href: "/cdc/new",
+    href: "/chat",
     icon: RefreshCw,
     color: "text-violet-600",
     bgColor: "bg-violet-100 dark:bg-violet-900/30",

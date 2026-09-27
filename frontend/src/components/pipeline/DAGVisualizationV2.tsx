@@ -47,8 +47,8 @@ import {
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { getConnectorLogoUrl } from "@/lib/api/mcp-connectors"
-import type { ExecutionPlanStage } from "./DAGVisualization"
-import { formatDuration } from "./DAGVisualization"
+import type { ExecutionPlanStage } from "./dagTypes"
+import { formatDuration } from "./dagHelpers"
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
@@ -143,10 +143,18 @@ function StatusIcon({ status, className }: { status: string; className?: string 
 
 // ─── Node dimensions (must match dagre layout) ───────────────────────────────
 
-const NODE_WIDTH = 230
-const NODE_HEIGHT = 108
+export const NODE_WIDTH = 230
+export const NODE_HEIGHT = 108
+
+// A straight chain of steps (a CDC pipeline's setup is eight) wraps into rows of
+// this many that snake, instead of one column: see chainLayout.
+export const CHAIN_COLUMNS = 4
+const CHAIN_COLUMN_GAP = 56
+const CHAIN_ROW_GAP = 64
 
 // ─── Custom Stage Node ────────────────────────────────────────────────────────
+
+const HIDDEN_HANDLE = { opacity: 0, pointerEvents: "none", width: 1, height: 1 } as const
 
 function StageNodeComponent({ data }: NodeProps<StageNode>) {
   const { stage, connectorType, isSelected, anomalyRatio } = data as StageNodeData
@@ -185,17 +193,15 @@ function StageNodeComponent({ data }: NodeProps<StageNode>) {
           {anomalyRatio.toFixed(1)}×
         </div>
       )}
-      {/* Invisible handles — required by ReactFlow to anchor edge endpoints */}
-      <Handle
-        type="target"
-        position={Position.Top}
-        style={{ opacity: 0, pointerEvents: "none", width: 1, height: 1 }}
-      />
-      <Handle
-        type="source"
-        position={Position.Bottom}
-        style={{ opacity: 0, pointerEvents: "none", width: 1, height: 1 }}
-      />
+      {/* Invisible handles — required by ReactFlow to anchor edge endpoints.
+          A branching graph runs top to bottom; a chain's rows snake, so its
+          edges leave from either side. buildElements names the pair per edge. */}
+      <Handle id="top" type="target" position={Position.Top} style={HIDDEN_HANDLE} />
+      <Handle id="bottom" type="source" position={Position.Bottom} style={HIDDEN_HANDLE} />
+      <Handle id="left" type="target" position={Position.Left} style={HIDDEN_HANDLE} />
+      <Handle id="right" type="source" position={Position.Right} style={HIDDEN_HANDLE} />
+      <Handle id="right-in" type="target" position={Position.Right} style={HIDDEN_HANDLE} />
+      <Handle id="left-out" type="source" position={Position.Left} style={HIDDEN_HANDLE} />
       {/* Left kind accent bar */}
       <div
         className={cn(
@@ -300,7 +306,90 @@ function synthesizeSequential(stages: ExecutionPlanStage[]): ExecutionPlanStage[
   }))
 }
 
-function buildElements(
+type XY = { x: number; y: number }
+type EdgeHandles = { sourceHandle: string; targetHandle: string }
+
+const TOP_TO_BOTTOM: EdgeHandles = { sourceHandle: "bottom", targetHandle: "top" }
+const edgeKey = (from: string, to: string) => `${from}->${to}`
+
+/**
+ * The stages in dependency order when they form one straight chain (one root,
+ * each stage waiting on at most one other, none waited on twice), else null.
+ */
+function chainOrder(stages: ExecutionPlanStage[]): ExecutionPlanStage[] | null {
+  const byId = new Map(stages.map((s) => [s.id, s]))
+  const next = new Map<string, string>()
+  let root: ExecutionPlanStage | null = null
+  for (const s of stages) {
+    const deps = s.dependencies ?? []
+    if (deps.length > 1) return null
+    if (deps.length === 0) {
+      if (root) return null
+      root = s
+      continue
+    }
+    if (!byId.has(deps[0]) || next.has(deps[0])) return null
+    next.set(deps[0], s.id)
+  }
+  const order: ExecutionPlanStage[] = []
+  for (let id = root?.id; id !== undefined && order.length < stages.length; id = next.get(id)) {
+    order.push(byId.get(id)!)
+  }
+  return order.length === stages.length ? order : null
+}
+
+/**
+ * A chain wraps into rows of CHAIN_COLUMNS that snake: left to right, then right
+ * to left starting under the row's last step. As one top-to-bottom column, a
+ * CDC setup's eight steps fitted a 540 px pane only at zoom 0.32, where no label
+ * could be read; as two rows of four they fit at about 0.9.
+ */
+function chainLayout(order: ExecutionPlanStage[]): { positions: Map<string, XY>; handles: Map<string, EdgeHandles> } {
+  const positions = new Map<string, XY>()
+  const handles = new Map<string, EdgeHandles>()
+  const rowOf = (i: number) => Math.floor(i / CHAIN_COLUMNS)
+  order.forEach((s, i) => {
+    const row = rowOf(i)
+    const inRow = i % CHAIN_COLUMNS
+    const col = row % 2 === 0 ? inRow : CHAIN_COLUMNS - 1 - inRow
+    positions.set(s.id, { x: col * (NODE_WIDTH + CHAIN_COLUMN_GAP), y: row * (NODE_HEIGHT + CHAIN_ROW_GAP) })
+    if (i === 0) return
+    const turn = rowOf(i - 1) !== row
+    handles.set(
+      edgeKey(order[i - 1].id, s.id),
+      turn
+        ? TOP_TO_BOTTOM
+        : row % 2 === 0
+          ? { sourceHandle: "right", targetHandle: "left" }
+          : { sourceHandle: "left-out", targetHandle: "right-in" },
+    )
+  })
+  return { positions, handles }
+}
+
+/** Any other graph: dagre, top to bottom, so branches and joins read. */
+function dagreLayout(stages: ExecutionPlanStage[]): Map<string, XY> {
+  const g = new dagre.graphlib.Graph()
+  g.setDefaultEdgeLabel(() => ({}))
+  g.setGraph({ rankdir: "TB", nodesep: 60, ranksep: 70, marginx: 50, marginy: 50 })
+
+  stages.forEach((s) => g.setNode(s.id, { width: NODE_WIDTH, height: NODE_HEIGHT }))
+  stages.forEach((s) => {
+    ;(s.dependencies ?? []).forEach((dep) => g.setEdge(dep, s.id))
+  })
+
+  dagre.layout(g)
+
+  // dagre places centers; React Flow wants top-left corners.
+  return new Map(
+    stages.map((s) => {
+      const c = g.node(s.id)
+      return [s.id, { x: c.x - NODE_WIDTH / 2, y: c.y - NODE_HEIGHT / 2 }]
+    }),
+  )
+}
+
+export function buildElements(
   stages: ExecutionPlanStage[],
   selectedStageId?: string | null,
 ): { nodes: StageNode[]; edges: Edge[] } {
@@ -309,20 +398,13 @@ function buildElements(
   const prepared = synthesizeSequential(stages)
   const anyRunning = prepared.some((s) => s.status === "running")
 
-  // dagre layout
-  const g = new dagre.graphlib.Graph()
-  g.setDefaultEdgeLabel(() => ({}))
-  g.setGraph({ rankdir: "TB", nodesep: 60, ranksep: 70, marginx: 50, marginy: 50 })
-
-  prepared.forEach((s) => g.setNode(s.id, { width: NODE_WIDTH, height: NODE_HEIGHT }))
-  prepared.forEach((s) => {
-    ;(s.dependencies ?? []).forEach((dep) => g.setEdge(dep, s.id))
-  })
-
-  dagre.layout(g)
+  const chain = chainOrder(prepared)
+  const { positions, handles } = chain
+    ? chainLayout(chain)
+    : { positions: dagreLayout(prepared), handles: new Map<string, EdgeHandles>() }
 
   const nodes: StageNode[] = prepared.map((s) => {
-    const pos = g.node(s.id)
+    const position = positions.get(s.id)!
     const connectorType =
       (s.metadata?.resolved_connector_type as string | undefined) ||
       (s.metadata?.node_config?.connector_type as string | undefined) ||
@@ -332,7 +414,7 @@ function buildElements(
     return {
       id: s.id,
       type: "stageNode" as const,
-      position: { x: pos.x - NODE_WIDTH / 2, y: pos.y - NODE_HEIGHT / 2 },
+      position,
       data: {
         stage: s,
         connectorType,
@@ -371,9 +453,10 @@ function buildElements(
         : null
 
       edges.push({
-        id: `${dep}->${s.id}`,
+        id: edgeKey(dep, s.id),
         source: dep,
         target: s.id,
+        ...(handles.get(edgeKey(dep, s.id)) ?? TOP_TO_BOTTOM),
         type: "animated",
         data: {
           active: edgeActive,
@@ -434,7 +517,7 @@ function DAGFlowInner({
       nodeTypes={nodeTypes}
       edgeTypes={edgeTypes}
       fitView
-      fitViewOptions={{ padding: 0.25, maxZoom: 1.2 }}
+      fitViewOptions={{ padding: 0.15, maxZoom: 1.2 }}
       minZoom={0.3}
       maxZoom={1.5}
       nodesDraggable={false}

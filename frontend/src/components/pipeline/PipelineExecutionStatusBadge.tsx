@@ -1,62 +1,32 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { useMemo } from "react"
 import { Badge } from "@/components/ui/badge"
-import { API_ENDPOINTS } from "@/lib/config/api"
-import { authFetch } from "@/lib/api/auth-fetch"
 import { cn } from "@/lib/utils"
 import {
-  normalizePipelineStatus,
   pipelineStatusLabel,
   reconcilePipelineStatus,
   type NormalizedPipelineStatus,
 } from "@/lib/pipeline/statusNormalization"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
+import { usePipelineStatePoll } from "@/lib/hooks/usePipelineStatePoll"
 import { CheckCircle2, Loader2, Pause, Square, XCircle } from "lucide-react"
 
 export function PipelineExecutionStatusBadge(props: { pipelineId: string; className?: string }) {
   const { pipelineId, className } = props
-  const [status, setStatus] = useState<NormalizedPipelineStatus>("unknown")
+  // One shared /state poll for the whole header (usePipelineStatePoll). It also
+  // re-reads on the refresh bus, so Pause/Resume flip the pill at once (#13).
+  const live = usePipelineStatePoll(pipelineId)
+  const status: NormalizedPipelineStatus = live.status ?? "unknown"
   // "The last refresh failed", not "the pipeline is broken". Keeping the last
   // known status is right — flickering to Unknown on one dropped poll would be
   // worse — but a spinning "Running" pill is a claim that liveness was
-  // confirmed 4 s ago, and once the reads stop coming back nothing backs it.
-  const [stale, setStale] = useState(false)
+  // confirmed moments ago, and once the reads stop coming back nothing backs it.
+  const stale = live.error !== null
   // The dependency-aware /runtime endpoint is the source of truth for whether a
   // (CDC) stream is actually alive. /state can freeze at "running" after the feed
   // dies, so it alone would paint a dead stream as "Running".
   const { runtime } = usePipelineRuntime(pipelineId)
-
-  useEffect(() => {
-    let cancelled = false
-
-    const fetchStatus = async () => {
-      try {
-        const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, { cache: "no-store" })
-        if (!res.ok) {
-          if (!cancelled) setStale(true)
-          return
-        }
-        const data = (await res.json()) as { status?: string }
-        const next = normalizePipelineStatus(data?.status)
-        if (!cancelled) {
-          setStatus(next)
-          setStale(false)
-        }
-      } catch {
-        // Keep the last known status — but stop presenting it as a fresh one.
-        if (!cancelled) setStale(true)
-      }
-    }
-
-    void fetchStatus()
-
-    const interval = window.setInterval(fetchStatus, 4000)
-    return () => {
-      cancelled = true
-      window.clearInterval(interval)
-    }
-  }, [pipelineId])
 
   // Escalate to /runtime's verdict when it reports the stream failed or idle —
   // see reconcilePipelineStatus for why, and for the surfaces that must agree.

@@ -55,11 +55,25 @@ from _cut_collection import skip_if_cut
 
 # Both files are removed by scripts/flip/excludes.txt. This guard measures one against
 # the other, so either one missing leaves it nothing to say.
-skip_if_cut("CAPABILITIES.md", "CAPABILITIES-ARCHIVE.md")
+skip_if_cut(
+    "CAPABILITIES.md",
+    "CAPABILITIES-ARCHIVE.md",
+    "docs/status/verified.md",
+    "docs/status/untested.md",
+    "CLAUDE.md",
+)
 
 REPO = Path(__file__).resolve().parents[2]
 DOC = REPO / "CAPABILITIES.md"
 ARCHIVE = REPO / "CAPABILITIES-ARCHIVE.md"
+# The ✅ and 🔬 tables, moved out of the index on 2026-09-24. They hold 423 of the board's
+# 480 rows and none of them is reading material: CLAUDE.md tells a session not to
+# re-investigate a ✅, and a 🔬 is verified on real data rather than by reading its row. They
+# are looked up with `scripts/cap.py`, which searches all three files at once. Their shape
+# is the index's, and every assertion below covers them the same way -- a row that moves out
+# of CAPABILITIES.md must not move out of the guard with it.
+SATELLITES = (REPO / "docs" / "status" / "verified.md", REPO / "docs" / "status" / "untested.md")
+CLAUDE_MD = REPO / "CLAUDE.md"
 WORKFLOW = REPO / ".github" / "workflows" / "doc-links.yml"
 CENSUS = Path(__file__).resolve().parent / "test_doc_link_gate_runs_on_markdown_only_prs.py"
 
@@ -68,10 +82,29 @@ CENSUS = Path(__file__).resolve().parent / "test_doc_link_gate_runs_on_markdown_
 # not for evidence -- evidence goes in the archive.
 ROW_MAX = 400
 
-# 135,344 bytes on the day of the split. Roughly ninety more one-line rows fit before
-# this trips, and when it does the fix is to retire resolved rows to the archive,
-# not to raise the number.
-DOC_MAX_BYTES = 150_000
+# 65,398 bytes after the ✅/🔬 tables moved to docs/status/ on 2026-09-24, down from 143,608
+# against a 150,000 budget it was within 5% of. The number is a context budget, not a disk
+# one: CLAUDE.md sends every session here before it may claim a feature works or is broken,
+# so this file's size is paid on most tasks, and 150 KB of it was ~36,000 tokens -- 18% of a
+# 200k window -- before any code was read. When it trips, retire resolved rows to the archive
+# or move a table to a satellite. Do not raise the number; raising it is how it reached 96%
+# of the last one.
+DOC_MAX_BYTES = 80_000
+
+# Each satellite is looked up by scripts/cap.py, never read, so its budget is looser than the
+# index's -- but it is not unbounded: the fold appends here now, and a file with no ceiling is
+# the state this whole split exists to undo. untested.md was 46,076 bytes on the day it moved.
+SATELLITE_MAX_BYTES = 60_000
+
+# CLAUDE.md is the only file in this family loaded into EVERY turn of every session, so a byte
+# here costs more than a byte anywhere else in the repo. Trimmed 2026-09-24 from 16,508 to
+# 13,160 (~3,300 tokens a turn) by moving each rule's rationale into the doc that rule links
+# to -- the drop-in/union story to docs/capabilities.d/README.md, the Azure-host history to
+# prod-environment-status.md, the edition-gate argument to oss-cloud-runtime-split.md -- and
+# deleting a "where the commands live" section the docs index already covered. What remains is
+# decisions, at ~120 bytes per docs-index row, so the next real saving is a rule leaving, not
+# rewording. The headroom is for one new rule. Lower this number after a trim; never raise it.
+CLAUDE_MD_MAX_BYTES = 14_000
 
 BOARD = "## Live status board (read this first)"
 KNOWN_ISSUES = "## Known issues"
@@ -91,6 +124,15 @@ ACTIVE_WRITE_UPS = "## Active Known issues — full write-ups"
 RESOLVED_KIS = "## Known issues (resolved — historical)"
 RETIRED_KI_STUBS = "## Retired Known-issue stubs"
 KI_ID = re.compile(r"KI-[A-Z0-9]+(?:-[A-Z0-9]+)*")
+
+# A row held in a satellite writes `](../../CAPABILITIES-ARCHIVE.md#…)` where the identical row
+# in the index writes `](CAPABILITIES-ARCHIVE.md#…)`: the fold re-roots it on the way in, because
+# docs/status/ is two directories down. Those six characters are the file's depth, not the row's
+# content. Measured raw, ROW_MAX would mean two different things depending on which file a row
+# landed in, and a row that passed the cap on the PR that wrote it could fail it weeks later in
+# the scheduled fold, for moving. Normalised out, the cap measures what it is for: how much a
+# row says. Two rows were at 397 and went to 403 on the 2026-09-24 split -- that is the defect.
+UP_DIR = re.compile(r"(?<=\]\()(?:\.\./)+")
 
 FENCE = re.compile(r"^\s{0,3}(```|~~~)")
 CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1")
@@ -192,31 +234,59 @@ def _section(lines: list[str], heading: str) -> tuple[int, int]:
     return start, len(lines)
 
 
-def _status_tables() -> dict[str, list[tuple[int, str]]]:
-    """The four board tables: emoji -> [(line number, row)], header and delimiter excluded."""
-    lines = _lines(DOC)
-    start, end = _section(lines, BOARD)
-    tables: dict[str, list[tuple[int, str]]] = {}
-    heading, rows = None, None
-    for i in range(start, end):
-        line = lines[i]
-        if line.startswith("### "):
-            heading, rows = line[4:], None
-        elif line.strip() == STATUS_HEADER and heading:
-            key = next((e for e in BOARD_TABLES if heading.startswith(e)), None)
-            assert key, f"CAPABILITIES.md:{i + 1}: a status table under an unrecognised heading: {heading!r}"
-            assert key not in tables, f"CAPABILITIES.md:{i + 1}: a second {key} status table"
-            rows = tables[key] = []
-        elif rows is not None and line.startswith("|"):
-            if not re.fullmatch(r"\|[\s:|-]+\|", line.strip()):
-                rows.append((i + 1, line))
-        else:
-            rows = None
+def _board_sources() -> list[tuple[str, list[str], int, int]]:
+    """(name, lines, start, end) for every file the board lives in: the index's
+    `## Live status board` section, and each satellite whole. A satellite is one table with
+    a header above it, so its section is the file."""
+    doc = _lines(DOC)
+    start, end = _section(doc, BOARD)
+    sources = [("CAPABILITIES.md", doc, start, end)]
+    for path in SATELLITES:
+        lines = _lines(path)
+        # Bare name when the path is not under the repo: the fold's tests point this guard at
+        # throwaway copies in a tmp dir, and a ValueError there would fail for the wrong reason.
+        try:
+            name = path.relative_to(REPO).as_posix()
+        except ValueError:
+            name = path.name
+        sources.append((name, lines, 0, len(lines)))
+    return sources
+
+
+def _status_tables() -> dict[str, list[tuple[str, str]]]:
+    """The four board tables: emoji -> [("file:line", row)], header and delimiter excluded.
+
+    Keyed by emoji across every source, so a table that exists twice -- the defect a split
+    invites, one copy left behind in the index and one moved -- fails on the second one
+    rather than quietly shadowing the first."""
+    tables: dict[str, list[tuple[str, str]]] = {}
+    for name, lines, start, end in _board_sources():
+        heading, rows = None, None
+        for i in range(start, end):
+            line = lines[i]
+            if line.startswith("### "):
+                heading, rows = line[4:], None
+            elif line.strip() == STATUS_HEADER and heading:
+                key = next((e for e in BOARD_TABLES if heading.startswith(e)), None)
+                assert key, f"{name}:{i + 1}: a status table under an unrecognised heading: {heading!r}"
+                assert key not in tables, f"{name}:{i + 1}: a second {key} status table"
+                rows = tables[key] = []
+            elif rows is not None and line.startswith("|"):
+                if not re.fullmatch(r"\|[\s:|-]+\|", line.strip()):
+                    rows.append((f"{name}:{i + 1}", line))
+            else:
+                rows = None
     return tables
 
 
 def _cells(row: str) -> list[str]:
     return [c.strip() for c in CELL_SPLIT.split(row.strip()[1:-1])]
+
+
+def _row_len(row: str) -> int:
+    """A row's length in content, with the relative-path depth of whichever file holds it
+    normalised away. See UP_DIR."""
+    return len(UP_DIR.sub("", row))
 
 
 def _active_known_issues() -> list[tuple[int, str, list[str]]]:
@@ -280,28 +350,32 @@ def test_the_scan_finds_the_board_and_the_known_issues():
 
     # Every line in the board that starts with a legend status must be a row the table walk
     # found. A blank line or a stray heading splitting a table ends the walk early.
-    parsed = {n for rows in tables.values() for n, _ in rows}
+    parsed = {w for rows in tables.values() for w, _ in rows}
     assert parsed, "the table walk found no status rows"
-    lines = _lines(DOC)
-    start, end = _section(lines, BOARD)
-    status_lines = {
-        i + 1
-        for i in range(start, end)
-        if lines[i].startswith("|") and lines[i].count("|") > 1 and _cells(lines[i])[0] in legend
-    }
-    lost = sorted(status_lines - parsed)
+    status_lines: dict[str, str] = {}
+    for name, src, start, end in _board_sources():
+        for i in range(start, end):
+            line = src[i]
+            if line.startswith("|") and line.count("|") > 1 and _cells(line)[0] in legend:
+                status_lines[f"{name}:{i + 1}"] = line
+    lost = sorted(set(status_lines) - parsed)
     assert not lost, (
         "status-looking rows under the board that no table walk reached (a blank line or "
         "heading split the table, or the row sits outside the four tables):\n"
-        + "\n".join(f"CAPABILITIES.md:{n}: {lines[n - 1][:120]}" for n in lost)
+        + "\n".join(f"{w}: {status_lines[w][:120]}" for w in lost)
     )
-    unknown = sorted(n for n in parsed if _cells(lines[n - 1])[0] not in legend)
+    unknown = sorted(
+        f"{w}: {row[:120]}"
+        for rows in tables.values()
+        for w, row in rows
+        if _cells(row)[0] not in legend
+    )
     assert not unknown, (
         "status rows whose status is not in the legend at the top of CAPABILITIES.md -- add it "
-        "to the legend or use a listed one:\n"
-        + "\n".join(f"CAPABILITIES.md:{n}: {lines[n - 1][:120]}" for n in unknown)
+        "to the legend or use a listed one:\n" + "\n".join(unknown)
     )
 
+    lines = _lines(DOC)
     kis = _active_known_issues()
     assert kis, "no active Known issues parsed"
     ki_start, ki_end = _section(lines, KNOWN_ISSUES)
@@ -320,10 +394,10 @@ def test_the_scan_finds_the_board_and_the_known_issues():
 def test_every_status_row_is_one_short_line():
     """Evidence pasted back into a row is the regression this file exists to stop."""
     offenders = [
-        f"CAPABILITIES.md:{n}: {len(row)} chars: {row[:120]}…"
+        f"{w}: {_row_len(row)} chars: {row[:120]}…"
         for rows in _status_tables().values()
-        for n, row in rows
-        if len(row) > ROW_MAX
+        for w, row in rows
+        if _row_len(row) > ROW_MAX
     ]
     assert not offenders, (
         f"status rows longer than {ROW_MAX} characters. Keep the one-liner to status, "
@@ -331,16 +405,16 @@ def test_every_status_row_is_one_short_line():
         "CAPABILITIES-ARCHIVE.md § Status board -- full rows:\n" + "\n".join(offenders)
     )
     bad_shape = [
-        f"CAPABILITIES.md:{n}: {len(_cells(row))} cells: {row[:120]}"
+        f"{w}: {len(_cells(row))} cells: {row[:120]}"
         for rows in _status_tables().values()
-        for n, row in rows
+        for w, row in rows
         if len(_cells(row)) != 3 or not _cells(row)[1]
     ]
     assert not bad_shape, "status rows that are not `| status | headline | refs |`:\n" + "\n".join(bad_shape)
     cut_off = [
-        f"CAPABILITIES.md:{n}: {row[:120]}"
+        f"{w}: {row[:120]}"
         for rows in _status_tables().values()
-        for n, row in rows
+        for w, row in rows
         if _cells(row)[1].endswith("…")
     ]
     assert not cut_off, (
@@ -352,11 +426,11 @@ def test_every_status_row_is_one_short_line():
 
 def test_no_status_row_is_listed_twice():
     """Both sides of a union merge survive. One feature with two rows has two statuses."""
-    seen: dict[str, list[int]] = {}
+    seen: dict[str, list[str]] = {}
     for rows in _status_tables().values():
-        for n, row in rows:
-            seen.setdefault(_cells(row)[1], []).append(n)
-    dupes = [f"CAPABILITIES.md:{', '.join(map(str, ns))}: {what}" for what, ns in seen.items() if len(ns) > 1]
+        for w, row in rows:
+            seen.setdefault(_cells(row)[1], []).append(w)
+    dupes = [f"{', '.join(ws)}: {what}" for what, ws in seen.items() if len(ws) > 1]
     assert not dupes, (
         "status rows sharing a headline -- keep the current one and delete the other, or "
         "make the headlines say what distinguishes them:\n" + "\n".join(dupes)
@@ -385,8 +459,38 @@ def test_the_index_stays_small():
     size = DOC.stat().st_size
     assert size <= DOC_MAX_BYTES, (
         f"CAPABILITIES.md is {size:,} bytes, over the {DOC_MAX_BYTES:,} budget. Retire resolved "
-        "rows and Known issues to CAPABILITIES-ARCHIVE.md rather than raising the budget -- "
-        "every works/broken claim starts from this file."
+        "rows and Known issues to CAPABILITIES-ARCHIVE.md, or move a whole table to a "
+        "docs/status/ satellite as the ✅ and 🔬 tables were on 2026-09-24 -- rather than raising "
+        "the budget. Every works/broken claim starts from this file, so its size is paid in "
+        "context on most tasks."
+    )
+
+
+def test_each_satellite_stays_small():
+    """A table that left the index is still on the board, and still grows every time the fold
+    runs. Without its own ceiling it becomes the thing the split was meant to prevent."""
+    over = [
+        f"{p.relative_to(REPO).as_posix()} is {p.stat().st_size:,} bytes, over {SATELLITE_MAX_BYTES:,}"
+        for p in SATELLITES
+        if p.stat().st_size > SATELLITE_MAX_BYTES
+    ]
+    assert not over, (
+        "status-board satellites over budget. Retire resolved rows to "
+        "CAPABILITIES-ARCHIVE.md § Retired status-board rows:\n" + "\n".join(over)
+    )
+
+
+def test_the_always_loaded_rules_file_stays_small():
+    """CLAUDE.md is loaded into EVERY turn of every session -- the only file here that is.
+    A byte costs more than a byte anywhere else in the repo, and nothing else measures it:
+    the index guard above bounds the file a session reads once, this bounds the file it
+    re-reads on every turn. A rule belongs here; the reasoning behind it belongs in the doc
+    the rule links to."""
+    size = CLAUDE_MD.stat().st_size
+    assert size <= CLAUDE_MD_MAX_BYTES, (
+        f"CLAUDE.md is {size:,} bytes (~{size // 4:,} tokens, paid on every turn), over the "
+        f"{CLAUDE_MD_MAX_BYTES:,} budget. Move the rationale behind the new rule into the doc it "
+        "links to and leave the decision here, rather than raising the budget."
     )
 
 
@@ -428,6 +532,11 @@ def test_links_from_other_docs_land_on_an_anchor():
         ["git", "ls-files", "-z", "--", "*.md"], cwd=REPO, capture_output=True, text=True, check=True
     ).stdout.split("\0")
     targets = {"CAPABILITIES.md": _targets(_lines(DOC)), "CAPABILITIES-ARCHIVE.md": _targets(_lines(ARCHIVE))}
+    # A drop-in's Known-issue summary links its own write-up's `<a id>`, which reaches the
+    # archive only when the daily fold copies it there (docs/capabilities.d/README.md).
+    for rel in listed:
+        if rel.startswith("docs/capabilities.d/") and Path(rel).name != "README.md" and (REPO / rel).is_file():
+            targets["CAPABILITIES-ARCHIVE.md"] |= set(_html_ids(_lines(REPO / rel)))
     others = [p for p in listed if p and Path(p).name not in targets and (REPO / p).is_file()]
     assert len(others) > 50, f"git ls-files listed only {len(others)} other markdown files"
     texts = {rel: _lines(REPO / rel) for rel in others}

@@ -392,7 +392,10 @@ func GetPipelineState(c *gin.Context) {
 	if stageMaxAttempts.Valid {
 		state.MaxAttempts = int(stageMaxAttempts.Int32)
 	}
-	if stageSummary.Valid {
+	// Pause writes pipelines.status only, so stage_summary is still the last pre-pause
+	// tick (a CDC stream's table summary); it must not paint over the "Paused" set above
+	// while the pipeline is paused (BUG #14).
+	if stageSummary.Valid && pipelineStatusNormalized != "paused" {
 		state.Summary = stageSummary.String
 	}
 	if metadata.Valid {
@@ -686,7 +689,7 @@ func enrichBlockingReasonWithSchema(br *BlockingReason, details map[string]inter
 	case "table_selection":
 		// Schema for table selection: array of table names
 		details["input_schema"] = map[string]interface{}{
-			"type": "object",
+			"type":     "object",
 			"required": []string{"selected_tables"},
 			"properties": map[string]interface{}{
 				"selected_tables": map[string]interface{}{
@@ -694,24 +697,24 @@ func enrichBlockingReasonWithSchema(br *BlockingReason, details map[string]inter
 					"items": map[string]interface{}{
 						"type": "string",
 					},
-					"minItems": 1,
+					"minItems":    1,
 					"description": "Select one or more tables to sync",
 				},
 			},
 		}
 		details["ui_hints"] = map[string]interface{}{
-			"widget": "table_selector",
+			"widget":      "table_selector",
 			"data_source": "available_tables",
 		}
 
 	case "connection_config":
 		// Schema for connection configuration
 		details["input_schema"] = map[string]interface{}{
-			"type": "object",
+			"type":     "object",
 			"required": []string{"connections"},
 			"properties": map[string]interface{}{
 				"connections": map[string]interface{}{
-					"type": "object",
+					"type":        "object",
 					"description": "Connection configurations",
 					"additionalProperties": map[string]interface{}{
 						"type": "object",
@@ -720,18 +723,18 @@ func enrichBlockingReasonWithSchema(br *BlockingReason, details map[string]inter
 			},
 		}
 		details["ui_hints"] = map[string]interface{}{
-			"widget": "connection_configurator",
+			"widget":               "connection_configurator",
 			"required_connections": details["required_connections"],
 		}
 
 	case "connector_generation":
 		// Schema for connector generation approval
 		details["input_schema"] = map[string]interface{}{
-			"type": "object",
+			"type":     "object",
 			"required": []string{"approved"},
 			"properties": map[string]interface{}{
 				"approved": map[string]interface{}{
-					"type": "boolean",
+					"type":        "boolean",
 					"description": "Approve connector generation",
 				},
 				"connectors": map[string]interface{}{
@@ -744,7 +747,7 @@ func enrichBlockingReasonWithSchema(br *BlockingReason, details map[string]inter
 			},
 		}
 		details["ui_hints"] = map[string]interface{}{
-			"widget": "connector_generator",
+			"widget":             "connector_generator",
 			"missing_connectors": details["missing_connectors"],
 		}
 	}
@@ -929,45 +932,13 @@ func parsePersistedSuggestions(metaObj map[string]interface{}) (entries []map[st
 	return entries, status, true
 }
 
-// extractIntentText pulls a human-readable intent string out of
-// pipeline_states.intent_data (migration 012). Best-effort across known shapes.
-func extractIntentText(intentData map[string]interface{}) string {
-	if intentData == nil {
-		return ""
-	}
-	for _, key := range []string{"intent", "user_request", "raw_request", "original_request", "description"} {
-		if s, ok := intentData[key].(string); ok && strings.TrimSpace(s) != "" {
-			return strings.TrimSpace(s)
-		}
-	}
-	// Nested {"intent": {...}} (adapter CachedIntent shape).
-	if nested, ok := intentData["intent"].(map[string]interface{}); ok {
-		for _, key := range []string{"user_request", "raw_request", "description"} {
-			if s, ok := nested[key].(string); ok && strings.TrimSpace(s) != "" {
-				return strings.TrimSpace(s)
-			}
-		}
-	}
-	return ""
-}
-
-// lookupPipelineIntent resolves the user's intent for ranking: parsed
-// intent_data first, then the pipeline's own NL request / name / description
-// (all user text — never row values). Empty result → caller skips suggestions
-// rather than hallucinating a use case.
+// lookupPipelineIntent resolves the user's intent for ranking from the pipeline's
+// own NL request / name / description (all user text — never row values). Empty
+// result → caller skips suggestions rather than hallucinating a use case.
+//
+// It first read pipeline_states.intent_data (migration 012), which no service
+// writes: every call was a query that found no row.
 func lookupPipelineIntent(ctx context.Context, database *sql.DB, pipelineID string) string {
-	var intentRaw sql.NullString
-	if err := database.QueryRowContext(ctx,
-		`SELECT intent_data FROM pipeline_states WHERE pipeline_id = $1`, pipelineID,
-	).Scan(&intentRaw); err == nil && intentRaw.Valid && strings.TrimSpace(intentRaw.String) != "" {
-		var intentData map[string]interface{}
-		if json.Unmarshal([]byte(intentRaw.String), &intentData) == nil {
-			if intent := extractIntentText(intentData); intent != "" {
-				return intent
-			}
-		}
-	}
-
 	var name, desc, nlRequest sql.NullString
 	if err := database.QueryRowContext(ctx,
 		`SELECT name, description, natural_language_request FROM pipelines WHERE id = $1`, pipelineID,

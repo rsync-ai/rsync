@@ -3789,7 +3789,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
             
             # Handle NoSQL
             if pattern.get("is_nosql"):
-                return self._import_nosql(conn, config, table, data)
+                return self._import_nosql(conn, config, table, data, params)
             
             # SQL import
             cursor = self._get_cursor(conn, as_dict=False)
@@ -3979,7 +3979,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
 
             # Handle NoSQL (MongoDB)
             if pattern.get("is_nosql"):
-                return self._upsert_nosql(conn, config, table, data, key_fields)
+                return self._upsert_nosql(conn, config, table, data, key_fields, params)
             
             cursor = self._get_cursor(conn, as_dict=False)
             # Union keys across ALL rows, not just data[0]. Wide-format transforms
@@ -4015,15 +4015,34 @@ class {{ spec.class_name }}(BaseMCPConnector):
             # One catalog lookup, not one per row.
             perrow_conflict_keys = self._merge_conflict_keys(cursor, table, columns, key_fields)
             for row in data:
+                # Bind this row's OWN columns, never the batch union. A row whose key
+                # set is smaller than the union is not "the same row with NULLs in the
+                # gaps" — it is a row the producer deliberately said nothing about for
+                # those columns. The kafka sink depends on that: filterDebeziumUnavailable
+                # DROPS the key of a TOAST-able column Debezium reported unchanged
+                # (__debezium_unavailable_value), on the contract that an absent key
+                # means "leave this column alone". Binding the union broke the contract —
+                # row.get(col) -> None and `SET col = EXCLUDED.col` wrote NULL over the
+                # destination's good value, but only when a batch MIXED shapes, which is
+                # the normal shape of a CDC batch. Order is inherited from the union so
+                # rows of the same shape still produce one identical statement string, and
+                # a key present with an explicit None stays in row_cols and still writes
+                # NULL — only a key the row never carried is omitted.
+                row_cols = [c for c in columns if c in row]
+                if not row_cols:
+                    raise ValueError(
+                        f"upsert_data: a row in the batch for {table} carries no columns; "
+                        "refusing to write an all-NULL row"
+                    )
                 if "psycopg2" in driver_module or "asyncpg" in driver_module:
                     # PostgreSQL: INSERT ... ON CONFLICT DO UPDATE.
                     # Quote every identifier so camelCase columns survive
                     # Postgres' default lowercase-folding for unquoted names.
-                    col_str = ", ".join([f'"{c}"' for c in columns])
-                    placeholders = ", ".join(["%s"] * len(columns))
+                    col_str = ", ".join([f'"{c}"' for c in row_cols])
+                    placeholders = ", ".join(["%s"] * len(row_cols))
                     conflict_cols_list = perrow_conflict_keys
                     conflict_cols = ", ".join([f'"{c}"' for c in conflict_cols_list])
-                    update_cols = [c for c in columns if c not in conflict_cols_list]
+                    update_cols = [c for c in row_cols if c not in conflict_cols_list]
 
                     if update_cols:
                         update_str = ", ".join([f'"{c}" = EXCLUDED."{c}"' for c in update_cols])
@@ -4031,7 +4050,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     else:
                         query = f"INSERT INTO {table} ({col_str}) VALUES ({placeholders}) ON CONFLICT ({conflict_cols}) DO NOTHING"
                     
-                    values = tuple(row.get(col) for col in columns)
+                    values = tuple(row.get(col) for col in row_cols)
                     try:
                         cursor.execute(query, values)
                     except Exception as e:
@@ -4056,9 +4075,9 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 
                 elif "mysql" in driver_module or "pymysql" in driver_module:
                     # MySQL: INSERT ... ON DUPLICATE KEY UPDATE
-                    col_str = ", ".join(columns)
-                    placeholders = ", ".join(["%s"] * len(columns))
-                    update_cols = [c for c in columns if c not in key_fields]
+                    col_str = ", ".join(row_cols)
+                    placeholders = ", ".join(["%s"] * len(row_cols))
+                    update_cols = [c for c in row_cols if c not in key_fields]
                     
                     if update_cols:
                         update_str = ", ".join([f"{c} = VALUES({c})" for c in update_cols])
@@ -4071,19 +4090,19 @@ class {{ spec.class_name }}(BaseMCPConnector):
                         _noop = key_fields[0]
                         query = f"INSERT INTO {table} ({col_str}) VALUES ({placeholders}) ON DUPLICATE KEY UPDATE {_noop} = {_noop}"
                     
-                    values = tuple(row.get(col) for col in columns)
+                    values = tuple(row.get(col) for col in row_cols)
                     cursor.execute(query, values)
                 
                 elif "oracledb" in driver_module or "cx_Oracle" in driver_module:
                     # Oracle: MERGE statement
-                    col_str = ", ".join(columns)
-                    src_cols = ", ".join([f":{i+1} AS {c}" for i, c in enumerate(columns)])
+                    col_str = ", ".join(row_cols)
+                    src_cols = ", ".join([f":{i+1} AS {c}" for i, c in enumerate(row_cols)])
                     match_cond = " AND ".join([f"t.{k} = s.{k}" for k in key_fields])
-                    update_cols = [c for c in columns if c not in key_fields]
+                    update_cols = [c for c in row_cols if c not in key_fields]
                     
                     if update_cols:
                         update_str = ", ".join([f"t.{c} = s.{c}" for c in update_cols])
-                        insert_cols = ", ".join([f"s.{c}" for c in columns])
+                        insert_cols = ", ".join([f"s.{c}" for c in row_cols])
                         query = f"""
                             MERGE INTO {table} t
                             USING (SELECT {src_cols} FROM dual) s
@@ -4092,7 +4111,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                             WHEN NOT MATCHED THEN INSERT ({col_str}) VALUES ({insert_cols})
                         """
                     else:
-                        insert_cols = ", ".join([f"s.{c}" for c in columns])
+                        insert_cols = ", ".join([f"s.{c}" for c in row_cols])
                         query = f"""
                             MERGE INTO {table} t
                             USING (SELECT {src_cols} FROM dual) s
@@ -4100,7 +4119,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
                             WHEN NOT MATCHED THEN INSERT ({col_str}) VALUES ({insert_cols})
                         """
                     
-                    values = tuple(row.get(col) for col in columns)
+                    values = tuple(row.get(col) for col in row_cols)
                     cursor.execute(query, values)
                 
                 else:
@@ -4113,9 +4132,13 @@ class {{ spec.class_name }}(BaseMCPConnector):
                     key_values = tuple(row.get(k) for k in key_fields)
                     cursor.execute(f"DELETE FROM {_gf_quoted} WHERE {where_clause}", key_values)
 
-                    col_str = ", ".join(columns)
-                    placeholders = ", ".join(["%s"] * len(columns))
-                    values = tuple(row.get(col) for col in columns)
+                    # NOTE: this branch cannot honour an absent key the way the upsert
+                    # branches above do — it removes the destination row first, so a
+                    # column this row does not carry is gone either way. Binding row_cols
+                    # at least stops it writing an explicit NULL over a column DEFAULT.
+                    col_str = ", ".join(row_cols)
+                    placeholders = ", ".join(["%s"] * len(row_cols))
+                    values = tuple(row.get(col) for col in row_cols)
                     cursor.execute(f"INSERT INTO {_gf_quoted} ({col_str}) VALUES ({placeholders})", values)
                 
                 rows_upserted += 1
@@ -4208,7 +4231,7 @@ class {{ spec.class_name }}(BaseMCPConnector):
             pattern = self.driver_pattern
             
             if pattern.get("is_nosql"):
-                return self._delete_nosql(conn, config, table, data, key_fields)
+                return self._delete_nosql(conn, config, table, data, key_fields, params)
             
             cursor = self._get_cursor(conn, as_dict=False)
             rows_deleted = 0
@@ -5096,6 +5119,12 @@ class {{ spec.class_name }}(BaseMCPConnector):
         """Return durable per-partition high-water offsets for a pipeline so the
         sink can seed its skip-map on restart (CDC exactly-once recovery)."""
         params = params or {}
+        # A NoSQL destination has no DB-API cursor: self._get_cursor(conn) on a
+        # MongoClient raises, so without this branch the seed read below could only
+        # ever fail and the sink would start with an empty skip-map.
+        _pattern = getattr(self, "driver_pattern", None) or {}
+        if _pattern.get("is_nosql"):
+            return self._get_cdc_offsets_nosql(params)
         # Non-DBAPI warehouses (e.g. BigQuery) keep offsets via their adapter.
         if getattr(self, "_warehouse_adapter", None) and hasattr(self._warehouse_adapter, "get_cdc_offsets"):
             config = self._get_config(params) if hasattr(self, "_get_config") else (params.get("config") or {})
@@ -5148,7 +5177,111 @@ class {{ spec.class_name }}(BaseMCPConnector):
     #
     # This keeps generated connectors valid for ALL ids while preserving backwards compatibility.
     
-    def _import_nosql(self, conn, config: Dict, collection: str, data: List) -> Dict:
+    # ------------------------------------------------------------------
+    # CDC exactly-once offsets, NoSQL flavour (Tier B).
+    #
+    # Contract: docs/connectors/cdc-exactly-once-offsets.md. Identical INTENT to
+    # the SQL _write_cdc_offsets above, but a document store has no cursor and no
+    # multi-document transaction on a standalone deployment, so the offset is
+    # written AFTER the data (Tier B) instead of inside its transaction (Tier A).
+    # The hand-curated MongoDB connector
+    # (shared/mcp-connectors/public/database/mongodb) carries the same logic.
+    #
+    # Best-effort is safe for the idempotent upsert/delete paths; the keyless
+    # _import_nosql append is NOT idempotent, so a crash strictly between the
+    # insert and the offset write still duplicates those rows on replay. That
+    # window is one in-process round-trip rather than the whole uncommitted batch
+    # window, but it is not zero.
+    # ------------------------------------------------------------------
+
+    _CDC_OFFSETS_COLLECTION = "_rsync_cdc_offsets"
+
+    def _write_cdc_offsets_nosql(self, conn, config: Dict, params: Dict = None) -> None:
+        """Record the batch's Kafka high-water offset(s) in <db>._rsync_cdc_offsets.
+
+        No-op without params["kafka_offset"], so a plain batch load never grows an
+        offsets collection. Never raises: a failed offset write costs reprocessing
+        on the next restart and must not fail a data write that already landed.
+        """
+        ko = (params or {}).get("kafka_offset")
+        if not ko or "mongo" not in self.driver_pattern.get("module", ""):
+            return
+        try:
+            from datetime import timezone
+            from pymongo import UpdateOne
+            now = datetime.now(timezone.utc)
+            ops = []
+            for o in (ko if isinstance(ko, list) else [ko]):
+                if not isinstance(o, dict):
+                    continue
+                pid = str(o.get("pipeline_id") or "")
+                topic = o.get("topic") or ""
+                part = o.get("partition")
+                off = o.get("offset")
+                if not topic or part is None or off is None:
+                    continue
+                part, off = int(part), int(off)
+                # (pipeline_id, topic, kafka_partition) is the contract's primary
+                # key; folding it into _id reuses Mongo's own unique index and makes
+                # the upsert atomic. A Kafka topic name is [a-zA-Z0-9._-], so the
+                # separator cannot collide. $max (never $set) is what keeps
+                # last_offset monotonic under a redelivered, LOWER mark.
+                ops.append(UpdateOne(
+                    {"_id": f"{pid}|{topic}|{part}"},
+                    {"$max": {"last_offset": off},
+                     "$set": {"pipeline_id": pid, "topic": str(topic),
+                              "kafka_partition": part, "updated_at": now}},
+                    upsert=True,
+                ))
+            if ops:
+                conn[config.get("database")][self._CDC_OFFSETS_COLLECTION].bulk_write(
+                    ops, ordered=False)
+        except Exception as e:
+            self.log(f"CDC offset write failed (the batch itself landed; the sink will "
+                     f"reprocess from the previous high-water mark on restart): {e}",
+                     level="warning")
+
+    def _get_cdc_offsets_nosql(self, params: Dict = None) -> Dict[str, Any]:
+        """Read back the per-partition high-water marks the sink seeds from.
+
+        A pipeline that has never written has no offsets collection, and a find on
+        a missing MongoDB collection is an empty cursor rather than an error, so a
+        first run returns [] with no special case (the contract requires success,
+        never an error, there).
+        """
+        params = params or {}
+        # Same driver guard the three _*_nosql write helpers carry: on a future
+        # non-Mongo NoSQL destination this would otherwise fall through to a
+        # Mongo-shaped conn[db][coll] and surface as a bare TypeError.
+        if "mongo" not in self.driver_pattern.get("module", ""):
+            return {"success": False,
+                    "error": "get_cdc_offsets not supported for this NoSQL database"}
+        config = self._get_config(params) if hasattr(self, "_get_config") else (params.get("config") or {})
+        pipeline_id = str(params.get("pipeline_id") or "")
+        conn = None
+        try:
+            conn = self._get_connection(config)
+            coll = conn[config.get("database")][self._CDC_OFFSETS_COLLECTION]
+            offsets = []
+            for row in coll.find({"pipeline_id": pipeline_id}):
+                topic = row.get("topic")
+                part = row.get("kafka_partition")
+                off = row.get("last_offset")
+                if not topic or part is None or off is None:
+                    continue
+                offsets.append({"topic": str(topic), "partition": int(part), "offset": int(off)})
+            return {"success": True, "offsets": offsets}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            if conn:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def _import_nosql(self, conn, config: Dict, collection: str, data: List,
+                      params: Dict = None) -> Dict:
         """Import into NoSQL database"""
         if "mongo" in self.driver_pattern.get("module", ""):
             database = config.get("database")
@@ -5156,11 +5289,13 @@ class {{ spec.class_name }}(BaseMCPConnector):
             coll = db[collection]
             
             result = coll.insert_many(data)
+            self._write_cdc_offsets_nosql(conn, config, params)
             return {"success": True, "rows_inserted": len(result.inserted_ids)}
         
         return {"success": False, "error": "Import not supported for this NoSQL database"}
     
-    def _upsert_nosql(self, conn, config: Dict, collection: str, data: List, key_fields: List) -> Dict:
+    def _upsert_nosql(self, conn, config: Dict, collection: str, data: List, key_fields: List,
+                      params: Dict = None) -> Dict:
         """Upsert into NoSQL database (MongoDB)"""
         if "mongo" in self.driver_pattern.get("module", ""):
             database = config.get("database")
@@ -5168,17 +5303,31 @@ class {{ spec.class_name }}(BaseMCPConnector):
             coll = db[collection]
             
             rows_upserted = 0
-            for row in data:
-                filter_doc = {k: row.get(k) for k in key_fields if k in row}
-                if filter_doc:
-                    coll.replace_one(filter_doc, row, upsert=True)
-                    rows_upserted += 1
-            
-            return {"success": True, "rows_upserted": rows_upserted}
+            # Positions in ``data`` of the records NOT written: a key field absent (or
+            # not a document). The CDC sink dead-letters exactly these, so report the
+            # positions and never a value — mirrors the hand-curated MongoDB connector.
+            skipped_indexes = []
+            for i, row in enumerate(data):
+                if not isinstance(row, dict) or not key_fields or any(k not in row for k in key_fields):
+                    skipped_indexes.append(i)
+                    continue
+                coll.replace_one({k: row[k] for k in key_fields}, row, upsert=True)
+                rows_upserted += 1
+
+            # No high-water mark past a skipped record: it did not land, and a restart
+            # would seed the sink's skip-map past it so it could never be dead-lettered.
+            if not skipped_indexes:
+                self._write_cdc_offsets_nosql(conn, config, params)
+            out = {"success": True, "rows_upserted": rows_upserted}
+            if skipped_indexes:
+                out["skipped"] = len(skipped_indexes)
+                out["skipped_indexes"] = skipped_indexes
+            return out
         
         return {"success": False, "error": "Upsert not supported for this NoSQL database"}
     
-    def _delete_nosql(self, conn, config: Dict, collection: str, data: List, key_fields: List) -> Dict:
+    def _delete_nosql(self, conn, config: Dict, collection: str, data: List, key_fields: List,
+                      params: Dict = None) -> Dict:
         """Delete from NoSQL database (MongoDB)"""
         if "mongo" in self.driver_pattern.get("module", ""):
             database = config.get("database")
@@ -5186,13 +5335,21 @@ class {{ spec.class_name }}(BaseMCPConnector):
             coll = db[collection]
             
             rows_deleted = 0
-            for row in data:
-                filter_doc = {k: row.get(k) for k in key_fields if k in row}
-                if filter_doc:
-                    result = coll.delete_one(filter_doc)
-                    rows_deleted += result.deleted_count
-            
-            return {"success": True, "rows_deleted": rows_deleted}
+            skipped_indexes = []  # as _upsert_nosql: positions, never values
+            for i, row in enumerate(data):
+                if not isinstance(row, dict) or not key_fields or any(k not in row for k in key_fields):
+                    skipped_indexes.append(i)
+                    continue
+                result = coll.delete_one({k: row[k] for k in key_fields})
+                rows_deleted += result.deleted_count
+
+            if not skipped_indexes:
+                self._write_cdc_offsets_nosql(conn, config, params)
+            out = {"success": True, "rows_deleted": rows_deleted}
+            if skipped_indexes:
+                out["skipped"] = len(skipped_indexes)
+                out["skipped_indexes"] = skipped_indexes
+            return out
         
         return {"success": False, "error": "Delete not supported for this NoSQL database"}
 {% endif %}

@@ -102,7 +102,7 @@ The UI shows:
 | `/connectors` | Connector catalog (17 pre-built + generated) |
 | `/connectors/generate` | AI connector generation |
 | `/explorer` | Data exploration with NL2SQL |
-| `/cdc/new` | CDC pipeline creation |
+| `/cdc/new` | Legacy — redirects to `/chat` (CDC and batch pipelines are both created there) |
 | `/chat` | Direct agent conversation |
 | `/admin` | System administration |
 | `/pii` | PII scanning tool |

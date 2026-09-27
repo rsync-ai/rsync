@@ -9,9 +9,10 @@ import { useWorkspace } from "@/contexts/WorkspaceContext"
 import { WorkspaceGeneralSettings } from "@/components/workspace/WorkspaceGeneralSettings"
 import { WorkspaceMembers } from "@/components/workspace/WorkspaceMembers"
 import { WorkspaceRolesMatrix } from "@/components/workspace/WorkspaceRolesMatrix"
+import { SavedQueryRetentionCard } from "@/components/workspace/SavedQueryRetentionCard"
 import { ROLE_LABELS, roleBadgeVariant, meetsRole, type WorkspaceRole } from "@/lib/workspace/roles"
 
-const VALID_TABS = ["general", "members", "roles"] as const
+const VALID_TABS = ["general", "members", "roles", "data"] as const
 type SettingsTab = (typeof VALID_TABS)[number]
 
 /**
@@ -94,6 +95,7 @@ export default function WorkspaceSettingsPage() {
           <TabsTrigger value="general">General</TabsTrigger>
           <TabsTrigger value="members">Members &amp; invitations</TabsTrigger>
           <TabsTrigger value="roles">Roles &amp; permissions</TabsTrigger>
+          <TabsTrigger value="data">Data retention</TabsTrigger>
         </TabsList>
 
         <TabsContent value="general">
@@ -117,6 +119,14 @@ export default function WorkspaceSettingsPage() {
 
         <TabsContent value="roles">
           <WorkspaceRolesMatrix currentRole={role} />
+        </TabsContent>
+
+        {/* Settings whose effect is deleting data. One card today (saved-query
+            version history); kept as its own tab rather than buried in General
+            because "what does this workspace throw away, and when?" is a
+            question an admin should be able to answer in one place. */}
+        <TabsContent value="data" className="space-y-4">
+          <SavedQueryRetentionCard currentRole={role} />
         </TabsContent>
       </Tabs>
     </div>

@@ -1,12 +1,34 @@
 "use client"
 
-import { useEffect, useId, useMemo, useState } from "react"
+import { useCallback, useEffect, useId, useMemo, useState } from "react"
 import Link from "next/link"
+import { toast } from "sonner"
 import { authGet } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { useWorkspaceRole } from "@/contexts/WorkspaceContext"
+import { meetsRole } from "@/lib/workspace/roles"
+import {
+  deleteTransform,
+  deIdentifyWarning,
+  idsOf,
+  isDeIdentifying,
+  partialFailureMessage,
+  setTransformEnabled,
+} from "@/lib/pipeline/transformMutations"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { Switch } from "@/components/ui/switch"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible"
 import { TransformExecutionLog, TransformExecutionLogsPanel } from "@/components/transforms/TransformExecutionLogsPanel"
 import { TransformMonitoringPanel } from "@/components/transforms/TransformMonitoringPanel"
@@ -17,6 +39,9 @@ import {
   Search,
   Copy,
   Check,
+  Loader2,
+  ShieldAlert,
+  Trash2,
 } from "lucide-react"
 import {
   transformTypeLabel,
@@ -137,6 +162,18 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({})
   const [reloadKey, setReloadKey] = useState(0)
 
+  // Mirrors requireTransformWorkspaceRole(..., security.WSMember) on both
+  // PUT /transforms/:id and DELETE /transforms/:id (transforms.go:551, :614).
+  // `role` is "" while the workspace context is loading, and meetsRole fails
+  // closed on that, so the controls never flash enabled for a viewer.
+  const { role } = useWorkspaceRole()
+  const canEdit = meetsRole(role, "member")
+
+  // Every mutation refetches rather than patching local state: the two rows
+  // behind one logical transform are merged on read, so the honest way to show
+  // the result of a half-applied change is to re-read it.
+  const refetch = useCallback(() => setReloadKey((k) => k + 1), [])
+
   useEffect(() => {
     let cancelled = false
     const run = async () => {
@@ -254,7 +291,21 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
       ) : (
         <>
           <div className="space-y-3">
-            <div className="text-sm font-semibold text-zinc-900 dark:text-white">Configured transforms</div>
+            <div className="flex items-center justify-between gap-3">
+              <div className="text-sm font-semibold text-zinc-900 dark:text-white">Configured transforms</div>
+              {/* This tab shows what is configured and what each run did with it;
+                  the builder is the only place a rule can be authored. Without this
+                  link the two pages had nothing pointing at each other, and an
+                  operator who wanted to add a transform had no route from here. */}
+              {canEdit ? (
+                <Link
+                  href={`/transforms?pipeline=${encodeURIComponent(pipelineId)}`}
+                  className="shrink-0 text-xs text-blue-600 hover:underline dark:text-blue-400"
+                >
+                  Edit in Transform Builder
+                </Link>
+              ) : null}
+            </div>
 
             {!hasConfigured ? (
               <div className="rounded-lg border border-zinc-200 dark:border-zinc-800 bg-white dark:bg-zinc-950 p-4 text-sm text-zinc-500 dark:text-zinc-400">
@@ -288,6 +339,8 @@ export function PipelineTransformsTab({ pipelineId }: { pipelineId: string }) {
                         key={group.operation}
                         group={group}
                         open={isOpen(group.operation)}
+                        canEdit={canEdit}
+                        onChanged={refetch}
                         onToggle={() =>
                           setCollapsed((prev) => ({ ...prev, [group.operation]: !prev[group.operation] }))
                         }
@@ -372,10 +425,14 @@ function TransformGroupCard({
   group,
   open,
   onToggle,
+  canEdit,
+  onChanged,
 }: {
   group: TransformGroup
   open: boolean
   onToggle: () => void
+  canEdit: boolean
+  onChanged: () => void
 }) {
   const tone = transformTypeTone(group.operation)
   const blurb = transformTypeBlurb(group.operation)
@@ -423,7 +480,7 @@ function TransformGroupCard({
       {open && (
         <div id={contentId} className="border-t border-zinc-200 dark:border-zinc-800">
           {group.items.map((lt) => (
-            <TransformRow key={lt.key} lt={lt} tone={tone} />
+            <TransformRow key={lt.key} lt={lt} tone={tone} canEdit={canEdit} onChanged={onChanged} />
           ))}
         </div>
       )}
@@ -431,11 +488,27 @@ function TransformGroupCard({
   )
 }
 
-function TransformRow({ lt, tone }: { lt: LogicalTransform; tone: { badge: string; dot: string } }) {
+function TransformRow({
+  lt,
+  tone,
+  canEdit,
+  onChanged,
+}: {
+  lt: LogicalTransform
+  tone: { badge: string; dot: string }
+  canEdit: boolean
+  onChanged: () => void
+}) {
   const [open, setOpen] = useState(false)
   const [copied, setCopied] = useState(false)
+  const [busy, setBusy] = useState(false)
+  // Which confirmation is open, if any. A masking rule gets one for BOTH
+  // actions; everything else only for delete, which is not recoverable here.
+  const [confirm, setConfirm] = useState<null | "disable" | "delete">(null)
   const { primary, secondary } = describeTransform(lt.operation, lt.config)
   const sideLabel = appliesToLabel(lt.appliesTo)
+  const rowCount = idsOf(lt.ids).length
+  const sensitive = isDeIdentifying(lt.operation)
 
   const copyId = () => {
     const id = lt.ids.batch || lt.ids.cdc || ""
@@ -444,6 +517,55 @@ function TransformRow({ lt, tone }: { lt: LogicalTransform; tone: { badge: strin
       setCopied(true)
       setTimeout(() => setCopied(false), 1500)
     })
+  }
+
+  const applyEnabled = async (enabled: boolean) => {
+    setBusy(true)
+    try {
+      const out = await setTransformEnabled(lt.ids, enabled)
+      if (out.ok) {
+        toast.success(
+          enabled
+            ? `Enabled — ${primary} runs again from the next execution.`
+            : `Disabled — ${primary} is skipped from the next execution.`
+        )
+        onChanged()
+      } else {
+        toast.error(partialFailureMessage(out.applied, rowCount, out.error))
+        // Re-read even on failure: a partial fan-out changed real state.
+        if (out.applied > 0) onChanged()
+      }
+    } finally {
+      setBusy(false)
+      setConfirm(null)
+    }
+  }
+
+  const applyDelete = async () => {
+    setBusy(true)
+    try {
+      const out = await deleteTransform(lt.ids)
+      if (out.ok) {
+        toast.success(`Deleted — ${primary} is gone from this pipeline.`)
+        onChanged()
+      } else {
+        toast.error(partialFailureMessage(out.applied, rowCount, out.error))
+        if (out.applied > 0) onChanged()
+      }
+    } finally {
+      setBusy(false)
+      setConfirm(null)
+    }
+  }
+
+  // A masking rule being switched OFF is the only toggle that needs asking
+  // about; switching one back on restores protection and goes straight through.
+  const onSwitch = (next: boolean) => {
+    if (!next && sensitive) {
+      setConfirm("disable")
+      return
+    }
+    void applyEnabled(next)
   }
 
   return (
@@ -459,11 +581,33 @@ function TransformRow({ lt, tone }: { lt: LogicalTransform; tone: { badge: strin
         {sideLabel && (
           <span className="text-[11px] text-zinc-500 dark:text-zinc-400">{sideLabel}</span>
         )}
-        <span
-          className={`text-xs ${lt.enabled ? "text-emerald-600 dark:text-emerald-400" : "text-zinc-400"}`}
-        >
-          {lt.enabled ? "enabled" : "disabled"}
-        </span>
+        {canEdit ? (
+          <div className="flex items-center gap-2">
+            {busy && <Loader2 aria-hidden="true" className="h-3 w-3 animate-spin text-zinc-400" />}
+            <Switch
+              checked={lt.enabled}
+              disabled={busy}
+              onCheckedChange={onSwitch}
+              aria-label={`${lt.enabled ? "Disable" : "Enable"} ${primary}`}
+            />
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 w-7 p-0 text-zinc-400 hover:text-red-600 dark:hover:text-red-400"
+              disabled={busy}
+              onClick={() => setConfirm("delete")}
+              aria-label={`Delete ${primary}`}
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+            </Button>
+          </div>
+        ) : (
+          <span
+            className={`text-xs ${lt.enabled ? "text-emerald-600 dark:text-emerald-400" : "text-zinc-400"}`}
+          >
+            {lt.enabled ? "enabled" : "disabled"}
+          </span>
+        )}
         <CollapsibleTrigger asChild>
           <Button variant="ghost" size="sm" className="h-7 px-2">
             {open ? <ChevronDown aria-hidden="true" className="h-4 w-4" /> : <ChevronRight aria-hidden="true" className="h-4 w-4" />}
@@ -485,6 +629,50 @@ function TransformRow({ lt, tone }: { lt: LogicalTransform; tone: { badge: strin
           {JSON.stringify(lt.config ?? {}, null, 2)}
         </pre>
       </CollapsibleContent>
+
+      <AlertDialog open={confirm !== null} onOpenChange={(o) => !o && setConfirm(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle className="flex items-center gap-2">
+              {sensitive && <ShieldAlert className="h-4 w-4 text-red-600 dark:text-red-400" />}
+              {confirm === "delete" ? "Delete this transform?" : "Turn off this masking rule?"}
+            </AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                <div className="font-medium text-zinc-900 dark:text-zinc-100">
+                  {primary}
+                  {secondary ? <span className="ml-2 font-mono text-xs">{secondary}</span> : null}
+                </div>
+                {sensitive && (
+                  <div className="rounded border border-red-200 bg-red-50 p-2 text-sm text-red-800 dark:border-red-900/60 dark:bg-red-950/30 dark:text-red-300">
+                    {deIdentifyWarning(confirm === "delete" ? "delete" : "disable", lt.appliesTo)}
+                  </div>
+                )}
+                <div>
+                  {confirm === "delete"
+                    ? `This removes ${rowCount === 2 ? "both rows (producer and consumer)" : "the row"} behind this transform. It cannot be undone from here.`
+                    : `This changes ${rowCount === 2 ? "both rows (producer and consumer)" : "the row"}. You can switch it back on at any time.`}
+                </div>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={busy}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={busy}
+              className={sensitive || confirm === "delete" ? "bg-red-600 hover:bg-red-700 text-white" : undefined}
+              onClick={(e) => {
+                e.preventDefault()
+                if (confirm === "delete") void applyDelete()
+                else void applyEnabled(false)
+              }}
+            >
+              {busy && <Loader2 className="mr-2 h-3 w-3 animate-spin" />}
+              {confirm === "delete" ? "Delete transform" : "Turn off masking"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </Collapsible>
   )
 }

@@ -34,8 +34,7 @@ Exact route paths are defined in `service.py` near the FastAPI router section.
 - `API_GATEWAY_URL`
 - `LLM_GATEWAY_URL`
 - `CONNECTORS_DIR`
-- `KAFKA_BOOTSTRAP_SERVERS`
-- `ENABLE_KAFKA_CONSUMER` (feature flag)
+- `KAFKA_BROKERS` (falls back to `KAFKA_BOOTSTRAP_SERVERS`) — written into generated Debezium configs; the planner does not consume Kafka
 - `OTEL_*`, `LOG_FORMAT`, `LOG_LEVEL`
 
 

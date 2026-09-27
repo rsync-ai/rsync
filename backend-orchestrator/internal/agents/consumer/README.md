@@ -165,7 +165,7 @@ DOCKER_NETWORK=rsync-network
 CONSUMER_IMAGE=rsync-ai/consumer:latest
 
 # Agent
-ENABLE_CONSUMER_AGENT=true
+ENABLE_CONSUMER_AGENT=true   # opt-in; off by default since v0.1.6
 CONSUMER_AUTO_SCALE=true
 CONSUMER_GROUP_PREFIX=rsync-pipeline
 ```

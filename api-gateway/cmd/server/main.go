@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"github.com/rsync-ai/shared/crypto"
 	"github.com/rsync-ai/shared/kafkaclient"
+	"github.com/rsync-ai/shared/memlimit"
 	"net/http"
 	"net/url"
 	"os"
@@ -314,6 +315,11 @@ func main() {
 	// Initialize trace-aware logging FIRST
 	telemetry.InitLogging("api-gateway")
 
+	// Soft memory limit from the container cgroup (GOMEMLIMIT, when set, wins).
+	if ml := memlimit.Apply(); ml.Source != "none" {
+		log.Infof("memory soft limit: %d MiB (source=%s, cgroup=%d MiB)", ml.LimitBytes>>20, ml.Source, ml.CgroupBytes>>20)
+	}
+
 	// Load feature flags early
 	config.LoadFeatures()
 
@@ -462,10 +468,6 @@ func main() {
 		log.Info("   Pattern: API Gateway → Temporal → Kafka → Agents")
 	}
 
-	// Initialize Status Manager
-	statusManager := handlers.NewStatusManager()
-	log.Info("Status manager initialized")
-
 	// Initialize Schema Cache (Redis)
 	// Prefer a single address var; fall back to host/port; finally a dev-compose default.
 	redisAddr := strings.TrimSpace(os.Getenv("REDIS_ADDRESS"))
@@ -527,13 +529,20 @@ func main() {
 	// Initialize PII handler (needs producer for async scan publishing)
 	piiHandler := handlers.NewPIIHandler(db.GetDB(), kafkaProducer)
 
-	// Initialize Kafka Consumer for agent responses (multi-topic via per-reader fan-out).
-	// The group id is spelled logically here; NewConsumer applies the
-	// KAFKA_TOPIC_PREFIX namespace, so every caller is qualified by
+	// Initialize the Kafka consumer for PII scan results. The llm-service PII
+	// scanner is the only producer to pii.scan.response and stamps every message
+	// agent="pii_scanner". The group id is spelled logically here; NewConsumer
+	// applies the KAFKA_TOPIC_PREFIX namespace, so every caller is qualified by
 	// construction rather than by remembering to wrap this literal.
+	//
+	// This consumer used to read agent.planner.responses too and hand anything
+	// that was not a PII result to a StatusManager that wrote pipelines.status.
+	// The agent control plane and its topics are gone, so it reads the one topic
+	// that still has a producer; the Temporal adapter's UpdatePipelineStatusActivity
+	// owns pipelines.status.
 	consumer := kafka.NewConsumer(
 		brokerList,
-		kafkaclient.Topics("agent.planner.responses", "pii.scan.response"),
+		kafkaclient.Topics("pii.scan.response"),
 		"api-gateway-consumer-group",
 	)
 
@@ -542,16 +551,16 @@ func main() {
 	defer appCancel()
 
 	go consumer.Start(appCtx, func(ctx context.Context, response kafka.AgentResponse) error {
-		// Route pii scan responses to the PII handler; everything else to status manager
-		if response.Agent == "pii_scanner" {
-			scanID, _ := response.Result["scan_id"].(string)
-			piiHandler.HandlePIIScanResponse(ctx, scanID, response.Status, response.Result, response.Error)
+		if response.Agent != "pii_scanner" {
+			log.Warnf("pii.scan.response: ignoring message from unexpected agent %q (trace_id=%s)", response.Agent, response.TraceID)
 			return nil
 		}
-		return statusManager.HandleAgentResponse(ctx, response)
+		scanID, _ := response.Result["scan_id"].(string)
+		piiHandler.HandlePIIScanResponse(ctx, scanID, response.Status, response.Result, response.Error)
+		return nil
 	})
 
-	log.Info("Kafka consumer started, listening to agent.planner.responses, pii.scan.response")
+	log.Info("Kafka consumer started, listening to pii.scan.response")
 
 	hub := websocket.NewHub()
 	go hub.Run()
@@ -608,10 +617,10 @@ func main() {
 		log.Info("✅ Domain event manager initialized")
 	}
 
-	// G1 / F-Obs-1: notifier consumer — subscribes to
-	// rsync.notifications + rsync.healer.actions + rsync.healer.results
-	// and persists each event into pipeline_notifications + delivers
-	// via Slack/email per env. Pre-fix those topics had no consumer.
+	// G1 / F-Obs-1: notifier consumer — subscribes to rsync.notifications,
+	// plus rsync.healer.results only when RSYNC_SCHEMA_DRIFT_ENABLED=true
+	// (notifier.resolveNotifierTopics), and persists each event into
+	// pipeline_notifications + delivers via Slack/email per env.
 	//
 	// Error, not Warn, for the same reason as the domain event manager above —
 	// and one worse: this consumer is the delivery path for every Slack/email
@@ -629,6 +638,11 @@ func main() {
 	// pipelines are re-assessed every ASSESSMENT_RECHECK_INTERVAL (default 6h).
 	handlers.SetAssessmentNotifier(notifier.NewEmitter(db.GetDB()))
 	handlers.StartAssessmentScheduler(appCtx, db.GetDB())
+
+	// The two outages the orchestrator's sentinel cannot alert on: its own, and
+	// Kafka's, whose alert would travel over Kafka. Delivered in-process, like the
+	// assessment alerts above, so neither needs the broker or the orchestrator.
+	handlers.StartCoreServiceWatch(appCtx, notifier.NewEmitter(db.GetDB()))
 
 	// Initialize OAuth, Schema Registry, and Auth handlers
 	oauthHandler := handlers.NewOAuthHandler(db.GetDB())
@@ -909,8 +923,23 @@ func main() {
 		api.POST("/pipelines/:id/events/raw", handlers.GetPipelineEventsRaw) // Requires power_user/admin + justification
 		api.POST("/pipelines/:id/cdc/tables", handlers.UpdatePipelineCDCTables)
 		api.POST("/pipelines/:id/cdc/backfill", handlers.BackfillPipelineCDCTables)
+		api.GET("/pipelines/:id/cdc/backfill", handlers.GetPipelineCDCBackfillCapability)        // read-only: would a backfill be accepted?
+		api.GET("/pipelines/:id/cdc/snapshot-requests", handlers.GetPipelineCDCSnapshotRequests) // read-only: latest snapshot loads and their progress
 		api.POST("/pipelines/:id/tables", handlers.UpdatePipelineTables)
 		api.GET("/pipelines/:id/table-stats", handlers.GetPipelineTableStats) // DMS-like per-table statistics
+		// The pipeline's OWN Sentinel findings (source lag, sink drain lag, connector
+		// down). Viewer, and NO feature flag -- unlike /monitoring/sentinel/issues,
+		// which is the admin infrastructure view and is gated on
+		// FEATURE_MONITORING_INFRA plus a platform power_user/admin role. Those gates
+		// meant that on a default deployment the Sentinel detected a stalled sink and
+		// the pipeline's own owner was never told. Infrastructure monitoring stays
+		// admin-only; a pipeline's health belongs to whoever owns the pipeline.
+		api.GET("/pipelines/:id/alerts", handlers.GetPipelineAlerts)
+		// The pipeline's own Kafka consumers and their per-topic lag. Viewer, no
+		// feature flag, for the same reason as /alerts. Admin -> Health's consumer
+		// table is the PLATFORM's own consumers (keyed by topic, no workspace
+		// column); this is the consumers moving THIS customer's rows.
+		api.GET("/pipelines/:id/consumers", handlers.GetPipelineConsumers)
 		api.GET("/pipelines/:id/compare", handlers.ComparePipelineRuns)
 		api.GET("/pipelines/:id/trends", handlers.GetPipelineTrends)
 		// Monitoring endpoints (feature-flagged)
@@ -1093,19 +1122,44 @@ func main() {
 		api.POST("/suggestions/generate", handlers.GenerateSuggestions)
 
 		// ========================================================================
-		// SCHEMA REGISTRY - Kafka Avro Schema Management
+		// SCHEMA REGISTRY - Kafka Avro Schema Management (ADMIN ONLY)
 		// ========================================================================
-		api.GET("/schemas", schemaHandler.ListSubjects)
-		api.GET("/schemas/info", schemaHandler.GetRegistryInfo)
-		api.GET("/schemas/config", schemaHandler.GetConfig)
-		api.PUT("/schemas/config", handlers.AdminRoleMiddleware(), schemaHandler.SetConfig)
-		api.GET("/schemas/:subject", schemaHandler.GetSubjectVersions)
-		api.GET("/schemas/:subject/versions/:version", schemaHandler.GetSchema)
-		api.POST("/schemas/:subject", handlers.PowerUserOrAdminMiddleware(), schemaHandler.RegisterSchema)
-		api.POST("/schemas/:subject/compatibility", schemaHandler.CheckCompatibility)
-		api.DELETE("/schemas/:subject", handlers.AdminRoleMiddleware(), schemaHandler.DeleteSubject)
-		api.GET("/schemas/:subject/config", schemaHandler.GetConfig)
-		api.PUT("/schemas/:subject/config", handlers.PowerUserOrAdminMiddleware(), schemaHandler.SetConfig)
+		// Every route here is a thin proxy to ONE shared Confluent Schema Registry.
+		// A subject name has no workspace in it, the handler takes no workspace
+		// argument, and the registry has no tenant concept to filter on — so there
+		// is no per-workspace answer these routes could give. Reads were open to any
+		// authenticated user, which meant a member of one workspace could enumerate
+		// every other tenant's subject names (their topics, hence their tables) and
+		// read their schemas.
+		//
+		// The gate is the whole surface, not the writes. SEC-M-03 gated the mutating
+		// routes at power_user and left the reads open; that split is superseded here
+		// because the resource turned out to be global, and "may overwrite any
+		// tenant's schema but may not read one" is not a coherent rule. Admin is the
+		// right role for a global infrastructure resource.
+		//
+		// Narrowing this costs no caller: the product has none. Nothing under
+		// frontend/ calls /api/v1/schemas, and CDC never populates the registry at
+		// all — every connector config in this repo (docker-compose.yml:584,
+		// docker-compose.quickstart.yml:1558, deploy/helm/.../cdc.yaml:193 and
+		// cdc_config_generator.py:342) uses JsonConverter, which embeds the schema
+		// inline per message and never dials a registry. The exposure is latent
+		// today; the gate is here so it does not become live the day someone flips a
+		// pipeline to Avro.
+		schemas := api.Group("/schemas", handlers.AdminRoleMiddleware())
+		{
+			schemas.GET("", schemaHandler.ListSubjects)
+			schemas.GET("/info", schemaHandler.GetRegistryInfo)
+			schemas.GET("/config", schemaHandler.GetConfig)
+			schemas.PUT("/config", schemaHandler.SetConfig)
+			schemas.GET("/:subject", schemaHandler.GetSubjectVersions)
+			schemas.GET("/:subject/versions/:version", schemaHandler.GetSchema)
+			schemas.POST("/:subject", schemaHandler.RegisterSchema)
+			schemas.POST("/:subject/compatibility", schemaHandler.CheckCompatibility)
+			schemas.DELETE("/:subject", schemaHandler.DeleteSubject)
+			schemas.GET("/:subject/config", schemaHandler.GetConfig)
+			schemas.PUT("/:subject/config", schemaHandler.SetConfig)
+		}
 
 		// ========================================================================
 		// OAUTH - Authentication & Authorization
@@ -1126,9 +1180,16 @@ func main() {
 		// ========================================================================
 		// MONITORING - Sentinel Health & Issues (feature-flagged)
 		// ========================================================================
-		// Admin only: component ids name Kafka topics and containers across every
-		// workspace, and the table is not workspace-scoped (admin/health renders it).
+		// /health is admin only: component ids name Kafka topics and containers
+		// across every workspace, and the table is not workspace-scoped
+		// (admin/health renders it).
 		api.GET("/monitoring/sentinel/health", handlers.AdminRoleMiddleware(), handlers.GetSentinelHealth)
+		// /issues deliberately has NO admin middleware: CDCLagAlertsPanel reads it
+		// per pipeline from the ordinary pipeline page, so admin-gating would blank
+		// that panel for every non-admin. It carries the same tenant concern as
+		// /health, so the scope lives in the handler instead — see
+		// sentinelIssueTenantPredicate, which restricts a non-admin to
+		// pipeline-scoped rows in workspaces they belong to.
 		api.GET("/monitoring/sentinel/issues", handlers.GetSentinelIssues)
 
 		// ========================================================================
@@ -1209,7 +1270,6 @@ func main() {
 		api.GET("/explorer/export.csv", handlers.ExportCSVHandler) // Legacy: direct GET CSV export (kept for any deep links)
 		api.POST("/explorer/export", handlers.ExportQueryHandler)  // D4: multi-format export (csv/tsv/json) for the Download dropdown
 		api.POST("/explorer/share/slack", handlers.ShareToSlack)   // Share to Slack via webhook
-		api.POST("/explorer/share/email", handlers.ShareViaEmail)  // Send via SMTP email
 
 		// Saved Queries (migration 084) — replaces the per-browser localStorage
 		// history with a workspace-scoped, shareable, versioned resource.

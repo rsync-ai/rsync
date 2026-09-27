@@ -62,8 +62,8 @@ import (
 
 // executorDispatchOperations is the set of operations the executor actually
 // handles, transcribed from the `switch task.Operation` at
-// backend-orchestrator/internal/agents/executor/executor.go:1661-1680. Its
-// default arm (:1681) returns `unknown operation: %s` as a task failure.
+// backend-orchestrator/internal/agents/executor/executor.go:1534-1553. Its
+// default arm (:1554) returns `unknown operation: %s` as a task failure.
 //
 // It is a transcription because the executor is a different Go module; this
 // package cannot import it. That makes the set the weakest link in the census,
@@ -72,19 +72,19 @@ import (
 // operation that is not here would make the node fail at runtime with
 // `unknown operation`, which is not routing either.
 var executorDispatchOperations = map[string]string{
-	"export":            "executor.go:1662",
-	"import":            "executor.go:1664",
-	"query":             "executor.go:1666",
-	"execute":           "executor.go:1668",
-	"data_transfer":     "executor.go:1670",
-	"start_streaming":   "executor.go:1673",
-	"start_cdc":         "executor.go:1673",
-	"stop_streaming":    "executor.go:1675",
-	"stop_cdc":          "executor.go:1675",
-	"streaming_status":  "executor.go:1677",
-	"cdc_status":        "executor.go:1677",
-	"restart_streaming": "executor.go:1679",
-	"restart_cdc":       "executor.go:1679",
+	"export":            "executor.go:1535",
+	"import":            "executor.go:1537",
+	"query":             "executor.go:1539",
+	"execute":           "executor.go:1541",
+	"data_transfer":     "executor.go:1543",
+	"start_streaming":   "executor.go:1546",
+	"start_cdc":         "executor.go:1546",
+	"stop_streaming":    "executor.go:1548",
+	"stop_cdc":          "executor.go:1548",
+	"streaming_status":  "executor.go:1550",
+	"cdc_status":        "executor.go:1550",
+	"restart_streaming": "executor.go:1552",
+	"restart_cdc":       "executor.go:1552",
 }
 
 // nodeKindExpectation pins the complete observable routing outcome for one kind.
@@ -104,14 +104,14 @@ type nodeKindExpectation struct {
 	RequestType string
 	// Operation: the value forced onto task["operation"], the ONLY field the
 	// downstream executor branches on
-	// (backend-orchestrator/internal/workers/executor.go:557 ->
-	// internal/agents/executor/executor.go:1661). A non-empty value here — other
+	// (backend-orchestrator/internal/workers/executor.go:540 ->
+	// internal/agents/executor/executor.go:1534). A non-empty value here — other
 	// than the executor's own default — is what makes a dispatched kind routed.
 	Operation string
 	// ConnectorTypeField: the task key node_config["connector_type"] is copied
 	// into, if any. Also inert downstream: the executor reads source_type /
 	// destination_type only when the task carries source_config /
-	// destination_config (executor.go:582-593), which this adapter never sets.
+	// destination_config (workers/executor.go:565-577), which this adapter never sets.
 	ConnectorTypeField string
 	// Unrouted must be non-empty exactly when the kind changes nothing a
 	// consumer reads — i.e. it is not locally handled and forces no operation.
@@ -187,7 +187,7 @@ type observedNodeRouting struct {
 
 // ForcesOperation reports whether the kind changed the one task field the
 // executor dispatches on. Setting it to the executor's own default
-// (backend-orchestrator/internal/workers/executor.go:561) is the same as not
+// (backend-orchestrator/internal/workers/executor.go:544) is the same as not
 // setting it, so that does not count.
 func (o observedNodeRouting) ForcesOperation() bool {
 	return o.Operation != "" && o.Operation != defaultExecutorOperation
@@ -280,7 +280,7 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 		if rule.Operation == defaultExecutorOperation {
 			t.Errorf("nodeDispatchRules[%q].Operation is %q, which is the operation the "+
 				"executor falls back to when the payload names none "+
-				"(backend-orchestrator/internal/workers/executor.go:561). Forcing it is "+
+				"(backend-orchestrator/internal/workers/executor.go:544). Forcing it is "+
 				"byte-for-byte identical to forcing nothing, so this rule routes nothing.",
 				kind, rule.Operation)
 		}
@@ -288,7 +288,7 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 			if _, handled := executorDispatchOperations[rule.Operation]; !handled {
 				t.Errorf("nodeDispatchRules[%q].Operation is %q, which is not one of the "+
 					"operations the executor dispatches (%v — transcribed from "+
-					"backend-orchestrator/internal/agents/executor/executor.go:1661-1680). A "+
+					"backend-orchestrator/internal/agents/executor/executor.go:1534-1553). A "+
 					"node forcing it fails at runtime with `unknown operation: %s`. Add the "+
 					"handler on the orchestrator side first, then list it in "+
 					"executorDispatchOperations with its file:line.",
@@ -359,7 +359,7 @@ func TestNodeKindRoutingCensus(t *testing.T) {
 		if got.Operation != want.Operation {
 			t.Errorf("node kind %q: applyNodeKindRouting wrote operation=%q, census pins "+
 				"%q. `operation` is the ONLY field the executor dispatches on "+
-				"(backend-orchestrator/internal/agents/executor/executor.go:1661), so this "+
+				"(backend-orchestrator/internal/agents/executor/executor.go:1534), so this "+
 				"IS a real behaviour change.", kind, got.Operation, want.Operation)
 		}
 		if want.ConnectorTypeField != "" {
@@ -702,7 +702,7 @@ func TestUnroutedKindsReachTheExecutorLikeAnUnknownKind(t *testing.T) {
 			t.Errorf("the census records node kind %q as unrouted, but "+
 				"applyNodeKindRouting now forces task[operation]=%v. That IS a runtime "+
 				"change: the executor dispatches on this field "+
-				"(backend-orchestrator/internal/agents/executor/executor.go:1661). Verify a "+
+				"(backend-orchestrator/internal/agents/executor/executor.go:1534). Verify a "+
 				"handler for that operation exists AND does what this kind means, then "+
 				"update the census entry. Do not try to reach this state by adding a "+
 				"request_type: that key is read by nobody.", kind, op)

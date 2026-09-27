@@ -133,9 +133,9 @@ export default async function PipelineDetailPage({ params, searchParams }: Props
               Back
             </Button>
           </Link>
-          <div>
-            <div className="flex items-center gap-3">
-              <h1 className="text-2xl font-bold tracking-tight text-zinc-900 dark:text-white break-words">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center gap-3">
+              <h1 className="min-w-0 text-2xl font-bold tracking-tight text-zinc-900 dark:text-white break-words">
                 {pipeline.name}
               </h1>
               <PipelineExecutionStatusBadge pipelineId={pipeline.id} />

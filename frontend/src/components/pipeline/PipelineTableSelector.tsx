@@ -18,6 +18,8 @@ import { kindMeta, validateNamespace, namespaceKindForType, defaultNamespaceForT
 import { namespaceModelFor, namespaceModelsSnapshot, useNamespaceModels, type NamespaceModels } from "@/lib/pipeline/namespaceModel"
 import { isInternalExplorerTable } from "@/lib/explorer/internalTables"
 import { displayConnectorName } from "@/lib/connector-display"
+import { makeTableMatcher } from "@/lib/pipeline/tableStatsRows"
+import { TableEditError } from "@/lib/pipeline/cdcBackfill"
 
 export type AvailableTable = {
   name: string
@@ -246,6 +248,25 @@ export function PipelineTableSelector(props: {
   showCdcBackfillToggle?: boolean
   cdcBackfillNewTables?: boolean
   onCdcBackfillNewTablesChange?: (enabled: boolean) => void
+  // CDC-only: set when the backfill capability check (GET .../cdc/backfill)
+  // said the connector cannot backfill. The option is then replaced by this
+  // reason — it used to sit there pre-ticked and "Recommended" while every
+  // save's backfill was refused and nobody was told.
+  cdcBackfillUnavailableDetail?: string | null
+  // CDC-only: the connector loads rows with a blocking snapshot only (MongoDB),
+  // which pauses the whole pipeline's streaming while it runs. Said next to
+  // the option, because ticking it is what starts that pause.
+  cdcBackfillBlockingOnly?: boolean
+  // CDC-only: the destination is object storage, whose re-read is blocking for
+  // its own reason (the snapshot rewrites the table's folder), not MongoDB's.
+  cdcBackfillObjectStorage?: boolean
+  // CDC-only: the pipeline's (reconciled) status. "paused" = nothing streams
+  // until it is resumed, so "start streaming now" would be false (#17).
+  pipelineStatus?: string
+  // CDC-only: tables this pipeline loaded once and that were removed since
+  // (their stats row says "removed"). Adding one back without loading its rows
+  // leaves the changes made while it was out missing at the destination (#5).
+  previouslyLoadedTables?: string[]
   // Discovery hint from the backend so we can distinguish "we couldn't list
   // tables" (transport/auth failure) from "the database is empty" (success
   // with 0 rows). Without this we show the wrong message and the user thinks
@@ -289,6 +310,11 @@ export function PipelineTableSelector(props: {
     showCdcBackfillToggle = false,
     cdcBackfillNewTables = true,
     onCdcBackfillNewTablesChange,
+    cdcBackfillUnavailableDetail = null,
+    cdcBackfillBlockingOnly = false,
+    cdcBackfillObjectStorage = false,
+    pipelineStatus,
+    previouslyLoadedTables,
     discoveryStatus,
     sourceDatabase,
     sourceServerLevel = false,
@@ -301,7 +327,7 @@ export function PipelineTableSelector(props: {
 
   const [submitting, setSubmitting] = useState(false)
   const [cancelling, setCancelling] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  const [error, setError] = useState<string | TableEditError | null>(null)
   const [expandedPreview, setExpandedPreview] = useState<string | null>(null)
   const [selected, setSelected] = useState<Record<string, boolean>>({})
   const [manualTables, setManualTables] = useState("")
@@ -685,6 +711,13 @@ export function PipelineTableSelector(props: {
     }
     return map
   }, [effectiveSuggestions, sortedTables])
+  // The tables the AI picked out: the set the pre-selection ticks. The ranker is
+  // prompted "top N of N" and returns low-confidence entries too, so badging every
+  // match put "AI suggested" on all 9 tables while 6 were ticked (prod 2026-09-26).
+  const aiSuggestedKeys = useMemo(
+    () => new Set(computeAutoPreselectKeys(suggestionMatch, sortedTables.length)),
+    [suggestionMatch, sortedTables.length]
+  )
   const isLoadingTables = (Boolean(loading) || discovering) && !hasTables
 
   const schemaOptions = useMemo(() => {
@@ -884,6 +917,31 @@ export function PipelineTableSelector(props: {
       .map(([k]) => k)
   }, [selected])
 
+  // #5: tables being added back after a removal. They missed every change made
+  // while they were out, so loading their rows is the default for them; a table
+  // still in the saved selection is not being re-added.
+  const pipelinePaused = String(pipelineStatus || "").trim().toLowerCase() === "paused"
+  const readdedTables = useMemo(() => {
+    if (!showCdcBackfillToggle || !previouslyLoadedTables || previouslyLoadedTables.length === 0) return []
+    const wasLoaded = makeTableMatcher(previouslyLoadedTables)
+    const alreadySelected = makeTableMatcher(initialSelectedTables || [])
+    return selectedTables.filter((k) => wasLoaded(k) && !alreadySelected(k))
+  }, [showCdcBackfillToggle, previouslyLoadedTables, initialSelectedTables, selectedTables])
+  // Turn loading on once per open when a re-added table appears — unless the
+  // user already chose, in which case the warning below says what it costs.
+  const backfillTouchedRef = useRef(false)
+  const backfillAutoOnRef = useRef(false)
+  useEffect(() => {
+    if (!isOpen) {
+      backfillTouchedRef.current = false
+      backfillAutoOnRef.current = false
+      return
+    }
+    if (readdedTables.length === 0 || backfillTouchedRef.current || backfillAutoOnRef.current) return
+    backfillAutoOnRef.current = true
+    if (!cdcBackfillNewTables) onCdcBackfillNewTablesChange?.(true)
+  }, [isOpen, readdedTables.length, cdcBackfillNewTables, onCdcBackfillNewTablesChange])
+
   const manualSelectedTables = useMemo(() => parseManualTables(manualTables), [manualTables])
 
   // How many distinct source schemas the current selection spans. Whole-database
@@ -922,6 +980,19 @@ export function PipelineTableSelector(props: {
       ? validatePipelinePrefix(destNamespace)
       : validateNamespace(destNamespace, { required: namespaceRequired })
     : ""
+  // Why the confirm button is disabled, in onConfirm's order and words. The
+  // namespace error rendered only in the mapping block at the top of the scrolled
+  // body, out of sight of the button (KI-TABLE-SELECTION-CONTINUE-DISABLED-NO-REASON).
+  const selectionEmpty =
+    !wholeDatabase && !hasNamespaceWildcards && selectedTables.length === 0 && manualSelectedTables.length === 0
+  const confirmBlockedReason = selectionEmpty
+    ? hasTables
+      ? "Select at least one table to continue."
+      : "Enter at least one table name to continue."
+    : showMapping && destNamespaceError
+      ? destNamespaceError
+      : ""
+  const showConfirmBlockedReason = confirmBlockedReason !== "" && !submitting && !cancelling
 
   // Safe default for a multi-schema selection: blank ⇒ preserve each source
   // schema at the destination. The field is seeded with the destination's
@@ -1051,7 +1122,9 @@ export function PipelineTableSelector(props: {
         await onTablesSelected(toSend, destCfg)
         onClose()
       } catch (e: any) {
-        setError(String(e?.message || e || "Failed to process table selection"))
+        // A keyless table is refused with its name: keep the structure so the
+        // banner can list the tables to fix in the source.
+        setError(e instanceof TableEditError ? e : String(e?.message || e || "Failed to process table selection"))
       } finally {
         setSubmitting(false)
       }
@@ -1438,8 +1511,27 @@ export function PipelineTableSelector(props: {
           ) : null}
 
           {error && (
-            <div className="text-sm text-red-600 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md p-3">
-              {error}
+            <div
+              role="alert"
+              className="text-sm text-red-600 bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 rounded-md p-3"
+            >
+              {error instanceof TableEditError ? (
+                <>
+                  <div className="font-medium">{error.title}</div>
+                  {error.tables.length > 0 && (
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      {error.tables.map((t) => (
+                        <Badge key={t} variant="outline" className="font-mono text-[11px] font-normal">
+                          {t}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                  <div className="mt-2 text-xs">{error.detail}</div>
+                </>
+              ) : (
+                error
+              )}
             </div>
           )}
 
@@ -1468,7 +1560,7 @@ export function PipelineTableSelector(props: {
                         {tableDisplayName(t)}
                       </span>
                       <div className="flex items-center gap-1.5 shrink-0">
-                        {suggestionMatch.has(key) && (
+                        {aiSuggestedKeys.has(key) && (
                           <Badge
                             variant="secondary"
                             className="text-xs font-normal py-0 bg-violet-100 text-violet-700 dark:bg-violet-900/40 dark:text-violet-300"
@@ -1525,34 +1617,108 @@ export function PipelineTableSelector(props: {
         </div>
 
         {showCdcBackfillToggle ? (
-          <div className="mt-3 rounded-md border bg-zinc-50 dark:bg-zinc-900 p-3 flex items-start gap-3">
-            <Checkbox
-              checked={cdcBackfillNewTables}
-              onCheckedChange={(v) => onCdcBackfillNewTablesChange?.(Boolean(v))}
-              className="mt-0.5"
-            />
-            <div className="flex-1">
-              <div className="text-sm font-medium">Backfill existing rows for newly added tables</div>
-              <div className="text-xs text-zinc-500 dark:text-zinc-400">
-                Recommended. Existing tables won&apos;t be reloaded—only tables you add now will be backfilled.
+          <div className="mt-3 space-y-2" data-testid="cdc-edit-tables-help">
+            {/* What this dialog does, and what it does not: it is easy to take
+                for Re-snapshot, which sits on the same tab and also loads rows. */}
+            <p className="text-xs text-zinc-600 dark:text-zinc-400">
+              Choose which tables this pipeline streams.{" "}
+              {pipelinePaused
+                ? "The pipeline is paused: tables you add start streaming when you resume it; tables you remove stop."
+                : "Tables you add start streaming now; tables you remove stop."}{" "}
+              Tables that are already streaming are not reloaded — to re-read one, use{" "}
+              <span className="font-medium">Re-snapshot tables</span> at the bottom of the Table statistics tab.
+            </p>
+            {cdcBackfillUnavailableDetail ? (
+              <div
+                role="status"
+                className="rounded-md border border-amber-200 bg-amber-50 p-3 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+              >
+                <div className="text-sm font-medium">Existing rows of the tables you add cannot be loaded</div>
+                <div className="mt-1 text-xs">{cdcBackfillUnavailableDetail}</div>
+                <div className="mt-1 text-xs">
+                  {pipelinePaused
+                    ? "You can still add tables: they will stream every change made once you resume the pipeline, without their existing rows."
+                    : "You can still add tables: they will stream every change made from now on, without their existing rows."}
+                </div>
               </div>
-            </div>
+            ) : (
+              <div className="rounded-md border bg-zinc-50 dark:bg-zinc-900 p-3 flex items-start gap-3">
+                <Checkbox
+                  id="cdc-backfill-new-tables"
+                  checked={cdcBackfillNewTables}
+                  onCheckedChange={(v) => {
+                    backfillTouchedRef.current = true
+                    onCdcBackfillNewTablesChange?.(Boolean(v))
+                  }}
+                  className="mt-0.5"
+                />
+                <label htmlFor="cdc-backfill-new-tables" className="flex-1 cursor-pointer">
+                  <div className="text-sm font-medium">Also load the existing rows of the tables you add</div>
+                  <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                    Recommended. Without it, a table you add streams only the changes made from now on. Only the
+                    tables you add now are loaded; tables already streaming are not touched.
+                  </div>
+                  {cdcBackfillBlockingOnly && (
+                    <div
+                      className="mt-1 text-xs text-sky-800 dark:text-sky-300"
+                      data-testid="cdc-backfill-blocking-note"
+                    >
+                      {cdcBackfillObjectStorage
+                        ? "This pipeline writes to object storage, so it loads them with a blocking snapshot: change " +
+                          "streaming for the whole pipeline pauses until the added tables are read, then resumes where " +
+                          "it stopped, so changes made meanwhile arrive late rather than being skipped. The load is " +
+                          "queued and starts about a minute after you save."
+                        : "This MongoDB pipeline loads them with a blocking snapshot: change streaming for the whole " +
+                          "pipeline pauses until the added collections are read, then resumes where it stopped, so " +
+                          "changes made meanwhile arrive late rather than being skipped. Nothing is written to your database."}
+                    </div>
+                  )}
+                </label>
+              </div>
+            )}
+            {readdedTables.length > 0 && (!cdcBackfillNewTables || cdcBackfillUnavailableDetail) ? (
+              <div
+                role="alert"
+                data-testid="cdc-readded-without-load-warning"
+                className="rounded-md border border-amber-200 bg-amber-50 p-3 text-xs text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+              >
+                <span className="font-medium">
+                  {readdedTables.length === 1
+                    ? `${readdedTables[0]} was removed from this pipeline before.`
+                    : `${readdedTables.length} of the tables you add were removed from this pipeline before.`}
+                </span>{" "}
+                The changes made while the table was removed are not streamed; without loading, those rows stay missing
+                or stale at the destination.
+              </div>
+            ) : null}
           </div>
         ) : null}
         </div>
 
         <DialogFooter className="gap-2 items-center shrink-0 border-t border-zinc-200 dark:border-zinc-800 pt-4 mt-1">
-          {selectedTables.length > 0 && (
-            <span className="text-sm text-zinc-500 dark:text-zinc-400 mr-auto">
-              {selectedTables.length} table{selectedTables.length !== 1 ? "s" : ""} selected
-            </span>
-          )}
+          <div className="mr-auto flex flex-col">
+            {selectedTables.length > 0 && (
+              <span className="text-sm text-zinc-500 dark:text-zinc-400">
+                {selectedTables.length} table{selectedTables.length !== 1 ? "s" : ""} selected
+              </span>
+            )}
+            {showConfirmBlockedReason && (
+              <span
+                id="table-selector-confirm-reason"
+                data-testid="table-selector-confirm-reason"
+                className="text-xs text-amber-700 dark:text-amber-400"
+              >
+                {confirmBlockedReason}
+              </span>
+            )}
+          </div>
           <Button variant="outline" onClick={onCancelClick} disabled={submitting || cancelling}>
             {cancelling ? "Cancelling…" : "Cancel"}
           </Button>
           <Button
             onClick={onConfirm}
-            disabled={submitting || cancelling || (showMapping && !!destNamespaceError) || (!wholeDatabase && !hasNamespaceWildcards && selectedTables.length === 0 && manualSelectedTables.length === 0)}
+            disabled={submitting || cancelling || confirmBlockedReason !== ""}
+            aria-describedby={showConfirmBlockedReason ? "table-selector-confirm-reason" : undefined}
             className="bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700"
           >
             {submitting ? (

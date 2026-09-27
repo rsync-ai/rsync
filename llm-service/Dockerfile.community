@@ -59,7 +59,6 @@ COPY src/agents/explorer/ ./src/agents/explorer/
 COPY src/agents/pii_scanner/ ./src/agents/pii_scanner/
 COPY src/agents/planner/ ./src/agents/planner/
 COPY src/agents/suggestions/ ./src/agents/suggestions/
-COPY src/agents/telemetry/ ./src/agents/telemetry/
 
 # The generation package: its __init__, the moat-free deploy runtime, and the
 # deterministic renderer. The renderer turns an OpenAPI document into a connector

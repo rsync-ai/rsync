@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useCallback, useMemo, useRef } from "react"
+import { useState, useEffect, useCallback, useMemo, useRef, type CSSProperties } from "react"
 import { PageHeader } from "@/components/layout/PageHeader"
 import { isNameResolutionFailure } from "@/lib/errors/name-resolution"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -9,11 +9,13 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Badge } from "@/components/ui/badge"
 import { Textarea } from "@/components/ui/textarea"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import {
@@ -60,9 +62,13 @@ import {
   Server,
   PanelLeftClose,
   PanelLeftOpen,
+  Table2,
+  EyeOff,
+  GripHorizontal,
 } from "lucide-react"
 import { Switch } from "@/components/ui/switch"
 import { toast } from "sonner"
+import { copyTextToClipboard } from "@/lib/clipboard"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { cn } from "@/lib/utils"
@@ -97,11 +103,19 @@ import {
   SavedQueries,
 } from "@/components/explorer"
 import { groupTablesByDatabase } from "@/lib/explorer/schemaTree"
+import { fetchNextStepSuggestions } from "@/lib/explorer/nextSteps"
+import {
+  describeColumnLink,
+  flattenResolvedColumns,
+  resolveExplorerColumns,
+} from "@/lib/explorer/resolveColumns"
 import { handleExplorerRunShortcut } from "@/lib/explorer/runShortcut"
+import { ShareToSlackDialog } from "@/components/explorer/ShareToSlackDialog"
 import { DocumentExplorer } from "@/components/explorer/DocumentExplorer"
 import { SuggestTablesCard } from "@/components/explorer/SuggestTablesCard"
 import { isInternalExplorerTable } from "@/lib/explorer/internalTables"
 import { llmNotConfiguredError } from "@/lib/explorer/llmNotConfigured"
+import { maskedColumns } from "@/lib/explorer/redactedColumns"
 
 // Types
 interface Connection {
@@ -117,6 +131,11 @@ interface Connection {
   supports_explorer?: boolean
   explorer_mode?: string // "sql" | "document" (MongoDB: DocumentExplorer instead of the SQL editor)
   sql_dialect?: string
+  // Decrypted, secret-masked connection config — already in the /connections
+  // payload (ListConnections runs it through maskSensitiveFields). Read here for
+  // `config.database`: the ONE database discovery is pinned to, which is the
+  // whole explanation when a connection browses empty.
+  config?: Record<string, unknown>
 }
 
 interface TableMetadata {
@@ -182,12 +201,51 @@ interface QueryHistory {
   rowCount?: number
 }
 
-// The three exploration panes. "history" is the automatic, per-browser
+// The four panes of the workspace's results half. "results" is the run output
+// and the default — it used to be a card stacked below the editor, so a run's
+// outcome was off-screen on a laptop. "history" is the automatic, per-browser
 // localStorage scratchpad; "saved" is the workspace-scoped server resource
-// (migration 084). They coexist on purpose — one is disposable, one is shared.
-type ExplorerPanelTab = "steps" | "history" | "saved"
+// (migration 084). Those two coexist on purpose — one is disposable, one shared.
+type ExplorerPanelTab = "results" | "steps" | "history" | "saved"
 
 type ExportFormat = "csv" | "tsv" | "json" | "xlsx"
+
+// Compose/results split: the editor pane's share of the workspace column,
+// dragged by the separator between them and persisted per browser. The bounds
+// keep both panes usable — the editor never gets too short to read SQL in, the
+// grid never gets squeezed to one row.
+const COMPOSE_RATIO_KEY = "explorer.composeRatio"
+const DEFAULT_COMPOSE_RATIO = 0.45
+const MIN_COMPOSE_RATIO = 0.25
+const MAX_COMPOSE_RATIO = 0.75
+
+function clampComposeRatio(v: number): number {
+  if (!Number.isFinite(v)) return DEFAULT_COMPOSE_RATIO
+  return Math.min(MAX_COMPOSE_RATIO, Math.max(MIN_COMPOSE_RATIO, v))
+}
+
+// Human name for the dialect the editor highlights against and the AI writes
+// for. Resolved from the connector on every generate and never shown until now.
+const SQL_DIALECT_LABELS: Record<string, string> = {
+  postgresql: "PostgreSQL",
+  mysql: "MySQL",
+  redshift: "Redshift",
+  databricks: "Databricks",
+  generic: "ANSI SQL",
+}
+
+// The one database discovery is pinned to. A connector whose tables live in
+// databases and whose config names one ignores the connection's Scope entirely
+// (connectionScope, backend-orchestrator .../discovery_scope.go), so this single
+// value decides what the tree can possibly contain.
+function pinnedDatabaseOf(config: Record<string, unknown> | undefined): string {
+  if (!config) return ""
+  for (const key of ["database", "db", "dbname", "database_name"]) {
+    const v = config[key]
+    if (typeof v === "string" && v.trim() !== "") return v.trim()
+  }
+  return ""
+}
 
 // Tiny English-only pluralization helper. Centralized so every label
 // across the page reads "1 row" vs "12 rows" the same way; locale-aware
@@ -197,7 +255,7 @@ function pluralizeRows(n: number): string {
   return `${count} ${n === 1 ? "row" : "rows"}`
 }
 
-type VisualizationTool = "metabase" | "superset" | "looker" | "powerbi" | "tableau" | "grafana"
+type VisualizationTool = "metabase" | "superset" | "looker" | "powerbi" | "tableau"
 
 interface VisualizationToolDef {
   id: VisualizationTool
@@ -424,7 +482,6 @@ export default function ExplorerPage() {
 
   // History state
   const [queryHistory, setQueryHistory] = useState<QueryHistory[]>([])
-  const [showHistory, setShowHistory] = useState(false)
 
   // Cell viewer (for long values so UI truncation isn't confused with masking)
   const [cellViewerOpen, setCellViewerOpen] = useState(false)
@@ -440,7 +497,15 @@ export default function ExplorerPage() {
 
   // Exploration run state (for step DAG/timeline)
   const [currentRun, setCurrentRun] = useState<ExplorerRun | null>(null)
-  const [rightPanelTab, setRightPanelTab] = useState<ExplorerPanelTab>("steps")
+  const [rightPanelTab, setRightPanelTab] = useState<ExplorerPanelTab>("results")
+
+  // Height split between the compose pane and the results pane below it.
+  const [composeRatio, setComposeRatio] = useState(DEFAULT_COMPOSE_RATIO)
+  const splitColumnRef = useRef<HTMLDivElement>(null)
+
+  // "ask" shows the natural-language box above the SQL editor; "sql" hides it so
+  // the editor owns the whole compose pane. The editor stays mounted in both.
+  const [composeMode, setComposeMode] = useState<"ask" | "sql">("ask")
 
   // The schema browser (left rail) collapses to a thin strip so power users
   // writing raw SQL can reclaim the full editor width. Open by default.
@@ -471,25 +536,84 @@ export default function ExplorerPage() {
   // server-side query via the request context (the Go driver honors
   // ctx.Done() on connections).
   const executeAbortRef = useRef<AbortController | null>(null)
-  // Target for the top-right Steps/History buttons. Without this, clicking
-  // those buttons changes rightPanelTab state but the Exploration Details
-  // card sits below the query editor + results, so the user sees no visible
-  // change. We smooth-scroll the panel into view after the tab switch.
-  const explorationPanelRef = useRef<HTMLDivElement>(null)
 
-  // Set rightPanelTab AND scroll the Exploration Details card into view.
-  // Wrapped in requestAnimationFrame so the scroll happens after React
-  // flushes the tab-state render (otherwise the ref's bounding box can be
-  // stale and the browser scrolls to the wrong position).
-  const focusExplorationPanel = useCallback((tab: ExplorerPanelTab) => {
-    setRightPanelTab(tab)
-    if (tab === "history") {
-      setShowHistory(true)
+  // Persist the dragged split so a chosen layout survives a reload.
+  const persistComposeRatio = useCallback((next: number) => {
+    const clamped = clampComposeRatio(next)
+    setComposeRatio(clamped)
+    try {
+      window.localStorage.setItem(COMPOSE_RATIO_KEY, String(clamped))
+    } catch {
+      // Storage disabled (private window): the split still works this session.
     }
-    requestAnimationFrame(() => {
-      explorationPanelRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
-    })
   }, [])
+
+  // Restore it. Deliberately an effect rather than a useState initializer so the
+  // server render and the first client render agree.
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(COMPOSE_RATIO_KEY)
+      // localStorage is only readable on the client, and a useState initializer
+      // that read it would make the server and client renders disagree. Runs
+      // once, no deps, so there is no cascading-render loop to worry about.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      if (raw !== null) setComposeRatio(clampComposeRatio(Number(raw)))
+    } catch {
+      // Same as above — fall back to the default ratio.
+    }
+  }, [])
+
+  // Pointer drag on the separator. The ratio moves by how far the pointer
+  // travelled, NOT to where it landed. Both panes have minimum heights, so as
+  // soon as one of those floors binds, the separator stops sitting at
+  // `composeRatio` of the column — and mapping the pointer's absolute position
+  // onto the ratio then teleports the split the moment it is grabbed. Measured
+  // on the deployed page: grabbing the handle at rest moved the stored ratio
+  // from 43% to 75%, and because the drag persists, the jump outlived it.
+  // Measured against the workspace column, not the pane, so a given delta means
+  // the same thing whatever the panes currently are.
+  const startSplitDrag = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const column = splitColumnRef.current
+      if (!column) return
+      e.preventDefault()
+      const box = column.getBoundingClientRect()
+      if (box.height <= 0) return
+      const startY = e.clientY
+      const startRatio = composeRatio
+      const ratioAt = (clientY: number) => startRatio + (clientY - startY) / box.height
+      const move = (ev: PointerEvent) => setComposeRatio(clampComposeRatio(ratioAt(ev.clientY)))
+      const up = (ev: PointerEvent) => {
+        window.removeEventListener("pointermove", move)
+        window.removeEventListener("pointerup", up)
+        persistComposeRatio(ratioAt(ev.clientY))
+      }
+      window.addEventListener("pointermove", move)
+      window.addEventListener("pointerup", up)
+    },
+    [composeRatio, persistComposeRatio]
+  )
+
+  // Keyboard equivalent — a drag handle that only works with a mouse is not one.
+  const handleSplitKeyDown = useCallback(
+    (e: React.KeyboardEvent<HTMLDivElement>) => {
+      const step = e.shiftKey ? 0.1 : 0.02
+      if (e.key === "ArrowUp") {
+        e.preventDefault()
+        persistComposeRatio(composeRatio - step)
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault()
+        persistComposeRatio(composeRatio + step)
+      } else if (e.key === "Home") {
+        e.preventDefault()
+        persistComposeRatio(MIN_COMPOSE_RATIO)
+      } else if (e.key === "End") {
+        e.preventDefault()
+        persistComposeRatio(MAX_COMPOSE_RATIO)
+      }
+    },
+    [composeRatio, persistComposeRatio]
+  )
 
   const HISTORY_KEY_PREFIX = "rsync_explorer_history_v1"
 
@@ -526,9 +650,10 @@ export default function ExplorerPage() {
 
       setConnections(usable)
 
-      // Auto-select a default connection.
-      if (usable.length > 0 && !selectedConnection) {
-        setSelectedConnection(usable[0].id)
+      // Auto-select a default connection. Read the selection through the updater, not a
+      // closure: depending on it made every pick in the menu fetch this list again.
+      if (usable.length > 0) {
+        setSelectedConnection((current) => current || usable[0].id)
       }
       if (usable.length === 0) {
         toast.message("No queryable connections found", {
@@ -545,7 +670,7 @@ export default function ExplorerPage() {
     } finally {
       setLoadingConnections(false)
     }
-  }, [selectedConnection])
+  }, [])
 
   // Load per-connection query history from localStorage
   useEffect(() => {
@@ -723,6 +848,16 @@ export default function ExplorerPage() {
     })
   }, [])
 
+  // The parked updates ARE what the timeline is meant to be showing, so land
+  // them the moment the timeline comes into view. Until this existed the queue
+  // was flushed from exactly two places — the two editor blur handlers — so a
+  // run started with Cmd/Ctrl+Enter from inside a focused editor never flushed
+  // at all: the Steps tab showed "Completed · 0ms total" with every step blank
+  // while the rows sat in the grid next to it.
+  useEffect(() => {
+    if (rightPanelTab === "steps") flushPendingRunStepUpdates()
+  }, [rightPanelTab, flushPendingRunStepUpdates])
+
   // Helper to update a step in the current run
   const updateRunStep = useCallback(
     (stepId: string, updates: Partial<ExplorerStep>) => {
@@ -754,6 +889,10 @@ export default function ExplorerPage() {
       startedAt: new Date(),
       status: "running",
     }
+    // Drop whatever the last run parked while an editor held focus. The queue
+    // addresses steps by id, so without this a stale update from the previous
+    // run lands on this one the next time a flush fires.
+    pendingRunStepUpdatesRef.current = []
     setCurrentRun(run)
     setRightPanelTab("steps")
     return run
@@ -779,6 +918,15 @@ export default function ExplorerPage() {
     if (ct.includes("postgres")) return "postgresql"
     return "generic"
   }, [connections, selectedConnection])
+
+  // Columns the server masked before sending this preview, detected from the
+  // values rather than by re-implementing the Go naming rules (which would
+  // drift). The grid has always shown "ab***" with no explanation, and the
+  // export path deliberately does NOT mask — both now get said out loud.
+  const maskedResultColumns = useMemo(
+    () => maskedColumns(queryResult?.columns, queryResult?.rows),
+    [queryResult]
+  )
 
   const generateSQL = async (opts?: { tablesOverride?: string[]; metricChoiceOverride?: MetricChoice }) => {
     if (!nlInput.trim()) {
@@ -1069,7 +1217,18 @@ export default function ExplorerPage() {
         return tableKeySet.has(fkKey(fk.from_schema, fk.from_table)) && tableKeySet.has(fkKey(fk.to_schema, fk.to_table))
       })
 
-      // Step 3: Column Link (simplified for now)
+      // Step 3: Column Link.
+      //
+      // This used to list every column of every linked table and report a
+      // hard-coded confidence of 0.85 — a step that could not fail and measured
+      // nothing. POST /explorer/nl/resolve-columns has been implemented the
+      // whole time with no caller; it is what actually decides which columns the
+      // question needs, and it is the only step that can say "I am not sure
+      // which column you meant" (needs_hitl / ambiguous_columns).
+      //
+      // It is NOT fatal. Nothing downstream consumes this step's output — SQL
+      // generation is handed `schemaContext` directly — so a failure degrades
+      // the timeline entry to the local list rather than killing the run.
       const colLinkStart = Date.now()
       updateRunStep("column_link", {
         status: "running",
@@ -1077,15 +1236,48 @@ export default function ExplorerPage() {
         inputs: [{ key: "tables", value: linkedTables }],
       })
 
-      const linkedColumns = tablesToUse.flatMap((t) => (t.columns || []).map((c) => `${tableKeyFromMeta(t)}.${c.name}`))
-      
-      updateRunStep("column_link", {
-        status: "success",
-        durationMs: Date.now() - colLinkStart,
-        completedAt: new Date(),
-        confidence: 0.85,
-        outputs: [{ key: "columns", value: linkedColumns.slice(0, 10) }],
-      })
+      const localColumns = tablesToUse.flatMap((t) => (t.columns || []).map((c) => `${tableKeyFromMeta(t)}.${c.name}`))
+      let linkedColumns = localColumns
+
+      try {
+        const resolved = await resolveExplorerColumns({
+          connectionId: selectedConnection,
+          question: nlInput,
+          tables: tablesTyped,
+        })
+        const chosen = flattenResolvedColumns(resolved.columns)
+        if (chosen.length > 0) linkedColumns = chosen
+
+        const joins = (resolved.join_plan || [])
+          .map((j) => `${j.left_table} ${j.join_type || "JOIN"} ${j.right_table} ON ${j.condition}`)
+          .filter(Boolean)
+
+        updateRunStep("column_link", {
+          status: "success",
+          durationMs: Date.now() - colLinkStart,
+          completedAt: new Date(),
+          // The server's number, not a constant.
+          confidence: resolved.confidence,
+          reason: describeColumnLink(resolved),
+          outputs: [
+            { key: "columns", value: linkedColumns.slice(0, 10) },
+            ...(joins.length > 0 ? [{ key: "joins", value: joins }] : []),
+            ...(resolved.ambiguous_columns?.length
+              ? [{ key: "ambiguous", value: resolved.ambiguous_columns }]
+              : []),
+          ],
+        })
+      } catch (colErr) {
+        // "skipped", not "failed": the run is unaffected, and marking it failed
+        // would make a working query look like it went wrong.
+        updateRunStep("column_link", {
+          status: "skipped",
+          durationMs: Date.now() - colLinkStart,
+          completedAt: new Date(),
+          reason: `Column linking unavailable (${colErr instanceof Error ? colErr.message : "request failed"}) — every column of the linked tables was passed to SQL generation instead.`,
+          outputs: [{ key: "columns", value: linkedColumns.slice(0, 10) }],
+        })
+      }
 
       // Step 4: SQL Generation
       const sqlGenStart = Date.now()
@@ -1270,6 +1462,7 @@ export default function ExplorerPage() {
       toast.error(e.title, { description: e.hint ?? e.message })
     } finally {
       setGeneratingSql(false)
+      flushPendingRunStepUpdates()
     }
   }
 
@@ -1372,8 +1565,6 @@ export default function ExplorerPage() {
       setExecutingQuery(true)
       setQueryError(null)
       setQueryResult(null)
-      setRightPanelTab("steps")
-
       // Ensure manual SQL runs still show a step timeline.
       // (Without NL "Generate SQL", `currentRun` can be null and the UI misleadingly says
       // "No exploration run yet" even though the query executed.)
@@ -1387,6 +1578,11 @@ export default function ExplorerPage() {
           durationMs: 0,
         })
         updateRunStep("sql_generate", { status: "skipped" })
+        // A hand-written query identifies no tables and maps no columns, so
+        // these two stayed `pending` — a clock icon reading "still to come" on
+        // a run that had already finished. Skipped is what actually happened.
+        updateRunStep("table_link", { status: "skipped" })
+        updateRunStep("column_link", { status: "skipped" })
         updateRunStep("safety_check", {
           status: "success",
           startedAt: new Date(t),
@@ -1394,6 +1590,15 @@ export default function ExplorerPage() {
           durationMs: 0,
         })
       }
+
+      // A run's output belongs in front of the operator. (This used to switch to
+      // the step timeline, which meant the grid arrived in a pane nobody was
+      // looking at; Steps is one click away on the same pane.) This has to run
+      // AFTER the block above, not before it: `startExplorationRun` selects
+      // Steps itself — right for the NL path, where you watch the SQL being
+      // generated — so selecting Results first just got overwritten, and every
+      // manual run finished on the timeline with its grid out of sight.
+      setRightPanelTab("results")
 
       const sqlLimit = extractLimitFromSQL(targetSql)
       const nlLimit = extractRequestedRowLimit(nlInput)
@@ -1485,16 +1690,44 @@ export default function ExplorerPage() {
           ],
         })
 
-        // Update next_steps
+        // Next steps: ask the server rather than print a fixed list. The three
+        // strings that used to be hard-coded here were identical for every run —
+        // a zero-row result, a DDL statement, a 40-column report all got
+        // "Create Metabase Dashboard / Download CSV / Share via Slack" — while
+        // POST /explorer/nl/next-steps had been shipped with no caller at all.
         const nextStepsStart = Date.now()
-      updateRunStep("next_steps", {
-        status: "success",
-        startedAt: new Date(nextStepsStart),
-        durationMs: Date.now() - nextStepsStart,
-        completedAt: new Date(),
-        outputs: [{ key: "suggestions", value: ["Create Metabase Dashboard", "Download CSV", "Share via Slack"] }],
-      })
-      setCurrentRun((prev) => (prev ? { ...prev, status: "completed", completedAt: new Date() } : prev))
+        updateRunStep("next_steps", { status: "running", startedAt: new Date(nextStepsStart) })
+
+        // The run is complete once the rows are in hand. Deliberately NOT
+        // awaiting the suggestion call: the gateway gives it up to 25 s, and
+        // nothing below depends on it. The step fills itself in when it lands.
+        setCurrentRun((prev) => (prev ? { ...prev, status: "completed", completedAt: new Date() } : prev))
+
+        void fetchNextStepSuggestions({
+          question: nlInput || "",
+          sql: sqlToRun,
+          rowCount,
+          columns: columns.map((c) => String(c)),
+          signal: abortController.signal,
+        })
+          .then((suggestions) => {
+            updateRunStep("next_steps", {
+              status: suggestions.length > 0 ? "success" : "skipped",
+              durationMs: Date.now() - nextStepsStart,
+              completedAt: new Date(),
+              outputs: suggestions.length > 0 ? [{ key: "suggestions", value: suggestions }] : undefined,
+            })
+          })
+          .catch((err) => {
+            // A cancelled run is not a failed suggestion call.
+            if (abortController.signal.aborted) return
+            updateRunStep("next_steps", {
+              status: "failed",
+              durationMs: Date.now() - nextStepsStart,
+              completedAt: new Date(),
+              error: err instanceof Error ? err.message : "Could not get suggestions",
+            })
+          })
 
         const nextResult: QueryResult = {
           columns,
@@ -1519,8 +1752,6 @@ export default function ExplorerPage() {
           rowCount,
         }
         setQueryHistory(prev => [historyEntry, ...prev.slice(0, 19)])
-        // Make history visible
-        setShowHistory(true)
         // No success toast: the Results header already says the rows (or rows
         // affected) and the time, and the toast sat on top of it (#54).
         if (isWriteResult(statementType)) {
@@ -1574,6 +1805,10 @@ export default function ExplorerPage() {
         executeAbortRef.current = null
       }
       setExecutingQuery(false)
+      // The run is over, so the anti-jitter reason for parking step updates is
+      // over with it. Without this the timeline stays blank after a Cmd-Enter
+      // run until the editor happens to lose focus.
+      flushPendingRunStepUpdates()
     }
   }
 
@@ -1592,9 +1827,12 @@ export default function ExplorerPage() {
     })
   }
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text)
-    toast.success("Copied to clipboard")
+  const copyToClipboard = async (text: string) => {
+    if (await copyTextToClipboard(text)) {
+      toast.success("Copied to clipboard")
+    } else {
+      toast.error("Could not copy to clipboard")
+    }
   }
 
   const downloadBlob = (blob: Blob, filename: string) => {
@@ -1726,7 +1964,6 @@ export default function ExplorerPage() {
     if (entry.question) {
       setNlInput(entry.question)
     }
-    setShowHistory(false)
     toast.info("Query loaded from history")
   }
 
@@ -1742,6 +1979,26 @@ export default function ExplorerPage() {
   // tree below it. The full tree (grouping, search, expand/collapse) lives in
   // <SchemaBrowser>, which is also fed visibleTables.
   const databaseCount = groupTablesByDatabase(visibleTables).length
+  const isDestinationConn = (selectedConn?.type || "").toLowerCase() === "destination"
+  const pinnedDatabase = pinnedDatabaseOf(selectedConn?.config)
+  const dialectLabel = SQL_DIALECT_LABELS[sqlDialect] ?? "SQL"
+  const composePct = Math.round(composeRatio * 100)
+
+  // What the tree says when it has nothing to show. "No tables found" answers a
+  // question nobody asked: discovery is pinned to ONE database, so an empty tree
+  // almost always means "that database is empty", not "the server is". This is
+  // the whole of the reported "my MongoDB destination does not show up in
+  // Explorer" — discovery was returning success with zero collections for the
+  // database the connection names, and the UI never named it.
+  const emptyTreeHint = (() => {
+    if (!selectedConnection) return "Select a connection to browse tables"
+    const items = isDocumentConn ? "collections" : "tables"
+    if (!pinnedDatabase || (isMySQLConn && allDatabases)) return `No ${items} found`
+    const head = `No ${items} in "${pinnedDatabase}" — the one database this connection browses.`
+    return isDestinationConn
+      ? `${head} This is a destination: a pipeline writing to it targets its own database, which can be a different one, so an empty tree here does not mean the pipeline is not landing data.`
+      : `${head} Point the connection at another database to browse that one instead.`
+  })()
 
   const toggleTableSelection = (tableKey: string) => {
     setSelectedTables(prev =>
@@ -1752,8 +2009,13 @@ export default function ExplorerPage() {
   }
 
   return (
-    <div className="space-y-6" onKeyDown={handleKeyDown}>
+    <div
+      data-testid="explorer-shell"
+      className="flex flex-col gap-4 lg:h-[calc(100vh-8rem)] lg:min-h-0"
+      onKeyDown={handleKeyDown}
+    >
       <PageHeader
+        className="shrink-0"
         heading="Data Explorer"
         description={
           isDocumentConn
@@ -1762,19 +2024,22 @@ export default function ExplorerPage() {
         }
       />
 
-      {/* Workspace: collapsible schema rail · full-width query editor + results.
+      {/* Workspace: collapsible schema rail · compose pane above results pane.
           Flex (not grid) so the schema rail can collapse to a thin strip by
-          animating its width. Stacks vertically on mobile. */}
-      <div className="flex flex-col gap-3 lg:flex-row lg:items-start">
+          animating its width. From lg up the row IS the page's remaining height
+          and each pane scrolls inside it — that is what makes the schema tree
+          and the result grid as tall as the window allows instead of the 340px
+          and 400px boxes they used to be. Stacks and grows on mobile. */}
+      <div className="flex flex-col gap-3 lg:min-h-0 lg:flex-1 lg:flex-row lg:items-stretch">
         {/* ── Left rail: schema browser ── */}
         <aside
           className={cn(
-            "w-full shrink-0 transition-[width] duration-200",
+            "w-full shrink-0 transition-[width] duration-200 lg:min-h-0",
             leftRailOpen ? "lg:w-[280px]" : "lg:w-[48px]"
           )}
         >
         {leftRailOpen ? (
-        <Card>
+        <Card className="flex flex-col lg:h-full lg:min-h-0">
           <CardHeader className="px-3 pt-4 pb-3">
             <div className="flex items-center justify-between gap-2">
               <CardTitle className="flex items-center gap-2 text-base">
@@ -1796,9 +2061,9 @@ export default function ExplorerPage() {
               Browse databases, schemas &amp; tables
             </CardDescription>
           </CardHeader>
-          <CardContent className="space-y-3 px-3 pb-3">
+          <CardContent className="flex min-h-0 flex-1 flex-col gap-3 px-3 pb-3">
             {/* Connection Selector */}
-            <div className="space-y-2">
+            <div className="shrink-0 space-y-2">
               <Label className="text-xs">Connection</Label>
               <Select
                 value={selectedConnection}
@@ -1824,9 +2089,35 @@ export default function ExplorerPage() {
               </Select>
             </div>
 
+            {/* The one database this connection browses. Discovery is hard-pinned
+                to it, so it is the difference between "the server is empty" and
+                "this database is empty" — and for a destination, between "the
+                pipeline is not landing data" and "it lands it somewhere else". */}
+            {selectedConnection && pinnedDatabase && !(isMySQLConn && allDatabases) && (
+              <div
+                className="flex shrink-0 flex-wrap items-center gap-1.5 text-[11px] text-zinc-500 dark:text-zinc-400"
+                title={
+                  isDestinationConn
+                    ? `Browsing the database this connection names. It is a destination: a pipeline writing to it targets its own database, which may be a different one.`
+                    : `Browsing "${pinnedDatabase}". Discovery is pinned to this one database — other databases on the server are not listed.`
+                }
+              >
+                <Database className="h-3 w-3 shrink-0 text-violet-500" />
+                <span>Browsing</span>
+                <code className="rounded bg-zinc-100 px-1 py-px font-mono text-[10px] dark:bg-zinc-800">
+                  {pinnedDatabase}
+                </code>
+                {isDestinationConn && (
+                  <Badge variant="outline" className="h-4 px-1 text-[9px] font-normal">
+                    destination
+                  </Badge>
+                )}
+              </div>
+            )}
+
             {/* Schema browser controls */}
             {selectedConnection && (
-              <div className="space-y-2">
+              <div className="shrink-0 space-y-2">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
                     {/* A failed or in-flight schema load has no tables yet; a count
@@ -1884,14 +2175,19 @@ export default function ExplorerPage() {
               </div>
             )}
 
-            {/* Schema tree: namespace → table → columns */}
-            <div className="h-[340px] overflow-auto rounded-md border">
+            {/* Schema tree: namespace → table → columns. Takes whatever height is
+                left, so "how many tables can I see at once" is set by the window
+                rather than by a hardcoded 340px box. */}
+            <div
+              data-testid="schema-tree-pane"
+              className="min-h-[240px] overflow-hidden rounded-md border lg:min-h-0 lg:flex-1"
+            >
               {loadingSchema ? (
-                <div className="flex items-center justify-center py-8">
+                <div className="flex h-full items-center justify-center py-8">
                   <Loader2 className="h-5 w-5 animate-spin text-violet-500" />
                 </div>
               ) : schemaError ? (
-                <div className="flex flex-col items-center justify-center py-8 px-4 gap-2 text-center">
+                <div className="flex h-full flex-col items-center justify-center py-8 px-4 gap-2 text-center">
                   <AlertCircle className="h-5 w-5 text-red-400 shrink-0" />
                   <div className="text-xs font-semibold text-red-600 dark:text-red-400">{schemaError.title}</div>
                   <div className="text-xs text-zinc-500 dark:text-zinc-400 break-words">{schemaError.message}</div>
@@ -1911,6 +2207,10 @@ export default function ExplorerPage() {
               ) : (
                 <SchemaBrowser
                   tables={visibleTables}
+                  // Already fetched for SQL generation and never displayed.
+                  // Showing them is what makes the joins the AI writes — and the
+                  // ones it only guessed at — inspectable before you trust them.
+                  foreignKeys={foreignKeys}
                   selectedTables={selectedTables}
                   selectionKey={(t) => tableKeyFromMeta(t)}
                   // Document mode: no table picking for NL→SQL and no SQL editor to
@@ -1927,19 +2227,16 @@ export default function ExplorerPage() {
                   onInsertColumn={isDocumentConn ? undefined : insertIntoEditor}
                   itemLabel={isDocumentConn ? "collections" : "tables"}
                   insertTitle={isDocumentConn ? "Open collection" : "Add to SQL"}
+                  insertLabel={isDocumentConn ? "Open collection" : "Insert table"}
                   namespaceLabel={namespaceLabel === "schemas" ? "Schema" : "Database"}
-                  emptyHint={
-                    selectedConnection
-                      ? isDocumentConn ? "No collections found" : "No tables found"
-                      : "Select a connection to browse tables"
-                  }
+                  emptyHint={emptyTreeHint}
                   className="p-1.5"
                 />
               )}
             </div>
 
             {selectedTables.length > 0 && (
-              <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex shrink-0 items-center gap-2 flex-wrap">
                 <span className="text-xs text-zinc-500 dark:text-zinc-400">Selected:</span>
                 {selectedTables.map(t => (
                   <Badge key={t} variant="secondary" className="text-[10px] gap-1">
@@ -1955,7 +2252,7 @@ export default function ExplorerPage() {
           </CardContent>
         </Card>
         ) : (
-          <div className="hidden flex-col items-center gap-3 rounded-lg border bg-card py-3 lg:flex">
+          <div className="hidden flex-col items-center gap-3 rounded-lg border bg-card py-3 lg:flex lg:h-full">
             <Button
               variant="ghost"
               size="sm"
@@ -1973,9 +2270,13 @@ export default function ExplorerPage() {
         )}
         </aside>
 
-        {/* ── Center: NL → SQL → results ── */}
-        <main className="w-full min-w-0 space-y-6 lg:flex-1">
+        {/* ── Center: compose pane · draggable split · results pane ── */}
+        <main
+          ref={splitColumnRef}
+          className="flex w-full min-w-0 flex-col gap-3 lg:min-h-0 lg:flex-1"
+        >
           {isDocumentConn ? (
+          <div className="lg:min-h-0 lg:flex-1 lg:overflow-auto">
             <DocumentExplorer
               connectionId={selectedConnection}
               collections={visibleTables}
@@ -1986,44 +2287,82 @@ export default function ExplorerPage() {
               collectionsError={schemaError}
               onRetryCollections={() => loadSchema({ force: true })}
             />
+          </div>
           ) : (
           <>
-          {/* Query Editor */}
-          <Card>
-            <CardHeader className="px-4 pt-4 pb-3">
-              <div className="flex items-center justify-between">
-                <div>
+          {/* ── Compose pane ── */}
+          {/* `basis` is the dragged split and `shrink-0` holds it there, so the
+              results pane below absorbs whatever is left. Below lg it is
+              content-height and the page scrolls as it always did. */}
+          <Card
+            data-testid="compose-pane"
+            className={cn(
+              "flex shrink-0 flex-col lg:basis-[var(--compose-basis)] lg:overflow-hidden",
+              // A percentage basis cannot promise the editor a single pixel. The
+              // question box, the labels and the Run row are all shrink-0 and
+              // take ~310px before the editor is measured, so at 45% of any
+              // window shorter than ~1050px the editor was squeezed to 0 and the
+              // pane showed a bare "SQL Query" label with no editor under it.
+              // These floors are the measured content minimum: 25rem yields a
+              // 94px editor with nothing clipped. The drag cannot go below them.
+              composeMode === "ask" ? "lg:min-h-[25rem]" : "lg:min-h-[17rem]",
+            )}
+            style={{ "--compose-basis": `${composePct}%` } as CSSProperties}
+          >
+            <CardHeader className="shrink-0 px-4 pt-4 pb-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex min-w-0 items-center gap-2">
                   <CardTitle className="flex items-center gap-2 text-base">
                     <Code className="h-4 w-4 text-violet-500" />
                     Query Editor
                   </CardTitle>
-                  <CardDescription className="text-xs mt-1">
-                    Ask in natural language (Cmd+Enter) or write SQL directly
-                  </CardDescription>
-                </div>
-                <div className="flex items-center gap-2">
-                  <Button
-                    variant={rightPanelTab === "steps" ? "secondary" : "outline"}
-                    size="sm"
-                    onClick={() => focusExplorationPanel("steps")}
+                  {/* The dialect the editor highlights and completes against —
+                      and the one the AI is told to write. Resolved per connector
+                      server-side and used on every generate; never shown before. */}
+                  <Badge
+                    variant="outline"
+                    className="text-[10px] font-normal"
+                    title={`SQL is highlighted, completed and generated for ${dialectLabel}`}
                   >
-                    <GitBranch className="h-4 w-4 mr-2" />
-                    Steps
+                    {dialectLabel}
+                  </Badge>
+                </div>
+                {/* Ask AI / SQL. "SQL" drops the question box so the editor owns
+                    the whole pane; the editor stays mounted either way. */}
+                <div
+                  role="group"
+                  aria-label="Compose mode"
+                  className="flex shrink-0 items-center gap-0.5 rounded-md border p-0.5"
+                >
+                  <Button
+                    variant={composeMode === "ask" ? "secondary" : "ghost"}
+                    size="sm"
+                    className="h-7 px-2.5 text-xs"
+                    aria-pressed={composeMode === "ask"}
+                    onClick={() => setComposeMode("ask")}
+                    title="Ask in English (Cmd+Enter) and let the AI write the SQL"
+                  >
+                    <Sparkles className="mr-1 h-3 w-3" />
+                    Ask AI
                   </Button>
                   <Button
-                    variant={rightPanelTab === "history" ? "secondary" : "outline"}
+                    variant={composeMode === "sql" ? "secondary" : "ghost"}
                     size="sm"
-                    onClick={() => focusExplorationPanel("history")}
+                    className="h-7 px-2.5 text-xs"
+                    aria-pressed={composeMode === "sql"}
+                    onClick={() => setComposeMode("sql")}
+                    title="Hide the question box and give the SQL editor the whole pane"
                   >
-                    <History className="h-4 w-4 mr-2" />
-                    History
+                    <Code className="mr-1 h-3 w-3" />
+                    SQL
                   </Button>
                 </div>
               </div>
             </CardHeader>
-            <CardContent className="space-y-4 px-4 pb-4">
+            <CardContent className="flex min-h-0 flex-1 flex-col gap-3 px-4 pb-4">
               {/* NL Input */}
-              <div className="space-y-2">
+              {composeMode === "ask" && (
+              <div className="shrink-0 space-y-2">
                 <Label htmlFor="explorer-nl" className="text-xs flex items-center gap-2">
                   <Sparkles className="h-3 w-3 text-violet-500" />
                   Natural Language Query
@@ -2076,10 +2415,13 @@ export default function ExplorerPage() {
                   }}
                 />
               </div>
+              )}
 
-              {/* SQL Editor */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
+              {/* SQL Editor — the pane's only growing child */}
+              {/* `min-h-0` lets this shrink with the pane; the `lg` floor stops
+                  it at ~five editor lines instead of letting it reach 0. */}
+              <div data-testid="sql-editor-pane" className="flex min-h-0 flex-1 flex-col gap-2 lg:min-h-[7.5rem]">
+                <div className="flex shrink-0 items-center justify-between">
                   <Label htmlFor="explorer-sql" className="text-xs">SQL Query</Label>
                   {sqlQuery && (
                     <Button
@@ -2104,7 +2446,11 @@ export default function ExplorerPage() {
                   foreignKeys={foreignKeys}
                   dialect={sqlDialect}
                   placeholder="SELECT * FROM table_name LIMIT 100"
-                  className="rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden"
+                  // Fill the pane rather than a fixed ~200px box: on lg the
+                  // dragged split decides the height; below lg the explicit
+                  // h-[220px] keeps CodeMirror's height:100% resolvable.
+                  fill
+                  className="h-[220px] rounded-md border border-zinc-200 dark:border-zinc-800 overflow-hidden lg:h-auto"
                   onSubmit={() => {
                     // Gate on the resolved target, matching the Run button. `multi` still
                     // calls through so attemptRunQuery can explain why it won't run.
@@ -2132,7 +2478,7 @@ export default function ExplorerPage() {
               </div>
 
               {/* Actions */}
-              <div className="flex items-center justify-between">
+              <div className="flex shrink-0 flex-wrap items-center justify-between gap-2">
                 <div className="flex items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
                   <kbd className="px-1.5 py-0.5 bg-zinc-100 dark:bg-zinc-800 rounded text-[10px]">⌘</kbd>
                   <span>+</span>
@@ -2184,13 +2530,13 @@ export default function ExplorerPage() {
                 )}
               </div>
               {runTarget.multi ? (
-                <div className="text-xs text-amber-700 dark:text-amber-300">
+                <div className="shrink-0 text-xs text-amber-700 dark:text-amber-300">
                   Your selection covers more than one statement. Queries run one at a time —
                   select a single statement, or clear the selection and put the cursor inside
                   the one you want.
                 </div>
               ) : runTarget.sql.trim() && !canRunCurrentStatement ? (
-                <div className="text-xs text-amber-700 dark:text-amber-300">
+                <div className="shrink-0 text-xs text-amber-700 dark:text-amber-300">
                   {currentStmtClass === "blocked" ? (
                     <>
                       <span className="font-medium">{firstSqlVerb(runTarget.sql)}</span>{" "}
@@ -2205,7 +2551,7 @@ export default function ExplorerPage() {
                   )}
                 </div>
               ) : currentStmtClass === "destructive" && runTarget.sql.trim() ? (
-                <div className="text-xs text-red-700 dark:text-red-300">
+                <div className="shrink-0 text-xs text-red-700 dark:text-red-300">
                   <span className="font-medium">{destructiveLabel(runTarget.sql)}</span>{" "}
                   is destructive and irreversible — you&apos;ll be asked to confirm.
                 </div>
@@ -2213,247 +2559,380 @@ export default function ExplorerPage() {
             </CardContent>
           </Card>
 
-          {/* Error Display */}
-          {queryError && (
-            <Card className="border-red-200 bg-red-50 dark:bg-red-950/20">
-              <CardContent className="py-4">
-                <div className="flex items-start gap-3">
-                  <AlertCircle className="h-5 w-5 text-red-500 mt-0.5 shrink-0" />
-                  <div className="flex-1 min-w-0 space-y-1">
-                    <div className="font-semibold text-sm text-red-700 dark:text-red-400">
-                      {queryError.title}
-                    </div>
-                    <div className="text-sm text-red-600 dark:text-red-300 font-mono break-words">
-                      {queryError.message}
-                    </div>
-                    {queryError.hint && (
-                      <div className="flex items-start gap-1.5 mt-2 text-xs text-zinc-600 dark:text-zinc-400 bg-white/60 dark:bg-zinc-900/60 rounded px-2 py-1.5">
-                        <span className="shrink-0 mt-px">💡</span>
-                        <span>{queryError.hint}</span>
-                      </div>
-                    )}
-                  </div>
-                </div>
-              </CardContent>
-            </Card>
-          )}
+          {/* Drag to re-balance editor against results. Keyboard-operable and
+              double-click-to-reset, because a handle that only works with a
+              mouse is not one. */}
+          <div
+            role="separator"
+            aria-orientation="horizontal"
+            aria-label="Resize the editor and results panes"
+            aria-valuenow={composePct}
+            aria-valuemin={Math.round(MIN_COMPOSE_RATIO * 100)}
+            aria-valuemax={Math.round(MAX_COMPOSE_RATIO * 100)}
+            tabIndex={0}
+            onPointerDown={startSplitDrag}
+            onKeyDown={handleSplitKeyDown}
+            onDoubleClick={() => persistComposeRatio(DEFAULT_COMPOSE_RATIO)}
+            title="Drag to resize · double-click to reset"
+            className="group hidden shrink-0 cursor-row-resize items-center justify-center rounded py-1 outline-none focus-visible:ring-2 focus-visible:ring-violet-500 lg:flex"
+          >
+            <GripHorizontal className="h-3 w-3 text-zinc-300 transition-colors group-hover:text-violet-500 dark:text-zinc-700" />
+          </div>
 
-          {/* Results */}
-          {queryResult && (
-            <Card>
-              <CardHeader className="pb-3">
-                <div className="flex items-center justify-between">
-                  <CardTitle className="text-base flex items-center gap-2">
-                    <CheckCircle2 className="h-4 w-4 text-emerald-500" />
-                    Results
-                  </CardTitle>
-                  <div className="flex items-center gap-4">
-                    <div className="flex items-center gap-4 text-xs text-zinc-500 dark:text-zinc-400">
-                      {isWriteResult(queryResult.statement_type) ? (
-                        <span>
-                          {queryResult.statement_type}
-                          {queryResult.rows_affected !== undefined
-                            ? ` — ${pluralizeRows(queryResult.rows_affected)} affected`
-                            : " executed"}
-                        </span>
-                      ) : (
-                        <span>{pluralizeRows(queryResult.row_count)}</span>
-                      )}
-                      <span>{queryResult.execution_time_ms}ms</span>
-                      {queryResult.truncated && (
-                        <Badge
-                          variant="outline"
-                          className="text-[10px]"
-                          title="Result set exceeded the row cap — increase LIMIT or add filters to see more."
-                        >
-                          Truncated
-                        </Badge>
-                      )}
-                    </div>
-                    {/* Export + BI act on a returned result set — hidden for write
-                        statements, which return an affected-row count, not rows. */}
-                    {!isWriteResult(queryResult.statement_type) && (
-                      <>
-                        <DropdownMenu>
-                          <DropdownMenuTrigger asChild>
-                            <Button variant="outline" size="sm" disabled={!sqlQuery.trim() || exportingFormat !== null}>
-                              <Download className="h-4 w-4 mr-2" />
-                              {exportingFormat ? "Preparing…" : "Download"}
-                            </Button>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end">
-                            <DropdownMenuItem onClick={() => exportResults("csv")}>CSV</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => exportResults("tsv")}>TSV</DropdownMenuItem>
-                            <DropdownMenuItem onClick={() => exportResults("json")}>JSON</DropdownMenuItem>
-                            {/* Excel (.xlsx) export intentionally not exposed: the api-gateway has no Go xlsx renderer wired up.
-                                If demand surfaces, swap in xlsx-populate or excelize-go and add a `xlsx` branch to ExportQueryHandler. */}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                        <Button
-                          variant="outline"
-                          size="sm"
-                          onClick={() => {
-                            setSelectedBiTool("metabase")
-                            setDashboardName(nlInput || "Query Results")
-                            setShowDashboardDialog(true)
-                          }}
-                        >
-                          <BarChart3 className="h-4 w-4 mr-2" />
-                          Send to BI Tool
-                        </Button>
-                      </>
-                    )}
-                  </div>
-                </div>
-              </CardHeader>
-              <CardContent>
-                {isWriteResult(queryResult.statement_type) ? (
-                  // WriteOutcome: a write/DDL statement returns no result grid — show a
-                  // clear "N rows affected" confirmation instead.
-                  <div className="rounded-md border border-emerald-200 dark:border-emerald-900 bg-emerald-50/60 dark:bg-emerald-950/20 py-12 px-6 text-center">
-                    <CheckCircle2 className="mx-auto h-8 w-8 text-emerald-500" />
-                    <div className="mt-3 text-sm font-medium text-zinc-800 dark:text-zinc-100">
-                      {queryResult.statement_type} statement executed
-                    </div>
-                    <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
-                      {queryResult.rows_affected !== undefined
-                        ? `${pluralizeRows(queryResult.rows_affected)} affected.`
-                        : "The statement completed successfully."}
-                    </div>
-                  </div>
-                ) : queryResult.rows.length === 0 ? (
-                  // ZeroRowState: a successful query that returned no rows is
-                  // a common, expected outcome (filter too narrow, table really
-                  // is empty, etc.). Show a friendly empty state instead of
-                  // an awkward blank table so the user knows the run succeeded.
-                  <div className="rounded-md border border-dashed border-zinc-200 dark:border-zinc-800 py-12 px-6 text-center">
-                    <Database className="mx-auto h-8 w-8 text-zinc-300 dark:text-zinc-700" />
-                    <div className="mt-3 text-sm font-medium text-zinc-700 dark:text-zinc-200">
-                      Query ran successfully — no rows matched
-                    </div>
-                    <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
-                      {queryResult.columns.length > 0
-                        ? `The result set has ${queryResult.columns.length} column${queryResult.columns.length === 1 ? "" : "s"} but zero rows. Loosen your WHERE clause, or pick a different time range, then run again.`
-                        : "The query returned zero rows. Loosen your WHERE clause or pick a different time range, then run again."}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="h-[400px] overflow-auto rounded-md border">
-                    <Table>
-                      <TableHeader>
-                        <TableRow>
-                          {queryResult.columns.map((col) => (
-                            <TableHead key={col} className="text-xs font-medium">
-                              {col}
-                            </TableHead>
-                          ))}
-                        </TableRow>
-                      </TableHeader>
-                      <TableBody>
-                        {queryResult.rows.map((row, i) => (
-                          <TableRow key={i}>
-                            {queryResult.columns.map((col) => (
-                              <TableCell
-                                key={col}
-                                className={cn(
-                                  "text-xs font-mono max-w-[520px]",
-                                  typeof row[col] === "string" && String(row[col]).length > 200
-                                    ? "cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-900"
-                                    : ""
-                                )}
-                                title={
-                                  typeof row[col] === "string" && String(row[col]).length > 200
-                                    ? "Click to view full value"
-                                    : undefined
-                                }
-                                onClick={() => {
-                                  const full = formatCellValue(row[col], { truncate: false })
-                                  if (typeof full === "string" && full.length > 200) {
-                                    setCellViewerTitle(col)
-                                    setCellViewerValue(full)
-                                    setCellViewerOpen(true)
-                                  }
-                                }}
-                              >
-                                {formatCellValue(row[col], { truncate: true })}
-                              </TableCell>
-                            ))}
-                          </TableRow>
-                        ))}
-                      </TableBody>
-                    </Table>
-                  </div>
-                )}
-                {queryResult.warnings && queryResult.warnings.length > 0 && (
-                  <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-950/20 rounded-lg">
-                    <div className="text-xs text-amber-700 dark:text-amber-400">
-                      {queryResult.warnings.join("; ")}
-                    </div>
-                  </div>
-                )}
-              </CardContent>
-            </Card>
-          )}
-
-          {/* Empty state: suggest where to start. Kept mounted (hidden) once the user has a
-              query, so the suggestions are still there if they clear the editor; keyed by
-              connection so switching connections starts over. */}
-          {selectedConnection && (
-            <div hidden={Boolean(queryResult || queryError || sqlQuery.trim())}>
-              <SuggestTablesCard
-                key={selectedConnection}
-                connectionId={selectedConnection}
-                selectedTables={selectedTables}
-                tableKey={tableKeyFromMeta}
-                onToggleTable={toggleTableSelection}
-                onStartQuery={insertIntoEditor}
-              />
-            </div>
-          )}
-
-          {/* Exploration Details (below results) */}
-          {/* explorationPanelRef target — Steps/History buttons scroll here */}
-          <Card ref={explorationPanelRef}>
-            <CardHeader className="pb-3">
+          {/* ── Results pane ── */}
+          {/* An explicit floor rather than `lg:min-h-0`: the compose pane's
+              floor leaves this one 62px on a 706px-tall window, and 62px of
+              results pane renders a 2px grid scroller. Measured on the deployed
+              page at that height, with the masked-columns notice showing (the
+              worst realistic case — it costs two lines above the grid), the
+              floor buys this much of the scroller, which contains the 48px
+              column header: 15rem → 43px, 16rem → 59px, 18rem → 91px,
+              20rem → 123px. 15rem cannot show the header at all, so 18rem: the
+              header plus a 49px row. The floor only binds on a short window,
+              where the page already scrolls, so the extra 48px costs scroll
+              rather than layout. Past it the pane grows with `lg:flex-1`. */}
+          <Card data-testid="results-pane" className="flex flex-col lg:min-h-[18rem] lg:flex-1 lg:overflow-hidden">
+            <CardHeader className="shrink-0 px-4 pt-4 pb-3">
               <Tabs value={rightPanelTab} onValueChange={(v) => setRightPanelTab(v as ExplorerPanelTab)}>
-                <TabsList className="grid w-full grid-cols-3">
+                <TabsList className="grid w-full grid-cols-4">
+                  <TabsTrigger value="results" className="text-xs">
+                    {/* An error raised by a guard that returns before the run
+                        starts is toasted, then lives here — the marker is what
+                        makes it findable after the toast is gone. */}
+                    {queryError ? (
+                      <AlertCircle className="h-3 w-3 mr-1 text-red-500" />
+                    ) : (
+                      <Table2 className="h-3 w-3 mr-1" />
+                    )}
+                    Results
+                  </TabsTrigger>
                   <TabsTrigger value="steps" className="text-xs">
                     <GitBranch className="h-3 w-3 mr-1" />
-                    Exploration Steps
+                    Steps
                   </TabsTrigger>
                   <TabsTrigger value="history" className="text-xs">
                     <History className="h-3 w-3 mr-1" />
-                    Query History
+                    History
                   </TabsTrigger>
                   <TabsTrigger value="saved" className="text-xs">
                     <Bookmark className="h-3 w-3 mr-1" />
-                    Saved Queries
+                    Saved
                   </TabsTrigger>
                 </TabsList>
               </Tabs>
             </CardHeader>
-            <CardContent>
-              {rightPanelTab === "steps" ? (
-                <ExplorerStepTimeline
-                  run={currentRun}
-                  onRetry={() => {
-                    if (nlInput.trim()) {
-                      generateSQL()
-                    }
-                  }}
-                />
+            <CardContent className="flex min-h-0 flex-1 flex-col overflow-hidden px-4 pb-4">
+              {rightPanelTab === "results" ? (
+                <div className="flex min-h-0 flex-1 flex-col gap-3">
+                  {/* Error Display */}
+                  {queryError && (
+                    <div className="shrink-0 rounded-md border border-red-200 bg-red-50 p-3 dark:border-red-900 dark:bg-red-950/20">
+                        <div className="flex items-start gap-3">
+                          <AlertCircle className="h-5 w-5 text-red-500 mt-0.5 shrink-0" />
+                          <div className="flex-1 min-w-0 space-y-1">
+                            <div className="font-semibold text-sm text-red-700 dark:text-red-400">
+                              {queryError.title}
+                            </div>
+                            <div className="text-sm text-red-600 dark:text-red-300 font-mono break-words">
+                              {queryError.message}
+                            </div>
+                            {queryError.hint && (
+                              <div className="flex items-start gap-1.5 mt-2 text-xs text-zinc-600 dark:text-zinc-400 bg-white/60 dark:bg-zinc-900/60 rounded px-2 py-1.5">
+                                <span className="shrink-0 mt-px">💡</span>
+                                <span>{queryError.hint}</span>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                    </div>
+                  )}
+
+                  {/* A run in flight: the pane the result will land in says so, instead
+                      of looking like nothing happened. */}
+                  {executingQuery && !queryResult && (
+                    <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 py-12 text-center">
+                      <Loader2 className="h-6 w-6 animate-spin text-violet-500" />
+                      <div className="text-sm text-zinc-500 dark:text-zinc-400">Running your query…</div>
+                      <div className="text-xs text-zinc-400 dark:text-zinc-500">
+                        Press ⌘ + . to cancel
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Results */}
+                  {queryResult && (
+                    <>
+                      {/* Toolbar. The "Results" heading is the tab above it now, so the
+                          row is only what came back and what you can do with it. */}
+                      <div className="shrink-0">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex shrink-0 items-center gap-1.5 text-sm font-medium text-emerald-600 dark:text-emerald-400">
+                            <CheckCircle2 className="h-4 w-4" />
+                            Ran
+                          </div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <div className="flex flex-wrap items-center gap-3 text-xs text-zinc-500 dark:text-zinc-400">
+                              {isWriteResult(queryResult.statement_type) ? (
+                                <span>
+                                  {queryResult.statement_type}
+                                  {queryResult.rows_affected !== undefined
+                                    ? ` — ${pluralizeRows(queryResult.rows_affected)} affected`
+                                    : " executed"}
+                                </span>
+                              ) : (
+                                <span>{pluralizeRows(queryResult.row_count)}</span>
+                              )}
+                              <span>{queryResult.execution_time_ms}ms</span>
+                              {queryResult.truncated && (
+                                <Badge
+                                  variant="outline"
+                                  className="text-[10px]"
+                                  title="Result set exceeded the row cap — increase LIMIT or add filters to see more."
+                                >
+                                  Truncated
+                                </Badge>
+                              )}
+                            </div>
+                            {/* Export + BI act on a returned result set — hidden for write
+                                statements, which return an affected-row count, not rows. */}
+                            {!isWriteResult(queryResult.statement_type) && (
+                              <>
+                                <DropdownMenu>
+                                  <DropdownMenuTrigger asChild>
+                                    <Button variant="outline" size="sm" disabled={!sqlQuery.trim() || exportingFormat !== null}>
+                                      <Download className="h-4 w-4 mr-2" />
+                                      {exportingFormat ? "Preparing…" : "Download"}
+                                    </Button>
+                                  </DropdownMenuTrigger>
+                                  <DropdownMenuContent align="end">
+                                    {/* The grid masks secret/PII columns; the export
+                                        executors deliberately do not. Say so here,
+                                        where the download is actually chosen. */}
+                                    {maskedResultColumns.length > 0 && (
+                                      <>
+                                        <DropdownMenuLabel className="max-w-[17rem] text-xs font-normal whitespace-normal text-amber-700 dark:text-amber-300">
+                                          Downloads are not masked — the{" "}
+                                          {maskedResultColumns.length === 1 ? "column" : "columns"} hidden in
+                                          this preview will contain real values.
+                                        </DropdownMenuLabel>
+                                        <DropdownMenuSeparator />
+                                      </>
+                                    )}
+                                    <DropdownMenuItem onClick={() => exportResults("csv")}>CSV</DropdownMenuItem>
+                                    <DropdownMenuItem onClick={() => exportResults("tsv")}>TSV</DropdownMenuItem>
+                                    <DropdownMenuItem onClick={() => exportResults("json")}>JSON</DropdownMenuItem>
+                                    {/* Excel (.xlsx) export intentionally not exposed: the api-gateway has no Go xlsx renderer wired up.
+                                        If demand surfaces, swap in xlsx-populate or excelize-go and add a `xlsx` branch to ExportQueryHandler. */}
+                                  </DropdownMenuContent>
+                                </DropdownMenu>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  disabled={!sqlQuery.trim()}
+                                  onClick={() => {
+                                    setRightPanelTab("saved")
+                                    toast.info(
+                                      "Save this query, then use Schedule on it to materialize the result as a table on a schedule."
+                                    )
+                                  }}
+                                  title="Save this query, then schedule it to materialize as a table"
+                                >
+                                  <Table2 className="h-4 w-4 mr-2" />
+                                  Turn into a table
+                                </Button>
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() => {
+                                    setSelectedBiTool("metabase")
+                                    setDashboardName(nlInput || "Query Results")
+                                    setShowDashboardDialog(true)
+                                  }}
+                                >
+                                  <BarChart3 className="h-4 w-4 mr-2" />
+                                  Send to BI Tool
+                                </Button>
+                                {/* POST /explorer/share/slack has been live since the
+                                    explorer shipped and had no control anywhere. The
+                                    webhook is typed per-send and never stored; the
+                                    email sibling is absent on purpose (it needs
+                                    operator SMTP, so it is not a frontend-only gap). */}
+                                <ShareToSlackDialog
+                                  question={nlInput}
+                                  sql={sqlQuery}
+                                  columns={queryResult.columns || []}
+                                  rows={queryResult.rows || []}
+                                  rowCount={queryResult.row_count}
+                                  executionMs={queryResult.execution_time_ms}
+                                  truncated={queryResult.truncated}
+                                  disabled={!sqlQuery.trim()}
+                                />
+                              </>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+
+                      {/* Masking, said out loud. The grid has always rendered "ab***"
+                          with no explanation of why or of what a download returns. */}
+                      {maskedResultColumns.length > 0 && (
+                        <div className="flex shrink-0 items-start gap-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs dark:border-amber-900 dark:bg-amber-950/20">
+                          <EyeOff className="mt-px h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
+                          <div className="min-w-0 space-y-1">
+                            <div className="text-amber-800 dark:text-amber-200">
+                              <span className="font-medium">
+                                {maskedResultColumns.length}{" "}
+                                {maskedResultColumns.length === 1 ? "column is" : "columns are"} masked in
+                                this preview:
+                              </span>{" "}
+                              <span className="font-mono break-all">{maskedResultColumns.join(", ")}</span>
+                            </div>
+                            <div className="text-amber-700 dark:text-amber-300">
+                              Values read <span className="font-mono">ab***</span> because the column name
+                              marks it as a secret or as personal data. A download is not masked and
+                              returns the real values.
+                            </div>
+                          </div>
+                        </div>
+                      )}
+
+                      <div className="flex min-h-0 flex-1 flex-col gap-3">
+                        {isWriteResult(queryResult.statement_type) ? (
+                          // WriteOutcome: a write/DDL statement returns no result grid — show a
+                          // clear "N rows affected" confirmation instead.
+                          <div className="flex min-h-0 flex-1 flex-col justify-center rounded-md border border-emerald-200 dark:border-emerald-900 bg-emerald-50/60 dark:bg-emerald-950/20 py-12 px-6 text-center">
+                            <CheckCircle2 className="mx-auto h-8 w-8 text-emerald-500" />
+                            <div className="mt-3 text-sm font-medium text-zinc-800 dark:text-zinc-100">
+                              {queryResult.statement_type} statement executed
+                            </div>
+                            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
+                              {queryResult.rows_affected !== undefined
+                                ? `${pluralizeRows(queryResult.rows_affected)} affected.`
+                                : "The statement completed successfully."}
+                            </div>
+                          </div>
+                        ) : queryResult.rows.length === 0 ? (
+                          // ZeroRowState: a successful query that returned no rows is
+                          // a common, expected outcome (filter too narrow, table really
+                          // is empty, etc.). Show a friendly empty state instead of
+                          // an awkward blank table so the user knows the run succeeded.
+                          <div className="flex min-h-0 flex-1 flex-col justify-center rounded-md border border-dashed border-zinc-200 dark:border-zinc-800 py-12 px-6 text-center">
+                            <Database className="mx-auto h-8 w-8 text-zinc-300 dark:text-zinc-700" />
+                            <div className="mt-3 text-sm font-medium text-zinc-700 dark:text-zinc-200">
+                              Query ran successfully — no rows matched
+                            </div>
+                            <div className="mt-1 text-xs text-zinc-500 dark:text-zinc-400 max-w-md mx-auto">
+                              {queryResult.columns.length > 0
+                                ? `The result set has ${queryResult.columns.length} column${queryResult.columns.length === 1 ? "" : "s"} but zero rows. Loosen your WHERE clause, or pick a different time range, then run again.`
+                                : "The query returned zero rows. Loosen your WHERE clause or pick a different time range, then run again."}
+                            </div>
+                          </div>
+                        ) : (
+                          <div
+                            data-testid="results-grid-scroller"
+                            className="min-h-0 max-h-[70vh] flex-1 overflow-auto rounded-md border lg:max-h-none"
+                          >
+                            <Table>
+                              <TableHeader>
+                                <TableRow>
+                                  {queryResult.columns.map((col) => (
+                                    <TableHead key={col} className="text-xs font-medium">
+                                      {col}
+                                    </TableHead>
+                                  ))}
+                                </TableRow>
+                              </TableHeader>
+                              <TableBody>
+                                {queryResult.rows.map((row, i) => (
+                                  <TableRow key={i}>
+                                    {queryResult.columns.map((col) => (
+                                      <TableCell
+                                        key={col}
+                                        className={cn(
+                                          "text-xs font-mono max-w-[520px]",
+                                          typeof row[col] === "string" && String(row[col]).length > 200
+                                            ? "cursor-pointer hover:bg-zinc-50 dark:hover:bg-zinc-900"
+                                            : ""
+                                        )}
+                                        title={
+                                          typeof row[col] === "string" && String(row[col]).length > 200
+                                            ? "Click to view full value"
+                                            : undefined
+                                        }
+                                        onClick={() => {
+                                          const full = formatCellValue(row[col], { truncate: false })
+                                          if (typeof full === "string" && full.length > 200) {
+                                            setCellViewerTitle(col)
+                                            setCellViewerValue(full)
+                                            setCellViewerOpen(true)
+                                          }
+                                        }}
+                                      >
+                                        {formatCellValue(row[col], { truncate: true })}
+                                      </TableCell>
+                                    ))}
+                                  </TableRow>
+                                ))}
+                              </TableBody>
+                            </Table>
+                          </div>
+                        )}
+                        {queryResult.warnings && queryResult.warnings.length > 0 && (
+                          <div className="shrink-0 p-3 bg-amber-50 dark:bg-amber-950/20 rounded-lg">
+                            <div className="text-xs text-amber-700 dark:text-amber-400">
+                              {queryResult.warnings.join("; ")}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </>
+                  )}
+
+                  {/* Empty state: suggest where to start. Kept mounted (hidden) once the user has a
+                      query, so the suggestions are still there if they clear the editor; keyed by
+                      connection so switching connections starts over. */}
+                  {selectedConnection && (
+                    <div
+                      hidden={Boolean(queryResult || queryError || sqlQuery.trim() || executingQuery)}
+                      className="min-h-0 flex-1 overflow-auto"
+                    >
+                      <SuggestTablesCard
+                        embedded
+                        key={selectedConnection}
+                        connectionId={selectedConnection}
+                        selectedTables={selectedTables}
+                        tableKey={tableKeyFromMeta}
+                        onToggleTable={toggleTableSelection}
+                        onStartQuery={insertIntoEditor}
+                      />
+                    </div>
+                  )}
+                </div>
+              ) : rightPanelTab === "steps" ? (
+                <div className="min-h-0 flex-1 overflow-auto">
+                  <ExplorerStepTimeline
+                    run={currentRun}
+                    onRetry={() => {
+                      if (nlInput.trim()) {
+                        generateSQL()
+                      }
+                    }}
+                  />
+                </div>
               ) : rightPanelTab === "saved" ? (
-                <SavedQueries
-                  connectionId={selectedConnection}
-                  currentSql={sqlQuery}
-                  currentQuestion={nlInput}
-                  onLoad={(sql, question) => {
-                    setSqlQuery(sql)
-                    if (question) setNlInput(question)
-                  }}
-                />
+                <div className="min-h-0 flex-1 overflow-auto">
+                  <SavedQueries
+                    connectionId={selectedConnection}
+                    currentSql={sqlQuery}
+                    currentQuestion={nlInput}
+                    onLoad={(sql, question) => {
+                      setSqlQuery(sql)
+                      if (question) setNlInput(question)
+                    }}
+                  />
+                </div>
               ) : (
-                <div className="h-[400px] overflow-auto rounded-md border p-1">
+                <div className="min-h-0 flex-1 overflow-auto rounded-md border p-1">
                   {queryHistory.length === 0 ? (
                     <div className="text-sm text-zinc-500 dark:text-zinc-400 py-6 text-center">
                       No history yet. Run a query to populate this list.
@@ -3015,61 +3494,6 @@ function classifyApiError(
     message: raw || "An unexpected error occurred.",
     hint: status >= 500 ? "This appears to be a server-side error. Try again in a moment." : undefined,
   }
-}
-
-function extractDetailsLines(data: any): string[] {
-  const out: string[] = []
-
-  // Common patterns:
-  // - { details: string[] }
-  // - { details: [{ message, suggestion? }, ...] }
-  // - FastAPI style: { detail: [{ loc, msg, type }, ...] }
-  const primary = data?.details ?? (Array.isArray(data?.detail) ? data.detail : undefined)
-  const items = Array.isArray(primary) ? primary : primary ? [primary] : []
-
-  for (const it of items) {
-    if (!it) continue
-    if (typeof it === "string") {
-      out.push(it)
-      continue
-    }
-    if (typeof it === "object") {
-      const msg = typeof it.message === "string" ? it.message : typeof it.msg === "string" ? it.msg : ""
-      const sug = typeof it.suggestion === "string" ? it.suggestion : ""
-      const loc = Array.isArray(it.loc) ? it.loc.map((x: any) => String(x)).filter(Boolean).join(".") : ""
-      if (loc && msg) {
-        out.push(`${loc}: ${msg}${sug ? ` (${sug})` : ""}`)
-        continue
-      }
-      if (msg) {
-        out.push(`${msg}${sug ? ` (${sug})` : ""}`)
-        continue
-      }
-      try {
-        const raw = JSON.stringify(it)
-        if (raw) out.push(raw.length > 500 ? raw.slice(0, 500) + "…" : raw)
-      } catch {
-        // ignore
-      }
-    }
-  }
-
-  // Some services return `validation_errors: string[]`
-  if (Array.isArray(data?.validation_errors)) {
-    for (const v of data.validation_errors) {
-      if (typeof v === "string" && v.trim()) out.push(v.trim())
-    }
-  }
-
-  // Deduplicate while preserving order.
-  const seen = new Set<string>()
-  return out.filter((s) => {
-    const k = String(s || "").trim()
-    if (!k) return false
-    if (seen.has(k)) return false
-    seen.add(k)
-    return true
-  })
 }
 
 function clampInt(n: number, min: number, max: number): number {

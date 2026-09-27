@@ -248,3 +248,77 @@ describe("the stage-less bucket has a name a user can read", () => {
     expect(groups.map((g) => g.name)).toEqual(["Other events"])
   })
 })
+
+// Prod pipeline c228373b (2026-09-25): the orchestrator stamped its copy of
+// each transition to the whole second, the adapter to the millisecond. For a
+// stage shorter than a second the orchestrator's END (14:58:25Z) sorts before
+// the adapter's START (14:58:25.368Z), and the Overview read that start as a
+// second attempt — "Retry 2/2" on five stages that each ran once.
+describe("a sub-second stage whose orchestrator copies are whole-second stamped", () => {
+  const orch = (event_type: string, seq: number, received: string, payload: Record<string, unknown> = {}) =>
+    ev({ event_type, stage_id: "capability_resolver", stage_group: "connecting", trace_id: "orch", occurred_at: "2026-09-25T14:58:25Z", received_at: received, seq, event_id: `c228373b-${seq}`, payload })
+  const adapter = (event_type: string, occurred_at: string, seq: number) =>
+    ev({ event_type, stage_id: "capability_resolver", stage_group: "connecting", trace_id: EXEC, occurred_at, seq, event_id: `sha256:${seq}` })
+  // Newest-first, as the API serves them.
+  const prod = [
+    adapter("STAGE_COMPLETED", "2026-09-25T14:58:25.857Z", 1_790_348_305_857_000_000),
+    orch("STAGE_COMPLETED", 1_790_348_305_812_000_000, "2026-09-25T14:58:25.813Z", { summary: "Connectors resolved" }),
+    orch("STAGE_STARTED", 1_790_348_305_800_000_000, "2026-09-25T14:58:25.801Z", { summary: "Resolving connectors" }),
+    adapter("STAGE_STARTED", "2026-09-25T14:58:25.368Z", 1_790_348_305_368_000_000),
+  ]
+
+  it("collapses to one start and one end, timed from the precise copies", () => {
+    const lifecycle = dedupeStageLifecycleEvents(prod).filter((e) => e.event_type.startsWith("STAGE_"))
+    expect(lifecycle.map((e) => `${e.event_type}@${e.occurred_at}`)).toEqual([
+      "STAGE_STARTED@2026-09-25T14:58:25.368Z",
+      "STAGE_COMPLETED@2026-09-25T14:58:25.857Z",
+    ])
+    // The orchestrator's copy carries the summary, so it is the row kept.
+    expect(lifecycle.map((e) => e.payload.summary)).toEqual(["Resolving connectors", "Connectors resolved"])
+  })
+
+  it("reads as one attempt of 489 ms in the Activity feed", () => {
+    const g = EventNormalizer.groupByStage(prod).find((x) => x.id === "connecting")!
+    expect(g.attempts).toBe(1)
+    expect(g.duration).toBe(489)
+  })
+
+  it("control: a real retry across both producers still reads as two attempts", () => {
+    const at = (s: string) => `2026-09-25T14:58:${s}`
+    const orchAt = (event_type: string, occurred_at: string, seq: number) =>
+      ev({ event_type, stage_id: "capability_resolver", trace_id: "orch", occurred_at, seq, event_id: `c228373b-${seq}`, payload: { summary: event_type } })
+    const adapterAt = (event_type: string, occurred_at: string, seq: number) =>
+      ev({ event_type, stage_id: "capability_resolver", trace_id: EXEC, occurred_at, seq, event_id: `sha256:${seq}` })
+    const retried = [
+      orchAt("STAGE_STARTED", at("25Z"), 1),
+      orchAt("STAGE_FAILED", at("25Z"), 2),
+      adapterAt("STAGE_STARTED", at("25.368Z"), 3),
+      adapterAt("STAGE_FAILED", at("25.700Z"), 4),
+      orchAt("STAGE_STARTED", at("26Z"), 5),
+      orchAt("STAGE_COMPLETED", at("26Z"), 6),
+      adapterAt("STAGE_STARTED", at("26.650Z"), 7),
+      adapterAt("STAGE_COMPLETED", at("27.100Z"), 8),
+    ].reverse()
+    const lifecycle = dedupeStageLifecycleEvents(retried).filter((e) => e.event_type.startsWith("STAGE_"))
+    expect(lifecycle.map((e) => `${e.event_type}@${e.occurred_at!.slice(17)}`)).toEqual([
+      "STAGE_STARTED@25.368Z",
+      "STAGE_FAILED@25.700Z",
+      "STAGE_STARTED@26.650Z",
+      "STAGE_COMPLETED@27.100Z",
+    ])
+  })
+
+  it("control: one producer's whole-second retry inside a single second is kept", () => {
+    // All four rows are the orchestrator's, so seq orders them and none is a
+    // floor that could really sit on the other side of its neighbour.
+    const one = (event_type: string, s: string, seq: number) =>
+      ev({ event_type, stage_id: "planner", trace_id: "orch", occurred_at: `2026-09-25T14:58:${s}`, seq })
+    const out = dedupeStageLifecycleEvents([
+      one("STAGE_STARTED", "25Z", 1),
+      one("STAGE_FAILED", "25Z", 2),
+      one("STAGE_STARTED", "25Z", 3),
+      one("STAGE_COMPLETED", "26Z", 4),
+    ])
+    expect(out.map((e) => e.event_type)).toEqual(["STAGE_STARTED", "STAGE_FAILED", "STAGE_STARTED", "STAGE_COMPLETED"])
+  })
+})

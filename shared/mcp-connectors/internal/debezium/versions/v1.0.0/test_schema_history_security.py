@@ -114,17 +114,19 @@ def test_unsupported_protocol_is_rejected_by_name():
 
 
 def test_relational_config_carries_the_security_properties():
+    """A historized engine's config carries them. PostgreSQL keeps no schema
+    history, so it carries none: test_schema_history_is_for_historized_engines.py."""
     _sasl_env()
     c = connector.DebeziumConnector()
     _, cfg, _ = c._build_config(
         {
-            "database_type": "postgresql",
+            "database_type": "mysql",
             "connector_name": "cdc-abc12345",
             "db_host": "db.example.com",
             "db_user": "svc",
             "db_password": "pw",
             "db_name": "app",
-            "tables": ["public.users"],
+            "tables": ["app.users"],
         }
     )
     assert cfg["schema.history.internal.consumer.security.protocol"] == "SASL_SSL"

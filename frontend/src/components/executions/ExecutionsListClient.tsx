@@ -42,6 +42,7 @@ import { authFetch } from "@/lib/api/auth-fetch"
 // re-exported as `normalizeExecutionStatus` for backwards-compat with this
 // component's call sites. Source of truth: @/lib/execution-status.
 import { normalizeExecutionStatus as _normalizeExecutionStatus, executionStatusConfig as _statusConfig, formatErrorMessage } from "@/lib/execution-status"
+import { toast } from "sonner"
 function normalizeExecutionStatus(status: string | null | undefined, errorMessage?: string | null): string {
   return _normalizeExecutionStatus(status, errorMessage)
 }
@@ -278,7 +279,14 @@ export function ExecutionsListClient({ initialExecutions, pipelines, stats }: Pr
       // Trigger refresh to confirm
       fetchExecutions()
     } catch (error) {
+      // The optimistic row flip above never runs when the call throws, so a
+      // failed cancel left the row exactly as it was and said nothing. Two
+      // clicks look identical from here: the one that worked and the one that
+      // did not. Say which this was.
       console.error("Failed to cancel execution:", error)
+      toast.error("Could not cancel this execution", {
+        description: `${error instanceof Error ? error.message : "The request never reached the server."} The run is still going.`,
+      })
     }
   }
 

@@ -11,6 +11,10 @@ type TableUpdate struct {
 	TableName     string
 	Op            string // c,u,d,r
 	Timestamp     time.Time
+	// Snapshot is source.snapshot on a snapshot read: "true"/"first"/"last"/
+	// "first_in_data_collection"/"last_in_data_collection" for a blocking or
+	// initial snapshot, "incremental" for an incremental one; "" otherwise.
+	Snapshot string
 }
 
 // ParseDebeziumChange extracts (table, op, ts) from a Debezium message payload.
@@ -42,7 +46,17 @@ func ParseDebeziumChange(payload map[string]interface{}, topic string) (TableUpd
 	// Prefer payload.source.{schema|db} and payload.source.table
 	schemaName := ""
 	tableName := ""
+	snapshot := ""
 	if src, ok := payload["source"].(map[string]interface{}); ok && src != nil {
+		// A string in current Debezium; a boolean in old (and some MongoDB) builds.
+		switch v := src["snapshot"].(type) {
+		case string:
+			snapshot = strings.ToLower(strings.TrimSpace(v))
+		case bool:
+			if v {
+				snapshot = "true"
+			}
+		}
 		if v, ok := src["schema"].(string); ok {
 			schemaName = strings.TrimSpace(v)
 		}
@@ -82,6 +96,6 @@ func ParseDebeziumChange(payload map[string]interface{}, topic string) (TableUpd
 		TableName:     tableName,
 		Op:            op,
 		Timestamp:     ts,
+		Snapshot:      snapshot,
 	}, true
 }
-

@@ -15,9 +15,6 @@ from models.kafka_message import (
     ConnectorCategory,
     CONNECTOR_CATEGORIES,
     hash_to_partition,
-    topic_name,
-    cdc_topic_name,
-    protected_topic_name,
 )
 from models.entity_stats import (
     EntityStats,
@@ -25,11 +22,6 @@ from models.entity_stats import (
     HotThresholds,
     DEFAULT_HOT_THRESHOLDS,
 )
-# Imported via the same path src/models/kafka_message.py uses, so this test
-# reads the identical module object the code under test does. A bare
-# `utils.` import resolves to a different package once another test in the
-# suite has bound that name.
-from src.utils.kafka_topics import topic_prefix
 from models.partition_key import (
     PartitionKeyBuilder,
     FieldMapping,
@@ -325,52 +317,6 @@ class TestEntityStatsRegistry:
         
         hot = registry.get_hot_entities()
         assert "prod_mysql.public.orders" in hot
-
-
-class TestTopicNaming:
-    """Tests for topic naming functions."""
-    
-    def test_topic_name(self):
-        """Test connection topic name."""
-        assert topic_name("prod_mysql") == "rsync.conn.prod-mysql"
-        assert topic_name("my connection") == "rsync.conn.my-connection"
-
-    def test_cdc_topic_name(self):
-        """Test CDC topic name."""
-        assert cdc_topic_name("prod_mysql") == "rsync.cdc.prod-mysql"
-
-    def test_protected_topic_name(self):
-        """Test PII-protected topic name."""
-        assert protected_topic_name("prod_mysql") == "rsync.protected.conn.prod-mysql"
-
-    def test_every_helper_is_namespaced(self):
-        """Every name-building helper in this module must go through topic().
-
-        Asserted as a property rather than three literals because the failure
-        mode is a *stranded* helper: the namespacing change routed
-        cdc_topic_name() through topic() and left topic_name() and
-        protected_topic_name() building bare strings. Nothing raised -- they
-        simply returned a name outside the prefix an operator granted ACLs on,
-        which on a BYO cluster is an authorization failure that reads as a
-        consumer that never receives anything.
-        """
-        prefix = topic_prefix()
-        assert prefix, "default prefix must be non-empty for this assertion to mean anything"
-        for helper in (topic_name, cdc_topic_name, protected_topic_name):
-            assert helper("prod_mysql").startswith(prefix), (
-                f"{helper.__name__} does not route through topic()"
-            )
-
-    def test_empty_prefix_disables_qualification(self, monkeypatch):
-        """The documented migration lever: KAFKA_TOPIC_PREFIX="" -> bare names.
-
-        A deployment with live topics and committed offsets under the unprefixed
-        names needs this to stay reachable.
-        """
-        monkeypatch.setenv("KAFKA_TOPIC_PREFIX", "")
-        assert topic_name("prod_mysql") == "conn.prod-mysql"
-        assert cdc_topic_name("prod_mysql") == "cdc.prod-mysql"
-        assert protected_topic_name("prod_mysql") == "protected.conn.prod-mysql"
 
 
 class TestPartitionKeyBuilder:

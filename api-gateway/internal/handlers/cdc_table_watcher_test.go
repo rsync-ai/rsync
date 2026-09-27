@@ -12,6 +12,8 @@ import (
 
 	"github.com/DATA-DOG/go-sqlmock"
 	"github.com/gin-gonic/gin"
+	"github.com/sirupsen/logrus"
+	logrustest "github.com/sirupsen/logrus/hooks/test"
 )
 
 // --- the rule ------------------------------------------------------------
@@ -514,5 +516,57 @@ func TestNewCDCTableWatcherRespectsTheEnvironment(t *testing.T) {
 	t.Setenv("CDC_TABLE_WATCH_INTERVAL_SECONDS", "900")
 	if w := NewCDCTableWatcher(openNilDB(t)); w.interval.Seconds() != 900 {
 		t.Fatalf("interval = %s, want 15m", w.interval)
+	}
+}
+
+// A refused backfill leaves the new tables streaming with none of their existing
+// rows. The sweep runs unattended, so the log line is the only place that shows
+// up — it must be a Warn naming the orchestrator's reason, not the Info line a
+// success prints (KI-CDC-EDIT-TABLES-BACKFILL-SILENT).
+func TestApplyNewTablesWarnsWhenBackfillIsRefused(t *testing.T) {
+	std := logrus.StandardLogger()
+	previous := std.ReplaceHooks(make(logrus.LevelHooks))
+	hook := logrustest.NewLocal(std)
+	t.Cleanup(func() { std.ReplaceHooks(previous) })
+
+	run := func(bf gin.H) *logrus.Entry {
+		hook.Reset()
+		f := &fakePush{status: []int{200}, body: []string{`{"success":true}`}}
+		w := f.watcher()
+		w.backfill = func(_ context.Context, _ string, _ []string, _ string) gin.H { return bf }
+		if err := w.applyNewTables(context.Background(), pipelineWith("public.orders"), []string{"public.invoices"}); err != nil {
+			t.Fatalf("applyNewTables: %v", err)
+		}
+		for _, e := range hook.AllEntries() {
+			if strings.Contains(e.Message, "cdc auto-pickup: new source tables added") {
+				return e
+			}
+		}
+		t.Fatalf("no auto-pickup summary line logged; got %d entries", len(hook.AllEntries()))
+		return nil
+	}
+
+	refused := run(gin.H{
+		"success":     false,
+		"status_code": 400,
+		"error":       "orchestrator backfill failed (status 400)",
+		"response":    json.RawMessage(`{"error":"cdc_backfill_not_supported","message":"no signal channel"}`),
+	})
+	if refused.Level != logrus.WarnLevel {
+		t.Fatalf("refused backfill logged at %s, want warning", refused.Level)
+	}
+	if got := refused.Data["backfill_error"]; got != "cdc_backfill_not_supported" {
+		t.Fatalf("backfill_error = %v, want the orchestrator's code", got)
+	}
+
+	// Transport failure: no body, so the gateway's own error is the reason.
+	unreachable := run(gin.H{"success": false, "error": "dial tcp: connection refused"})
+	if unreachable.Level != logrus.WarnLevel || unreachable.Data["backfill_error"] != "dial tcp: connection refused" {
+		t.Fatalf("unreachable: level=%s backfill_error=%v", unreachable.Level, unreachable.Data["backfill_error"])
+	}
+
+	// Control: a successful backfill stays the Info line it always was.
+	if ok := run(gin.H{"success": true}); ok.Level != logrus.InfoLevel {
+		t.Fatalf("successful backfill logged at %s, want info", ok.Level)
 	}
 }

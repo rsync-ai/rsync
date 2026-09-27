@@ -37,12 +37,14 @@ func projectOrchestrationID(t *testing.T, ev map[string]interface{}) (driver.Val
 	execID := &capturedArg{}
 	orchID := &capturedArg{}
 
-	args := make([]driver.Value, 0, 28)
+	args := make([]driver.Value, 0, 31)
 	args = append(args, sqlmock.AnyArg(), execID)
 	for i := 0; i < 25; i++ {
 		args = append(args, sqlmock.AnyArg())
 	}
 	args = append(args, orchID)
+	// $29-$31: snapshot_rows, applied_snapshot_rows, capturedFromApplied.
+	args = append(args, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg())
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COALESCE(bytes_committed, 0)")).

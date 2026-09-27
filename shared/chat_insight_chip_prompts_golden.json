@@ -1,0 +1,9 @@
+{
+  "_comment": "The prompts the pipeline page's problem chips (frontend PipelineInsightsBar.tsx) send to /chat for fixed fixture stages. The frontend test (PipelineInsightsBar.chipPrompts.test.tsx) renders those stages and requires these exact strings; the api-gateway test (chat_insight_chip_prompts_golden_test.go) requires each one to reach the chat's per-pipeline diagnosis (chat_diagnose.go reDiagWithUUID) with this pipeline_id. Without the id they reached intent classification, which cannot tell which pipeline they mean, and on an LLM timeout they got the generic pipeline examples. Changing a prompt's wording means changing it here, which runs both sides.",
+  "pipeline_id": "5f2c9a1e-8b3d-4e6f-a7c0-1d2e3f4a5b6c",
+  "prompts": [
+    "In my pipeline, these stages are taking unusually long: Executing Pipeline. Why might that be, and what should I check? (pipeline 5f2c9a1e-8b3d-4e6f-a7c0-1d2e3f4a5b6c)",
+    "Why did this stage fail in my pipeline \"orders-sync\": Load? What should I check? (pipeline 5f2c9a1e-8b3d-4e6f-a7c0-1d2e3f4a5b6c)",
+    "Why did the \"Extract\" stage take 5s? What does that stage do and what would speed it up? (pipeline 5f2c9a1e-8b3d-4e6f-a7c0-1d2e3f4a5b6c)"
+  ]
+}

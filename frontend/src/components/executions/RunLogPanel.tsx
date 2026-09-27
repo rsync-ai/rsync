@@ -113,7 +113,7 @@ export function RunLogPanel({ pipelineId, executionId }: { pipelineId: string; e
         qs.set("before_seq", String(cursor.before_seq))
         qs.set("before_event_id", cursor.before_event_id)
       }
-      const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events?${qs.toString()}`, {
+      const res = await authFetch(`${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?${qs.toString()}`, {
         cache: "no-store",
         signal,
       })

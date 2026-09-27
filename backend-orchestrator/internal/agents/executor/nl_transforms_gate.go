@@ -521,13 +521,19 @@ func isMongoSourceFamily(connectorType string) bool {
 }
 
 // isMaskTransformConfig reports whether a stored transform_config is a masking
-// transform ("mask" or "mask_pii", under "operation" or "type") — the aliases
-// transforms.NormalizeAndValidate folds to mask_pii.
+// transform ("mask", "mask_pii" or "hash", under "operation" or "type") — the
+// aliases transforms.NormalizeAndValidate folds to mask_pii.
+//
+// "hash" belongs here for the same reason it belongs in normalizeType: the
+// builder's Hash Column card IS mask_pii with mask_type=hash. It is listed
+// because this guard is fail-closed by design — a masking rule it does not
+// recognize is a masking rule it does not block, which is the failure direction
+// that leaks values.
 func isMaskTransformConfig(cfg map[string]any) bool {
 	for _, k := range []string{"operation", "type"} {
 		if s, ok := cfg[k].(string); ok {
 			switch strings.ToLower(strings.TrimSpace(s)) {
-			case "mask", "mask_pii":
+			case "mask", "mask_pii", "hash":
 				return true
 			}
 		}

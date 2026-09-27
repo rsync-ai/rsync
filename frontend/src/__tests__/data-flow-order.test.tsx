@@ -59,6 +59,22 @@ afterEach(() => {
   authFetch.mockReset()
 })
 
+describe("pipeline tabs", () => {
+  it("read Overview, Execution History, Steps/DAG, Table statistics, Data flow, Assessment, Transforms", () => {
+    authFetch.mockResolvedValue(res(200, {}))
+    render(<PipelineDetailTabsClient pipelineId="p1" pipelineType="cdc" initialTab="monitor" />)
+    expect(screen.getAllByRole("tab").map((t) => t.textContent?.trim())).toEqual([
+      "Overview",
+      "Execution History",
+      "Steps/DAG",
+      "Table statistics",
+      "Data flow",
+      "Assessment",
+      "Transforms",
+    ])
+  })
+})
+
 describe("Data flow tab order", () => {
   it("CDC: lag alert, then Monitoring, then the numbers", () => {
     authFetch.mockResolvedValue(res(200, {}))

@@ -1,5 +1,5 @@
 import type { NextConfig } from "next";
-import { withSentryConfig } from "@sentry/nextjs";
+import { withSentryConfig } from "@sentry/nextjs/config";
 
 const nextConfig: NextConfig = {
   output: 'standalone',
@@ -22,7 +22,9 @@ export default withSentryConfig(nextConfig, {
   sourcemaps: {
     deleteSourcemapsAfterUpload: true,
   },
-  disableLogger: true,
+  webpack: {
+    treeshake: { removeDebugLogging: true },
+  },
 
   // Avoid build failure when SENTRY_DSN is missing in dev
   telemetry: false,

@@ -15,7 +15,8 @@ import {
   RotateCcw,
 } from "lucide-react"
 import { formatDateTime } from "@/lib/utils"
-import { type ExecutionPlanStage, getStageStatusConfig, formatDuration } from "./DAGVisualization"
+import { formatDuration } from "./dagHelpers"
+import { getStageStatusConfig, type ExecutionPlanStage } from "./dagTypes"
 import { stageDurationMs } from "./dagHelpers"
 
 interface NodeInspectorProps {

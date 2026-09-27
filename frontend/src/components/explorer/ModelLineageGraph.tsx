@@ -4,22 +4,10 @@
 // wakes, and how each of them last ran. The rules for what a node may say live in
 // modelLineage.ts; this file fetches, lays out and draws.
 
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import Link from "next/link"
-import { useTheme } from "next-themes"
-import {
-  Handle,
-  MarkerType,
-  Position,
-  ReactFlow,
-  ReactFlowProvider,
-  useReactFlow,
-  type Edge,
-  type Node,
-  type NodeProps,
-  type ReactFlowInstance,
-} from "@xyflow/react"
-import { AlertTriangle, Loader2, Maximize, Minus, Plus } from "lucide-react"
+import { MarkerType, type Edge, type Node, type NodeProps } from "@xyflow/react"
+import { AlertTriangle, Loader2 } from "lucide-react"
 
 import { cn, formatRelativeTime } from "@/lib/utils"
 import { Button } from "@/components/ui/button"
@@ -34,7 +22,6 @@ import {
   SCHEDULE_LIST_LIMIT,
   buildModelLineage,
   describeLineageNode,
-  initialViewport,
   layoutLineage,
   liveRunningKeys,
   lookupFromResponse,
@@ -50,14 +37,22 @@ import { getJson } from "@/components/explorer/getJson"
 import { buildRunGrid } from "@/components/explorer/modelRunGrid"
 import { ModelRunGridTable } from "@/components/explorer/ModelRunGridTable"
 import { ModelRunPanel, type RunPanelTarget, type RunSelection } from "@/components/explorer/ModelRunPanel"
+import {
+  CanvasStatus,
+  CardHandles,
+  GraphListToggle,
+  LegendLine,
+  LineageFlowCanvas,
+  nodeHandles,
+  useCanvasCapable,
+  useEdgeColors,
+} from "@/components/explorer/LineageFlowCanvas"
+import { useGraphLayout } from "@/lib/hooks/useGraphLayout"
 
 /** Lookups in flight at once: a 50-node graph is nine rounds, not fifty requests at once. */
 const LOOKUP_CONCURRENCY = 6
 const LOOKUP_TIMEOUT_MS = 10_000
 const SCHEDULES_TIMEOUT_MS = 15_000
-
-/** A canvas needs a pointer to pan and room to show more than one node; anything else gets the list. */
-const CANVAS_MEDIA_QUERY = "(min-width: 640px) and (pointer: fine)"
 
 export interface ModelLineageGraphProps {
   modelId: string
@@ -127,16 +122,7 @@ async function runPool<T>(items: T[], limit: number, work: (item: T) => Promise<
   await Promise.all(workers)
 }
 
-function subscribeCanvasMedia(onChange: () => void): () => void {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return () => {}
-  const mq = window.matchMedia(CANVAS_MEDIA_QUERY)
-  mq.addEventListener?.("change", onChange)
-  return () => mq.removeEventListener?.("change", onChange)
-}
 
-function canvasMediaMatches(): boolean {
-  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(CANVAS_MEDIA_QUERY).matches
-}
 
 const TONE_TEXT: Record<LineageTone, string> = {
   success: "text-emerald-700 dark:text-emerald-400",
@@ -190,7 +176,7 @@ export function ModelLineageGraph(props: ModelLineageGraphProps) {
   const headingRef = useRef<HTMLHeadingElement>(null)
   const [result, setResult] = useState<LoadResult | null>(null)
   const [view, setView] = useState<"graph" | "list">("graph")
-  const canvasCapable = useSyncExternalStore(subscribeCanvasMedia, canvasMediaMatches, () => false)
+  const canvasCapable = useCanvasCapable()
 
   // Read when a load starts rather than being a dependency of it: the page hands over a new
   // object on every schedule reload. What in it can change the graph is `rootKey`.
@@ -347,20 +333,7 @@ export function ModelLineageGraph(props: ModelLineageGraphProps) {
           )}
         </div>
         {canvasCapable && data && data.lineage.nodes.length > 1 && (
-          <div role="group" aria-label="Show the chain as" className="flex gap-1">
-            {(["graph", "list"] as const).map((v) => (
-              <Button
-                key={v}
-                size="sm"
-                variant={view === v ? "secondary" : "ghost"}
-                className="h-7 px-2 text-xs"
-                aria-pressed={view === v}
-                onClick={() => setView(v)}
-              >
-                {v === "graph" ? "Graph" : "List"}
-              </Button>
-            ))}
-          </div>
+          <GraphListToggle label="Show the chain as" value={view} onChange={setView} />
         )}
       </div>
 
@@ -388,9 +361,7 @@ export function ModelLineageGraph(props: ModelLineageGraphProps) {
           {data.lineage.nodes.length === 1 ? (
             <EmptyLineage rootSchedule={rootSchedule} canSchedule={canSchedule} capped={data.schedulesCapped} />
           ) : effectiveView === "graph" ? (
-            <ReactFlowProvider>
-              <LineageCanvas lineage={data.lineage} views={views} clickableKeys={clickableKeys} onOpen={openPanel} />
-            </ReactFlowProvider>
+            <LineageCanvas lineage={data.lineage} views={views} clickableKeys={clickableKeys} onOpen={openPanel} />
           ) : (
             <LineageList lineage={data.lineage} views={views} clickableKeys={clickableKeys} onOpen={openPanel} />
           )}
@@ -486,8 +457,6 @@ interface LineageNodeData extends Record<string, unknown> {
 
 type LineageFlowNode = Node<LineageNodeData, "lineage">
 
-const HIDDEN_HANDLE_STYLE = { opacity: 0, pointerEvents: "none" as const }
-
 function LineageNodeCard({ data }: NodeProps<LineageFlowNode>) {
   const { view: v, isRoot, clickable } = data
   return (
@@ -501,7 +470,7 @@ function LineageNodeCard({ data }: NodeProps<LineageFlowNode>) {
       )}
       style={{ width: LINEAGE_NODE_WIDTH, height: LINEAGE_NODE_HEIGHT }}
     >
-      <Handle type="target" position={Position.Left} isConnectable={false} style={HIDDEN_HANDLE_STYLE} />
+      <CardHandles top={LINEAGE_NODE_HEIGHT / 2} />
       {isRoot && (
         <span className="absolute -top-2 left-2 rounded bg-zinc-900 px-1 text-[10px] font-medium leading-4 text-white dark:bg-white dark:text-zinc-900">
           This model
@@ -530,17 +499,22 @@ function LineageNodeCard({ data }: NodeProps<LineageFlowNode>) {
           {v.secondary}
         </div>
       )}
-      <Handle type="source" position={Position.Right} isConnectable={false} style={HIDDEN_HANDLE_STYLE} />
     </div>
   )
 }
 
 const nodeTypes = { lineage: LineageNodeCard }
 
-const NODE_HANDLES = [
-  { type: "target" as const, position: Position.Left, x: 0, y: LINEAGE_NODE_HEIGHT / 2, width: 1, height: 1 },
-  { type: "source" as const, position: Position.Right, x: LINEAGE_NODE_WIDTH - 1, y: LINEAGE_NODE_HEIGHT / 2, width: 1, height: 1 },
-]
+/** Edges meet a card at the middle of its sides. */
+const LINEAGE_HANDLES = nodeHandles(LINEAGE_NODE_WIDTH, LINEAGE_NODE_HEIGHT / 2)
+
+/** What the Graph tab lays out: its cards and links, and nothing that a status refresh changes. */
+interface LineageShape {
+  keys: string[]
+  links: { from: string; to: string }[]
+}
+
+const layoutShape = (shape: LineageShape) => layoutLineage(shape.keys, shape.links)
 
 function LineageCanvas({
   lineage,
@@ -553,130 +527,117 @@ function LineageCanvas({
   clickableKeys: Set<string>
   onOpen: (key: string) => void
 }) {
-  const { resolvedTheme } = useTheme()
-  const dark = resolvedTheme === "dark"
-  const { zoomIn, zoomOut, fitView } = useReactFlow()
-  const wrapperRef = useRef<HTMLDivElement>(null)
+  const { stroke } = useEdgeColors()
 
-  const layout = useMemo(() => {
+  const shape: LineageShape = useMemo(
+    () => ({ keys: lineage.nodes.map((n) => n.key), links: lineage.edges.map(({ from, to }) => ({ from, to })) }),
+    [lineage],
+  )
+  // Changes only when what is drawn changes, so a status refresh keeps the layout and the reader's pan.
+  const signature = `${shape.keys.join(",")}|${shape.links.map((e) => `${e.from}>${e.to}`).join(",")}`
+  const { settled, pending, error } = useGraphLayout(signature, shape, layoutShape)
+
+  const drawing = useMemo(() => {
+    if (!settled) return null
+    const { keys, links } = settled.input
+    const { positions, bounds } = settled.layout
     // React Flow ids are positions in this list, never the model or pipeline id: a node
     // the caller cannot open must not put its id in the DOM.
-    const flowId = new Map(lineage.nodes.map((n, i) => [n.key, `n${i}`]))
+    const flowId = new Map(keys.map((key, i) => [key, `n${i}`]))
     const keyByFlowId = new Map([...flowId].map(([key, id]) => [id, key]))
-    const { positions, bounds } = layoutLineage(
-      lineage.nodes.map((n) => n.key),
-      lineage.edges,
-    )
-    const rootKey = lineage.nodes[0].key
-    const rootPos = positions.get(rootKey) ?? { x: 0, y: 0 }
+    const rootPos = positions.get(keys[0]) ?? { x: 0, y: 0 }
     return {
+      keys,
+      links,
       flowId,
       keyByFlowId,
       positions,
       bounds,
       root: { ...rootPos, width: LINEAGE_NODE_WIDTH, height: LINEAGE_NODE_HEIGHT },
-      // Changes only when what is drawn changes, so a status refresh keeps the reader's pan.
-      signature: `${lineage.nodes.map((n) => n.key).join(",")}|${lineage.edges.map((e) => `${e.from}>${e.to}`).join(",")}`,
+      signature: settled.key,
     }
-  }, [lineage])
+  }, [settled])
 
+  const rootKey = lineage.nodes.find((n) => n.role === "root")?.key
   const nodes: LineageFlowNode[] = useMemo(
     () =>
-      lineage.nodes.map((n) => ({
-        id: layout.flowId.get(n.key)!,
-        type: "lineage" as const,
-        position: layout.positions.get(n.key) ?? { x: 0, y: 0 },
-        data: { view: views.get(n.key)!, isRoot: n.role === "root", clickable: clickableKeys.has(n.key) },
-        width: LINEAGE_NODE_WIDTH,
-        height: LINEAGE_NODE_HEIGHT,
-        draggable: false,
-        selectable: false,
-        connectable: false,
-        focusable: false,
-        handles: NODE_HANDLES,
-      })),
-    [lineage, layout, views, clickableKeys],
+      (drawing?.keys ?? []).flatMap((key): LineageFlowNode[] => {
+        const view = views.get(key)
+        if (!view || !drawing) return []
+        return [
+          {
+            id: drawing.flowId.get(key)!,
+            type: "lineage" as const,
+            position: drawing.positions.get(key) ?? { x: 0, y: 0 },
+            data: { view, isRoot: key === rootKey, clickable: clickableKeys.has(key) },
+            width: LINEAGE_NODE_WIDTH,
+            height: LINEAGE_NODE_HEIGHT,
+            selectable: false,
+            connectable: false,
+            focusable: false,
+            handles: LINEAGE_HANDLES,
+          },
+        ]
+      }),
+    [drawing, views, rootKey, clickableKeys],
   )
 
-  const stroke = dark ? "#a1a1aa" : "#71717a"
+  // Whether a link wakes anything can change on a refresh that keeps the layout.
+  const inactive = useMemo(
+    () => new Set(lineage.edges.filter((e) => e.inactive).map((e) => `${e.from}>${e.to}`)),
+    [lineage],
+  )
   const edges: Edge[] = useMemo(
     () =>
-      lineage.edges.map((e, i) => ({
+      (drawing?.links ?? []).map((e, i) => ({
         id: `e${i}`,
-        source: layout.flowId.get(e.from)!,
-        target: layout.flowId.get(e.to)!,
+        source: drawing?.flowId.get(e.from) ?? "",
+        target: drawing?.flowId.get(e.to) ?? "",
         type: "smoothstep",
         focusable: false,
         selectable: false,
         // null stops React Flow writing "Edge from n0 to n1" as a label; the type says string.
         ariaLabel: null as unknown as string,
-        style: { stroke, strokeWidth: 1.5, ...(e.inactive ? { strokeDasharray: "4 4" } : {}) },
+        style: { stroke, strokeWidth: 1.5, ...(inactive.has(`${e.from}>${e.to}`) ? { strokeDasharray: "4 4" } : {}) },
         markerEnd: { type: MarkerType.ArrowClosed, color: stroke },
       })),
-    [lineage, layout, stroke],
+    [drawing, inactive, stroke],
   )
 
-  const onInit = (instance: ReactFlowInstance<LineageFlowNode, Edge>) => {
-    const el = wrapperRef.current
-    const size = { width: el?.clientWidth ?? 0, height: el?.clientHeight ?? 0 }
-    void instance.setViewport(initialViewport(layout.bounds, layout.root, size))
+  if (!drawing) {
+    return (
+      <CanvasStatus>
+        {error ? (
+          <span role="alert" className="text-red-600 dark:text-red-400">
+            Could not lay out the graph. The List view has the same models and pipelines.
+          </span>
+        ) : (
+          <>
+            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            Laying out the graph…
+          </>
+        )}
+      </CanvasStatus>
+    )
   }
 
-  const anyInactive = lineage.edges.some((e) => e.inactive)
-
   return (
-    <div>
-      <p className="sr-only">
-        A drawing of the chain. The List view has the same models and pipelines, with links and a button that shows
-        each one&apos;s runs and SQL.
-      </p>
-      <div className="relative">
-        <div ref={wrapperRef} aria-hidden="true" className="h-[420px] w-full bg-zinc-50 dark:bg-zinc-950">
-          <ReactFlow<LineageFlowNode, Edge>
-            key={layout.signature}
-            nodes={nodes}
-            edges={edges}
-            nodeTypes={nodeTypes}
-            onInit={onInit}
-            onNodeClick={(_, node) => {
-              const key = layout.keyByFlowId.get(node.id)
-              if (key && clickableKeys.has(key)) onOpen(key)
-            }}
-            colorMode={dark ? "dark" : "light"}
-            nodesDraggable={false}
-            nodesConnectable={false}
-            nodesFocusable={false}
-            edgesFocusable={false}
-            elementsSelectable={false}
-            disableKeyboardA11y
-            zoomOnScroll={false}
-            zoomOnDoubleClick={false}
-            preventScrolling={false}
-            minZoom={0.25}
-            maxZoom={1.5}
-            proOptions={{ hideAttribution: true }}
-          />
-        </div>
-        <div className="absolute right-2 top-2 flex flex-col gap-1">
-          <Button size="icon" variant="outline" className="h-7 w-7 bg-white dark:bg-zinc-900" aria-label="Zoom in" onClick={() => void zoomIn()}>
-            <Plus className="h-3.5 w-3.5" aria-hidden />
-          </Button>
-          <Button size="icon" variant="outline" className="h-7 w-7 bg-white dark:bg-zinc-900" aria-label="Zoom out" onClick={() => void zoomOut()}>
-            <Minus className="h-3.5 w-3.5" aria-hidden />
-          </Button>
-          <Button
-            size="icon"
-            variant="outline"
-            className="h-7 w-7 bg-white dark:bg-zinc-900"
-            aria-label="Fit the whole chain"
-            onClick={() => void fitView({ padding: 0.1, maxZoom: 1 })}
-          >
-            <Maximize className="h-3.5 w-3.5" aria-hidden />
-          </Button>
-        </div>
-      </div>
-      <LineageLegend showInactive={anyInactive} />
-    </div>
+    <LineageFlowCanvas<LineageFlowNode>
+      nodes={nodes}
+      edges={edges}
+      nodeTypes={nodeTypes}
+      bounds={drawing.bounds}
+      root={drawing.root}
+      signature={drawing.signature}
+      pending={pending}
+      onNodeClick={(flowId) => {
+        const key = drawing.keyByFlowId.get(flowId)
+        if (key && clickableKeys.has(key)) onOpen(key)
+      }}
+      description="A drawing of the chain. The List view has the same models and pipelines, with links and a button that shows each one's runs and SQL."
+      title="Graph"
+      legend={<LineageLegend showInactive={inactive.size > 0} />}
+    />
   )
 }
 
@@ -696,20 +657,8 @@ function LineageLegend({ showInactive }: { showInactive: boolean }) {
           {label}
         </span>
       ))}
-      <span className="inline-flex items-center gap-1.5">
-        <svg width="20" height="6" aria-hidden>
-          <line x1="0" y1="3" x2="20" y2="3" stroke="currentColor" strokeWidth="1.5" />
-        </svg>
-        wakes the next model
-      </span>
-      {showInactive && (
-        <span className="inline-flex items-center gap-1.5">
-          <svg width="20" height="6" aria-hidden>
-            <line x1="0" y1="3" x2="20" y2="3" stroke="currentColor" strokeWidth="1.5" strokeDasharray="4 4" />
-          </svg>
-          won&apos;t trigger (paused)
-        </span>
-      )}
+      <LegendLine label="wakes the next model" />
+      {showInactive && <LegendLine dash="4 4" label="won't trigger (paused)" />}
     </div>
   )
 }

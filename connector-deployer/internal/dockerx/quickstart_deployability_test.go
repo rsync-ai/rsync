@@ -112,8 +112,11 @@ func TestComposeManagedConnectorsUnstartedByQuickstartAreJITDeployable(t *testin
 	}
 }
 
-// The bundled demo names two connectors. Both have to be runnable on the stack
-// that offers the demo, whichever mechanism gets them running.
+// The bundled demo names two connectors. Both have to be deployable on demand:
+// the quickstart starts neither at install (sample-data-mcp sits behind the
+// opt-in "connectors" profile), so the first POST /demo/seed is what brings them
+// up. A compose service that merely names the container does not count, since
+// this regex parse cannot tell a default service from a profiled one.
 func TestDemoPinnedConnectorsAreRunnableOnQuickstart(t *testing.T) {
 	body, err := os.ReadFile(filepath.Join(repoRoot, "api-gateway/internal/handlers/demo.go"))
 	if err != nil {
@@ -129,14 +132,10 @@ func TestDemoPinnedConnectorsAreRunnableOnQuickstart(t *testing.T) {
 	}
 	t.Logf("demo pins: source=%q destination=%q", pins["source"], pins["destination"])
 
-	started := connectorsStartedBy(t, "docker-compose.quickstart.yml")
 	for label, id := range pins {
-		if _, ok := started[id]; ok {
-			continue // compose starts it — nothing for the deployer to do
-		}
 		if err := deployMissing(t, id); err != nil {
-			t.Errorf("the demo's %s connector %q is neither started by docker-compose.quickstart.yml "+
-				"nor deployable on demand (%v: %v) — POST /demo/seed cannot succeed on a self-host stack",
+			t.Errorf("the demo's %s connector %q is not deployable on demand (%v: %v) — "+
+				"POST /demo/seed cannot succeed on a fresh self-host install, which starts no connectors",
 				label, id, KindOf(err), err)
 		}
 	}

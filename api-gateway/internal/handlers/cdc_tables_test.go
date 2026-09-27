@@ -382,7 +382,8 @@ func TestUpdatePipelineCDCTables_BackfillNewlyAdded_TriggersOrchestrator(t *test
 			sawBackfill = true
 			_ = json.NewDecoder(r.Body).Decode(&backfillBody)
 			w.WriteHeader(http.StatusOK)
-			_ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+			// The mode the orchestrator resolved (MongoDB → blocking).
+			_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "snapshot_mode": "blocking"})
 			return
 		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/cdc/pipelines/"+pipelineID+"/sink/restart":
 			w.WriteHeader(http.StatusOK)
@@ -447,8 +448,20 @@ func TestUpdatePipelineCDCTables_BackfillNewlyAdded_TriggersOrchestrator(t *test
 	if tables, ok := backfillBody["tables"].([]any); !ok || len(tables) != 1 || tables[0] != "db.orders" {
 		t.Fatalf("unexpected backfill tables: %#v", backfillBody["tables"])
 	}
-	if mode, _ := backfillBody["mode"].(string); mode != "incremental" {
-		t.Fatalf("expected mode incremental, got %#v", backfillBody["mode"])
+	// No mode requested → none sent: the orchestrator owns the default, which is
+	// blocking on MongoDB (it refuses incremental there), incremental elsewhere.
+	if mode, has := backfillBody["mode"]; has {
+		t.Fatalf("expected no mode to be sent (orchestrator default), got %#v", mode)
+	}
+	// …and the gateway reports the mode that ran, not the empty request.
+	var resp struct {
+		Backfill map[string]any `json:"backfill"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Backfill["mode"] != "blocking" {
+		t.Fatalf("backfill.mode = %#v; want the orchestrator's snapshot_mode (blocking)", resp.Backfill["mode"])
 	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {

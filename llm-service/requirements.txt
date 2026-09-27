@@ -11,13 +11,11 @@
 fastapi==0.137.1
 starlette==1.3.1
 uvicorn[standard]>=0.53.0
-python-multipart>=0.0.32
 
 # AI/LLM
-openai>=3.14.1
+openai>=3.19.0
 tiktoken>=0.14.0
-langchain>=1.4.1
-langgraph>=1.2.11
+langgraph>=1.2.12
 
 # HTTP & Networking
 requests>=2.34.2
@@ -35,12 +33,14 @@ jinja2>=3.1.6
 
 # Messaging & Data
 kafka-python>=3.0.11
-boto3>=1.43.95
-duckdb>=1.5.5
 psycopg2-binary>=2.9.13
-fastavro>=1.12.2  # Avro serialization for Kafka
 
 # Security
+# presidio-anonymizer is no longer installed (nothing imports it; only the
+# analyzer is used), and it was the source of the ceiling below. Lifting the
+# ceiling is its own change, together with the dependabot.yml ignore entry.
+# The history, kept because it explains the pin:
+#
 # Ceiling is not ours: presidio-anonymizer 2.2.364 -- the newest release --
 # floors cryptography at 48.0.1 and caps it below 49, so anything from 49 up
 # cannot resolve at all (verified against the package metadata on PyPI, not
@@ -69,7 +69,6 @@ cryptography>=48.0.1,<49.0.0
 
 # PII Detection - Microsoft Presidio
 presidio-analyzer>=2.2.364
-presidio-anonymizer>=2.2.364
 spacy>=3.8.16
 # The en_core_web_sm spaCy model is installed in the Dockerfile via
 # `python -m spacy download en_core_web_sm` so cold-start doesn't trigger
@@ -86,9 +85,4 @@ opentelemetry-instrumentation-requests==0.46b0
 prometheus-client>=0.26.0
 
 # SQL Parsing & Transpilation
-sqlglot>=30.18.0
-
-# Development
-black>=26.5.1
-pytest>=9.1.1
-pytest-asyncio>=1.4.0
+sqlglot>=30.19.0

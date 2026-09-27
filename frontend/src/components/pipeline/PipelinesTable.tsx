@@ -137,7 +137,7 @@ interface PipelinesTableProps {
 import { configForExecution, formatErrorMessage } from "@/lib/execution-status"
 import { pipelineIsCDC } from "@/lib/pipeline/syncMode"
 
-function getStatusConfig(pipeline: PipelineListItem) {
+export function getStatusConfig(pipeline: PipelineListItem) {
   const status = pipeline.derived_status
   const pipelineOnly: Record<string, { icon: React.ElementType; color: string; bgColor: string; label: string }> = {
     running: {
@@ -192,7 +192,7 @@ function getStatusConfig(pipeline: PipelineListItem) {
   }
 }
 
-function getPipelineType(pipeline: PipelineListItem): string {
+export function getPipelineType(pipeline: PipelineListItem): string {
   // Explicit sync_mode wins; cdc_mode alone only decides for a legacy row.
   if (pipelineIsCDC(pipeline)) {
     return pipeline.cdc_mode === "streaming_only" ? "CDC (changes only)" : "Backfill+CDC"

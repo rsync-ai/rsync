@@ -82,6 +82,9 @@ spec:
               containerPort: {{ $svc.port }}
           env:
             {{- include "rsync-ai.commonEnv" $root | nindent 12 }}
+            {{- /* The rate limiter (llm-service src/utils/ratelimit.py) defaults
+                   REDIS_HOST to "redis", which no Service here is named. */}}
+            {{- include "rsync-ai.redisEnv" $root | nindent 12 }}
             - name: PORT
               value: {{ $svc.port | quote }}
             {{- if ne $svc.name "tool-generator" }}
@@ -184,11 +187,9 @@ spec:
             # internal/agents/executor/executor.go — but do not rely on the
             # backstop to paper over a misconfigured prefix here.)
             {{- include "rsync-ai.kafkaEnv" $root | nindent 12 }}
-            # The planner is a request/response service in this topology; its
-            # Kafka consumer is off and the broker vars above exist only so the
-            # producer names topics consistently.
-            - name: ENABLE_KAFKA_CONSUMER
-              value: "false"
+            # The planner is an HTTP request/response service; it runs no Kafka
+            # consumer. The broker vars above exist only so any producer names
+            # topics consistently.
             - name: CONNECTORS_DIR
               value: /app/shared/mcp-connectors
             {{- end }}

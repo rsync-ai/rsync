@@ -30,9 +30,9 @@ import (
 // HONEST SCOPE — which of the fields below a downstream consumer actually reads.
 // Only ONE of them does anything, and the census is keyed on that one:
 //
-//   - `operation` is read. internal/workers/executor.go:557 copies
+//   - `operation` is read. internal/workers/executor.go:540 copies
 //     task.Payload["operation"] into ExecutorTask.Operation (and defaults it to
-//     "execute" at :561 when absent), and internal/agents/executor/executor.go:1661
+//     "execute" at :544 when absent), and internal/agents/executor/executor.go:1534
 //     switches on it. Forcing it is the only way a node kind changes what runs.
 //   - `request_type` is read by NOTHING. The adapter's task map arrives on the
 //     orchestrator as PendingRequest.Payload, and that struct's own RequestType
@@ -44,7 +44,7 @@ import (
 //     stops.
 //   - `source_type` / `destination_type` are read only inside
 //     `if task.Context["source_config"]` / `["destination_config"]`
-//     (internal/workers/executor.go:582-593). No code path in this adapter ever
+//     (internal/workers/executor.go:565-577). No code path in this adapter ever
 //     writes either config key, so for a node_execution task those two are inert
 //     as well.
 //
@@ -61,7 +61,7 @@ import (
 const genericNodeRequestType = "execute"
 
 // defaultExecutorOperation is what the executor uses when the task payload
-// names no operation (internal/workers/executor.go:557-561). Setting
+// names no operation (internal/workers/executor.go:540-544). Setting
 // task["operation"] to this value is therefore byte-for-byte identical to not
 // setting it, so a rule that does so has forced nothing — the census rejects it
 // for the same reason it rejects a RequestType of genericNodeRequestType.

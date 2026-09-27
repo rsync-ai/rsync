@@ -84,19 +84,23 @@ def test_default_namespace_is_rsync():
 # The Go side of the same contract is
 # backend-orchestrator/internal/agents/executor/cdc_schema_history_topic_test.go;
 # the _safe_name cases below are mirrored there case-for-case.
+#
+# MySQL, because only the historized engines (connector._HISTORIZED_ENGINES) carry
+# a schema-history topic at all. test_schema_history_is_for_historized_engines.py
+# pins which engines those are.
 
-_PG_ARGS = {
-    "database_type": "postgresql",
+_MYSQL_ARGS = {
+    "database_type": "mysql",
     "db_host": "db.example.com",
     "db_user": "FAKEPLACEHOLDER",
     "db_password": "FAKEPLACEHOLDER",
     "db_name": "appdb",
-    "tables": ["public.orders"],
+    "tables": ["appdb.orders"],
 }
 
 
 def _history_topic(**overrides):
-    args = dict(_PG_ARGS)
+    args = dict(_MYSQL_ARGS)
     args.update(overrides)
     _name, cfg, _db = connector.DebeziumConnector()._build_config(args)
     return cfg["schema.history.internal.kafka.topic"]

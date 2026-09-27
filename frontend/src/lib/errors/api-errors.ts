@@ -21,6 +21,8 @@ export const ErrorCodes = {
 
 export type ErrorCode = (typeof ErrorCodes)[keyof typeof ErrorCodes]
 
+const KNOWN_CODES: ReadonlySet<string> = new Set(Object.values(ErrorCodes))
+
 // Structured API error
 export interface APIError {
   code: ErrorCode
@@ -28,6 +30,15 @@ export interface APIError {
   details?: string
   field?: string
   suggestion?: string
+  /** The connector's own reason a pre-save connectivity test failed. */
+  cause?: string
+}
+
+// Text a person can act on: a sentence, not a bare code ("DATABASE_ERROR") and
+// not a proxy's HTML error page.
+function isReadableServerText(message: string): boolean {
+  const text = message.trim()
+  return /\s/.test(text) && !text.startsWith("<") && text.length <= 500
 }
 
 // Parse raw error response into structured APIError
@@ -36,17 +47,32 @@ export function parseAPIError(error: unknown): APIError {
   // then map back into our APIError shape for backwards compatibility.
   const normalized = parseApiErrorGeneric(error)
   if (normalized && normalized.message) {
-    const inferredCode =
-      (normalized.code as ErrorCode) ||
-      inferErrorCode(normalized.message, normalized.statusCode)
+    const serverCode = normalized.code as ErrorCode | undefined
+    // respondError's codes ("encrypt_credentials_failed") are not ours; the
+    // friendly constants are chosen from a code we know, or one inferred.
+    const knownCode = serverCode && KNOWN_CODES.has(serverCode) ? serverCode : undefined
+    const inferredCode = knownCode || inferErrorCode(normalized.message, normalized.statusCode)
     const friendly = getUserFriendlyMessage(inferredCode, normalized.message, normalized.details)
+    // The server's sentence names the cause (a missing IAM role, a quota, an
+    // encryption key, which name is taken); the constant for its code does not,
+    // so every 5xx used to read "A server error occurred". The constants only
+    // fill in when the server sent nothing a person can read.
+    const serverText = isReadableServerText(normalized.message) ? normalized.message : undefined
+    // A conflict is the connection name's fault only when the server says so:
+    // its DUPLICATE_NAME code on a "named ..." sentence. Any 409 used to be
+    // rewritten as a taken connection name and focus that input, whatever
+    // actually collided.
+    const nameIsTaken =
+      serverCode === ErrorCodes.DUPLICATE_NAME && /\bnamed\b/i.test(normalized.message)
+    const guessedField =
+      inferredCode === ErrorCodes.DUPLICATE_NAME ? (nameIsTaken ? "name" : undefined) : friendly.field
     return {
-      code: inferredCode,
-      // Prefer the friendly message when we can infer a known code.
-      message: friendly.message || normalized.message,
+      code: serverCode || inferredCode,
+      message: serverText || friendly.message || normalized.message,
       details: normalized.details,
-      field: normalized.field || friendly.field,
-      suggestion: normalized.suggestion || friendly.suggestion,
+      field: normalized.field || guessedField,
+      suggestion: normalized.suggestion || (serverText ? undefined : friendly.suggestion),
+      ...(normalized.cause ? { cause: normalized.cause } : {}),
     }
   }
 
@@ -362,6 +388,10 @@ export class APIRequestError extends Error {
 
   get details(): string | undefined {
     return this.apiError.details
+  }
+
+  get cause(): string | undefined {
+    return this.apiError.cause
   }
 
   toDisplayFormat(): { title: string; description: string } {

@@ -480,18 +480,11 @@ func (m *MySQLManager) ValidatePrerequisites(ctx context.Context, connectionID s
 	// Check binlog row image
 	var binlogRowImage string
 	err = targetDB.QueryRowContext(ctx, "SHOW VARIABLES LIKE 'binlog_row_image'").Scan(&variable, &binlogRowImage)
-	if err == nil && binlogRowImage != "FULL" {
-		// BLOCKING for CDC: Debezium hard-requires binlog_row_image=FULL and aborts
-		// the connector task with "The database server is not configured to use a FULL
-		// binlog_row_image" when it is MINIMAL/NOBLOB. A warning would let the pipeline
-		// proceed and fail deep inside Debezium, so this must be a hard error.
-		errors = append(errors, ValidationError{
-			Code:     "MYSQL_BINLOG_ROW_IMAGE",
-			Severity: "error",
-			Message:  fmt.Sprintf("MySQL binlog_row_image is '%s' but must be 'FULL' for CDC", binlogRowImage),
-			Action:   "SET GLOBAL binlog_row_image='FULL'; (on managed MySQL such as Azure/RDS, change the binlog_row_image server parameter and restart)",
-		})
+	rowImageErrors, rowImageErr := evaluateBinlogRowImage(err, binlogRowImage)
+	if rowImageErr != nil {
+		return nil, rowImageErr
 	}
+	errors = append(errors, rowImageErrors...)
 
 	// Check replication permissions
 	var grants string
@@ -822,4 +815,45 @@ func findSubstring(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// evaluateBinlogRowImage turns the result of the binlog_row_image lookup into
+// validation errors, or into a hard failure of the whole check.
+//
+// The three outcomes are deliberately distinct, because the old code collapsed
+// two of them. It read `if scanErr == nil && value != "FULL"`, which made a
+// FAILED query a PASS: a permission error or a dropped connection skipped the
+// check entirely, the pipeline was allowed to proceed, and it then died deep
+// inside Debezium with "The database server is not configured to use a FULL
+// binlog_row_image" - the exact failure this validator exists to prevent. The
+// binlog_format check directly above it always returned its error.
+//
+//   - query failed      -> return the error; the caller could not check anything
+//   - no such variable  -> warning; MariaDB and MySQL 5.5 do not expose it, which
+//     is a real answer rather than a failure, but it is still
+//     the one case where FULL cannot be verified
+//   - value != "FULL"   -> blocking error, as before
+func evaluateBinlogRowImage(scanErr error, binlogRowImage string) ([]ValidationError, error) {
+	switch {
+	case scanErr == sql.ErrNoRows:
+		return []ValidationError{{
+			Code:     "MYSQL_BINLOG_ROW_IMAGE_UNKNOWN",
+			Severity: "warning",
+			Message:  "MySQL server does not expose binlog_row_image, so the FULL row-image requirement could not be verified (expected on MariaDB and MySQL 5.5)",
+			Action:   "Confirm the server writes full before/after row images; Debezium aborts the connector task without them",
+		}}, nil
+	case scanErr != nil:
+		return nil, fmt.Errorf("failed to check binlog_row_image: %w", scanErr)
+	case binlogRowImage != "FULL":
+		// BLOCKING for CDC: Debezium hard-requires binlog_row_image=FULL and aborts
+		// the connector task when it is MINIMAL/NOBLOB. A warning would let the
+		// pipeline proceed and fail deep inside Debezium, so this is a hard error.
+		return []ValidationError{{
+			Code:     "MYSQL_BINLOG_ROW_IMAGE",
+			Severity: "error",
+			Message:  fmt.Sprintf("MySQL binlog_row_image is '%s' but must be 'FULL' for CDC", binlogRowImage),
+			Action:   "SET GLOBAL binlog_row_image='FULL'; (on managed MySQL such as Azure/RDS, change the binlog_row_image server parameter and restart)",
+		}}, nil
+	}
+	return nil, nil
 }

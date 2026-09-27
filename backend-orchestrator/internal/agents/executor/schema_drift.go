@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 	"time"
@@ -13,6 +12,7 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/healer"
+	"github.com/rsync-ai/backend-orchestrator/internal/config"
 )
 
 // Self-healing schema drift — P1 detector.
@@ -30,8 +30,11 @@ import (
 // bookkeeping failure must never fail the data transfer.
 
 // schemaDriftEnabled reports whether the proactive detector is on (default off).
+// It is config.SchemaDriftEnabled, the one flag test shared with the healer and
+// kafka.EnsurePlatformTopics, so the producer here and the topic it writes to are
+// switched on and off together.
 func schemaDriftEnabled() bool {
-	return os.Getenv("RSYNC_SCHEMA_DRIFT_ENABLED") == "true"
+	return config.SchemaDriftEnabled()
 }
 
 // SchemaDriftPolicy is the per-pipeline detector policy persisted under
@@ -471,6 +474,11 @@ func sourceTypeOf(task ExecutorTask) string {
 // keyed by pipeline_id. Best-effort per message. auto_apply stays false for P0–P3
 // (propose -> approve only).
 func (a *Agent) emitSchemaChanges(ctx context.Context, pipelineID string, changes []healer.SchemaChange) {
+	// The produce itself is gated too, not only detectAndEmitSchemaDrift: with the
+	// flag off healer.HealerTopic is not provisioned, and a produce would auto-create it.
+	if !schemaDriftEnabled() {
+		return
+	}
 	now := time.Now().UTC().Format(time.RFC3339)
 	for _, ch := range changes {
 		ch.DetectedAt = now

@@ -52,7 +52,7 @@ func TestDeliverAppliesSavedSlackSettings(t *testing.T) {
 			sqlmock.NewRows(channelColumns).AddRow(
 				true, webhook, CategoryHealth,
 				false, "", 587, "", "", "", TLSModeStartTLS, "", "", time.Now()))
-		return n.deliver(context.Background(), "11111111-1111-1111-1111-111111111111", p, r, false, category)
+		return n.deliver(context.Background(), "11111111-1111-1111-1111-111111111111", p, r, false, category, true)
 	}
 	t.Cleanup(InvalidateChannelCache)
 
@@ -92,7 +92,7 @@ func TestDeliverWithNoChannelsIsSuppressed(t *testing.T) {
 	mock.ExpectQuery(`FROM notification_channel_settings`).WillReturnRows(sqlmock.NewRows(channelColumns))
 
 	n := &Notifier{db: mockDB, httpClient: http.DefaultClient}
-	got, err := n.deliver(context.Background(), "u", notificationPayload{}, Rendered{}, false, CategoryDataLoss)
+	got, err := n.deliver(context.Background(), "u", notificationPayload{}, Rendered{}, false, CategoryDataLoss, true)
 	if got != StatusSuppressed || err != nil {
 		t.Errorf("status=%q err=%v, want suppressed", got, err)
 	}
@@ -154,7 +154,7 @@ func TestDeliverEmailsOwnerAndAlertList(t *testing.T) {
 		mock.ExpectQuery(`FROM user_notification_preferences`).WillReturnError(sql.ErrNoRows)
 		mock.ExpectQuery(`SELECT email FROM users`).WillReturnRows(sqlmock.NewRows([]string{"email"}).AddRow("owner@example.com"))
 
-		got, err := n.deliver(context.Background(), user, p, r, false, CategoryRunStatus)
+		got, err := n.deliver(context.Background(), user, p, r, false, CategoryRunStatus, true)
 		if got != StatusDelivered || err != nil {
 			t.Fatalf("status=%q err=%v", got, err)
 		}
@@ -182,7 +182,7 @@ func TestDeliverEmailsOwnerAndAlertList(t *testing.T) {
 		mock.ExpectQuery(`FROM user_notification_preferences`).WillReturnRows(
 			sqlmock.NewRows([]string{"email_enabled", "muted"}).AddRow(false, ""))
 
-		got, err := n.deliver(context.Background(), user, p, r, false, CategoryRunStatus)
+		got, err := n.deliver(context.Background(), user, p, r, false, CategoryRunStatus, true)
 		if got != StatusDelivered || err != nil {
 			t.Fatalf("status=%q err=%v", got, err)
 		}
@@ -199,7 +199,7 @@ func TestDeliverEmailsOwnerAndAlertList(t *testing.T) {
 		mock.ExpectQuery(`FROM user_notification_preferences`).WillReturnError(sql.ErrNoRows)
 		mock.ExpectQuery(`SELECT email FROM users`).WillReturnError(errors.New("connection reset"))
 
-		got, err := n.deliver(context.Background(), user, p, r, false, CategoryRunStatus)
+		got, err := n.deliver(context.Background(), user, p, r, false, CategoryRunStatus, true)
 		if got != StatusDelivered || err == nil || !strings.HasPrefix(err.Error(), "email: ") {
 			t.Fatalf("status=%q err=%v, want delivered with the owner's failure recorded", got, err)
 		}
@@ -212,7 +212,7 @@ func TestDeliverEmailsOwnerAndAlertList(t *testing.T) {
 		f, mock, n := setup(t, CategoryRunStatus, "oncall@example.com")
 		mock.ExpectQuery(`FROM user_notification_preferences`).WillReturnError(sql.ErrNoRows)
 
-		got, err := n.deliver(context.Background(), user, p, r, false, CategoryRunStatus)
+		got, err := n.deliver(context.Background(), user, p, r, false, CategoryRunStatus, true)
 		if got != StatusSkipped || err != nil {
 			t.Fatalf("status=%q err=%v, want skipped", got, err)
 		}

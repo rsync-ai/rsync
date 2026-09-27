@@ -109,10 +109,10 @@ func (s *CDCSentinel) checkSourceFreshness(ctx context.Context, pipelineID, conn
 	}
 
 	cfg, ok := s.fetchSourceConfig(ctx, connectorName)
-	if !ok || !sourceHeartbeatEnabled(cfg) {
+	if !ok || !sourceHeartbeatEnabled(cfg) || !heartbeatAdvancesAnIdlePosition(cfg) {
 		// Without heartbeats a frozen position means "the source had no writes", which is
-		// perfectly healthy. Only a heartbeating connector is expected to advance on a
-		// timer, and only then does frozen mean stalled.
+		// perfectly healthy. Only a connector whose heartbeat moves an idle position is
+		// expected to advance on a timer, and only then does frozen mean stalled.
 		return
 	}
 
@@ -208,6 +208,24 @@ func sourceHeartbeatEnabled(config map[string]interface{}) bool {
 	}
 	ms, err := strconv.Atoi(strings.TrimSpace(fmt.Sprint(raw)))
 	return err == nil && ms > 0
+}
+
+// heartbeatAdvancesAnIdlePosition reports whether this connector's heartbeat moves its
+// committed position even when the source has no writes at all. Only then does a frozen
+// position prove a stall.
+//
+// MongoDB's does: every heartbeat commits the change stream's latest resume token, which
+// the server advances on its own. PostgreSQL's does not. Its heartbeat (#12) commits the
+// last LSN the connector received, so it acknowledges WAL that was decoded and filtered
+// out, but a database with no writes sends no new LSN and the heartbeat repeats the
+// same one. Only heartbeat.action.query would move it, and that writes to the source,
+// which rsync does not do. Treating a PostgreSQL heartbeat as a liveness beacon would
+// therefore raise the stall alarm on every quiet PostgreSQL pipeline.
+//
+// connector.class is not a secret; like the heartbeat key it is read and never logged.
+func heartbeatAdvancesAnIdlePosition(config map[string]interface{}) bool {
+	class, _ := config["connector.class"].(string)
+	return strings.Contains(strings.ToLower(class), "mongodb")
 }
 
 // fetchSourceOffsets reads a connector's committed source position via the Connect REST

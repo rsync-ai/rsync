@@ -103,13 +103,13 @@ NOT_A_KAFKA_CLIENT: dict[str, str] = {}
 # Adding a client means adding a line -- a reviewed decision. Losing one fails.
 MUST_BE_KAFKA_CLIENTS = {
     ("apps/api-gateway.yaml", "api-gateway"):
-        "publishes domain events and consumes agent results",
+        "produces and consumes pipeline.domain.events, pii.scan.* and rsync.notifications",
     ("apps/orchestrator.yaml", "orchestrator"):
-        "the agent control plane runs entirely over Kafka topics",
+        "produces pipeline.domain.events and provisions every platform and pipeline topic",
     ("apps/temporal-adapter.yaml", "temporal-adapter"):
-        "bridges Temporal workflows onto the agent command topics",
+        "publishes pipeline.domain.events and the terminal-failure rsync.notifications",
     ("apps/generation.yaml", "{{ $svc.name }}"):
-        "the generation services consume agent command topics",
+        "llm-service's PII scanner consumes pii.scan.request and answers on pii.scan.response",
     ("connectors/cdc.yaml", "kafka-connect"):
         "is a Kafka client by definition",
     ("connectors/cdc.yaml", "kafka-mcp-sink"):
@@ -119,7 +119,7 @@ MUST_BE_KAFKA_CLIENTS = {
         "produces CDC events, and its schema history is a SEPARATE client whose "
         "consumer half only fails on task restart",
     ("jobs/kafka-init.yaml", "kafka-init"):
-        "creates the 14 static topics; unauthenticated it BLOCKS rather than errors, "
+        "creates the platform topics; unauthenticated it BLOCKS rather than errors, "
         "which is what made `helm upgrade` hang instead of fail",
 }
 

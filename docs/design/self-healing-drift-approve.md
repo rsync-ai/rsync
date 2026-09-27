@@ -114,7 +114,7 @@ if os.Getenv("RSYNC_SCHEMA_DRIFT_ENABLED") == "true" {
 
 **Migrations:** none. **Flag:** `RSYNC_SCHEMA_DRIFT_ENABLED` (default `false`). Off → not called → zero behavior change.
 
-**Tests:** unit — assert `StartSchemaOnly` registers exactly 2 consumers and **never** subscribes `agent.executor.requests.dlq` / `agent.planner.responses.dlq`. Integration — produce a hand-crafted `add_column` event; assert a `healing_history` row and (for an approval class) a `schema_change_approvals` row.
+**Tests:** unit — assert `StartSchemaOnly` registers exactly 2 consumers and **never** subscribes `agent.executor.requests.dlq` / `agent.planner.responses.dlq` (both topics were removed with the agent Kafka bus in [#1227](https://github.com/rsync-ai/rsync-ai/pull/1227)). Integration — produce a hand-crafted `add_column` event; assert a `healing_history` row and (for an approval class) a `schema_change_approvals` row.
 
 **Verification evidence (gate 4):** orchestrator log `Listening for schema changes on rsync.healer.schema-changes` + `…approved-changes`, with **no** DLQ-topic line; consumer-group membership on `rsync.healer.schema-changes`.
 

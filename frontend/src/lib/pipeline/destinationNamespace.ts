@@ -91,6 +91,129 @@ export function validatePipelinePrefix(name: string): string {
   return ""
 }
 
+// OBJECT_STORAGE_DESTINATIONS are every object store, layout v2 or not (minio).
+const OBJECT_STORAGE_DESTINATIONS = new Set(["gcs", "aws-s3", "azure-blob", "minio"])
+
+export function isObjectStorageDestination(connectorType?: string): boolean {
+  return OBJECT_STORAGE_DESTINATIONS.has((connectorType || "").trim().toLowerCase().replace(/_/g, "-"))
+}
+
+// PG_LAYOUT_TYPES are the normalised PostgreSQL-family source types
+// (shared/postgres_family_golden.json members + the "postgres" alias).
+const PG_LAYOUT_TYPES = new Set([
+  "postgresql", "postgres", "cockroachdb", "cockroach_db", "aurora_postgresql", "alloydb", "neon", "supabase",
+])
+
+// objectLayoutSourceFamily mirrors the orchestrator's objectLayoutV2SourceFamily
+// (executor/object_layout_v2.go): the family that decides a table folder's depth.
+// "" = not a database family, which keeps the pipeline on the old layout.
+export function objectLayoutSourceFamily(sourceType?: string): string {
+  const t = (sourceType || "").trim().toLowerCase().replace(/-/g, "_")
+  if (PG_LAYOUT_TYPES.has(t)) return "postgresql"
+  if (["mongodb", "mongo", "mongodb_atlas", "mongodbatlas", "atlas"].includes(t)) return "mongodb"
+  if (["mysql", "mariadb", "aurora_mysql"].includes(t)) return "mysql"
+  if (["sqlserver", "mssql", "sql_server"].includes(t)) return "sqlserver"
+  if (t === "oracle") return "oracle"
+  return ""
+}
+
+// encodeLayoutSegment mirrors storage.layoutV2EncodeName: %, /, \, =, control
+// characters and a leading _ or . are percent-encoded; case and non-ASCII stay.
+function encodeLayoutSegment(s: string): string {
+  let out = ""
+  Array.from(s).forEach((ch, i) => {
+    const c = ch.codePointAt(0) ?? 0
+    const encode =
+      ch === "%" || ch === "/" || ch === "\\" || ch === "=" || c < 0x20 || c === 0x7f ||
+      (i === 0 && (ch === "_" || ch === "."))
+    out += encode ? `%${c.toString(16).toUpperCase().padStart(2, "0")}` : ch
+  })
+  return out
+}
+
+// objectLayoutTableParts mirrors the orchestrator's objectLayoutV2TableFor: it
+// splits a selected table name into the database / schema / table of its folder.
+// PostgreSQL / SQL Server take [<db>.]<schema>.<table> or a bare table in the
+// default schema (public / dbo; Oracle's default is the login user, unknown here,
+// so a bare Oracle table gets no schema and the folder is not shown). MongoDB
+// strips only the source database's own prefix; MySQL reads <db>.<table>.
+export function objectLayoutTableParts(
+  family: string,
+  database: string | undefined,
+  tableName: string
+): { database?: string; schema?: string; table: string } {
+  const name = (tableName || "").trim()
+  const db = database || undefined
+  switch (family) {
+    case "postgresql":
+    case "sqlserver":
+    case "oracle": {
+      const parts = name.split(".")
+      const table = parts[parts.length - 1]
+      const schema = parts.length >= 2 ? parts[parts.length - 2] : ""
+      const fallback = family === "postgresql" ? "public" : family === "sqlserver" ? "dbo" : ""
+      return { database: db, schema: schema.trim() ? schema : fallback, table }
+    }
+    case "mongodb":
+      return { database: db, table: db && name.startsWith(`${db}.`) ? name.slice(db.length + 1) : name }
+    case "mysql": {
+      const i = name.indexOf(".")
+      return i > 0 && i + 1 < name.length ? { database: name.slice(0, i), table: name.slice(i + 1) } : { database: db, table: name }
+    }
+  }
+  return { table: name }
+}
+
+const LAYOUT_SPACE = /^[ \t\n\r\v\f]+|[ \t\n\r\v\f]+$/g
+
+// objectStorageTableFolder is a layout v2 table's folder,
+// "<conn prefix>/<pipeline prefix>/<db>/[<schema>/]<table>/", as
+// storage.LayoutV2TablePrefix builds it (pinned by v2.table_prefix in
+// shared/object_layout_golden.json). sourceFamily is a layout family (see
+// objectLayoutSourceFamily). Returns null where the Go side returns an error, so a
+// caller falls back instead of showing a path nothing writes to. With a bucket it
+// is prepended, for display only.
+export function objectStorageTableFolder(args: {
+  bucket?: string
+  connPrefix?: string
+  pipelinePrefix: string
+  sourceFamily?: string
+  database?: string
+  schema?: string
+  table: string
+}): string | null {
+  const pipelinePrefix = args.pipelinePrefix || ""
+  if (!/^[a-z0-9][a-z0-9_-]{0,62}$/.test(pipelinePrefix)) return null
+  const db = (args.database || "").replace(LAYOUT_SPACE, "")
+  const schema = (args.schema || "").replace(LAYOUT_SPACE, "")
+  const table = (args.table || "").replace(LAYOUT_SPACE, "")
+  const parts: string[] = []
+  switch ((args.sourceFamily || "").replace(LAYOUT_SPACE, "").toLowerCase()) {
+    case "postgresql":
+    case "sqlserver":
+    case "oracle":
+      if (!db || !schema) return null
+      parts.push(db, schema)
+      break
+    case "mongodb":
+    case "mysql":
+      if (!db) return null
+      parts.push(db)
+      break
+    case "":
+      break
+    default:
+      return null
+  }
+  if (!table) return null
+  parts.push(table)
+  const conn = (args.connPrefix || "").replace(LAYOUT_SPACE, "").replace(/^\/+|\/+$/g, "")
+  const root = conn ? `${conn}/${pipelinePrefix}/` : `${pipelinePrefix}/`
+  const folder = root + parts.map((p) => `${encodeLayoutSegment(p)}/`).join("")
+  const bucket = (args.bucket || "").trim().replace(/^\/+|\/+$/g, "")
+  return bucket ? `${bucket}/${folder}` : folder
+}
+
 // genericSourceDefaults mirrors the Go set in api-gateway/handlers/pipelines.go.
 // These are source-engine internal placeholder names that must be translated to
 // the destination's own default before being shown to users.

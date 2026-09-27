@@ -8,8 +8,8 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
+import { BrowserConnectivityCard } from "@/components/admin/BrowserConnectivityCard"
 import { ComponentHealthTable } from "@/components/admin/ComponentHealthTable"
-import { DeployedCommitCard } from "@/components/admin/DeployedCommitCard"
 import { toast } from "sonner"
 import { RefreshCw, Database, Server, Radio, Clock, Timer, Workflow, Cable, ArrowDownToLine } from "lucide-react"
 import type { ServiceHealth } from "@/lib/api/admin"
@@ -262,7 +262,7 @@ export default function AdminHealthPage() {
             })}
           </div>
 
-          <DeployedCommitCard refreshToken={refreshToken} />
+          <BrowserConnectivityCard refreshToken={refreshToken} />
 
           <ComponentHealthTable refreshToken={refreshToken} />
         </>

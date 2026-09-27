@@ -15,7 +15,15 @@ const WebSocketContext = createContext<WebSocketContextType | undefined>(undefin
 export function WebSocketProvider({ children }: { children: ReactNode }) {
   const [ws, setWs] = useState<AgentWebSocket | null>(null)
   const [isConnected, setIsConnected] = useState(false)
+  // Gates a *pending* connect attempt, so a burst of subscribe() calls opens one
+  // socket. It is cleared whenever the socket closes -- it used to be set once
+  // and never reset, which meant that after the first disconnect no later
+  // subscribe() or sendMessage() could ever ask for the socket back.
   const hasAttemptedConnect = useRef(false)
+  // Whether anything on this page ever wanted realtime at all. The provider
+  // deliberately does not connect on pages that do not, and reviving on
+  // visibility must not undo that.
+  const everRequested = useRef(false)
 
   useEffect(() => {
     // Initialize WebSocket instance, but do NOT connect immediately.
@@ -30,24 +38,54 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
 
     websocket.onClose(() => {
       setIsConnected(false)
+      hasAttemptedConnect.current = false
     })
 
-    websocket.onError((error) => {
+    websocket.onError(() => {
       setIsConnected(false)
+      hasAttemptedConnect.current = false
     })
+
+    // A tab coming back to the foreground, or the network coming back, is the
+    // one signal that the reason the retry ladder burned through has probably
+    // gone away. The client cannot observe either, so without this a laptop
+    // that slept for an hour woke to a socket that had already given up and
+    // stayed given up for as long as the tab was open.
+    const revive = () => {
+      if (!everRequested.current) return
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return
+      const state = websocket.getState()
+      if (state === WebSocket.OPEN || state === WebSocket.CONNECTING) return
+      hasAttemptedConnect.current = true
+      websocket.reconnectNow()
+    }
+
+    if (typeof window !== "undefined") {
+      window.addEventListener("online", revive)
+      document.addEventListener("visibilitychange", revive)
+    }
 
     // Set the websocket instance first so components can subscribe.
     setWs(websocket)
 
     // Cleanup
     return () => {
+      if (typeof window !== "undefined") {
+        window.removeEventListener("online", revive)
+        document.removeEventListener("visibilitychange", revive)
+      }
       websocket.disconnect()
     }
   }, [])
 
   const ensureConnected = useCallback(() => {
     if (!ws) return
+    everRequested.current = true
     if (ws.isConnected()) return
+    if (ws.getState() === WebSocket.CONNECTING) return
+    // The client's own backoff already owns the next attempt; jumping in here
+    // would cancel its timer and connect immediately, throwing away the backoff.
+    if (ws.isReconnecting()) return
     if (hasAttemptedConnect.current) return
     hasAttemptedConnect.current = true
     ws.connect()
@@ -66,7 +104,7 @@ export function WebSocketProvider({ children }: { children: ReactNode }) {
     if (!ws) return
     ensureConnected()
     if (ws.isConnected()) ws.send(data)
-  }, [ws])
+  }, [ws, ensureConnected])
 
   return (
     <WebSocketContext.Provider value={{ ws, isConnected, subscribe, sendMessage }}>

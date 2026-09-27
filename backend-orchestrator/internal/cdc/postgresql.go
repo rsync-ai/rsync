@@ -337,9 +337,10 @@ func (m *PostgreSQLManager) CleanupResources(ctx context.Context, pipelineID str
 
 // ReapOrphanedSlots is the safety-net for the slot lifecycle: it drops the
 // physical replication slot on the source server for every cdc_resources slot
-// row that is no longer live — pipeline deleted (pipeline_id NULL via ON DELETE
-// SET NULL) or pipeline 'stopped'. It is idempotent and is meant to be called
-// periodically by the CDC reconciler. Returns the number of slots dropped.
+// row whose pipeline was deleted (pipeline_id NULL via ON DELETE SET NULL). It
+// is idempotent and is meant to be called periodically by the CDC reconciler.
+// Returns the number of slots dropped. A 'stopped' pipeline's slot is kept — it
+// is the position Start resumes from (see ReapSlotsUnderWALPressure).
 //
 // This is what guarantees a slot is never permanently leaked even if the
 // synchronous pre-delete cleanup did not run (orchestrator down, network flake,
@@ -350,6 +351,37 @@ func (m *PostgreSQLManager) ReapOrphanedSlots(ctx context.Context) (int, error) 
 	if err != nil {
 		return 0, err
 	}
+	return m.dropSlotResources(ctx, slots), nil
+}
+
+// ReapSlotsUnderWALPressure drops the named slots when their pipeline is deleted
+// or 'stopped'. The WAL watchdog calls it only with slots it measured past the
+// CRITICAL retained-WAL threshold: a stopped pipeline's slot is otherwise kept
+// as its resume position, but it still pins WAL on the source, and a full source
+// disk is worse than a pipeline that must be reloaded. Slots of running or
+// paused pipelines are never dropped, whatever their name.
+func (m *PostgreSQLManager) ReapSlotsUnderWALPressure(ctx context.Context, slotNames []string) (int, error) {
+	if len(slotNames) == 0 {
+		return 0, nil
+	}
+	want := make(map[string]bool, len(slotNames))
+	for _, n := range slotNames {
+		want[n] = true
+	}
+	slots, err := GetWALPressureReapableSlots(ctx, m.db)
+	if err != nil {
+		return 0, err
+	}
+	named := slots[:0:0]
+	for _, r := range slots {
+		if want[r.ResourceName] {
+			named = append(named, r)
+		}
+	}
+	return m.dropSlotResources(ctx, named), nil
+}
+
+func (m *PostgreSQLManager) dropSlotResources(ctx context.Context, slots []CDCResource) int {
 	dropped := 0
 	for _, resource := range slots {
 		cfg, err := m.getDecryptedConnectionConfig(ctx, resource.ConnectionID)
@@ -371,17 +403,17 @@ func (m *PostgreSQLManager) ReapOrphanedSlots(ctx context.Context) (int, error) 
 		}
 		dropped++
 		log.WithFields(log.Fields{"slot": resource.ResourceName, "pipeline_id": derefStr(resource.PipelineID)}).
-			Info("reaper: dropped orphaned/stopped replication slot")
+			Info("reaper: dropped replication slot")
 		if err := MarkResourceDeleted(ctx, m.db, resource.ResourceName, resource.ResourceType); err != nil {
 			log.WithError(err).WithField("slot", resource.ResourceName).Warn("reaper: failed to mark slot deleted")
 		}
 	}
-	return dropped, nil
+	return dropped
 }
 
 // ReapOrphanedPublications is the publication safety-net (BUG-3), mirroring
 // ReapOrphanedSlots: it DROPs the physical publication on the source server for
-// every publication cdc_resources row whose pipeline is gone or 'stopped'.
+// every publication cdc_resources row whose pipeline is gone.
 // Idempotent (DROP PUBLICATION IF EXISTS) and meant to be called periodically by
 // the CDC reconciler. Publications are per-pipeline (debezium_pub_pipe_*), so
 // dropping one never affects another pipeline. Returns the number dropped.
@@ -416,7 +448,7 @@ func (m *PostgreSQLManager) ReapOrphanedPublications(ctx context.Context) (int, 
 		}
 		dropped++
 		log.WithFields(log.Fields{"publication": resource.ResourceName, "pipeline_id": derefStr(resource.PipelineID)}).
-			Info("reaper: dropped orphaned/stopped publication")
+			Info("reaper: dropped orphaned publication")
 		if err := MarkResourceDeleted(ctx, m.db, resource.ResourceName, resource.ResourceType); err != nil {
 			log.WithError(err).WithField("publication", resource.ResourceName).Warn("reaper: failed to mark publication deleted")
 		}
@@ -432,6 +464,24 @@ func derefStr(s *string) string {
 }
 
 // dropReplicationSlotWithRetry drops a replication slot with retry and active-slot handling
+// retryBackoff waits before the next attempt of a teardown retry loop, and
+// reports ctx's error if the caller was cancelled while waiting.
+//
+// Every retry path must go through this. The two probe queries in
+// dropReplicationSlotWithRetry used to `continue` with no wait at all, so the
+// exact failure that makes retrying worthwhile -- an unreachable database --
+// burned all four attempts in microseconds and reported "failed after 4
+// attempts" as if it had been patient. Sleeping on the bare clock was the other
+// half: a cancelled teardown still sat out the full 1+2+4 seconds.
+func retryBackoff(ctx context.Context, attempt int) error {
+	select {
+	case <-time.After(time.Duration(1<<attempt) * time.Second):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (m *PostgreSQLManager) dropReplicationSlotWithRetry(ctx context.Context, db *sql.DB, slotName string, maxRetries int) error {
 	var lastErr error
 
@@ -440,6 +490,9 @@ func (m *PostgreSQLManager) dropReplicationSlotWithRetry(ctx context.Context, db
 		var exists bool
 		if err := db.QueryRowContext(ctx, "SELECT EXISTS(SELECT 1 FROM pg_replication_slots WHERE slot_name = $1)", slotName).Scan(&exists); err != nil {
 			lastErr = err
+			if bErr := retryBackoff(ctx, attempt); bErr != nil {
+				return fmt.Errorf("drop replication slot %s cancelled: %w (last error: %v)", slotName, bErr, lastErr)
+			}
 			continue
 		}
 
@@ -452,6 +505,9 @@ func (m *PostgreSQLManager) dropReplicationSlotWithRetry(ctx context.Context, db
 		var isActive bool
 		if err := db.QueryRowContext(ctx, "SELECT active FROM pg_replication_slots WHERE slot_name = $1", slotName).Scan(&isActive); err != nil {
 			lastErr = err
+			if bErr := retryBackoff(ctx, attempt); bErr != nil {
+				return fmt.Errorf("drop replication slot %s cancelled: %w (last error: %v)", slotName, bErr, lastErr)
+			}
 			continue
 		}
 
@@ -482,8 +538,9 @@ func (m *PostgreSQLManager) dropReplicationSlotWithRetry(ctx context.Context, db
 				"attempt": attempt + 1,
 			}).Warn("Failed to drop replication slot, will retry")
 
-			// Wait before retry with exponential backoff
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
+			if bErr := retryBackoff(ctx, attempt); bErr != nil {
+				return fmt.Errorf("drop replication slot %s cancelled: %w (last error: %v)", slotName, bErr, lastErr)
+			}
 			continue
 		}
 
@@ -508,8 +565,9 @@ func (m *PostgreSQLManager) dropPublicationWithRetry(ctx context.Context, db *sq
 				"attempt":     attempt + 1,
 			}).Warn("Failed to drop publication, will retry")
 
-			// Wait before retry
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
+			if bErr := retryBackoff(ctx, attempt); bErr != nil {
+				return fmt.Errorf("drop publication %s cancelled: %w (last error: %v)", pubName, bErr, lastErr)
+			}
 			continue
 		}
 

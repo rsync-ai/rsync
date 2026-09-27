@@ -106,7 +106,7 @@ describe("#23 — table statistics timestamps are local and labelled", () => {
     )
 
     render(<TableStatisticsPanel pipelineId="p1" />)
-    await waitFor(() => expect(screen.getByText(/events/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText("events")).toBeInTheDocument())
 
     for (const heading of ["Start", "Last Captured", "Last Applied", "Updated"]) {
       const cell = cellUnder(heading)

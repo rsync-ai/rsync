@@ -48,7 +48,7 @@ Oracle's free tier has two layers:
 A1.Flex is a supported target. Every `ghcr.io/rsync-ai/*` image is published as
 a multi-arch index with a native `linux/amd64` and a native `linux/arm64` entry,
 and the third-party dependencies (`postgres:16-alpine`, `redis:7-alpine`,
-`confluentinc/cp-kafka`, `temporalio/auto-setup`, `quay.io/minio/minio`) publish
+`confluentinc/cp-kafka`, `temporalio/auto-setup`, `cgr.dev/chainguard/minio`) publish
 arm64 as well. `install.sh` and `docker compose pull` pick the host's native
 image with no emulation and no flags.
 

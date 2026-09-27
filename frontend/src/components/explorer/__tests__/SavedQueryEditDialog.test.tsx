@@ -305,6 +305,65 @@ describe("SavedQueryEditDialog", () => {
     expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument()
   })
 
+  // The fresh read on open covers a list row that is minutes old. It cannot cover the
+  // dialog itself left open while a teammate saved: that needs the version the form was
+  // seeded from to travel with the save, so the server can refuse it (409 stale_write).
+  it("sends the version it loaded with the save", async () => {
+    const bodies: unknown[] = []
+    mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") return res(200, loaded({ updated_at: "2026-09-01T10:00:00.123456Z" }))
+      bodies.push(JSON.parse(String(init?.body)))
+      return res(200, loaded())
+    })
+
+    const user = userEvent.setup()
+    renderDialog()
+    await waitFor(() => expect(screen.getByLabelText("Name")).toHaveValue("Daily MRR"))
+
+    await user.type(screen.getByLabelText("Name"), " nightly")
+    await user.click(screen.getByRole("button", { name: /save changes/i }))
+
+    await waitFor(() => expect(bodies.length).toBe(1))
+    expect(bodies[0]).toEqual({ name: "Daily MRR nightly", expected_updated_at: "2026-09-01T10:00:00.123456Z" })
+  })
+
+  it("says a teammate's save got there first, keeps the typed edit, and reloads theirs on request", async () => {
+    let reads = 0
+    mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+      if ((init?.method ?? "GET") === "GET") {
+        reads++
+        return reads === 1
+          ? res(200, loaded({ updated_at: "2026-09-01T10:00:00Z" }))
+          : res(200, loaded({ sql_text: "SELECT 2", updated_at: "2026-09-01T10:05:00Z" }))
+      }
+      return res(409, {
+        error: "this query changed since you loaded it; reload it and re-apply your change",
+        code: "stale_write",
+        current_updated_at: "2026-09-01T10:05:00Z",
+      })
+    })
+    const onSaved = vi.fn()
+    const user = userEvent.setup()
+    render(<SavedQueryEditDialog savedQueryId={QUERY_ID} open onOpenChange={vi.fn()} onSaved={onSaved} />)
+    await waitFor(() => expect(screen.getByLabelText("SQL")).toHaveValue("SELECT 1"))
+
+    await user.clear(screen.getByLabelText("SQL"))
+    await user.type(screen.getByLabelText("SQL"), "SELECT 3")
+    await user.click(screen.getByRole("button", { name: /save changes/i }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(/someone else saved this query/i)
+    expect(toast.success).not.toHaveBeenCalled()
+    expect(onSaved).not.toHaveBeenCalled()
+    // What they typed stays, so it can be copied before it is replaced.
+    expect(screen.getByLabelText("SQL")).toHaveValue("SELECT 3")
+    // The same token would be refused again; the way forward is the reload.
+    expect(screen.getByRole("button", { name: /save changes/i })).toBeDisabled()
+
+    await user.click(screen.getByRole("button", { name: "Load their version" }))
+    await waitFor(() => expect(screen.getByLabelText("SQL")).toHaveValue("SELECT 2"))
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
   it("reports the server's reason when a save is refused", async () => {
     mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
       if ((init?.method ?? "GET") === "GET") return res(200, loaded())

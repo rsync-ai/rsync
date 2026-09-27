@@ -14,6 +14,7 @@ from .ml_detector import (
     PIIEntity,
     PIIType
 )
+from .column_names import DETECTION_METHOD, NAME_MATCH_CONFIDENCE, pii_type_for_column_name
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,9 @@ class PIIScannerService:
         Returns:
             Column scan result
         """
+        if not request.samples:
+            return self._scan_column_name(request)
+
         result = self.detector.analyze_column_samples(
             column_name=request.column_name,
             samples=request.samples,
@@ -171,6 +175,30 @@ class PIIScannerService:
             suggested_masking=suggested_masking
         )
     
+    def _scan_column_name(self, request: ColumnScanRequest) -> ColumnScanResult:
+        """Classify a column with no samples by its name and declared type.
+
+        Without samples the detector has nothing to read and answers "not PII"
+        for every column, which the gateway's prune would take as a clean scan.
+        """
+        pii_type = pii_type_for_column_name(request.column_name, request.data_type)
+        masking = "hash"
+        if pii_type:
+            try:
+                masking = self.masking_suggestions.get(PIIType(pii_type), "hash")
+            except ValueError:
+                masking = "hash"
+        return ColumnScanResult(
+            column_name=request.column_name,
+            is_pii=pii_type is not None,
+            pii_type=pii_type,
+            confidence=NAME_MATCH_CONFIDENCE if pii_type else 0.0,
+            detection_method=DETECTION_METHOD if pii_type else "none",
+            sample_count=0,
+            match_count=0,
+            suggested_masking=masking,
+        )
+
     def scan_table(self, request: TableScanRequest,
                    score_threshold: float = 0.5) -> TableScanResult:
         """Scan a table for PII.
@@ -207,28 +235,45 @@ class PIIScannerService:
         """
         errors = []
         table_results = []
-        
-        if not self.detector.is_available() and request.include_ml:
-            errors.append("ML detection not available, using pattern-based detection only")
-        
+
         tables = request.tables or []
-        
+        # With no sample anywhere there is nothing for the ML detector to read,
+        # so it is not loaded (a cold Presidio start is seconds) and the result
+        # says what the scan actually was.
+        has_samples = any(c.samples for t in tables for c in (t.columns or []))
+
+        if has_samples and not self.detector.is_available() and request.include_ml:
+            errors.append("ML detection not available, using pattern-based detection only")
+
         for table in tables:
+            # A table with no columns was not scanned. Listing it in `tables`
+            # would tell the gateway it came back clean, and the gateway prunes
+            # every stored finding of a table reported clean.
+            if not table.columns:
+                errors.append(f"Table {table.table_name}: no columns were supplied, so it was not scanned")
+                continue
             try:
                 result = self.scan_table(table, request.score_threshold)
                 table_results.append(result)
             except Exception as e:
                 logger.error(f"Error scanning table {table.table_name}: {e}")
                 errors.append(f"Table {table.table_name}: {str(e)}")
-        
+
         total_columns = sum(len(t.columns) for t in table_results)
         total_pii = sum(t.pii_columns_found for t in table_results)
-        
+
+        if not has_samples:
+            scan_method = DETECTION_METHOD
+        elif request.include_ml and self.detector.is_available():
+            scan_method = "ml"
+        else:
+            scan_method = "pattern"
+
         return SchemaScanResult(
             tables=table_results,
             total_columns_scanned=total_columns,
             total_pii_columns_found=total_pii,
-            scan_method="ml" if request.include_ml and self.detector.is_available() else "pattern",
+            scan_method=scan_method,
             errors=errors
         )
     
@@ -249,137 +294,3 @@ class PIIScannerService:
         if hasattr(obj, '__dataclass_fields__'):
             return asdict(obj)
         return obj
-
-
-# FastAPI router for the PII scanner service
-def create_router():
-    """Create FastAPI router for PII scanner endpoints."""
-    try:
-        from fastapi import APIRouter, HTTPException
-        from pydantic import BaseModel
-        from typing import List, Optional
-    except ImportError:
-        logger.warning("FastAPI not available, router not created")
-        return None
-    
-    router = APIRouter(prefix="/pii", tags=["PII Scanner"])
-    service = PIIScannerService()
-    
-    # Pydantic models for API
-    class TextDetectionRequest(BaseModel):
-        texts: List[str]
-        language: str = "en"
-        entities: Optional[List[str]] = None
-        score_threshold: float = 0.5
-    
-    class ColumnScanRequestModel(BaseModel):
-        column_name: str
-        samples: List[Any]
-        data_type: Optional[str] = None
-    
-    class TableScanRequestModel(BaseModel):
-        table_name: str
-        columns: List[ColumnScanRequestModel]
-    
-    class SchemaScanRequestModel(BaseModel):
-        connection_id: Optional[str] = None
-        tables: List[TableScanRequestModel]
-        include_ml: bool = True
-        score_threshold: float = 0.5
-    
-    @router.get("/status")
-    async def get_status():
-        """Get PII scanner service status."""
-        return service.get_status()
-    
-    @router.post("/detect")
-    async def detect_pii(request: TextDetectionRequest):
-        """Detect PII in text samples."""
-        req = PIIDetectionRequest(
-            texts=request.texts,
-            language=request.language,
-            entities=request.entities,
-            score_threshold=request.score_threshold
-        )
-        response = service.detect_texts(req)
-        
-        # Convert to JSON-serializable format
-        return {
-            "results": [[e.to_dict() for e in entities] for entities in response.results],
-            "language": response.language,
-            "model_version": response.model_version,
-            "errors": response.errors
-        }
-    
-    @router.post("/scan/column")
-    async def scan_column(request: ColumnScanRequestModel):
-        """Scan a single column for PII."""
-        req = ColumnScanRequest(
-            column_name=request.column_name,
-            samples=request.samples,
-            data_type=request.data_type
-        )
-        result = service.scan_column(req)
-        return asdict(result)
-    
-    @router.post("/scan/table")
-    async def scan_table(request: TableScanRequestModel):
-        """Scan a table for PII."""
-        req = TableScanRequest(
-            table_name=request.table_name,
-            columns=[
-                ColumnScanRequest(
-                    column_name=c.column_name,
-                    samples=c.samples,
-                    data_type=c.data_type
-                )
-                for c in request.columns
-            ]
-        )
-        result = service.scan_table(req)
-        return {
-            "table_name": result.table_name,
-            "columns": [asdict(c) for c in result.columns],
-            "pii_columns_found": result.pii_columns_found
-        }
-    
-    @router.post("/scan/schema")
-    async def scan_schema(request: SchemaScanRequestModel):
-        """Scan an entire schema for PII."""
-        req = SchemaScanRequest(
-            connection_id=request.connection_id,
-            tables=[
-                TableScanRequest(
-                    table_name=t.table_name,
-                    columns=[
-                        ColumnScanRequest(
-                            column_name=c.column_name,
-                            samples=c.samples,
-                            data_type=c.data_type
-                        )
-                        for c in t.columns
-                    ]
-                )
-                for t in request.tables
-            ],
-            include_ml=request.include_ml,
-            score_threshold=request.score_threshold
-        )
-        result = await service.scan_schema_async(req)
-        return {
-            "tables": [
-                {
-                    "table_name": t.table_name,
-                    "columns": [asdict(c) for c in t.columns],
-                    "pii_columns_found": t.pii_columns_found
-                }
-                for t in result.tables
-            ],
-            "total_columns_scanned": result.total_columns_scanned,
-            "total_pii_columns_found": result.total_pii_columns_found,
-            "scan_method": result.scan_method,
-            "errors": result.errors
-        }
-    
-    return router
-

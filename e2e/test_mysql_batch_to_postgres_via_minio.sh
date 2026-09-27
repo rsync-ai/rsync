@@ -189,10 +189,15 @@ minio_ls_prefix() {
   local mc_cfg="${ROOT_DIR}/.tmp/mc"
   mkdir -p "${mc_cfg}"
 
-  docker run --rm --network "${NETWORK}" -v "${mc_cfg}:/mc" quay.io/minio/mc:latest --config-dir /mc \
+  # `--entrypoint mc`: the image's entrypoint is the `minio` server. `--user`: the
+  # image runs as uid 65532, which cannot write a host-owned 0755 ${mc_cfg} on a
+  # Linux runner -- and the `|| true` below would turn that into an empty listing.
+  docker run --rm --network "${NETWORK}" --user "$(id -u):$(id -g)" -v "${mc_cfg}:/mc" \
+    --entrypoint mc cgr.dev/chainguard/minio:latest --config-dir /mc \
     alias set rsync "${MINIO_ENDPOINT_URL}" "${MINIO_ACCESS_KEY_ID}" "${MINIO_SECRET_ACCESS_KEY}" >/dev/null 2>&1 || true
 
-  docker run --rm --network "${NETWORK}" -v "${mc_cfg}:/mc" quay.io/minio/mc:latest --config-dir /mc \
+  docker run --rm --network "${NETWORK}" --user "$(id -u):$(id -g)" -v "${mc_cfg}:/mc" \
+    --entrypoint mc cgr.dev/chainguard/minio:latest --config-dir /mc \
     ls --recursive "rsync/${MINIO_BUCKET}/${prefix}" 2>/dev/null || true
 }
 

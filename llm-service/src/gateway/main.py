@@ -57,6 +57,8 @@ from src.utils.openai_client import (  # noqa: E402
     client_egress_host as _client_egress_host,
     _ollama_base_url,
     llm_configured as _llm_configured,
+    with_reasoning_headroom,
+    warn_if_cut_off,
 )
 from src.utils.llm_gate import (  # noqa: E402
     register_llm_gate,
@@ -765,16 +767,6 @@ app.include_router(explorer_router)
 app.include_router(rank_tables_router)
 # LLM-only routes answer 503 llm_not_configured when no LLM is set up (see llm_gate).
 register_llm_gate(app)
-
-# Mount PII scanner HTTP endpoints
-try:
-    from src.agents.pii_scanner.service import create_router as _create_pii_router
-    _pii_router = _create_pii_router()
-    if _pii_router is not None:
-        app.include_router(_pii_router)
-        logger.info("PII scanner router mounted at /pii/*")
-except Exception as _exc:
-    logger.warning("PII scanner router unavailable: %s", _exc)
 
 # Start async PII Kafka consumer as background task on startup
 @app.on_event("startup")
@@ -1890,30 +1882,17 @@ async def diagnose_pipeline(request: DiagnoseRequest):
             evidence_pointers=list(request.evidence.keys())[:3],
         )
 
-    # Defense-in-depth (H6): scrub only free-text error/log fields in the evidence
-    # before rendering it into the LLM prompt. Metadata fields (schema, table/column
-    # names, counts) are left intact so diagnosis quality is preserved; only the
-    # error strings — the sole realistic row-value leak vector — are scrubbed. The
-    # Go producer already scrubs; this is a backstop for a new/forgotten field.
-    from src.utils.masking import scrub_error_for_llm as _scrub_ll
-
-    _FREETEXT_KEYS = {
-        "error", "last_error", "error_message", "stderr", "stdout", "logs", "log",
-        "message", "detail", "exception", "traceback", "output", "reason",
-    }
-
-    def _scrub_evidence(v):
-        if isinstance(v, dict):
-            return {
-                k: (_scrub_ll(x) if (k in _FREETEXT_KEYS and isinstance(x, str)) else _scrub_evidence(x))
-                for k, x in v.items()
-            }
-        if isinstance(v, list):
-            return [_scrub_evidence(x) for x in v]
-        return v
+    # Defense-in-depth (H6): scrub the free-text error/log fields in the evidence
+    # before rendering it into the LLM prompt. Metadata (schema, table/column names,
+    # counts) is left intact so diagnosis quality is preserved; the error strings are
+    # the realistic row-value leak vector. The Go producer scrubs at source; this is
+    # the backstop for a field it forgets -- and this endpoint takes an arbitrary
+    # evidence object from any caller that can reach llm-service, so the backstop is
+    # the only thing standing between such a caller and the prompt.
+    from src.utils.masking import scrub_evidence_for_llm
 
     try:
-        evidence_json = json.dumps(_scrub_evidence(request.evidence), indent=2, default=str)
+        evidence_json = json.dumps(scrub_evidence_for_llm(request.evidence), indent=2, default=str)
     except (TypeError, ValueError) as e:
         raise HTTPException(status_code=400, detail=f"evidence not JSON-serializable: {e}")
 
@@ -1923,13 +1902,15 @@ async def diagnose_pipeline(request: DiagnoseRequest):
             {"pipeline_id": request.pipeline_id, "evidence_json": evidence_json},
         )
         config = registry.get_config("diagnose/pipeline_failure")
+        max_tokens = with_reasoning_headroom(config["parameters"].get("max_tokens", 600))
         response = await default_client.chat.completions.create(
             model=resolve_model(config),
             messages=messages,
             temperature=config["parameters"].get("temperature", 0.2),
-            max_tokens=config["parameters"].get("max_tokens", 600),
+            max_tokens=max_tokens,
         )
         text = (response.choices[0].message.content or "").strip()
+        cut_off = warn_if_cut_off(response, prompt="diagnose/pipeline_failure", max_tokens=max_tokens)
     except FileNotFoundError as e:
         raise HTTPException(status_code=500, detail=f"diagnose prompt missing: {e}")
     except Exception as e:
@@ -1952,6 +1933,20 @@ async def diagnose_pipeline(request: DiagnoseRequest):
             evidence_pointers=[str(p) for p in (parsed.get("evidence_pointers") or [])][:5],
         )
     except json.JSONDecodeError:
+        if cut_off:
+            # The model ran out of tokens mid-answer. Saying it ignored the JSON
+            # format would send the reader after the prompt instead.
+            return DiagnoseResponse(
+                summary="(the model's answer was cut off before it finished)",
+                root_cause=text[:1500],
+                suggested_action=(
+                    "Re-run the diagnosis. If it is cut off again, raise "
+                    "LLM_REASONING_TOKEN_HEADROOM on llm-service: a thinking model "
+                    "spends that budget reasoning before it answers."
+                ),
+                confidence="low",
+                raw=text,
+            )
         # Model didn't comply with JSON-only — return raw text so UI can still
         # display something useful instead of a 500.
         return DiagnoseResponse(
@@ -2104,17 +2099,19 @@ async def completion(request: PromptRequest):
             config = registry.get_config(request.prompt_name)
             
             model = resolve_model(config, request.model_override)
-            
+            max_tokens = with_reasoning_headroom(config["parameters"].get("max_tokens", 1024))
+
             response = await default_client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=config["parameters"].get("temperature", 0.7),
-                max_tokens=config["parameters"].get("max_tokens", 1024),
+                max_tokens=max_tokens,
             )
             
             # 3. Return Result
             result = response.choices[0].message.content
             usage = response.usage
+            warn_if_cut_off(response, prompt=request.prompt_name, max_tokens=max_tokens)
 
             # Cost tracking + atomic per-user quota charge (best-effort, non-blocking)
             try:
@@ -2135,6 +2132,8 @@ async def completion(request: PromptRequest):
             return {
                 "content": result,
                 "model": model,
+                # "length" means the reply stopped at max_tokens, not where the model finished.
+                "finish_reason": getattr(response.choices[0], "finish_reason", None),
                 "usage": {
                     "prompt_tokens": usage.prompt_tokens,
                     "completion_tokens": usage.completion_tokens,
@@ -2293,7 +2292,7 @@ async def _generate_query_spec(question: str, dialect: str, tables: list[dict], 
             model=EXPLORER_QUERY_SPEC_MODEL,
             messages=messages,
             temperature=temperature,
-            max_tokens=cfg["parameters"].get("max_tokens", 1024),
+            max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
         )
         content = (response.choices[0].message.content or "").strip()
         if not content:
@@ -2303,7 +2302,7 @@ async def _generate_query_spec(question: str, dialect: str, tables: list[dict], 
                 model=EXPLORER_QUERY_SPEC_MODEL,
                 prompt=prompt_text,
                 temperature=temperature,
-                max_tokens=cfg["parameters"].get("max_tokens", 1024),
+                max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
             )
             content = (getattr(resp2.choices[0], "text", "") or "").strip()
 
@@ -2358,7 +2357,7 @@ async def _repair_query_spec(
         model=EXPLORER_QUERY_SPEC_MODEL,
         messages=messages,
         temperature=cfg["parameters"].get("temperature", 0.0),
-        max_tokens=cfg["parameters"].get("max_tokens", 1024),
+        max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
     )
     content = (response.choices[0].message.content or "").strip()
     if not content:
@@ -2367,7 +2366,7 @@ async def _repair_query_spec(
             model=EXPLORER_QUERY_SPEC_MODEL,
             prompt=prompt_text,
             temperature=cfg["parameters"].get("temperature", 0.0),
-            max_tokens=cfg["parameters"].get("max_tokens", 1024),
+            max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
         )
         content = (getattr(resp2.choices[0], "text", "") or "").strip()
 
@@ -2687,7 +2686,7 @@ async def generate_sql(request: SQLGenerateRequest):
             model = resolve_model(cfg, os.getenv("EXPLORER_SQL_OPENAI_MODEL"), sql_provider_resolved).strip()
 
         temperature = cfg["parameters"].get("temperature", request.temperature)
-        max_tokens = cfg["parameters"].get("max_tokens", request.max_tokens)
+        max_tokens = with_reasoning_headroom(cfg["parameters"].get("max_tokens", request.max_tokens))
 
         # Some Ollama models (notably sqlcoder) work reliably via /v1/completions rather than chat-completions.
         response = await sql_client.chat.completions.create(
@@ -2777,7 +2776,7 @@ async def generate_sql(request: SQLGenerateRequest):
                         repair_messages = registry.render_messages(repair_prompt, repair_vars)
                         repair_cfg = registry.get_config(repair_prompt)
                         repair_temperature = repair_cfg["parameters"].get("temperature", 0.0)
-                        repair_max_tokens = repair_cfg["parameters"].get("max_tokens", request.max_tokens)
+                        repair_max_tokens = with_reasoning_headroom(repair_cfg["parameters"].get("max_tokens", request.max_tokens))
                         repair_resp = await sql_client.chat.completions.create(
                             model=model,
                             messages=repair_messages,
@@ -2877,7 +2876,7 @@ async def generate_sql(request: SQLGenerateRequest):
             repair_messages = registry.render_messages(repair_prompt, repair_vars)
             repair_cfg = registry.get_config(repair_prompt)
             repair_temperature = repair_cfg["parameters"].get("temperature", 0.0)
-            repair_max_tokens = repair_cfg["parameters"].get("max_tokens", request.max_tokens)
+            repair_max_tokens = with_reasoning_headroom(repair_cfg["parameters"].get("max_tokens", request.max_tokens))
             repair_resp = await sql_client.chat.completions.create(
                 model=model,
                 messages=repair_messages,
@@ -2957,7 +2956,7 @@ async def generate_sql(request: SQLGenerateRequest):
                 repair_messages = registry.render_messages(repair_prompt, repair_vars)
                 repair_cfg = registry.get_config(repair_prompt)
                 repair_temperature = repair_cfg["parameters"].get("temperature", 0.0)
-                repair_max_tokens = repair_cfg["parameters"].get("max_tokens", request.max_tokens)
+                repair_max_tokens = with_reasoning_headroom(repair_cfg["parameters"].get("max_tokens", request.max_tokens))
 
                 repair_resp = await sql_client.chat.completions.create(
                     model=model,

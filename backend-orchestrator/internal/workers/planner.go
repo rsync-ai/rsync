@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -81,10 +80,6 @@ func NewPlannerWorker(kafkaManager *kafka.Manager, db *sql.DB) *PlannerWorker {
 	}
 }
 
-func (w *PlannerWorker) GetWorkerType() string {
-	return "planner"
-}
-
 func (w *PlannerWorker) Execute(ctx context.Context, task Task) TaskResult {
 	ctx, span := w.tracer.Start(ctx, "planner.execute",
 		trace.WithAttributes(
@@ -130,18 +125,6 @@ func (w *PlannerWorker) Execute(ctx context.Context, task Task) TaskResult {
 		},
 	}, 7*time.Second)
 	defer stopHeartbeat()
-
-	// Emit telemetry for LLM planning
-	w.emitTelemetry(ctx, TelemetryEvent{
-		TelemetryType: TelemetryProgressUpdate,
-		PipelineID:    task.PipelineID,
-		Agent:         "planner",
-		Timestamp:     time.Now(),
-		Data: map[string]interface{}{
-			"message": "Generating execution plan with LLM",
-		},
-		TraceID: task.TraceID,
-	})
 
 	// PHASE 3: Auto-select mode (batch vs CDC) before planning
 	modeDecision, modeErr := w.selectOptimalMode(ctx, task)
@@ -370,21 +353,10 @@ func (w *PlannerWorker) generatePlan(ctx context.Context, task Task, modeDecisio
 
 	startTime := time.Now()
 	resp, err := w.httpClient.Do(req)
-	latencyMs := time.Since(startTime).Milliseconds()
+	span.SetAttributes(attribute.Int64("llm.latency_ms", time.Since(startTime).Milliseconds()))
 
 	if err != nil {
 		span.RecordError(err)
-		w.emitTelemetry(ctx, TelemetryEvent{
-			TelemetryType: TelemetryLLMCall,
-			PipelineID:    task.PipelineID,
-			Agent:         "planner",
-			Timestamp:     time.Now(),
-			Data: map[string]interface{}{
-				"error":      err.Error(),
-				"latency_ms": latencyMs,
-			},
-			TraceID: task.TraceID,
-		})
 		return nil, fmt.Errorf("planner request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -482,110 +454,22 @@ func (w *PlannerWorker) generatePlan(ctx context.Context, task Task, modeDecisio
 		}
 	}
 
-	// Emit telemetry for successful LLM call
-	w.emitTelemetry(ctx, TelemetryEvent{
-		TelemetryType: TelemetryLLMCall,
-		PipelineID:    task.PipelineID,
-		Agent:         "planner",
-		Timestamp:     time.Now(),
-		Data: map[string]interface{}{
-			"latency_ms": latencyMs,
-			"plan_steps": len(plan["steps"].([]interface{})),
-		},
-		TraceID: task.TraceID,
-	})
-
 	span.SetStatus(codes.Ok, "Plan generated successfully")
 	return plan, nil
 }
 
-// emitTelemetry sends telemetry to pipeline.agent.telemetry topic
-func (w *PlannerWorker) emitTelemetry(ctx context.Context, event TelemetryEvent) {
-	telemetryJSON, err := json.Marshal(event)
-	if err != nil {
-		log.WithError(err).Warn("Failed to marshal telemetry event")
-		return
-	}
-
-	// Fire and forget - telemetry should not block task processing
-	go func() {
-		err := w.kafkaManager.Produce("pipeline.agent.telemetry", []byte(event.PipelineID), telemetryJSON)
-		if err != nil {
-			log.WithError(err).Warn("Failed to emit telemetry")
-		}
-	}()
-}
-
+// Start launches the Redis correlation poller, the only way planner requests
+// reach this worker (the Temporal adapter writes them to the correlation store).
 func (w *PlannerWorker) Start() error {
 	log.Info("🚀 Starting Planner Worker (with REAL LLM integration)")
 	log.Infof("   Planner Service: %s", w.plannerURL)
 
-	// Start Redis poller for V2 workflows (correlation pattern)
-	if w.correlationClient != nil {
-		go w.startRedisPoller()
-		log.Info("✅ PlannerWorker: Redis poller started for V2 correlation requests")
-	} else {
+	if w.correlationClient == nil {
 		log.Warn("⚠️  PlannerWorker: Correlation client not initialized - V2 workflows will not work")
-	}
-
-	// Consume from dedicated topic (no consumer group = no rebalancing)
-	return w.kafkaManager.ConsumeWithContext("agent.control.commands.planner", w.handleTask)
-}
-
-func (w *PlannerWorker) handleTask(ctx context.Context, msg *sarama.ConsumerMessage) error {
-	log.WithFields(log.Fields{
-		"topic":     msg.Topic,
-		"partition": msg.Partition,
-		"offset":    msg.Offset,
-	}).Info("🔍 Planner Worker: Received message")
-
-	var task Task
-	if err := json.Unmarshal(msg.Value, &task); err != nil {
-		log.WithError(err).Error("❌ Failed to unmarshal task")
-		return err
-	}
-
-	// V2 tasks are handled by the Redis correlation poller; the Kafka path is V1-only.
-	// Skipping here prevents double-execution (see KI-HYBRID-1).
-	if task.CorrelationID != "" {
-		log.WithField("correlation_id", task.CorrelationID).
-			Debug("⏭️  Skipping Kafka path for V2 task (handled by Redis correlation poller)")
 		return nil
 	}
-
-	log.WithFields(log.Fields{
-		"task_id":     task.TaskID,
-		"task_type":   task.TaskType,
-		"pipeline_id": task.PipelineID,
-	}).Info("✅ Task unmarshaled successfully")
-
-	// Filter: only process planning tasks
-	if task.TaskType != "create_plan" && task.TaskType != "plan_pipeline" {
-		log.WithFields(log.Fields{
-			"received_type": task.TaskType,
-			"expected_type": "create_plan or plan_pipeline",
-		}).Warn("⏭️  Task type mismatch, skipping")
-		return nil
-	}
-
-	// Execute the task
-	result := w.Execute(ctx, task)
-
-	// Route result to correlation store (V2) or Kafka (V1)
-	if err := RouteResult(ctx, task, result, w.kafkaManager); err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"task_id":        task.TaskID,
-			"correlation_id": task.CorrelationID,
-		}).Error("Failed to route result")
-		return err
-	}
-
-	log.WithFields(log.Fields{
-		"task_id":     task.TaskID,
-		"pipeline_id": task.PipelineID,
-		"status":      result.Status,
-	}).Info("📤 Sent result to orchestrator")
-
+	go w.startRedisPoller()
+	log.Info("✅ PlannerWorker: Redis poller started for V2 correlation requests")
 	return nil
 }
 

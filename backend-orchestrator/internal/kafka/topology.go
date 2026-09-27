@@ -2,13 +2,16 @@ package kafka
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/IBM/sarama"
+	"github.com/rsync-ai/backend-orchestrator/internal/config"
 	kafkaclient "github.com/rsync-ai/shared/kafkaclient"
 	"github.com/rsync-ai/shared/kafkaclient/saramaauth"
 	log "github.com/sirupsen/logrus"
@@ -24,9 +27,8 @@ type TopicConfig struct {
 	// KeepExistingPartitions leaves an already-existing topic exactly as it is
 	// instead of growing it to Partitions.
 	//
-	// Growing partitions is safe for the control topics this package mints itself
-	// (they are keyless, and the point of EnsureAgentControlTopics is that a
-	// 1-partition auto-created topic starves every consumer but one). It is NOT
+	// Growing partitions is safe only for a keyless topic, where a 1-partition
+	// auto-created topic would starve every consumer in a group but one. It is NOT
 	// safe for a topic that carries KEYED data: Kafka hashes a key modulo the
 	// partition count, so adding partitions silently re-routes a key to a
 	// different partition and destroys the per-key ordering CDC depends on. The
@@ -112,11 +114,11 @@ func normalizeTopicConfig(cfg *TopicConfig, brokerCount int) error {
 // confineTopicName decides the name a topic is actually created under.
 //
 // There are two kinds of name here and conflating them is the bug this splits
-// apart. A name this package DERIVES (agent.control.commands.planner,
-// pipeline.<id8>.data, whatever the planner POSTs) is ours to place, so it gets
-// qualified into the deployment's namespace -- that is what makes the topics this
-// product creates on a customer's shared cluster identifiable, and what gives the
-// confinement allowlist in the topology handlers something to defend.
+// apart. A name this package DERIVES (pipeline.<id8>.data, whatever the planner
+// POSTs) is ours to place, so it gets qualified into the deployment's namespace --
+// that is what makes the topics this product creates on a customer's shared cluster
+// identifiable, and what gives the confinement allowlist in the topology handlers
+// something to defend.
 //
 // A name another component already OWNS is different. Debezium's topic.prefix is
 // computed inside the connector and the incremental-snapshot signal topic is minted
@@ -261,7 +263,7 @@ func (tm *TopologyManager) EnsureTopic(ctx context.Context, cfg TopicConfig) err
 
 // ensureTopicLocked is the ONLY place in this service that asks Kafka to create a
 // topic. Every other entry point -- TopologyManager.CreateTopic behind
-// POST /api/v1/topology/topics, CreateTopicForPipeline, EnsureAgentControlTopics,
+// POST /api/v1/topology/topics, EnsurePlatformTopics,
 // and Manager.EnsureTopicExists on the CDC pre-creation path -- funnels through it.
 //
 // It is one function because the alternative was tried and failed silently: there
@@ -329,201 +331,108 @@ func (tm *TopologyManager) ensureTopicLocked(ctx context.Context, cfg TopicConfi
 	return nil
 }
 
-// EnsureAgentControlTopics provisions the orchestrator/Temporal control topics needed for
-// agent command routing and workflow result signaling.
+// Platform topic geometry, shared by every topic EnsurePlatformTopics creates.
 //
-// This is required for horizontal scaling: if these topics are auto-created with 1 partition,
-// only one consumer in the group will receive work.
-func (tm *TopologyManager) EnsureAgentControlTopics(ctx context.Context, partitions int32) error {
-	partitions = defaultIfZeroI32(partitions, 3)
+// The width and retention are NOT free choices: scripts/kafka-init-new-topics.sh,
+// the Helm kafka-init job (deploy/helm/rsync-ai/templates/jobs/kafka-init.yaml) and
+// docker-compose.quickstart.yml create the same topics, none of them ALTERs an
+// existing one, so whichever runs first on a deployment wins permanently. On BYO
+// Kafka there is no kafka-init container and this function is the ONLY creator, so a
+// divergence would not be a race, it would be a guarantee.
+// topology_retention_contract_test.go reads all three provisioners and fails if any
+// of them disagrees with these values for pipeline.domain.events.
+const (
+	platformTopicPartitions = 3           // keyed records; only applies at CREATE
+	platformTopicRetention  = "604800000" // 7 days
+)
 
+// platformTopicConfig is the config every platform topic is created with.
+// pipeline.domain.events carries the api-gateway read-model projection; 7 days is
+// the replay window the provisioners above agree on.
+func platformTopicConfig() map[string]string {
+	return map[string]string{
+		"cleanup.policy":   "delete",
+		"retention.ms":     platformTopicRetention,
+		"compression.type": "snappy",
+	}
+}
+
+// PlatformTopicNames lists the steady-state topics EnsurePlatformTopics creates,
+// unqualified: the four every install has, plus the three rsync.healer.* topics of
+// the schema-drift loop when config.SchemaDriftEnabled() reports it on.
+//
+//	pipeline.domain.events        pipeline lifecycle events, projected by api-gateway
+//	rsync.notifications           every Slack and email alert the platform sends
+//	pii.scan.request              api-gateway -> llm-service PII scanner
+//	pii.scan.response             llm-service PII scanner -> api-gateway
+//	rsync.healer.schema-changes   drift detected (sink worker, executor, cdcstats) -> healer
+//	rsync.healer.approved-changes a user approved a DDL (api-gateway) -> healer
+//	rsync.healer.results          healer outcome -> api-gateway notifier
+//
+// The healer topics are gated because their producers and consumers are: with the
+// flag off nothing reads or writes them, and a topic created anyway is one an
+// operator has to account for on a customer-managed cluster.
+func PlatformTopicNames() []string {
+	names := []string{
+		"pipeline.domain.events",
+		"rsync.notifications",
+		"pii.scan.request",
+		"pii.scan.response",
+	}
+	if config.SchemaDriftEnabled() {
+		names = append(names,
+			"rsync.healer.schema-changes",
+			"rsync.healer.approved-changes",
+			"rsync.healer.results",
+		)
+	}
+	return names
+}
+
+// EnsurePlatformTopics creates the steady-state platform topics this and the sibling
+// services produce to and consume from (PlatformTopicNames), each at
+// platformTopicPartitions with platformTopicConfig.
+//
+// It exists because on a customer-managed cluster nothing else does: with
+// auto.create.topics.enable=false the first produce is rejected, and with it on a
+// topic is born carrying the BROKER's defaults, including a min.insync.replicas that
+// may exceed its replication factor and make it permanently unwritable -- which for
+// rsync.notifications means the mechanism that would have told somebody is the thing
+// that stopped working.
+//
+// KeepExistingPartitions on every topic: their records are keyed (pipeline id, issue
+// id), so widening a live topic would re-hash keys onto other partitions and let two
+// consumers act on one pipeline concurrently. Re-sizing an existing topic is a
+// separate decision from creating a new one, and this is only the second.
+//
+// A failed create does not stop the others: every topic is attempted and the
+// failures come back together (errors.Join), so one topic the broker refuses cannot
+// leave the rest of the platform uncreated. main.go calls this before any consumer of
+// these topics starts, because a consumer-group subscription auto-creates the topic
+// it joins at the broker's defaults.
+func (tm *TopologyManager) EnsurePlatformTopics(ctx context.Context) error {
 	// Replication factor: whatever KAFKA_REPLICATION_FACTOR asks for, else derived
-	// from the live broker count as before. EnsureTopic clamps it either way.
+	// from the live broker count. EnsureTopic clamps it either way.
 	rf := replicationDefaults().forCluster(len(tm.client.Brokers()))
 
-	// Commands are transient; keep retention limited.
-	commandsConfig := map[string]string{
-		"cleanup.policy":   "delete",
-		"retention.ms":     "86400000", // 1 day
-		"compression.type": "snappy",
-	}
-	// Results must exist for the Temporal adapter (KafkaAdapter) to signal workflows.
-	resultsConfig := map[string]string{
-		"cleanup.policy":   "delete",
-		"retention.ms":     "86400000", // 1 day
-		"compression.type": "snappy",
-	}
-
-	topics := []TopicConfig{
-		{Name: "agent.control.commands.intent", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-		{Name: "agent.control.commands.resolver", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-		{Name: "agent.control.commands.discovery", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-		{Name: "agent.control.commands.planner", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-		{Name: "agent.control.commands.validator", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-		{Name: "agent.control.commands.executor", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-		{Name: "agent.control.commands.cost_estimator", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-		{Name: "agent.control.commands.capability_resolver", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-		{Name: "agent.control.commands.connection_validator", Partitions: partitions, ReplicationFactor: rf, Config: commandsConfig},
-
-		// Results topic used by V1 adapter path (and still useful for observability).
-		{Name: "agent.control.results", Partitions: partitions, ReplicationFactor: rf, Config: resultsConfig},
-		// DLQ for failed activities (Temporal adapter helper).
-		{Name: "agent.failed.dlq", Partitions: partitions, ReplicationFactor: rf, Config: resultsConfig},
-	}
-
-	// The steady-state topics the orchestrator produces to but nothing ever created.
-	//
-	// They existed only because the broker auto-created them on first produce, which
-	// is a setting this platform does not own on a customer-managed cluster: with
-	// auto.create.topics.enable=false the produce is rejected, and with it on they are
-	// born carrying the BROKER's defaults, including a min.insync.replicas that may
-	// exceed their replication factor and make them permanently unwritable. Naming
-	// them here is what lets the setting be turned off.
-	//
-	// KeepExistingPartitions on all three: they carry KEYED records (pipeline id,
-	// task id), so widening a LIVE topic would re-hash keys onto other partitions
-	// and let two consumers process one pipeline's events concurrently. Re-sizing
-	// an existing topic is a separate decision from creating a new one, and this is
-	// only the second.
-	//
-	// The width and retention below are NOT free choices -- two other provisioners
-	// already create two of these topics, and neither ALTERs an existing one, so
-	// whichever runs first wins permanently. On the deployment this whole change
-	// targets (BYO Kafka, no kafka-init container) the orchestrator is the ONLY
-	// creator, so a divergence here is not a race, it is a guarantee. The values
-	// must therefore match, verbatim:
-	//
-	//	pipeline.domain.events    scripts/kafka-init-new-topics.sh:185  retention -1
-	//	                          docker-compose.quickstart.yml:489     --partitions 3
-	//	pipeline.agent.telemetry  scripts/kafka-init-new-topics.sh:189  retention 7d
-	//	                          scripts/kafka-init-new-topics.sh:150  --partitions $PARTITIONS (3)
-	//
-	// pipeline.domain.events is the canonical event log the api-gateway projector
-	// and websocket bridge rebuild read models from. Creating it with the 1-day
-	// commands/results retention would silently discard that history after a day --
-	// produce and consume both keep working and the loss surfaces only when a read
-	// model is rebuilt and comes back empty.
-	const (
-		keyedPartitions  = 3 // matches kafka-init / quickstart; only applies at CREATE
-		retentionForever = "-1"
-		retentionSevenD  = "604800000"
-	)
-	eventLogConfig := map[string]string{
-		"cleanup.policy":   "delete",
-		"retention.ms":     retentionForever, // canonical event log -- never expire
-		"compression.type": "snappy",
-	}
-	telemetryConfig := map[string]string{
-		"cleanup.policy":   "delete",
-		"retention.ms":     retentionSevenD, // 7 days, per kafka-init-new-topics.sh:188
-		"compression.type": "snappy",
-	}
-	// agent.executor.responses has no second provisioner, so there is no value to
-	// match -- but it was auto-created, which means it inherited the BROKER's
-	// retention. 7 days is Kafka's own default, so naming it explicitly preserves
-	// what a default broker already gave it rather than narrowing it to 1 day.
-	// One partition, because auto-creation gave it one and its records are keyed.
-	topics = append(topics,
-		// Executor task results, consumed by the agent consumer registry.
-		TopicConfig{Name: "agent.executor.responses", Partitions: 1,
-			ReplicationFactor: rf, Config: telemetryConfig, KeepExistingPartitions: true},
-		// Pipeline lifecycle events, projected into api-gateway read models.
-		TopicConfig{Name: "pipeline.domain.events", Partitions: keyedPartitions,
-			ReplicationFactor: rf, Config: eventLogConfig, KeepExistingPartitions: true},
-		// Per-agent telemetry.
-		TopicConfig{Name: "pipeline.agent.telemetry", Partitions: keyedPartitions,
-			ReplicationFactor: rf, Config: telemetryConfig, KeepExistingPartitions: true},
-	)
-
-	// The notification and healer family, for the same reason as the three above:
-	// nothing has ever created them, so they exist only where a broker auto-created
-	// them on first produce. They are listed later than the rest because they were
-	// the last to be noticed -- the scan in topology_produce_targets_test.go finds
-	// produce targets written as LITERALS, and all but rsync.notifications are
-	// produced through exported constants (healer.go:50-52, sentinel.go:23-24), so
-	// they were invisible to the check that caught the others.
-	//
-	// This is the family a customer actually feels. rsync.notifications is every
-	// Slack and email alert the platform sends; rsync.healer.{actions,results} is
-	// the self-healing control loop. On a cluster with auto.create.topics.enable
-	// off, the first produce to any of them is rejected and alerting is dead on
-	// arrival. On a cluster with it on and the common MSK default of
-	// min.insync.replicas=2 over an RF=1 topic, they are created, listed and
-	// subscribable but permanently unwritable -- which is worse, because the
-	// deployment looks healthy and the thing that has stopped working is the
-	// mechanism that would have told somebody.
-	//
-	// Retention deliberately matches what a default broker already gives them
-	// (7 days, Kafka's own default) rather than the 1 day the commands/results
-	// topics use. Naming a value here makes it explicit without changing what any
-	// existing deployment has, which is the same reasoning agent.executor.responses
-	// carries above. KeepExistingPartitions for all of them: their records are
-	// keyed (issue id, pipeline id, agent id), so widening a live topic would
-	// re-hash keys onto other partitions and let two healers act on one issue.
-	//
-	// approved-changes and schema-changes are produced by OTHER services
-	// (api-gateway's schema_evolution handler and the kafka sink worker), not by
-	// this one, so the scan cannot see them at all. They are provisioned here
-	// because this is the only service on a BYO-Kafka deployment that manages
-	// topology -- there is no kafka-init container to fall back on.
-	notificationConfig := telemetryConfig
-	for _, name := range []string{
-		"rsync.notifications",           // healer.go:1318, healthwatch/watchdog.go:333, sentinel/cdc_wal_watchdog.go:369
-		"rsync.healer.actions",          // healer.go ActionTopic
-		"rsync.healer.results",          // healer.go ResultsTopic
-		"rsync.healer.approved-changes", // produced by api-gateway/internal/handlers/schema_evolution.go
-		"rsync.healer.schema-changes",   // produced by the kafka-mcp-sink worker
-		"rsync.agents.heartbeat",        // sentinel.go / common/heartbeat.go
-		"rsync.sentinel.audit",          // sentinel.go AuditTopic
-	} {
-		topics = append(topics, TopicConfig{
-			Name: name, Partitions: keyedPartitions, ReplicationFactor: rf,
-			Config: notificationConfig, KeepExistingPartitions: true,
-		})
-	}
-
-	// Cross-service steady-state topics: produced or consumed by api-gateway, the
-	// Temporal adapter and llm-service, and provisioned here for the same reason as
-	// the healer family above -- on a BYO-Kafka or Kubernetes deployment there is no
-	// kafka-init container, so this is the only thing that creates a topic.
-	//
-	// Three of these values are NOT free choices. docker-compose.quickstart.yml:214-216
-	// creates agent.planner.responses, pipeline.domain.events and pii.scan.response
-	// with --partitions 3 and no --config, so they inherit the broker's default
-	// retention. Neither creator ALTERs an existing topic, so whichever runs first on
-	// a given deployment wins permanently, and a divergence here would mean the same
-	// topic has different geometry depending on which path installed it. 3 partitions
-	// and 7-day retention is what that file already produces on a default broker, so
-	// these match it rather than restating it differently.
-	//
-	// pii.scan.request and pipeline.failed.dlq are created by NOTHING today, on any
-	// path including quickstart -- they have only ever existed by auto-creation.
-	//
-	// pipeline.failed.dlq gets 7 days rather than the 1 day its sibling agent.failed.dlq
-	// uses above. A dead-letter queue is read when somebody investigates, which is
-	// rarely within a day of the failure, and 7 days is what a default broker already
-	// gives this topic today -- so this preserves current behavior rather than
-	// narrowing it. agent.failed.dlq is left alone deliberately: changing the retention
-	// of a topic that already exists is a separate decision from naming a new one, and
-	// this is only the second.
-	for _, name := range []string{
-		"agent.planner.responses", // llm-service planner -> api-gateway (main.go:455)
-		"pii.scan.request",        // api-gateway (pii.go:300) -> llm-service PII scanner
-		"pii.scan.response",       // llm-service PII scanner -> api-gateway (main.go:455)
-		"pipeline.failed.dlq",     // backend-temporal-adapter (workflows/activities.go:169)
-	} {
-		topics = append(topics, TopicConfig{
-			Name: name, Partitions: keyedPartitions, ReplicationFactor: rf,
-			Config: telemetryConfig, KeepExistingPartitions: true,
-		})
-	}
-
-	for _, t := range topics {
-		if err := tm.EnsureTopic(ctx, t); err != nil {
-			return err
+	var errs []error
+	for _, name := range PlatformTopicNames() {
+		if err := ctx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("platform topic %s: %w", name, err))
+			continue
+		}
+		cfg := TopicConfig{
+			Name:                   name,
+			Partitions:             platformTopicPartitions,
+			ReplicationFactor:      rf,
+			Config:                 platformTopicConfig(),
+			KeepExistingPartitions: true,
+		}
+		if err := tm.EnsureTopic(ctx, cfg); err != nil {
+			errs = append(errs, fmt.Errorf("platform topic %s: %w", name, err))
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // CreateTopic creates a Kafka topic with the specified configuration
@@ -543,103 +452,6 @@ func (tm *TopologyManager) CreateTopic(ctx context.Context, config TopicConfig) 
 	// business performing implicitly; UpdatePartitions is the explicit route.
 	config.KeepExistingPartitions = true
 	return tm.ensureTopicLocked(ctx, config)
-}
-
-// CreateTopicForPipeline creates an optimally configured topic for a pipeline
-// This is the main entry point for plan-time topic provisioning
-func (tm *TopologyManager) CreateTopicForPipeline(ctx context.Context, pipelineID string, syncMode string, tableCount int, estimatedSizeGB float64) (*TopicInfo, error) {
-	// Calculate optimal partitions
-	partitions := tm.calculateOptimalPartitions(syncMode, tableCount, estimatedSizeGB)
-
-	// Generate topic name
-	topicName := tm.generateTopicName(pipelineID, syncMode)
-
-	// Determine topic config based on sync mode
-	topicConfig := tm.getTopicConfigForMode(syncMode)
-
-	config := TopicConfig{
-		Name:       topicName,
-		Partitions: int32(partitions),
-		// KAFKA_REPLICATION_FACTOR if the operator set one, else derived from the
-		// live broker count as before. CreateTopic clamps it either way.
-		ReplicationFactor: replicationDefaults().forCluster(len(tm.client.Brokers())),
-		Config:            topicConfig,
-	}
-
-	// Create the topic
-	if err := tm.CreateTopic(ctx, config); err != nil {
-		return nil, err
-	}
-
-	return &TopicInfo{
-		Name:              topicName,
-		Partitions:        partitions,
-		ReplicationFactor: int(config.ReplicationFactor),
-		Config:            topicConfig,
-	}, nil
-}
-
-// calculateOptimalPartitions calculates optimal partition count
-// Based on the Kafka Topology Strategy document
-func (tm *TopologyManager) calculateOptimalPartitions(syncMode string, tableCount int, estimatedSizeGB float64) int {
-	const (
-		MinPartitions  = 3
-		MaxPartitions  = 50
-		GBPerPartition = 2.0
-	)
-
-	var partitions int
-
-	if syncMode == "cdc" || syncMode == "streaming" {
-		// CDC: Partition by table count for ordering guarantee per table
-		partitions = max(MinPartitions, tableCount)
-	} else {
-		// Batch: Partition by data size for parallelism
-		partitions = max(MinPartitions, int(estimatedSizeGB/GBPerPartition))
-	}
-
-	// Apply bounds
-	partitions = min(partitions, MaxPartitions)
-	partitions = max(partitions, MinPartitions)
-
-	log.Infof("📐 Calculated partitions: %d (mode=%s, tables=%d, size=%.1fGB)",
-		partitions, syncMode, tableCount, estimatedSizeGB)
-
-	return partitions
-}
-
-// generateTopicName generates a standardized topic name
-func (tm *TopologyManager) generateTopicName(pipelineID string, syncMode string) string {
-	shortID := pipelineID
-	if len(pipelineID) > 8 {
-		shortID = pipelineID[:8]
-	}
-
-	if syncMode == "cdc" || syncMode == "streaming" {
-		return kafkaclient.Topic(fmt.Sprintf("cdc.%s", shortID))
-	}
-	return kafkaclient.Topic(fmt.Sprintf("pipeline.%s.data", shortID))
-}
-
-// getTopicConfigForMode returns topic configuration based on sync mode
-func (tm *TopologyManager) getTopicConfigForMode(syncMode string) map[string]string {
-	// KAFKA_MIN_INSYNC_REPLICAS if the operator set one, else the historical 1.
-	// Whatever comes out is still clamped to the topic's final RF at creation.
-	misr := strconv.Itoa(replicationDefaults().minInsyncReplicasOr(1))
-	if syncMode == "cdc" || syncMode == "streaming" {
-		return map[string]string{
-			"cleanup.policy":     "compact", // Keep latest value per key
-			"retention.ms":       "-1",      // Infinite retention for CDC
-			minInsyncReplicasKey: misr,      // At least this many replicas must ack
-			"compression.type":   "snappy",  // Good balance of speed/ratio
-		}
-	}
-	return map[string]string{
-		"cleanup.policy":     "delete",    // Delete old messages
-		"retention.ms":       "604800000", // 7 days for batch
-		minInsyncReplicasKey: misr,
-		"compression.type":   "snappy",
-	}
 }
 
 // ListTopics returns all topics with their info
@@ -864,4 +676,106 @@ func SinkBootstrapServers() string {
 		return "kafka:29092"
 	}
 	return strings.Join(security.Brokers, ",")
+}
+
+// TopicConsumerGroups returns the consumer groups with a live member that is
+// subscribed to, or assigned partitions of, topic. A topic that one of them still
+// reads must not be deleted: the member's next metadata request would auto-create
+// it again on a broker with auto.create.topics.enable, and a consumer may lose
+// messages it has not applied yet.
+func (tm *TopologyManager) TopicConsumerGroups(ctx context.Context, topic string) ([]string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
+	tm.mu.RLock()
+	defer tm.mu.RUnlock()
+
+	listed, err := tm.admin.ListConsumerGroups()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list consumer groups: %w", err)
+	}
+	names := make([]string, 0, len(listed))
+	for name, protocolType := range listed {
+		// Kafka Connect workers ("connect") and other non-consumer protocols carry
+		// no topic subscription in the consumer wire format.
+		if protocolType == "" || protocolType == "consumer" {
+			names = append(names, name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	described, err := tm.admin.DescribeConsumerGroups(names)
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe consumer groups: %w", err)
+	}
+	return groupsReadingTopic(described, topic), nil
+}
+
+// groupsReadingTopic is TopicConsumerGroups' decision over described groups: a
+// group reads topic when any member's subscription or assignment names it. A
+// member whose metadata cannot be decoded counts as reading it — an unknown
+// consumer keeps the topic rather than risk deleting what it reads.
+func groupsReadingTopic(described []*sarama.GroupDescription, topic string) []string {
+	var out []string
+	for _, g := range described {
+		if g == nil || (g.ProtocolType != "" && g.ProtocolType != "consumer") {
+			continue
+		}
+		for _, m := range g.Members {
+			if memberReadsTopic(m, topic) {
+				out = append(out, g.GroupId)
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func memberReadsTopic(m *sarama.GroupMemberDescription, topic string) bool {
+	if m == nil {
+		return false
+	}
+	meta, merr := m.GetMemberMetadata()
+	if merr == nil && meta != nil {
+		for _, t := range meta.Topics {
+			if t == topic {
+				return true
+			}
+		}
+	}
+	asg, aerr := m.GetMemberAssignment()
+	if aerr == nil && asg != nil {
+		if _, ok := asg.Topics[topic]; ok {
+			return true
+		}
+	}
+	return merr != nil && aerr != nil
+}
+
+// SetTopicConfig sets per-topic configuration on an existing topic
+// (IncrementalAlterConfigs SET), leaving every other override as it is.
+func (tm *TopologyManager) SetTopicConfig(ctx context.Context, name string, entries map[string]string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	alter := make(map[string]sarama.IncrementalAlterConfigsEntry, len(entries))
+	for k, v := range entries {
+		v := v
+		alter[k] = sarama.IncrementalAlterConfigsEntry{Operation: sarama.IncrementalAlterConfigsOperationSet, Value: &v}
+	}
+	if err := tm.admin.IncrementalAlterConfig(sarama.TopicResource, name, alter, false); err != nil {
+		return fmt.Errorf("failed to set config on topic '%s': %w", name, err)
+	}
+	delete(tm.topicCache, name)
+	return nil
 }

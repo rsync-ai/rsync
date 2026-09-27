@@ -145,6 +145,22 @@ function formatDuration(ms: number | undefined): string | null {
   return sharedFormatDuration(ms)
 }
 
+/**
+ * The instant a live ticker counts from, or `null` when we do not know it.
+ *
+ * `startedAt ? new Date(startedAt).getTime() : Date.now()` counted from the
+ * MOUNT when the stage had no start time, and the result was rendered under the
+ * word "elapsed". Remounting the view (navigating back to a pipeline, a rerender
+ * after sleep) restarted the count, so a stage that had been running for forty
+ * minutes read "12s elapsed". A remount is not a restart, and an unparseable
+ * timestamp is not zero -- both are "unknown", and the caller renders nothing.
+ */
+export function resolveElapsedBase(startedAt?: string): number | null {
+  if (!startedAt) return null
+  const t = new Date(startedAt).getTime()
+  return Number.isFinite(t) ? t : null
+}
+
 function elapsedSince(iso?: string): string | null {
   if (!iso) return null
   const t = new Date(iso).getTime()
@@ -181,6 +197,9 @@ function StageIcon({ status }: { status: string }) {
       return <Clock className="h-5 w-5 text-gray-400" />
   }
 }
+
+// A run in one of these has ended; its status is final, whatever progress says.
+const TERMINAL_RAW_STATUSES = new Set(['completed', 'failed', 'cancelled', 'canceled', 'cancelling', 'stopped'])
 
 function PipelineStatusBadge({ status }: { status: string }) {
   switch (status) {
@@ -321,9 +340,11 @@ function getCurrentStageId(state: PipelineState): string | null {
 // infra_preflight is run by the executor worker before data transfer, NOT the planner.
 // It is never added to execution_plan.stages, so we inject it as a synthetic stage
 // between validator and executor when the current_stage is infra_preflight or executor.
-function withInfraPreflight(
+export function withInfraPreflight(
   stages: NonNullable<PipelineState['execution_plan']>['stages'],
   currentStage: string | null,
+  pipelineStatus?: string,
+  pipelineError?: string,
 ): NonNullable<PipelineState['execution_plan']>['stages'] {
   if (stages.some((s) => s.id === 'infra_preflight')) return stages // already present
 
@@ -335,6 +356,20 @@ function withInfraPreflight(
   const syntheticOrder = (prevOrder + executorOrder) / 2
 
   const isActive = currentStage === 'infra_preflight'
+
+  // A FAILED preflight is the case this synthetic stage used to render as a
+  // spinner that never stopped. ExecutorWorker returns a failed TaskResult when
+  // preflight.Run errors (backend-orchestrator/internal/workers/executor.go:167),
+  // so the pipeline goes to `failed` while current_stage stays pinned at
+  // 'infra_preflight' -- and `isActive ? 'running'` rendered a dead run as live
+  // infrastructure work in progress. Ask the run's own outcome first.
+  const isFailed =
+    isActive && (pipelineStatus === 'failed' || pipelineStatus === 'cancelled')
+
+  // `complete` is still inferred from the executor, and that inference is sound
+  // rather than positional guesswork: the executor stage is only reached after
+  // preflight.Run returns nil, so an executor that is running or done IS
+  // preflight's own successful result, observed one stage downstream.
   const isPast = currentStage === 'executor' ||
     stages.some((s) => s.id === 'executor' && (s.status === 'running' || s.status === 'complete'))
 
@@ -344,7 +379,8 @@ function withInfraPreflight(
     description: 'Starting MCP servers, Kafka Connect, and required infrastructure',
     icon: '⚙️',
     order: syntheticOrder,
-    status: isActive ? 'running' : isPast ? 'complete' : 'pending',
+    status: isFailed ? 'failed' : isActive ? 'running' : isPast ? 'complete' : 'pending',
+    ...(isFailed && pipelineError ? { error_message: pipelineError } : {}),
   } as NonNullable<PipelineState['execution_plan']>['stages'][number]
 
   const result = [...stages]
@@ -365,6 +401,8 @@ function getVisibleStages(state: PipelineState): NonNullable<PipelineState['exec
       .filter((s) => s?.id !== 'connection_validator')
       .sort((a, b) => (a.order || 0) - (b.order || 0)),
     currentStageId,
+    state.status,
+    state.error_message,
   )
 
   // If pipeline finished, show all stages (audit trail)
@@ -483,9 +521,16 @@ function StageActivityPanel({
   const [lastEvent, setLastEvent] = useState<string | null>(null)
   const isExecutor = stageId === 'executor'
 
-  // Tick elapsed time every second
+  // Tick elapsed time every second -- but only when we know when the stage
+  // actually started (see resolveElapsedBase). With no usable start time the
+  // `{elapsed && ...}` span drops out entirely; the animated bar still says the
+  // stage is live, without putting a number on it.
   useEffect(() => {
-    const base = startedAt ? new Date(startedAt).getTime() : Date.now()
+    const base = resolveElapsedBase(startedAt)
+    if (base === null) {
+      setElapsed("")
+      return
+    }
     const tick = () => {
       // The shared formatter, so a stage's live ticker and the figure frozen
       // beside it when the stage finishes are in the same units.
@@ -503,7 +548,7 @@ function StageActivityPanel({
     const poll = async () => {
       try {
         const res = await authFetch(
-          `${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events?limit=3`,
+          `${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?limit=3`,
           { cache: "no-store" }
         )
         if (!res.ok || cancelled) return
@@ -624,15 +669,40 @@ export function PipelineAccordionView({
   }, [])
 
   // Normalize status defensively: some backends may lag setting `status=completed`
-  // even when progress/current_stage indicates completion.
+  // even when progress/current_stage indicates completion. Only a run that has not
+  // ended yet: the post-run check fails a run after current_stage='completed' and
+  // percent=100 are written, and this turned that failed run into a green
+  // "Completed" (prod 65f0c413, 2026-09-26).
   const normalizedState = useMemo(() => {
     const raw = String(state.status || '')
     const pct = Number(state.progress?.percent)
     const stage = String(state.current_stage || '')
-    const shouldForceCompleted = raw !== 'completed' && (stage === 'completed' || pct === 100)
+    const shouldForceCompleted =
+      !TERMINAL_RAW_STATUSES.has(raw.toLowerCase()) && (stage === 'completed' || pct === 100)
     if (!shouldForceCompleted) return state
     return { ...state, status: 'completed' }
   }, [state])
+
+  // What the card says when the backend sent no message, and the step count. A
+  // finished run said "Processing pipeline..." and "7/8 steps" beside its
+  // "Completed" badge: the fallback assumed a run in flight, and the step
+  // columns lag the plan (activities.go). A failed run's error_message has its
+  // own box below, so the line does not repeat it.
+  const statusLine =
+    normalizedState.message ||
+    normalizedState.summary ||
+    (normalizedState.status === 'completed'
+      ? 'Pipeline completed'
+      : normalizedState.status === 'failed'
+        ? 'Pipeline failed'
+        : normalizedState.status === 'cancelled'
+          ? 'Pipeline cancelled'
+          : 'Processing pipeline...')
+  const totalSteps = normalizedState.progress?.total_steps
+  const currentStep =
+    normalizedState.status === 'completed' && typeof totalSteps === 'number'
+      ? totalSteps
+      : normalizedState.progress?.current_step
 
   // Resolve the source/destination connector types from the best available data so
   // the "Understood as" strip stays visible across ALL stages — not just after the
@@ -828,7 +898,15 @@ export function PipelineAccordionView({
   const showCDCLiveBanner = !awaitingUserInput && (runtimeOverridesBanners
     ? runtimePhase === 'streaming' || runtimePhase === 'idle'
     : localProgress.showCDCLiveBanner)
-  const showRuntimeFailureBanner = runtimeOverridesBanners && runtimePhase === 'failed'
+  // /runtime reports phase "failed" for ANY failed run and then forces health to
+  // "unhealthy" with it (pipeline_runtime.go computeRuntimePhase), so neither says a
+  // dependency is down — only a dependency row does. Prod 2026-09-26: a batch run
+  // failed by its post-run check read "a required dependency is unreachable" beside
+  // an all-Healthy dependency panel. Without a dead dependency, the "Pipeline Failed"
+  // alert already carries the run's own reason.
+  const hasUnhealthyDependency = Boolean(runtime?.dependencies?.some((d) => d.status === 'unhealthy'))
+  const showRuntimeFailureBanner =
+    runtimeOverridesBanners && runtimePhase === 'failed' && hasUnhealthyDependency
   // The stream was handed off but nothing has reached the destination past the grace
   // period (/runtime waiting_for_data). The card used to show no banner at all and a
   // "LIVE (streaming)" badge. A CDC run reads "completed" here once setup finishes, so
@@ -906,12 +984,11 @@ export function PipelineAccordionView({
               </CardTitle>
             </div>
             <p className="text-sm text-muted-foreground mt-1">
-              {normalizedState.message || normalizedState.summary || 'Processing pipeline...'}
+              {statusLine}
             </p>
             <div className="flex items-center gap-3 mt-2 text-xs text-muted-foreground">
-              {typeof normalizedState.progress?.current_step === 'number' && 
-               typeof normalizedState.progress?.total_steps === 'number' && (
-                <span>{normalizedState.progress.current_step}/{normalizedState.progress.total_steps} steps</span>
+              {typeof currentStep === 'number' && typeof totalSteps === 'number' && (
+                <span>{currentStep}/{totalSteps} steps</span>
               )}
               {lastUpdate && <span>Updated {lastUpdate}</span>}
             </div>
@@ -1268,7 +1345,7 @@ export function PipelineAccordionView({
                               // whether the executor is about to request table selection or
                               // about to transfer; only switch to "Syncing X → Y…" once we
                               // have evidence the transfer is past prep (progress, rows, or
-                              // the per-table "Transferred N of M" message). Connection
+                              // the executor's "Queued N of M" message). Connection
                               // names alone are not that evidence: they exist before the
                               // table selection. See executorRunningMessage.
                               msg = executorRunningMessage({

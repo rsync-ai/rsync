@@ -151,6 +151,18 @@ func classifyExecutorResponse(status, errStr string, output map[string]interface
 		meta["destination_connection_id"] = state.DestinationConnectionID
 	}
 
+	// A silent-drop status is the executor's own verdict that rows did not land,
+	// and its error embeds the SINK's failure text after "; sink error:". The
+	// heuristics below would read that text as the user's connection being wrong:
+	// a sink that could not resolve an internal Service ("no such host") parked
+	// the run on "Configure connections" for 24h with its execution left running,
+	// and any row count containing "401"/"403" would read as an expired token.
+	// The connections are not what failed, and the rows it lost were rewound, so
+	// fail it like any other execution failure.
+	if isSilentDropStatus(status) {
+		return nil, NewDeterministicError("EXECUTION_FAILED", errStr, meta)
+	}
+
 	// Heuristic classification (beta): auth expiry, invalid config, schema drift.
 	if looksLikeAuthError(errStr, meta) {
 		// If we can't even identify an oauth_token_id, user likely needs to reconnect.
@@ -168,4 +180,10 @@ func classifyExecutorResponse(status, errStr string, output map[string]interface
 	}
 
 	return nil, NewDeterministicError("EXECUTION_FAILED", errStr, meta)
+}
+
+// isSilentDropStatus reports the executor statuses that mean rows were dispatched
+// but did not land (backend-orchestrator silent_drop_check.go and blob_lane.go).
+func isSilentDropStatus(status string) bool {
+	return status == "silent_drop_detected" || status == "silent_partial_drop_detected"
 }

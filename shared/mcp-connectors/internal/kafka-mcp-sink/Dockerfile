@@ -11,6 +11,7 @@ WORKDIR /src
 COPY shared/go/transforms/ /src/shared/go/transforms/
 COPY shared/go/kafkaclient/ /src/shared/go/kafkaclient/
 COPY shared/go/pgdriver/ /src/shared/go/pgdriver/
+COPY shared/go/memlimit/ /src/shared/go/memlimit/
 COPY shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/ /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/
 
 WORKDIR /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src

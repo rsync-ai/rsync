@@ -49,4 +49,19 @@ describe("extractLatestRowMetrics", () => {
     const other = { ...metricsEvent({ rows_processed: 7 }, 1), event_type: "STAGE_COMPLETED" }
     expect(extractLatestRowMetrics([other])).toEqual({ read: undefined, written: undefined })
   })
+
+  // Prod 9a094389: a Reload (05ec379f) read 75,230 rows, the Resume after it (e0afbc01)
+  // read 0, and the page said "read 75230" beside a grid of zeros for e0afbc01.
+  it("counts only the named execution's events", () => {
+    const run = (execution_id: string, read: number, n: number) => ({
+      ...metricsEvent({ source: "executor_batch", metrics: { records_read: read, records_written: read } }, n),
+      execution_id,
+    })
+    const events = [run("reload", 75230, 1), run("resume", 0, 2)]
+    expect(extractLatestRowMetrics(events, "resume")).toEqual({ read: 0, written: 0 })
+    expect(extractLatestRowMetrics(events, "reload")).toEqual({ read: 75230, written: 75230 })
+    // Control: without an execution the old cross-run maximum is still what comes back.
+    expect(extractLatestRowMetrics(events)).toEqual({ read: 75230, written: 75230 })
+    expect(extractLatestRowMetrics(events, "other")).toEqual({ read: undefined, written: undefined })
+  })
 })

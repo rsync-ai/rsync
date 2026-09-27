@@ -87,3 +87,40 @@ func TestSumCommittedOffsets_SkipsNeverCommittedPartitions(t *testing.T) {
 		t.Fatalf("sumCommittedOffsets(nil) = %d, want 0", got)
 	}
 }
+
+// TestCommittedByTopic_IsPerTopicAndScoped locks the per-topic committed position the
+// consumer census stores. The census used to write the group-wide sum on every topic
+// row, so the Consumers card showed one pipeline-wide number beside each table as if
+// it were that table's position — pipeline_consumer_lag.committed is documented as
+// "the group's committed position on this topic". Same scoping as the sum: a
+// never-committed partition (-1) is another pipeline's, and a topic with none of its
+// own is absent, matching computeConsumerGroupLag so the census has one position per
+// lag row.
+func TestCommittedByTopic_IsPerTopicAndScoped(t *testing.T) {
+	committed := map[string]map[int32]int64{
+		"dbz.public.orders":      {0: 100, 1: 40},
+		"dbz.public.customers":   {0: 0},
+		"dbz.public.mixed":       {0: 7, 1: -1},
+		"foreign.other_pipeline": {0: -1, 1: -1},
+	}
+	got := committedByTopic(committed)
+	want := map[string]int64{"dbz.public.orders": 140, "dbz.public.customers": 0, "dbz.public.mixed": 7}
+	if len(got) != len(want) {
+		t.Fatalf("committedByTopic = %v, want %v", got, want)
+	}
+	for topic, w := range want {
+		if g, ok := got[topic]; !ok || g != w {
+			t.Errorf("committedByTopic[%q] = %d (present=%v), want %d", topic, g, ok, w)
+		}
+	}
+	// One position per lag row: the two helpers must agree on which topics exist.
+	lag := computeConsumerGroupLag(committed, map[string]map[int32]int64{})
+	for topic := range lag {
+		if _, ok := got[topic]; !ok {
+			t.Errorf("topic %q has a lag reading but no committed position", topic)
+		}
+	}
+	if len(committedByTopic(nil)) != 0 {
+		t.Fatalf("committedByTopic(nil) must be empty")
+	}
+}

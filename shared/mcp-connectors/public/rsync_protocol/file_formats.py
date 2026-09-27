@@ -1,8 +1,13 @@
 from __future__ import annotations
 
+import datetime as _dt
+import decimal as _decimal
 import json
+import logging
 import mimetypes
 from typing import Any, Dict, Iterable, Iterator, Optional
+
+logger = logging.getLogger(__name__)
 
 
 def iter_jsonl_bytes(records: Iterable[Dict[str, Any]]) -> Iterator[bytes]:
@@ -87,7 +92,8 @@ def content_type_for_object(key: str, declared: Optional[str] = None) -> str:
     return guessed or "application/octet-stream"
 
 
-def try_write_parquet_to_file(path: str, rows: Any) -> Optional[int]:
+def try_write_parquet_to_file(path: str, rows: Any,
+                              column_types: Optional[Dict[str, Any]] = None) -> Optional[int]:
     """
     Best-effort Parquet writer. Returns bytes written or None if unavailable.
     Uses pyarrow if installed (many connectors already include it).
@@ -103,6 +109,7 @@ def try_write_parquet_to_file(path: str, rows: Any) -> Optional[int]:
         return 0
 
     # Convert list-of-dicts to Arrow table
+    rows = normalize_rows_for_columnar(rows, "parquet", column_types)
     table = pa.Table.from_pylist(rows)  # type: ignore[arg-type]
     pq.write_table(table, path)  # type: ignore[arg-type]
 
@@ -112,6 +119,145 @@ def try_write_parquet_to_file(path: str, rows: Any) -> Optional[int]:
         return int(os.path.getsize(path))
     except Exception:
         return None
+
+
+# =============================================================================
+# WRITE SIDE — one type per column for the columnar formats.
+#
+# parquet / orc / arrow give every column ONE type, and pyarrow picks it from the
+# values: a column holding 1 in one row and "65f0c3…" in the next raises
+# ArrowInvalid and the whole batch goes to the DLQ. Schemaless sources produce that
+# routinely — a Mongo collection whose _id is an int in some documents and an
+# ObjectId (serialised as a string) in others. So before a columnar write:
+#
+#   1. a column the source DECLARED string-like gets its non-string values as text,
+#      so every file for the table agrees with the declared DDL (a hive/BigQuery
+#      external table takes its schema from one file and rejects the others);
+#   2. any other column whose values mix kinds (int + str, str + dict, …) becomes
+#      text as a whole — a string column is the only type every value fits in;
+#      int + float stays numeric, which pyarrow already widens to double;
+#   3. a dict/list column pyarrow cannot build (nested fields that disagree) is
+#      written as JSON text.
+#
+# No value is dropped and no row is removed. Only the column NAME is logged, never a
+# value. Row-oriented formats (json/jsonl/csv/…) carry mixed values natively and
+# are returned untouched.
+# =============================================================================
+
+COLUMNAR_FORMATS = ("parquet", "orc", "arrow")
+
+# Declared type names (canonical, and the common source dialects) that mean "text".
+_STRING_LIKE_TYPES = frozenset({
+    "string", "str", "text", "varchar", "char", "character", "character varying",
+    "nvarchar", "nchar", "ntext", "bpchar", "citext", "uuid", "objectid", "keyword",
+})
+
+
+def _declared_string_like(declared: Any) -> bool:
+    if not isinstance(declared, str):
+        return False
+    t = declared.strip().lower()
+    base = t.split("(", 1)[0].strip()  # VARCHAR(255) -> varchar
+    return base in _STRING_LIKE_TYPES
+
+
+def _value_kind(v: Any) -> str:
+    # bool before int: bool is an int subclass in Python, a distinct type in Arrow.
+    if isinstance(v, bool):
+        return "bool"
+    if isinstance(v, int):
+        return "int"
+    if isinstance(v, float):
+        return "float"
+    if isinstance(v, str):
+        return "str"
+    if isinstance(v, (bytes, bytearray)):
+        return "bytes"
+    if isinstance(v, dict):
+        return "dict"
+    if isinstance(v, (list, tuple)):
+        return "list"
+    if isinstance(v, _dt.datetime):
+        return "datetime"
+    if isinstance(v, _dt.date):
+        return "date"
+    if isinstance(v, _dt.time):
+        return "time"
+    if isinstance(v, _decimal.Decimal):
+        return "decimal"
+    return type(v).__name__
+
+
+def _as_text(v: Any) -> Any:
+    if v is None or isinstance(v, str):
+        return v
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (dict, list, tuple)):
+        return json.dumps(v, default=str)
+    if isinstance(v, (_dt.datetime, _dt.date, _dt.time)):
+        return v.isoformat()
+    if isinstance(v, (bytes, bytearray)):
+        return bytes(v).hex()
+    return str(v)
+
+
+def _pyarrow_rejects(values: list) -> bool:
+    """True when pyarrow is installed and cannot build one array from ``values``."""
+    try:
+        import pyarrow as pa  # type: ignore
+    except Exception:
+        return False
+    try:
+        pa.array(values)
+    except Exception:
+        return True
+    return False
+
+
+def normalize_rows_for_columnar(rows: Any, file_format: Any,
+                                column_types: Optional[Dict[str, Any]] = None) -> Any:
+    """Return ``rows`` with every column holding values of one Arrow type.
+
+    A no-op (the same object back) for non-columnar formats, non-list input, and a
+    batch whose columns already agree. Otherwise returns a NEW list; changed rows are
+    copies, so the caller's rows are never mutated.
+    """
+    fmt = str(file_format or "").strip().lower()
+    if fmt not in COLUMNAR_FORMATS or not isinstance(rows, list) or not rows:
+        return rows
+    declared = column_types if isinstance(column_types, dict) else {}
+
+    kinds: Dict[str, set] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for col, v in row.items():
+            if v is not None:
+                kinds.setdefault(col, set()).add(_value_kind(v))
+
+    to_text = []
+    for col, ks in kinds.items():
+        if _declared_string_like(declared.get(col)):
+            if ks != {"str"}:
+                to_text.append((col, "declared a string type"))
+        elif len(ks) > 1 and not ks <= {"int", "float"}:
+            to_text.append((col, "mixed value types " + "+".join(sorted(ks))))
+        elif ks & {"dict", "list"} and _pyarrow_rejects(
+                [r.get(col) for r in rows if isinstance(r, dict)]):
+            to_text.append((col, "nested values with conflicting shapes"))
+
+    if not to_text:
+        return rows
+    for col, why in to_text:
+        logger.warning("columnar write: column %r written as text (%s)", col, why)
+    cols = {c for c, _ in to_text}
+    out = []
+    for row in rows:
+        if isinstance(row, dict) and cols.intersection(row):
+            row = {k: (_as_text(v) if k in cols else v) for k, v in row.items()}
+        out.append(row)
+    return out
 
 
 # =============================================================================

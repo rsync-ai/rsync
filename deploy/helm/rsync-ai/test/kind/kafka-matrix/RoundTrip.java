@@ -49,7 +49,9 @@ public class RoundTrip {
       }
       pp.put("key.serializer", StringSerializer.class.getName());
       pp.put("value.serializer", StringSerializer.class.getName());
-      pp.put("max.block.ms", "15000");
+      // Bounds only a broker that has not ANSWERED: a TLS or SASL verdict throws
+      // at once. 15s ran out mid-handshake on a starved CI host (#1223).
+      pp.put("max.block.ms", "30000");
       pp.put("request.timeout.ms", "10000");
       pp.put("delivery.timeout.ms", "20000");
       pp.put("retries", "0");

@@ -267,6 +267,22 @@ func ObjectLayoutAppliesTo(destType string) bool {
 	return objectLayoutV2DestSupported(destType)
 }
 
+// PipelineCleansFolderOnResnapshot reports whether the sink empties a table's
+// folder before a re-snapshot rewrites it: object layout v2 only, where each
+// table has its own folder the pipeline owns. Any read failure says no — a
+// folder is never emptied on a guess. One rule for Re-snapshot
+// (handlers.BackfillCDCTables) and a CDC Reload (queueCDCReload).
+func PipelineCleansFolderOnResnapshot(ctx context.Context, db *sql.DB, pipelineID, destType string) bool {
+	if db == nil || !ObjectLayoutAppliesTo(destType) {
+		return false
+	}
+	var version sql.NullInt64
+	if err := db.QueryRowContext(ctx, `SELECT storage_layout_version FROM pipelines WHERE id = $1::uuid`, pipelineID).Scan(&version); err != nil {
+		return false
+	}
+	return version.Valid && version.Int64 == 2
+}
+
 // ResolveObjectLayoutForRestart is the CDC sink restart handler's entry point
 // (handlers/cdc_sink.go): it never moves a pipeline to v2.
 func ResolveObjectLayoutForRestart(ctx context.Context, db *sql.DB, in ObjectLayoutInput) (ObjectLayout, error) {

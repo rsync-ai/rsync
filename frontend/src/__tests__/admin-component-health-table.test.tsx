@@ -20,6 +20,8 @@ vi.mock("next/navigation", () => ({
   usePathname: () => "/admin/health",
 }))
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
+// The page also renders the browser-side probes; with none, the tests stay off the network.
+vi.mock("@/lib/diagnostics/browser-connectivity", () => ({ BROWSER_PROBES: [] }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
 
 const mockFetch = authFetch as unknown as Mock
@@ -81,6 +83,18 @@ const fleet: ComponentHealth[] = [
   }),
 ]
 
+function services(): HTMLElement {
+  return screen.getByRole("region", { name: "rsync services" })
+}
+
+function findServices(): Promise<HTMLElement> {
+  return screen.findByRole("region", { name: "rsync services" })
+}
+
+function connectors(): HTMLElement {
+  return screen.getByRole("region", { name: "Connectors" })
+}
+
 function rowFor(id: string): HTMLElement {
   const row = document.querySelector<HTMLElement>(`tr[data-component="${id}"]`)
   if (!row) throw new Error(`no row for ${id}`)
@@ -132,26 +146,27 @@ describe("ageLabel and sortComponents", () => {
 })
 
 describe("ComponentHealthTable", () => {
-  it("reads the admin route and shows every row, worst first", async () => {
+  it("reads the admin route and shows every row, worst first, services before connectors", async () => {
     mockFetch.mockResolvedValue(res(200, { components: fleet, total: fleet.length }))
     render(<ComponentHealthTable refreshToken={0} />)
 
     await screen.findByText("orchestrator-agent")
     expect(mockFetch).toHaveBeenCalledWith(SENTINEL, { method: "GET" })
 
-    const ids = [...document.querySelectorAll("tr[data-component]")].map((r) => r.getAttribute("data-component"))
-    expect(ids).toEqual([
-      "orchestrator-agent",
-      "mcp_connector:rsync-mcp-postgres-v1",
-      "rsync.pipeline.events",
-      "infrastructure:postgres",
-    ])
+    const ids = (root: ParentNode) =>
+      [...root.querySelectorAll("tr[data-component]")].map((r) => r.getAttribute("data-component"))
+    // The stale consumer is healthy but 2h old, so it reads "no recent check" and sorts above
+    // the freshly checked postgres row.
+    expect(ids(services())).toEqual(["orchestrator-agent", "rsync.pipeline.events", "infrastructure:postgres"])
+    expect(ids(connectors())).toEqual(["mcp_connector:rsync-mcp-postgres-v1"])
 
     const summary = screen.getByLabelText("Status summary")
     expect(summary).toHaveTextContent("1 dead")
-    expect(summary).toHaveTextContent("1 unhealthy")
-    expect(summary).toHaveTextContent("2 healthy")
+    expect(summary).toHaveTextContent("1 no recent check")
+    expect(summary).toHaveTextContent("1 healthy")
+    expect(summary).not.toHaveTextContent("unhealthy")
     expect(summary).not.toHaveTextContent("degraded")
+    expect(screen.getByLabelText("Connector status summary")).toHaveTextContent("1 unhealthy")
   })
 
   it("shows counts only where the type measures them, and errors in red", async () => {
@@ -187,7 +202,34 @@ describe("ComponentHealthTable", () => {
     // A dead agent's heartbeat is old but its row is fresh: the verdict is current, not stale.
     expect(within(rowFor("orchestrator-agent")).getByText("3m ago")).toBeInTheDocument()
     expect(within(rowFor("orchestrator-agent")).queryByText(/Row not updated/)).toBeNull()
-    expect(screen.getByLabelText("Status summary")).toHaveTextContent("1 not updated in 5 min")
+  })
+
+  it("does not show green for a healthy row nobody has re-checked", async () => {
+    mockFetch.mockResolvedValue(res(200, { components: fleet }))
+    render(<ComponentHealthTable refreshToken={0} />)
+    await screen.findByText("orchestrator-agent")
+
+    const stale = within(rowFor("rsync.pipeline.events"))
+    expect(stale.getByText("no recent check")).toBeInTheDocument()
+    expect(stale.queryByText("healthy")).toBeNull()
+    expect(rowFor("rsync.pipeline.events").querySelector("[data-status-dot]")).toHaveAttribute("data-status-dot", "stale")
+    expect(within(rowFor("infrastructure:postgres")).getByText("healthy")).toBeInTheDocument()
+  })
+
+  it("keeps the last verdict of a stale row that was already down", async () => {
+    mockFetch.mockResolvedValue(
+      res(200, {
+        components: [
+          component({ component_id: "infrastructure:kafka", status: "unhealthy", updated_at: ago(30 * MIN) }),
+        ],
+      }),
+    )
+    render(<ComponentHealthTable refreshToken={0} />)
+    await screen.findByText("infrastructure:kafka")
+
+    expect(within(rowFor("infrastructure:kafka")).getByText("unhealthy")).toBeInTheDocument()
+    expect(within(rowFor("infrastructure:kafka")).getByText("Row not updated 30m ago")).toBeInTheDocument()
+    expect(screen.getByLabelText("Status summary")).toHaveTextContent("1 unhealthy")
   })
 
   it("filters by type and counts each type", async () => {
@@ -195,14 +237,76 @@ describe("ComponentHealthTable", () => {
     render(<ComponentHealthTable refreshToken={0} />)
     await screen.findByText("orchestrator-agent")
 
+    // Connectors have their own section, so they are not a filter here.
     const group = screen.getByRole("group", { name: "Filter by type" })
+    expect(within(group).queryByRole("button", { name: /MCP connector/ })).toBeNull()
+    expect(within(group).getByRole("button", { name: /All/ })).toHaveTextContent("All3")
+
     await userEvent.click(within(group).getByRole("button", { name: /Kafka consumer/ }))
-    expect(document.querySelectorAll("tr[data-component]")).toHaveLength(1)
+    expect(services().querySelectorAll("tr[data-component]")).toHaveLength(1)
     expect(rowFor("rsync.pipeline.events")).toBeInTheDocument()
     expect(within(group).getByRole("button", { name: /Kafka consumer/ })).toHaveAttribute("aria-pressed", "true")
 
     await userEvent.click(within(group).getByRole("button", { name: /All/ }))
-    expect(document.querySelectorAll("tr[data-component]")).toHaveLength(4)
+    expect(services().querySelectorAll("tr[data-component]")).toHaveLength(3)
+  })
+
+  it("folds connectors away while all of them are up, and opens on request", async () => {
+    mockFetch.mockResolvedValue(
+      res(200, {
+        components: [
+          component({ component_id: "infrastructure:postgres" }),
+          component({ component_id: "mcp_connector:rsync-mcp-postgres-v1", component_type: "mcp_connector" }),
+          // A row left by an older pinned version: stale, but not a reason to open the section.
+          component({
+            component_id: "mcp_connector:rsync-mcp-gcs-v1",
+            component_type: "mcp_connector",
+            updated_at: ago(3 * 60 * MIN),
+          }),
+        ],
+      }),
+    )
+    render(<ComponentHealthTable refreshToken={0} />)
+    await screen.findByText("infrastructure:postgres")
+
+    expect(connectors().querySelector("tr[data-component]")).toBeNull()
+    const summary = screen.getByLabelText("Connector status summary")
+    expect(summary).toHaveTextContent("1 healthy")
+    expect(summary).toHaveTextContent("1 no recent check")
+
+    const toggle = within(connectors()).getByRole("button", { name: "Show connectors" })
+    expect(toggle).toHaveAttribute("aria-expanded", "false")
+    await userEvent.click(toggle)
+    expect(within(connectors()).getByRole("button", { name: "Hide connectors" })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    )
+    expect(connectors().querySelectorAll("tr[data-component]")).toHaveLength(2)
+  })
+
+  it("opens the connectors when a refresh finds one down", async () => {
+    const up = component({ component_id: "mcp_connector:rsync-mcp-postgres-v1", component_type: "mcp_connector" })
+    mockFetch.mockResolvedValueOnce(res(200, { components: [up] }))
+    mockFetch.mockResolvedValueOnce(res(200, { components: [{ ...up, status: "unhealthy" }] }))
+    const { rerender } = render(<ComponentHealthTable refreshToken={0} />)
+    await screen.findByRole("button", { name: "Show connectors" })
+
+    rerender(<ComponentHealthTable refreshToken={1} />)
+    expect(await screen.findByRole("button", { name: "Hide connectors" })).toHaveAttribute("aria-expanded", "true")
+    expect(within(rowFor("mcp_connector:rsync-mcp-postgres-v1")).getByText("unhealthy")).toBeInTheDocument()
+  })
+
+  it("says so when only connectors have reported", async () => {
+    mockFetch.mockResolvedValue(
+      res(200, {
+        components: [
+          component({ component_id: "mcp_connector:rsync-mcp-postgres-v1", component_type: "mcp_connector" }),
+        ],
+      }),
+    )
+    render(<ComponentHealthTable refreshToken={0} />)
+    expect(await within(await findServices()).findByText("No rsync service has reported yet.")).toBeInTheDocument()
+    expect(screen.getByLabelText("Connector status summary")).toHaveTextContent("1 healthy")
   })
 
   it("says the feature is off on a 404", async () => {

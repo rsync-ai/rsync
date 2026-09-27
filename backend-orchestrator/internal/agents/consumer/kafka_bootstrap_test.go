@@ -9,7 +9,7 @@ import (
 
 // A4. Every shipped compose file hands the orchestrator KAFKA_BROKERS
 // (docker-compose.yml:713) and nothing hands it KAFKA_BOOTSTRAP_SERVERS, while
-// this agent is on by default (ENABLE_CONSUMER_AGENT, config/config.go:239). It
+// this agent was on by default (ENABLE_CONSUMER_AGENT, opt-in since v0.1.6). It
 // read only the second name, so in every deployment — prod included — it held a
 // Kafka client pointed at localhost:9092 and made lag, autoscale and
 // auto-restart decisions against a cluster that was never there.

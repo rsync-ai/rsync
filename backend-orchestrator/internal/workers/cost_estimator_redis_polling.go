@@ -83,8 +83,10 @@ func (w *CostEstimatorWorker) pollAndProcessRequests() error {
 }
 
 func (w *CostEstimatorWorker) processCorrelationRequest(req *correlation.PendingRequest) {
-	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+	ctx, cancel := correlationWorkContext(w.ctx, "cost_estimator")
 	defer cancel()
+	deliverCtx, cancelDeliver := correlationDeliveryContext()
+	defer cancelDeliver()
 
 	logger := log.WithFields(log.Fields{
 		"correlation_id": req.CorrelationID,
@@ -127,12 +129,12 @@ func (w *CostEstimatorWorker) processCorrelationRequest(req *correlation.Pending
 	}
 
 	// Write response to Redis
-	if routeErr := RouteResult(ctx, task, result, w.kafkaManager); routeErr != nil {
+	if routeErr := RouteResult(deliverCtx, task, result); routeErr != nil {
 		logger.WithError(routeErr).Error("Failed to route response")
 	}
 
 	// Delete request from Redis after processing
-	if delErr := w.correlationClient.DeleteRequest(ctx, req.CorrelationID, "cost_estimator"); delErr != nil {
+	if delErr := w.correlationClient.DeleteRequest(deliverCtx, req.CorrelationID, "cost_estimator"); delErr != nil {
 		logger.WithError(delErr).Warn("Failed to delete request from Redis")
 	}
 

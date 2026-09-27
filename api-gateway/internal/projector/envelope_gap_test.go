@@ -14,9 +14,11 @@ import (
 
 // The projector invents an event_id and a seq when a producer omits them, and the
 // invented values are individually plausible — a unique content hash, an increasing
-// per-execution counter. That plausibility is what let the temporal adapter emit
-// events with no seq for as long as it did: the rows looked identical to the
-// orchestrator's, while sorting three orders of magnitude below them on every tie.
+// seq. That plausibility is what let the temporal adapter emit events with no seq for
+// as long as it did: the rows looked identical to the orchestrator's, while the
+// per-execution counter invented for them then sorted nine orders of magnitude below
+// the orchestrator's nanosecond stamps on every tie (the scale is fixed now — see
+// inventSeq and invent_seq_test.go).
 //
 // Substituting is still the right behaviour (dropping telemetry would be worse), so
 // the fix is to make the substitution audible. These tests pin that it says which

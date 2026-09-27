@@ -119,14 +119,6 @@ func (p *UnifiedProducer) SendAgentMessage(ctx context.Context, topic string, tr
 	return p.sendJSON(ctx, topic, traceID, request)
 }
 
-// SendIntentTask sends an Intent Task using the proper schema
-func (p *UnifiedProducer) SendIntentTask(ctx context.Context, topic string, traceID string, request map[string]interface{}) error {
-	if p.useAvro && p.avroProducer != nil {
-		return p.avroProducer.SendIntentTask(ctx, topic, traceID, request)
-	}
-	return p.sendJSON(ctx, topic, traceID, request)
-}
-
 // sendJSON sends a message using JSON serialization (fallback)
 func (p *UnifiedProducer) sendJSON(ctx context.Context, topic string, traceID string, request map[string]interface{}) error {
 	ctx, span := p.tracer.Start(ctx, "kafka.send.json",

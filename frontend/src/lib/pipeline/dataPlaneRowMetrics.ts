@@ -39,11 +39,19 @@ function asNumber(v: unknown): number | undefined {
 /**
  * extractLatestRowMetrics returns the highest rows read / written the data-plane metrics
  * events report. The counters are cumulative, so the highest one is the latest.
+ *
+ * With `executionId`, only that run's events count. The event list spans several
+ * runs, so without it a Resume that read 0 rows showed the previous Reload's 75,230
+ * as its own.
  */
-export function extractLatestRowMetrics(events: PipelineRunEvent[]): { read?: number; written?: number } {
+export function extractLatestRowMetrics(
+  events: PipelineRunEvent[],
+  executionId?: string,
+): { read?: number; written?: number } {
   const metricEvents: Record<string, unknown>[] = []
   for (const e of events) {
     if (e.event_type !== "DATA_PLANE_METRICS") continue
+    if (executionId && e.execution_id !== executionId) continue
     const p = asObject(e.payload) || {}
     const meta = asObject(p["metadata"]) || {}
     if (meta["source"] === CDC_STATUS_POLL_SOURCE) continue

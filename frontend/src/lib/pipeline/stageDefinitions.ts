@@ -326,60 +326,6 @@ export function calculateDerivedProgress(
 }
 
 /**
- * Estimate remaining time based on stage durations
- */
-export function estimateRemainingTime(
-  stages: Record<string, StageExecution>,
-  currentStage?: string
-): number | undefined {
-  const stageList = Object.values(stages)
-  if (stageList.length === 0) return undefined
-
-  let remainingSeconds = 0
-  let foundCurrent = false
-
-  for (const stage of stageList) {
-    // Include current stage and all pending/future stages
-    if (stage.stage === currentStage) {
-      foundCurrent = true
-    }
-
-    if (foundCurrent && stage.status !== 'completed') {
-      remainingSeconds += stage.estimatedDuration || 30 // Default 30s
-    }
-  }
-
-  return remainingSeconds > 0 ? remainingSeconds : undefined
-}
-
-/**
- * Get current active stage
- */
-export function getCurrentStage(
-  stages: Record<string, StageExecution>
-): StageExecution | undefined {
-  return Object.values(stages).find(s => s.status === 'running' || s.status === 'retrying')
-}
-
-/**
- * Check if pipeline is in terminal state
- */
-export function isTerminalState(executionState: ExecutionState): boolean {
-  return executionState === 'completed' || executionState === 'failed' || executionState === 'cancelled'
-}
-
-/**
- * Check if stage can be retried
- */
-export function canRetryStage(stage: StageExecution): boolean {
-  // Unknown counters are not a licence to claim a retry is available, so absence
-  // reads as "no". (This helper currently has no call sites; it is kept compiling
-  // and honest rather than being quietly deleted alongside an unrelated fix.)
-  if (stage.currentAttempt === undefined || stage.maxAttempts === undefined) return false
-  return stage.status === 'failed' && stage.currentAttempt < stage.maxAttempts
-}
-
-/**
  * The agent pipeline's stages in run order. connection_validation and
  * connection_validator are one step under the two names builds have emitted.
  * infra_preflight is not in the execution plan; the Steps tab adds it from the

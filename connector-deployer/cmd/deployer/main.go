@@ -39,7 +39,7 @@ func main() {
 		Host:         cfg.BuildKitHost,
 		RegistryPush: cfg.RegistryPush,
 		RegistryPull: cfg.RegistryPull,
-	}), cfg.ToolsDir)
+	}), cfg.ToolsDir).WithStackPrefix(cfg.StackPrefix)
 	srv := server.New(cfg, deployer, log)
 
 	httpSrv := &http.Server{

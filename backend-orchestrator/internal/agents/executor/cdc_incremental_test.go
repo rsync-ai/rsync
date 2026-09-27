@@ -10,11 +10,11 @@ func TestComputeCDCSnapshotStrategy(t *testing.T) {
 	const threshold = int64(1_000_000)
 
 	cases := []struct {
-		name    string
-		source  string
-		rows    int64
-		allPK   bool
-		want    string
+		name   string
+		source string
+		rows   int64
+		allPK  bool
+		want   string
 	}{
 		{"pg large all-pk -> incremental", "postgresql", 5_000_000, true, snapshotStrategyIncremental},
 		{"pg at threshold -> incremental", "postgresql", 1_000_000, true, snapshotStrategyIncremental},
@@ -191,5 +191,52 @@ func TestCDCAutoBatchInitialLoadKillSwitch(t *testing.T) {
 		if cdcAutoBatchInitialLoadEnabled() {
 			t.Fatalf("CDC_AUTO_BATCH_INITIAL_LOAD=%q → want disabled", v)
 		}
+	}
+}
+
+// The signal channel must not depend on the snapshot strategy: a small (blocking)
+// PostgreSQL pipeline needs it just as much, or Re-snapshot and "backfill newly added
+// tables" are refused with cdc_backfill_not_supported. And the channel alone must never
+// ask for the incremental strategy, which swaps the blocking initial load for
+// snapshot.mode=no_data plus a signal.
+func TestApplyCDCSignalParams(t *testing.T) {
+	const pipelineID = "3a7e63e5-1111-2222-3333-444455556666"
+	wantTopic := "signals.3a7e63e5"
+
+	cases := []struct {
+		name         string
+		source       string
+		strategy     string
+		wantTopic    bool
+		wantStrategy bool
+	}{
+		{"pg blocking -> channel only", "postgresql", snapshotStrategyBlocking, true, false},
+		{"pg incremental -> channel + strategy", "postgresql", snapshotStrategyIncremental, true, true},
+		{"pg-family neon blocking -> channel", "neon", snapshotStrategyBlocking, true, false},
+		{"pg-family supabase blocking -> channel", "supabase", snapshotStrategyBlocking, true, false},
+		{"mysql -> neither (source signal table)", "mysql", snapshotStrategyBlocking, false, false},
+		{"mongodb -> channel only (blocking re-snapshots)", "mongodb", snapshotStrategyBlocking, true, false},
+		{"mongodb spelled MongoDB -> channel", "MongoDB", snapshotStrategyBlocking, true, false},
+		{"sqlserver -> neither", "sqlserver", snapshotStrategyBlocking, false, false},
+		{"oracle -> neither", "oracle", snapshotStrategyBlocking, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			params := map[string]interface{}{}
+			applyCDCSignalParams(params, tc.strategy, cdcSignalTopicFor(tc.source, pipelineID))
+
+			topic, hasTopic := params["signal_kafka_topic"].(string)
+			if hasTopic != tc.wantTopic {
+				t.Fatalf("signal_kafka_topic present = %v, want %v (params=%v)", hasTopic, tc.wantTopic, params)
+			}
+			// The name teardown deletes (cdc_kafka_teardown.go ownsTopic), in either spelling.
+			if hasTopic && !strings.HasSuffix(topic, wantTopic) {
+				t.Fatalf("signal_kafka_topic = %q, want it to end in %q", topic, wantTopic)
+			}
+			_, hasStrategy := params["snapshot_strategy"]
+			if hasStrategy != tc.wantStrategy {
+				t.Fatalf("snapshot_strategy present = %v, want %v (params=%v)", hasStrategy, tc.wantStrategy, params)
+			}
+		})
 	}
 }

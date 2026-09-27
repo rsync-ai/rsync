@@ -236,6 +236,20 @@ func summarizeTrendWindow(executions []ExecutionSummary) PipelineTrends {
 	return t
 }
 
+// trendStatusFromExecution maps executionStatusSQL's answer onto the trends
+// vocabulary (completed, failed, cancelled, running).
+func trendStatusFromExecution(s string) string {
+	switch s {
+	case "completed", "success":
+		return "completed"
+	case "failed", "error", "silent_drop_detected", "silent_partial_drop_detected", "credential_check_failed":
+		return "failed"
+	case "cancelled":
+		return "cancelled"
+	}
+	return "running"
+}
+
 // Helper: fetch summary for a single execution. Takes no user id: both callers
 // have already proven the pipeline belongs to the caller's active workspace, and
 // re-filtering by created_by here would hide a teammate's runs from a legitimate
@@ -278,6 +292,19 @@ func getExecutionSummary(database *sql.DB, pipelineID, executionID string) (*Exe
 		status = "failed"
 	} else if hasCompleted {
 		status = "completed"
+	}
+	// The events cannot say a run failed: PIPELINE_FAILED has no producer, and
+	// PIPELINE_COMPLETED is emitted before the postflight check that can still
+	// fail the run (KI-SILENTDROP-COMPLETED-EVENT). executions.status is the
+	// terminal field, read the way the executions endpoints read it. A run with
+	// no executions row keeps the events' answer.
+	var execStatus string
+	err := database.QueryRow(`SELECT `+executionStatusSQL+executionFromSQL+`
+		WHERE e.id = $1::uuid AND e.pipeline_id = $2::uuid`, executionID, pipelineID).Scan(&execStatus)
+	if err == nil {
+		status = trendStatusFromExecution(execStatus)
+	} else if err != sql.ErrNoRows {
+		log.WithError(err).WithField("execution_id", executionID).Warn("trends: executions status lookup failed; using the event-derived status")
 	}
 
 	summary := &ExecutionSummary{

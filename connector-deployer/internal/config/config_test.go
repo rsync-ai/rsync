@@ -7,7 +7,7 @@ func TestLoadDefaults(t *testing.T) {
 	for _, k := range []string{
 		"PORT", "ENVIRONMENT", "INTERNAL_SERVICE_SECRET", "DEPLOYER_DOCKER_NETWORK",
 		"MCP_SHARED_NETWORK", "OAUTH_TOKENS_VOLUME_NAME", "OAUTH_TOKENS_TARGET",
-		"TOOLS_DIR", "DOCKER_HOST",
+		"TOOLS_DIR", "DOCKER_HOST", "STACK_PREFIX", "RSYNC_LOG_MAX_SIZE", "RSYNC_LOG_MAX_FILE",
 	} {
 		t.Setenv(k, "")
 	}
@@ -21,6 +21,9 @@ func TestLoadDefaults(t *testing.T) {
 	if c.ToolsDir != "/app/shared/mcp-connectors" {
 		t.Errorf("ToolsDir = %q", c.ToolsDir)
 	}
+	if c.StackPrefix != "rsync-ai" {
+		t.Errorf("StackPrefix = %q, want rsync-ai", c.StackPrefix)
+	}
 	// An unset ENVIRONMENT must not count as dev: that is the default a container
 	// started without ENVIRONMENT gets, and dev is what lets an unauthenticated
 	// deploy through when the secret is unset.
@@ -30,6 +33,11 @@ func TestLoadDefaults(t *testing.T) {
 	dc := c.DeployerConfig()
 	if dc.Network != "rsync-ai-mcp" || dc.OAuthVolumeName != "rsync-ai-oauth-tokens" || dc.OAuthVolumeTarget != "/root/.rsync-ai" {
 		t.Errorf("DeployerConfig view wrong: %+v", dc)
+	}
+	// The compose files' `logging:` default. Without it every deployer-created
+	// connector logs unrotated (seen on prod 2026-09-26: 3 of 37 containers).
+	if dc.ConnectorLogMaxSize != "10m" || dc.ConnectorLogMaxFile != "3" {
+		t.Errorf("connector log rotation = %q x %q, want 10m x 3", dc.ConnectorLogMaxSize, dc.ConnectorLogMaxFile)
 	}
 }
 

@@ -50,6 +50,19 @@ const SEVERITY_ORDER: Record<AssessmentSeverity, number> = {
   info: 2,
 }
 
+// The one ordering every consumer must agree on. findingKey() identifies a
+// finding by its position, so the list the checkboxes render and the list the
+// acknowledgement bookkeeping walks have to be the SAME list — deriving them
+// from two different orders silently breaks the ack (see the regression test
+// in src/__tests__/pipeline-assessment-tab.test.tsx). Array#sort is stable, so
+// equal-severity findings keep their server order and the keys stay stable
+// across renders.
+function sortFindings(findings: AssessmentFinding[]): AssessmentFinding[] {
+  return [...findings].sort(
+    (a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
+  )
+}
+
 function severityIcon(s: AssessmentSeverity) {
   switch (s) {
     case "error":
@@ -263,7 +276,7 @@ export function PreMigrationAssessmentModal({
   let errorCount = 0
   let infoCount = 0
   report.tables.forEach((t) => {
-    t.findings.forEach((f, idx) => {
+    sortFindings(t.findings).forEach((f, idx) => {
       const key = findingKey(t.name, f, idx)
       if (f.severity === "warning") {
         allWarnings.push({ key, tableName: t.name, finding: f })
@@ -298,9 +311,7 @@ export function PreMigrationAssessmentModal({
 
         <div className="overflow-y-auto flex-1 -mx-2 px-2 space-y-4 my-4">
           {report.tables.map((table) => {
-            const sortedFindings = [...table.findings].sort(
-              (a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity],
-            )
+            const sortedFindings = sortFindings(table.findings)
             // Keyless table → offer a key-column picker (PR-D). Only when the
             // source has no declared PK (synthetic-hash fallback) and we know
             // its columns.

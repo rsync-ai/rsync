@@ -44,8 +44,8 @@ func componentHealthWriteSites(t *testing.T) map[string]bool {
 					}
 				}
 			case *ast.CallExpr:
-				// Reached through GoStmt too: RecordHeartbeat persists in a goroutine,
-				// which is still a persist.
+				// Reached through GoStmt too: a persist run in a goroutine is still a
+				// persist (TestPersistCensusDistinguishesPersistingFromSilent proves it).
 				if sel, ok := node.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "persistHealthToDB" {
 					persists = true
 				}
@@ -66,7 +66,8 @@ func componentHealthWriteSites(t *testing.T) map[string]bool {
 // The same defect has now shipped in this file twice: a health verdict computed correctly,
 // written into h.componentHealth, and never persisted. First for the three infrastructure
 // checks (#731 T9, fixed by introducing recordInfraHealth), then — left behind by that same
-// fix — for the three callers of RecordHealthChange and for checkMCPConnectorHealth. The
+// fix — for the three callers of RecordHealthChange (since deleted) and for
+// checkMCPConnectorHealth. The
 // map is read by no code outside health_monitor.go, so an unpersisted verdict reaches
 // nobody: the row in sentinel_component_health is the only published form, and it is what
 // GET /api/v1/monitoring/sentinel/health returns.
@@ -79,10 +80,11 @@ func TestEveryComponentHealthWriteSitePersists(t *testing.T) {
 
 	// Positive denominator. A matcher that silently matched nothing would make every
 	// assertion below vacuously true — the census would report a clean bill of health for
-	// a file it had failed to read. These four are the write sites that exist today; the
-	// assertion is >=, so adding a fifth is not a failure, only an unpersisted one is.
-	if len(sites) < 4 {
-		t.Fatalf("census found only %d componentHealth write sites (%v); expected at least 4 — the matcher is broken, not the code", len(sites), sites)
+	// a file it had failed to read. These two (recordInfraHealth, recordConnectorVerdict)
+	// are the write sites that exist today; the assertion is >=, so adding a third is not
+	// a failure, only an unpersisted one is.
+	if len(sites) < 2 {
+		t.Fatalf("census found only %d componentHealth write sites (%v); expected at least 2 — the matcher is broken, not the code", len(sites), sites)
 	}
 
 	for _, name := range sortedKeys(sites) {
@@ -95,73 +97,60 @@ func TestEveryComponentHealthWriteSitePersists(t *testing.T) {
 
 // The census must be able to fail. If the detector could not tell a persisting function
 // from a silent one, the test above would pass no matter what the file said — which is
-// precisely the failure mode that let this bug ship twice. RecordHeartbeat persists inside
-// a `go` statement, so it also proves the walk descends into GoStmt.
+// precisely the failure mode that let this bug ship twice.
 func TestPersistCensusDistinguishesPersistingFromSilent(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "health_monitor.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse health_monitor.go: %v", err)
+	// The positive half, on the real file: recordInfraHealth is the write site every
+	// infrastructure check and service probe goes through.
+	sites := componentHealthWriteSites(t)
+	persists, found := sites["recordInfraHealth"]
+	if !found {
+		t.Fatal("recordInfraHealth not found as a write site — the census is reading the wrong file")
+	}
+	if !persists {
+		t.Error("detector failed to see recordInfraHealth's persist")
 	}
 
-	var found bool
-	for _, decl := range file.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Name.Name != "RecordHeartbeat" {
-			continue
+	// The synthetic halves: a function that only writes must be reported silent, and one
+	// that persists inside a `go` statement must not be — no write site in the real file
+	// does that today, so the walk's descent into GoStmt is proved here.
+	for _, tc := range []struct {
+		name         string
+		body         string
+		wantPersists bool
+	}{
+		{"silent writer", `h.componentHealth[id] = health`, false},
+		{"persist in a goroutine", "h.componentHealth[id] = health\n\tgo h.persistHealthToDB(health)", true},
+	} {
+		src := "package sentinel\nfunc (h *HealthMonitor) f(id string, health *ComponentHealth) {\n\t" + tc.body + "\n}"
+		f2, err := parser.ParseFile(token.NewFileSet(), "synthetic.go", src, 0)
+		if err != nil {
+			t.Fatalf("%s: parse synthetic: %v", tc.name, err)
 		}
-		found = true
-		var persists bool
+		fn := f2.Decls[0].(*ast.FuncDecl)
+		var writes, persists bool
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
-			if call, ok := n.(*ast.CallExpr); ok {
-				if sel, ok := call.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "persistHealthToDB" {
+			switch node := n.(type) {
+			case *ast.AssignStmt:
+				for _, lhs := range node.Lhs {
+					if idx, ok := lhs.(*ast.IndexExpr); ok {
+						if sel, ok := idx.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "componentHealth" {
+							writes = true
+						}
+					}
+				}
+			case *ast.CallExpr:
+				if sel, ok := node.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "persistHealthToDB" {
 					persists = true
 				}
 			}
 			return true
 		})
-		if !persists {
-			t.Error("detector failed to see the persist inside RecordHeartbeat's go statement")
+		if !writes {
+			t.Errorf("%s: detector did not recognise a plain componentHealth write", tc.name)
 		}
-	}
-	if !found {
-		t.Fatal("RecordHeartbeat not found — the census is reading the wrong file")
-	}
-
-	// The negative half: a function that only writes must be reported as silent.
-	src := `package sentinel
-func (h *HealthMonitor) silentWriter(id string, health *ComponentHealth) {
-	h.componentHealth[id] = health
-}`
-	fset2 := token.NewFileSet()
-	f2, err := parser.ParseFile(fset2, "synthetic.go", src, 0)
-	if err != nil {
-		t.Fatalf("parse synthetic: %v", err)
-	}
-	fn := f2.Decls[0].(*ast.FuncDecl)
-	var writes, persists bool
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		switch node := n.(type) {
-		case *ast.AssignStmt:
-			for _, lhs := range node.Lhs {
-				if idx, ok := lhs.(*ast.IndexExpr); ok {
-					if sel, ok := idx.X.(*ast.SelectorExpr); ok && sel.Sel.Name == "componentHealth" {
-						writes = true
-					}
-				}
-			}
-		case *ast.CallExpr:
-			if sel, ok := node.Fun.(*ast.SelectorExpr); ok && sel.Sel.Name == "persistHealthToDB" {
-				persists = true
-			}
+		if persists != tc.wantPersists {
+			t.Errorf("%s: detector reported persists=%v, want %v", tc.name, persists, tc.wantPersists)
 		}
-		return true
-	})
-	if !writes {
-		t.Error("detector did not recognise a plain componentHealth write")
-	}
-	if persists {
-		t.Error("detector claimed a persist in a function that has none")
 	}
 }
 

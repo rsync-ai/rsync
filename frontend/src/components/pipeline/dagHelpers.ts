@@ -1,4 +1,4 @@
-import type { ExecutionPlanStage } from "./DAGVisualization"
+import type { ExecutionPlanStage } from "./dagTypes"
 
 // Deleted from this file: `parseRecordCount`, `applyMagnitude`, `formatCount`
 // and `extractPiiInfo`. Do not re-add a reader for any of them.

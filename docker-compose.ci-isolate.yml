@@ -23,8 +23,6 @@ services:
     container_name: ${STACK_PREFIX:-rsync-ai}-debezium-v1-0-0-mcp
   docker-socket-proxy:
     container_name: ${STACK_PREFIX:-rsync-ai}-docker-socket-proxy
-  fluent-bit:
-    container_name: ${STACK_PREFIX:-rsync-ai}-fluent-bit
   frontend:
     container_name: ${STACK_PREFIX:-rsync-ai}-frontend
   kafka:
@@ -56,8 +54,6 @@ services:
       MINIO_ENDPOINT_URL: http://${STACK_PREFIX:-rsync-ai}-minio:9000
   orchestrator:
     container_name: ${STACK_PREFIX:-rsync-ai}-orchestrator
-  otel-collector:
-    container_name: ${STACK_PREFIX:-rsync-ai}-otel-collector
   planner:
     container_name: ${STACK_PREFIX:-rsync-ai}-planner
   postgres:

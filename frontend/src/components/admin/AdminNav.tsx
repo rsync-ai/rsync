@@ -13,7 +13,6 @@ import {
   GitBranch,
   Play,
   FileText,
-  TestTube,
   Gauge,
   Bell,
 } from "lucide-react"
@@ -30,7 +29,6 @@ const items = [
   { name: "Pipelines", href: "/admin/pipelines", icon: GitBranch },
   { name: "Executions", href: "/admin/executions", icon: Play },
   { name: "Raw events", href: "/admin/events", icon: FileText },
-  { name: "Test suite", href: "/admin/test-suite", icon: TestTube },
 ]
 
 export function AdminNav() {

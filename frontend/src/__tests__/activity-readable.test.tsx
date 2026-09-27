@@ -38,7 +38,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import "@testing-library/jest-dom"
 
@@ -71,6 +71,27 @@ vi.mock("@/lib/api/auth-fetch", () => ({
 
 import { ReasoningTimeline } from "@/components/pipeline/ReasoningTimeline"
 import { PipelineMonitoringPanel } from "@/components/pipeline/PipelineMonitoringPanel"
+
+/**
+ * Render the panel and open its Activity sub-tab.
+ *
+ * These tests are about Activity, so they select it rather than relying on which
+ * sub-tab happens to open first. That default is a function of
+ * NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW: with it set (now the default, and what
+ * docker-compose.yml and prod have always set) the Monitoring card opens on
+ * Overview. Clicking through makes each test independent of that flag.
+ */
+async function renderActivity(variant: "monitoring" | "table_stats" = "monitoring") {
+  const out = render(<PipelineMonitoringPanel pipelineId="p1" variant={variant} />)
+  if (variant !== "monitoring") return out
+
+  // Switch through the panel's own affordance rather than by clicking the Radix
+  // trigger: Radix Tabs do not change on a synthetic click, and this is the hook
+  // the Overview mock at the top of this file exists to expose.
+  const open = await screen.findAllByRole("button", { name: "View in Activity" })
+  fireEvent.click(open[0])
+  return out
+}
 import { EventNormalizer, type PipelineRunEvent } from "@/lib/pipeline/eventNormalizer"
 import { mergeNewestPage } from "@/lib/pipeline/mergeNewestEvents"
 import { featureFlagsManager } from "@/config/features"
@@ -410,7 +431,7 @@ describe("Activity does not present a failed read as an empty stream (F-284)", (
   it("THE REGRESSION: a 500 says the read failed, not that there are no events", async () => {
     serveEvents(() => res(500, { error: "database unavailable" }))
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
 
     expect(await screen.findByText("Could not load events (HTTP 500).")).toBeInTheDocument()
     expect(screen.queryByText(NO_EVENTS)).not.toBeInTheDocument()
@@ -421,7 +442,7 @@ describe("Activity does not present a failed read as an empty stream (F-284)", (
       throw new TypeError("Failed to fetch")
     })
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
 
     expect(await screen.findByText("Could not load events (network error).")).toBeInTheDocument()
     expect(screen.queryByText(NO_EVENTS)).not.toBeInTheDocument()
@@ -431,7 +452,7 @@ describe("Activity does not present a failed read as an empty stream (F-284)", (
     // Without this the fix could pass by never showing the empty state at all.
     serveEvents(() => page([]))
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
 
     expect(await screen.findByText("No events to display yet.")).toBeInTheDocument()
     expect(screen.queryByText(READ_FAILED)).not.toBeInTheDocument()
@@ -449,6 +470,10 @@ describe("The Monitoring sub-tabs are controlled", () => {
 
   it("the Overview's 'View in Activity' opens the Activity sub-tab", async () => {
     serveEvents(() => page([]))
+    // Rendered directly, not through renderActivity(): this test IS the switch,
+    // so it has to start on the sub-tab the panel opens by default. That is
+    // Overview whenever NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW is set, which is
+    // now the default and what docker-compose.yml and prod have always set.
     render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
 
     expect(await screen.findByRole("tab", { name: /Overview/ })).toHaveAttribute("aria-selected", "true")
@@ -473,7 +498,7 @@ describe("Activity keeps itself current while it is open", () => {
     let calls = 0
     serveEvents(() => (++calls === 1 ? page([first]) : page([second, first])))
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
     await screen.findByText("Snapshot started")
     expect(screen.queryByText("Copied 12 tables")).not.toBeInTheDocument()
 
@@ -488,7 +513,7 @@ describe("Activity keeps itself current while it is open", () => {
     let calls = 0
     serveEvents(() => (++calls === 1 ? page([said("Snapshot started")]) : res(500, { error: "boom" })))
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
     await screen.findByText("Snapshot started")
 
     await advance(5000)
@@ -506,7 +531,7 @@ describe("Activity keeps itself current while it is open", () => {
     let missing = true
     serveEvents(() => (missing ? res(404, { error: "Pipeline not found" }) : page([said("Snapshot started")])))
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
     expect(await screen.findByText("Could not load events (pipeline not found).")).toBeInTheDocument()
     expect(screen.queryByText(NO_EVENTS)).not.toBeInTheDocument()
 
@@ -533,7 +558,7 @@ describe("Activity keeps itself current while it is open", () => {
       return page([newest, a, b], { has_more: true, next_cursor: cursor })
     })
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
     await screen.findByText("Row A")
     await userEvent.click(screen.getByRole("button", { name: /load more events/i }))
     await screen.findByText("Older row")
@@ -548,7 +573,7 @@ describe("Activity keeps itself current while it is open", () => {
     serveEvents(() => page([said("Snapshot started")]))
     const visibility = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden")
     try {
-      render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+      await renderActivity()
       await screen.findByText("Snapshot started")
       const before = eventsCalls.length
 
@@ -563,7 +588,7 @@ describe("Activity keeps itself current while it is open", () => {
   it("the Table statistics variant does not poll events", async () => {
     serveEvents(() => page([]))
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="table_stats" />)
+    await renderActivity("table_stats")
     await waitFor(() => expect(eventsCalls.length).toBe(1))
 
     await advance(15000)
@@ -617,7 +642,7 @@ describe("Activity reads stage transitions apart from the paged feed", () => {
       () => page(failedRun),
     )
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
 
     await screen.findByText("Wrote table stats")
     expect(await screen.findByText("Failed")).toBeInTheDocument()
@@ -640,7 +665,7 @@ describe("Activity reads stage transitions apart from the paged feed", () => {
       () => res(500, { error: "boom" }),
     )
 
-    render(<PipelineMonitoringPanel pipelineId="p1" variant="monitoring" />)
+    await renderActivity()
 
     await screen.findByText("Wrote table stats")
     await waitFor(() => expect(statusCalls).toHaveLength(1))

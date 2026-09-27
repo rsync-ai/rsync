@@ -23,14 +23,13 @@ import {
 } from "lucide-react"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
-import {
-  DAGVisualization,
-  LinearTimeline,
-  type ExecutionPlan,
-  type ExecutionPlanStage,
-} from "@/components/pipeline/DAGVisualization"
+import { DAGVisualization, LinearTimeline } from "@/components/pipeline/DAGVisualization"
+import type { ExecutionPlan, ExecutionPlanStage } from "@/components/pipeline/dagTypes"
 import { NodeInspector } from "@/components/pipeline/NodeInspector"
 import { formatRelativeTime } from "@/lib/utils"
+import { FeedOutageNotice } from "@/components/pipeline/FeedOutageNotice"
+import { feedFailed, feedSucceeded, healthyFeed, type FeedHealth } from "@/lib/polling/feedHealth"
+import { isTerminalPipelineStatus, normalizePipelineStatus } from "@/lib/pipeline/statusNormalization"
 
 interface ChatRightPanelProps {
   pipelineId: string
@@ -45,6 +44,7 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
   const [pipelineState, setPipelineState] = useState<Record<string, any> | null>(null)
   const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
+  const [feedHealth, setFeedHealth] = useState<FeedHealth>(healthyFeed)
 
   const fetchPipelineData = useCallback(async () => {
     if (!pipelineId) return
@@ -53,9 +53,16 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
       const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, {
         cache: "no-store",
       })
-      if (!res.ok) return
+      // `if (!res.ok) return` left the panel showing the last state it ever
+      // received, indefinitely and without a word -- the same silence as the
+      // chat view's poll. See lib/polling/feedHealth.
+      if (!res.ok) {
+        setFeedHealth(feedFailed)
+        return
+      }
 
       const data = await res.json()
+      setFeedHealth(feedSucceeded())
       setPipelineState(data)
 
       if (data.execution_plan) {
@@ -66,7 +73,8 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
         setExecutionPlan(plan)
       }
     } catch {
-      // Ignore errors for now
+      // The poll keeps trying; it just no longer does so in silence.
+      setFeedHealth(feedFailed)
     } finally {
       setLoading(false)
     }
@@ -78,14 +86,19 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
     }
   }, [isOpen, pipelineId, fetchPipelineData])
 
-  // Poll for updates while panel is open and pipeline is running
+  // Poll for updates while the panel is open and the run has not ended. A
+  // stopped run ends it too: /state answers "stopped", which the old
+  // completed/failed check missed, so the panel polled it every 3 s for good.
   useEffect(() => {
     if (!isOpen || !pipelineId) return
 
-    const status = pipelineState?.status
-    if (status === "completed" || status === "failed") return
+    if (isTerminalPipelineStatus(normalizePipelineStatus(pipelineState?.status))) return
 
-    const interval = setInterval(fetchPipelineData, 3000)
+    const interval = setInterval(() => {
+      // A hidden tab skips its reads.
+      if (document.visibilityState === "hidden") return
+      void fetchPipelineData()
+    }, 3000)
     return () => clearInterval(interval)
   }, [isOpen, pipelineId, pipelineState?.status, fetchPipelineData])
 
@@ -192,6 +205,11 @@ export function ChatRightPanel({ pipelineId, isOpen, onClose }: ChatRightPanelPr
                 Timeline
               </TabsTrigger>
             </TabsList>
+
+            {/* Every tab below renders whatever the poll last delivered, so a
+                lost feed is announced once, above all three, rather than three
+                times inside them. */}
+            <FeedOutageNotice health={feedHealth} className="mx-3 mt-2" />
 
             {/* Status Tab */}
             <TabsContent value="status" className="flex-1 m-0">

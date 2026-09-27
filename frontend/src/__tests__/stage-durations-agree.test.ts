@@ -163,3 +163,50 @@ describe("stage durations agree between the Overview and the Activity feed", () 
     expect(timing.elapsedMs).not.toBe(timing.activeMs)
   })
 })
+
+// Prod pipeline c228373b (2026-09-25): the Overview showed "Retry 2/2" on
+// Understanding, Resolving, Creating Plan, Validating Plan and Infra Preflight,
+// each of which ran once; Steps/DAG showed the same stages with no badge. The
+// orchestrator's whole-second END sorted before the adapter's millisecond START.
+describe("the Overview does not call a sub-second stage retried", () => {
+  const RESOLVER = "capability_resolver"
+  const row = (event_type: string, occurred_at: string, seq: number, payload: Record<string, unknown> = {}) => ({
+    pipeline_id: "p1",
+    execution_id: "e1",
+    event_id: `r-${seq}`,
+    seq,
+    event_type,
+    stage_id: RESOLVER,
+    stage_group: "connecting",
+    occurred_at,
+    received_at: occurred_at,
+    payload,
+  })
+  const prod = [
+    row("STAGE_COMPLETED", "2026-09-25T14:58:25.857Z", 4),
+    row("STAGE_COMPLETED", "2026-09-25T14:58:25Z", 2, { summary: "Connectors resolved" }),
+    row("STAGE_STARTED", "2026-09-25T14:58:25Z", 1, { summary: "Resolving connectors" }),
+    row("STAGE_STARTED", "2026-09-25T14:58:25.368Z", 3),
+  ]
+  const resolver = (events: typeof prod) =>
+    buildAgenticStagesFromEvents(events, { execution_id: "e1", created_at: "2026-09-25T14:58:20Z" } as never).find(
+      (s) => s.stage === RESOLVER,
+    )!
+
+  it("reports one attempt and the 489 ms it took", () => {
+    const stage = resolver(prod)
+    expect(stage.currentAttempt).toBe(1)
+    expect(stage.maxAttempts).toBe(1)
+    expect(stage.durationMs).toBe(489)
+  })
+
+  it("control: a failure between two starts is still a retry", () => {
+    const stage = resolver([
+      row("STAGE_STARTED", "2026-09-25T14:58:25Z", 1),
+      row("STAGE_FAILED", "2026-09-25T14:58:26Z", 2),
+      row("STAGE_STARTED", "2026-09-25T14:58:28Z", 3),
+      row("STAGE_COMPLETED", "2026-09-25T14:58:29Z", 4),
+    ])
+    expect(stage.currentAttempt).toBe(2)
+  })
+})

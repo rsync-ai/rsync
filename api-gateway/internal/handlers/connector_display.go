@@ -24,6 +24,8 @@ func getFriendlyName(connectorType string) string {
 		"cassandra":  "Cassandra",
 		"dynamodb":   "DynamoDB",
 		"redis":      "Redis",
+		// Built-in zero-credential demo source (its metadata.json display_name)
+		"sample-data": "Sample Data (Demo)",
 		// Object stores
 		"aws_s3":               "Amazon S3",
 		"aws-s3":               "Amazon S3",

@@ -11,6 +11,7 @@ import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { type UpstreamPolicy } from "@/components/explorer/runProvenance"
 import { describeCadence } from "@/components/explorer/scheduledModel"
+import { runModelNow } from "@/components/explorer/runModelNow"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import {
   Dialog,
@@ -797,33 +798,11 @@ export function SavedQueryModelDialog({
 
   const handleRunNow = async () => {
     setRunning(true)
-    try {
-      const res = await authFetch(`/api/v1/explorer/saved/${savedQueryId}/run`, { method: "POST" })
-      const data = await res.json().catch(() => ({}))
-      if (res.ok) {
-        // Two modes, two different things to report. "Rebuilt …" is a lie about a
-        // MERGE, and a statement model has no target table to name — what it has is
-        // a row count, which the server only reports for a DML write.
-        const rows = typeof data?.rows_affected === "number" ? (data.rows_affected as number) : null
-        toast.success(
-          savedMode.materialization === "statement"
-            ? rows === null
-              ? "Statement ran"
-              : `Statement ran — ${rows} row${rows === 1 ? "" : "s"} affected`
-            : `Rebuilt ${data?.target_table || "the target table"}`
-        )
-      } else {
-        // 400 = rsync refused (wrong class for the mode, no target, unsupported
-        // connector); 422 = the engine rejected the statement. Both carry a usable
-        // message, and neither is a server fault worth a generic "something went wrong".
-        toast.error(data?.error || "The run did not complete")
-      }
-      onChanged()
-    } catch {
-      toast.error("Could not run the model")
-    } finally {
-      setRunning(false)
-    }
+    const run = await runModelNow(savedQueryId, savedMode.materialization, savedMode.targetTable)
+    if (run.ok) toast.success(run.message)
+    else toast.error(run.message)
+    setRunning(false)
+    onChanged()
   }
 
   const scheduleAction = async (

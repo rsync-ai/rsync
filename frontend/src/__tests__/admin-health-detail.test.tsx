@@ -16,6 +16,8 @@ vi.mock("next/navigation", () => ({
   usePathname: () => "/admin/health",
 }))
 vi.mock("@/lib/api/auth-fetch", () => ({ authFetch: vi.fn() }))
+// The page also renders the browser-side probes; with none, the tests stay off the network.
+vi.mock("@/lib/diagnostics/browser-connectivity", () => ({ BROWSER_PROBES: [] }))
 vi.mock("sonner", () => ({ toast: { success: vi.fn(), error: vi.fn() } }))
 
 const mockFetch = authFetch as unknown as Mock

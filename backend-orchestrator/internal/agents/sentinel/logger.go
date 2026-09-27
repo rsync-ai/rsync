@@ -11,25 +11,21 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-
-	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 )
 
-// AuditLogger logs all Sentinel actions for observability
+// AuditLogger logs all Sentinel actions for observability: to the structured log and
+// to the sentinel_audit_logs / sentinel_healing_results tables. There is no Kafka copy;
+// the rsync.sentinel.audit topic it used to feed had no consumer.
 type AuditLogger struct {
-	kafkaManager *kafka.Manager
-	db           *sql.DB
-	config       *SentinelConfig
+	db     *sql.DB
+	config *SentinelConfig
 
 	// OTLP metrics
-	meter              metric.Meter
-	issuesDetected     metric.Int64Counter
-	issuesResolved     metric.Int64Counter
-	healingSuccess     metric.Int64Counter
-	healingFailures    metric.Int64Counter
-	// Consumer lag per (topic, group). Push-model gauge — Sentinel's health
-	// monitor calls RecordConsumerLag() on each polling cycle.
-	consumerLagGauge metric.Int64Gauge
+	meter           metric.Meter
+	issuesDetected  metric.Int64Counter
+	issuesResolved  metric.Int64Counter
+	healingSuccess  metric.Int64Counter
+	healingFailures metric.Int64Counter
 
 	// Control
 	ctx    context.Context
@@ -58,11 +54,10 @@ type AuditLog struct {
 }
 
 // NewAuditLogger creates a new audit logger
-func NewAuditLogger(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelConfig) *AuditLogger {
+func NewAuditLogger(db *sql.DB, config *SentinelConfig) *AuditLogger {
 	logger := &AuditLogger{
-		kafkaManager: kafkaManager,
-		db:           db,
-		config:       config,
+		db:     db,
+		config: config,
 	}
 
 	// Initialize OpenTelemetry metrics
@@ -117,37 +112,7 @@ func (l *AuditLogger) initializeMetrics() {
 		log.WithError(err).Error("Failed to create healing_failures metric")
 	}
 
-	l.consumerLagGauge, err = l.meter.Int64Gauge(
-		"sentinel.kafka.consumer_lag",
-		metric.WithDescription("Kafka consumer-group lag (messages behind log end)"),
-		metric.WithUnit("{message}"),
-	)
-	if err != nil {
-		log.WithError(err).Error("Failed to create consumer_lag metric")
-	}
-
 	log.Info("✅ Initialized OTLP metrics for Sentinel")
-}
-
-// RecordConsumerLag emits the current Kafka consumer lag for a (topic, group)
-// pair. Safe to call when metrics export is disabled — becomes a no-op.
-//
-// Lag is the number of records produced to a partition that the consumer
-// group hasn't acknowledged yet. Sustained non-zero lag indicates a slow or
-// dead consumer; sudden growth on a previously-zero topic indicates a
-// producer/consumer topic-name mismatch (the failure mode that left 2892
-// messages stranded on agent.control.commands before the publishAgentCommand
-// fix).
-func (l *AuditLogger) RecordConsumerLag(ctx context.Context, topic, group string, lag int64) {
-	if l.consumerLagGauge == nil {
-		return
-	}
-	l.consumerLagGauge.Record(ctx, lag,
-		metric.WithAttributes(
-			attribute.String("topic", topic),
-			attribute.String("group", group),
-		),
-	)
 }
 
 // Start starts the audit logger
@@ -192,9 +157,6 @@ func (l *AuditLogger) LogIssueDetected(ctx context.Context, issue *Issue) {
 
 	// Log to structured logger
 	l.logToStructuredLogger(auditLog)
-
-	// Publish to Kafka audit topic
-	l.publishToKafka(auditLog)
 
 	// Store in database
 	l.storeInDatabase(ctx, auditLog, issue.ID, issue.Severity)
@@ -272,9 +234,6 @@ func (l *AuditLogger) LogHealingResult(ctx context.Context, result *HealingResul
 	// Log to structured logger
 	l.logToStructuredLogger(auditLog)
 
-	// Publish to Kafka audit topic
-	l.publishToKafka(auditLog)
-
 	// Store in database
 	l.storeHealingResultInDatabase(ctx, result)
 
@@ -345,27 +304,6 @@ func (l *AuditLogger) logToStructuredLogger(auditLog AuditLog) {
 		entry.Warn(auditLog.Action)
 	default:
 		entry.Info(auditLog.Action)
-	}
-}
-
-// publishToKafka publishes audit log to Kafka for real-time monitoring
-func (l *AuditLogger) publishToKafka(auditLog AuditLog) {
-	// A nil manager is the unit-test shape (and the pre-wiring startup window), the same
-	// state CDCSentinel.emitCDCIssue already guards at cdc_sentinel.go:1288. Without this
-	// the audit path panics inside Produce on the nil receiver instead of degrading to the
-	// structured log and the database, which both still work.
-	if l.kafkaManager == nil {
-		return
-	}
-
-	logBytes, err := json.Marshal(auditLog)
-	if err != nil {
-		log.WithError(err).Error("Failed to marshal audit log")
-		return
-	}
-
-	if err := l.kafkaManager.Produce(AuditTopic, []byte(auditLog.Target), logBytes); err != nil {
-		log.WithError(err).Error("Failed to publish audit log to Kafka")
 	}
 }
 

@@ -302,19 +302,3 @@ services:
       resources:
         limits:
           memory: 768M
-
-  # ─────────────────────────────────────────────────────────────────────────
-  # OBSERVABILITY
-  # ─────────────────────────────────────────────────────────────────────────
-
-  fluent-bit:
-    deploy:
-      resources:
-        limits:
-          memory: 64M
-
-  otel-collector:
-    deploy:
-      resources:
-        limits:
-          memory: 128M

@@ -26,8 +26,10 @@ import { useEffect, useRef, useState, type Dispatch, type SetStateAction } from 
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { formatSpanCoarse } from "@/lib/duration"
 import { API_ENDPOINTS } from "@/lib/config/api"
-import type { PipelineRuntime, RuntimePhase } from "@/lib/hooks/usePipelineRuntime"
+import type { PipelineRuntime, RuntimeDep, RuntimePhase } from "@/lib/hooks/usePipelineRuntime"
+import { backlogIncludesLoadRows } from "@/lib/pipeline/loadStatus"
 import { formatAbsoluteTime, formatAge, formatCount } from "@/lib/transform-format"
 import { cn } from "@/lib/utils"
 import type { TableStatsSummaryPayload } from "./executionSummary"
@@ -77,6 +79,9 @@ export type AttentionTable = {
   inserted_rows?: number | null
   total_events?: number | null
   applied_total_events?: number | null
+  // Full-load (snapshot) rows, counted apart from the changes above.
+  snapshot_rows?: number | null
+  applied_snapshot_rows?: number | null
   last_applied_ts?: string | null
   dlq_rows?: number | null
   completed_at?: string | null
@@ -101,6 +106,9 @@ export type TileState = {
   /** Absolute time behind a relative value, for the hover title. */
   title?: string
 }
+
+/** What a backlog counts: changes, or rows while the initial load's are still being written. */
+type BacklogUnit = "change" | "row"
 
 function plural(n: number, one: string, many = `${one}s`) {
   return `${formatCount(n)} ${n === 1 ? one : many}`
@@ -160,18 +168,187 @@ export function batchFreshness(phase: string | undefined, tables: AttentionTable
   }
 }
 
-export function backlogTile(pending: number | undefined): TileState {
-  if (typeof pending !== "number") return { value: "—", detail: "not reported by this server", tone: "neutral" }
-  if (pending <= 0) return { value: "Caught up", detail: "nothing waiting to be written", tone: "ok" }
-  return { value: plural(pending, "change"), detail: "read by the sink, not yet written", tone: "warn" }
+/**
+ * Is the source side still capturing?
+ *
+ * This is the fact the page was missing, and without it a lag of zero is not
+ * interpretable. Debezium is the only producer into a pipeline's CDC topics, so when
+ * it dies the sink drains what is already there and EVERY topic reaches lag 0 — while
+ * `pipelines.status` stays `running`. Lag, the badge and the ack ledger then all read
+ * healthy across a capture hole (KI-DEBEZIUM-WORKER-DEATH-NOT-SURFACED, 877k rows on
+ * the demo VM). "Caught up" and "the producer is dead" are the same pixels.
+ *
+ * The state comes from the dependency the gateway already probes and already serves:
+ * `dependencies[kind="debezium_task"]`, whose health is written by the orchestrator's
+ * 15 s probe from Kafka Connect (connector RUNNING *and* every task RUNNING). No new
+ * read — the runtime payload has carried this all along and no tile looked at it.
+ *
+ * "unknown"/absent is NOT "stopped": a batch pipeline has no such dependency, and a
+ * CDC pipeline mid-setup has one nobody has probed yet. Only an explicit unhealthy
+ * verdict is allowed to turn a zero red.
+ */
+export type CaptureState = "capturing" | "degraded" | "stopped" | "unknown"
+
+export function captureState(deps: RuntimeDep[] | undefined): CaptureState {
+  const dep = deps?.find((d) => d.kind === "debezium_task")
+  if (!dep) return "unknown"
+  switch (dep.status) {
+    case "healthy":
+      return "capturing"
+    case "degraded":
+      return "degraded"
+    case "unhealthy":
+      return "stopped"
+    default:
+      return "unknown"
+  }
 }
 
-export function kafkaTile(messages: number | null | undefined): TileState {
-  if (typeof messages !== "number") {
-    return { value: "No reading", detail: "no lag reading in the last 24h", tone: "neutral" }
+export function captureTile(state: CaptureState, deps: RuntimeDep[] | undefined): TileState {
+  const dep = deps?.find((d) => d.kind === "debezium_task")
+  switch (state) {
+    case "capturing":
+      return { value: "Capturing", detail: "the source stream is running", tone: "ok" }
+    case "degraded":
+      return {
+        value: "Degraded",
+        detail: dep?.last_error || "the source stream is not fully running",
+        tone: "warn",
+      }
+    case "stopped":
+      return {
+        value: "Stopped",
+        // The number beside this tile cannot be trusted while capture is down, and
+        // saying so is the point: silence here is what made the 877k-row hole invisible.
+        detail: dep?.last_error || "no changes are being captured from the source",
+        tone: "bad",
+      }
+    default:
+      return { value: "—", detail: "no source-stream check has run yet", tone: "neutral" }
   }
-  if (messages <= 0) return { value: "Caught up", detail: "nothing waiting in Kafka", tone: "ok" }
-  return { value: plural(messages, "change"), detail: "in Kafka, not yet read by the sink", tone: "warn" }
+}
+
+/**
+ * Backlog: changes our own counters say were captured but not yet applied.
+ *
+ * Deliberately NOT "Caught up" at zero any more. `pending_events` is
+ * captured-minus-applied summed over `pipeline_run_table_stats`, so a pipeline whose
+ * stats agent has never written a row computes 0 − 0 = 0 and used to render a
+ * confident green "Caught up". That is the same missing data the Throughput card
+ * shows as a wall of zeros — one absence of measurement, reported twice as health.
+ *
+ * `measured` is false when nothing has been counted; the caller reads it off the
+ * table-stats summary, which now omits its totals rather than publishing zeros.
+ */
+export function backlogTile(pending: number | undefined, measured: boolean, unit: BacklogUnit = "change"): TileState {
+  if (typeof pending !== "number") return { value: "—", detail: "not reported by this server", tone: "neutral" }
+  if (pending > 0) return { value: plural(pending, unit), detail: "read by the sink, not yet written", tone: "warn" }
+  if (!measured) {
+    return {
+      value: "Not measured",
+      detail: "no change counts recorded yet — this is not the same as nothing waiting",
+      tone: "neutral",
+    }
+  }
+  return { value: "Caught up", detail: "nothing waiting to be written", tone: "ok" }
+}
+
+/**
+ * The broker half of Delivery (deliveryTile): the broker's own answer to how far
+ * behind the sink's consumer group is, plus the two facts that make it mean
+ * something.
+ *
+ * The truth table, and why each row exists:
+ *
+ *   lag  | committed moving | capture  | reading
+ *   -----+------------------+----------+---------------------------------------------
+ *   —    | —                | —        | No reading (the Sentinel has not measured)
+ *   0    | —                | stopped  | Capture stopped — 0 is NOT caught up
+ *   0    | —                | ok       | Caught up
+ *   >0   | yes              | ok       | Catching up (a first load looks like this)
+ *   >0   | no               | ok       | Stalled (captured, not arriving)
+ *
+ * The >0 rows are the reason `committed_moving` is carried at all: lag alone cannot
+ * separate a sink working through a large first load from one that has died, because
+ * both show a big backlog. The committed offset moves only when the sink commits.
+ */
+export function kafkaTile(
+  messages: number | null | undefined,
+  opts: {
+    capture: CaptureState
+    committedMoving?: boolean
+    stalled?: boolean
+    stalledSeconds?: number
+    unit?: BacklogUnit
+  } = {
+    capture: "unknown",
+  },
+): TileState {
+  const unit = opts.unit ?? "change"
+  if (typeof messages !== "number") {
+    return { value: "No reading", detail: "no lag measurement recorded yet", tone: "neutral" }
+  }
+
+  if (messages <= 0) {
+    // The dangerous row. Zero lag with the producer down is a capture hole, not health.
+    if (opts.capture === "stopped") {
+      return {
+        value: "Capture stopped",
+        detail: "nothing is waiting because nothing is being captured — not caught up",
+        tone: "bad",
+      }
+    }
+    if (opts.capture === "degraded") {
+      return {
+        value: "Nothing waiting",
+        detail: "but the source stream is degraded, so the queue may be empty for the wrong reason",
+        tone: "warn",
+      }
+    }
+    return { value: "Caught up", detail: "nothing waiting in Kafka", tone: "ok" }
+  }
+
+  // A backlog the sink has stopped working through. This is the sentinel's own
+  // two-signal verdict (backlog AND no committed movement for the stall window), so
+  // the tile and the cdc-sink-lag alert can never disagree.
+  if (opts.stalled) {
+    const forHow = opts.stalledSeconds && opts.stalledSeconds > 0 ? ` for ${formatSpanCoarse(opts.stalledSeconds)}` : ""
+    return {
+      value: plural(messages, unit),
+      detail: `captured but not arriving — the sink has not committed any progress${forHow}`,
+      tone: "bad",
+    }
+  }
+  if (opts.committedMoving) {
+    return {
+      value: plural(messages, unit),
+      detail: "in Kafka — the sink is draining them now",
+      tone: "warn",
+    }
+  }
+  return { value: plural(messages, unit), detail: "in Kafka, not yet read by the sink", tone: "warn" }
+}
+
+/**
+ * "Delivery": one tile for "is anything waiting to reach the destination?".
+ *
+ * It used to be two — Backlog (our counters: read by the sink, not yet written)
+ * and Waiting in Kafka (the broker: captured, not yet read). Side by side they
+ * read "Caught up" next to "1,280 changes", two answers to one question.
+ *
+ * The broker's reading leads, because it holds even when our counters are empty
+ * and it knows about a stalled sink and a stopped capture. The counters win only
+ * when they show changes waiting and the broker has no fault to report: those
+ * changes are past Kafka already, so a broker "Caught up" says nothing about them.
+ * The counters alone never make the tile green — that is the capture-hole case
+ * (KI-DEBEZIUM-WORKER-DEATH-NOT-SURFACED), where every counter agrees.
+ *
+ * `lag` is null when no lag source has answered yet; the tile then shows loading
+ * or the read error.
+ */
+export function deliveryTile(lag: TileState | null, backlog: TileState): TileState | null {
+  if (backlog.tone === "warn" && lag?.tone !== "warn" && lag?.tone !== "bad") return backlog
+  return lag
 }
 
 export function errorsTile(summary: TableStatsSummaryPayload | undefined, isCdc: boolean): TileState {
@@ -194,10 +371,14 @@ export type AttentionItem = { name: string; reason: string; tone: Tone }
 /**
  * Tables worth a look, worst first: failed, then with failed rows, then
  * degraded, then (CDC) the furthest behind — ties go to the one whose last
- * write is oldest. A table that is merely quiet is not listed.
+ * write is oldest. A table that is merely quiet is not listed. Behind counts
+ * full-load rows not yet written as well as changes: total_events leaves the
+ * load out, so a table whose load still sits in Kafka is not caught up.
  */
 export function tablesNeedingAttention(tables: AttentionTable[], isCdc: boolean): AttentionItem[] {
-  const behind = (t: AttentionTable) => Math.max(0, (t.total_events ?? 0) - (t.applied_total_events ?? 0))
+  const changesBehind = (t: AttentionTable) => Math.max(0, (t.total_events ?? 0) - (t.applied_total_events ?? 0))
+  const loadBehind = (t: AttentionTable) => Math.max(0, (t.snapshot_rows ?? 0) - (t.applied_snapshot_rows ?? 0))
+  const behind = (t: AttentionTable) => changesBehind(t) + loadBehind(t)
   const dlq = (t: AttentionTable) => t.dlq_rows ?? 0
   const rank = (t: AttentionTable) => {
     if (t.status === "failed") return 0
@@ -236,7 +417,13 @@ export function tablesNeedingAttention(tables: AttentionTable[], isCdc: boolean)
         return { name: t.qualified_name, reason, tone: "warn" as Tone }
       }
       const last = t.last_applied_ts ? ` · last write ${formatAge(t.last_applied_ts)}` : " · nothing written yet"
-      return { name: t.qualified_name, reason: `${plural(behind(t), "change")} waiting${last}`, tone: "warn" as Tone }
+      const waiting = [
+        loadBehind(t) > 0 ? plural(loadBehind(t), "full-load row") : "",
+        changesBehind(t) > 0 ? plural(changesBehind(t), "change") : "",
+      ]
+        .filter(Boolean)
+        .join(" and ")
+      return { name: t.qualified_name, reason: `${waiting} waiting${last}`, tone: "warn" as Tone }
     })
 }
 
@@ -419,8 +606,46 @@ export function MonitoringOverviewTab({
   const summary = tables.data?.summary
   const dataPlane = overview.data?.data_plane
   const pending = rt?.liveness?.pending_events
-  const kafkaLag = dataPlane?.sink_lag_messages
+  // Prefer /runtime's own reading over the monitoring overview's.
+  //
+  // Both are sink consumer-group lag, but they arrive very differently.
+  // /runtime reads pipeline_sink_lag, which the Sentinel rewrites every tick, and
+  // /runtime is workspace-scoped and unflagged. The overview's value is scraped from
+  // a DATA_PLANE_METRICS event that is only written when somebody loads
+  // GET /cdc/pipelines/:id/status — so it dates from whenever this page was last
+  // opened — and the whole endpoint 404s unless FEATURE_MONITORING_OVERVIEW is set.
+  // The overview stays as the fallback so a gateway that predates migration 116
+  // keeps showing something.
+  const runtimeLag = rt?.liveness?.sink_lag_messages
+  const usingRuntimeLag = typeof runtimeLag === "number"
+  const kafkaLag = usingRuntimeLag ? runtimeLag : dataPlane?.sink_lag_messages
+  const lagMeasuredAt = usingRuntimeLag ? rt?.liveness?.sink_lag_measured_at : dataPlane?.lag_measured_at
+  const capture = captureState(rt?.dependencies)
+  // Has anything actually counted changes for this pipeline? The summary now omits
+  // its totals when nothing measured them, so `undefined` is the honest answer and
+  // must not collapse into "zero changes". This is what stops Backlog rendering a
+  // green "Caught up" over a pipeline nobody has measured.
+  const changesMeasured =
+    summary?.total_cdc_events !== undefined ||
+    summary?.total_applied_cdc_events !== undefined ||
+    summary?.total_inserts !== undefined ||
+    summary?.total_applied_inserts !== undefined
   const backlogged = (pending ?? 0) > 0 || (kafkaLag ?? 0) > 0
+  // Both backlogs count the initial load's rows alongside changes.
+  const backlogUnit: BacklogUnit = backlogIncludesLoadRows(rt) ? "row" : "change"
+  const lagState: TileState | null =
+    rt && (usingRuntimeLag || overview.data)
+      ? kafkaTile(kafkaLag, {
+          capture,
+          committedMoving: rt.liveness?.sink_committed_moving,
+          stalled: rt.liveness?.sink_stalled,
+          stalledSeconds: rt.liveness?.sink_stalled_seconds,
+          unit: backlogUnit,
+        })
+      : null
+  const backlogState = backlogTile(pending, changesMeasured, backlogUnit)
+  const delivery = deliveryTile(lagState, backlogState)
+  const deliveryFromCounters = delivery === backlogState
   const hasRun = Boolean(rt?.execution_id)
 
   // Table-derived tiles wait for their own read; a batch pipeline with no run
@@ -470,22 +695,29 @@ export function MonitoringOverviewTab({
           )}
           <div className={cn("grid grid-cols-1 gap-3 sm:grid-cols-2", isCdc && "lg:grid-cols-4")}>
             <Tile id="freshness" label="Freshness" state={freshness} asOf={tables.at ?? runtime.at} error={tablesError} />
+            {/* Capture comes FIRST of the CDC tiles: it is the upstream fact, and
+                Delivery is only interpretable once it is known. */}
             {isCdc && (
               <Tile
-                id="backlog"
-                label="Backlog"
-                state={backlogTile(pending)}
+                id="capture"
+                label="Capture"
+                state={captureTile(capture, rt.dependencies)}
                 asOf={runtime.at}
                 error={readError(runtime.error, true)}
               />
             )}
             {isCdc && (
               <Tile
-                id="kafka"
-                label="Waiting in Kafka"
-                state={overview.data ? kafkaTile(kafkaLag) : null}
-                asOf={dataPlane?.lag_measured_at}
-                error={overviewError}
+                id="delivery"
+                label="Delivery"
+                // The runtime's lag needs no overview response at all, which is the
+                // point: this used to render nothing whenever
+                // FEATURE_MONITORING_OVERVIEW was unset.
+                state={delivery}
+                asOf={deliveryFromCounters ? runtime.at : lagMeasuredAt}
+                error={
+                  deliveryFromCounters || usingRuntimeLag ? readError(runtime.error, true) : overviewError
+                }
               />
             )}
             <Tile id="errors" label="Errors" state={errors} asOf={tables.at} error={tablesError} />

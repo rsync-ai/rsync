@@ -35,6 +35,11 @@ type DependencyProbe struct {
 	stopCh      chan struct{}
 }
 
+// findRunningMCPServer is how probeOne looks for a connector container this process
+// never registered. Tests replace it: the real lookup reaches the container by Docker
+// DNS name.
+var findRunningMCPServer = (*mcp.ServerManager).FindRunningServer
+
 // NewDependencyProbe constructs a probe. Caller is expected to call Start in a
 // goroutine and Stop on shutdown.
 func NewDependencyProbe(db *sql.DB, mcpManager *mcp.ServerManager) *DependencyProbe {
@@ -87,12 +92,14 @@ func (p *DependencyProbe) sweep(ctx context.Context) {
 	// unconditionally — so a failed/cancelled/archived CDC pipeline (e.g. one
 	// pinned to a connector version that was later removed) kept getting probed
 	// forever. Actively-streaming CDC pipelines are still covered because their
-	// status ('running'/'streaming_active') is non-terminal.
+	// status ('running'/'streaming_active') is non-terminal. A 'stopped'
+	// pipeline is not probed either: its connector is parked on purpose, and
+	// probing it reported a stopped pipeline as a broken dependency.
 	rows, err := p.db.QueryContext(ctx, `
 		SELECT d.id, d.pipeline_id, d.kind, d.identifier, COALESCE(d.metadata, '{}'::jsonb)
 		FROM pipeline_dependencies d
 		JOIN pipelines p ON p.id = d.pipeline_id
-		WHERE COALESCE(p.status, '') NOT IN ('completed', 'failed', 'cancelled', 'paused', 'archived')
+		WHERE COALESCE(p.status, '') NOT IN ('completed', 'failed', 'cancelled', 'paused', 'stopped', 'archived')
 	`)
 	if err != nil {
 		log.Warnf("dependency_probe: list query failed: %v", err)
@@ -269,6 +276,21 @@ func (p *DependencyProbe) probeOne(ctx context.Context, pipelineID, kind, identi
 			}
 		}
 		if !ok || server == nil {
+			// Nothing in this process's registry. After an orchestrator restart that is
+			// the normal state for a connector nobody has called since: a CDC source is
+			// read by Debezium, never through the orchestrator, so it read "not
+			// registered" until something unrelated (a new pipeline, the gateway's 6h
+			// assessment re-check) happened to call it. Look for its running container,
+			// as the kafka_sink_worker case does; FindRunningServer never deploys. The
+			// canonical v-prefixed version keeps a bare "1.0.0" from registering a
+			// second key for the same container.
+			if canon, err := p.mcpManager.ResolveConcreteVersion(name, version); err == nil && canon != "" && canon != "latest" {
+				if s3, ok3 := findRunningMCPServer(p.mcpManager, name, canon); ok3 && s3 != nil {
+					server, ok = s3, true
+				}
+			}
+		}
+		if !ok || server == nil {
 			return "unhealthy", "no MCP server registered with orchestrator", details
 		}
 		details["transport"] = server.ConnType
@@ -372,6 +394,13 @@ func (p *DependencyProbe) probeOne(ctx context.Context, pipelineID, kind, identi
 		}
 		if connState == "PAUSED" {
 			return "degraded", "debezium connector paused", details
+		}
+		// Stop parks the connector in STOPPED on purpose (handlers.StopCDCPipeline),
+		// keeping its offsets. A sweep that races Stop's status write, or Start's
+		// resume, used to grade it unhealthy; the probe then skipped the stopped
+		// pipeline and the frozen row read as phase "failed" at the next Start (U-18).
+		if connState == "STOPPED" {
+			return "degraded", "debezium connector stopped", details
 		}
 		msg := fmt.Sprintf("connector=%s", connState)
 		if len(failed) > 0 {

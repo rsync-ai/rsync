@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net"
 	"net/http"
@@ -48,10 +49,8 @@ func AdminSystemHealth(c *gin.Context) {
 	// The services a CDC pipeline runs through past Kafka. Each answers a plain HTTP
 	// GET when it is up; the page listed none of them (#53).
 	services = append(services,
-		probeHTTPService("orchestrator", strings.TrimRight(orchestratorBaseURL(), "/")+"/health"),
-		probeHTTPService("kafka-connect", strings.TrimRight(kafkaConnectURL(), "/")+"/"),
-		probeHTTPService("kafka-mcp-sink", strings.TrimRight(kafkaSinkURL(), "/")+"/health"),
-	)
+		probeHTTPService("orchestrator", strings.TrimRight(orchestratorBaseURL(), "/")+"/health"))
+	services = append(services, cdcDataPlaneHealth(c.Request.Context(), db.GetDB(), probeHTTPService)...)
 
 	// The freshness sweep. Not infrastructure — a singleton workflow — but it belongs
 	// beside them because it fails the same way they do and nothing else reports it.
@@ -209,6 +208,59 @@ func checkTemporal() serviceHealth {
 	}
 	conn.Close()
 	return serviceHealth{Service: "temporal", Status: "up", LatencyMs: latency}
+}
+
+// cdcPipelinesExistQuery asks whether any pipeline is CDC, in any status. It is the
+// orchestrator's own (sentinel health_monitor.go cdcPipelinesExistQuery), so this page
+// and the alerts agree on when Kafka Connect is expected. A failed CDC pipeline counts:
+// one that failed because Connect went down is the one that most needs Connect back.
+const cdcPipelinesExistQuery = `SELECT EXISTS (SELECT 1 FROM pipelines WHERE sync_mode = 'cdc' OR cdc_mode IS NOT NULL)`
+
+// cdcDemandQueryTimeout bounds the one query this page adds, so a slow database costs
+// no more than a probe does.
+const cdcDemandQueryTimeout = 3 * time.Second
+
+// cdcDataPlaneHealth probes Kafka Connect and the CDC sink where this install is meant
+// to run them. Both are optional: the quickstart starts them only in the `cdc` profile
+// and the Helm chart only with CDC enabled. On an install without CDC they are absent,
+// not down, and listing them as down put two red cards on every load of the page.
+//
+// A service is listed when its address is set explicitly or a CDC pipeline exists. An
+// address is not enough on its own: no compose file sets either one, so gating on it
+// would drop both cards from every compose install that does run CDC. A failed query,
+// or no database, lists both, which is what the page always did.
+func cdcDataPlaneHealth(ctx context.Context, database *sql.DB, probe func(service, url string) serviceHealth) []serviceHealth {
+	connectSet := strings.TrimSpace(os.Getenv("KAFKA_CONNECT_URL")) != ""
+	sinkSet := strings.TrimSpace(os.Getenv("KAFKA_SINK_URL")) != ""
+	cdc := false
+	if !connectSet || !sinkSet {
+		cdc = cdcPipelinesMayExist(ctx, database)
+	}
+
+	var out []serviceHealth
+	if connectSet || cdc {
+		out = append(out, probe("kafka-connect", strings.TrimRight(kafkaConnectURL(), "/")+"/"))
+	}
+	if sinkSet || cdc {
+		out = append(out, probe("kafka-mcp-sink", strings.TrimRight(kafkaSinkURL(), "/")+"/health"))
+	}
+	return out
+}
+
+// cdcPipelinesMayExist answers false only when the database says no CDC pipeline
+// exists. Anything short of that answer is not evidence that nothing needs the CDC
+// data plane.
+func cdcPipelinesMayExist(ctx context.Context, database *sql.DB) bool {
+	if database == nil {
+		return true
+	}
+	ctx, cancel := context.WithTimeout(ctx, cdcDemandQueryTimeout)
+	defer cancel()
+	var exists bool
+	if err := database.QueryRowContext(ctx, cdcPipelinesExistQuery).Scan(&exists); err != nil {
+		return true
+	}
+	return exists
 }
 
 // kafkaSinkURL is the kafka-mcp-sink's base URL. The compose service name, not the

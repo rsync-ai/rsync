@@ -71,11 +71,6 @@ type KafkaConfig struct {
 	GroupID string `mapstructure:"group_id"`
 }
 
-// BrokerList returns brokers as a slice
-func (k *KafkaConfig) BrokerList() []string {
-	return strings.Split(k.Brokers, ",")
-}
-
 // TelemetryConfig holds OpenTelemetry settings
 type TelemetryConfig struct {
 	// OTLP Endpoint (typically the sidecar at localhost:4317)
@@ -103,11 +98,6 @@ type RedisConfig struct {
 	Port     string `mapstructure:"port"`
 	Password string `mapstructure:"password"`
 	DB       int    `mapstructure:"db"`
-}
-
-// Address returns the Redis address
-func (r *RedisConfig) Address() string {
-	return r.Host + ":" + r.Port
 }
 
 // FeatureFlags holds feature toggles
@@ -267,7 +257,11 @@ func setDefaults(v *viper.Viper) {
 
 	// Feature flags defaults
 	v.SetDefault("ENABLE_SCHEDULER", true)
-	v.SetDefault("ENABLE_CONSUMER_AGENT", true)
+	// Consumer registry defaults OFF: consumers enter it only through its own
+	// /api/v1/consumers routes, which no service or UI page calls (the Monitor tab
+	// reads the gateway's /pipelines/:id/consumers). On by default it ran an empty
+	// health monitor and scaling/restart loops and added a readiness condition.
+	v.SetDefault("ENABLE_CONSUMER_AGENT", false)
 	// Retention agent defaults OFF: it is currently non-functional (its
 	// BootstrapServers is never used by any Kafka client; all ops go through a
 	// hardcoded, nonexistent localhost:8082 REST proxy; the bulk-load registry

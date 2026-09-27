@@ -151,9 +151,10 @@ jobs:
           # it reads as a code test and was left in ci.yml's `llm-service-unit` job.
           # That job is gated on the `llm` paths-filter, which covers exactly ONE
           # of those six subjects: ci.yml itself, via the '.github/workflows/**'
-          # glob added for the fork-guard census (ci.yml:155). The other five --
+          # glob added for the fork-guard census (.github/paths-filters.yml,
+          # where the filters live since the `changes` job was removed). The other five --
           # install.sh, README.md, docs/**, LICENSE, TRADEMARK.md, which is every
-          # reference a reader actually copies -- match nothing in its 13 paths.
+          # reference a reader actually copies -- match none of its patterns.
           # So a slug change skipped the guard, twice over for docs: a docs-only PR
           # never triggers ci.yml at all (`paths-ignore: ['**.md', 'docs/**',
           # 'LICENSE*']`), and an install.sh PR triggers ci.yml but not the llm job.
@@ -203,6 +204,10 @@ jobs:
           # headlines, <= 150 KB) and checks the #fragment links between it and
           # CAPABILITIES-ARCHIVE.md, which check-doc-links.sh strips. Every one
           # of those is broken by a markdown edit alone.
+          # test_capabilities_drops_are_foldable.py checks the docs/capabilities.d/
+          # drop-ins a PR writes instead of editing CAPABILITIES.md directly. A drop-in
+          # is folded days later by a scheduled job nobody watches, so a malformed one
+          # has to fail on the PR that wrote it, not in that job.
           pytest -q \
             tests/test_doc_merge_claims_are_true.py \
             tests/test_doc_links_resolve.py \
@@ -223,6 +228,7 @@ jobs:
             tests/test_deployment_docs_do_not_hand_the_operator_a_step_the_product_runs.py \
             tests/test_capabilities_stays_an_index.py \
             tests/test_no_bundled_observability_vendor.py \
+            tests/test_capabilities_drops_are_foldable.py \
             tests/test_no_public_file_references_the_enterprise_tree.py \
             tests/test_enterprise_images_cannot_overwrite_a_public_one.py
 

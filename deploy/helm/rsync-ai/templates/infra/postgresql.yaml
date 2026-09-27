@@ -88,9 +88,15 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 5
             timeoutSeconds: 5
+          {{/*
+            Liveness names the database too. pg_isready still exits 0 while it does
+            not exist yet (the server answered), so bootstrap is unaffected; without
+            -d it connects to a database named after the USER and the server logs
+            `FATAL: database "<user>" does not exist` on every probe.
+          */}}
           livenessProbe:
             exec:
-              command: ["pg_isready", "-U", {{ .Values.postgresql.username | quote }}]
+              command: ["pg_isready", "-U", {{ .Values.postgresql.username | quote }}, "-d", {{ .Values.postgresql.database | quote }}]
             initialDelaySeconds: 30
             periodSeconds: 15
             timeoutSeconds: 5

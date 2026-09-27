@@ -15,6 +15,8 @@ import { PipelineMonitoringPanelNoSSR } from "@/components/pipeline/PipelineMoni
 import { ExecutionHistoryTab } from "@/components/pipeline/ExecutionHistoryTab"
 import { StepsDAGTab } from "@/components/pipeline/StepsDAGTab"
 import { PipelineTransformsTab } from "@/components/pipeline/PipelineTransformsTab"
+import { PipelineCheckpointsCard } from "@/components/pipeline/PipelineCheckpointsCard"
+import { CdcResnapshotCard } from "@/components/pipeline/CdcResnapshotCard"
 import { CDCLagAlertsPanel } from "@/components/pipeline/CDCLagAlertsPanel"
 import { PipelineHealthHeader } from "@/components/pipeline/PipelineHealthHeader"
 import { MonitorTab } from "@/components/pipeline/MonitorTab"
@@ -77,12 +79,14 @@ export function PipelineDetailTabsClient(props: {
     <div className="space-y-6">
       <PipelineHealthHeader pipelineId={pipelineId} />
       <Tabs value={value} onValueChange={onValueChange} className="space-y-6">
-        <TabsList>
+        {/* Seven tabs no longer fit one line below ~1046 px with the sidebar open,
+            and the strip scrolled the whole page sideways; on a phone it widened
+            the layout viewport to 757 px (#13). They wrap instead. */}
+        <TabsList className="h-auto max-w-full flex-wrap justify-start">
           <TabsTrigger value="overview">Overview</TabsTrigger>
           <TabsTrigger value="history">Execution History</TabsTrigger>
           <TabsTrigger value="steps">Steps/DAG</TabsTrigger>
           <TabsTrigger value="table-stats">Table statistics</TabsTrigger>
-          <TabsTrigger value="transforms">Transforms</TabsTrigger>
           {/* Labeled "Data flow" (not "Monitor") so it doesn't collide with the
               transform-level monitoring that lives inside the Transforms tab. The
               tab value stays "monitor" to keep existing deep links working. */}
@@ -93,6 +97,9 @@ export function PipelineDetailTabsClient(props: {
             Assessment
             <AssessmentTabBadge pipelineId={pipelineId} />
           </TabsTrigger>
+          {/* Last: a pipeline's tables and data come first (Table statistics, Data
+              flow, Assessment); Transforms is authoring, not monitoring. */}
+          <TabsTrigger value="transforms">Transforms</TabsTrigger>
         </TabsList>
 
       {/* Overview Tab */}
@@ -117,11 +124,12 @@ export function PipelineDetailTabsClient(props: {
         {/* Live State */}
         <PipelineLiveStatePanel pipelineId={pipelineId} />
 
-        {/* What the heal agent did about this pipeline, and why. Renders nothing
-            when the healer has never had reason to look at it, so a healthy
-            pipeline's Overview is unchanged. Below the live state on purpose:
+        {/* What watches this pipeline, what the heal agent did and why, and
+            (CDC) how many Sentinel alerts are open. Always shown: a card that
+            appeared only after a failure left a healthy pipeline with no sign
+            that anything was watching it. Below the live state on purpose:
             healing is always a reaction to what that panel is showing. */}
-        <SelfHealingPanel pipelineId={pipelineId} />
+        <SelfHealingPanel pipelineId={pipelineId} pipelineType={pipelineType} />
       </TabsContent>
 
       {/* Execution History Tab */}
@@ -143,21 +151,21 @@ export function PipelineDetailTabsClient(props: {
       </TabsContent>
 
       {/* Table statistics Tab */}
-      <TabsContent value="table-stats">
+      <TabsContent value="table-stats" className="space-y-6">
         <Card>
           <CardContent className="pt-6">
             <PipelineMonitoringPanelNoSSR pipelineId={pipelineId} variant="table_stats" />
           </CardContent>
         </Card>
-      </TabsContent>
-
-      {/* Transforms Tab */}
-      <TabsContent value="transforms">
-        <Card>
-          <CardContent className="pt-6">
-            <PipelineTransformsTab pipelineId={pipelineId} />
-          </CardContent>
-        </Card>
+        {/* Per-table resume positions. Below the stats on purpose: the panel
+            above says how much moved per table, this says where each table is
+            resumable from. Same granularity, so the same tab. */}
+        <PipelineCheckpointsCard pipelineId={pipelineId} pipelineType={pipelineType} />
+        {/* Re-read a table that is already streaming (CDC only). Last in the
+            tab on purpose: the two panels above say how much moved per table
+            and where each one resumes from — this is the action you take when
+            those numbers say a table needs reloading. */}
+        {pipelineType === "cdc" && <CdcResnapshotCard pipelineId={pipelineId} />}
       </TabsContent>
 
       {/* Monitor Tab */}
@@ -180,6 +188,15 @@ export function PipelineDetailTabsClient(props: {
         <Card>
           <CardContent className="pt-6">
             <AssessmentTab pipelineId={pipelineId} pipelineType={pipelineType} />
+          </CardContent>
+        </Card>
+      </TabsContent>
+
+      {/* Transforms Tab */}
+      <TabsContent value="transforms">
+        <Card>
+          <CardContent className="pt-6">
+            <PipelineTransformsTab pipelineId={pipelineId} />
           </CardContent>
         </Card>
       </TabsContent>

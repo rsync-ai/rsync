@@ -1,16 +1,21 @@
 #!/bin/bash
 
 # ==============================================================================
-# Kafka Topic Initialization Script - New Agentic Architecture
+# Kafka Topic Initialization Script - rsync platform topics
 # ==============================================================================
-# This script creates the new topics required for the control plane/data plane
-# separation architecture following Temporal/Conductor patterns.
+# Run by the kafka-init service in docker-compose.yml. Creates the platform
+# topics a default install needs before any pipeline exists:
 #
-# New Topics:
-# 1. task.assignments     - Orchestrator assigns tasks to agent workers
-# 2. task.results         - Agent workers return results to orchestrator
-# 3. pipeline.domain.events - Canonical domain events (infinite retention)
-# 4. pipeline.agent.telemetry - Agent telemetry (7-day TTL, optional)
+# 1. pipeline.domain.events - Pipeline lifecycle events (7-day retention)
+# 2. pii.scan.request       - api-gateway -> llm-service PII scanner
+# 3. pii.scan.response      - llm-service PII scanner -> api-gateway
+#
+# All three get 3 partitions, cleanup.policy=delete, retention.ms=604800000 and
+# compression.type=snappy: the values the orchestrator's topology provisioner
+# (backend-orchestrator/internal/kafka/topology.go) gives the same names. No
+# creator alters a topic that already exists, so whichever runs first fixes the
+# config for good, and they must agree. The quickstart compose and the Helm
+# chart's kafka-init Job create the same three with the same config.
 # ==============================================================================
 
 set -e
@@ -31,7 +36,8 @@ else
 fi
 
 KAFKA_BROKER=${KAFKA_BROKER:-"localhost:9092"}
-PARTITIONS=${PARTITIONS:-10}
+# 3 is what the orchestrator creates these topics with; see the header.
+PARTITIONS=${PARTITIONS:-3}
 
 # Durability. KAFKA_REPLICATION_FACTOR / KAFKA_MIN_INSYNC_REPLICAS are the names
 # the Go side reads (backend-orchestrator/internal/kafka/replication.go), so an
@@ -82,8 +88,8 @@ TOPIC_PREFIX="${KAFKA_TOPIC_PREFIX-rsync.}"
 
 # Same normalization the Go and Python helpers apply: drop anything outside
 # Kafka's topic charset, then guarantee a trailing separator. Without the
-# separator an operator prefix of "acme" yields "acmetask.results" here and
-# "acme.task.results" in the services -- both legal topic names, so the split
+# separator an operator prefix of "acme" yields "acmepii.scan.request" here and
+# "acme.pii.scan.request" in the services -- both legal topic names, so the split
 # surfaces only as a consumer that never receives anything.
 TOPIC_PREFIX="$(printf '%s' "$TOPIC_PREFIX" | tr -cd 'a-zA-Z0-9._-')"
 case "$TOPIC_PREFIX" in
@@ -333,7 +339,7 @@ if [ -n "$_kafka_sec_any" ]; then
     KAFKA_CC="--command-config $KAFKA_CLIENT_CONFIG"
 fi
 
-echo "🚀 Creating new Kafka topics for agentic architecture..."
+echo "🚀 Creating rsync platform Kafka topics..."
 echo "Broker: $KAFKA_BROKER"
 echo "Security: ${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}${KAFKA_SASL_MECHANISM:+ / $KAFKA_SASL_MECHANISM}"
 echo "Partitions: $PARTITIONS"
@@ -349,15 +355,18 @@ create_topic() {
     local config_args=""
 
     # Idempotent, like Topic() in Go and topic() in Python: a name that already
-    # carries the prefix must not become "rsync.rsync.task.results". With an
+    # carries the prefix must not become "rsync.rsync.pii.scan.request". With an
     # empty prefix the pattern matches everything and this is a no-op.
     case "$topic_name" in
         "$TOPIC_PREFIX"*) ;;
         *) topic_name="${TOPIC_PREFIX}${topic_name}" ;;
     esac
     
+    # Every topic this script creates is a platform topic with the orchestrator's
+    # config for it: delete-policy, snappy, and the retention passed in.
+    config_args="--config cleanup.policy=delete --config compression.type=snappy"
     if [ ! -z "$retention_ms" ]; then
-        config_args="--config retention.ms=$retention_ms"
+        config_args="$config_args --config retention.ms=$retention_ms"
     fi
 
     # Pin min.insync.replicas explicitly when the operator asked for one. Left
@@ -385,8 +394,8 @@ create_topic() {
     done
     
     # Check if topic already exists
-    # -x -F: the topic names contain dots, and as a regex "task.results" also
-    # matches "taskXresults". A false match here reports "already exists" and
+    # -x -F: the topic names contain dots, and as a regex "pii.scan.request" also
+    # matches "piiXscanXrequest". A false match here reports "already exists" and
     # skips creating a topic that was never there.
     if "$KAFKA_TOPICS" $KAFKA_CC --bootstrap-server $KAFKA_BROKER --list 2>/dev/null | grep -qxF "$topic_name"; then
         echo "⚠️  Topic '$topic_name' already exists, skipping..."
@@ -416,43 +425,33 @@ create_topic() {
 # ==============================================================================
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📋 CREATING CONTROL PLANE TOPICS"
+echo "📋 CREATING PLATFORM TOPICS"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-# 1. Task Assignments (Orchestrator → Agents)
-create_topic "task.assignments" ""
-
-# 2. Task Results (Agents → Orchestrator)
-create_topic "task.results" ""
-
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "📋 CREATING EVENT SOURCING TOPICS"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-
-# 3. Domain Events (Infinite retention - source of truth)
-create_topic "pipeline.domain.events" "-1"
-
-# 4. Agent Telemetry (7 days retention - debug/monitoring)
 SEVEN_DAYS_MS=$((7 * 24 * 60 * 60 * 1000))
-create_topic "pipeline.agent.telemetry" "$SEVEN_DAYS_MS"
+
+# 1. Pipeline lifecycle events (7 days)
+create_topic "pipeline.domain.events" "$SEVEN_DAYS_MS"
+
+# 2. PII scan round trip (7 days each)
+create_topic "pii.scan.request" "$SEVEN_DAYS_MS"
+create_topic "pii.scan.response" "$SEVEN_DAYS_MS"
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "✅ ALL NEW TOPICS CREATED SUCCESSFULLY"
+echo "✅ ALL PLATFORM TOPICS CREATED SUCCESSFULLY"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
 # List all topics to verify
 echo "📜 Current Kafka topics in the ${TOPIC_PREFIX:-<unprefixed>} namespace:"
-"$KAFKA_TOPICS" $KAFKA_CC --bootstrap-server $KAFKA_BROKER --list 2>/dev/null | grep -F "$TOPIC_PREFIX" | grep -E "(task\.|pipeline\.)" | sort
+"$KAFKA_TOPICS" $KAFKA_CC --bootstrap-server $KAFKA_BROKER --list 2>/dev/null | grep -F "$TOPIC_PREFIX" | grep -E "(pipeline\.domain\.events|pii\.scan\.)" | sort
 
 echo ""
 echo "🎉 Kafka topic initialization complete!"
 echo ""
 echo "📊 Topic Details:"
-echo "  - ${TOPIC_PREFIX}task.assignments:          Orchestrator → Agent task assignment"
-echo "  - ${TOPIC_PREFIX}task.results:             Agent → Orchestrator result reporting"
-echo "  - ${TOPIC_PREFIX}pipeline.domain.events:   Canonical events (infinite retention)"
-echo "  - ${TOPIC_PREFIX}pipeline.agent.telemetry: Debug/monitoring (7-day TTL)"
+echo "  - ${TOPIC_PREFIX}pipeline.domain.events: Pipeline lifecycle events (7-day retention)"
+echo "  - ${TOPIC_PREFIX}pii.scan.request:       api-gateway → llm-service PII scanner (7-day retention)"
+echo "  - ${TOPIC_PREFIX}pii.scan.response:      llm-service PII scanner → api-gateway (7-day retention)"
 

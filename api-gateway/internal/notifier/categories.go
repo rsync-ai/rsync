@@ -84,6 +84,29 @@ var codeCategory = map[string]string{
 	"MONGODB_NOT_REPLICA_SET":             CategorySourceSetup,
 	"PRE_MIGRATION_ASSESSMENT_ISSUE":      CategorySourceSetup,
 
+	// Instance-level health, raised by healthwatch rather than by a run.
+	"RSYNC_CONNECTOR_VERSION_REGRESSION": CategoryHealth,
+
+	// Sentinel: the pipeline stopped moving data without failing a run.
+	// Split on whether rows are GONE or merely stuck. A rejected write and a
+	// lost stream position both mean rows that will not arrive without somebody
+	// re-running something, which is what data_loss means here. A down
+	// connector, an absent writer and a wedged writer have everything safely
+	// queued — muting "health & capacity" should not also mute "rows missing".
+	"SINK_WRITE_REJECTED":       CategoryDataLoss,
+	"CDC_SOURCE_STREAM_STALLED": CategoryDataLoss,
+	"CDC_CONNECTOR_DOWN":        CategoryHealth,
+	"SINK_WORKER_ABSENT":        CategoryHealth,
+	"CDC_SINK_WEDGED":           CategoryHealth,
+
+	// Sentinel component health. Health, not data_loss, on the same split: a
+	// service that is down, a worker that stopped reporting and a closed queue
+	// reader all leave the data where it is. Rows only go missing if somebody
+	// leaves them there.
+	"INFRASTRUCTURE_DOWN":   CategoryHealth,
+	"WORKER_HEARTBEAT_LOST": CategoryHealth,
+	"CONSUMER_GROUP_CLOSED": CategoryHealth,
+
 	// The classifier gave up. These are still delivered by default: an
 	// unclassified failure is exactly the alert nobody should miss by accident.
 	"UNKNOWN_ERROR":       CategoryOther,

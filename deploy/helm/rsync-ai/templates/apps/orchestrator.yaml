@@ -49,6 +49,9 @@ spec:
         {{- with .Values.global.podAnnotations }}{{- toYaml . | nindent 8 }}{{- end }}
     spec:
       {{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      # Kubernetes' default is 30 s, under this pod's shutdown budget; see the
+      # value's comment in values.yaml.
+      terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
       initContainers:
         {{- include "rsync-ai.waitForDepsInitContainer" (dict "root" . "image" .Values.orchestrator.image "kafka" true) | nindent 8 }}
         {{- include "rsync-ai.catalogInitContainer" . | nindent 8 }}
@@ -75,6 +78,14 @@ spec:
             # both come from global.stackPrefix.
             - name: STACK_PREFIX
               value: {{ .Values.global.stackPrefix | quote }}
+            # Sentinel core-service probes (sentinel/service_probes.go): each service
+            # is probed only when its address is set, and after 3 failed 30s checks
+            # every admin gets an INFRASTRUCTURE_DOWN alert. Redis is always probed,
+            # through REDIS_ADDRESS from redisEnv above. The temporal-adapter and the
+            # connector-deployer are not probed here: this chart renders no Service in
+            # front of the first and no deployer at all.
+            - name: TEMPORAL_ADDRESS
+              value: {{ include "rsync-ai.temporal.address" . | quote }}
             {{- if .Values.generation.enabled }}
             - name: TOOL_GENERATOR_URL
               value: "http://{{ $fullname }}-tool-generator:5010"
@@ -93,6 +104,11 @@ spec:
             - name: LLM_SERVICE_URL
               value: "http://{{ $fullname }}-planner:5011"
             - name: RSYNC_LLM_DIAGNOSER_URL
+              value: "http://{{ $fullname }}-llm-service:5000"
+            # Inside this block because generation.yaml renders llm-service only when
+            # generation is enabled; a probe of a service that is not there would page
+            # every admin. TOOL_GENERATOR_URL above doubles as its probe address.
+            - name: SENTINEL_PROBE_LLM_SERVICE_URL
               value: "http://{{ $fullname }}-llm-service:5000"
             {{- end }}
             {{- if .Values.connectors.cdc.enabled }}

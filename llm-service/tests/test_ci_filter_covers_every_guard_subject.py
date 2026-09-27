@@ -29,6 +29,9 @@ import yaml
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 TESTS_DIR = os.path.join(REPO_ROOT, "llm-service", "tests")
 CI_WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
+# The filters left ci.yml with the `changes` job -- see "Why there is no
+# `changes` job" in ci.yml. This file is now the one definition.
+CI_FILTERS = os.path.join(REPO_ROOT, ".github", "paths-filters.yml")
 
 # The guards this file is responsible for. Scoped, not repo-wide -- see module docstring.
 GUARDS = [
@@ -203,18 +206,18 @@ GUARDS = [
     # breaks them is a file added anywhere, which no paths filter can predict.
     "test_no_public_file_references_the_enterprise_tree.py",
     "test_enterprise_images_cannot_overwrite_a_public_one.py",
+    # Enrolled 2026-09-26 with the PII scan fix. Its subject is
+    # shared/pii_scan_contract_golden.json, which the gateway's
+    # pii_scan_contract_test.go reads too. No pattern the llm filter had
+    # matched it, so the filter gained it in the same change: a PR that edits
+    # only the golden is the drift the two tests exist to catch.
+    "test_pii_scan_names_only.py",
 ]
 
 
 def _llm_filter_patterns():
     """The `llm` pattern list as dorny/paths-filter actually receives it."""
-    doc = yaml.safe_load(open(CI_WORKFLOW))
-    step = next(
-        st
-        for st in doc["jobs"]["changes"]["steps"]
-        if "paths-filter" in str(st.get("uses", "")) and "filters" in (st.get("with") or {})
-    )
-    return yaml.safe_load(step["with"]["filters"])["llm"]
+    return yaml.safe_load(open(CI_FILTERS))["llm"]
 
 
 def _declared_paths(guard):
@@ -321,7 +324,18 @@ def test_the_llm_job_is_still_the_one_gated_on_that_filter():
     """The premise of every test below: change the gate and they stop meaning anything."""
     doc = yaml.safe_load(open(CI_WORKFLOW))
     job = doc["jobs"]["llm-service-unit"]
-    assert "needs.changes.outputs.llm == 'true'" in str(job.get("if", "")), (
+    # Two halves, and both are needed. The job must still consult the `llm`
+    # filter, AND it must consult it from the file read above -- a job pointing
+    # dorny/paths-filter at some other `filters:` would make every assertion
+    # below describe a list CI does not use.
+    assert any(
+        (st.get("with") or {}).get("filters") == ".github/paths-filters.yml"
+        for st in job["steps"]
+    ), (
+        "llm-service-unit no longer runs dorny/paths-filter against .github/paths-filters.yml, "
+        "so the patterns read from that file decide nothing here."
+    )
+    assert "steps.filter.outputs.llm == 'true'" in yaml.safe_dump(job), (
         "llm-service-unit is no longer gated on the `llm` paths filter, so the "
         "coverage tests below assert against a filter that decides nothing. "
         "Point them at whatever gates the job now."
@@ -432,10 +446,10 @@ def test_the_ci_filter_covers_every_guard_subject(guard, subject):
     pats = _llm_filter_patterns()
     assert any(fnmatch.fnmatch(subject, p) for p in pats), (
         f"`{subject}` is read by {guard}, but no `llm` paths-filter pattern in "
-        f"ci.yml matches it. A PR touching only that file would skip "
+        f".github/paths-filters.yml matches it. A PR touching only that file would skip "
         f"llm-service-unit, so the guard would not run on exactly the change it "
         f"exists to catch -- and a skipped check reads as a passing one.\n"
         f"Add a pattern covering it to the `llm:` filter in "
-        f"{os.path.relpath(CI_WORKFLOW, REPO_ROOT)}.\n"
+        f"{os.path.relpath(CI_FILTERS, REPO_ROOT)}.\n"
         f"Patterns today: {pats}"
     )

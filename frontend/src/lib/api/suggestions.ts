@@ -175,17 +175,42 @@ export async function generateSuggestions(request: SuggestionsRequest): Promise<
     data = null
   }
 
-  if (!response.ok && !data) {
+  // An error status whose body happens to parse used to slip through every
+  // guard here: `!response.ok && !data` did not fire because the body parsed,
+  // and the `success === false` guard did not fire because an upstream error
+  // body ({"detail": ...} from FastAPI, {"error": ...} from the gateway) has no
+  // `success` field. The cast at the end then handed the caller an object whose
+  // pii_columns and transforms were `undefined`, and the modal rendered
+  // "0 PII columns, 0 transforms" -- telling the user the AI had scanned their
+  // schema and found no PII in it. An error status is an error, body or not.
+  if (!response.ok) {
+    const detail = (data as Record<string, unknown> | null)?.error
+      ?? (data as Record<string, unknown> | null)?.detail
+      ?? (data as Record<string, unknown> | null)?.message
+    const detailText = typeof detail === "string" && detail.trim() ? detail.trim() : null
     throw new Error(
       response.status === 504 || response.status === 502
         ? "AI suggestions service is unavailable right now. You can continue without transforms."
-        : `Failed to generate suggestions (HTTP ${response.status})`
+        : detailText
+          ? `Failed to generate suggestions: ${detailText}`
+          : `Failed to generate suggestions (HTTP ${response.status})`
     )
   }
 
   // Hard failure (no usable payload): surface the structured error.
   if (data && data.success === false && (!data.pii_columns?.length && !data.transforms?.length && !data.optimizations?.length)) {
     throw new Error(data.error || "Failed to generate suggestions")
+  }
+
+  // A 200 whose body is not a suggestions payload at all. The discriminator is
+  // present-and-empty vs absent: a genuine "nothing to suggest" answer carries
+  // `pii_columns: []` and `transforms: []`, so it passes. A body with neither
+  // array is some other message being cast into this shape.
+  if (!data || (!Array.isArray(data.pii_columns) && !Array.isArray(data.transforms))) {
+    throw new Error(
+      (data as Record<string, unknown> | null)?.error as string
+        || "The suggestions service returned a response with no suggestions in it"
+    )
   }
 
   return data as SuggestionsResponse

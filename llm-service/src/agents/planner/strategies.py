@@ -26,7 +26,7 @@ import requests
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from src.utils.connector_paths import iter_connector_dirs, resolve_current_dir
-from src.utils.masking import scrub_error_for_llm
+from src.utils.masking import connections_for_llm, scrub_error_for_llm
 from src.utils.kafka_topics import topic
 
 logger = logging.getLogger("planner.strategies")
@@ -806,8 +806,19 @@ class TopicProvisioner:
                     "partitions": partitions,
                     "replication_factor": replication_factor,
                     "config": {
-                        "cleanup.policy": "delete" if sync_mode == "batch" else "compact",
-                        "retention.ms": "604800000" if sync_mode == "batch" else "-1",  # 7 days for batch, forever for CDC
+                        # One policy for every rsync-created data topic, batch and CDC
+                        # alike: 7-day delete. CDC used to get compact + retention.ms=-1
+                        # and both were wrong — compaction keeps only the latest record
+                        # per key, which collapses a row's update history and makes a
+                        # replaying sink miss intermediate changes; -1 grows the topic
+                        # until the broker's disk fills, which stops both data planes.
+                        #
+                        # The one deliberate exception lives in the orchestrator: the
+                        # Debezium schema-history topic (MySQL-family, SQL Server,
+                        # Oracle, Db2 only) stays retention.ms=-1, because expiring it
+                        # breaks the connector on its next restart.
+                        "cleanup.policy": "delete",
+                        "retention.ms": "604800000",  # 7 days
                         "min.insync.replicas": min(2, replication_factor),
                     }
                 },
@@ -1460,11 +1471,11 @@ class LLMPlanningStrategy(PlanningStrategy):
         try:
             # Format context for prompt
             avail_tools_list = list(context.available_tools)
-            avail_conns_list = [{
-                "type": c.get("connector_type"), 
-                "id": c.get("id"), 
-                "name": c.get("name")
-            } for c in context.available_connections]
+            # This used to inline its own three-field whitelist while the DAG
+            # planner dumped the whole record. One allowlist now serves both --
+            # see connections_for_llm. (The old key name was "type", which on a
+            # connection record means source/destination, not the connector.)
+            avail_conns_list = connections_for_llm(context.available_connections)
             
             # Build prompt variables
             prompt_vars = {

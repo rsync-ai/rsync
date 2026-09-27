@@ -46,392 +46,28 @@ permissions:
 # be the wrong place if any job ever went back.
 
 jobs:
-  # Detect which directories changed in this PR, so downstream jobs can
-  # skip themselves when their code wasn't touched. A frontend-only PR
-  # no longer waits on every Go matrix entry, and a Go-only PR doesn't
-  # rebuild Next.js + Playwright. Huge perceived-speed win.
+  # Why there is no `changes` job
   #
-  # `changes` itself is fast (<30s), so the overhead is negligible
-  # against the wall-clock savings on the jobs that get skipped.
-  changes:
-    name: Detect changes
-    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-    runs-on: ubuntu-latest
-    outputs:
-      go: ${{ steps.filter.outputs.go }}
-      go-shared: ${{ steps.filter.outputs.go-shared }}
-      sink: ${{ steps.filter.outputs.sink }}
-      llm: ${{ steps.filter.outputs.llm }}
-      e2e: ${{ steps.filter.outputs.e2e }}
-      frontend: ${{ steps.filter.outputs.frontend }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
-        id: filter
-        with:
-          filters: |
-            go:
-              - 'api-gateway/**'
-              - 'backend-orchestrator/**'
-              - 'backend-temporal-adapter/**'
-              - 'connector-deployer/**'
-              - 'shared/go/**'
-              # The compose files are here because connector-deployer's
-              # quickstart_deployability_test.go PARSES them: it derives which
-              # connectors the self-host stack actually pre-starts and asserts
-              # that everything composeManagedConnectors refuses to build is
-              # started by somebody. Without these paths the guard would be dead
-              # on half its subject -- deleting a connector service from
-              # docker-compose.quickstart.yml is exactly the change that
-              # re-opens the bug (postgresql refused by the deployer AND started
-              # by nobody, which 502'd the bundled demo), and it touches no Go
-              # file, so this job would report `skipping` and look identical to
-              # a pass. Same failure mode as the Helm paths on the `llm` filter
-              # below.
-              - 'docker-compose.quickstart.yml'
-              - 'docker-compose.mcp.yml'
-              # api-gateway's handlers/admin_drift_test.go reads these too: every
-              # deployment-drift target must name a host, port and /version route
-              # its service serves (the llm-service one lives in Python), and
-              # match config/services.yaml. Moving a port in one of these touches
-              # no Go file, and that is how the drift check probed a port nothing
-              # listened on.
-              - 'docker-compose.yml'
-              - 'docker-compose.prod.yml'
-              - 'docker-compose.staging.yml'
-              - 'config/services.yaml'
-              - 'llm-service/src/gateway/main.py'
-              # Connector metadata is here for the same reason: the orchestrator's
-              # registry tests (backend-orchestrator/internal/registry) load the real
-              # connector tree and assert that every alias a connector declares
-              # resolves back to that connector. Editing a metadata.json `aliases`
-              # array is exactly the change that breaks name resolution -- the chat
-              # path could not reach the gcs connector by its catalog name for
-              # months -- and it touches no Go file, so without this path the guard
-              # is dead on its own subject and the job reports `skipping`, which
-              # looks identical to a pass.
-              - 'shared/mcp-connectors/**'
-              # backend-orchestrator/internal/storage/layout_test.go reads this
-              # fixture; a PR changing only the object-storage key contract must
-              # run it (same for the sink and llm filters below).
-              - 'shared/object_layout_golden.json'
-              # api-gateway validators/statement_class_golden_test.go reads this; the
-              # frontend filter below lists it too (the vitest copy reads it).
-              - 'shared/explorer_statement_class_golden.json'
-              # Duplicate-logic goldens, each pinned from both languages:
-              # security/masking_golden_test.go (gateway + orchestrator),
-              # executor/postgres_family_golden_test.go and
-              # handlers/data_loading_strategy_golden_test.go. The llm and frontend
-              # filters below list the ones their tests read.
-              - 'shared/sensitive_keys_golden.json'
-              - 'shared/postgres_family_golden.json'
-              - 'shared/data_loading_strategy_golden.json'
-              # pkg/namespacemodel/model_test.go and the frontend's
-              # namespaceModel.test.ts pin namespacemodel.For to the same cases.
-              - 'shared/namespace_model_golden.json'
-              - '.github/workflows/ci.yml'
-            go-shared:
-              - 'shared/go/**'
-              - '.github/workflows/ci.yml'
-            # kafka-mcp-sink worker is its own Go module (NOT under shared/go,
-            # so neither the `go` nor `go-shared` module list covers it). Add it
-            # to the Go job on the worker module itself AND on shared/go/transforms
-            # — the worker `replace`s that path, so a transforms API change can
-            # break the sink build/tests and must be caught on the PR.
-            sink:
-              - 'shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/**'
-              - 'shared/go/transforms/**'
-              # compression_default_test.go reads these to keep the sink's
-              # compression defaults in lockstep with the storage connectors'
-              # schema defaults; a PR changing only a schema must run it.
-              - 'shared/mcp-connectors/public/storage/*/latest.json'
-              - 'shared/mcp-connectors/public/storage/*/versions/*/metadata.json'
-              # object_layout_test.go pins the sink's key builders to this fixture.
-              - 'shared/object_layout_golden.json'
-              - '.github/workflows/ci.yml'
-            llm:
-              - 'llm-service/**'
-              - 'shared/mcp-connectors/**'
-              # tests/test_object_layout_golden.py pins rsync_protocol to it.
-              - 'shared/object_layout_golden.json'
-              # test_sensitive_keys_golden.py / test_postgres_family_golden.py pin
-              # the masking list and POSTGRES_FAMILY to these (Go reads them too).
-              - 'shared/sensitive_keys_golden.json'
-              - 'shared/postgres_family_golden.json'
-              # The Helm chart is here because llm-service/tests holds the chart
-              # guards (test_chart_service_hostnames_resolve.py,
-              # test_chart_kafka_security_env.py) -- they parse deploy/helm as
-              # text and need no cluster. Without this path the guards were dead
-              # on exactly the change they exist to catch: PR #836 rewrote six
-              # chart templates and this job reported `skipping`, so the test
-              # written to catch a chart hostname bug never ran against a chart
-              # PR. A guard gated on a filter that excludes its own subject is
-              # not a guard.
-              - 'deploy/helm/**'
-              # Same reasoning one step further out: this filter gates the
-              # oss-leak-proof job, whose subject IS this script. Without the
-              # path, editing the moat-leak proof itself would not run it.
-              - 'scripts/oss-leak-proof-test.sh'
-              # And once more, one directory over. test_validate_connector_script_
-              # finds_connectors.py guards scripts/mcp-connectors/validate_connector.py
-              # -- the contributor gate the developer guide points at, which spent its
-              # whole life resolving connectors under its OWN directory and therefore
-              # examined zero of them. The guard lives here because its fixture is the
-              # connector tree; its subject does not, so without this path a PR fixing
-              # (or re-breaking) the script alone would skip the job.
-              - 'scripts/mcp-connectors/**'
-              # And the three Go service trees, for the same reason a fourth
-              # time. test_chart_sets_every_service_url_env.py reads these
-              # sources to find env vars whose fallback is a bare compose
-              # service name, then asserts the chart sets them. Its subject is
-              # therefore Go code as much as the chart -- and every one of the
-              # four instances of that defect (KAFKA_CONNECT_URL,
-              # TOOL_GENERATOR_URL, LLM_SERVICE_URL/PLANNER_URL, the internal
-              # URL pairs) ORIGINATED in a Go change, not a chart change. Gated
-              # on 'deploy/helm/**' alone, the guard would skip on precisely the
-              # PR shape that introduces the bug: a new os.Getenv with a
-              # compose-shaped default and no chart edit.
-              - 'api-gateway/**'
-              - 'backend-orchestrator/**'
-              - 'backend-temporal-adapter/**'
-              # And once more, for the same reason. test_kafka_init_builders_
-              # stay_in_lockstep.py compares SEVEN copies of the SASL
-              # mechanism -> JAAS login module mapping. Five live under paths
-              # already listed above; these two do not, and the compose one is
-              # the likeliest drift vector of the lot -- it is the file
-              # install.sh downloads. Without these paths, a PR editing only
-              # the Docker install path would not run the guard written to
-              # catch exactly that.
-              # A sixth time, same shape, and the widest yet.
-              # test_shipped_images_are_pinned.py reads EVERY root compose file --
-              # a floating image tag anywhere on the delivery surface is the bug
-              # it exists to catch. Scoped to the two compose files this filter
-              # used to name, it was dead on the other 18, including
-              # docker-compose.yml itself: the base stack the prod overlay merges
-              # onto, and where the docker-socket-proxy pin lives. A PR floating a
-              # tag there would have skipped this job entirely, and a skipped
-              # check is not a passing one. The glob is what makes the guard's
-              # reach equal its subject; test_the_ci_filter_covers_every_file_this
-              # _guard_reads asserts they stay equal. It subsumes
-              # docker-compose.quickstart.yml (needed by test_kafka_init_builders_
-              # stay_in_lockstep.py, the file install.sh downloads) and
-              # docker-compose.mcp.yml (the independently generated census
-              # test_mcp_compose_generation.py cross-checks against), so neither
-              # is listed separately.
-              - 'docker-compose*.yml'
-              # Same shape again -- and this one a census found rather than a
-              # reader. The compose glob above is anchored at the repo root, so
-              # the compose file under shared/internal/infra/kafka-connect/ --
-              # tracked, shipped, and read by test_shipped_images_are_pinned.py
-              # -- was matched by no pattern here. Two successive widenings of
-              # that guard's own pattern list had already missed it, which is
-              # why the guard now discovers compose files from `git ls-files`
-              # instead of from a list, and this path is what the discovery
-              # turned up. A directory glob rather than the one file, because
-              # the Dockerfile beside it is this component's build context and
-              # was equally uncovered.
-              - 'shared/internal/infra/kafka-connect/**'
-              - 'deploy/docker-compose.sidecar.yaml'
-              - 'scripts/kafka-init-new-topics.sh'
-              # A fourth time, same shape. test_mcp_compose_generation.py now reads
-              # the release workflow's OWN connector pathspec and re-runs it
-              # against the tree, so that narrowing that pathspec fails a PR
-              # instead of silently publishing a partial image set. That guard is
-              # only worth having if editing docker-publish.yml is what runs it --
-              # and the one edit it exists to catch is an edit to that file alone.
-              # (docker-compose.mcp.yml -- the independently generated census
-              # those guards cross-check against -- is covered by the
-              # docker-compose*.yml glob above.)
-              # Every workflow file, not just ci.yml and docker-publish.yml, because
-              # llm-service/tests also holds the fork-guard census
-              # (test_self_hosted_jobs_are_fork_guarded.py) and its subject is all
-              # four workflows. Scoped to one file, an unguarded job added to
-              # security.yml or licenses.yml would never run the test written to
-              # catch it -- the same dead-guard shape PR #836 hit with the chart
-              # tests, one file over. This glob subsumes the two specific workflow
-              # paths the guards above need, so neither is listed separately.
-              - '.github/workflows/**'
-              # A fifth time, same shape. test_connector_metadata_matches_cdc_policy.py
-              # asserts that no connector's metadata claims CDC the policy denies,
-              # and that the Go allowlist in tools.go still equals the YAML one --
-              # a promise tools.go:586 makes in a comment and nothing enforced.
-              # Grading metadata against a policy the product does not run is worse
-              # than not checking, so the Go file and the generator that mirrors it
-              # both have to be able to trigger this job.
-              - 'api-gateway/internal/handlers/tools.go'
-              # test_connector_reference_matches_disk.py (#888) imports this script
-              # and re-runs it; without the path, editing the generator itself was
-              # the one change that could not run its own guard.
-              - 'scripts/generate_connector_reference.py'
-              # A sixth time, and this one was already dead rather than
-              # hypothetical. test_sarif_findings_have_a_destination.py exists to
-              # stop the SARIF destinations being silently removed, and these two
-              # scripts ARE two of the three -- but neither path was listed, so a
-              # PR that deleted or broke scripts/summarize-sarif.sh and touched
-              # nothing else ran no guard at all. The glob above covers
-              # security.yml, which CALLS them; it does not cover them.
-              - 'scripts/summarize-sarif.sh'
-              - 'scripts/report-sarif-sinks.sh'
-              # test_security_scan_scope.py drives this script, which picks the Go
-              # modules and files security.yml scans on a PR. Listed for the same
-              # reason as the two above: the security.yml glob does not cover it.
-              - 'scripts/security/ci-scan.py'
-              # Same guard, third subject. test_retired_claims_are_not_quoted_verbatim
-              # sweeps this report for two sentences retired from security.yml's
-              # header, so the report is an INPUT to the guard and has to be able to
-              # trigger it. Caveat recorded honestly: `pull_request` above carries
-              # `paths-ignore: '**.md'`, so a REPORT.md-ONLY PR still runs nothing --
-              # this only helps a mixed PR, and `push: [main]` (unfiltered) after it.
-              # Second caveat, for the public repo: security-audit-results/ is on
-              # scripts/flip/excludes.txt, so there this glob matches nothing and is a
-              # silent no-op. Kept anyway rather than deleted -- it is load-bearing
-              # HERE, and the guard it triggers (test_retired_claims_are_not_quoted_
-              # verbatim) loses its subject in the same cut, so filter and guard die
-              # together rather than leaving a live check with a dead trigger.
-              - 'security-audit-results/**'
-              # A seventh time, same shape -- and this one arrived with the very
-              # guards it would have killed. The self-host fixes added five guards
-              # whose subjects are the root compose files (already covered by the
-              # docker-compose*.yml glob above), the prod env template, the
-              # preflight script, the flip runbook and the flip tooling. The last
-              # four matched no pattern here: a PR that re-broke
-              # scripts/preflight-prod-config.sh -- the file whose SIGPIPE defect
-              # the guard exists to catch -- would have skipped llm-service-unit
-              # and reported green.
-              # Same honest caveat as security-audit-results above: `pull_request`
-              # carries `paths-ignore: '**.md'`, so a runbook-ONLY PR still runs
-              # nothing; the markdown path helps a mixed PR and the unfiltered
-              # `push: [main]` after it. The three non-markdown paths are not
-              # subject to that.
-              # test_ci_filter_covers_every_guard_subject.py derives each guard's
-              # subjects from the guard's own source and asserts this list still
-              # matches them, so the next subject added to one of those guards
-              # cannot quietly land dead.
-              - '.env.prod.example'
-              - 'scripts/preflight-prod-config.sh'
-              - 'docs/internal/public-flip-runbook.md'
-              - 'scripts/flip/**'
-              # A seventh time, and this one's subject cannot be read out of the guard's
-              # source at all. test_doc_links_into_the_moat_are_delinked.py sweeps EVERY
-              # tracked *.md for links into the paths llm-service/oss-strip-list.txt
-              # strips -- the three that survived un-de-linked aborted the cut at
-              # check-doc-links.sh -- and test_doc_links_resolve.py reads ARCHITECTURE.md,
-              # the one pinned doc the cut keeps. Both subjects are computed from
-              # `git ls-files '*.md'`, so the census in
-              # test_ci_filter_covers_every_guard_subject.py sees no literal to match and
-              # stays green while the guards sit dead on exactly the PR shape that breaks
-              # them: a docs-only edit adding a fourth link into the moat.
-              - 'docs/**'
-              - '*.md'
-              # Same shape again, and the widest subject of any guard here.
-              # test_no_doc_promises_a_silent_gateway_db_failure.py sweeps EVERY
-              # tracked file -- not `git ls-files '*.md'` like every other doc
-              # guard -- because that markdown restriction is exactly how the
-              # retired claim survived an earlier sweep in 10 of the 12 files
-              # that carried it, all .tpl/.yaml/.sh/.py. It declares no literal
-              # path, so the census in
-              # test_ci_filter_covers_every_guard_subject.py cannot see it either.
-              # No new pattern is added for it: every tree that has ever carried
-              # the claim is already matched above (`deploy/helm/**`, `docs/**`,
-              # `*.md`, `llm-service/**`). Recorded rather than left implicit,
-              # because that coverage is a fact about today's tree, not a
-              # property of the guard -- the same claim written into, say,
-              # `api-gateway/internal/handlers/` would land on a PR this filter
-              # does not match. The unfiltered `push: [main]` after the PR is
-              # what still sweeps it.
-              # `install.sh` is the whole Docker-install acceptance path and is read by four
-              # guards (test_install_reachability, test_byo_overlays_are_complete,
-              # test_repo_slug_is_publishable, test_shipped_images_are_publishable -- 18
-              # references in the last alone). It matched no pattern here, so an
-              # install.sh-only PR ran none of them.
-              - 'install.sh'
-              # install-k8s.sh is the Kubernetes counterpart and has its own guard
-              # (test_install_k8s_defaults_work.py), which also compares its embedded
-              # connector list with shared/mcp-connectors/public/**/latest.json.
-              - 'install-k8s.sh'
-              - 'scripts/mcp_generate_compose.py'
-              # An eighth time, and the two paths are a matched pair rather than two
-              # separate subjects. test_chart_waits_for_the_dependency_that_is_fatal_to_miss.py
-              # asserts that the chart's dependency wait is opt-in, that
-              # backend-temporal-adapter opts in because it dies without Temporal, and
-              # that api-gateway does NOT because it serves the whole UI without one.
-              # The chart half is already covered by `deploy/helm/**` above; these two
-              # Go files are the halves that say WHY each side is what it is, and a PR
-              # deleting the adapter's retry -- or the gateway's tolerance that earns
-              # its exemption -- would otherwise touch nothing this filter matches.
-              - 'backend-temporal-adapter/cmd/adapter/main.go'
-              - 'api-gateway/cmd/server/main.go'
-              # A ninth time, same shape.
-              # test_both_install_paths_start_the_cdc_plane.py holds the docker
-              # and kubernetes installs to one promise: a default install can
-              # run the sync modes the UI offers. The reason there is no
-              # degraded path lives in this Go file -- the pre-flight builds its
-              # required-service list from sync_mode and demands all three CDC
-              # services together. Rename one there and the guard's premise is
-              # stale, which is precisely when it must run; every other subject
-              # it reads is already matched, so without this path that PR would
-              # skip the job.
-              - 'backend-orchestrator/internal/workers/infra_preflight.go'
-              # A tenth time, same shape, and this one spans three Go modules.
-              # test_otel_export_errors_are_collapsed.py asserts that every Go
-              # service building an OTLP exporter installs the rate-limiting
-              # error handler, and that the three byte-identical copies of that
-              # handler do not drift. They are separate modules with no shared
-              # telemetry package, so the copies stay in lockstep by that guard
-              # and nothing else -- and without these paths a PR editing one
-              # copy alone would run neither the guard nor anything else that
-              # could notice.
-              - 'backend-orchestrator/internal/telemetry/**'
-              - 'api-gateway/internal/telemetry/**'
-              - 'backend-temporal-adapter/internal/telemetry/**'
-              # An eleventh time, same shape, and the subjects are whole test
-              # trees rather than single files.
-              # test_shipped_images_are_anonymously_pullable.py sweeps every
-              # tracked file for an image behind a registry auth wall -- the
-              # defect that killed a `curl | bash` install outright when MinIO
-              # withdrew anonymous pulls from docker.io/minio/*. Most of its
-              # subjects are compose files and the chart, already matched above,
-              # but five are shell and Python scripts under these two trees that
-              # `docker run` the `mc` client directly, and neither tree matched
-              # any pattern here: the `e2e:` filter below is scoped to
-              # e2e/_support/** and gates a different job. So a PR reverting one
-              # of those lines to the Docker Hub name would have skipped
-              # llm-service-unit and reported green.
-              - 'e2e/**'
-              - 'tests/**'
-              # A twelfth time, same shape, and this one is a Go file guarded
-              # from Python. test_insecure_token_endpoint_rule_is_one_rule.py
-              # holds ALL EIGHT places that decide whether a plain-http Kafka
-              # OAuth token endpoint is refused to one rule -- the Go tier, the
-              # Python tier, the Debezium connector, the Connect entrypoint, the
-              # kafka-init script, the quickstart compose and two chart
-              # templates. Seven are matched above; shared/go/kafkaclient is not
-              # under any pattern here, and it is the tier the rule was written
-              # in first. A PR that deleted the refusal from config.go alone --
-              # the single edit that re-opens the hole this guard exists to
-              # close -- would have skipped llm-service-unit and reported green.
-              - 'shared/go/kafkaclient/**'
-            e2e:
-              - 'e2e/_support/**'
-              - '.github/workflows/ci.yml'
-            frontend:
-              - 'frontend/**'
-              # statementClassGolden.test.ts pins the Explorer classifier to the
-              # api-gateway's; a PR changing only the shared fixture must run it.
-              - 'shared/explorer_statement_class_golden.json'
-              # dataLoadingStrategyGolden.test.ts pins computeStrategySteps to the
-              # api-gateway's step builder the same way.
-              - 'shared/data_loading_strategy_golden.json'
-              # namespaceModel.test.ts pins the frontend's namespace lookup to
-              # backend-orchestrator/pkg/namespacemodel the same way, and builds
-              # its models from every connector's latest.json + metadata.json.
-              - 'shared/namespace_model_golden.json'
-              - 'shared/mcp-connectors/**/latest.json'
-              - 'shared/mcp-connectors/**/versions/*/metadata.json'
-  # Deliberately NOT behind `needs: changes`. It is a sub-second pure-grep check, and
-  # a paths-filter that excluded the very file it protects is exactly how
-  # KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW happened. Running it unconditionally
-  # costs nothing and cannot be filtered wrong.
+  # Change detection used to be its own job that nine jobs waited on via
+  # `needs:`. That `needs:` did not cost the ~11 s the job ran -- it cost a
+  # second trip through the runner queue. Four self-hosted agents serve every
+  # workflow in this repo, and measured across runs 36025851448, 36024668512
+  # and 36023391830, `Detect changes` itself waited 495-925 s for a slot, then
+  # its dependents waited another 153-907 s once it released one. Two
+  # traversals of a queue that deep dwarfed the 1440 s of real work the whole
+  # run contains. `frontend-a11y`, needing both, paid three.
+  #
+  # So each job runs the filter itself, from the single definition in
+  # .github/paths-filters.yml, and gates its own steps on `env.RUN`. A job with
+  # nothing to do now costs one checkout (~11 s) instead of reporting `skipping`
+  # for free -- cheap against a queue traversal, and it buys every job the right
+  # to start at t=0. The same reasoning that merged ten Go module jobs into one
+  # below: on this fleet a job boundary costs far more than it saves.
+
+  # Deliberately UNFILTERED even though the rest of ci.yml now filters itself. It
+  # is a sub-second pure-grep check, and a paths-filter that excluded the very file
+  # it protects is exactly how KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW happened.
+  # Running it unconditionally costs nothing and cannot be filtered wrong.
   #
   # Guards a failure mode that no other job can see: a `${VAR:?}` in a shipped compose
   # file whose value no shipped template supplies. One `:?` aborts interpolation for
@@ -461,11 +97,31 @@ jobs:
   # (the matrices' fail-fast: false), and the job fails at the end naming each.
   go:
     name: Go
-    needs: changes
-    if: ${{ (needs.changes.outputs.go == 'true' || needs.changes.outputs.go-shared == 'true' || needs.changes.outputs.sink == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Change detection, inlined -- see "Why there is no `changes` job" above.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: .github/paths-filters.yml
+      # RUN is this job's only gate. EVERY step below carries `if: env.RUN == '1'`,
+      # and llm-service/tests/test_ci_inline_change_filters.py fails if one does not:
+      # an unguarded step would work on a PR that changed none of this job's paths,
+      # and a step wrongly left outside the gate would report green having done
+      # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
+      - name: Does this job have anything to do?
+        env:
+          WANTED: ${{ steps.filter.outputs.go == 'true' || steps.filter.outputs.go-shared == 'true' || steps.filter.outputs.sink == 'true' }}
+        run: |
+          if [ "$WANTED" = 'true' ]; then
+            echo 'RUN=1' >> "$GITHUB_ENV"
+          else
+            echo 'RUN=0' >> "$GITHUB_ENV"
+            echo '::notice title=Go skipped::no path this job filters on changed'
+            echo '`Go` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
       # The job's own Go is api-gateway's toolchain. A module that declares a
       # different `toolchain` in its go.mod still gets exactly that one: the
       # loop below sets GOTOOLCHAIN per module, and the go command downloads
@@ -474,6 +130,7 @@ jobs:
       # toolchain the services that compile it are built with -- rather than
       # the newest 1.23.x / 1.24.x its `go` line would otherwise resolve to.
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        if: env.RUN == '1'
         with:
           go-version-file: api-gateway/go.mod
           # Disable setup-go's built-in auto-cache. It saves the entire global
@@ -526,16 +183,21 @@ jobs:
       # - shared/go/kafkaclient: every Go service's Kafka config, TLS and SASL
       #   (FromEnvForService). Same reason again: four modules `replace` it, so
       #   it was built on every Go PR while its own config/auth tests never ran.
+      # - shared/go/memlimit: the cgroup-derived GOMEMLIMIT every Go service and
+      #   the sink worker set at startup. Same reason: `replace` builds it but
+      #   never runs memlimit_test.go, whose real-runtime case is the only check
+      #   that the soft limit actually reaches the Go runtime.
       # - the kafka-mcp-sink worker is its own module outside both lists above,
       #   so its data-critical unit tests (table normalization, namespace
       #   routing, CDC/batch message parsing, DLQ handling) otherwise never
       #   run. It `replace`s ../../../../go/transforms; actions/checkout pulls
       #   the whole repo so that relative path resolves.
       - name: go test (includes build + vet via compiler)
+        if: env.RUN == '1'
         env:
-          SERVICES: ${{ needs.changes.outputs.go }}
-          SHARED: ${{ needs.changes.outputs.go-shared }}
-          SINK: ${{ needs.changes.outputs.sink }}
+          SERVICES: ${{ steps.filter.outputs.go }}
+          SHARED: ${{ steps.filter.outputs.go-shared }}
+          SINK: ${{ steps.filter.outputs.sink }}
         # `go test ./...` compiles every package, so the explicit
         # `go build` + `go vet` steps that used to run before were
         # redundant — `go test` already runs the same compile checks
@@ -556,7 +218,7 @@ jobs:
             modules="$modules api-gateway backend-orchestrator backend-temporal-adapter connector-deployer"
           fi
           if [ "$SHARED" = true ]; then
-            modules="$modules shared/go/correlation shared/go/crypto shared/go/transforms shared/go/naming shared/go/pgdriver shared/go/kafkaclient"
+            modules="$modules shared/go/correlation shared/go/crypto shared/go/transforms shared/go/naming shared/go/pgdriver shared/go/kafkaclient shared/go/memlimit"
           fi
           if [ "$SINK" = true ]; then
             modules="$modules shared/mcp-connectors/internal/kafka-mcp-sink/worker-src"
@@ -577,8 +239,7 @@ jobs:
 
   llm-service-unit:
     name: llm-service unit tests
-    needs: changes
-    if: ${{ (needs.changes.outputs.llm == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -592,6 +253,27 @@ jobs:
           # was simply never fetched. A check that cannot tell absence from
           # not-having-looked is the exact failure it was written to catch.
           fetch-depth: 0
+      # Change detection, inlined -- see "Why there is no `changes` job" above.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: .github/paths-filters.yml
+      # RUN is this job's only gate. EVERY step below carries `if: env.RUN == '1'`,
+      # and llm-service/tests/test_ci_inline_change_filters.py fails if one does not:
+      # an unguarded step would work on a PR that changed none of this job's paths,
+      # and a step wrongly left outside the gate would report green having done
+      # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
+      - name: Does this job have anything to do?
+        env:
+          WANTED: ${{ steps.filter.outputs.llm == 'true' }}
+        run: |
+          if [ "$WANTED" = 'true' ]; then
+            echo 'RUN=1' >> "$GITHUB_ENV"
+          else
+            echo 'RUN=0' >> "$GITHUB_ENV"
+            echo '::notice title=llm-service unit tests skipped::no path this job filters on changed'
+            echo '`llm-service unit tests` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
       # This job used to skip `actions/setup-python` and hard-code the brew
       # interpreter: the action writes `/Users/runner/hostedtoolcache/...`,
       # which a self-hosted Mac cannot create regardless of RUNNER_TOOL_CACHE
@@ -600,9 +282,11 @@ jobs:
       # built to write — so the action is now the right way to pin 3.11, and
       # the bare `python3` below resolves to it.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        if: env.RUN == '1'
         with:
           python-version: '3.11'
       - name: Set up Python venv
+        if: env.RUN == '1'
         run: |
           PY=python3
           $PY --version
@@ -666,7 +350,7 @@ jobs:
       # there it would only ever find nothing.
       - name: Reuse the venv already on this runner's disk
         id: venv-local
-        if: runner.environment == 'self-hosted'
+        if: env.RUN == '1' && (runner.environment == 'self-hosted')
         run: |
           v="$HOME/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}"
           if [ -f "$v.complete" ] && "$v/bin/python" -c 'import pytest' 2>/dev/null; then
@@ -705,13 +389,13 @@ jobs:
       # still skips that step and keeps the ~5s restore.
       - name: Cache Python venv
         id: venv-cache
-        if: steps.venv-local.outputs.ready != 'true'
+        if: env.RUN == '1' && (steps.venv-local.outputs.ready != 'true')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}
           key: ${{ runner.os }}-venv-llm-${{ hashFiles('llm-service/requirements.txt') }}
       - name: Install dependencies
-        if: steps.venv-local.outputs.ready != 'true' && steps.venv-cache.outputs.cache-hit != 'true'
+        if: env.RUN == '1' && (steps.venv-local.outputs.ready != 'true' && steps.venv-cache.outputs.cache-hit != 'true')
         working-directory: llm-service
         run: |
           PY=python3
@@ -737,9 +421,10 @@ jobs:
           "$VPY" -m pip install -r requirements.txt
           "$VPY" -m pip install pytest pytest-asyncio
       - name: Mark this venv complete
-        if: runner.environment == 'self-hosted' && steps.venv-local.outputs.ready != 'true'
+        if: env.RUN == '1' && (runner.environment == 'self-hosted' && steps.venv-local.outputs.ready != 'true')
         run: touch "$HOME/.venvs/llm-ci-${{ hashFiles('llm-service/requirements.txt') }}.complete"
       - name: Install connector test drivers
+        if: env.RUN == '1'
         # Test-only DB drivers NOT in llm-service/requirements.txt — each connector ships
         # its own driver in its own image and llm-service never imports them, so they don't
         # belong in requirements.txt. Only the per-connector offline suites (added below)
@@ -770,11 +455,16 @@ jobs:
       # red job instead of eight quiet skips. Same action and same pin as
       # docker-publish.yml already uses for publish-chart, and the version
       # print after it turns a broken setup into a named failure rather than a
-      # later skip.
+      # later skip. Gated like every step after the RUN decision: an ungated
+      # setup step runs on PRs the job has nothing to do for
+      # (test_ci_inline_change_filters.py).
       - uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        if: env.RUN == '1'
       - name: helm is present (eight chart cases skip silently without it)
+        if: env.RUN == '1'
         run: helm version --short
       - name: Run unit tests
+        if: env.RUN == '1'
         working-directory: llm-service
         env:
           PYTHONPATH: ${{ github.workspace }}/llm-service:${{ github.workspace }}/llm-service/src:${{ github.workspace }}/shared/mcp-connectors
@@ -929,6 +619,7 @@ jobs:
             ../shared/mcp-connectors/tests/ \
             -v
       - name: Per-connector regression tests (offline suites)
+        if: env.RUN == '1'
         # The offline unit suites that ship next to each connector under
         # public/**/versions/<v>/test_*.py — fail-loud-on-truncation, decimal scale
         # fidelity, multi-schema discovery, type canonicalization, INV-1 storage
@@ -1017,15 +708,37 @@ jobs:
 
   e2e-support-unit:
     name: e2e/_support unit tests
-    needs: changes
-    if: ${{ (needs.changes.outputs.e2e == 'true') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Change detection, inlined -- see "Why there is no `changes` job" above.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: .github/paths-filters.yml
+      # RUN is this job's only gate. EVERY step below carries `if: env.RUN == '1'`,
+      # and llm-service/tests/test_ci_inline_change_filters.py fails if one does not:
+      # an unguarded step would work on a PR that changed none of this job's paths,
+      # and a step wrongly left outside the gate would report green having done
+      # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
+      - name: Does this job have anything to do?
+        env:
+          WANTED: ${{ steps.filter.outputs.e2e == 'true' }}
+        run: |
+          if [ "$WANTED" = 'true' ]; then
+            echo 'RUN=1' >> "$GITHUB_ENV"
+          else
+            echo 'RUN=0' >> "$GITHUB_ENV"
+            echo '::notice title=e2e/_support unit tests skipped::no path this job filters on changed'
+            echo '`e2e/_support unit tests` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        if: env.RUN == '1'
         with:
           python-version: '3.11'
       - name: Set up Python 3.11 venv
+        if: env.RUN == '1'
         run: |
           PY=python3
           $PY --version
@@ -1033,8 +746,10 @@ jobs:
           "$GITHUB_WORKSPACE/.venv-e2e/bin/python" -m pip install --upgrade pip
           echo "$GITHUB_WORKSPACE/.venv-e2e/bin" >> "$GITHUB_PATH"
       - name: Install dependencies
+        if: env.RUN == '1'
         run: pip install pytest requests
       - name: Run unit tests for e2e helpers
+        if: env.RUN == '1'
         run: pytest e2e/_support -v
 
   # OSS connector-lifecycle DEPLOY smoke — the runtime guard for the F1 class.
@@ -1109,7 +824,6 @@ jobs:
   # inspects the built artifact.
   oss-leak-proof:
     name: OSS images are moat-free
-    needs: changes
     # Guard to the canonical repo: a fork or mirror has no business running this
     # repo's moat proof against its own docker daemon.
     #
@@ -1126,7 +840,7 @@ jobs:
     # Both slugs, for the reason spelled out on oss-deploy-smoke above: this job
     # must keep running on the private repo before the flip and on the public one
     # after it.
-    if: ${{ contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync"]'), github.repository) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (needs.changes.outputs.llm == 'true' || github.event_name == 'schedule') }}
+    if: ${{ contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync"]'), github.repository) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     # NO job-level `concurrency` here, deliberately. There used to be one -- a
     # repository-wide group `oss-leak-proof` with `cancel-in-progress: false` --
@@ -1151,12 +865,34 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Change detection, inlined -- see "Why there is no `changes` job" above.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: .github/paths-filters.yml
+      # RUN is this job's only gate. EVERY step below carries `if: env.RUN == '1'`,
+      # and llm-service/tests/test_ci_inline_change_filters.py fails if one does not:
+      # an unguarded step would work on a PR that changed none of this job's paths,
+      # and a step wrongly left outside the gate would report green having done
+      # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
+      - name: Does this job have anything to do?
+        env:
+          WANTED: ${{ steps.filter.outputs.llm == 'true' || github.event_name == 'schedule' }}
+        run: |
+          if [ "$WANTED" = 'true' ]; then
+            echo 'RUN=1' >> "$GITHUB_ENV"
+          else
+            echo 'RUN=0' >> "$GITHUB_ENV"
+            echo '::notice title=OSS images are moat-free skipped::no path this job filters on changed'
+            echo '`OSS images are moat-free` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Both published OSS images carry none of the moat
+        if: env.RUN == '1'
         run: |
           chmod +x scripts/oss-leak-proof-test.sh
           bash scripts/oss-leak-proof-test.sh
       - name: Remove the leak-test images
-        if: always()
+        if: env.RUN == '1' && (always())
         # The runner is a long-lived box; two ~1GB images per run would accumulate.
         # Never fail the job on cleanup -- a red X here would be read as a leak.
         #
@@ -1181,14 +917,35 @@ jobs:
 
   frontend:
     name: Frontend (lint + test + build)
-    needs: changes
     # Runs on frontend PRs AND on the nightly schedule (the a11y job below
     # needs this job's build artifact, so the build must run nightly too).
-    if: ${{ (needs.changes.outputs.frontend == 'true' || github.event_name == 'schedule') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Change detection, inlined -- see "Why there is no `changes` job" above.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: .github/paths-filters.yml
+      # RUN is this job's only gate. EVERY step below carries `if: env.RUN == '1'`,
+      # and llm-service/tests/test_ci_inline_change_filters.py fails if one does not:
+      # an unguarded step would work on a PR that changed none of this job's paths,
+      # and a step wrongly left outside the gate would report green having done
+      # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
+      - name: Does this job have anything to do?
+        env:
+          WANTED: ${{ steps.filter.outputs.frontend == 'true' || github.event_name == 'schedule' }}
+        run: |
+          if [ "$WANTED" = 'true' ]; then
+            echo 'RUN=1' >> "$GITHUB_ENV"
+          else
+            echo 'RUN=0' >> "$GITHUB_ENV"
+            echo '::notice title=Frontend skipped::no path this job filters on changed'
+            echo '`Frontend` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        if: env.RUN == '1'
         with:
           # MUST equal the major in frontend/Dockerfile (node:26-alpine in all
           # three stages) — CI is only a gate on what we ship if it runs the
@@ -1231,7 +988,7 @@ jobs:
       # so there the step is skipped and the install below always runs.
       - name: Cache node_modules
         id: nm-cache
-        if: runner.environment != 'self-hosted'
+        if: env.RUN == '1' && (runner.environment != 'self-hosted')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: frontend/node_modules
@@ -1244,7 +1001,7 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node26-nm-
       - name: Install dependencies
-        if: steps.nm-cache.outputs.cache-hit != 'true'
+        if: env.RUN == '1' && (steps.nm-cache.outputs.cache-hit != 'true')
         working-directory: frontend
         run: npm ci
       # Vitest ran nowhere in CI until 2026-07-30 — `npm test` was not invoked by
@@ -1253,6 +1010,7 @@ jobs:
       # "compiles + lints", never "tests pass". Placed BEFORE the build: a failed
       # assertion should not cost the 60-90s Next build first.
       - name: Unit tests (vitest)
+        if: env.RUN == '1'
         working-directory: frontend
         run: npm test
       # CI SPEEDUP: cache Next.js incremental build output (.next/cache).
@@ -1277,7 +1035,7 @@ jobs:
       # 256 s, for a cache an APFS clone copies in 0.01 s; a warm build takes
       # 9 s against 36 s cold.
       - name: Cache Next.js build cache
-        if: runner.environment != 'self-hosted'
+        if: env.RUN == '1' && (runner.environment != 'self-hosted')
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: frontend/.next/cache
@@ -1293,7 +1051,7 @@ jobs:
       # free whatever its size. A missing or failed copy only means a cold
       # build, so neither this step nor the Keep step can fail the job.
       - name: Restore Next.js build cache (this runner's disk)
-        if: runner.environment == 'self-hosted'
+        if: env.RUN == '1' && (runner.environment == 'self-hosted')
         continue-on-error: true
         run: |
           d="$HOME/.cache/rsync-ci/$RUNNER_NAME/nextjs"
@@ -1313,6 +1071,7 @@ jobs:
       # Lint is CPU-light (ESLint pass) and finishes well before the build.
       # Both must succeed; if lint fails its exit code surfaces at `wait`.
       - name: Lint + Build (parallel)
+        if: env.RUN == '1'
         working-directory: frontend
         env:
           NEXT_PUBLIC_API_URL: http://localhost:5001
@@ -1328,7 +1087,7 @@ jobs:
       # copy is never a partial one. Capped at 2 GB -- past that it is dropped,
       # and the next build starts cold and small again.
       - name: Keep Next.js build cache (this runner's disk)
-        if: runner.environment == 'self-hosted'
+        if: env.RUN == '1' && (runner.environment == 'self-hosted')
         continue-on-error: true
         run: |
           d="$HOME/.cache/rsync-ci/$RUNNER_NAME/nextjs"
@@ -1359,7 +1118,7 @@ jobs:
         # upload to the SAME condition so PR/push runs don't upload an artifact
         # nothing downloads -- which previously failed the whole gate whenever the
         # Actions artifact-storage quota was exhausted.
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: env.RUN == '1' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         # Next.js 16 emits internal chunk files whose names contain ':' (e.g.
         # `[externals]_node:inspector_*.js`). upload-artifact@v4 rejects colons
         # for NTFS compatibility, so we tar the build first and ship a single
@@ -1367,7 +1126,7 @@ jobs:
         working-directory: frontend
         run: tar -cf frontend-build.tar .next public
       - name: Cache build output
-        if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+        if: env.RUN == '1' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: frontend-build
@@ -1376,7 +1135,7 @@ jobs:
 
   frontend-a11y:
     name: Frontend a11y (axe-core)
-    needs: [changes, frontend]
+    needs: frontend
     # Nightly / manual only — NOT on PRs, and it MEASURES LESS THAN IT LOOKS.
     #
     # This job brings up only the Next frontend (playwright.a11y.config.ts
@@ -1410,7 +1169,29 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # Change detection, inlined -- see "Why there is no `changes` job" above.
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: .github/paths-filters.yml
+      # RUN is this job's only gate. EVERY step below carries `if: env.RUN == '1'`,
+      # and llm-service/tests/test_ci_inline_change_filters.py fails if one does not:
+      # an unguarded step would work on a PR that changed none of this job's paths,
+      # and a step wrongly left outside the gate would report green having done
+      # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
+      - name: Does this job have anything to do?
+        env:
+          WANTED: ${{ steps.filter.outputs.frontend == 'true' || github.event_name == 'schedule' }}
+        run: |
+          if [ "$WANTED" = 'true' ]; then
+            echo 'RUN=1' >> "$GITHUB_ENV"
+          else
+            echo 'RUN=0' >> "$GITHUB_ENV"
+            echo '::notice title=Frontend a11y (axe-core) skipped::no path this job filters on changed'
+            echo '`Frontend a11y (axe-core)` -- skipped: no path this job filters on changed.' >> "$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        if: env.RUN == '1'
         with:
           # Kept in lockstep with the frontend job above — the two share one
           # node_modules cache, so they must install under the same Node major.
@@ -1420,6 +1201,7 @@ jobs:
       # CI SPEEDUP: share the same node_modules cache the frontend
       # build job populated. Same key so warm hits skip `npm ci`.
       - name: Cache node_modules
+        if: env.RUN == '1'
         id: nm-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -1433,15 +1215,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node26-nm-
       - name: Install dependencies
-        if: steps.nm-cache.outputs.cache-hit != 'true'
+        if: env.RUN == '1' && (steps.nm-cache.outputs.cache-hit != 'true')
         working-directory: frontend
         run: npm ci
       - name: Restore build output
+        if: env.RUN == '1'
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: frontend-build
           path: frontend
       - name: Extract build output
+        if: env.RUN == '1'
         working-directory: frontend
         run: tar -xf frontend-build.tar && rm frontend-build.tar
       # CI SPEEDUP: cache Playwright's chromium download. Without
@@ -1455,6 +1239,7 @@ jobs:
       # would cache nothing and quietly pay the ~100 MB download every run --
       # the speedup this step exists for, not happening and not saying so.
       - name: Cache Playwright browsers
+        if: env.RUN == '1'
         id: pw-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -1463,10 +1248,11 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-pw-
       - name: Install Playwright browsers
-        if: steps.pw-cache.outputs.cache-hit != 'true'
+        if: env.RUN == '1' && (steps.pw-cache.outputs.cache-hit != 'true')
         working-directory: frontend
         run: npx playwright install --with-deps chromium
       - name: Run axe-core a11y suite
+        if: env.RUN == '1'
         working-directory: frontend
         # Without an api-gateway on :5001 the four authenticated specs SKIP
         # (see the job-level comment above) — so a green result here is not
@@ -1484,7 +1270,7 @@ jobs:
           NEXT_PUBLIC_WS_URL: ws://localhost:5001/ws
         run: npm run test:a11y
       - name: Upload report on failure
-        if: always()
+        if: env.RUN == '1' && (always())
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: playwright-a11y-report

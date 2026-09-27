@@ -16,17 +16,11 @@ import (
 )
 
 // ==============================================================================
-// TEMPORAL ACTIVITIES - KAFKA BRIDGE
+// TEMPORAL ACTIVITIES - SHARED
 // ==============================================================================
-// Activities emit commands to Kafka and emit domain events.
-// Results are received via Temporal signals from the Kafka adapter.
-//
-// Pattern:
-// 1. Activity emits command to agent.control.commands
-// 2. Agent consumes command, executes task
-// 3. Agent emits result to agent.control.results
-// 4. Kafka adapter consumes result and signals workflow
-// 5. Workflow resumes with result
+// Activities that emit domain events to Kafka and write authoritative state.
+// Workflows are resumed by Temporal signals sent over the Temporal API, never by a
+// Kafka consumer in this process.
 // ==============================================================================
 
 // KafkaProducer interface for producing messages
@@ -89,16 +83,6 @@ func activityTemporalClient() client.Client {
 // EmitDomainEventActivity emits a domain event to Kafka
 func EmitDomainEventActivity(ctx context.Context, event map[string]interface{}) error {
 	return emitDomainEventActivity(ctx, event)
-}
-
-// SendToPipelineDLQ sends a failed pipeline to the DLQ
-func SendToPipelineDLQ(ctx context.Context, failure map[string]interface{}) error {
-	return sendToPipelineDLQ(ctx, failure)
-}
-
-// SendToAgentDLQ sends a failed activity to the DLQ
-func SendToAgentDLQ(ctx context.Context, failure map[string]interface{}) error {
-	return sendToAgentDLQ(ctx, failure)
 }
 
 // StateUpdateActivity updates the authoritative pipeline state in DB (Architecture Phase 1)
@@ -172,72 +156,6 @@ func emitDomainEventActivity(ctx context.Context, event map[string]interface{}) 
 		"event_type":  event["event_type"],
 		"pipeline_id": pipelineID,
 	}).Info("📡 Emitted domain event to Kafka")
-
-	return nil
-}
-
-// ==============================================================================
-// DLQ ACTIVITIES
-// ==============================================================================
-
-// sendToPipelineDLQ sends a failed pipeline to the DLQ
-func sendToPipelineDLQ(ctx context.Context, failure map[string]interface{}) error {
-	failureJSON, err := json.Marshal(failure)
-	if err != nil {
-		return fmt.Errorf("failed to marshal pipeline failure: %w", err)
-	}
-
-	pipelineID, ok := failure["pipeline_id"].(string)
-	if !ok {
-		return fmt.Errorf("pipeline failure missing pipeline_id")
-	}
-
-	msg := &sarama.ProducerMessage{
-		Topic: kafkaclient.Topic("pipeline.failed.dlq"),
-		Key:   sarama.StringEncoder(pipelineID),
-		Value: sarama.ByteEncoder(failureJSON),
-	}
-
-	_, _, err = activityCtx.KafkaProducer.SendMessage(msg)
-	if err != nil {
-		return fmt.Errorf("failed to send to pipeline DLQ: %w", err)
-	}
-
-	log.WithFields(log.Fields{
-		"pipeline_id": pipelineID,
-		"stage":       failure["stage"],
-	}).Warn("⚠️  Sent failed pipeline to DLQ")
-
-	return nil
-}
-
-// sendToAgentDLQ sends a failed activity to the DLQ
-func sendToAgentDLQ(ctx context.Context, failure map[string]interface{}) error {
-	failureJSON, err := json.Marshal(failure)
-	if err != nil {
-		return fmt.Errorf("failed to marshal agent failure: %w", err)
-	}
-
-	workflowID, ok := failure["workflow_id"].(string)
-	if !ok {
-		return fmt.Errorf("agent failure missing workflow_id")
-	}
-
-	msg := &sarama.ProducerMessage{
-		Topic: kafkaclient.Topic("agent.failed.dlq"),
-		Key:   sarama.StringEncoder(workflowID),
-		Value: sarama.ByteEncoder(failureJSON),
-	}
-
-	_, _, err = activityCtx.KafkaProducer.SendMessage(msg)
-	if err != nil {
-		return fmt.Errorf("failed to send to agent DLQ: %w", err)
-	}
-
-	log.WithFields(log.Fields{
-		"workflow_id": workflowID,
-		"agent_type":  failure["agent_type"],
-	}).Warn("⚠️  Sent failed activity to DLQ")
 
 	return nil
 }

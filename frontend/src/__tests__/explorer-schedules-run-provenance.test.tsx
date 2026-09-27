@@ -99,6 +99,7 @@ const RUNS = [
 async function openHistory() {
   ;(authFetch as Mock).mockImplementation(async (url: string) => {
     if (url === "/api/v1/explorer/schedules?saved_query_id=q-1") return res(200, { schedules: [SCHEDULE], count: 1 })
+    if (url === "/api/v1/explorer/saved/q-1") return res(200, { ...SCHEDULE, id: "q-1" })
     if (url.startsWith("/api/v1/explorer/saved/q-1/runs")) return res(200, { runs: RUNS })
     return res(404, {})
   })

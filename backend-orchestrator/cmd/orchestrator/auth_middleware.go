@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/rsync-ai/backend-orchestrator/internal/handlers"
 	"github.com/rsync-ai/shared/crypto"
 )
 
@@ -107,43 +108,20 @@ func principalUserID(c *gin.Context) (userID string, internal bool) {
 	return c.GetString("auth_user_id"), false
 }
 
-// assertPipelineOwner enforces that a user principal owns the target pipeline
-// before a mutating CDC control action (pause/resume). Trusted internal callers
+// assertPipelineOwner enforces that the caller may drive a mutating CDC control
+// action (pause / resume) on the target pipeline. Trusted internal callers
 // (api-gateway proxy, which already applied its own workspace-role gate) pass
 // through. On any failure it writes the response, aborts, and returns false so
-// the handler must `return`. This closes the cross-tenant tamper where anyone
-// with a pipeline UUID could pause/resume another tenant's Debezium connector.
+// the handler must `return`.
+//
+// The boundary is the WORKSPACE, not the creator. This used to compare the
+// caller against `pipelines.created_by`, which is workspace-blind in both
+// directions: a user removed from the workspace kept control of its CDC, and a
+// teammate holding a real role on a pipeline the workspace collectively owns was
+// refused. Every handler-side CDC route already authorized through
+// handlers.assertPipelineOwnerForHandlers; these inline routes were the omission,
+// so this now delegates to that same gate rather than keeping a second copy of
+// the policy. Pinned by TestAssertPipelineOwnerUsesTheWorkspaceGate.
 func assertPipelineOwner(c *gin.Context, db *sql.DB, pipelineID string) bool {
-	authUser, internal := principalUserID(c)
-	if internal {
-		return true
-	}
-	if authUser == "" {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
-		c.Abort()
-		return false
-	}
-	if db == nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "database unavailable"})
-		c.Abort()
-		return false
-	}
-	var owner sql.NullString
-	err := db.QueryRow(`SELECT created_by::text FROM pipelines WHERE id = $1`, pipelineID).Scan(&owner)
-	if err == sql.ErrNoRows {
-		c.JSON(http.StatusNotFound, gin.H{"error": "pipeline not found"})
-		c.Abort()
-		return false
-	}
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "ownership check failed"})
-		c.Abort()
-		return false
-	}
-	if !owner.Valid || owner.String != authUser {
-		c.JSON(http.StatusForbidden, gin.H{"error": "not authorized for this pipeline"})
-		c.Abort()
-		return false
-	}
-	return true
+	return handlers.AssertPipelineWorkspaceRole(c, db, pipelineID)
 }

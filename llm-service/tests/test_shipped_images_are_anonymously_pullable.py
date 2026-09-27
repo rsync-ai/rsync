@@ -13,6 +13,10 @@ as absent rather than private. The host that hit this was *already running* that
 exact image: it had pulled it 28 hours earlier. So the break is invisible to
 every machine that already has the layers cached, and total for every new one.
 
+It then happened again. The repo moved to `quay.io/minio/*`, and by 2026-09-26
+that answered 401 to an anonymous client as well, for the server and `mc` alike.
+Same failure, same silence, one registry over.
+
 THIS IS A DIFFERENT FAILURE MODE FROM A FLOATING TAG, AND ITS SIBLING.
 test_shipped_images_are_pinned.py covers the case where the tag stays and the
 bits move. This covers the case where the bits stay and the *source* goes away.
@@ -24,19 +28,27 @@ serves an anonymous pull is the check you want and the check you cannot have in
 CI: it needs network, it is slow per image, and a vendor outage would turn every
 PR red for a reason no author could act on. A test that is red for reasons
 outside the PR gets ignored, and an ignored test protects nothing. So what is
-asserted here is the *decision*: MinIO images come from quay.io. That is
-checkable offline, it is exactly the thing a future edit would undo by accident,
-and it fails on the PR that introduces the regression rather than on the install
-six weeks later.
+asserted here is the *decision*: MinIO images come from cgr.dev/chainguard/minio.
+That is checkable offline, it is exactly the thing a future edit would undo by
+accident, and it fails on the PR that introduces the regression rather than on
+the install six weeks later. The flip side is written down here too: a denylist
+only knows the walls someone has already hit. Nothing in this file would have
+seen quay.io go dark, and nothing here will see a pinned Chainguard digest stop
+answering. Only a scheduled probe of the registry can.
 
-WHY quay.io IS A SAFE SWAP AND NOT A DIFFERENT IMAGE. quay.io/minio publishes
-the same `RELEASE.*` tags. At the time of the move, `quay.io/minio/minio:
-RELEASE.2025-09-07T16-13-09Z` returned manifest digest
-sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e --
-byte-identical to the digest of the Docker Hub image the affected host was
-already running. The registry changed; the bits did not. That comparison is what
-separates a registry move from an upgrade, and it is the same technique the
-MinIO tag pins used to prove they were a no-op.
+THE FIRST MOVE WAS A REGISTRY MOVE; THE SECOND IS AN UPGRADE. quay.io/minio/*
+published the same `RELEASE.*` tags, and at the time of that move
+`RELEASE.2025-09-07T16-13-09Z` returned manifest digest
+sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e on both
+registries -- byte-identical, so the source moved and the bits did not. No such
+comparison exists for the second move: once quay.io/minio/* walled off too, no
+MinIO-built image was left to pull anonymously. cgr.dev/chainguard/minio is
+Chainguard's build from its own fork, a year of releases newer
+(RELEASE.2026-09-22T19-25-18Z), and it serves only `latest`, so the shipped
+files pin it by digest. It is one image for both roles: the server is its
+entrypoint and it carries `mc` and a shell. Chainguard's `minio-client` is
+distroless (no shell for the `sh -c` jobs) and `cgr.dev/chainguard/mc` is not
+anonymous, which is why both `mc` keys below map to the server image.
 
 A GUARD IS ONLY WORTH ITS REACH. This file runs from ci.yml's
 `llm-service-unit` job, gated on the `llm` paths filter. The subjects here are
@@ -57,14 +69,20 @@ import yaml
 
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
-# Docker Hub repository -> the registry-qualified name to use instead.
+# Walled repository -> the name to use instead.
 #
-# Keyed by the *bare* Docker Hub name because that is the form a regression
-# takes: someone copies an upstream README, or an LLM completes the image line
-# from memory, and the unqualified name is what both produce.
+# The Docker Hub entries are keyed by the *bare* name because that is the form a
+# regression takes: someone copies an upstream README, or an LLM completes the
+# image line from memory, and the unqualified name is what both produce. The
+# quay.io entries are keyed qualified, because that is the only way to write
+# them: quay.io is never the default registry. They need keys of their own --
+# the lookbehind in _WALLED_RE is built to NOT see `minio/minio` at the end of a
+# longer path, so the bare keys alone are blind to the quay.io form.
 AUTH_WALLED = {
-    "minio/minio": "quay.io/minio/minio",
-    "minio/mc": "quay.io/minio/mc",
+    "minio/minio": "cgr.dev/chainguard/minio",
+    "minio/mc": "cgr.dev/chainguard/minio",
+    "quay.io/minio/minio": "cgr.dev/chainguard/minio",
+    "quay.io/minio/mc": "cgr.dev/chainguard/minio",
 }
 
 # Files that record history rather than pull images. A dated entry describing
@@ -120,13 +138,15 @@ _DOCKER_HUB_HOSTS = (
 # of the hostnames above: `docker pull docker.io/minio/minio` and `docker pull
 # minio/minio` fetch from the same walled repository.
 #
-# The lookbehind is what keeps `quay.io/minio/minio` -- the fix -- from matching: it
-# ends in `/minio`, so a bare search for `minio/minio` would flag the fixed form and
-# the guard would fail on its own fix. But a lookbehind ALONE rejects every host,
-# Docker Hub's included, so all three qualified forms of the walled name went unseen
-# and the guard stayed green on the exact regression it exists for. The optional
-# prefix re-admits precisely those and nothing else -- a host absent from the tuple
-# still fails the lookbehind, which is why quay.io and ghcr.io stay clean.
+# The lookbehind is what keeps a bare key from matching the tail of some other
+# registry's path: `quay.io/minio/minio` ends in `minio/minio`, and while quay.io was
+# the fix, a bare search flagged the fixed form and the guard failed on its own fix.
+# But a lookbehind ALONE rejects every host, Docker Hub's included, so all three
+# qualified forms of the walled name went unseen and the guard stayed green on the
+# exact regression it exists for. The optional prefix re-admits precisely those and
+# nothing else -- a host absent from the tuple still fails the lookbehind. That is
+# also why quay.io, walled in its turn, is caught by keys of its own (they start at
+# a token boundary, so the lookbehind admits them), not by widening the tuple.
 _WALLED_RE = re.compile(
     r"(?<![A-Za-z0-9_./-])"
     r"(?:(?:" + "|".join(re.escape(h) for h in _DOCKER_HUB_HOSTS) + r")/)?"
@@ -142,15 +162,19 @@ _WALLED_RE = re.compile(
 #
 # It exists because the census counted its own source. The walled branch below is
 # gated on EXEMPT; the fixed branch was gated on nothing, so AUTH_WALLED's own dict
-# literal -- four lines naming both quay.io repositories -- landed in the census as
-# evidence that the repo uses them. That made
+# literal -- the lines naming each replacement -- landed in the census as evidence
+# that the repo uses them. That made
 # test_every_denylisted_repository_has_a_replacement_the_repo_actually_uses
-# non-empty by construction: delete every real use of quay.io/minio/mc and this file
-# would still vouch for it. The floor below was inflated by the same four lines.
+# non-empty by construction: delete every real use of a replacement and this file
+# would still vouch for it. The floor below was inflated by the same lines.
+#
+# CAPABILITIES-ARCHIVE.md was listed here too, for a status row citing the quay.io
+# fix. That fix is now walled itself, so the row names no replacement, and
+# test_every_census_exclusion_still_holds_a_reference below rejected the entry as
+# inert. When a status row naming cgr.dev/chainguard/minio reaches the archive (the
+# daily fold carries it there), that test accepts the entry again; add it back then.
 NOT_EVIDENCE_OF_USE = {
-    os.path.relpath(__file__, REPO_ROOT): "AUTH_WALLED names both replacements",
-    # Moved from CAPABILITIES.md with the row itself (2026-09-16 index split).
-    "CAPABILITIES-ARCHIVE.md": "a status row citing the fix is a record, not a pull",
+    os.path.relpath(__file__, REPO_ROOT): "AUTH_WALLED names the replacement",
 }
 
 # The census must keep finding the *fixed* references. If a rename or a file move
@@ -160,6 +184,9 @@ NOT_EVIDENCE_OF_USE = {
 # wholesale disappearance. That 21 is now what the code actually counts: before the
 # exclusion above it counted 26, and the extra five were this file vouching for
 # itself and one CAPABILITIES.md row -- the comment was right and the code was not.
+# After the move to cgr.dev/chainguard/minio (2026-09-26) the census reads 24 lines
+# in 12 files: 19 image lines, one e2e comment, and four lines in the three
+# deployment docs that name it.
 _MIN_FIXED_REFS = 12
 
 
@@ -218,12 +245,14 @@ def test_the_census_read_the_tree():
 
 def test_no_tracked_file_pulls_an_image_from_behind_an_auth_wall():
     assert not _WALLED, (
-        "These lines name a Docker Hub repository that no longer serves anonymous "
-        "pulls, so `docker compose pull` (or `docker run`) fails on any host that "
-        "has not already cached the image:\n  "
+        "These lines name a repository (on Docker Hub or quay.io) that no longer "
+        "serves anonymous pulls, so `docker compose pull` (or `docker run`) fails on "
+        "any host that has not already cached the image:\n  "
         + "\n  ".join(f"{f}:{n}  {t}" for f, n, t in _WALLED)
-        + "\nUse the registry-qualified name instead: "
+        + "\nUse the replacement instead: "
         + ", ".join(f"{k} -> {v}" for k, v in sorted(AUTH_WALLED.items()))
+        + "\nIn prose that records history, write the wildcard form "
+        "(docker.io/minio/*, quay.io/minio/*), which this check does not match."
     )
 
 
@@ -247,7 +276,7 @@ def test_every_denylisted_repository_has_a_replacement_the_repo_actually_uses(
 
 def test_the_fixed_references_are_still_there():
     assert len(_FIXED) >= _MIN_FIXED_REFS, (
-        f"only {len(_FIXED)} registry-qualified references found, expected at least "
+        f"only {len(_FIXED)} replacement references found, expected at least "
         f"{_MIN_FIXED_REFS}. The guard above passes trivially when its subject has "
         f"vanished; if these images really were removed, drop the denylist entry "
         f"and this floor together."
@@ -327,22 +356,30 @@ def test_every_census_exclusion_still_holds_a_reference(rel, reason):
 # --------------------------------------------------------------------------
 
 CI_WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
+# The filters left ci.yml with the `changes` job -- see "Why there is no
+# `changes` job" in ci.yml. This file is now the one definition.
+CI_FILTERS = os.path.join(REPO_ROOT, ".github", "paths-filters.yml")
 
 
 def _llm_filter_patterns():
-    doc = yaml.safe_load(open(CI_WORKFLOW))
-    step = next(
-        st
-        for st in doc["jobs"]["changes"]["steps"]
-        if "paths-filter" in str(st.get("uses", "")) and "filters" in (st.get("with") or {})
-    )
-    return yaml.safe_load(step["with"]["filters"])["llm"]
+    return yaml.safe_load(open(CI_FILTERS))["llm"]
 
 
 def test_the_llm_job_is_still_the_one_gated_on_that_filter():
     doc = yaml.safe_load(open(CI_WORKFLOW))
     job = doc["jobs"]["llm-service-unit"]
-    assert "needs.changes.outputs.llm == 'true'" in str(job.get("if", "")), (
+    # Two halves, and both are needed. The job must still consult the `llm`
+    # filter, AND it must consult it from the file read above -- a job pointing
+    # dorny/paths-filter at some other `filters:` would make every assertion
+    # below describe a list CI does not use.
+    assert any(
+        (st.get("with") or {}).get("filters") == ".github/paths-filters.yml"
+        for st in job["steps"]
+    ), (
+        "llm-service-unit no longer runs dorny/paths-filter against .github/paths-filters.yml, "
+        "so the patterns read from that file decide nothing here."
+    )
+    assert "steps.filter.outputs.llm == 'true'" in yaml.safe_dump(job), (
         "llm-service-unit is no longer gated on the `llm` paths filter, so the "
         "reach test below asserts against a filter that decides nothing. Point it "
         "at whatever gates the job now."
@@ -361,10 +398,11 @@ def test_the_ci_filter_covers_every_file_holding_one_of_these_images(subject):
     """
     pats = _llm_filter_patterns()
     assert any(fnmatch.fnmatch(subject, p) for p in pats), (
-        f"`{subject}` pulls a registry-qualified MinIO image, but no `llm` "
-        f"paths-filter pattern in ci.yml matches it. A PR that reverted that line "
-        f"to the Docker Hub name would skip llm-service-unit, and a skipped check "
+        f"`{subject}` pulls the replacement MinIO image, but no `llm` "
+        f"paths-filter pattern in .github/paths-filters.yml matches it. A PR that "
+        f"reverted that line "
+        f"to a walled name would skip llm-service-unit, and a skipped check "
         f"reads as a passing one.\n"
         f"Add a pattern covering it to the `llm:` filter in "
-        f"{os.path.relpath(CI_WORKFLOW, REPO_ROOT)}.\nPatterns today: {pats}"
+        f"{os.path.relpath(CI_FILTERS, REPO_ROOT)}.\nPatterns today: {pats}"
     )

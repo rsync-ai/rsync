@@ -4,9 +4,11 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/rsync-ai/shared/kafkaclient"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -26,30 +28,23 @@ type kafkaBrokerProbe interface {
 	Ping() error
 }
 
-// kafkaConsumerLagSource is the part of *kafka.Manager the consumer check needs: whether
-// this process's consumer for a topic is running, and how far its group is behind. Narrow
-// for the same reason as kafkaBrokerProbe.
-type kafkaConsumerLagSource interface {
-	IsConsumerActive(topic string) bool
-	GetConsumerGroupLag(groupID string) (map[string]int64, error)
-}
-
 // HealthMonitor monitors the health of all system components
 type HealthMonitor struct {
 	kafkaManager *kafka.Manager
-	// kafkaProbe and consumerLag are kafkaManager again, narrowed, and consumerGroupBase is
-	// its Config.GroupID. All three stay unset when this process has no manager — see
-	// NewHealthMonitor for why they are not simply assigned.
-	kafkaProbe        kafkaBrokerProbe
-	consumerLag       kafkaConsumerLagSource
-	consumerGroupBase string
-	db                *sql.DB
-	config            *SentinelConfig
-	logger            *AuditLogger
+	// kafkaProbe is kafkaManager again, narrowed. It stays unset when this process has
+	// no manager — see NewHealthMonitor for why it is not simply assigned.
+	kafkaProbe kafkaBrokerProbe
+	db         *sql.DB
+	config     *SentinelConfig
+	logger     *AuditLogger
 
 	// Component tracking
 	componentHealth map[string]*ComponentHealth
-	mu              sync.RWMutex
+	// absentConnectors remembers which connector containers this host does not run,
+	// so the row eviction below happens once per name instead of on every 30s tick.
+	// Guarded by mu like componentHealth.
+	absentConnectors map[string]struct{}
+	mu               sync.RWMutex
 
 	// Control
 	ctx    context.Context
@@ -58,27 +53,64 @@ type HealthMonitor struct {
 
 	// HTTP client for connector health checks
 	httpClient *http.Client
+
+	// dockerClient is kept separate from httpClient on purpose: the connector probe's
+	// transport is replaced wholesale in tests, and a census sharing that client would
+	// answer with whatever the connector stub was told to return.
+	dockerClient *http.Client
+
+	// containerCensus answers "which containers exist on this host?" — a field rather
+	// than a direct call so a sweep can be tested against a known host without a
+	// Docker daemon. Defaults to dockerContainerCensus.
+	containerCensus func(ctx context.Context) (containerCensus, error)
+
+	// censusFailing is the previous sweep's census outcome, so a socket proxy that goes
+	// away logs once instead of every 30 seconds. Touched only by checkMCPConnectorHealth,
+	// which runs on the single monitorMCPConnectors goroutine, so it needs no lock.
+	censusFailing bool
+
+	// kafkaConnectForgotten and cdcDemandFailing belong to checkKafkaConnectHealth, which
+	// runs only on the infrastructure goroutine, so they need no lock. The first records
+	// that Kafka Connect's rows have been cleared since it was last recorded; the second
+	// is the previous tick's CDC-pipeline query outcome, so a failing query logs once.
+	kafkaConnectForgotten bool
+	cdcDemandFailing      bool
+
+	// onComponentsEvicted lets the Agent drop its in-memory issues for components this
+	// monitor has just collected as garbage. Without it, handleDetectedIssue's
+	// "already active, return early" branch would suppress the re-insert of an issue
+	// whose row eviction has just deleted, leaving a real fault invisible in the table
+	// the UI reads. nil is valid — a monitor with no Agent attached.
+	onComponentsEvicted func(componentIDs []string)
+
+	// serviceProbes are the core rsync services checked alongside PostgreSQL, Kafka and
+	// Kafka Connect on the infrastructure tick (service_probes.go). Set by NewAgent from
+	// the environment; empty for a monitor built directly, as the tests do.
+	serviceProbes []*serviceProbe
 }
 
 // NewHealthMonitor creates a new health monitor
 func NewHealthMonitor(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelConfig, logger *AuditLogger) *HealthMonitor {
 	h := &HealthMonitor{
-		kafkaManager:    kafkaManager,
-		db:              db,
-		config:          config,
-		logger:          logger,
-		componentHealth: make(map[string]*ComponentHealth),
+		kafkaManager:     kafkaManager,
+		db:               db,
+		config:           config,
+		logger:           logger,
+		componentHealth:  make(map[string]*ComponentHealth),
+		absentConnectors: make(map[string]struct{}),
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 		},
+		dockerClient: &http.Client{
+			Timeout: dockerCensusTimeout,
+		},
 	}
+	h.containerCensus = h.dockerContainerCensus
 	// Assigned only when non-nil. A nil *kafka.Manager put straight into an interface
 	// field yields a NON-nil interface holding a nil pointer, so `h.kafkaProbe != nil`
 	// would pass and the check would call Ping() on a nil receiver.
 	if kafkaManager != nil {
 		h.kafkaProbe = kafkaManager
-		h.consumerLag = kafkaManager
-		h.consumerGroupBase = kafkaManager.Config.GroupID
 	}
 	return h
 }
@@ -87,9 +119,14 @@ func NewHealthMonitor(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelC
 func (h *HealthMonitor) Start(ctx context.Context) error {
 	h.ctx, h.cancel = context.WithCancel(ctx)
 
-	// Start background monitoring loops
-	h.wg.Add(4)
-	go h.monitorKafkaConsumers()
+	// Start background monitoring loops.
+	//
+	// There is no Kafka consumer-lag loop. The orchestrator runs no always-on consumer of
+	// its own — its workers poll the Redis correlation store, and the schema-drift healer's
+	// consumers exist only behind RSYNC_SCHEMA_DRIFT_ENABLED — so a liveness check keyed
+	// on this Manager's consumers would have nothing to watch. CDC sink groups are counted
+	// by CDCSentinel's consumer census instead (cdc_consumer_census.go).
+	h.wg.Add(3)
 	go h.monitorMCPConnectors()
 	go h.monitorInfrastructure()
 	go h.pruneStaleComponentsLoop()
@@ -103,17 +140,7 @@ func (h *HealthMonitor) Stop() {
 		h.cancel()
 	}
 	h.wg.Wait()
-}
-
-// RecordHeartbeat records a heartbeat from a component
-func (h *HealthMonitor) RecordHeartbeat(componentID string, health *ComponentHealth) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.componentHealth[componentID] = health
-
-	// Persist to database
-	go h.persistHealthToDB(health)
+	h.closeServiceProbes()
 }
 
 // persistHealthToDB persists component health to the database.
@@ -174,9 +201,8 @@ func (h *HealthMonitor) persistHealthToDB(health *ComponentHealth) {
 // is what the monitoring API and its infrastructure summary
 // (api-gateway/internal/handlers/monitoring.go:394 and :722) read.
 //
-// The write is synchronous, unlike RecordHeartbeat's `go h.persistHealthToDB(...)`: this
-// runs on a 30s ticker over three components, so there is nothing to gain from a goroutine
-// and a caller can be sure the row landed.
+// The write is synchronous: this runs on a 30s ticker over a handful of components, so
+// there is nothing to gain from a goroutine and a caller can be sure the row landed.
 func (h *HealthMonitor) recordInfraHealth(componentID string, status HealthStatus, lastErr string, metadata map[string]interface{}) {
 	h.mu.Lock()
 	health, exists := h.componentHealth[componentID]
@@ -213,248 +239,6 @@ func (h *HealthMonitor) recordInfraHealth(componentID string, status HealthStatu
 	h.persistHealthToDB(&snapshot)
 }
 
-// RecordHealthChange records a health status change and persists it.
-//
-// The persist is the point. This function used to write only to h.componentHealth — a map
-// no code outside this file reads — so its three callers each detected a real failure
-// correctly and then told nobody: a closed consumer group (checkKafkaConsumerLag), consumer
-// lag (same loop), and the widest one, the heartbeat-timeout sweep that marks a component
-// dead (sentinel.go performHealthCheck). The row in sentinel_component_health is what
-// GET /api/v1/monitoring/sentinel/health reads; without it "the component died" reached a
-// log line and nothing else. This is the same omission #731 T9 fixed for the three
-// infrastructure checks by introducing recordInfraHealth — these callers were left behind
-// on the old route, which is why health_monitor_persist_census_test.go now enforces the
-// rule against the source rather than trusting the next reader to notice.
-//
-// The two consumer callers have since moved to recordConsumerHealth, which rewrites each
-// consumer's row on every tick rather than only when something is wrong.
-//
-// The argument is copied rather than stored. performHealthCheck passes a *ComponentHealth
-// owned by the Sentinel agent's own map and guarded by the agent's mutex; storing that
-// pointer here published one struct into two maps under two different locks. Copying also
-// means the value handed to persistHealthToDB cannot be mutated underneath it by the
-// owning agent while the write is in flight.
-func (h *HealthMonitor) RecordHealthChange(componentID string, health *ComponentHealth) {
-	if health == nil {
-		return
-	}
-
-	snapshot := *health
-	snapshot.ComponentID = componentID
-	snapshot.Metadata = make(map[string]interface{}, len(health.Metadata))
-	for k, v := range health.Metadata {
-		snapshot.Metadata[k] = v
-	}
-	if snapshot.UpdatedAt.IsZero() {
-		snapshot.UpdatedAt = time.Now()
-	}
-	// last_heartbeat is NOT NULL (migration 011). A caller that never sets it (the consumer
-	// check used to be two) would otherwise record a component that last reported in year 1.
-	// Only the zero value is filled in: on the heartbeat-timeout path the stale timestamp
-	// IS the evidence, and overwriting it would erase the reason the component was
-	// declared dead.
-	if snapshot.LastHeartbeat.IsZero() {
-		snapshot.LastHeartbeat = snapshot.UpdatedAt
-	}
-
-	stored := snapshot
-	h.mu.Lock()
-	h.componentHealth[componentID] = &stored
-	h.mu.Unlock()
-
-	log.WithFields(log.Fields{
-		"component_id":   componentID,
-		"status":         snapshot.Status,
-		"last_heartbeat": snapshot.LastHeartbeat,
-	}).Info("Component health changed")
-
-	h.persistHealthToDB(&snapshot)
-}
-
-// recordConsumerHealth stores one consumed topic's verdict and publishes it. It is called
-// for every topic on every tick of checkKafkaConsumerLag.
-//
-// Every tick is the point. The check used to write only when something was wrong (a closed
-// group, or lag above zero), so a consumer that recovered or drained its lag was never
-// written again: its sentinel_component_health row kept "unhealthy / Consumer group closed"
-// or a lag of 4500 indefinitely, and GET /api/v1/monitoring/sentinel/health served it as
-// current. Rewriting the row each time, as recordInfraHealth and checkMCPConnectorHealth
-// do, keeps it current and its updated_at fresh.
-//
-// It is not RecordHealthChange because that logs "Component health changed" at Info on
-// every call, and this runs for each consumed topic every 30s. The same line is logged here
-// only when a topic's status differs from the last one this process recorded for it.
-//
-// The entry is replaced, not merged: a recovered consumer must not keep the
-// issue_type "consumer_group_closed" its closed verdict carried. The persist is synchronous,
-// as in recordInfraHealth.
-func (h *HealthMonitor) recordConsumerHealth(topic string, status HealthStatus, lag int64, lastErr string, metadata map[string]interface{}) {
-	now := time.Now()
-	health := ComponentHealth{
-		ComponentID:   topic,
-		ComponentType: ComponentTypeKafkaConsumer,
-		Status:        status,
-		// The check is these components' heartbeat; nothing else reports for them, and
-		// last_heartbeat is NOT NULL.
-		LastHeartbeat: now,
-		ConsumerLag:   lag,
-		// Assigned every time, empty string included, so a recovered consumer stops
-		// reporting the failure it came back from.
-		LastError: lastErr,
-		Metadata:  make(map[string]interface{}, len(metadata)),
-		UpdatedAt: now,
-	}
-	for k, v := range metadata {
-		health.Metadata[k] = v
-	}
-
-	stored := health
-	h.mu.Lock()
-	previous, seen := h.componentHealth[topic]
-	changed := !seen || previous.Status != status
-	h.componentHealth[topic] = &stored
-	h.mu.Unlock()
-
-	entry := log.WithFields(log.Fields{
-		"component_id": topic,
-		"status":       status,
-		"consumer_lag": lag,
-	})
-	if changed {
-		entry.Info("Component health changed")
-	} else {
-		entry.Debug("Consumer health recorded")
-	}
-
-	h.persistHealthToDB(&health)
-}
-
-// monitorKafkaConsumers monitors Kafka consumer health and lag
-func (h *HealthMonitor) monitorKafkaConsumers() {
-	defer h.wg.Done()
-
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		case <-ticker.C:
-			h.checkKafkaConsumerLag()
-		}
-	}
-}
-
-// orchestratorConsumedTopics is the set of topics THIS process consumes, and is
-// the only valid input to a consumer-liveness check.
-//
-// The invariant that matters: every entry must have a matching
-// kafkaManager.ConsumeWithContext(<topic>, …) call inside the orchestrator
-// binary, because IsConsumerActive answers from this Manager's own `consumers`
-// map — a topic the orchestrator merely *produces* to has no entry there and so
-// reports "inactive" forever.
-//
-// `pipeline.domain.events` used to be in this list and was exactly that mistake:
-// the orchestrator only produces to it (cmd/orchestrator/main.go ProduceWithHeaders,
-// sentinel/cdc_wal_watchdog.go, sentinel/cdc_sentinel.go), while its consumers all
-// live in *other* processes — api-gateway's event projector, WebSocket bridge and
-// domain-event handler, plus the Kafka sink worker. The check therefore logged
-// "⚠️ Consumer group is closed or inactive" and pinned a permanently Unhealthy
-// component on every tick, at the poll interval, forever. Do not re-add a topic
-// here just because the orchestrator touches it — produce ≠ consume.
-var orchestratorConsumedTopics = []string{
-	"agent.control.commands.intent",
-	"agent.control.commands.resolver",
-	"agent.control.commands.discovery",
-	"agent.control.commands.planner",
-	"agent.control.commands.validator",
-	"agent.control.commands.executor",
-	"agent.control.commands.cost_estimator",
-	"agent.control.commands.capability_resolver",
-	"agent.control.commands.connection_validator",
-}
-
-// checkKafkaConsumerLag checks consumer lag and status for the per-agent
-// command topics that drive the orchestrator. The list mirrors the workers
-// in cmd/orchestrator/main.go — keep in sync when adding/removing agents.
-//
-// Lag is emitted both as health-system input (drives healing) and as an OTel
-// gauge (sentinel.kafka.consumer_lag, labelled by topic + group). Sustained
-// non-zero lag on a topic with active consumers usually indicates a slow
-// worker; sudden growth on a previously-zero topic indicates a producer/
-// consumer topic-name mismatch (the failure mode that left 2892 messages
-// stranded on agent.control.commands before the publishAgentCommand fix).
-func (h *HealthMonitor) checkKafkaConsumerLag() {
-	// No manager, no consumers to ask about.
-	if h.consumerLag == nil {
-		return
-	}
-
-	ctx, span := sentinelTracer.Start(h.ctx, "check_consumer_lag")
-	defer span.End()
-
-	// Qualified here, not in the list above: the list is paired entry-by-entry
-	// against the ConsumeWithContext literals in this module by
-	// consumed_topics_test.go, and that invariant is about logical identity.
-	// The broker lookup is the only place that needs the wire name.
-	agentTopics := kafkaclient.Topics(orchestratorConsumedTopics...)
-
-	// One lag fetch per topic — manager scopes the consumer-group name as
-	// "<base-group>-<topic>", matching how ConsumeWithContext registers them.
-	baseGroup := h.consumerGroupBase
-
-	for _, topic := range agentTopics {
-		isActive := h.consumerLag.IsConsumerActive(topic)
-
-		if !isActive {
-			log.WithField("topic", topic).Warn("⚠️  Consumer group is closed or inactive")
-
-			h.recordConsumerHealth(topic, HealthStatusUnhealthy, 0, "Consumer group closed", map[string]interface{}{
-				"topic":      topic,
-				"is_active":  false,
-				"issue_type": "consumer_group_closed",
-			})
-			continue
-		}
-
-		topicGroup := fmt.Sprintf("%s-%s", baseGroup, topic)
-		lag, err := h.consumerLag.GetConsumerGroupLag(topicGroup)
-		if err != nil {
-			log.WithError(err).WithField("topic", topic).Debug("Could not get consumer lag")
-			continue
-		}
-
-		// GetConsumerGroupLag returns a topic→lag map; for our per-topic
-		// groups there's only one entry but iterating is cheap and robust.
-		topicLag := lag[topic]
-
-		// Always emit the OTel gauge — including zero lag — so a backend can
-		// distinguish "consumer healthy at zero" from "consumer not reporting".
-		if h.logger != nil {
-			h.logger.RecordConsumerLag(ctx, topic, topicGroup, topicLag)
-		}
-
-		if topicLag > 0 {
-			log.WithFields(log.Fields{
-				"topic": topic,
-				"group": topicGroup,
-				"lag":   topicLag,
-			}).Debug("Consumer lag detected")
-		}
-
-		// Written at zero lag too. Writing only when lag > 0 left a consumer that
-		// recovered, or drained its backlog, on its last bad row indefinitely.
-		h.recordConsumerHealth(topic, HealthStatusHealthy, topicLag, "", map[string]interface{}{
-			"topic":          topic,
-			"is_active":      true,
-			"consumer_group": topicGroup,
-		})
-	}
-
-	span.SetAttributes(attribute.Int("topics_checked", len(agentTopics)))
-}
-
 // monitorMCPConnectors monitors MCP connector health
 func (h *HealthMonitor) monitorMCPConnectors() {
 	defer h.wg.Done()
@@ -479,6 +263,62 @@ func (h *HealthMonitor) monitorMCPConnectors() {
 // column from a table nobody wrote, which meant this check would have probed
 // port 0 even if it had ever found a row.
 const mcpConnectorPort = 8000
+
+// connectorReachability is the three-way answer to "is this connector there?".
+//
+// The probe used to return a bool, which forced two unrelated facts through one
+// bit: "this host never deployed this connector" and "this connector is deployed
+// and broken" both came back false, and both were written down as unhealthy. The
+// tree is the set of connectors this repo can BUILD, while a deployment is a
+// subset chosen per host, so on any host that runs a subset — which is every host
+// except a full-catalogue one — the most alarming number on /admin/health was an
+// artifact of the enumeration rather than a fault
+// (KI-HEALTH-COUNTS-UNDEPLOYED-CONNECTORS).
+type connectorReachability int
+
+const (
+	// connectorReachable: /health answered 200.
+	connectorReachable connectorReachability = iota
+
+	// connectorFailing: there is something there to fail. Either the census says a
+	// container of this name exists on this host, or the probe failed in a way that
+	// implies one — connection refused, a TCP timeout, a non-200. This is a fault
+	// and stays unhealthy.
+	connectorFailing
+
+	// connectorUnknown: the probe could not tell absence from fault. Only the
+	// resolver fallback produces this — a DNS error that is not IsNotFound says
+	// nothing either way, and the sweep writes nothing down for it.
+	//
+	// It exists because the alternative was tried and was wrong. This used to fold
+	// into connectorFailing on the reasoning that a component "keeps its row and
+	// stays a fault" when the resolver does not answer; on a host whose resolv.conf
+	// carries search domains that is every undeployed connector, which is how prod
+	// came to show 18 faults for containers it had never deployed. An unknown that
+	// is silent costs a fault this lane would have reported second (the pipeline lane
+	// reports the connectors a pipeline actually uses); an unknown reported as a
+	// fault costs every reading of the board.
+	connectorUnknown
+
+	// connectorAbsent: no container of this name exists on this host.
+	//
+	// Since the container census (dockerContainerCensus) this is a direct answer from
+	// the Docker API rather than an inference from DNS, and it is the census that is
+	// authoritative whenever one is available. The resolver fallback below still
+	// produces it from a clean NXDOMAIN, for a deployment with no socket proxy.
+	//
+	// In the fallback, Docker's embedded DNS publishes a record per RUNNING container
+	// and withdraws it when the container stops, so the fallback cannot distinguish
+	// "never deployed" from "deployed and currently stopped". The census can, and
+	// calls a stopped container a fault. Where the fallback cannot, it is safe in this
+	// direction for two reasons: connectors are deployed on demand
+	// (mcp.tryDeployConnectorContainer), so an unresolvable name is overwhelmingly
+	// "this host has never needed this connector"; and the case it does hide — a
+	// connector a pipeline is actually using going away — is alarmed on by the
+	// pipeline lane, which watches that pipeline's own connector and publishes
+	// CDC_CONNECTOR_DOWN (cdc_sentinel.go emitCDCIssue -> notify.go).
+	connectorAbsent
+)
 
 // checkMCPConnectorHealth checks health of all MCP connectors
 func (h *HealthMonitor) checkMCPConnectorHealth() {
@@ -507,6 +347,12 @@ func (h *HealthMonitor) checkMCPConnectorHealth() {
 	// Internal connectors and roots without a Dockerfile are skipped for exactly
 	// that reason — the generator skips them, so no container of theirs exists and
 	// probing one would manufacture a permanently-unhealthy component.
+	//
+	// An undeployed connector manufactured one the same way, and that half took a
+	// second fix: the set enumerated here is still every connector this repo could
+	// build, because narrowing it is what made the old query blind, so the verdict
+	// is what changed. A name that does not resolve on the Docker network is
+	// reported as not deployed and gets no row at all — see connectorReachability.
 	toolsDir := connectorpaths.ToolsDir()
 	if toolsDir == "" {
 		log.Warn("MCP connector health: connector tree not found (set MCP_CONNECTORS_PATH); skipping check")
@@ -515,7 +361,29 @@ func (h *HealthMonitor) checkMCPConnectorHealth() {
 	roots := connectorpaths.IterConnectorRoots(toolsDir)
 	span.SetAttributes(attribute.Int("connector_roots_found", len(roots)))
 
+	// One census per sweep, not one lookup per connector: the answer is the same for
+	// every name in the tree, and it is the authority on which of them this host runs.
+	census, censusErr := h.containerCensus(ctx)
+	if censusErr != nil && !h.censusFailing {
+		h.censusFailing = true
+		if errors.Is(censusErr, errNoDockerAPI) {
+			// Not a fault: this deployment runs no socket proxy (the quickstart/self-host
+			// compose does not), so the sweep uses the resolver and records only what the
+			// resolver can answer for.
+			log.Debug("Connector health: no container census configured; falling back to name resolution")
+		} else {
+			log.WithError(censusErr).
+				Warn("Connector health: container census unavailable; connectors this host has not been seen to run will go unreported until it returns")
+		}
+	} else if censusErr == nil && h.censusFailing {
+		h.censusFailing = false
+		log.WithField("containers", len(census)).Info("Connector health: container census available again")
+	}
+
 	connectorCount := 0
+	notDeployed := 0
+	undetermined := 0
+	var evicted []string
 	for _, cr := range roots {
 		if cr.Internal || !cr.HasDockerfile {
 			continue
@@ -529,65 +397,208 @@ func (h *HealthMonitor) checkMCPConnectorHealth() {
 			continue
 		}
 
-		connectorCount++
 		componentID := fmt.Sprintf("mcp_connector:%s", name)
 
-		// Check HTTP health endpoint
-		healthy := h.checkConnectorHTTPHealth(ctx, name, mcpConnectorPort)
-
-		h.mu.Lock()
-		health, exists := h.componentHealth[componentID]
-		if !exists {
-			health = &ComponentHealth{
-				ComponentID:   componentID,
-				ComponentType: ComponentTypeMCPConnector,
-				Metadata:      make(map[string]interface{}),
+		switch reach := h.classifyConnector(ctx, name, census, censusErr); reach {
+		case connectorAbsent:
+			notDeployed++
+			// No row, rather than a fourth status. A status only this enumeration can
+			// produce would have to be taught to the panel, to the counts and to the
+			// issue detector; an absent row is already understood by all three, and a
+			// connector nobody deployed is not a component of this deployment.
+			if id := h.forgetConnector(componentID); id != "" {
+				evicted = append(evicted, id)
 			}
-			h.componentHealth[componentID] = health
+		case connectorUnknown:
+			// Nothing conclusive, so nothing written down — and no eviction either,
+			// because an unknown is not evidence that an existing row is wrong.
+			undetermined++
+		default:
+			connectorCount++
+			h.recordConnectorVerdict(componentID, cr.ID, cr.CurrentVersion, reach == connectorReachable)
 		}
-
-		if healthy {
-			health.Status = HealthStatusHealthy
-		} else {
-			health.Status = HealthStatusUnhealthy
-		}
-		health.UpdatedAt = time.Now()
-		// These checks ARE the connector's heartbeat — nothing else reports for MCP
-		// connectors, and last_heartbeat is NOT NULL.
-		health.LastHeartbeat = health.UpdatedAt
-		health.Metadata["connector_id"] = cr.ID
-		health.Metadata["connector_version"] = cr.CurrentVersion
-		health.Metadata["port"] = mcpConnectorPort
-
-		// Copied so the persist below runs outside the lock without aliasing state a
-		// concurrent check may be mutating — the recordInfraHealth pattern.
-		snapshot := *health
-		snapshot.Metadata = make(map[string]interface{}, len(health.Metadata))
-		for k, v := range health.Metadata {
-			snapshot.Metadata[k] = v
-		}
-		h.mu.Unlock()
-
-		// Both breaks in KI-SENTINEL-MCP-CONNECTOR-HEALTH-DEAD-TWO-WAYS are closed
-		// now: #818 added this persist, and the enumeration above gives it rows to
-		// persist. Either half alone is invisible — a persist with no rows and a
-		// row that is never persisted produce the same empty table.
-		h.persistHealthToDB(&snapshot)
-
-		log.WithFields(log.Fields{
-			"connector": name,
-			"healthy":   healthy,
-			"port":      mcpConnectorPort,
-		}).Debug("Checked MCP connector health")
 	}
 
-	span.SetAttributes(attribute.Int("connectors_checked", connectorCount))
+	// One DELETE per sweep, and only while there is something to delete:
+	// forgetConnector answers "" once it has reconciled a name, so a host running 7
+	// of 21 connectors issues this once after start and not again. It has to run at
+	// least once per process, though — the rows outlive the process, so this is also
+	// what clears rows an older build wrote.
+	if len(evicted) > 0 {
+		h.forgetComponents(evicted)
+		log.WithField("components", evicted).
+			Info("Connector health: dropped components with no container deployed on this host")
+	}
+
+	span.SetAttributes(
+		attribute.Int("connectors_checked", connectorCount),
+		attribute.Int("connectors_not_deployed", notDeployed),
+		attribute.Int("connectors_undetermined", undetermined),
+		attribute.Bool("census_available", censusErr == nil),
+		attribute.Int("census_containers", len(census)),
+	)
 }
 
-// checkConnectorHTTPHealth checks HTTP health endpoint for a connector
-func (h *HealthMonitor) checkConnectorHTTPHealth(ctx context.Context, name string, port int) bool {
+// classifyConnector answers "is this connector there?" from the census when there is
+// one, and from name resolution when there is not.
+//
+// The census is the authority on existence, so a container it lists is never an
+// absence no matter what the resolver says. The two can disagree in both directions:
+// Docker withdraws a stopped container's DNS record while the container still exists,
+// and on a host with search domains the resolver can fail to answer conclusively for
+// a name that is plainly in the list.
+func (h *HealthMonitor) classifyConnector(
+	ctx context.Context, name string, census containerCensus, censusErr error,
+) connectorReachability {
+	if censusErr != nil {
+		return h.checkConnectorReachability(ctx, name, mcpConnectorPort)
+	}
+
+	state, exists := census[name]
+	if !exists {
+		return connectorAbsent
+	}
+	if state != "running" {
+		// Deployed here and not up. The resolver cannot report this at all — there is
+		// no DNS record for a stopped container — so it read as an absence before.
+		log.WithFields(log.Fields{"connector": name, "state": state}).
+			Debug("MCP connector container exists but is not running")
+		return connectorFailing
+	}
+
+	if reach := h.checkConnectorReachability(ctx, name, mcpConnectorPort); reach == connectorReachable {
+		return connectorReachable
+	}
+	// Running, and it did not answer 200. Whatever the probe made of the error, the
+	// census has already settled that there is something here to be broken.
+	return connectorFailing
+}
+
+// forgetComponents removes evicted components from both tables that outlive this
+// process: the health row, and any issue the detector filed against the component.
+//
+// Both halves are needed. The two rows are written by different lanes and only the
+// health row has ever been deleted, so an issue filed against a component that is
+// later collected as garbage outlived it indefinitely — which is what prod's 18
+// connector_down rows are. api-gateway's monitoring endpoints read that table
+// directly, so a ghost there is a ghost on /admin/health and in the bell's count.
+func (h *HealthMonitor) forgetComponents(componentIDs []string) {
+	if len(componentIDs) == 0 {
+		return
+	}
+	h.deleteHealthFromDB(componentIDs)
+	h.deleteIssuesFromDB(componentIDs)
+	// The Agent keeps its own map of active issues and returns early for one it has
+	// already seen, so without this the row just deleted would not be re-inserted if
+	// the component came back and failed again.
+	if h.onComponentsEvicted != nil {
+		h.onComponentsEvicted(componentIDs)
+	}
+}
+
+// recordConnectorVerdict writes one connector's verdict to the in-memory map and
+// to sentinel_component_health. Split out of the sweep so the persist can be
+// tested for a verdict the probe cannot reach without a Docker network.
+func (h *HealthMonitor) recordConnectorVerdict(componentID, connectorID, version string, healthy bool) {
+	h.mu.Lock()
+	health, exists := h.componentHealth[componentID]
+	if !exists {
+		health = &ComponentHealth{
+			ComponentID:   componentID,
+			ComponentType: ComponentTypeMCPConnector,
+			Metadata:      make(map[string]interface{}),
+		}
+		h.componentHealth[componentID] = health
+	}
+	// It answered, so any earlier conclusion that this host does not run it is stale.
+	delete(h.absentConnectors, componentID)
+
+	if healthy {
+		health.Status = HealthStatusHealthy
+	} else {
+		health.Status = HealthStatusUnhealthy
+	}
+	health.UpdatedAt = time.Now()
+	// These checks ARE the connector's heartbeat — nothing else reports for MCP
+	// connectors, and last_heartbeat is NOT NULL.
+	health.LastHeartbeat = health.UpdatedAt
+	health.Metadata["connector_id"] = connectorID
+	health.Metadata["connector_version"] = version
+	health.Metadata["port"] = mcpConnectorPort
+
+	// Copied so the persist below runs outside the lock without aliasing state a
+	// concurrent check may be mutating — the recordInfraHealth pattern.
+	snapshot := copyComponentHealth(health)
+	h.mu.Unlock()
+
+	// Both breaks in KI-SENTINEL-MCP-CONNECTOR-HEALTH-DEAD-TWO-WAYS are closed
+	// now: #818 added this persist, and the enumeration above gives it rows to
+	// persist. Either half alone is invisible — a persist with no rows and a
+	// row that is never persisted produce the same empty table.
+	h.persistHealthToDB(snapshot)
+
+	log.WithFields(log.Fields{
+		"connector": componentID,
+		"healthy":   healthy,
+		"port":      mcpConnectorPort,
+	}).Debug("Checked MCP connector health")
+}
+
+// forgetConnector drops a connector this host does not run from the in-memory map,
+// and answers with the component id while there is still a row to delete with it —
+// "" once the name has been reconciled, so the DELETE and the log line happen once
+// per transition rather than every 30 seconds.
+func (h *HealthMonitor) forgetConnector(componentID string) string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	_, inMap := h.componentHealth[componentID]
+	_, reconciled := h.absentConnectors[componentID]
+	if reconciled && !inMap {
+		return ""
+	}
+	delete(h.componentHealth, componentID)
+	h.absentConnectors[componentID] = struct{}{}
+	return componentID
+}
+
+// copyComponentHealth returns a deep-enough copy of a component's health: the
+// struct plus its metadata map, which is the only reference type in it. Callers
+// read these fields without holding the lock the writers take.
+func copyComponentHealth(c *ComponentHealth) *ComponentHealth {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+	cp.Metadata = make(map[string]interface{}, len(c.Metadata))
+	for k, v := range c.Metadata {
+		cp.Metadata[k] = v
+	}
+	return &cp
+}
+
+// snapshotComponents returns a copy of every component this monitor polls, for a
+// reader that does not hold mu — the issue detector, which reads each field
+// directly while the polling loops are writing them.
+func (h *HealthMonitor) snapshotComponents() []*ComponentHealth {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	out := make([]*ComponentHealth, 0, len(h.componentHealth))
+	for _, c := range h.componentHealth {
+		if c == nil {
+			continue
+		}
+		out = append(out, copyComponentHealth(c))
+	}
+	return out
+}
+
+// checkConnectorReachability probes a connector's /health endpoint and separates
+// "not deployed here" from "deployed and failing".
+func (h *HealthMonitor) checkConnectorReachability(ctx context.Context, name string, port int) connectorReachability {
 	if port == 0 {
-		return false
+		return connectorFailing
 	}
 
 	// MCP connectors are accessed internally via Docker network
@@ -598,20 +609,42 @@ func (h *HealthMonitor) checkConnectorHTTPHealth(ctx context.Context, name strin
 
 	req, err := http.NewRequestWithContext(ctx, "GET", healthURL, nil)
 	if err != nil {
-		return false
+		return connectorFailing
 	}
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
+		// errors.As walks *url.Error -> *net.OpError -> *net.DNSError, each of which
+		// unwraps to the next. IsNotFound is the resolver saying the name does not
+		// exist, which is an absence this can act on.
+		var dnsErr *net.DNSError
+		if errors.As(err, &dnsErr) {
+			if dnsErr.IsNotFound {
+				log.WithField("connector", name).
+					Debug("MCP connector name does not resolve; not deployed on this host")
+				return connectorAbsent
+			}
+			// A resolver that timed out, refused or SERVFAILed has told us nothing:
+			// the name may be a container that is down, or a container that was never
+			// here. This used to return connectorFailing, which is what put 18
+			// never-deployed connectors on prod's board — see connectorUnknown.
+			log.WithError(err).WithField("connector", name).
+				Debug("MCP connector name did not resolve conclusively; no verdict recorded")
+			return connectorUnknown
+		}
 		log.WithError(err).WithField("connector", name).Debug("HTTP health check failed")
-		return false
+		return connectorFailing
 	}
 	defer resp.Body.Close()
 
-	return resp.StatusCode == http.StatusOK
+	if resp.StatusCode == http.StatusOK {
+		return connectorReachable
+	}
+	return connectorFailing
 }
 
-// monitorInfrastructure monitors infrastructure components (Kafka, Redis, PostgreSQL)
+// monitorInfrastructure monitors infrastructure components: PostgreSQL, Kafka, Kafka
+// Connect, and the core rsync services in service_probes.go.
 func (h *HealthMonitor) monitorInfrastructure() {
 	defer h.wg.Done()
 
@@ -642,7 +675,8 @@ func (h *HealthMonitor) checkInfrastructureHealth() {
 	// Check Kafka Connect (Debezium) for CDC pipelines
 	h.checkKafkaConnectHealth(ctx)
 
-	// TODO: Check Redis health
+	// Redis, Temporal and the rsync services pipelines depend on
+	h.checkServiceProbes(ctx)
 }
 
 // checkPostgreSQLHealth checks PostgreSQL connectivity
@@ -694,10 +728,75 @@ func (h *HealthMonitor) checkKafkaHealth(ctx context.Context) {
 	h.recordInfraHealth("infrastructure:kafka", status, lastErr, nil)
 }
 
+// cdcPipelinesExistQuery is the predicate the CDC sentinel selects its pipelines by
+// (cdc_sentinel.go activeCDCPipelinesQuery) without its status filter. A pipeline that
+// failed because Kafka Connect went down still needs Connect back, so counting only
+// running ones would stop the check at the moment it matters. Pipelines are
+// hard-deleted (workers/cdc_reconciler.go), so any row is one somebody still has.
+const cdcPipelinesExistQuery = `SELECT EXISTS (SELECT 1 FROM pipelines WHERE sync_mode = 'cdc' OR cdc_mode IS NOT NULL)`
+
+// kafkaConnectExpected reports whether this deployment is meant to be running Kafka
+// Connect.
+//
+// Kafka Connect is optional. The quickstart runs it only under the cdc profile, and the
+// chart only with connectors.cdc.enabled. Probing it unconditionally put
+// infrastructure:kafka-connect down on every install without CDC. Once the detector
+// read infrastructure components, that became an INFRASTRUCTURE_DOWN finding alerted
+// to every admin that no recovery could close, because the service was never coming.
+//
+// Two things say it is expected. The first is an explicit KAFKA_CONNECT_URL: the chart
+// sets it only when CDC is enabled, and an operator who brings their own Connect sets
+// it. The second, under the compose default, is a CDC pipeline for it to serve. With
+// none, Connect being down stops nothing.
+//
+// The container census and name resolution cannot answer this. The quickstart runs no
+// socket proxy, so it has no census. And Docker withdraws a stopped container's DNS
+// record, so a crashed Connect would read as one that was never deployed.
+//
+// When it cannot find out, it answers expected, which is how the probe always behaved.
+func (h *HealthMonitor) kafkaConnectExpected(ctx context.Context) bool {
+	if strings.TrimSpace(os.Getenv("KAFKA_CONNECT_URL")) != "" || h.db == nil {
+		return true
+	}
+	qctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	var exists bool
+	if err := h.db.QueryRowContext(qctx, cdcPipelinesExistQuery).Scan(&exists); err != nil {
+		if !h.cdcDemandFailing {
+			h.cdcDemandFailing = true
+			log.WithError(err).Warn("Kafka Connect health: could not tell whether any CDC pipeline exists; probing Kafka Connect anyway")
+		}
+		return true
+	}
+	h.cdcDemandFailing = false
+	return exists
+}
+
+// forgetKafkaConnect takes Kafka Connect off the board while nothing needs it. It gets
+// no row, rather than a status, as with a connector this host never deployed. Its
+// health row and any finding filed against it are deleted, which closes a finding an
+// earlier tick or an older build left. That happens once, and again only if Connect
+// has been recorded since.
+func (h *HealthMonitor) forgetKafkaConnect(componentID string) {
+	h.mu.Lock()
+	_, inMap := h.componentHealth[componentID]
+	delete(h.componentHealth, componentID)
+	h.mu.Unlock()
+	if inMap || !h.kafkaConnectForgotten {
+		h.kafkaConnectForgotten = true
+		h.forgetComponents([]string{componentID})
+	}
+}
+
 // checkKafkaConnectHealth checks Kafka Connect REST API health.
 // This is a critical dependency for CDC pipelines (Debezium).
 func (h *HealthMonitor) checkKafkaConnectHealth(ctx context.Context) {
 	componentID := "infrastructure:kafka-connect"
+
+	if !h.kafkaConnectExpected(ctx) {
+		h.forgetKafkaConnect(componentID)
+		return
+	}
 
 	// Resolve the same way every other Kafka Connect caller in the orchestrator
 	// does — KAFKA_CONNECT_URL, falling back to the compose service name. This
@@ -743,29 +842,13 @@ func (h *HealthMonitor) checkKafkaConnectHealth(ctx context.Context) {
 	h.recordInfraHealth(componentID, status, lastErr, map[string]interface{}{"url": healthURL})
 }
 
-// EvictStaleComponents removes specific component IDs from the health monitor's map and
-// from sentinel_component_health.
-//
-// Called by the sentinel agent after it has already determined these are stale-dead.
-func (h *HealthMonitor) EvictStaleComponents(ids []string) {
-	h.mu.Lock()
-	for _, id := range ids {
-		delete(h.componentHealth, id)
-	}
-	h.mu.Unlock()
-
-	h.deleteHealthFromDB(ids)
-}
-
 // deleteHealthFromDB removes evicted components from sentinel_component_health.
 //
-// Eviction has to reach both stores or it reaches neither usefully. While RecordHealthChange
-// was silent, a dead component never had a row, so evicting it from the map alone was
-// consistent; now that the dead verdict is published, dropping it from the map only would
-// leave GET /api/v1/monitoring/sentinel/health reporting a component the sentinel has
-// already collected as garbage — permanently, because nothing else in this repo deletes
-// from this table. That would turn the Total this change just made honest into a count of
-// accumulated ghosts.
+// Eviction has to reach both stores or it reaches neither usefully. Every verdict is
+// published, so dropping a component from the map only would leave
+// GET /api/v1/monitoring/sentinel/health reporting a component the sentinel has already
+// collected as garbage — permanently, because nothing else in this repo deletes from this
+// table.
 func (h *HealthMonitor) deleteHealthFromDB(ids []string) {
 	if h.db == nil || len(ids) == 0 {
 		return
@@ -792,6 +875,41 @@ func (h *HealthMonitor) deleteHealthFromDB(ids []string) {
 	if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
 		log.WithError(err).WithField("component_ids", ids).
 			Debug("Failed to delete evicted component health rows")
+	}
+}
+
+// deleteIssuesFromDB removes the IssueDetector's findings for components that no
+// longer exist.
+//
+// Nothing else in this repo deletes from this table for the generic detector lane.
+// The CDC and batch lanes each resolve their own ids by prefix, and a successful heal
+// clears only the Agent's in-memory map, so a finding persisted by persistIssueToDB
+// has no path out of the table at all. Combined with an enumeration that could invent
+// components, that turned the issue list into an append-only log of things that were
+// once believed.
+func (h *HealthMonitor) deleteIssuesFromDB(componentIDs []string) {
+	if h.db == nil || len(componentIDs) == 0 {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	placeholders := make([]string, len(componentIDs))
+	args := make([]interface{}, len(componentIDs))
+	for i, id := range componentIDs {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+
+	query := fmt.Sprintf(
+		`DELETE FROM sentinel_active_issues WHERE component_id IN (%s)`,
+		strings.Join(placeholders, ", "),
+	)
+
+	if _, err := h.db.ExecContext(ctx, query, args...); err != nil {
+		log.WithError(err).WithField("component_ids", componentIDs).
+			Debug("Failed to delete active issues for evicted components")
 	}
 }
 
@@ -841,7 +959,7 @@ func (h *HealthMonitor) pruneStaleComponents() {
 	}
 	h.mu.Unlock()
 
-	h.deleteHealthFromDB(staleIDs)
+	h.forgetComponents(staleIDs)
 
 	log.WithField("evicted", len(staleIDs)).Info("Pruned stale dead components from health monitor")
 }

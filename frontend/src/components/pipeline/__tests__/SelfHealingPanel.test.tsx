@@ -71,12 +71,32 @@ const LEGACY_DECISION = {
   },
 }
 
-function respond(events: unknown[], status = 200) {
-  authFetch.mockResolvedValue({
-    ok: status === 200,
-    status,
-    json: async () => ({ events }),
+/**
+ * One body per endpoint: the card reads healer events and, for a CDC pipeline,
+ * the open Sentinel alerts. `alerts` is the alerts list, or a status code to fail
+ * that one request with.
+ */
+function respond(events: unknown[], status = 200, alerts: unknown[] | number = []) {
+  authFetch.mockImplementation(async (url: string) => {
+    if (String(url).includes("/alerts")) {
+      if (typeof alerts === "number") return { ok: false, status: alerts, json: async () => ({}) }
+      return { ok: true, status: 200, json: async () => ({ alerts }) }
+    }
+    return { ok: status === 200, status, json: async () => ({ events }) }
   })
+}
+
+/** A decision on attempt `id`, and the verdict the verifier later wrote for it. */
+function escalation(id: number, at: string, outcome = "escalated") {
+  return {
+    ...DECISION,
+    event_id: `d-${id}`,
+    received_at: at,
+    payload: { ...DECISION.payload, outcome, attempt_id: id },
+  }
+}
+function verdict(id: number, v: string, at: string) {
+  return { ...VERDICT, event_id: `v-${id}`, received_at: at, payload: { ...VERDICT.payload, attempt_id: id, verdict: v } }
 }
 
 beforeEach(() => {
@@ -91,7 +111,7 @@ describe("SelfHealingPanel", () => {
     respond([DECISION, VERDICT])
     render(<SelfHealingPanel pipelineId="p1" />)
 
-    expect(await screen.findByText("Self-healing activity")).toBeInTheDocument()
+    expect(await screen.findByText("Self-healing")).toBeInTheDocument()
 
     // Verdict first — newest first.
     expect(screen.getByText("Retry the run — Healed")).toBeInTheDocument()
@@ -121,22 +141,58 @@ describe("SelfHealingPanel", () => {
 
     await userEvent.click(toggle)
 
-    expect(screen.getByText("Error it diagnosed")).toBeInTheDocument()
+    const errorLabel = screen.getByText("Error it diagnosed")
     expect(
       screen.getByText("pipeline run is no longer active (workflow not found)")
     ).toBeInTheDocument()
-    expect(screen.getByText("Failure signature")).toBeInTheDocument()
+    // The signature is a grouping key (ids and numbers replaced, error part cut
+    // at 160 characters), so it comes after the error and says what it is.
+    const signatureLabel = screen.getByText(/^Grouped as/)
+    expect(signatureLabel).toHaveTextContent("ids and numbers replaced, error cut at 160 characters")
+    expect(errorLabel.compareDocumentPosition(signatureLabel) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
     expect(screen.getByText("workflow_gone")).toBeInTheDocument()
     // The id that joins this decision to its verdict.
     expect(screen.getByText(/attempt #42/)).toBeInTheDocument()
   })
 
-  it("counts healed runs and the ones still waiting on a person", async () => {
+  it("counts a healed run, and no longer counts the request it answered as needing you", async () => {
+    // Attempt 42 asked for approval, then the verifier graded it healed.
     respond([DECISION, VERDICT])
     render(<SelfHealingPanel pipelineId="p1" />)
 
     expect(await screen.findByText("1 healed")).toBeInTheDocument()
-    expect(screen.getByText("1 needs you")).toBeInTheDocument()
+    expect(screen.queryByText(/needs? you/)).not.toBeInTheDocument()
+  })
+
+  it("counts only the escalations still open, not every one in the history", async () => {
+    // Prod shape: two old escalations the pipeline has since recovered from, one
+    // superseded by a newer failure, and one still waiting. It used to read "4 need you".
+    respond([
+      escalation(4, "2026-08-04T10:00:00Z", "hitl_requested"),
+      verdict(3, "superseded", "2026-08-03T11:00:00Z"),
+      escalation(3, "2026-08-03T10:00:00Z"),
+      verdict(2, "self_resolved", "2026-08-02T11:00:00Z"),
+      escalation(2, "2026-08-02T10:00:00Z"),
+      verdict(1, "failed_again", "2026-08-01T11:00:00Z"),
+      escalation(1, "2026-08-01T10:00:00Z"),
+    ])
+    render(<SelfHealingPanel pipelineId="p1" />)
+
+    expect(await screen.findByText("1 needs you")).toBeInTheDocument()
+    // Recovered without an action: not a heal the agent can take credit for.
+    expect(screen.queryByText(/\d healed/)).not.toBeInTheDocument()
+    expect(screen.getByText("Retry the run — Recovered on its own")).toBeInTheDocument()
+  })
+
+  it("keeps an escalation open when its verdict is inconclusive or not written yet", async () => {
+    respond([
+      verdict(2, "inconclusive", "2026-08-02T11:00:00Z"),
+      escalation(2, "2026-08-02T10:00:00Z"),
+      escalation(1, "2026-08-01T10:00:00Z"),
+    ])
+    render(<SelfHealingPanel pipelineId="p1" />)
+
+    expect(await screen.findByText("2 need you")).toBeInTheDocument()
   })
 
   it("does not count a HITL request or an escalation as a heal", async () => {
@@ -145,9 +201,18 @@ describe("SelfHealingPanel", () => {
     respond([DECISION, LEGACY_DECISION])
     render(<SelfHealingPanel pipelineId="p1" />)
 
-    await screen.findByText("Self-healing activity")
+    await screen.findByText("Self-healing")
     expect(screen.queryByText(/healed/)).not.toBeInTheDocument()
-    expect(screen.getByText("2 need you")).toBeInTheDocument()
+    // Attempt 42 has no verdict: open. The legacy row cannot be joined to a
+    // verdict and the healer has spoken since, so it is not counted.
+    expect(screen.getByText("1 needs you")).toBeInTheDocument()
+  })
+
+  it("counts a legacy escalation only while it is the healer's latest word", async () => {
+    respond([LEGACY_DECISION])
+    render(<SelfHealingPanel pipelineId="p1" />)
+
+    expect(await screen.findByText("1 needs you")).toBeInTheDocument()
   })
 
   it("renders a pre-fix decision event rather than a blank row", async () => {
@@ -167,7 +232,7 @@ describe("SelfHealingPanel", () => {
     // on a busy pipeline can contain none of them.
     respond([DECISION])
     render(<SelfHealingPanel pipelineId="p1" />)
-    await screen.findByText("Self-healing activity")
+    await screen.findByText("Self-healing")
 
     const url = String(authFetch.mock.calls[0][0])
     expect(url).toContain("/events")
@@ -176,11 +241,46 @@ describe("SelfHealingPanel", () => {
     expect(url).toContain("healer_verified")
   })
 
-  it("renders nothing for a pipeline the healer never looked at", async () => {
+  it("shows on a pipeline the healer never had to touch, saying what watches it", async () => {
+    // It used to render nothing here, so a healthy pipeline gave no sign that
+    // anything was watching it at all.
     respond([])
-    const { container } = render(<SelfHealingPanel pipelineId="p1" />)
-    await waitFor(() => expect(authFetch).toHaveBeenCalled())
-    await waitFor(() => expect(container).toBeEmptyDOMElement())
+    render(<SelfHealingPanel pipelineId="p1" pipelineType="etl" />)
+
+    expect(await screen.findByTestId("self-healing-card")).toBeInTheDocument()
+    expect(screen.getByText("The heal agent has not had to act on this pipeline.")).toBeInTheDocument()
+    expect(screen.getByText(/The heal agent reads every failed run/)).toBeInTheDocument()
+    // Batch: no Sentinel, and no alerts request.
+    expect(screen.queryByText(/Sentinel/)).not.toBeInTheDocument()
+    expect(authFetch.mock.calls.some(([u]) => String(u).includes("/alerts"))).toBe(false)
+  })
+
+  it("on a CDC pipeline names the Sentinel and links its open alerts to Data flow", async () => {
+    respond([], 200, [{ id: "a1" }, { id: "a2" }])
+    render(<SelfHealingPanel pipelineId="p1" pipelineType="cdc" />)
+
+    expect(await screen.findByText(/2 open Sentinel alerts/)).toBeInTheDocument()
+    expect(screen.getByText(/The Sentinel watches the running stream/)).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: "See them in Data flow" })).toHaveAttribute(
+      "href",
+      "/pipelines/p1?tab=monitor"
+    )
+    const alertsUrl = String(authFetch.mock.calls.find(([u]) => String(u).includes("/alerts"))?.[0])
+    expect(alertsUrl).toContain("resolved=false")
+  })
+
+  it("says there are no open alerts only when it could read them", async () => {
+    respond([], 200, [])
+    const { unmount } = render(<SelfHealingPanel pipelineId="p1" pipelineType="cdc" />)
+    expect(await screen.findByText("No open Sentinel alerts.")).toBeInTheDocument()
+    unmount()
+
+    // A failed alerts read is not "no alerts": the line is left out.
+    respond([], 200, 500)
+    render(<SelfHealingPanel pipelineId="p1" pipelineType="cdc" />)
+    await screen.findByTestId("self-healing-card")
+    expect(screen.queryByText(/open Sentinel alert/)).not.toBeInTheDocument()
+    expect(screen.getByText(/The Sentinel watches the running stream/)).toBeInTheDocument()
   })
 
   it("stays silent for a viewer who cannot read this pipeline's events", async () => {

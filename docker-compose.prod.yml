@@ -76,10 +76,15 @@ services:
   # INFRASTRUCTURE
   # ============================================
 
-  # Local postgres is DISABLED for both staging and prod — both use managed
-  # Azure PostgreSQL. The profile keeps the service defined (so the compose
-  # project is valid) but it never starts unless explicitly requested with
-  # `--profile local-db`. All services connect to POSTGRES_HOST (Azure).
+  # Local postgres is DISABLED by default here: this file is the EXTERNAL-database
+  # path, so every service connects to POSTGRES_HOST — a managed instance outside
+  # this compose project (RDS / Cloud SQL / Azure Flexible Server / a database on
+  # another host). Which one is deployment state, not a property of this file, and
+  # naming one here read as fact long after it stopped being true: the invariant
+  # worth writing down is that the database is not this file's to start. The
+  # profile keeps the service defined (so the compose project is valid) but it
+  # never starts unless explicitly requested with `--profile local-db`, the
+  # single-VM path where POSTGRES_HOST=postgres.
   postgres:
     profiles: ["local-db"]
     restart: unless-stopped
@@ -107,7 +112,7 @@ services:
     environment:
       # Keep Kafka lean on small VPS (2c/8GB).
       # This is the single biggest memory win for the stack.
-      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m -XX:+ExitOnOutOfMemoryError"
     deploy:
       resources:
         limits:
@@ -182,9 +187,19 @@ services:
   # already exist, or `setup-schema` fails instead. See docker-compose.byo-postgres.yml.
   temporal:
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          # The other previously-uncapped always-on service — see the minio note
+          # above for why "uncapped" is the dangerous state on a swapless host.
+          # Temporal is four roles in one container (frontend, history, matching,
+          # worker) and the history cache is what grows with workflow volume,
+          # which is exactly what a high-volume run drives up. Measured 201.7 MiB
+          # at rest on the GCP host 2026-09-23.
+          memory: 1024M
     ports: !override []
-    # Base compose depended on local postgres only; now external (Azure), so
-    # no service dependency remains.
+    # Base compose depended on local postgres only; here the database is external
+    # (POSTGRES_HOST), so no service dependency remains.
     depends_on: !override []
     environment:
       - DB=postgresql
@@ -318,7 +333,7 @@ services:
       - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=temporal-adapter
-      - OTEL_ENABLED=true
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
     deploy:
       resources:
         limits:
@@ -327,7 +342,7 @@ services:
   orchestrator:
     restart: unless-stopped
     ports: !override []
-    # Drop the base postgres dependency (DB is now external Azure).
+    # Drop the base postgres dependency: the DB is external (POSTGRES_HOST).
     depends_on: !override
       kafka:
         condition: service_healthy
@@ -339,8 +354,6 @@ services:
         required: false
       redis:
         condition: service_healthy
-      fluent-bit:
-        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s
@@ -396,7 +409,7 @@ services:
       - ENABLE_SCHEDULER=false
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=orchestrator
-      - OTEL_ENABLED=true
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
       - ENABLE_CDC_TABLE_STATS=true
       - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
     labels:
@@ -416,7 +429,7 @@ services:
   api-gateway:
     restart: unless-stopped
     ports: !override []
-    # Drop the base postgres dependency (DB is now external Azure).
+    # Drop the base postgres dependency: the DB is external (POSTGRES_HOST).
     depends_on: !override
       kafka:
         condition: service_healthy
@@ -436,8 +449,6 @@ services:
       temporal:
         condition: service_started
       orchestrator:
-        condition: service_started
-      fluent-bit:
         condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
@@ -525,7 +536,7 @@ services:
       - SMTP_FROM=${SMTP_FROM:-}
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=api-gateway
-      - OTEL_ENABLED=true
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
       - FEATURE_MONITORING_OVERVIEW=true
       - FEATURE_MONITORING_INFRA=true
       - FEATURE_MONITORING_TRACES=true
@@ -641,15 +652,9 @@ services:
       # `:-` would silently turn that back into the default.
       - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
       - KAFKA_BROKERS=${KAFKA_BROKERS:-kafka:29092}
-      # Pin Avro OFF to match the producers (api-gateway/orchestrator both set
-      # KAFKA_USE_AVRO=false). llm-service's planner consumer defaults this to
-      # "true" when the avro libs are importable, so leaving it unset risks a
-      # consumer that expects Avro while the producers emit JSON. Explicit here
-      # keeps the whole Kafka path on one wire format.
-      - KAFKA_USE_AVRO=false
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=llm-service
-      - OTEL_ENABLED=true
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
     deploy:
       resources:
         limits:
@@ -834,7 +839,7 @@ services:
       - REDIS_PASSWORD=${REDIS_PASSWORD}
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=tool-generator
-      - OTEL_ENABLED=true
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
       # SEC-H-03: S2S secret so /v1/deploy can require X-Internal-Secret. Orchestrator
       # (:279) already carries the same value; unset => auth disabled (dev/e2e no-op).
       - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
@@ -864,13 +869,12 @@ services:
       # an explicit empty value means "disable" (keep pre-prefix topic names) and
       # `:-` would silently turn that back into the default.
       - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
-      - ENABLE_KAFKA_CONSUMER=false
       - CONNECTORS_DIR=/app/shared/mcp-connectors
       - KAFKA_USE_AVRO=false
       - REDIS_PASSWORD=${REDIS_PASSWORD}
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=planner
-      - OTEL_ENABLED=true
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
       # Plan-time topic creation POSTs the orchestrator's requirePrincipal-gated
       # /api/v1/topology with no user session; ENVIRONMENT=production, so no secret = 401.
       - INTERNAL_SERVICE_SECRET=${INTERNAL_SERVICE_SECRET:?INTERNAL_SERVICE_SECRET must be set in prod .env (S2S auth fail-closed; generate with openssl rand -hex 32)}
@@ -953,6 +957,20 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ACCESS_KEY_ID:?MINIO_ACCESS_KEY_ID must be set in prod .env (refusing the minioadmin default)}
       MINIO_ROOT_PASSWORD: ${MINIO_SECRET_ACCESS_KEY:?MINIO_SECRET_ACCESS_KEY must be set in prod .env (refusing the minioadmin default)}
+    deploy:
+      resources:
+        limits:
+          # Was unbounded — one of only two always-on services in this file with
+          # no cap. On a host with NO SWAP (confirmed: `free -m` Swap 0) an
+          # unbounded service does not fail politely: it grows until the KERNEL
+          # picks an OOM victim by score, and the largest RSS on the box is
+          # normally Kafka. So the service that misbehaves is not the service
+          # that dies, and both data planes stop.
+          #
+          # minio is the batch path's claim-check store, so its footprint tracks
+          # concurrent multipart uploads, not dataset size. Measured 107.1 MiB at
+          # rest on the GCP host 2026-09-23; 1G is ~10x that for burst headroom.
+          memory: 1024M
 
   minio-mcp:
     restart: unless-stopped
@@ -1021,33 +1039,6 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-    deploy:
-      resources:
-        limits:
-          memory: 256M
-
-  # ============================================
-  # OBSERVABILITY
-  # ============================================
-
-  fluent-bit:
-    restart: unless-stopped
-    # Only Docker daemon should reach this (log driver).
-    ports: !override
-      - "127.0.0.1:24224:24224"
-      - "127.0.0.1:24224:24224/udp"
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-
-  otel-collector:
-    restart: unless-stopped
-    ports: !override
-      # Keep collector ports local-only; services talk over the Docker network.
-      - "127.0.0.1:14317:4317"
-      - "127.0.0.1:14318:4318"
-      - "127.0.0.1:8006:8006"
     deploy:
       resources:
         limits:

@@ -44,6 +44,7 @@ import {
 import { authFetch } from "@/lib/api/auth-fetch"
 import { AccessDeniedState, LoadingState, RateLimitExceededState } from "@/components/admin/AdminStates"
 import { toast } from "sonner"
+import { copyTextToClipboard } from "@/lib/clipboard"
 import { Plus, Copy, Trash2 } from "lucide-react"
 import type { AdminInvitation } from "@/lib/api/admin"
 import { adminCreateInvitation, adminListInvitations, adminRevokeInvitation } from "@/lib/api/admin"
@@ -119,9 +120,12 @@ export default function AdminInvitationsPage() {
     }
   }
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text)
-    toast.success("Link copied to clipboard")
+  const copyToClipboard = async (text: string) => {
+    if (await copyTextToClipboard(text)) {
+      toast.success("Link copied to clipboard")
+    } else {
+      toast.error("Could not copy the invite link to the clipboard")
+    }
   }
 
   return (

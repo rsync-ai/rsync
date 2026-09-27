@@ -26,10 +26,19 @@ export interface FeatureFlags {
  * These are the build-time defaults
  */
 export const DEFAULT_FEATURES: FeatureFlags = {
-  // Monitoring Overview - defaults to OFF for safety
-  monitoringOverview: parseBool(process.env.NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW, false),
-  
-  // Monitoring Infrastructure tab - defaults to OFF for safety
+  // Monitoring Overview - the pipeline page's own health tiles. Defaults ON, in
+  // lockstep with the gateway's FEATURE_MONITORING_OVERVIEW (config/features.go):
+  // this flag hides the Overview SUB-TAB outright (PipelineMonitoringPanel renders
+  // neither its trigger nor its content), so off meant the tiles that say
+  // "Capture stopped" when Debezium has died were not on the page at all.
+  // docker-compose.yml and docker-compose.prod.yml already set it "true";
+  // docker-compose.staging.yml sets it "false" explicitly and keeps that.
+  monitoringOverview: parseBool(process.env.NEXT_PUBLIC_FEATURE_MONITORING_OVERVIEW, true),
+
+  // Monitoring Infrastructure tab - the ADMIN view of the platform's own workers.
+  // Stays OFF by default: it is admin-only by construction and no pipeline surface
+  // depends on it (pipeline alerts and consumers have their own unflagged,
+  // workspace-scoped routes).
   monitoringInfra: parseBool(process.env.NEXT_PUBLIC_FEATURE_MONITORING_INFRA, false),
   
   // Monitoring Traces tab - defaults to OFF in production, ON in dev

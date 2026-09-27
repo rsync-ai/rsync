@@ -54,8 +54,21 @@ describe("executor subtitle", () => {
         stage: executor,
         srcName: "a",
         dstName: "b",
-        stateMessage: "Transferred 1 of 3 tables",
+        stateMessage: "Queued 1 of 3 tables for writing",
       }),
+    ).toBe('Syncing "a" → "b"…')
+    // Still syncing while the destination confirms the last rows.
+    expect(
+      executorRunningMessage({
+        stage: executor,
+        srcName: "a",
+        dstName: "b",
+        stateMessage: "All tables queued — waiting for the destination to confirm every row landed",
+      }),
+    ).toBe('Syncing "a" → "b"…')
+    // An orchestrator image from before the rename still says "Transferred".
+    expect(
+      executorRunningMessage({ stage: executor, srcName: "a", dstName: "b", stateMessage: "Transferred 1 of 3 tables" }),
     ).toBe('Syncing "a" → "b"…')
     expect(
       executorRunningMessage({ stage: { ...executor, metadata: { rows_synced: 10 } }, srcName: null, dstName: null }),

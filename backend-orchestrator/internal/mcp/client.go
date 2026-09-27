@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/security"
@@ -543,6 +546,12 @@ func (c *Client) executeViaHTTP(ctx context.Context, server *ServerInfo, req JSO
 	client := &http.Client{Timeout: timeout}
 	resp, err := client.Do(httpReq)
 	if err != nil {
+		if connectorIsGone(err) && c.serverManager != nil {
+			// The container was stopped or removed. Drop its entry so the next
+			// StartServer searches for or deploys one instead of returning it again.
+			log.Warnf("⚠️  MCP server %s at %s:%d is gone — dropping it from the cache", server.Name, server.Host, server.Port)
+			c.serverManager.forgetServer(server)
+		}
 		return &ExecuteResponse{Success: false, Error: fmt.Sprintf("HTTP request failed: %v", err)}, nil
 	}
 	defer resp.Body.Close()
@@ -615,6 +624,18 @@ func (c *Client) executeViaHTTP(ctx context.Context, server *ServerInfo, req JSO
 	}
 
 	return &ExecuteResponse{Success: true, Result: rpcResp.Result}, nil
+}
+
+// connectorIsGone reports whether an HTTP call failed because nothing is at the
+// connector's address any more: the port refuses connections (container stopped) or the
+// name does not resolve (container removed). A timeout, or the caller giving up, says
+// nothing about whether the connector is there, and returns false.
+func connectorIsGone(err error) bool {
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	var dnsErr *net.DNSError
+	return errors.As(err, &dnsErr) && dnsErr.IsNotFound
 }
 
 // CallMethod calls a method on an MCP connector using JSON-RPC

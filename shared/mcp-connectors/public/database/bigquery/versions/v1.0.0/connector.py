@@ -16,8 +16,11 @@ Optimized paths (Level 1, batch):
              load job when ``RSYNC_BQ_LOAD_JOB`` (or a ``bulk_load`` param) is set,
              falling back to streaming inserts on failure — never a silent drop.
 
-The ``DestinationLoadSpec`` advertises ``load_method='bq_load_job'`` so the
-orchestrator discovers the bulk path via ``load_strategy_capability()``. The
+The ``DestinationLoadSpec`` advertises ``load_method='bq_load_job'`` through
+``load_strategy_capability()``, but nothing consumes it yet -- no service reads
+the ``load_strategy`` key (BACKLOG: LOAD-STRATEGY-NO-CONSUMER). The bulk path is
+selected here by ``RSYNC_BQ_LOAD_JOB`` / the ``bulk_load`` param, NOT by
+capability discovery; the declaration is forward-looking only. The
 DBAPI-cursor ``_stage_*`` hooks of ``DestinationLoadMixin`` are intentionally left
 unimplemented — BigQuery's bulk write is the adapter load job, not a cursor COPY,
 so ``staged_upsert`` is never invoked here.

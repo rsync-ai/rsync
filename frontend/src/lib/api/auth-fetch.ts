@@ -79,6 +79,83 @@ export async function getAccessToken(): Promise<string | null> {
 }
 
 /**
+ * Does the API still recognise this session?
+ *
+ * `authFetch` used to read EVERY 401 as "your session expired" and force a
+ * logout. That is wrong for any endpoint that can answer 401 about the
+ * *resource* rather than the caller, and the api-gateway has such endpoints:
+ * the CDC proxies forward the orchestrator's answer verbatim
+ * (`pipeline_cdc.go` `forwardOrchestratorJSON`), and the orchestrator replies
+ * `401 {"error":"authentication required"}` whenever the proxied call carries
+ * no principal — which is exactly what happens when `INTERNAL_SERVICE_SECRET`
+ * is unset, the documented dev/self-host default. The result was that merely
+ * OPENING a CDC pipeline's detail page deleted the operator's session row and
+ * bounced them to the login form, with nothing in the UI naming a cause.
+ *
+ * So ask the one endpoint that can actually answer the question. Three
+ * outcomes, and the difference between them matters:
+ *
+ *  - "invalid" — /auth/me itself says 401. The session really is gone; log out,
+ *    exactly as before.
+ *  - "valid"   — /auth/me says 200. The session is fine and the 401 belonged to
+ *    the resource; hand the response back and let the caller render an error.
+ *  - "unknown" — the probe never got an answer (offline, DNS, gateway down).
+ *    Do nothing. Signing someone out because their wifi dropped is a worse
+ *    failure than leaving a stale page on screen, and the next 401 re-probes.
+ *
+ * Deliberately a bare `fetch`, not `authFetch`: routing the probe through the
+ * helper that triggers it would recurse.
+ */
+type SessionProbe = "valid" | "invalid" | "unknown"
+
+let sessionProbeInFlight: Promise<SessionProbe> | null = null
+
+async function probeSession(): Promise<SessionProbe> {
+  // A page that 401s usually 401s on several parallel requests at once. Share
+  // one probe between them so a single render cannot fan out into N probes.
+  if (sessionProbeInFlight) return sessionProbeInFlight
+
+  const probe = (async (): Promise<SessionProbe> => {
+    try {
+      const res = await fetch(`${API_URL}/api/v1/auth/me`, {
+        method: "GET",
+        credentials: "include",
+        headers: { Accept: "application/json" },
+        cache: "no-store",
+      })
+      if (res.status === 401) return "invalid"
+      if (res.ok) return "valid"
+      return "unknown"
+    } catch {
+      return "unknown"
+    }
+  })()
+
+  sessionProbeInFlight = probe
+  try {
+    return await probe
+  } finally {
+    sessionProbeInFlight = null
+  }
+}
+
+let loggingOut = false
+
+/** Navigate to /logout once, however many requests 401 in the same tick. */
+function redirectToLogout(): void {
+  if (loggingOut) return
+  loggingOut = true
+  const next = `${window.location.pathname}${window.location.search}`
+  window.location.href = `/logout?next=${encodeURIComponent(next)}`
+}
+
+/** Test seam: reset the module-level probe/redirect latches. */
+export function __resetAuthFetchSessionState(): void {
+  sessionProbeInFlight = null
+  loggingOut = false
+}
+
+/**
  * Fetch wrapper for client-side API calls
  */
 export async function authFetch(
@@ -150,14 +227,19 @@ export async function authFetch(
     // Global session-expired handling:
     // If the API says the token is invalid/expired, clear the cookie via /logout
     // so the frontend middleware stops treating the user as authenticated.
+    //
+    // A 401 alone is not that statement -- see probeSession() for why. Confirm
+    // against /auth/me first, and log out only when the session is the thing
+    // that is actually broken.
     if (
       !skipAuth &&
       response.status === 401 &&
       typeof window !== "undefined" &&
       !String(endpoint).includes("/api/v1/auth/")
     ) {
-      const next = `${window.location.pathname}${window.location.search}`
-      window.location.href = `/logout?next=${encodeURIComponent(next)}`
+      if ((await probeSession()) === "invalid") {
+        redirectToLogout()
+      }
     }
 
     return response

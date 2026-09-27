@@ -6,6 +6,7 @@ import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { extractErrorMessage } from "@/lib/utils/error-handling"
 import type { DataLoadingStrategy } from "@/lib/pipeline/dataLoadingStrategy"
+import { explainTableEditError, type TableEditResult } from "@/lib/pipeline/cdcBackfill"
 
 export interface PipelineNode {
   id: string
@@ -78,18 +79,13 @@ export async function getPipeline(id: string, options: { timeoutMs?: number } = 
 
 export type CDCBackfillMode = "incremental" | "blocking"
 
-export interface CDCBackfillSummary {
-  triggered?: boolean
-  mode?: CDCBackfillMode
-  tables?: string[]
-  message?: string
-}
-
+// The response shape (and what it means for the operator) lives with the rest
+// of the backfill client: see describeTableEditResult.
 export async function updatePipelineCDCTables(
   pipelineId: string,
   tables: string[],
   opts?: { backfill_newly_added?: boolean; backfill_mode?: CDCBackfillMode },
-): Promise<{ success: boolean; new_tables?: string[]; backfill?: CDCBackfillSummary }> {
+): Promise<TableEditResult> {
   const response = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/cdc/tables`, {
     method: "POST",
     body: JSON.stringify({ tables, ...(opts || {}) }),
@@ -97,7 +93,7 @@ export async function updatePipelineCDCTables(
 
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: "Failed to update CDC tables" }))
-    throw new Error(extractErrorMessage(error) || "Failed to update CDC tables")
+    throw explainTableEditError(error) ?? new Error(extractErrorMessage(error) || "Failed to update CDC tables")
   }
 
   return response.json()

@@ -21,7 +21,7 @@ import (
 
 var cdcStatsCols = []string{
 	"schema_name", "table_name", "qualified_name", "mode", "status",
-	"read_rows", "inserted_rows",
+	"snapshot_rows", "applied_snapshot_rows",
 	"inserts", "updates", "deletes", "total_events", "last_event_ts",
 	"applied_inserts", "applied_updates", "applied_deletes", "applied_total_events", "last_applied_ts",
 	"dlq_rows",
@@ -49,7 +49,7 @@ func buildCDCStatsForTest(t *testing.T, rows *sqlmock.Rows, selected []string, s
 	defer db.Close()
 	mock.ExpectQuery(regexp.QuoteMeta("FROM pipeline_run_table_stats")).WillReturnRows(rows)
 
-	stats, summary, _, err := buildCDCTableStatsResponse(db, "p1", "e1", selected, "", sortBy, 50, 0, "")
+	stats, summary, _, err := buildCDCTableStatsResponse(db, "p1", "e1", selected, nil, "", sortBy, 50, 0, "")
 	if err != nil {
 		t.Fatalf("buildCDCTableStatsResponse: %v", err)
 	}

@@ -15,8 +15,8 @@ import { classifyError } from "@/lib/utils/error-handling"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
 import { StageTimeline } from "@/components/pipeline/StageTimeline"
 import { stageDurationMs } from "@/components/pipeline/dagHelpers"
-import { stageTiming, type StageTransitionPoint } from "@/lib/duration"
-import { dedupeStageLifecycleEvents } from "@/lib/pipeline/eventNormalizer"
+import { formatDuration, stageTiming, type StageTransitionPoint } from "@/lib/duration"
+import { dedupeStageLifecycleEvents, STATUS_EVENT_TYPES } from "@/lib/pipeline/eventNormalizer"
 import type { HITLState, StageExecution, StageStatus } from "@/lib/pipeline/stageDefinitions"
 import { AGENT_STAGE_ORDER, passedOverAgentStages, stageRegistry } from "@/lib/pipeline/stageDefinitions"
 import {
@@ -25,6 +25,7 @@ import {
   normalizePipelineStatus,
   reconcilePipelineStatus,
   WAITING_FOR_FIRST_DATA_LABEL,
+  type NormalizedPipelineStatus,
 } from "@/lib/pipeline/statusNormalization"
 import { HITLPanel } from "@/components/pipeline/HITLPanel"
 import { PipelineTableSelector, normalizeSuggestedTables } from "@/components/pipeline/PipelineTableSelector"
@@ -68,6 +69,60 @@ type PipelineRunEvent = {
 
 const DAG_STAGE_GROUPS = new Set(["extracting", "transforming", "loading"])
 
+/**
+ * The events that make, move or end a row of the stage list, and every event
+ * this panel reads (a table-selection prompt's `blocking_reason` rides on
+ * PIPELINE_WAITING). Anything else that names a stage is not a stage: the
+ * orchestrator's CDC counter sends TABLE_STATS as stage `cdc_stats` for as long
+ * as the pipeline streams, and each one made a "Cdc Stats" row that never
+ * started or finished — so the list never folded, and a streaming pipeline read
+ * "Step 8/9" (prod pipeline c228373b, 2026-09-25). The events read asks for these
+ * types alone, so a busy stream's stats cannot push setup off the page either.
+ * STAGE_PROGRESS stays in: a running stage's heartbeats are its clock.
+ */
+export const STAGE_ROW_EVENT_TYPES = [...STATUS_EVENT_TYPES, "STAGE_PROGRESS"] as const
+const STAGE_ROW_EVENT_TYPE_SET = new Set<string>(STAGE_ROW_EVENT_TYPES)
+
+/**
+ * Stage keys that name how a run ended, not a stage it ran. The V2 workflow
+ * writes current_stage 'completed' once its last stage has finished
+ * (nl_pipeline_v2_workflow.go), and the post-run check can still fail the run
+ * after that without touching current_stage. Taken as a stage, that key became a
+ * "Completed" row described "Processing Completed" and a "Failed during:
+ * Completed" line (prod 65f0c413, 2026-09-26).
+ */
+const TERMINAL_PSEUDO_STAGES = new Set(["completed", "failed", "cancelled", "canceled", "stopped"])
+
+function isTerminalPseudoStage(key: string): boolean {
+  return TERMINAL_PSEUDO_STAGES.has(key.trim().toLowerCase())
+}
+
+/**
+ * The Overview's stage list, folded to one line once setup is over.
+ *
+ * Every stage here is also a node in the Steps/DAG tab, with the same name and
+ * the same duration (steps-graph-overview-names-durations.test.tsx pins that),
+ * so a finished list is the graph again in a second place. The list is worth its
+ * room only while it says something the rest of the Overview does not: a stage
+ * still running, a question waiting on the user, or the stage a run died in.
+ *
+ * `null` keeps the full list. The duration is the sum of the stages' own times,
+ * not first-start to last-end: a table-selection question can sit unanswered for
+ * a day, and that wait is not setup work.
+ */
+export function finishedSetupSummary(
+  stages: StageExecution[],
+  status: NormalizedPipelineStatus
+): { steps: number; durationMs: number | null } | null {
+  if (stages.length === 0) return null
+  if (status === "waiting_for_user" || status === "failed" || status === "cancelled") return null
+  if (!stages.every((s) => s.status === "completed")) return null
+  const measured = stages.flatMap((s) =>
+    typeof s.durationMs === "number" && Number.isFinite(s.durationMs) && s.durationMs > 0 ? [s.durationMs] : []
+  )
+  return { steps: stages.length, durationMs: measured.length > 0 ? measured.reduce((a, b) => a + b, 0) : null }
+}
+
 function parseTs(s?: string): number | undefined {
   if (!s) return undefined
   const t = new Date(s).getTime()
@@ -78,6 +133,31 @@ function isProbablyDagNodeStageId(stageId?: string): boolean {
   const id = String(stageId || "")
   if (!id) return false
   return /^(source|dest|transform|notify)_[0-9]+$/.test(id)
+}
+
+/**
+ * How many tries a stage took: its first start, plus each start after a
+ * failure. A stage that finished and was started again was run again, not
+ * retried — `infra_preflight` re-checks the services once a table-selection
+ * question is answered, and counting that second start put "Retry 2/2" on a
+ * stage that never failed (prod pipeline c228373b, 14:58:29 and 14:59:03 on
+ * 2026-09-25). The durations still sum every run (`stageTiming`).
+ *
+ * @param points  One stage's transitions, in the order they happened.
+ */
+function stageTries(points: StageTransitionPoint[]): number {
+  let tries = 0
+  let lastEnd = ""
+  for (const p of points) {
+    const type = String(p.type || "").toUpperCase()
+    if (type === "STAGE_STARTED") {
+      if (tries === 0 || lastEnd === "STAGE_FAILED") tries += 1
+      lastEnd = ""
+    } else if (type === "STAGE_COMPLETED" || type === "STAGE_FAILED") {
+      lastEnd = type
+    }
+  }
+  return tries
 }
 
 export function buildAgenticStagesFromEvents(
@@ -186,14 +266,15 @@ export function buildAgenticStagesFromEvents(
     const stageKey = String(e.stage_id || "").trim()
     if (!stageKey) continue
 
+    const at = parseTs(e.occurred_at || e.received_at)
+    if (at !== undefined && (latestEventAt === undefined || at > latestEventAt)) latestEventAt = at
+    if (!STAGE_ROW_EVENT_TYPE_SET.has(String(e.event_type || ""))) continue
+    if (isTerminalPseudoStage(stageKey)) continue
+
     const agg = ensure(stageKey)
     reported.add(stageKey)
-    const at = parseTs(e.occurred_at || e.received_at)
     agg.lastEventAt = at ?? agg.lastEventAt
-    if (at !== undefined) {
-      agg.points.push({ type: String(e.event_type || ""), at })
-      if (latestEventAt === undefined || at > latestEventAt) latestEventAt = at
-    }
+    if (at !== undefined) agg.points.push({ type: String(e.event_type || ""), at })
 
     const p = (e.payload && typeof e.payload === "object" ? e.payload : {}) as Record<string, any>
     const attempt = Number(p.attempt ?? p.current_attempt ?? 1)
@@ -342,12 +423,22 @@ export function buildAgenticStagesFromEvents(
   // Overlay: if failed, ensure we don't leave earlier/later stages "running".
   // Prefer failing exactly the backend-reported stage, and make later stages pending.
   if (pipelineStatus === "failed") {
-    const failedStage = statusStageKey || AGENT_STAGE_ORDER.find((k) => byStage.get(k)?.status === "failed") || ""
+    const pseudo = isTerminalPseudoStage(statusStageKey)
+    const failedStage =
+      (pseudo ? "" : statusStageKey) || AGENT_STAGE_ORDER.find((k) => byStage.get(k)?.status === "failed") || ""
     if (failedStage) {
       ensure(String(failedStage))
       reported.add(String(failedStage))
+      inferLinearStatuses(String(failedStage), "failed")
+    } else if (statusStageKey.toLowerCase() === "completed") {
+      // Every stage finished and no stage failed: the run failed after its last
+      // stage (the post-run check). Same overlay as a completed run, so a stage
+      // whose STAGE_COMPLETED was lost does not keep spinning.
+      for (const agg of byStage.values()) {
+        if (agg.status === "failed" || agg.status === "cancelled") continue
+        setCompleted(agg)
+      }
     }
-    inferLinearStatuses(String(failedStage), "failed")
   }
 
   // Compose final ordered list:
@@ -401,6 +492,7 @@ export function buildAgenticStagesFromEvents(
             ? agg.completedAt - agg.startedAt
             : undefined))
     const startedAt = agg.startedAt ?? parseTs(state?.created_at) ?? 0
+    const tries = stageTries(agg.points) || 1
     const attempt = {
       attemptNumber: agg.currentAttempt,
       status: agg.status,
@@ -417,8 +509,8 @@ export function buildAgenticStagesFromEvents(
       description: planStage?.description?.trim() || base.description,
       icon: base.icon,
       status: agg.status,
-      currentAttempt: Math.max(agg.currentAttempt, timing.attempts || 1),
-      maxAttempts: Math.max(agg.maxAttempts, timing.attempts || 1),
+      currentAttempt: Math.max(agg.currentAttempt, tries),
+      maxAttempts: Math.max(agg.maxAttempts, tries),
       attempts: [attempt],
       startedAt: agg.startedAt,
       completedAt: agg.completedAt,
@@ -488,16 +580,65 @@ export type StepInfo = { current_step: number; total_steps: number; stage_key: s
 /**
  * "Step n of m" read off the stage timeline: the current stage's position, or
  * the completed count when no stage is current.
+ *
+ * A finished run is decided by its status, not by how many rows happen to be
+ * green: a completed run is on its last step, and a failed one is on the stage
+ * that failed, or on its last step when it failed after every stage (the key is
+ * then the pseudo-stage 'completed', which is not a row). A completed batch run
+ * read "7/8 steps" beside its "Completed" badge.
  */
-export function deriveStepInfo(stages: StageExecution[], currentStageKey?: string): StepInfo | null {
+export function deriveStepInfo(
+  stages: StageExecution[],
+  currentStageKey?: string,
+  pipelineStatus?: string
+): StepInfo | null {
   if (!stages || stages.length === 0) return null
   const key =
     (currentStageKey || "").trim() ||
     stages.find((s) => s.status === "running" || s.status === "retrying" || s.status === "waiting")?.stage ||
     ""
   const idx = key ? stages.findIndex((s) => s.stage === key) : -1
+  if (pipelineStatus === "completed") {
+    return { current_step: stages.length, total_steps: stages.length, stage_key: key }
+  }
+  if (pipelineStatus === "failed" && idx < 0) {
+    const failedIdx = stages.findIndex((s) => s.status === "failed")
+    return failedIdx >= 0
+      ? { current_step: failedIdx + 1, total_steps: stages.length, stage_key: stages[failedIdx].stage }
+      : { current_step: stages.length, total_steps: stages.length, stage_key: key }
+  }
   const current_step = idx >= 0 ? idx + 1 : Math.max(1, stages.filter((s) => s.status === "completed").length)
   return { current_step, total_steps: stages.length, stage_key: key }
+}
+
+/**
+ * The line under the stage list once a run has ended. It said "Failed during"
+ * for a failed run and "Stopped during" for everything else, a completed run
+ * included, and took the stage from current_stage, which after the post-run
+ * check holds the pseudo-stage 'completed': "Failed during: Completed".
+ */
+export function terminalStageLine(
+  status: string,
+  stages: StageExecution[],
+  stageKey: string,
+  stageLabel: string
+): string {
+  const key = (stageKey || "").trim()
+  const namesAStage = !!key && !isTerminalPseudoStage(key) && !!stageLabel
+  if (status === "completed") return "Completed"
+  if (status === "failed") {
+    const failed = stages.find((s) => s.status === "failed")
+    if (failed) return `Failed during: ${failed.label || stageLabel}`
+    if (namesAStage && stages.find((s) => s.stage === key)?.status !== "completed") {
+      return `Failed during: ${stageLabel}`
+    }
+    if (key.toLowerCase() === "completed" || (stages.length > 0 && stages.every((s) => s.status === "completed"))) {
+      // The reason is the state message printed under this line.
+      return "Failed after every step finished"
+    }
+    return "Failed"
+  }
+  return namesAStage ? `Stopped during: ${stageLabel}` : "Stopped"
 }
 
 /**
@@ -509,7 +650,7 @@ export function deriveStepInfo(stages: StageExecution[], currentStageKey?: strin
 export function stepInfoFromEvents(events: PipelineRunEvent[], state: PipelineStateResponse | null): StepInfo | null {
   const agentic = buildAgenticStagesFromEvents(events, state)
   const stages = agentic.length > 0 ? agentic : buildStagesFromExecutionPlan(state)
-  return deriveStepInfo(stages, resolveCurrentStageKey(state))
+  return deriveStepInfo(stages, resolveCurrentStageKey(state), normalizePipelineStatus(state?.status))
 }
 
 /** A reported count is usable only when it is a finite positive integer. */
@@ -688,7 +829,8 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     if (!pipelineId) return
     try {
       setEventsError(null)
-      const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events?limit=200`, {
+      const qs = new URLSearchParams({ limit: "200", event_types: STAGE_ROW_EVENT_TYPES.join(",") })
+      const res = await authFetch(`${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?${qs.toString()}`, {
         cache: "no-store",
       })
       if (!res.ok) {
@@ -767,12 +909,17 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
       // re-fetches a finished run (no more websocket events arrive), so without
       // this the panel stayed on "No active execution yet · 0%" until a reload.
       if (!error) return
-      const retry = setInterval(() => void fetchState(), 5000)
+      const retry = setInterval(() => {
+        // A hidden tab skips its reads (#13); the next visible tick reads.
+        if (document.visibilityState === "hidden") return
+        void fetchState()
+      }, 5000)
       return () => clearInterval(retry)
     }
     if (!["processing", "waiting_for_user", "pending"].includes(status)) return
     const pollIntervalMs = status === "processing" ? 2500 : 5000
     const t = setInterval(() => {
+      if (document.visibilityState === "hidden") return
       void fetchState()
       void fetchEvents()
     }, pollIntervalMs)
@@ -814,6 +961,12 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     [pipelineTerminal.status, pipelineRuntime?.phase]
   )
   const statusEscalated = reconciledStatus !== pipelineTerminal.status
+  // Raw /state status, not the reconciled one: a stream whose dependencies went
+  // unhealthy after setup has nothing to show in its (all green) setup stages.
+  const setupSummary = useMemo(
+    () => finishedSetupSummary(stages, pipelineTerminal.status),
+    [stages, pipelineTerminal.status]
+  )
   // Issue #20: /state says "running" with "Streaming pipeline active" the moment a CDC
   // stream is handed off, whether or not anything ever reaches the destination.
   // /runtime's waiting_for_data is the honest answer once the grace has passed.
@@ -898,7 +1051,10 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
   // timeline builder so both agree on which stage the top-level fields describe.
   const currentStageKey = useMemo(() => resolveCurrentStageKey(state), [state])
 
-  const derivedStepInfo = useMemo(() => deriveStepInfo(stages, currentStageKey), [stages, currentStageKey])
+  const derivedStepInfo = useMemo(
+    () => deriveStepInfo(stages, currentStageKey, pipelineTerminal.status),
+    [stages, currentStageKey, pipelineTerminal.status]
+  )
 
   const currentStageLabel = useMemo(() => {
     const key = (derivedStepInfo?.stage_key || currentStageKey || state?.current_stage || state?.progress?.stage || "").trim()
@@ -1625,8 +1781,13 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
         <div className="space-y-2">
           <div className="flex items-center justify-between text-sm">
             <span className="text-zinc-600 dark:text-zinc-400">
-              {pipelineTerminal.isTerminal && currentStageLabel
-                ? `${pipelineTerminal.status === "failed" ? "Failed during" : "Stopped during"}: ${currentStageLabel}`
+              {pipelineTerminal.isTerminal
+                ? terminalStageLine(
+                    pipelineTerminal.status,
+                    stages,
+                    derivedStepInfo?.stage_key || currentStageKey || "",
+                    currentStageLabel
+                  )
                 : isLiveStreaming
                   ? "Current stage: Streaming (CDC)"
                   : waitingForFirstData
@@ -1666,7 +1827,26 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
           ) : null}
         </div>
 
-        {stages.length > 0 ? (
+        {setupSummary ? (
+          <div
+            data-testid="setup-summary"
+            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-zinc-200 px-3 py-2 text-sm dark:border-zinc-800"
+          >
+            <span className="text-zinc-600 dark:text-zinc-400">
+              <span aria-hidden="true" className="mr-1.5 text-green-600 dark:text-green-400">
+                ✓
+              </span>
+              Setup completed: {setupSummary.steps} {setupSummary.steps === 1 ? "step" : "steps"}
+              {setupSummary.durationMs !== null ? `, ${formatDuration(setupSummary.durationMs)} in total` : ""}
+            </span>
+            <Link
+              href={`/pipelines/${pipelineId}?tab=steps`}
+              className="text-xs font-medium text-blue-600 hover:underline dark:text-blue-400"
+            >
+              See each step in Steps/DAG
+            </Link>
+          </div>
+        ) : stages.length > 0 ? (
           <StageTimeline
             title="Agentic pipeline stages"
             stages={timelineStages}

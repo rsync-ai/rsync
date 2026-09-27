@@ -66,9 +66,10 @@ func (d *IssueDetector) DetectIssues(ctx context.Context, components []*Componen
 		}
 
 		// Check for closed consumer groups
-		if issue := d.detectClosedConsumerGroup(component); issue != nil {
-			if d.shouldReportIssue(issue) {
-				issues = append(issues, issue)
+		closedGroup := d.detectClosedConsumerGroup(component)
+		if closedGroup != nil {
+			if d.shouldReportIssue(closedGroup) {
+				issues = append(issues, closedGroup)
 			}
 		}
 
@@ -79,10 +80,23 @@ func (d *IssueDetector) DetectIssues(ctx context.Context, components []*Componen
 			}
 		}
 
-		// Check for component unhealthy status
-		if issue := d.detectUnhealthyStatus(component); issue != nil {
-			if d.shouldReportIssue(issue) {
-				issues = append(issues, issue)
+		// Check for component unhealthy status.
+		//
+		// detectUnhealthyStatus is the catch-all: it fires for ANY component written
+		// unhealthy or dead, and maps a kafka_consumer to missing_heartbeat because
+		// that is its default branch. A closed consumer group is written unhealthy AND
+		// carries issue_type "consumer_group_closed", so both detectors describe the
+		// same fault under two issue IDs — which now means two criticals in every
+		// admin's bell, under two different dedup keys, for one dead consumer.
+		//
+		// The specific diagnosis wins. A consumer unhealthy for any OTHER reason (a
+		// refused dial, an auth failure) is untouched: detectClosedConsumerGroup
+		// returns nil for it, so it still reaches the catch-all below.
+		if closedGroup == nil {
+			if issue := d.detectUnhealthyStatus(component); issue != nil {
+				if d.shouldReportIssue(issue) {
+					issues = append(issues, issue)
+				}
 			}
 		}
 	}

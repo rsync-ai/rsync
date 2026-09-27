@@ -63,6 +63,10 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_DIR = REPO_ROOT / ".github" / "workflows"
+# The filters used to live inline in ci.yml's `changes` job. They are one
+# shared file now, read by every job that gates itself -- see
+# llm-service/tests/test_ci_inline_change_filters.py.
+CI_FILTERS = REPO_ROOT / ".github" / "paths-filters.yml"
 
 SUMMARIZER = "summarize-sarif.sh"
 SINK_REPORTER = "report-sarif-sinks.sh"
@@ -209,11 +213,14 @@ def test_both_sarif_scripts_are_in_the_ci_paths_filter():
     no guard at all. A guard gated on a paths filter that excludes its own subject
     is not a guard -- this repo has hit that shape five times.
     """
-    ci = (WORKFLOW_DIR / "ci.yml").read_text()
+    globs = yaml.safe_load(CI_FILTERS.read_text())["llm"]
+    assert globs, "the llm filter parsed empty -- this check would pass vacuously"
     for script in (SUMMARIZER, SINK_REPORTER):
-        assert f"'scripts/{script}'" in ci, (
-            f"scripts/{script} is not in ci.yml's paths filter, so a PR changing only "
-            "that file runs none of these tests. Add it to the `llm:` filter."
+        assert f"scripts/{script}" in globs, (
+            f"scripts/{script} is not in the `llm` filter, so a PR changing only "
+            f"that file runs none of these tests. Add it to {CI_FILTERS.name}. "
+            f"(The filters left ci.yml so each job could run them itself; the "
+            f"file is the one definition.) Filter is: {globs}"
         )
 
 

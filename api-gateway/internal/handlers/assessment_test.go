@@ -201,6 +201,25 @@ func TestHasBlockingFindings(t *testing.T) {
 	}
 }
 
+func TestSummariseCountsOnlySourceTables(t *testing.T) {
+	// Six real tables plus the two check rows the report appends read
+	// "across 8 tables" on prod (U-19).
+	rows := []AssessmentTable{{Name: "a"}, {Name: "b"}, {Name: "c"}, {Name: "d"}, {Name: "e"}, {Name: "f"},
+		{Name: "(source readiness)"},
+		{Name: "(destination namespace)", Findings: []AssessmentFinding{{Severity: AssessmentWarning, Code: "W"}}},
+	}
+	if got := summarise(rows); got != "1 warning across 6 tables" {
+		t.Errorf("summary = %q; want %q", got, "1 warning across 6 tables")
+	}
+	onlyChecks := []AssessmentTable{{Name: "(catalog)", Findings: []AssessmentFinding{{Severity: AssessmentError, Code: "E"}}}}
+	if got := summarise(onlyChecks); got != "1 error" {
+		t.Errorf("summary = %q; want %q (no \"across 0 tables\")", got, "1 error")
+	}
+	if got := summarise([]AssessmentTable{{Name: "a"}}); got != "All checks passed across 1 table" {
+		t.Errorf("summary = %q", got)
+	}
+}
+
 func TestSummarise(t *testing.T) {
 	clean := []AssessmentTable{{Name: "a"}, {Name: "b"}}
 	if got := summarise(clean); got != "All checks passed across 2 tables" {

@@ -9,15 +9,6 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// truncateForLog clips long strings so we can log payload previews without
-// flooding the log stream. Used for MCP response diagnostics.
-func truncateForLog(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n] + "...(truncated)"
-}
-
 // upsertDependency writes (or refreshes) one row in pipeline_dependencies. The
 // dependency liveness probe + the api-gateway /runtime endpoint read this table
 // to know which infrastructure pieces a pipeline needs to keep running.

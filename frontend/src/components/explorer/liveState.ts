@@ -73,6 +73,12 @@ export interface ModelFreshnessBreach {
   resolution?: string
 }
 
+/**
+ * One producer a scheduled model rebuilds after, as the gateway returns it. `kind` stays a
+ * string on this read side: modelLineage drops a kind it does not know rather than trust
+ * the gateway to send only "pipeline" or "model". The editor's write shape is the stricter
+ * one in SavedQueryModelDialog.
+ */
 export interface ScheduleUpstream {
   kind: string
   id: string
@@ -124,6 +130,20 @@ export function parseRunningModels(body: unknown): RunningModelsResponse | null 
 }
 
 /**
+ * The most breaches /explorer/freshness returns, open and resolved together, across the
+ * whole workspace (saved_query_freshness.go ListModelFreshness, LIMIT 500). A list this
+ * long may have been cut, so a model's history read from it may be missing older misses.
+ */
+export const FRESHNESS_LIST_LIMIT = 500
+
+/** Reads a /explorer/freshness body into every breach it holds, or null if unreadable. */
+export function parseBreaches(body: unknown): ModelFreshnessBreach[] | null {
+  if (!body || typeof body !== "object") return null
+  const breaches = (body as Record<string, unknown>).breaches
+  return Array.isArray(breaches) ? (breaches as ModelFreshnessBreach[]) : null
+}
+
+/**
  * Reads a /explorer/freshness body into its OPEN breaches, or null if unreadable.
  *
  * The route already returns only open breaches unless asked for history. They are
@@ -131,10 +151,7 @@ export function parseRunningModels(body: unknown): RunningModelsResponse | null 
  * is a false alarm on a table that has since been rebuilt.
  */
 export function parseOpenBreaches(body: unknown): ModelFreshnessBreach[] | null {
-  if (!body || typeof body !== "object") return null
-  const breaches = (body as Record<string, unknown>).breaches
-  if (!Array.isArray(breaches)) return null
-  return (breaches as ModelFreshnessBreach[]).filter((b) => !b.resolved_at)
+  return parseBreaches(body)?.filter((b) => !b.resolved_at) ?? null
 }
 
 /** What the Now column says for one schedule row. */
@@ -245,6 +262,39 @@ export function describeFreshnessCause(cause: string): string {
       return "it rebuilds after upstreams, but none are set"
     default:
       return cause ? `recorded cause "${cause}"` : "no cause was recorded"
+  }
+}
+
+/**
+ * How far past its deadline the table got before a miss ended: the gap from the last good
+ * build to the close, less the deadline the miss was opened under. The breach row keeps
+ * that deadline, so a widened one is still measured against the promise that was missed.
+ * Never less than what was recorded when the miss was detected.
+ */
+export function overdueAtClose(b: ModelFreshnessBreach): number | null {
+  if (!b.resolved_at) return null
+  const ms = Date.parse(b.resolved_at) - Date.parse(b.reference_at)
+  if (!Number.isFinite(ms)) return b.stale_seconds
+  return Math.max(b.stale_seconds, Math.floor(ms / 1000) - b.deadline_seconds)
+}
+
+/**
+ * How a miss ended (saved_query_freshness.go, the resolution constants). `detail` is set
+ * for the two endings that are not a fix, so neither can be read as one.
+ */
+export function describeFreshnessResolution(resolution: string | undefined): { label: string; detail?: string } {
+  switch (resolution) {
+    case "rebuilt":
+      return { label: "Rebuilt" }
+    case "deadline_widened":
+      return { label: "Deadline widened", detail: "The table was not rebuilt; the deadline was relaxed past its age." }
+    case "no_longer_tracked":
+      return {
+        label: "No longer tracked",
+        detail: "The deadline was cleared, or the model stopped building a table.",
+      }
+    default:
+      return { label: resolution ? `Closed (${resolution})` : "Closed" }
   }
 }
 

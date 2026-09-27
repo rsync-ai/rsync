@@ -24,6 +24,8 @@ import re
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
+from src.utils.masking import connections_for_llm
+
 from .types import (
     DAGPlannerState,
     PlanningStep,
@@ -184,7 +186,10 @@ class DAGPlannerAgent:
                 "planner/dag_planning",  # Uses prompt registry
                 {
                     "user_request": state.user_request,
-                    "available_connections": json.dumps(state.available_connections),
+                    # Allowlist, not the raw records: the prompt needs to name a
+                    # connection, not describe the customer's infrastructure.
+                    # See connections_for_llm.
+                    "available_connections": json.dumps(connections_for_llm(state.available_connections)),
                     "available_tools": json.dumps(state.available_tools),
                     "phase": "analyze",
                 }
@@ -218,7 +223,8 @@ class DAGPlannerAgent:
         # Build context for LLM
         llm_context = {
             "user_request": state.user_request,
-            "available_connections": json.dumps(state.available_connections),
+            # Allowlist -- see connections_for_llm.
+            "available_connections": json.dumps(connections_for_llm(state.available_connections)),
             "available_tools": json.dumps(state.available_tools),
             "phase": "generate",
             "current_nodes": json.dumps(state.current_nodes),

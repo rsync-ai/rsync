@@ -30,7 +30,18 @@ function statusBadgeVariant(status: string) {
   const s = String(status || "").toLowerCase()
   if (s === "failed" || s === "error") return "destructive" as const
   if (s === "success") return "success" as const
+  // A step that consumed rows and emitted none. Amber, not red: a filter that
+  // legitimately matches nothing is correct. But not green either -- this row
+  // used to read "success" over an empty table, which is how a filter on a
+  // column an earlier step had renamed looked like a healthy run.
+  if (s === "empty_output") return "warning" as const
   return "secondary" as const
+}
+
+function statusLabel(status: string) {
+  const s = String(status || "").toLowerCase()
+  if (s === "empty_output") return "no rows out"
+  return String(status || "unknown")
 }
 
 export function TransformExecutionLogsPanel(props: {
@@ -98,7 +109,7 @@ function TransformLogRow({ log }: { log: TransformExecutionLog }) {
               #{log.transform_order}
             </Badge>
             <div className="font-medium text-zinc-900 dark:text-white truncate">{log.transform_type}</div>
-            <Badge variant={statusBadgeVariant(log.status)}>{String(log.status || "unknown")}</Badge>
+            <Badge variant={statusBadgeVariant(log.status)}>{statusLabel(log.status)}</Badge>
           </div>
           <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-zinc-500 dark:text-zinc-400">
             <span>

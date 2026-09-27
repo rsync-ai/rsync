@@ -12,9 +12,9 @@ import (
 //
 // triggerHealer is the CDC Sentinel's terminal escalation — the thing it does
 // when a connector has failed and restarting it did not help. It produced a
-// message to HealerDLQ ("agent.executor.requests.dlq"), and **nothing consumes
-// that topic**: the healer subscribes "agent.executor.requests", and its
-// schemaDriftSubscriptions comment says it deliberately does not take the DLQ,
+// message to a HealerDLQ topic, and **nothing consumed that topic**: the healer
+// subscribes only the schema-drift topics, and its
+// schemaDriftSubscriptions comment says it deliberately does not take a DLQ,
 // for good reasons that still hold. So the sentinel's loudest signal went
 // nowhere at all.
 //

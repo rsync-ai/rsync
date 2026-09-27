@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/DATA-DOG/go-sqlmock"
@@ -31,9 +32,9 @@ func TestStopPipeline_RefusalNamesCurrentStatus(t *testing.T) {
 			mock.ExpectQuery(`SELECT wm\.role\s+FROM pipelines r`).
 				WithArgs(wsScopePipeline, wsScopeUser, wsScopeWS).
 				WillReturnRows(gateRoleRows("member"))
-			mock.ExpectQuery(`SELECT status FROM pipelines WHERE id = \$1 AND workspace_id = \$2`).
+			mock.ExpectQuery(`SELECT p\.status, .* FROM pipelines p WHERE p\.id = \$1 AND p\.workspace_id = \$2`).
 				WithArgs(wsScopePipeline, wsScopeWS).
-				WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow(status))
+				WillReturnRows(sqlmock.NewRows([]string{"status", "is_cdc"}).AddRow(status, false))
 			// No UPDATE is expected: a refused stop writes nothing, and sqlmock
 			// fails any statement it was not told about.
 
@@ -59,5 +60,83 @@ func TestStopPipeline_RefusalNamesCurrentStatus(t *testing.T) {
 				t.Fatalf("db expectations: %v", err)
 			}
 		})
+	}
+}
+
+// A CDC pipeline streams outside any execution, so Stop goes through the
+// orchestrator, which parks the connector and stops the sink. These pin that the
+// gateway does not flip the row when the orchestrator could not stop the
+// connector, and that a paused CDC pipeline can be stopped.
+func stopCDCHarness(t *testing.T, status string, orchestratorStatus int) (sqlmock.Sqlmock, *httptest.ResponseRecorder, *[]string, func()) {
+	t.Helper()
+	var calls []string
+	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.WriteHeader(orchestratorStatus)
+		_, _ = w.Write([]byte(`{"success":` + map[bool]string{true: "true", false: "false"}[orchestratorStatus < 300] + `,"warnings":["w1"]}`))
+	}))
+	t.Setenv("ORCHESTRATOR_URL", orch.URL)
+
+	mock, cleanup := wsScopeMockDB(t)
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery(`SELECT wm\.role\s+FROM pipelines r`).
+		WithArgs(wsScopePipeline, wsScopeUser, wsScopeWS).
+		WillReturnRows(gateRoleRows("member"))
+	mock.ExpectQuery(`SELECT p\.status, .* FROM pipelines p WHERE p\.id = \$1 AND p\.workspace_id = \$2`).
+		WithArgs(wsScopePipeline, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "is_cdc"}).AddRow(status, true))
+	return mock, nil, &calls, func() { cleanup(); orch.Close() }
+}
+
+func serveStop(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	r := wsScopeRouter(http.MethodPost, "/api/v1/pipelines/:id/stop", StopPipeline)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/pipelines/"+wsScopePipeline+"/stop", nil))
+	return w
+}
+
+func TestStopPipeline_CDCStopsConnectorAndClosesEveryExecution(t *testing.T) {
+	for _, status := range []string{"running", "paused"} {
+		t.Run(status, func(t *testing.T) {
+			mock, _, calls, cleanup := stopCDCHarness(t, status, http.StatusOK)
+			defer cleanup()
+			mock.ExpectExec(`UPDATE pipelines SET status = 'stopped'`).
+				WithArgs(wsScopePipeline, wsScopeWS).WillReturnResult(sqlmock.NewResult(0, 1))
+			mock.ExpectQuery(`FROM pipeline_progress`).WithArgs(wsScopePipeline).
+				WillReturnRows(sqlmock.NewRows([]string{"execution_id"}))
+			mock.ExpectQuery(`FROM executions`).WithArgs(wsScopePipeline).
+				WillReturnRows(sqlmock.NewRows([]string{"id"}))
+			// The stream row (id = pipeline id) is closed along with any other.
+			mock.ExpectExec(`UPDATE executions[\s\S]*WHERE pipeline_id = \$1 AND status IN \('running','pending'\)`).
+				WithArgs(wsScopePipeline).WillReturnResult(sqlmock.NewResult(0, 2))
+
+			w := serveStop(t)
+			if w.Code != http.StatusOK {
+				t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+			}
+			if len(*calls) != 1 || !strings.HasSuffix((*calls)[0], "/api/v1/cdc/pipelines/"+wsScopePipeline+"/stop") {
+				t.Fatalf("orchestrator calls = %v", *calls)
+			}
+			if !strings.Contains(w.Body.String(), "w1") {
+				t.Fatalf("sink warnings not passed on: %s", w.Body.String())
+			}
+			if err := mock.ExpectationsWereMet(); err != nil {
+				t.Fatalf("db expectations: %v", err)
+			}
+		})
+	}
+}
+
+func TestStopPipeline_CDCConnectorRefusedKeepsStatus(t *testing.T) {
+	mock, _, _, cleanup := stopCDCHarness(t, "running", http.StatusBadGateway)
+	defer cleanup()
+	// No UPDATE is expected: sqlmock fails any statement it was not told about.
+	w := serveStop(t)
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("code=%d body=%s; want the orchestrator's 502", w.Code, w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
 	}
 }

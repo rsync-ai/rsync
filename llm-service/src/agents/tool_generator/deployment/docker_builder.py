@@ -15,7 +15,6 @@ VERSION: 1.1.0
 """ 
 
 import os
-import re
 import sys
 import json
 import asyncio
@@ -25,6 +24,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from enum import Enum
+
+from .container_names import parse_versioned_container_name, strip_stack_affixes
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,25 @@ _COMPOSE_MANAGED_CONNECTORS = {
     "mysql",
     "aws-s3",
 }
+
+
+def _connector_log_config() -> Optional[Dict[str, Any]]:
+    """json-file rotation for a connector container this module creates.
+
+    Same env and defaults as the compose files' `logging:` blocks and as
+    connector-deployer (RSYNC_LOG_MAX_SIZE / RSYNC_LOG_MAX_FILE, 10m x 3). Compose
+    writes that bound only on the services it starts; a container created through
+    the SDK gets the daemon default, and a stock daemon's default is json-file with
+    NO rotation. Empty RSYNC_LOG_MAX_SIZE leaves the daemon default in place.
+    """
+    max_size = os.getenv("RSYNC_LOG_MAX_SIZE", "10m").strip()
+    if not max_size:
+        return None
+    config = {"max-size": max_size}
+    max_file = os.getenv("RSYNC_LOG_MAX_FILE", "3").strip()
+    if max_file:
+        config["max-file"] = max_file
+    return {"type": "json-file", "config": config}
 
 # Try to import Docker SDK
 try:
@@ -179,18 +199,17 @@ class DockerBuilder:
         """
         Best-effort inference of connector id from container name.
 
-        Supports both:
-        - Versioned runtime standard: rsync-ai-<id>-vX-Y-Z-mcp
-        - Legacy stable:           rsync-ai-<id>-mcp
+        Supports both (<prefix> = STACK_PREFIX, default rsync-ai):
+        - Versioned runtime standard: <prefix>-<id>-vX-Y-Z-mcp
+        - Legacy stable:           <prefix>-<id>-mcp
         """
         if not container_name:
             return ""
 
-        # Only attempt inference for our naming convention.
-        if not (container_name.startswith("rsync-ai-") and container_name.endswith("-mcp")):
+        # Only attempt inference for this stack's naming convention.
+        core = strip_stack_affixes(container_name)
+        if core is None:
             return container_name
-
-        core = container_name[len("rsync-ai-"):-len("-mcp")]
         if not core:
             return ""
 
@@ -517,18 +536,13 @@ class DockerBuilder:
     
     @staticmethod
     def _parse_container_name(container_name: str) -> Optional[Tuple[str, str]]:
-        """Parse 'rsync-ai-<id>-v<X-Y-Z>-mcp' → (connector_id, 'X-Y-Z').
+        """Parse '<STACK_PREFIX>-<id>-v<X-Y-Z>-mcp' → (connector_id, 'X-Y-Z').
 
-        Returns None if the name doesn't match the versioned runtime naming scheme.
+        Returns None if the name doesn't match the versioned runtime naming scheme, or
+        belongs to another stack on the same Docker host. Mirrors connector-deployer's
+        parseContainerName (internal/dockerx/compose.go) — keep the two in lockstep.
         """
-        name = (container_name or "").strip()
-        if not (name.startswith("rsync-ai-") and name.endswith("-mcp")):
-            return None
-        middle = name[len("rsync-ai-"):-len("-mcp")]
-        m = re.match(r"^(.*)-v(\d+-\d+-\d+)$", middle)
-        if not m:
-            return None
-        return m.group(1), m.group(2)
+        return parse_versioned_container_name(container_name)
 
     def _resolve_current_version(self, connector_id: str) -> Optional[str]:
         """Read the connector's latest.json current_version → 'X-Y-Z' (hyphenated, no
@@ -749,8 +763,9 @@ class DockerBuilder:
                     restart_policy={"Name": "unless-stopped"},
                     labels=labels,
                     volumes=volumes,
+                    log_config=_connector_log_config(),
                 )
-                
+
                 container_id = container.short_id
 
                 # Attach the same network aliases that docker-compose assigns

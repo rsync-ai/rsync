@@ -200,6 +200,12 @@ type tableProducer struct {
 	ConnectionID string
 	Kind         string
 	Table        producedTable
+	// SourceQualified is the stats row's own qualified_name: the name the table was
+	// captured under, which for CDC is the SOURCE side. Read only for an Unplaced row.
+	SourceQualified string
+	// Unplaced is a pipeline's stats row that recorded no destination name. The
+	// pipeline still wrote the table; this row just cannot say what it is called there.
+	Unplaced bool
 }
 
 type assetGraphInput struct {
@@ -290,22 +296,27 @@ func loadAssetGraphInput(
 	// happens to read. A pipeline whose output nothing consumes is a finding, and it is
 	// invisible if the query is filtered by what the models asked for.
 	//
-	// destination_qualified_name IS NOT NULL is the same guard the upstream suggestion
-	// uses: a row with no destination namespace cannot be placed in any warehouse, so
-	// it cannot honestly be drawn as a table in one.
+	// Rows with no destination_qualified_name are kept. Only the CDC sink fills that
+	// column, and it leaves it NULL for an object-storage destination, a namespace that
+	// is empty or literally "default", a row the orchestrator's cdcstats agent wrote
+	// before any sink write, and every row older than migration 089. Filtering them out
+	// drew a pipeline that was landing data as "Writes 0 tables". buildAssetGraph draws
+	// them under the captured name and keeps them away from the read matcher; the
+	// upstream suggestion still excludes them (saved_query_upstreams.go), because it
+	// offers a confident answer rather than a picture.
 	prodRows, err := database.QueryContext(ctx, `
 		SELECT DISTINCT
 		    p.id::text,
 		    COALESCE(p.name, ''),
 		    COALESCE(p.destination_connection_id::text, ''),
 		    COALESCE(s.destination_qualified_name, ''),
-		    COALESCE(s.table_name, '')
+		    COALESCE(s.table_name, ''),
+		    COALESCE(s.qualified_name, '')
 		FROM pipeline_run_table_stats s
 		JOIN pipelines p ON p.id = s.pipeline_id
 		WHERE p.workspace_id = $1::uuid
 		  AND ($2 = '' OR p.destination_connection_id::text = $2)
-		  AND s.destination_qualified_name IS NOT NULL
-		ORDER BY 1, 4, 5
+		ORDER BY 1, 4, 5, 6
 		LIMIT $3`, workspaceID, connectionID, assetGraphProducedLimit+1)
 	if err != nil {
 		return in, err
@@ -314,9 +325,11 @@ func loadAssetGraphInput(
 	for prodRows.Next() {
 		tp := tableProducer{Kind: assetKindPipeline}
 		if err := prodRows.Scan(&tp.Table.ProducerID, &tp.Table.ProducerName,
-			&tp.ConnectionID, &tp.Table.DestQualified, &tp.Table.TableName); err != nil {
+			&tp.ConnectionID, &tp.Table.DestQualified, &tp.Table.TableName,
+			&tp.SourceQualified); err != nil {
 			return in, err
 		}
+		tp.Unplaced = tp.Table.DestQualified == ""
 		in.Produced = append(in.Produced, tp)
 	}
 	if err := prodRows.Err(); err != nil {
@@ -439,11 +452,54 @@ func buildAssetGraph(in assetGraphInput) assetGraph {
 		addEdge(assetEdge{From: producerNodeID, To: tableNodeID, Kind: edgeKind, Evidence: evidence})
 	}
 
+	// An Unplaced row is a table the pipeline wrote under a name the row does not
+	// record. It is drawn, so the pipeline does not read as writing nothing, but it is
+	// keyed apart from destination-side names and never added to byConnection: a
+	// model's `FROM orders` names a table in its warehouse, and matching it against a
+	// captured-side name is the confident wrong answer saved_query_upstreams.go exists
+	// to avoid.
+	//
+	// The same table can have a named row from one run and an unnamed one from
+	// another (a run from before the sink recorded destinations). The named row
+	// already draws it; drawing both would count one table twice.
+	sourceKey := func(tp tableProducer) string {
+		return tp.Table.ProducerID + "\x00" + strings.ToLower(tp.SourceQualified)
+	}
+	placedSource := map[string]bool{}
+	for _, tp := range in.Produced {
+		if !tp.Unplaced && tp.SourceQualified != "" {
+			placedSource[sourceKey(tp)] = true
+		}
+	}
+	registerUnplaced := func(tp tableProducer) {
+		name := tp.SourceQualified
+		if name == "" {
+			name = tp.Table.TableName
+		}
+		tableNodeID := assetKindTable + ":" + tp.ConnectionID + "\x00captured\x00" + strings.ToLower(name)
+		addNode(assetNode{
+			ID:           tableNodeID,
+			Kind:         assetKindTable,
+			Name:         name,
+			ConnectionID: tp.ConnectionID,
+		})
+		addEdge(assetEdge{
+			From: assetKindPipeline + ":" + tp.Table.ProducerID, To: tableNodeID,
+			Kind: assetEdgeWrites, Evidence: assetEvidenceObserved,
+		})
+	}
+
 	for _, tp := range in.Produced {
 		// A stats row whose pipeline fell outside the page is not drawable: its
 		// producer node does not exist, and an edge from a node that is not in the
 		// response is worse than a missing edge.
 		if _, ok := pipelineByID[tp.Table.ProducerID]; !ok {
+			continue
+		}
+		if tp.Unplaced {
+			if !placedSource[sourceKey(tp)] {
+				registerUnplaced(tp)
+			}
 			continue
 		}
 		registerProducer(tp, assetKindPipeline+":"+tp.Table.ProducerID, assetEdgeWrites, assetEvidenceObserved)

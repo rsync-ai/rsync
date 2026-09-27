@@ -11,7 +11,6 @@ from pydantic import BaseModel, Field
 from datetime import datetime
 import hashlib
 import json
-from src.utils.kafka_topics import topic
 
 
 class ConnectorCategory(str, Enum):
@@ -184,26 +183,3 @@ def hash_to_partition(key: str, num_partitions: int) -> int:
     hash_int = int.from_bytes(hash_bytes[:8], byteorder='big')
     
     return hash_int % num_partitions
-
-
-def topic_name(connection_name: str) -> str:
-    """Generate topic name for a connection."""
-    normalized = connection_name.lower().replace(" ", "-").replace("_", "-")
-    return topic(f"conn.{normalized}")
-
-
-def cdc_topic_name(connection_name: str) -> str:
-    """Generate CDC topic name for a connection."""
-    normalized = connection_name.lower().replace(" ", "-").replace("_", "-")
-    return topic(f"cdc.{normalized}")
-
-
-def protected_topic_name(connection_name: str) -> str:
-    """Generate PII-protected topic name."""
-    normalized = connection_name.lower().replace(" ", "-").replace("_", "-")
-    return topic(f"protected.conn.{normalized}")
-
-
-def transformed_topic_name(pipeline_id: str, destination: str) -> str:
-    """Generate transformed data topic name."""
-    return f"transformed.{pipeline_id}.{destination}"

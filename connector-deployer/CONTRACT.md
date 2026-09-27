@@ -19,6 +19,7 @@ internal RPC. The security property lives in `internal/spec` (allow-by-construct
 | `OAUTH_TOKENS_TARGET` | `/root/.rsync-ai` | mount target for the above |
 | `TOOLS_DIR` | `/app/shared/mcp-connectors` | connector-artifacts root (mounted READ-ONLY) |
 | `DOCKER_HOST` | `unix:///var/run/docker.sock` | daemon socket |
+| `STACK_PREFIX` | `rsync-ai` | container-name prefix, `<STACK_PREFIX>-<id>-vX-Y-Z-mcp`; must match the orchestrator's so an isolated stack's compose-managed connectors are recognised as protected |
 | `BUILDKIT_HOST` | (unset) | rootless buildkitd gRPC addr (`buildctl --addr`). **Set ⇒ BUILD runs OFF the daemon** (increment 2); unset ⇒ legacy in-daemon `docker build` (rollback valve) |
 | `DEPLOYER_REGISTRY_PUSH` | `mcp-registry:5000` | registry buildkitd pushes to (compose DNS); used only when `BUILDKIT_HOST` set |
 | `DEPLOYER_REGISTRY_PULL` | `127.0.0.1:5000` | registry the HOST daemon pulls from (loopback ⇒ auto-insecure, no daemon.json change); used only when `BUILDKIT_HOST` set |

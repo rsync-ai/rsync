@@ -208,7 +208,15 @@ func TestIsMaskTransformConfig(t *testing.T) {
 		{map[string]any{"operation": "mask"}, true},
 		{map[string]any{"operation": "MASK_PII"}, true},
 		{map[string]any{"type": "mask_pii"}, true},
+		// The Transform Builder Hash Column card stores operation "hash"; it
+		// folds to mask_pii server-side (shared/go/transforms normalizeType), so
+		// it IS a masking rule. This guard is fail-closed by design, and a
+		// masking rule it does not recognize is a masking rule it does not
+		// enforce — the hole the hash fix would otherwise have opened.
+		{map[string]any{"operation": "hash"}, true},
+		{map[string]any{"type": "Hash"}, true},
 		{map[string]any{"operation": "type_convert"}, false},
+		{map[string]any{"operation": "hash_join"}, false},
 		{map[string]any{}, false},
 	} {
 		if got := isMaskTransformConfig(c.cfg); got != c.want {

@@ -1020,8 +1020,3 @@ func (w *HealWorker) markHealed(ctx context.Context, execID string) {
 			Warn("healer: failed to stamp heal_attempted_at")
 	}
 }
-
-// StampHealAttempted is exported for tests.
-func (w *HealWorker) StampHealAttempted(ctx context.Context, execID string) {
-	w.markHealed(ctx, execID)
-}

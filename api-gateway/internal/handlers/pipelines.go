@@ -947,6 +947,16 @@ const pipelineDerivedStatusCaseSQL = `CASE
       -- "Needs input"). The frontend badge delegates unknown list tokens to the
       -- shared execution-status helper, which renders waiting_for_user as amber.
       WHEN pp.status = 'waiting_for_user' THEN 'waiting_for_user'
+      -- The workflow emits PIPELINE_COMPLETED before its postflight check, and the
+      -- postflight can then fail the run (pipeline_status_activity.go). A late
+      -- projection of that event re-stamps pp.status='completed' over the
+      -- postflight's 'failed', so for the same execution the executions row wins.
+      WHEN pp.status = 'completed'
+        AND le.execution_id IS NOT NULL
+        AND pp.execution_id = le.execution_id
+        AND le.execution_status IN ('failed', 'error', 'silent_drop_detected',
+                                    'silent_partial_drop_detected', 'credential_check_failed')
+      THEN 'failed'
       WHEN pp.status = 'completed' THEN 'passed'
       WHEN pp.status = 'failed' THEN 'failed'
       WHEN pp.status = 'cancelled' THEN 'stopped'
@@ -3467,11 +3477,10 @@ func enqueuePipelineRun(c *gin.Context, database *sql.DB, id, wsID, userID strin
 		log.Printf("   Pattern: Temporal → Kafka → Agents")
 
 	} else {
-		// Temporal is the ONLY supported orchestration path. The old fallback
-		// here published `intentRequest` to the Kafka topic `agent.intent.requests`,
-		// which NO consumer reads (the orchestrator IntentWorker listens on
-		// `agent.control.commands.intent`). That silently hung every run in
-		// "processing" forever with no error surfaced to the user.
+		// Temporal is the ONLY supported orchestration path. An old fallback here
+		// published the intent request straight to a Kafka topic that no consumer
+		// read, which silently hung every run in "processing" forever with no
+		// error surfaced to the user.
 		//
 		// getTemporalClient() already attempted a fresh dial above, so reaching
 		// here means Temporal is genuinely unreachable. Fail loudly with 503 and
@@ -3619,18 +3628,32 @@ func StopPipeline(c *gin.Context) {
 
 	// Get current status (scoped to the active workspace — defense in depth)
 	var status string
-	err := database.QueryRow("SELECT status FROM pipelines WHERE id = $1 AND workspace_id = $2", id, wsID).Scan(&status)
+	var isCDC bool
+	err := database.QueryRow(`SELECT p.status, `+pipelineRowIsCDCSQL+` FROM pipelines p WHERE p.id = $1 AND p.workspace_id = $2`, id, wsID).Scan(&status, &isCDC)
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "Pipeline not found"})
 		return
 	}
 
-	if status != "running" && status != "pending" {
+	if !stopAllowedFrom(status, isCDC) {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":          "Pipeline is not running",
 			"current_status": status,
 		})
 		return
+	}
+
+	// A CDC pipeline streams outside any execution: its last execution is the
+	// finished snapshot, so cancelling that and flipping the row left the connector
+	// and sink running. The orchestrator parks the connector (offsets, slot and
+	// publication kept) and stops the sink first; if it cannot, nothing changes here.
+	var cdcStopWarnings []string
+	if isCDC {
+		var stopped bool
+		cdcStopWarnings, stopped = stopCDCStreaming(c, id)
+		if !stopped {
+			return
+		}
 	}
 
 	// Send cancel signal to Temporal workflow (best-effort).
@@ -3689,13 +3712,73 @@ func StopPipeline(c *gin.Context) {
 		}
 	}
 
+	if isCDC {
+		// Every open execution of a stopped CDC pipeline is over, including the
+		// stream row the sink keeps open (id = pipeline id, trigger_source cdc).
+		if _, err := database.Exec(`
+			UPDATE executions
+			SET status = 'cancelled',
+			    end_time = NOW(),
+			    error_message = COALESCE(error_message, 'Cancelled by user')
+			WHERE pipeline_id = $1 AND status IN ('running','pending')
+		`, id); err != nil {
+			log.Printf("⚠️ [StopPipeline] failed to close CDC executions (ignored): %v", err)
+		}
+	}
+
 	log.Printf("✓ Pipeline %s stopped", id)
 
-	c.JSON(http.StatusOK, gin.H{
+	resp := gin.H{
 		"message":     "Pipeline stopped",
 		"pipeline_id": id,
 		"status":      "stopped",
-	})
+	}
+	if len(cdcStopWarnings) > 0 {
+		resp["warnings"] = cdcStopWarnings
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// stopAllowedFrom: a batch run can be stopped while it runs; a CDC pipeline also
+// while paused, since Stop is what releases its sink workers.
+func stopAllowedFrom(status string, isCDC bool) bool {
+	switch status {
+	case "running", "pending":
+		return true
+	case "paused":
+		return isCDC
+	}
+	return false
+}
+
+// stopCDCStreaming asks the orchestrator to stop the pipeline's connector and sink.
+// On failure it has already answered the request and returns false.
+func stopCDCStreaming(c *gin.Context, pipelineID string) ([]string, bool) {
+	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/stop", orchestratorBaseURL(), pipelineID)
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPut, url, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
+		return nil, false
+	}
+	if traceID := c.GetHeader("X-Trace-ID"); traceID != "" {
+		req.Header.Set("X-Trace-ID", traceID)
+	}
+	setInternalServiceSecret(req)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		respondError(c, http.StatusBadGateway, "orchestrator_unreachable", "Orchestrator is unreachable", err)
+		return nil, false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		forwardOrchestratorJSON(c, resp, "Stop")
+		return nil, false
+	}
+	var out struct {
+		Warnings []string `json:"warnings"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.Warnings, true
 }
 
 type ControlPlaneRequest struct {

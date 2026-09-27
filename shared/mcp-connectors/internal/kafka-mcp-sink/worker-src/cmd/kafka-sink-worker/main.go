@@ -26,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/rsync-ai/shared/memlimit"
 	_ "github.com/rsync-ai/shared/pgdriver"
 	"github.com/rsync-ai/shared/transforms"
 	"github.com/segmentio/kafka-go"
@@ -323,6 +324,12 @@ type Metrics struct {
 	// This is the counter that closes that blind spot — it rides the TABLE_STATS
 	// event into pipeline_run_table_stats and out to the pipeline UI.
 	dlqByTable sync.Map
+
+	// cdcSnapshotRowsByTable is each table's snapshot reads (op r, value: int64),
+	// counted apart from its inserts (op c): a re-snapshot re-reads every row, and
+	// adding those to inserts reported the table as having grown by its own size.
+	// Seeded from the ack ledger like the insert/update/delete maps.
+	cdcSnapshotRowsByTable sync.Map
 
 	// Observability: last known Kafka position + lag (best-effort from kafka-go reader stats).
 	lastKafkaOffset       int64
@@ -647,10 +654,12 @@ func upsertTransformExecutionLogPG(
 		return
 	}
 
-	status := "success"
+	// A step that consumed rows and emitted none is recorded as empty_output,
+	// not success: see transforms.StepStatus for why that distinction is the
+	// whole point of this column.
+	status := transforms.StepStatus(inputRows, outputRows, stepErr)
 	var errMsg interface{} = nil
 	if stepErr != nil {
-		status = "failed"
 		errMsg = stepErr.Error()
 	}
 	snap, mErr := json.Marshal(t)
@@ -723,11 +732,16 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 		return nil
 	}
 	op := strings.ToLower(strings.TrimSpace(sm.CDCOp))
-	if op == "d" {
-		// CDC delete event carries no row body to transform.
-		return nil
-	}
-	if len(sm.Data) == 0 {
+	// A delete used to return here on the premise that it "carries no row body".
+	// It does: the CDC parse path sets sm.Data = [sm.Before] for op=d, append mode
+	// writes that Before image to the destination in full tagged op=D, and the
+	// upsert, warehouse and bronze paths write sm.PK. Returning early therefore
+	// shipped the deleted row - and its key values - straight past a mask_pii rule
+	// that masked every insert and update in the same pipeline, and past a rename
+	// the destination's columns had already been renamed by. A delete is
+	// transformed below like any other row, minus the rules that could DROP it.
+	isDelete := op == "d"
+	if len(sm.Data) == 0 && !isDelete {
 		return nil
 	}
 
@@ -784,9 +798,24 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 		return nil
 	}
 
+	// A delete has to be reshaped but must never be DROPPED. If a filter removed
+	// it, an upsert destination would keep the deleted row forever and an append
+	// destination would lose the tombstone that says it ever went away - neither
+	// leaves a trace at the destination. So for a delete the row-reducing rules are
+	// skipped and the value- and column-shaping ones (mask_pii, rename_columns,
+	// select_columns, ...) still run.
+	applicable := cdcApplicableTransforms(canonical, isDelete, sm.Table)
+
 	rows := make([]transforms.Row, 0, len(sm.Data))
 	for _, r := range sm.Data {
 		rows = append(rows, transforms.Row(r))
+	}
+
+	// A delete with no before image (REPLICA IDENTITY not FULL) has no row to
+	// transform, but its key metadata still has to follow the chain's renames.
+	if len(rows) == 0 {
+		applyRenamesToCDCKeys(sm, applicable)
+		return nil
 	}
 
 	tier1 := transforms.NewSimpleTransformEngine()
@@ -794,8 +823,16 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 	coordinator := transforms.NewTransformCoordinator(tier1, tier2)
 
 	out := rows
-	for _, t := range canonical {
+	for _, t := range applicable {
 		inRows := len(out)
+		// A rule naming a column no row carries can no longer delete the CDC
+		// batch, but it still does nothing at all, so say so rather than running
+		// silent. Checked against the rows ENTERING this step, so a column an
+		// earlier rename/select/exclude removed is caught.
+		for _, w := range transforms.MissingColumnWarnings(t.EngineTransform(), out) {
+			logf("warning", "transform %s (order %d) on %s: %s", t.Type, t.Order, sm.Table, w)
+		}
+
 		start := time.Now()
 		stepOut, stepErr := coordinator.Apply(ctx, out, []transforms.Transform{t.EngineTransform()})
 		dur := time.Since(start)
@@ -823,18 +860,87 @@ func applyConsumerTransforms(ctx context.Context, pgDB *sql.DB, cfg *WorkerConfi
 	// Without this, masking a non-string column (boolean verifiedEmail, numeric salary)
 	// makes ensure_table CREATE a BOOLEAN/NUMERIC column the string value cannot be
 	// inserted into — a deterministic dest-write failure and silent table drop.
-	reconcileTransformedColumnTypes(sm, canonical)
+	reconcileTransformedColumnTypes(sm, applicable)
 
 	// Keep CDC envelope convenience fields in sync. For batch messages op is empty,
 	// so this is skipped (batch has no After/Before envelope).
-	if op == "c" || op == "u" || op == "r" {
+	switch {
+	case isDelete:
+		// Every delete path reads sm.Before directly - append mode writes it whole,
+		// the upsert and warehouse paths fall back to it - so the transformed row has
+		// to land back there and not only in sm.Data. Guarded on a non-empty result:
+		// no row-reducing rule ran, so an empty out here would mean the message had
+		// no before image at all, and nulling Before would throw away the only
+		// payload those fallbacks have.
+		if len(sm.Data) > 0 {
+			sm.Before = sm.Data[0]
+		}
+	case op == "c" || op == "u" || op == "r":
 		if len(sm.Data) > 0 {
 			sm.After = sm.Data[0]
 		} else {
 			sm.After = nil
 		}
 	}
+
+	applyRenamesToCDCKeys(sm, applicable)
 	return nil
+}
+
+// cdcApplicableTransforms returns the rules that may run against a CDC event of
+// this operation.
+//
+// A delete has to be reshaped but must never be DROPPED. If a filter removed it,
+// an upsert destination would keep the deleted row forever and an append
+// destination would lose the tombstone that says it ever went away - neither
+// leaves a trace at the destination. So for a delete the row-reducing rules are
+// skipped and the value- and column-shaping ones (mask_pii, rename_columns,
+// select_columns, ...) still run. Every other operation runs the whole chain.
+func cdcApplicableTransforms(chain []transforms.CanonicalTransform, isDelete bool, table string) []transforms.CanonicalTransform {
+	if !isDelete {
+		return chain
+	}
+	applicable := make([]transforms.CanonicalTransform, 0, len(chain))
+	for _, t := range chain {
+		if transforms.IsRowReducing(t.EngineTransform()) {
+			logf("info", "transform %s (order %d) on %s: skipped for CDC delete (a row-reducing rule must not drop a tombstone)",
+				t.Type, t.Order, table)
+			continue
+		}
+		applicable = append(applicable, t)
+	}
+	return applicable
+}
+
+// engineChain projects canonical transforms down to the engine transforms the
+// shared transforms package reasons about.
+func engineChain(chain []transforms.CanonicalTransform) []transforms.Transform {
+	out := make([]transforms.Transform, 0, len(chain))
+	for _, t := range chain {
+		out = append(out, t.EngineTransform())
+	}
+	return out
+}
+
+// applyRenamesToCDCKeys follows a transform chain's renames into the metadata
+// that travels ALONGSIDE the rows.
+//
+// sm.KeyFields becomes params["key_fields"] / params["primary_key_fields"] and
+// sm.PK becomes params["key_data"], while params["data"] carries the RENAMED
+// rows. While these two kept source names, a rename_columns on a key column left
+// the destination told to match on a column its own rows no longer carry: an
+// "no unique or exclusion constraint matching the ON CONFLICT specification" on
+// an upsert, and a delete aimed at nothing.
+func applyRenamesToCDCKeys(sm *SinkMessage, chain []transforms.CanonicalTransform) {
+	if sm == nil || len(chain) == 0 {
+		return
+	}
+	mappings := transforms.AccumulateRenameMappings(engineChain(chain))
+	if len(mappings) == 0 {
+		return
+	}
+	sm.KeyFields = transforms.RemapColumnNames(sm.KeyFields, mappings)
+	sm.PK = transforms.RemapMapKeys(sm.PK, mappings)
 }
 
 // reconcileTransformedColumnTypes updates sm.ColumnTypes so the destination DDL matches
@@ -1631,7 +1737,22 @@ func (b *cdcDBBatcher) flushAll(ctx context.Context) {
 // retry can reuse it when a destination comes back mid-hold, rather than keeping
 // a second copy of the commit sequence in step with this one
 // (KI-CDC-SINK-INFRA-FAULT-DLQ-COMMITS).
-func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch *cdcDBBatch) {
+func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch *cdcDBBatch, dlqd map[int]bool) {
+	// dlqd holds the batch positions the destination skipped and landFlushedBatch
+	// parked in the DLQ. They did not land, so they stay out of the ledger and the
+	// landed-row counters; their offsets are still committed below with the rest.
+	sms, messages := batch.sms, batch.messages
+	if len(dlqd) > 0 {
+		sms = make([]*SinkMessage, 0, len(batch.sms))
+		messages = make([]kafka.Message, 0, len(batch.messages))
+		for i := range batch.messages {
+			if !dlqd[i] && i < len(batch.sms) {
+				sms = append(sms, batch.sms[i])
+				messages = append(messages, batch.messages[i])
+			}
+		}
+	}
+
 	// Per-message bookkeeping. The durable offset already landed in
 	// _rsync_cdc_offsets within the upsert transaction above; the Postgres ledger
 	// write here is a best-effort audit trail only (non-fatal on error).
@@ -1639,7 +1760,7 @@ func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch
 	// instead of one remote round-trip per message — the high-volume CDC
 	// throughput fix. Non-fatal: exactly-once is enforced by _rsync_cdc_offsets
 	// committed in the upsert transaction above, not by this ledger.
-	counted, ackErr := persistCDCAcksBatch(ctx, b.pgDB, batch.sms, batch.messages, batch.targetTable)
+	counted, ackErr := persistCDCAcksBatch(ctx, b.pgDB, sms, messages, batch.targetTable)
 	if ackErr != nil {
 		logf("warning", "cdc ack-ledger batch write failed (non-fatal, audit only): %v", ackErr)
 	}
@@ -1647,7 +1768,7 @@ func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch
 	// Update per-table CDC counters (in-memory). A message the ledger already held
 	// was counted before — by this process or the one before a restart — so only the
 	// process-wide metrics see it again.
-	for i, sm := range batch.sms {
+	for i, sm := range sms {
 		switch strings.ToLower(strings.TrimSpace(sm.CDCOp)) {
 		case "c":
 			if counted[i] {
@@ -1656,7 +1777,7 @@ func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch
 			atomic.AddUint64(&b.metrics.cdcInserts, 1)
 		case "r":
 			if counted[i] {
-				incrementCounter(b.cdcInserts, sm.Table, 1)
+				incrementCounter(&b.metrics.cdcSnapshotRowsByTable, sm.Table, 1)
 			}
 			atomic.AddUint64(&b.metrics.cdcReads, 1)
 		case "u":
@@ -1684,11 +1805,55 @@ func (b *cdcDBBatcher) commitFlushedBatch(ctx context.Context, key string, batch
 	inserts := loadCounter(b.cdcInserts, lastSM.Table)
 	updates := loadCounter(b.cdcUpdates, lastSM.Table)
 	deletes := loadCounter(b.cdcDeletes, lastSM.Table)
-	noteTableStatsEmit(b.metrics, lastSM, "cdc", emitCDCTableStats(ctx, b.eventsWriter, lastSM, inserts, updates, deletes, loadCounter(b.cdcBytes, lastSM.Table), loadCounter(&b.metrics.dlqByTable, lastSM.Table)))
+	noteTableStatsEmit(b.metrics, lastSM, "cdc", emitCDCTableStats(ctx, b.eventsWriter, lastSM, inserts, updates, deletes, loadCounter(b.cdcBytes, lastSM.Table), loadCounter(&b.metrics.dlqByTable, lastSM.Table), loadCounter(&b.metrics.cdcSnapshotRowsByTable, lastSM.Table)))
 
-	atomic.AddUint64(&b.metrics.processed, uint64(len(batch.rows)))
+	atomic.AddUint64(&b.metrics.processed, uint64(len(batch.rows)-len(dlqd)))
 	// The batch left b.batches when submitFlush sealed it. Removing it here too
 	// would be a map write from a lane goroutine — a data race, not a no-op.
+}
+
+// landFlushedBatch finishes a batch write the destination accepted. A document
+// destination may skip a row it cannot key and still answer success (#24): the
+// MongoDB connector names those rows in skipped_indexes, and each one is parked in
+// the DLQ before anything commits, so the table reports it in dlq_rows instead of
+// counting it as applied. No DLQ, or a DLQ publish that fails, is fail-closed. The
+// reason carries the op, offset and key column NAMES only — never a row value.
+func (b *cdcDBBatcher) landFlushedBatch(ctx context.Context, key string, batch *cdcDBBatch, result map[string]interface{}, sent []int, reason string) {
+	if !isDocumentDBConnector(b.destType) {
+		b.commitFlushedBatch(ctx, key, batch, nil)
+		return
+	}
+	skipped, ok := destSkippedRows(result, sent, len(batch.rows))
+	if !ok {
+		// A skip the destination could not pin to rows. Re-apply row by row: a
+		// single-row write lands or fails on its own, and a failed one is DLQ'd.
+		b.flushBatchPerRow(ctx, key, batch, reason,
+			fmt.Errorf("dest %s reported skipped rows without identifying them (table=%s)", b.destType, batch.targetTable))
+		return
+	}
+	if len(skipped) == 0 {
+		b.commitFlushedBatch(ctx, key, batch, nil)
+		return
+	}
+	dlqd := make(map[int]bool, len(skipped))
+	for _, i := range skipped {
+		condemned := fmt.Errorf("destination skipped the row: missing primary key (table=%s op=%s offset=%d key_fields=%s)",
+			batch.targetTable, sinkOpOf(batch, i), batch.messages[i].Offset, strings.Join(batch.keyFields, ","))
+		if b.dlqWriter == nil {
+			sinkFailClosed("fatal cdc db batch: destination skipped a row and no DLQ is configured (reason=%s, table=%s): %v",
+				reason, batch.targetTable, condemned)
+			return
+		}
+		if dlqErr := sendToDLQ(ctx, b.dlqWriter, batch.messages[i], condemned, b.metrics, dlqTableOf(batch, i)); dlqErr != nil {
+			sinkFailClosed("fatal cdc db batch DLQ publish error (reason=%s, table=%s): %v (original: %v)",
+				reason, batch.targetTable, dlqErr, condemned)
+			return
+		}
+		dlqd[i] = true
+	}
+	logf("warning", "warn: cdc db batch: destination skipped %d row(s) missing a primary key, routed to DLQ (reason=%s, table=%s)",
+		len(skipped), reason, batch.targetTable)
+	b.commitFlushedBatch(ctx, key, batch, dlqd)
 }
 
 func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBBatch, reason string) {
@@ -1736,10 +1901,24 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 	// SAME transaction as the data (Tier-A relational sinks) → exactly-once: the durable
 	// offset advances iff the data commits. batch.lastOffset is the highest offset in
 	// this batch for (topic,partition).
+	//
+	// A document destination applies the batch unordered, so it gets each key once,
+	// by its last event (#22, lastEventPerKey). sent maps what it was sent back to
+	// batch positions; batch.messages/sms stay whole, and every message is still
+	// acked, counted and committed — a superseded event was applied by its successor.
+	data, sent := batch.rows, []int(nil)
+	if isDocumentDBConnector(b.destType) {
+		if sent = lastEventPerKey(batch.rows, batch.keyFields); sent != nil {
+			data = make([]map[string]interface{}, len(sent))
+			for j, i := range sent {
+				data[j] = batch.rows[i]
+			}
+		}
+	}
 	args := map[string]interface{}{
 		"config":    b.destCfg,
 		"table":     batch.targetTable,
-		"data":      batch.rows,
+		"data":      data,
 		"operation": "upsert",
 		"kafka_offset": map[string]interface{}{
 			"pipeline_id": b.cfg.PipelineID,
@@ -1828,11 +2007,12 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 			"table", batch.targetTable,
 			"tool", toolName,
 			"rows", len(batch.rows),
+			"rows_sent", len(data),
 			"rows_written", writtenRows,
 			"topic", batch.topic,
 			"partition", batch.partition,
 			"offset", batch.lastOffset)
-		b.commitFlushedBatch(ctx, key, batch)
+		b.landFlushedBatch(ctx, key, batch, result, sent, reason)
 		return
 	}
 
@@ -1859,6 +2039,7 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 	// whole-batch DLQ.
 	if isDestInfraFault(lastErr) {
 		var landed bool
+		var heldResult map[string]interface{}
 		lastErr, landed = holdForInfraFault(ctx, "cdc db batch", batch.targetTable, lastErr, func() error {
 			result, err := callDestinationTool(ctx, b.httpClient, b.cfg, b.destType, strings.TrimPrefix(toolName, b.destType+"_"), args)
 			if err != nil {
@@ -1868,10 +2049,11 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 				return fmt.Errorf("dest %s returned success without a write-count field (possible non-landing write); table=%s rows=%d",
 					toolName, batch.targetTable, len(batch.rows))
 			}
+			heldResult = result
 			return nil
 		})
 		if landed {
-			b.commitFlushedBatch(ctx, key, batch)
+			b.landFlushedBatch(ctx, key, batch, heldResult, sent, reason)
 			return
 		}
 		if ctx.Err() != nil {
@@ -1938,7 +2120,7 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 			noteTableStatsEmit(b.metrics, lastSM, "cdc", emitCDCTableStats(ctx, b.eventsWriter, lastSM,
 				loadCounter(b.cdcInserts, lastSM.Table), loadCounter(b.cdcUpdates, lastSM.Table),
 				loadCounter(b.cdcDeletes, lastSM.Table), loadCounter(b.cdcBytes, lastSM.Table),
-				loadCounter(&b.metrics.dlqByTable, lastSM.Table)))
+				loadCounter(&b.metrics.dlqByTable, lastSM.Table), loadCounter(&b.metrics.cdcSnapshotRowsByTable, lastSM.Table)))
 		}
 		logf("warning", "warn: cdc db batch routed %d message(s) to DLQ after %d failed retries (reason=%s, table=%s): %v",
 			len(batch.messages), b.params.maxRetries, reason, batch.targetTable, lastErr)
@@ -2035,7 +2217,7 @@ func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *
 					atomic.AddUint64(&b.metrics.cdcInserts, 1)
 				case "r":
 					if counted {
-						incrementCounter(b.cdcInserts, batch.sms[i].Table, 1)
+						incrementCounter(&b.metrics.cdcSnapshotRowsByTable, batch.sms[i].Table, 1)
 					}
 					atomic.AddUint64(&b.metrics.cdcReads, 1)
 				case "u":
@@ -2099,7 +2281,8 @@ func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *
 	if len(batch.sms) > 0 {
 		lastSM := batch.sms[len(batch.sms)-1]
 		noteTableStatsEmit(b.metrics, lastSM, "cdc", emitCDCTableStats(ctx, b.eventsWriter, lastSM,
-			loadCounter(b.cdcInserts, lastSM.Table), loadCounter(b.cdcUpdates, lastSM.Table), loadCounter(b.cdcDeletes, lastSM.Table), loadCounter(b.cdcBytes, lastSM.Table), loadCounter(&b.metrics.dlqByTable, lastSM.Table)))
+			loadCounter(b.cdcInserts, lastSM.Table), loadCounter(b.cdcUpdates, lastSM.Table), loadCounter(b.cdcDeletes, lastSM.Table), loadCounter(b.cdcBytes, lastSM.Table),
+			loadCounter(&b.metrics.dlqByTable, lastSM.Table), loadCounter(&b.metrics.cdcSnapshotRowsByTable, lastSM.Table)))
 	}
 	logf("warning", "warn: cdc per-row isolation recovered batch (reason=%s, table=%s): %d row(s) written, %d row(s) DLQ'd (batch error: %v)",
 		reason, batch.targetTable, good, bad, batchErr)
@@ -2403,7 +2586,7 @@ func (b *cdcObjectBatcher) flushBatch(ctx context.Context, key string, batch *cd
 					atomic.AddUint64(&b.metrics.cdcInserts, 1)
 				case "r":
 					if counted[i] {
-						incrementCounter(b.cdcInserts, sm.Table, 1)
+						incrementCounter(&b.metrics.cdcSnapshotRowsByTable, sm.Table, 1)
 					}
 					atomic.AddUint64(&b.metrics.cdcReads, 1)
 				case "u":
@@ -2437,7 +2620,7 @@ func (b *cdcObjectBatcher) flushBatch(ctx context.Context, key string, batch *cd
 				inserts := loadCounter(b.cdcInserts, lastSM.Table)
 				updates := loadCounter(b.cdcUpdates, lastSM.Table)
 				deletes := loadCounter(b.cdcDeletes, lastSM.Table)
-				noteTableStatsEmit(b.metrics, lastSM, "cdc", emitCDCTableStats(ctx, b.eventsWriter, lastSM, inserts, updates, deletes, loadCounter(b.cdcBytes, lastSM.Table), loadCounter(&b.metrics.dlqByTable, lastSM.Table)))
+				noteTableStatsEmit(b.metrics, lastSM, "cdc", emitCDCTableStats(ctx, b.eventsWriter, lastSM, inserts, updates, deletes, loadCounter(b.cdcBytes, lastSM.Table), loadCounter(&b.metrics.dlqByTable, lastSM.Table), loadCounter(&b.metrics.cdcSnapshotRowsByTable, lastSM.Table)))
 
 				atomic.AddUint64(&b.metrics.processed, uint64(len(batch.events)))
 				delete(b.batches, key)
@@ -2607,7 +2790,8 @@ func isDataWarehouseConnector(connector string) bool {
 // relational destination — skip ensure_table/DDL and never synthesize a PK.
 //
 // To add a document-store destination: add its canonical name here and implement
-// import_data/upsert_data/delete_data (keyed on the store's natural id) in its connector.
+// import_data/upsert_data/delete_data (keyed on the store's natural id) and drop_table
+// (reload cleanup, see reloadCanDropTable) in its connector.
 func isDocumentDBConnector(connector string) bool {
 	switch canonicalConnectorType(connector) {
 	// mongodb is the canonical id the sink receives; the rest are the aliases
@@ -3575,6 +3759,13 @@ func chunkRowsForFileRolling(rows []map[string]interface{}, maxRows, maxBytes in
 }
 
 func main() {
+	// Soft memory limit from the container cgroup (GOMEMLIMIT, when set, wins). The
+	// cgroup is the whole sink container, shared with the Python parent and every other
+	// worker, so this bounds one worker only loosely; a per-worker share is a BACKLOG item.
+	if ml := memlimit.Apply(); ml.Source != "none" {
+		logf("info", "memory soft limit: %d MiB (source=%s, cgroup=%d MiB)", ml.LimitBytes>>20, ml.Source, ml.CgroupBytes>>20)
+	}
+
 	cfg, err := loadConfig()
 	if err != nil {
 		logf("error", "config error: %v", err)
@@ -3805,21 +3996,12 @@ func main() {
 	// Report CDC's self-applied additive drift on the healer's schema-change topic —
 	// the same topic the executor's batch detector writes to — so a column added
 	// mid-stream lands in the pipeline's Schema changes tab instead of nowhere.
-	// Separate from eventsWriter, which is pinned to pipeline.domain.events.
-	driftWriter := &kafka.Writer{
-		Addr:                   brokerAddr(cfg.KafkaBootstrapServers),
-		Transport:              kafkaTransport(),
-		Topic:                  kafkaclient.Topic("rsync.healer.schema-changes"),
-		Balancer:               &kafka.LeastBytes{},
-		AllowAutoTopicCreation: true,
-		RequiredAcks:           kafka.RequireAll,
-		// Reporting is best-effort and sits on the CDC apply path: fail fast rather
-		// than hold a committed batch waiting on the broker (see reportAppliedSchemaDrift).
-		WriteTimeout: 3 * time.Second,
-		MaxAttempts:  1,
+	// Only when the schema-drift loop is on (newSchemaDriftWriter); a nil Drift
+	// disables reporting.
+	if driftWriter := newSchemaDriftWriter(cfg); driftWriter != nil {
+		defer driftWriter.Close()
+		ddl.Drift = driftWriter
 	}
-	defer driftWriter.Close()
-	ddl.Drift = driftWriter
 
 	// Seed the high-water tracker from the destination's durable offset table so a
 	// restart skips any offsets already written (exactly-once on recovery). Tier-C
@@ -3849,7 +4031,7 @@ func main() {
 	// the projector keeps the larger of the stored and reported value, so a restart
 	// that began at zero froze a table's count below what had really been delivered.
 	if pgDB != nil && !strings.EqualFold(strings.TrimSpace(cfg.SinkMode), "batch") {
-		seedCDCCountersFromLedger(ctx, pgDB, cfg.PipelineID, cdcStatsExecutionID(cfg), &tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes)
+		seedCDCCountersFromLedger(ctx, pgDB, cfg.PipelineID, cdcStatsExecutionID(cfg), &tableCDCInserts, &tableCDCUpdates, &tableCDCDeletes, &metrics.cdcSnapshotRowsByTable)
 	}
 
 	// Track written object keys per table so we can emit _MANIFEST.json + _SUCCESS at EOF.
@@ -4700,11 +4882,12 @@ func main() {
 				// (see the connector drop_table docstring). The connector owns the operation
 				// via the structured drop_table tool — we never send raw SQL over the wire.
 				//
-				// Only drop when DDL rebuild is available; otherwise ensure_table can't
-				// recreate the schema, so skip cleanup (best-effort, matches prior behavior).
+				// Only drop when the next write can rebuild the table (reloadCanDropTable);
+				// otherwise skip cleanup (best-effort, matches prior behavior).
 				// safeTruncateSQL is reused purely as a safe-identifier gate on the target.
 				target := normalizeTargetTable(destType, destCfg, sm.Table)
-				if _, ok := safeTruncateSQL(target); ok && ddl != nil && ddl.supported(ctx, httpClient, cfg, destType) {
+				_, safeTarget := safeTruncateSQL(target)
+				if safeTarget && reloadCanDropTable(destType, func() bool { return ddl != nil && ddl.supported(ctx, httpClient, cfg, destType) }) {
 					dropArgs := map[string]interface{}{
 						"config":      destCfg,
 						"table":       target,
@@ -4745,7 +4928,9 @@ func main() {
 					st.reloadCleaned = true
 				} else {
 					// Can't safely identify the target or DDL rebuild is disabled: proceed
-					// without cleanup (reload still resets checkpoints upstream).
+					// without cleanup (reload still resets checkpoints upstream). Say so —
+					// rows deleted at the source then survive a "rebuild from scratch".
+					logf("warning", "reload cleanup skipped for %s (dest=%s, safe_identifier=%t): destination cannot rebuild a dropped table; existing rows are kept", target, destType, safeTarget)
 					st.reloadCleaned = true
 				}
 			}
@@ -4896,8 +5081,7 @@ func main() {
 		// every key + its row count — the EOF manifest lists them all.
 		if looksLikeObjectStorage {
 			st := ensureWriteState(writeStates, sm)
-			st.keys = append(st.keys, destKeys...)
-			st.rowCounts = append(st.rowCounts, destCounts...)
+			st.recordWrites(destKeys, destCounts)
 		}
 
 		// Write to Postgres (durable ledger) — fail-closed.
@@ -5058,6 +5242,7 @@ func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, ht
 			if err == nil {
 				tableCounter = cdcInserts
 				if sm.CDCOp == "r" {
+					tableCounter = &metrics.cdcSnapshotRowsByTable
 					atomic.AddUint64(&metrics.cdcReads, 1)
 				} else {
 					atomic.AddUint64(&metrics.cdcInserts, 1)
@@ -5128,7 +5313,7 @@ func processCDCEvent(ctx context.Context, hw *highWaterTracker, pgDB *sql.DB, ht
 	inserts := loadCounter(cdcInserts, sm.Table)
 	updates := loadCounter(cdcUpdates, sm.Table)
 	deletes := loadCounter(cdcDeletes, sm.Table)
-	noteTableStatsEmit(metrics, sm, "cdc", emitCDCTableStats(ctx, eventsWriter, sm, inserts, updates, deletes, loadCounter(cdcBytes, sm.Table), loadCounter(&metrics.dlqByTable, sm.Table)))
+	noteTableStatsEmit(metrics, sm, "cdc", emitCDCTableStats(ctx, eventsWriter, sm, inserts, updates, deletes, loadCounter(cdcBytes, sm.Table), loadCounter(&metrics.dlqByTable, sm.Table), loadCounter(&metrics.cdcSnapshotRowsByTable, sm.Table)))
 
 	atomic.AddUint64(&metrics.processed, 1)
 	return true, nil
@@ -5837,6 +6022,21 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 			n = 1
 		}
 
+		// #24: a document destination answers success after skipping a row it has no
+		// key to match on (an upsert or delete missing a key field). That row was not
+		// applied, and no retry can apply it: poison, so the caller DLQs + commits and
+		// the loss shows in dlq_rows instead of as an applied change. Names only.
+		if isDocumentDBConnector(destType) {
+			sentRows := 1
+			if d, ok := params["data"].([]map[string]interface{}); ok {
+				sentRows = len(d)
+			}
+			if skipped, ok := destSkippedRows(res, nil, sentRows); !ok || len(skipped) > 0 {
+				return 0, destKey, poisonError{err: fmt.Errorf("destination skipped the row: missing primary key (table=%s op=%s key_fields=%s)",
+					targetTable, sm.CDCOp, strings.Join(keyFieldsForDDL, ","))}
+			}
+		}
+
 		// KI-CDC-DELETE-PATH-UNLOGGED: a delete used to apply and log NOTHING.
 		//
 		// The mechanism: this function performs its own MCP HTTP round-trip (the
@@ -6001,9 +6201,10 @@ func loadCounter(m *sync.Map, key string) int64 {
 // will never receive. It is carried on every emission (not only when non-zero) so
 // the projector can clear a stale value, and it drives status=degraded: a table
 // still streaming while shedding rows is not "running", and reporting it as
-// running is what let a discarded row pass for a healthy one.
-func emitCDCTableStats(ctx context.Context, w *kafka.Writer, sm *SinkMessage, inserts, updates, deletes, bytesCommitted, dlqRows int64) error {
-	b, _ := json.Marshal(buildCDCTableStatsEvent(sm, inserts, updates, deletes, bytesCommitted, dlqRows))
+// running is what let a discarded row pass for a healthy one. snapshotRows is the
+// table's snapshot reads (op r), which inserts (op c only) does not include.
+func emitCDCTableStats(ctx context.Context, w *kafka.Writer, sm *SinkMessage, inserts, updates, deletes, bytesCommitted, dlqRows, snapshotRows int64) error {
+	b, _ := json.Marshal(buildCDCTableStatsEvent(sm, inserts, updates, deletes, bytesCommitted, dlqRows, snapshotRows))
 
 	return w.WriteMessages(ctx, kafka.Message{
 		Key:   []byte(sm.PipelineID),
@@ -6066,10 +6267,10 @@ func tableIdentityForStats(sm *SinkMessage) (map[string]interface{}, string) {
 // buildCDCTableStatsEvent builds the TABLE_STATS payload. Split out from the write so
 // the counts/status contract the api-gateway projector reads is unit-testable without
 // a broker.
-func buildCDCTableStatsEvent(sm *SinkMessage, inserts, updates, deletes, bytesCommitted, dlqRows int64) map[string]interface{} {
+func buildCDCTableStatsEvent(sm *SinkMessage, inserts, updates, deletes, bytesCommitted, dlqRows, snapshotRows int64) map[string]interface{} {
 	table, tableName := tableIdentityForStats(sm)
 
-	totalEvents := inserts + updates + deletes
+	totalEvents := inserts + updates + deletes + snapshotRows
 
 	// CDC is "running" until stopped — except while it is dropping rows on the floor.
 	tableStatus := "running"
@@ -6083,17 +6284,20 @@ func buildCDCTableStatsEvent(sm *SinkMessage, inserts, updates, deletes, bytesCo
 		"status": tableStatus,
 		"table":  table,
 		"counts": map[string]interface{}{
-			"inserts":      inserts,
-			"updates":      updates,
-			"deletes":      deletes,
-			"total_events": totalEvents,
+			"inserts": inserts,
+			"updates": updates,
+			"deletes": deletes,
+			// Snapshot reads, apart from inserts: a re-snapshot re-reads rows the table
+			// already had, so it is not growth.
+			"snapshot_rows": snapshotRows,
+			"total_events":  totalEvents,
 			// Rows the destination will never receive. Deliberately NOT folded into
 			// read_rows/inserted_rows: those are "what landed", and adding a lost row
 			// to either would restore the very reconciliation that hid the loss.
 			"dlq_rows": dlqRows,
 			// For compatibility with batch stats
 			"read_rows":       totalEvents,
-			"inserted_rows":   inserts + updates, // rows added/modified
+			"inserted_rows":   inserts + snapshotRows + updates, // rows added/modified
 			"bytes_committed": bytesCommitted,
 		},
 		"cdc_position": map[string]interface{}{
@@ -6586,10 +6790,17 @@ const debeziumUnavailablePlaceholder = "__debezium_unavailable_value"
 // it to NULL) makes the destination's upsert path SKIP that column
 // in its SET clause — the existing destination value is preserved.
 //
-// The destination Postgres MCP at
-// shared/mcp-connectors/public/postgresql/versions/v1.0.14/connector.py:2890+
-// builds the UPDATE SET clause from data[0].keys(), so a missing key
-// is the correct way to say "leave this column alone".
+// That contract lives on the destination side, in the database MCP
+// connectors' upsert_data (shared/mcp-connectors/public/postgresql,
+// public/database/{mysql,oracle,sqlserver}, resolved through
+// latest.json.current_version — NOT a hard-coded version directory).
+// Each one now builds every statement from the columns the ROW carries
+// (row_cols / _group_rows_by_shape) rather than from the union of keys
+// across the batch. The union is still what DDL and ensure_table need,
+// but binding it per row turned an absent key into row.get(col) -> None
+// and wrote NULL over the destination's good TOAST value — silently, and
+// only when a batch mixed a row that carried the column with one that did
+// not. Change either side and this filter starts destroying data again.
 func filterDebeziumUnavailable(row map[string]interface{}) map[string]interface{} {
 	if row == nil {
 		return nil
@@ -7495,6 +7706,21 @@ func normalizeMongoID(v interface{}) string {
 		return s
 	case map[string]interface{}:
 		return normalizeMongoIDFromMap(t)
+	case json.Number:
+		// Already the exact decimal literal from the wire — never reformat it.
+		return t.String()
+	case float64:
+		// Defence in depth: the decoders feeding this now preserve integers as
+		// int64, but a float64 _id from any other path must still render as a
+		// faithful key. toString would hand it to fmt.Sprint -> %g, which emits
+		// exponent form from 1e6 up ("9.000001e+06"); an _id is a key, not a
+		// measurement, so an integral value is written as plain digits. Above
+		// 2^53 float64 has already lost integer precision, so the %g form is
+		// kept there rather than printing a falsely exact run of digits.
+		if t == float64(int64(t)) && t > -(1<<53) && t < (1<<53) {
+			return strconv.FormatInt(int64(t), 10)
+		}
+		return toString(v)
 	default:
 		return toString(v)
 	}
@@ -7560,11 +7786,22 @@ func decodeMongoDocument(cfg *WorkerConfig, sm *SinkMessage, payload map[string]
 	if strings.EqualFold(op, "d") {
 		docField = "before"
 	}
+	// UseNumber + normalizeJSONNumbers for the same reason the batch/CDC payload
+	// decoder above uses them: a plain json.Unmarshal forces every JSON number
+	// through float64. That is not merely a precision risk here — it decides the
+	// PRIMARY KEY, because the block below prefers the document's own _id over the
+	// message key. float64 reaches fmt.Sprint, which formats with %g and switches
+	// to exponent form at 1e6, so a numeric _id of 9000001 became the literal key
+	// "9.000001e+06" (observed in prod, 2026-09-23), and an _id above 2^53 was
+	// rounded before it was ever formatted.
 	var doc map[string]interface{}
 	if raw, ok := payload[docField].(string); ok && strings.TrimSpace(raw) != "" {
-		if err := json.Unmarshal([]byte(raw), &doc); err != nil {
+		dec := json.NewDecoder(strings.NewReader(raw))
+		dec.UseNumber()
+		if err := dec.Decode(&doc); err != nil {
 			return fmt.Errorf("mongodb cdc: failed to parse %s document JSON (op=%s): %w", docField, op, err)
 		}
+		normalizeJSONNumbers(doc)
 	}
 
 	// Prefer the document's own _id; fall back to the message key.
@@ -7854,6 +8091,20 @@ func isRetryableMinioFetchErr(err error) bool {
 	return true
 }
 
+// defaultMinIOMCPURL is the minio connector's address on a Compose install,
+// where the Service is literally named minio-mcp. Helm names it
+// <stackPrefix>-minio-v1-0-0-mcp and passes that in MINIO_MCP_URL; without it
+// the lookup fails with "no such host" and every claim-checked batch is DLQ'd.
+const defaultMinIOMCPURL = "http://minio-mcp:8000/mcp"
+
+// minioMCPURL is where claim-checked batches are read from and deleted.
+func minioMCPURL() string {
+	if u := strings.TrimSpace(os.Getenv("MINIO_MCP_URL")); u != "" {
+		return u
+	}
+	return defaultMinIOMCPURL
+}
+
 func fetchFromMinIOOnce(ctx context.Context, httpClient *http.Client, claimCheckURL string) ([]map[string]interface{}, error) {
 	reqBody := map[string]interface{}{
 		"jsonrpc": "2.0",
@@ -7868,7 +8119,7 @@ func fetchFromMinIOOnce(ctx context.Context, httpClient *http.Client, claimCheck
 		},
 	}
 	b, _ := json.Marshal(reqBody)
-	req, _ := http.NewRequestWithContext(ctx, "POST", "http://minio-mcp:8000/mcp", bytes.NewReader(b))
+	req, _ := http.NewRequestWithContext(ctx, "POST", minioMCPURL(), bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -7924,7 +8175,7 @@ func deleteFromMinIO(ctx context.Context, httpClient *http.Client, claimCheckURL
 		},
 	}
 	b, _ := json.Marshal(reqBody)
-	req, _ := http.NewRequestWithContext(ctx, "POST", "http://minio-mcp:8000/mcp", bytes.NewReader(b))
+	req, _ := http.NewRequestWithContext(ctx, "POST", minioMCPURL(), bytes.NewReader(b))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
@@ -7955,6 +8206,35 @@ func ifaceRowsToMaps(rows []interface{}) []map[string]interface{} {
 		}
 	}
 	return out
+}
+
+// recordWrites adds written object keys for the EOF manifest. A key written
+// again is the same object overwritten -- a Resume that re-reads the rows of a
+// dead-lettered batch rewrites the batches that had landed, under the same
+// execution id -- so it keeps one entry and takes the newer row count instead
+// of listing the object twice and counting its rows twice.
+func (st *tableWriteState) recordWrites(keys []string, counts []int64) {
+	for i, k := range keys {
+		var c int64
+		if i < len(counts) {
+			c = counts[i]
+		}
+		if j := indexOf(st.keys, k); j >= 0 {
+			st.rowCounts[j] = c
+			continue
+		}
+		st.keys = append(st.keys, k)
+		st.rowCounts = append(st.rowCounts, c)
+	}
+}
+
+func indexOf(keys []string, k string) int {
+	for i, have := range keys {
+		if have == k {
+			return i
+		}
+	}
+	return -1
 }
 
 func ensureWriteState(writeStates map[string]*tableWriteState, sm *SinkMessage) *tableWriteState {
@@ -8012,7 +8292,7 @@ func loadKeysAndCountsFromLedger(ctx context.Context, db *sql.DB, sm *SinkMessag
 		`SELECT dest_key, rows_written
 		 FROM pipeline_batch_acks
 		 WHERE pipeline_id = $1 AND execution_id = $2 AND table_name = $3 AND rows_written >= 0
-		 ORDER BY batch_offset ASC`,
+		 ORDER BY created_at ASC, batch_offset ASC`,
 		sm.PipelineID, sm.ExecutionID, sm.Table,
 	)
 	if err != nil {
@@ -8020,8 +8300,8 @@ func loadKeysAndCountsFromLedger(ctx context.Context, db *sql.DB, sm *SinkMessag
 	}
 	defer rows.Close()
 
-	var keys []string
-	var counts []int64
+	// One entry per object: a re-read after a DLQ acks the same dest_key again.
+	st := &tableWriteState{}
 	for rows.Next() {
 		var k string
 		var c int64
@@ -8031,13 +8311,12 @@ func loadKeysAndCountsFromLedger(ctx context.Context, db *sql.DB, sm *SinkMessag
 		if strings.TrimSpace(k) == "" {
 			continue
 		}
-		keys = append(keys, k)
-		counts = append(counts, c)
+		st.recordWrites([]string{k}, []int64{c})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
-	return keys, counts, nil
+	return st.keys, st.rowCounts, nil
 }
 
 func callDestinationTool(ctx context.Context, httpClient *http.Client, cfg *WorkerConfig, destType, op string, args map[string]interface{}) (map[string]interface{}, error) {
@@ -8211,6 +8490,39 @@ type DDLSupport struct {
 	Drift *kafka.Writer
 }
 
+// schemaDriftEnabled reports whether this installation runs the schema-drift loop.
+// It reads RSYNC_SCHEMA_DRIFT_ENABLED exactly as the orchestrator's and the
+// api-gateway's config.SchemaDriftEnabled do — true only for the exact value
+// "true" — because the three must agree: the orchestrator creates the
+// rsync.healer.* topics and starts their consumers only when it is on.
+func schemaDriftEnabled() bool {
+	return os.Getenv("RSYNC_SCHEMA_DRIFT_ENABLED") == "true"
+}
+
+// newSchemaDriftWriter returns the writer for rsync.healer.schema-changes, or nil
+// when the schema-drift loop is off.
+//
+// With the loop off nothing consumes that topic and the orchestrator does not create
+// it, so a writer here would only make the broker auto-create an unread topic at its
+// own defaults. Separate from eventsWriter, which is pinned to pipeline.domain.events.
+func newSchemaDriftWriter(cfg *WorkerConfig) *kafka.Writer {
+	if !schemaDriftEnabled() {
+		return nil
+	}
+	return &kafka.Writer{
+		Addr:                   brokerAddr(cfg.KafkaBootstrapServers),
+		Transport:              kafkaTransport(),
+		Topic:                  kafkaclient.Topic("rsync.healer.schema-changes"),
+		Balancer:               &kafka.LeastBytes{},
+		AllowAutoTopicCreation: true,
+		RequiredAcks:           kafka.RequireAll,
+		// Reporting is best-effort and sits on the CDC apply path: fail fast rather
+		// than hold a committed batch waiting on the broker (see reportAppliedSchemaDrift).
+		WriteTimeout: 3 * time.Second,
+		MaxAttempts:  1,
+	}
+}
+
 func toBool(v interface{}) bool {
 	switch t := v.(type) {
 	case bool:
@@ -8230,6 +8542,20 @@ func toBool(v interface{}) bool {
 	default:
 		return false
 	}
+}
+
+// reloadCanDropTable reports whether reload cleanup may DROP the destination
+// table: only when the following write rebuilds it. A relational destination
+// rebuilds through ensure_table, so it needs DDL support (ddlSupported, probed
+// lazily — only asked when it matters). A document store (isDocumentDBConnector)
+// has no DDL and needs none: its collections are created by the first write, so
+// its drop_table is always safe — and without this, reload never cleared a
+// MongoDB destination and rows deleted at the source survived every reload.
+func reloadCanDropTable(destType string, ddlSupported func() bool) bool {
+	if isDocumentDBConnector(destType) {
+		return true
+	}
+	return ddlSupported != nil && ddlSupported()
 }
 
 // probeDDLSupport queries the destination's get_capabilities and reports whether
@@ -9102,6 +9428,99 @@ func buildTableStatsEvent(sm *SinkMessage, mode, status string, readRows, insert
 	return event
 }
 
+const (
+	// dlqTopicRetentionMs is how long a parked record stays readable: seven days.
+	dlqTopicRetentionMs = "604800000"
+
+	// dlqTopicCreateTimeout bounds one CreateTopics attempt. It adds to the
+	// fail-closed budget documented on dlqWriter: 3s here plus the ~12s sendToDLQ
+	// publish-retry budget still halts well inside the 30s SLA.
+	dlqTopicCreateTimeout = 3 * time.Second
+)
+
+// dlqTopicCreateRetryInterval is how long ensureDLQTopic waits after a failed
+// CreateTopics before it tries that topic again. A var, not a const, so a test can
+// drive the retry without sleeping.
+var dlqTopicCreateRetryInterval = time.Minute
+
+// dlqTopicState is the pre-create state of one DLQ topic. mu serialises attempts, so
+// concurrent parks on the same topic send one CreateTopics between them.
+type dlqTopicState struct {
+	mu       sync.Mutex
+	created  bool      // CreateTopics succeeded or the topic already existed
+	failedAt time.Time // last failed attempt; zero when none has failed
+}
+
+// dlqTopicsEnsured maps each DLQ topic name to its *dlqTopicState. Only a success is
+// final. A failed attempt is retried on a later park, at most once per
+// dlqTopicCreateRetryInterval. A transient failure, such as a broker that is down,
+// also fails the write, so the topic is not auto-created yet and a later attempt can
+// still give it dlqTopicConfig.
+var dlqTopicsEnsured sync.Map
+
+// dlqTopicConfig is the shape every "<source_topic>.dlq" is created with.
+//
+// One partition: a DLQ is a low-volume audit trail, and broker auto-create would
+// hand it num.partitions (sized for data topics). Seven-day retention: parked
+// records must outlive a long weekend, and nothing else bounds them. Replication
+// factor -1 asks for the broker's default.replication.factor, which is exactly
+// what auto-create would have used, so this changes partitions and retention only.
+func dlqTopicConfig(topic string) kafka.TopicConfig {
+	return kafka.TopicConfig{
+		Topic:             topic,
+		NumPartitions:     1,
+		ReplicationFactor: -1,
+		ConfigEntries:     []kafka.ConfigEntry{{ConfigName: "retention.ms", ConfigValue: dlqTopicRetentionMs}},
+	}
+}
+
+// ensureDLQTopic creates topic before its first write. It succeeds at most once per
+// topic per process; after a failure it retries on a later call, at most once per
+// dlqTopicCreateRetryInterval (see dlqTopicsEnsured).
+//
+// It goes through the DLQ writer's own address and transport, so a DLQ on a separate
+// cluster (the dlq_bootstrap_servers config override) and its TLS/SASL settings are honoured. It never
+// fails the caller: TopicAlreadyExists is the expected steady state, and any other
+// error is logged and left to the write that follows. dlqWriter keeps
+// AllowAutoTopicCreation, so a failed create (no CreateTopics ACL, a pre-2.4 broker
+// that rejects replication factor -1) degrades to today's auto-create rather than to
+// a lost record, and a broker that is actually down still fails the write, and so
+// still fails closed, exactly as before.
+func ensureDLQTopic(ctx context.Context, w *kafka.Writer, topic string) {
+	v, _ := dlqTopicsEnsured.LoadOrStore(topic, &dlqTopicState{})
+	st := v.(*dlqTopicState)
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if st.created {
+		return
+	}
+	if !st.failedAt.IsZero() && time.Since(st.failedAt) < dlqTopicCreateRetryInterval {
+		return
+	}
+	cctx, cancel := context.WithTimeout(ctx, dlqTopicCreateTimeout)
+	defer cancel()
+	client := &kafka.Client{Addr: w.Addr, Transport: w.Transport, Timeout: dlqTopicCreateTimeout}
+	resp, err := client.CreateTopics(cctx, &kafka.CreateTopicsRequest{
+		Topics: []kafka.TopicConfig{dlqTopicConfig(topic)},
+	})
+	if err == nil && resp != nil {
+		err = resp.Errors[topic]
+	}
+	if err == nil || errors.Is(err, kafka.TopicAlreadyExists) {
+		st.created = true
+		return
+	}
+	// A caller that was cancelled says nothing about the broker, so it does not
+	// start the retry wait: the next park tries again straight away.
+	if ctx.Err() == nil {
+		st.failedAt = time.Now()
+	}
+	logEvent("warn", "DLQ topic pre-create failed; the write will rely on broker auto-create",
+		"dlq_topic", topic,
+		"reason", err.Error(),
+	)
+}
+
 // sendToDLQ parks a record the destination will never accept. `table` is the
 // qualified source table the record belongs to ("" when it could not be parsed);
 // it is required, not optional, because a DLQ routing IS a row loss and the only
@@ -9120,9 +9539,13 @@ func sendToDLQ(ctx context.Context, w *kafka.Writer, msg kafka.Message, err erro
 
 	srcTopic := strings.TrimSpace(msg.Topic)
 	if srcTopic == "" {
-		srcTopic = "unknown"
+		// Qualified like every other topic this worker names. A bare "unknown.dlq"
+		// sat outside the KAFKA_TOPIC_PREFIX namespace, so it was both unattributable
+		// on a shared cluster and outside the PREFIXED ACL grant that covers the rest.
+		srcTopic = kafkaclient.Topic("unknown")
 	}
 	dlqTopic := srcTopic + ".dlq"
+	ensureDLQTopic(ctx, w, dlqTopic)
 
 	dlqPayload := map[string]interface{}{
 		"error":     err.Error(),

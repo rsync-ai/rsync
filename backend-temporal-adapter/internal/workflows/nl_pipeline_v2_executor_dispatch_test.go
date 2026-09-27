@@ -99,3 +99,31 @@ func TestBuildExecutorTaskMap_CoreFields(t *testing.T) {
 		t.Errorf("task must not embed correlation_id")
 	}
 }
+
+// The GKE rsync-v016 run a6026f71 (2026-09-27): the sink DLQ'd a batch because it
+// could not resolve the MinIO MCP Service, the executor failed the run with that
+// sink error embedded, and "no such host" classified it INVALID_CONFIGURATION. The
+// workflow then parked on "Configure connections" for 24h with the execution row
+// left running, and the batch sentinel re-raised its alert every minute.
+func TestClassifyExecutorResponse_SilentDropIsNotReadAsAConnectionProblem(t *testing.T) {
+	cases := map[string]struct{ status, err string }{
+		"sink dns failure": {"silent_partial_drop_detected",
+			`destination partially dropped rows: dispatched 12000, ack ledger confirmed only 2000 landed after the sink DLQ'd at least one batch (execution a6026f71); sink error: minio fetch failed after 5 attempt(s): Post "http://minio-mcp:8000/mcp": dial tcp: lookup minio-mcp on 34.118.224.10:53: no such host`},
+		"row count containing 403": {"silent_drop_detected",
+			"destination silently dropped all rows: dispatched 14030, ack ledger confirmed 0 landed across 3 ack batches (execution e1)"},
+	}
+	for name, c := range cases {
+		// Control: the same text under a plain failure status still trips the
+		// heuristics, so the assertion below is about the status, not the text.
+		if _, ctl := classifyExecutorResponse("failed", c.err, nil, "corr", nil); ctl == nil || ctl.Type != ErrTypePolicy {
+			t.Fatalf("%s: control expected a POLICY classification for status failed, got %v", name, ctl)
+		}
+		_, aerr := classifyExecutorResponse(c.status, c.err, nil, "corr", nil)
+		if aerr == nil || aerr.Type != ErrTypeDeterministic || aerr.Code != "EXECUTION_FAILED" {
+			t.Fatalf("%s: expected deterministic EXECUTION_FAILED, got %v", name, aerr)
+		}
+		if aerr.Metadata["agent_status"] != c.status {
+			t.Fatalf("%s: healing metadata lost the status: %v", name, aerr.Metadata)
+		}
+	}
+}

@@ -35,7 +35,7 @@ func TestClampToClusterAlsoLowersMinInsyncReplicas(t *testing.T) {
 // otherwise the clamp would silently downgrade durability on real deployments.
 func TestClampToClusterLeavesSatisfiableRequestsAlone(t *testing.T) {
 	cfg := TopicConfig{
-		Name:              "agent.control.commands.intent",
+		Name:              "pipeline.domain.events",
 		ReplicationFactor: 3,
 		Config:            map[string]string{"min.insync.replicas": "2"},
 	}

@@ -35,6 +35,7 @@ import {
   type NormalizedPipelineStatus,
 } from "@/lib/pipeline/statusNormalization"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
+import { usePipelineStatePoll } from "@/lib/hooks/usePipelineStatePoll"
 import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import { readResponseErrorMessage } from "@/lib/utils/error-handling"
 import { deleteWarningToast, readDeleteWarnings } from "@/lib/utils/delete-warnings"
@@ -71,35 +72,22 @@ export function PipelineHeaderOverflowMenu(props: {
   const [stopping, setStopping] = useState(false)
 
   // Live status drives the "Stop Pipeline" item's visibility for CDC pipelines.
-  // Poll /state (mirrors CDCPipelineActions) only when we actually own Stop.
+  // Read the header's one shared /state poll only when we actually own Stop.
   const isCDC = (pipelineType || "").toLowerCase() === "cdc"
-  const [liveStatus, setLiveStatus] = useState<NormalizedPipelineStatus>(() => normalizePipelineStatus(status))
+  const live = usePipelineStatePoll(isCDC ? pipelineId : null)
+  // Stop hides itself the moment it lands; the next read of /state (the refresh
+  // Stop emits asks for one at once) decides from there, as this menu's own poll did.
+  const [stoppedAtRead, setStoppedAtRead] = useState<number | null>(null)
+  const liveStatus: NormalizedPipelineStatus =
+    stoppedAtRead !== null && live.reads === stoppedAtRead
+      ? "cancelled"
+      : live.status ?? normalizePipelineStatus(status)
   const inFlightRef = useRef(false)
   // /state can freeze at "running" after a CDC feed dies; the dependency-aware
   // /runtime endpoint is the source of truth. Reconcile so a dead stream isn't
   // offered "Stop" (it's not running) — same escalation the status pill and the
   // inline actions use (#673). Only polled for CDC (where we own Stop).
   const { runtime } = usePipelineRuntime(pipelineId, { enabled: isCDC })
-  useEffect(() => {
-    if (!isCDC) return
-    let cancelled = false
-    const fetchLiveStatus = async () => {
-      try {
-        const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, { cache: "no-store" })
-        if (!res.ok) return
-        const data = (await res.json()) as { status?: string }
-        if (!cancelled) setLiveStatus(normalizePipelineStatus(data?.status))
-      } catch {
-        // ignore; keep last known status
-      }
-    }
-    void fetchLiveStatus()
-    const t = window.setInterval(() => void fetchLiveStatus(), 4000)
-    return () => {
-      cancelled = true
-      window.clearInterval(t)
-    }
-  }, [isCDC, pipelineId])
 
   // Escalate a frozen "running" to the /runtime verdict before gating Stop — the
   // shared reconciliation, so this menu cannot drift from the badge beside it.
@@ -153,7 +141,7 @@ export function PipelineHeaderOverflowMenu(props: {
         return
       }
       toast.success("Pipeline stopped")
-      setLiveStatus("cancelled")
+      setStoppedAtRead(live.reads)
       router.refresh()
       emitPipelineRefresh(pipelineId)
     } catch {
@@ -162,7 +150,7 @@ export function PipelineHeaderOverflowMenu(props: {
       setStopping(false)
       inFlightRef.current = false
     }
-  }, [pipelineId, router])
+  }, [pipelineId, router, live.reads])
 
   const pushWithParams = useCallback(
     (patch: Record<string, string | null | undefined>) => {

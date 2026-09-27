@@ -346,7 +346,10 @@ export default function ConnectionDetailPage({ params }: Props) {
           toast.error(refusal.title, { description: refusal.description })
           throw Object.assign(new Error(refusal.description), { statusCode: response.status, alreadyReported: true })
         }
-        throw Object.assign(new Error(), { statusCode: response.status, message: body?.error || body?.message || `HTTP ${response.status}` })
+        // The body as the server sent it: the form's parser prefers its sentence
+        // over a bare code in `error`, and keeps its `code` and status. Picking
+        // `error` first here handed the form a code, which it then guessed at.
+        throw Object.assign(new Error(`HTTP ${response.status}`), { ...body, statusCode: response.status })
       }
 
       toast.success("Connection updated successfully")

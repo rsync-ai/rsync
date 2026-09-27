@@ -79,3 +79,50 @@ func TestCDCSentinelDoesNotPollAKafkaConnectEndpointThatDoesNotExist(t *testing.
 		}
 	}
 }
+
+// A PostgreSQL connector heartbeats (#12) so its slot acknowledges filtered WAL, but its
+// position does not move on a database with no writes. checkSourceFreshness must never
+// read its offsets, or every quiet PostgreSQL pipeline would raise SOURCE_STALLED. A
+// MongoDB connector with the same heartbeat is still checked.
+func TestCheckSourceFreshnessReadsOffsetsOnlyForAHeartbeatThatAdvancesWhenIdle(t *testing.T) {
+	for _, tc := range []struct {
+		class       string
+		wantOffsets bool
+	}{
+		{"io.debezium.connector.postgresql.PostgresConnector", false},
+		{"io.debezium.connector.mongodb.MongoDbConnector", true},
+	} {
+		t.Run(tc.class, func(t *testing.T) {
+			rec := &recordingConnect{}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				rec.record(req.URL.Path)
+				if req.URL.Path == "/connectors/cdc-abcd1234/config" {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = w.Write([]byte(`{"connector.class":"` + tc.class + `","heartbeat.interval.ms":"300000"}`))
+					return
+				}
+				w.WriteHeader(http.StatusNotFound)
+			}))
+			defer srv.Close()
+
+			db, _, err := sqlmock.New()
+			if err != nil {
+				t.Fatalf("sqlmock.New: %v", err)
+			}
+			defer func() { _ = db.Close() }()
+
+			s := &CDCSentinel{db: db, httpClient: srv.Client(), connectURL: srv.URL}
+			s.checkSourceFreshness(context.Background(), "abcd1234-0000-0000-0000-000000000001", "cdc-abcd1234", nil)
+
+			gotOffsets := false
+			for _, p := range rec.seen() {
+				if strings.HasSuffix(p, "/offsets") {
+					gotOffsets = true
+				}
+			}
+			if gotOffsets != tc.wantOffsets {
+				t.Fatalf("offsets read = %v, want %v (paths %v)", gotOffsets, tc.wantOffsets, rec.seen())
+			}
+		})
+	}
+}

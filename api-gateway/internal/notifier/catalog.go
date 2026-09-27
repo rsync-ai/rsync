@@ -230,6 +230,84 @@ var catalog = map[string]Entry{
 		Severity:    severityCritical,
 	},
 
+	// ── Instance-level, for whoever operates the install ────────────────────
+	// No pipeline: these are fanned out to every active admin (migration 112).
+	// The copy is addressed to an operator, not to a pipeline owner, because
+	// that is who can actually act on it.
+	"RSYNC_CONNECTOR_VERSION_REGRESSION": {
+		Title:       "A connector version is failing more often than its predecessor",
+		Impact:      "Pipelines on this connector version are failing more often. Rolling back the version is usually the fastest fix.",
+		ActionLabel: "Review connector health",
+		Severity:    severityWarning,
+	},
+
+	// ── The pipeline stopped moving data (sentinel) ─────────────────────────
+	// Raised by the sentinel agents through publishSentinelAlert
+	// (backend-orchestrator/internal/agents/sentinel/notify.go). These are the
+	// failures that do NOT fail a run: the run stays "running", the connector
+	// still reports itself healthy, and the rows quietly stop arriving. Which
+	// is exactly why they have to be pushed — nobody goes looking for a
+	// pipeline that claims to be fine.
+	"CDC_CONNECTOR_DOWN": {
+		Title:       "Change capture has stopped on {pipeline}",
+		Impact:      "New changes at the source are not being captured, so nothing new will reach the destination until the connector is running again.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
+	"CDC_SOURCE_STREAM_STALLED": {
+		Title:       "Real-time sync has gone quiet on {pipeline}",
+		Impact:      "Changes are piling up at the source. If the connector has lost its place in the change stream, a fresh sync is needed to catch up.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
+	"CDC_SINK_WEDGED": {
+		Title:       "The writer for {pipeline} is stuck and restarts have not freed it",
+		Impact:      "Changes are still being captured, so nothing is lost yet, but they will keep building up until somebody clears the writer.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
+	"SINK_WORKER_ABSENT": {
+		Title:       "Nothing is writing this run's rows to the destination",
+		Impact:      "Rows are being read from the source and are queueing instead of landing. The run will go quiet rather than fail.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
+	// Component health, raised by the sentinel's IssueDetector. These three are
+	// instance-scoped: the producer sends pipeline_id "instance", so {pipeline}
+	// would render as "This instance" and read badly in a headline. No placeholder
+	// here — the component is named in the message body instead, which is where the
+	// producer has it.
+	//
+	// INFRASTRUCTURE_DOWN's Impact is deliberately service-neutral. What an outage
+	// stops depends on which service it is — Postgres or Kafka stops every pipeline,
+	// the LLM service stops none — and the body is message + "\n" + Impact, so a
+	// fixed "pipelines cannot move data" here would contradict the producer's message
+	// for every service that is not on the data path.
+	"INFRASTRUCTURE_DOWN": {
+		Title:       "A core service is not responding",
+		Impact:      "What stops while it is down depends on the service, and the message says which. System health shows every service's latest check.",
+		ActionLabel: "View system health",
+		Severity:    severityCritical,
+	},
+	"WORKER_HEARTBEAT_LOST": {
+		Title:       "A background worker has stopped reporting in",
+		Impact:      "Work assigned to it is not being picked up. Pipelines that depend on it go quiet rather than fail, so nothing else will raise this.",
+		ActionLabel: "View system health",
+		Severity:    severityCritical,
+	},
+	"CONSUMER_GROUP_CLOSED": {
+		Title:       "A queue reader has shut down",
+		Impact:      "Captured changes are safe in the queue but will stop arriving at their destination until the reader is running again.",
+		ActionLabel: "View system health",
+		Severity:    severityCritical,
+	},
+	"SINK_WRITE_REJECTED": {
+		Title:       "Your destination is rejecting rows",
+		Impact:      "Rows are being read from the source and are not arriving. Every rejected batch is data that is not in the destination.",
+		ActionLabel: "See how to fix",
+		Severity:    severityCritical,
+	},
+
 	// ── Terminal run outcome ────────────────────────────────────────────────
 	// Raised by the temporal adapter's UpdatePipelineStatusActivity — the single
 	// authoritative terminal-write site, reached from a defer that fires on every
@@ -288,12 +366,6 @@ var catalog = map[string]Entry{
 // that carries neither a code nor a type can still never render its topic name.
 // Keyed by topic; used only after the code and type lookups miss.
 var topicDefaults = map[string]Entry{
-	healerActions: {
-		Title:       "Automatic recovery in progress",
-		Impact:      "We're trying to fix {pipeline} automatically. Nothing to do yet.",
-		ActionLabel: "View pipeline",
-		Severity:    severityInfo,
-	},
 	healerResults: {
 		Title:       "Pipeline update",
 		ActionLabel: "View pipeline",

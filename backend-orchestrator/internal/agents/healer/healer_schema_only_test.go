@@ -1,14 +1,19 @@
 package healer
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
-// forbiddenDLQTopics are the reactive DLQ topics that the FULL Start() subscribes.
-// They MUST NEVER appear in the schema-only drift path: subscribing them would make
-// the healer double-react to execution failures that the executor worker already
-// handles synchronously via executeWithHealer + suggestRecoveryAction.
-var forbiddenDLQTopics = []string{
-	"agent.executor.requests.dlq",
-	"agent.planner.responses.dlq",
+// isForbiddenDriftTopic reports whether a topic must never be subscribed by the
+// schema-only drift path. A DLQ (any ".dlq" topic) would make the healer double-react
+// to execution failures the executor worker already handles synchronously via
+// executeWithHealer + suggestRecoveryAction; the old full Start() subscribed the
+// executor and planner DLQs and was removed for exactly that reason. An agent-bus
+// topic ("agent.*") no longer exists at all — the agent command bus was removed and the
+// workers poll the Redis correlation store instead.
+func isForbiddenDriftTopic(topic string) bool {
+	return strings.HasSuffix(topic, ".dlq") || strings.Contains(topic, "agent.")
 }
 
 // TestSchemaDriftSubscriptions_OnlySchemaTopics is the P0 regression guard: the
@@ -42,10 +47,16 @@ func TestSchemaDriftSubscriptions_OnlySchemaTopics(t *testing.T) {
 		}
 	}
 
-	// No DLQ topic may be subscribed by the schema-only path.
-	for _, forbidden := range forbiddenDLQTopics {
-		if _, ok := got[forbidden]; ok {
-			t.Errorf("schema-only path must NOT subscribe DLQ topic %q (double-processing risk)", forbidden)
+	// No DLQ or agent-bus topic may be subscribed by the schema-only path.
+	for topic := range got {
+		if isForbiddenDriftTopic(topic) {
+			t.Errorf("schema-only path must NOT subscribe %q (a DLQ double-processes; an agent-bus topic does not exist)", topic)
+		}
+	}
+	// The predicate must be able to fire, or the loop above passes vacuously.
+	for _, control := range []string{"rsync.healer.schema-changes.dlq", "rsync.agent.executor.requests"} {
+		if !isForbiddenDriftTopic(control) {
+			t.Fatalf("isForbiddenDriftTopic(%q) = false; the forbidden-topic check is blind", control)
 		}
 	}
 

@@ -16,7 +16,7 @@ import (
 // and keeps the executions table in sync when executionID is provided.
 //
 // This is intentionally best-effort: it should not fail workflow correctness if the DB is unavailable,
-// but it keeps the "pipelines" table aligned with the authoritative workflow state stored in pipeline_states.
+// but it keeps the "pipelines" table aligned with the authoritative workflow state held by Temporal.
 func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, executionID string, status string, errorMessage string) error {
 	logger := activity.GetLogger(ctx)
 	logger.Info("Updating pipeline row status",
@@ -110,6 +110,14 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 	// reason prefix would break the moment the reason text is reworded.
 	silentDrop := false
 	if status == "completed" && executionID != "" {
+		// The stats rows this check reads arrive asynchronously (sink → events topic →
+		// projector) and can trail the workflow's completion by seconds, so judge them
+		// only once they have settled — otherwise a table whose final stats are still
+		// in flight reads as dropped and a run that landed every row is failed.
+		if !awaitTableStatsSettled(ctx, db, executionID, func() { activity.RecordHeartbeat(ctx) }) {
+			logger.Warn("Postflight: table stats did not settle within the grace period; judging what has arrived",
+				"execution_id", executionID, "grace", statsSettleGrace.String())
+		}
 		if dropReason, ok := postflightSilentDropCheck(ctx, db, executionID); ok {
 			logger.Warn("🚨 Postflight silent-drop guard downgraded completed -> failed",
 				"execution_id", executionID,
@@ -278,6 +286,106 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 	_ = time.Now()
 
 	return nil
+}
+
+// statsSettleGrace bounds how long the postflight waits for this execution's table
+// stats to settle before judging them anyway, and statsSettleInterval is the re-read
+// cadence. The sink sends a table's final stats when it handles that table's EOF
+// marker, and the projector writes them a moment later — on prod the last one trailed
+// the workflow's completion by ~2s — so a healthy run settles within a poll or two and
+// only a run with a genuinely missing or stuck table waits out the grace. Vars, not
+// consts, so tests can shrink them.
+var (
+	statsSettleGrace    = 60 * time.Second
+	statsSettleInterval = 2 * time.Second
+)
+
+// awaitTableStatsSettled waits until every stats row this execution has reported is
+// final (no row still 'running') and every selected table has a row, or until
+// statsSettleGrace elapses. It returns whether the stats settled; the caller judges
+// whatever has arrived either way, so a table still missing after the grace is failed
+// exactly as before. heartbeat runs between polls — the activity's heartbeat timeout
+// is shorter than the grace.
+func awaitTableStatsSettled(ctx context.Context, db *sql.DB, executionID string, heartbeat func()) bool {
+	if db == nil || executionID == "" {
+		return true
+	}
+	return waitUntilSettled(ctx, func(ctx context.Context) (bool, error) {
+		return tableStatsSettled(ctx, db, executionID)
+	}, heartbeat, statsSettleGrace, statsSettleInterval)
+}
+
+// waitUntilSettled polls probe until it reports settled, the grace elapses, the
+// context ends, or the probe errors. Only a settled probe returns true.
+func waitUntilSettled(ctx context.Context, probe func(context.Context) (bool, error), heartbeat func(), grace, interval time.Duration) bool {
+	deadline := time.Now().Add(grace)
+	for {
+		settled, err := probe(ctx)
+		if err != nil {
+			log.Warnf("postflight: table stats settle probe failed (judging what has arrived): %v", err)
+			return false
+		}
+		if settled {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		if heartbeat != nil {
+			heartbeat()
+		}
+		t := time.NewTimer(interval)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return false
+		case <-t.C:
+		}
+	}
+}
+
+// tableStatsSettled reports whether this execution's stats are final. A run with no
+// stats rows at all counts as settled: postflightSilentDropCheck judges nothing for it
+// (the stats path isn't live for that run), so there is nothing to wait for.
+func tableStatsSettled(ctx context.Context, db *sql.DB, executionID string) (bool, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT
+			COALESCE(qualified_name, table_name) AS tbl,
+			COALESCE(table_name, '') AS bare,
+			COALESCE(status, '') AS st
+		FROM pipeline_run_table_stats
+		WHERE execution_id = $1
+	`, executionID)
+	if err != nil {
+		return false, err
+	}
+	defer rows.Close()
+
+	reported := make(map[string]bool)
+	running := false
+	for rows.Next() {
+		var tbl, bare, st string
+		if err := rows.Scan(&tbl, &bare, &st); err != nil {
+			return false, err
+		}
+		reported[strings.ToLower(strings.TrimSpace(tbl))] = true
+		if bare != "" {
+			reported[strings.ToLower(strings.TrimSpace(bare))] = true
+		}
+		if strings.EqualFold(strings.TrimSpace(st), "running") {
+			running = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return false, err
+	}
+	if len(reported) == 0 {
+		return true, nil
+	}
+	if running {
+		return false, nil
+	}
+	return len(missingSelectedTables(ctx, db, executionID, reported)) == 0, nil
 }
 
 // postflightSilentDropCheck inspects pipeline_run_table_stats for the

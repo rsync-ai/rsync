@@ -9,18 +9,20 @@ import (
 // ==============================================================================
 // AGENT WORKER TYPES
 // ==============================================================================
-// This package defines the interface for stateless agent workers that follow
-// the Temporal + Kafka data plane pattern.
+// This package defines the stateless agent workers driven by the Temporal
+// adapter through the Redis correlation store.
 //
 // Key Principles:
 // 1. Workers are STATELESS (can be killed and restarted)
-// 2. Workers consume tasks from agent.control.commands (sent by Temporal adapter)
-// 3. Workers produce results to agent.control.results (consumed by Temporal adapter)
+// 2. Workers claim requests the Temporal adapter writes to the Redis
+//    correlation store (each worker's startRedisPoller)
+// 3. Workers write results back to that store (RouteResult), where the waiting
+//    Temporal activity reads them
 // 4. Workers are GENERIC (work with ANY connector via MCP)
 // 5. Workers are AUTONOMOUS (make decisions, not just execute scripts)
 // ==============================================================================
 
-// Task represents a task sent to a worker from Temporal (via Kafka)
+// Task represents a task sent to a worker from Temporal (via the correlation store)
 type Task struct {
 	TaskID        string                 `json:"task_id"`
 	WorkflowID    string                 `json:"workflow_id"` // Temporal workflow ID
@@ -48,7 +50,7 @@ func (t *Task) IdempotencyKey() string {
 	return fmt.Sprintf("%s-%s-%s-%s", t.PipelineID, t.ExecutionID, t.StepID, t.ChunkID)
 }
 
-// TaskResult represents a result sent back to Temporal (via Kafka)
+// TaskResult represents a result sent back to Temporal (via the correlation store)
 type TaskResult struct {
 	TaskID      string                 `json:"task_id"`
 	WorkflowID  string                 `json:"workflow_id"` // Temporal workflow ID
@@ -70,45 +72,9 @@ type Worker interface {
 	// GetWorkerType returns the type of worker (e.g., "intent", "resolver")
 	GetWorkerType() string
 
-	// Start begins consuming tasks from agent.control.commands topic
+	// Start begins claiming requests from the Redis correlation store
 	Start() error
 
 	// Stop gracefully shuts down the worker
 	Stop() error
 }
-
-// BaseWorker provides common functionality for all workers
-type BaseWorker struct {
-	WorkerType string
-	// Add common fields like kafka manager, logger, etc.
-}
-
-// WorkerConfig holds configuration for a worker
-type WorkerConfig struct {
-	WorkerType      string
-	KafkaBrokers    []string
-	ConsumerGroupID string
-	MaxConcurrency  int
-}
-
-// ==============================================================================
-// TELEMETRY TYPES (Optional - for observability)
-// ==============================================================================
-
-// TelemetryEvent represents a telemetry event emitted by workers
-type TelemetryEvent struct {
-	TelemetryType string                 `json:"telemetry_type"`
-	PipelineID    string                 `json:"pipeline_id"`
-	Agent         string                 `json:"agent"`
-	Timestamp     time.Time              `json:"timestamp"`
-	Data          map[string]interface{} `json:"data"`
-	TraceID       string                 `json:"trace_id"`
-}
-
-// Telemetry event types
-const (
-	TelemetryProgressUpdate = "progress_update"
-	TelemetryLLMCall        = "llm_call"
-	TelemetryMCPCall        = "mcp_call"
-	TelemetryError          = "error"
-)

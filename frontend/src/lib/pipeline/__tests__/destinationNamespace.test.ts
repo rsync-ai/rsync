@@ -10,6 +10,9 @@ import {
   kindMeta,
   isLayoutV2Destination,
   validatePipelinePrefix,
+  isObjectStorageDestination,
+  objectLayoutSourceFamily,
+  objectStorageTableFolder,
 } from "../destinationNamespace"
 
 import { primeNamespaceModels } from "../namespaceModel"
@@ -140,5 +143,78 @@ describe("layout v2 path prefix (GCS, S3, Azure Blob)", () => {
     expect(validatePipelinePrefix("a".repeat(64))).toMatch(/too long/)
     expect(validatePipelinePrefix("the")).toMatch(/reserved/)
     expect(validatePipelinePrefix("default")).toMatch(/reserved/)
+  })
+})
+
+// #18: the table folder the Tables card shows for a layout v2 destination is the
+// one the sink writes, so it is checked against the same golden cases as Go.
+describe("objectStorageTableFolder (layout v2 table folder)", () => {
+  type Case = {
+    name: string
+    in: {
+      conn_prefix: string
+      pipeline_prefix: string
+      source_family: string
+      database: string
+      schema: string
+      table: string
+    }
+    want?: string
+    error?: string
+  }
+  const goldenPath = path.resolve(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "../../../../../shared/object_layout_golden.json",
+  )
+  const cases = (JSON.parse(fs.readFileSync(goldenPath, "utf8")).v2.table_prefix || []) as Case[]
+
+  it("reads cases from the golden, with and without an error", () => {
+    expect(cases.filter((c) => c.want).length).toBeGreaterThan(0)
+    expect(cases.filter((c) => c.error).length).toBeGreaterThan(0)
+  })
+
+  it("builds every golden folder, and gives null where Go returns an error", () => {
+    for (const c of cases) {
+      const got = objectStorageTableFolder({
+        connPrefix: c.in.conn_prefix,
+        pipelinePrefix: c.in.pipeline_prefix,
+        sourceFamily: c.in.source_family,
+        database: c.in.database,
+        schema: c.in.schema,
+        table: c.in.table,
+      })
+      expect(got, c.name).toBe(c.error ? null : c.want)
+    }
+  })
+
+  it("prepends the bucket for display only", () => {
+    expect(
+      objectStorageTableFolder({
+        bucket: "acme-lake",
+        connPrefix: "raw",
+        pipelinePrefix: "shop",
+        sourceFamily: "postgresql",
+        database: "shop",
+        schema: "public",
+        table: "orders",
+      }),
+    ).toBe("acme-lake/raw/shop/shop/public/orders/")
+  })
+
+  it("maps source connector types to the orchestrator's layout families", () => {
+    expect(objectLayoutSourceFamily("PostgreSQL")).toBe("postgresql")
+    expect(objectLayoutSourceFamily("cockroach-db")).toBe("postgresql")
+    expect(objectLayoutSourceFamily("supabase")).toBe("postgresql")
+    expect(objectLayoutSourceFamily("mongodb_atlas")).toBe("mongodb")
+    expect(objectLayoutSourceFamily("mariadb")).toBe("mysql")
+    expect(objectLayoutSourceFamily("mssql")).toBe("sqlserver")
+    expect(objectLayoutSourceFamily("oracle")).toBe("oracle")
+    expect(objectLayoutSourceFamily("shopify")).toBe("")
+    expect(objectLayoutSourceFamily(undefined)).toBe("")
+  })
+
+  it("counts minio as object storage though it is not layout v2", () => {
+    for (const t of ["gcs", "aws-s3", "aws_s3", "azure-blob", "minio"]) expect(isObjectStorageDestination(t), t).toBe(true)
+    for (const t of ["postgresql", "bigquery", "", undefined]) expect(isObjectStorageDestination(t)).toBe(false)
   })
 })

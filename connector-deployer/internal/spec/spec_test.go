@@ -308,3 +308,52 @@ func TestValidateHostConfigSafeRejectsMissingCeilings(t *testing.T) {
 		})
 	}
 }
+
+// ── Log rotation ─────────────────────────────────────────────────────────────
+//
+// Compose puts a `logging:` block on every service it starts; a container created
+// through the API gets only the daemon default, which on a stock daemon is json-file
+// with no rotation. On prod (2026-09-26) the three deployer-created connectors were
+// the only unrotated logs of 37 containers.
+
+func TestBuildContainerSpecRotatesConnectorLogs(t *testing.T) {
+	dc := DeployerConfig{Network: testNet, ConnectorLogMaxSize: "10m", ConnectorLogMaxFile: "3"}
+	_, hc, _, err := BuildContainerSpec(DeployRequest{
+		Image: "mcp-gcs:v1.0.0", Name: "rsync-ai-gcs-v1-0-0-mcp",
+	}, dc)
+	if err != nil {
+		t.Fatalf("BuildContainerSpec: %v", err)
+	}
+	if hc.LogConfig.Type != "json-file" || hc.LogConfig.Config["max-size"] != "10m" || hc.LogConfig.Config["max-file"] != "3" {
+		t.Errorf("LogConfig = %+v, want json-file 10m x 3", hc.LogConfig)
+	}
+	if err := ValidateHostConfigSafe(hc, dc); err != nil {
+		t.Errorf("ValidateHostConfigSafe rejected a rotated spec: %v", err)
+	}
+}
+
+func TestValidateHostConfigSafeRejectsMissingLogRotation(t *testing.T) {
+	dc := DeployerConfig{Network: testNet, ConnectorLogMaxSize: "10m", ConnectorLogMaxFile: "3"}
+	for _, tc := range []struct {
+		name string
+		mut  func(*container.HostConfig)
+	}{
+		{"log config dropped", func(hc *container.HostConfig) { hc.LogConfig = container.LogConfig{} }},
+		{"other driver", func(hc *container.HostConfig) { hc.LogConfig.Type = "local" }},
+		{"max-size dropped", func(hc *container.HostConfig) { delete(hc.LogConfig.Config, "max-size") }},
+		{"max-file weakened", func(hc *container.HostConfig) { hc.LogConfig.Config["max-file"] = "1000" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, hc, _, err := BuildContainerSpec(DeployRequest{
+				Image: "mcp-mongodb:v1.0.0", Name: "rsync-ai-mongodb-v1-0-0-mcp",
+			}, dc)
+			if err != nil {
+				t.Fatalf("BuildContainerSpec: %v", err)
+			}
+			tc.mut(hc)
+			if err := ValidateHostConfigSafe(hc, dc); err == nil {
+				t.Fatal("ValidateHostConfigSafe accepted a spec without the configured log rotation")
+			}
+		})
+	}
+}

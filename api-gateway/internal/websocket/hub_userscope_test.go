@@ -113,10 +113,13 @@ func TestBroadcastEvent_ScopesWhenDataCarriesPipelineID(t *testing.T) {
 	const pipelineID = "33333333-3333-3333-3333-333333333333"
 	h.cachePipelineOwner(pipelineID, "user-A")
 
-	// BroadcastAgentActivity puts pipeline_id into the data map, so the
-	// generic BroadcastEvent path must scope it by owner via extractPipelineID.
-	h.BroadcastAgentActivity("planner", "processing", pipelineID, map[string]interface{}{
-		"message": "thinking",
+	// A pipeline_id in the data map makes BroadcastEvent scope the event by
+	// owner via extractPipelineID.
+	h.BroadcastEvent(EventAgentActivity, map[string]interface{}{
+		"agent":       "planner",
+		"status":      "processing",
+		"pipeline_id": pipelineID,
+		"message":     "thinking",
 	}, "trace-3")
 
 	if _, ok := drain(owner, 250*time.Millisecond); !ok {

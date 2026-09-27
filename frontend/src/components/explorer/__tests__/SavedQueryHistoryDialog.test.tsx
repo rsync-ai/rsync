@@ -321,6 +321,42 @@ describe("SavedQueryHistoryDialog", () => {
       expect(message).not.toMatch(/^Restored/)
     })
 
+    it("restores against the text it compared with, and re-reads the history if the query moved on", async () => {
+      // The diff on screen is against CURRENT as this panel read it. A restore that
+      // lands after a teammate's save would undo their edit behind a diff that never
+      // showed it, so the version compared with goes along and a mismatch is refused.
+      const bodies: string[] = []
+      let versionReads = 0
+      mockFetch.mockImplementation(async (url: string, init?: RequestInit) => {
+        if (url.includes("/members")) return res(200, { members: [] })
+        if (url.includes("/versions")) {
+          versionReads++
+          return res(200, { versions: VERSIONS, count: VERSIONS.length, current: CURRENT, pending_edit: null })
+        }
+        if ((init?.method ?? "GET") === "PATCH") {
+          bodies.push(String(init?.body ?? ""))
+          return res(409, {
+            error: "this query changed since you loaded it; reload it and re-apply your change",
+            code: "stale_write",
+          })
+        }
+        return res(404, { error: "unexpected" })
+      })
+      const user = userEvent.setup()
+      renderPanel()
+
+      await user.click(await screen.findByRole("button", { name: "v1" }))
+      await user.click(screen.getByRole("button", { name: /restore this version/i }))
+
+      await waitFor(() => expect(toast.error).toHaveBeenCalled())
+      expect(JSON.parse(bodies[0]).expected_updated_at).toBe(CURRENT.updated_at)
+      expect(String((toast.error as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0])).toMatch(
+        /changed since this history was loaded/i,
+      )
+      expect(toast.success).not.toHaveBeenCalled()
+      await waitFor(() => expect(versionReads).toBe(2))
+    })
+
     it("does not offer to restore the version that is already running", async () => {
       wire({
         versions: [{ ...VERSIONS[0], sql_text: CURRENT.sql_text }],

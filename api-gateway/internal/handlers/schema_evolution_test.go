@@ -36,11 +36,12 @@ const schemaEvoTestWS = "33333333-3333-3333-3333-333333333333"
 // fakeKafka satisfies KafkaProducer without touching a real broker.
 type fakeKafka struct {
 	calls []string
+	err   error // returned by SendPipelineRequest, after recording the call
 }
 
 func (f *fakeKafka) SendPipelineRequest(topic, _ string, _ map[string]interface{}) error {
 	f.calls = append(f.calls, topic)
-	return nil
+	return f.err
 }
 
 func (f *fakeKafka) SendPipelineRequestWithContext(_ context.Context, topic, _ string, _ map[string]interface{}) error {
@@ -129,6 +130,8 @@ func newApproveRouter(handler gin.HandlerFunc, userEmail, userID string) *gin.En
 // --------------------------------------------------------------------- //
 
 func TestApproveSchemaChange_HappyPath_Returns200(t *testing.T) {
+	// The healer that applies approved DDL runs only with schema drift on.
+	t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", "true")
 	withSchemaEvolutionDeps(t, func(mock sqlmock.Sqlmock, kafka *fakeKafka) {
 		expectOwnerCheck(mock, schemaEvoTestPipelineUUID, "user-A")
 		mock.ExpectExec(regexp.QuoteMeta(`UPDATE schema_change_approvals`)).
@@ -294,6 +297,7 @@ func TestApproveSchemaChange_DestructiveDDL_RecordsDecisionWithoutDispatch(t *te
 // auto_applicable=true, so the honest-approval fix doesn't silently disable
 // auto-apply for additive changes.
 func TestApproveSchemaChange_AdditiveDDL_ReportsAutoApplicable(t *testing.T) {
+	t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", "true")
 	withSchemaEvolutionDeps(t, func(mock sqlmock.Sqlmock, kafka *fakeKafka) {
 		expectOwnerCheck(mock, schemaEvoTestPipelineUUID, "user-A")
 		mock.ExpectExec(regexp.QuoteMeta(`UPDATE schema_change_approvals`)).
@@ -325,6 +329,91 @@ func TestApproveSchemaChange_AdditiveDDL_ReportsAutoApplicable(t *testing.T) {
 			t.Errorf("auto_applicable = %v, want true", body.AutoApplicable)
 		}
 	})
+}
+
+// A publish that fails leaves the healer without the change, so the approval is
+// record-only and the response must say so. The error used to be discarded and
+// the response claimed auto_applicable=true for DDL nobody received.
+func TestApproveSchemaChange_PublishFails_ReportsNotAutoApplicable(t *testing.T) {
+	t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", "true")
+	withSchemaEvolutionDeps(t, func(mock sqlmock.Sqlmock, kafka *fakeKafka) {
+		kafka.err = errors.New("broker unavailable")
+		expectOwnerCheck(mock, schemaEvoTestPipelineUUID, "user-A")
+		mock.ExpectExec(regexp.QuoteMeta(`UPDATE schema_change_approvals`)).
+			WithArgs("alice@example.com", "change-1", schemaEvoTestPipelineUUID).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, pipeline_id, change_type, table_name, ddl FROM schema_change_approvals WHERE id = $1`)).
+			WithArgs("change-1").
+			WillReturnRows(sqlmock.NewRows([]string{"id", "pipeline_id", "change_type", "table_name", "ddl"}).
+				AddRow("change-1", schemaEvoTestPipelineUUID, "add_column", "orders", "ALTER TABLE orders ADD COLUMN note TEXT"))
+		expectDriftBadgeClear(mock, schemaEvoTestPipelineUUID, 0)
+
+		r := newApproveRouter(ApproveSchemaChange, "alice@example.com", "user-A")
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/pipelines/"+schemaEvoTestPipelineUUID+"/schema-changes/change-1/approve", nil))
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("expected 200 (the decision is recorded), got %d: %s", w.Code, w.Body.String())
+		}
+		if len(kafka.calls) != 1 {
+			t.Fatalf("expected one publish attempt; got %v", kafka.calls)
+		}
+		var body struct {
+			AutoApplicable *bool `json:"auto_applicable"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("decode body: %v", err)
+		}
+		if body.AutoApplicable == nil || *body.AutoApplicable {
+			t.Errorf("auto_applicable = %v, want false after a failed publish", body.AutoApplicable)
+		}
+	})
+}
+
+// rsync.healer.approved-changes exists only while RSYNC_SCHEMA_DRIFT_ENABLED=true:
+// the orchestrator creates it, and runs the healer consumer that applies what
+// arrives on it, only then. With the flag off an approval of perfectly additive
+// DDL must be recorded but NOT published — a publish would auto-create the topic
+// through the UnifiedProducer on an installation that does not provision it, and
+// report "applied automatically" for DDL nobody will run. Remove the flag check
+// in approveSchemaChangeCore and this fails on the kafka call.
+func TestApproveSchemaChange_DriftOff_RecordsWithoutDispatch(t *testing.T) {
+	for _, env := range []string{"", "false", "1", "TRUE"} {
+		t.Run("RSYNC_SCHEMA_DRIFT_ENABLED="+env, func(t *testing.T) {
+			t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", env)
+			withSchemaEvolutionDeps(t, func(mock sqlmock.Sqlmock, kafka *fakeKafka) {
+				expectOwnerCheck(mock, schemaEvoTestPipelineUUID, "user-A")
+				mock.ExpectExec(regexp.QuoteMeta(`UPDATE schema_change_approvals`)).
+					WithArgs("alice@example.com", "change-1", schemaEvoTestPipelineUUID).
+					WillReturnResult(sqlmock.NewResult(0, 1))
+				mock.ExpectQuery(regexp.QuoteMeta(`SELECT id, pipeline_id, change_type, table_name, ddl FROM schema_change_approvals WHERE id = $1`)).
+					WithArgs("change-1").
+					WillReturnRows(sqlmock.NewRows([]string{"id", "pipeline_id", "change_type", "table_name", "ddl"}).
+						AddRow("change-1", schemaEvoTestPipelineUUID, "add_column", "orders", "ALTER TABLE orders ADD COLUMN note TEXT"))
+				expectDriftBadgeClear(mock, schemaEvoTestPipelineUUID, 0)
+
+				r := newApproveRouter(ApproveSchemaChange, "alice@example.com", "user-A")
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, httptest.NewRequest("POST", "/api/v1/pipelines/"+schemaEvoTestPipelineUUID+"/schema-changes/change-1/approve", nil))
+
+				if w.Code != http.StatusOK {
+					t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+				}
+				if len(kafka.calls) != 0 {
+					t.Fatalf("schema drift is off: nothing may be published to the healer; got %v", kafka.calls)
+				}
+				var body struct {
+					AutoApplicable *bool `json:"auto_applicable"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+					t.Fatalf("decode body: %v", err)
+				}
+				if body.AutoApplicable == nil || *body.AutoApplicable {
+					t.Errorf("auto_applicable = %v, want false — nothing will apply the DDL", body.AutoApplicable)
+				}
+			})
+		})
+	}
 }
 
 func TestApproveSchemaChange_AlreadyActioned_Returns404(t *testing.T) {

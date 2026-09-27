@@ -18,8 +18,8 @@ block. Four defects of exactly this shape shipped at once:
                       service whose tracer defaults to on retried gRPC exports at
                       localhost:4317 forever. The cloud composes set it explicitly
                       true in 6 and 7 places; only this file was silent.
-  LLM_SERVICE_TIMEOUT_SECONDS  absent, leaving the 10s code default against CPU
-                      Ollama, where a first token takes 60-100s.
+  LLM_SERVICE_TIMEOUT_SECONDS  absent, leaving the code default (then 10s) against
+                      CPU Ollama, where a first token takes 60-100s.
 
 A fifth came later: GROQ_API_KEY and AZURE_OPENAI_* were never listed, so
 ``LLM_PROVIDER=groq`` or ``=azure`` in .env resolved to the Ollama fallback on every
@@ -241,9 +241,10 @@ def test_a_service_that_rate_limits_gets_a_redis_to_rate_limit_with(name):
     )
 
 
-# The functions a service calls to choose its provider, key and model and to build
-# its client. Everything they read -- directly or through a helper in the same
-# module -- is a setting an operator can put in .env and expect to take effect.
+# The functions a service calls to choose its provider, key and model, to build
+# its client and to size a reply's output budget. Everything they read -- directly
+# or through a helper in the same module -- is a setting an operator can put in
+# .env and expect to take effect.
 LLM_CLIENT_ENTRYPOINTS = (
     "resolve_provider",
     "llm_configured",
@@ -251,6 +252,7 @@ LLM_CLIENT_ENTRYPOINTS = (
     "openai_api_key",
     "make_sync_client",
     "make_async_client",
+    "with_reasoning_headroom",
 )
 # Callables whose string arguments are environment variable names.
 _ENV_READERS_FIRST_ARG = {"getenv", "get", "env_bool", "_env_bool"}
@@ -309,6 +311,7 @@ def test_the_llm_variable_census_is_not_vacuous():
         "AZURE_OPENAI_API_KEY",
         "LLM_MODEL",
         "OLLAMA_URL",
+        "LLM_REASONING_TOKEN_HEADROOM",
     ):
         assert anchor in found, f"census of {OPENAI_CLIENT_MODULE} lost {anchor}: {sorted(found)}"
     reaching = [
@@ -520,18 +523,31 @@ def test_the_chat_deadline_is_delivered_and_fits_under_the_write_timeout():
     ]
     assert readers, f"nothing in api-gateway reads {TIMEOUT_VAR} -- guard has no subject"
 
+    # The code default, read from the reader itself so this cannot pin a stale number.
+    defaults = {
+        int(m.group(1))
+        for p in readers
+        for m in re.finditer(
+            rf'getEnvDuration\(\s*"{TIMEOUT_VAR}"\s*,\s*(\d+)\s*\)', p.read_text(errors="ignore")
+        )
+    }
+    assert len(defaults) == 1, f"expected one code default for {TIMEOUT_VAR}, found {sorted(defaults)}"
+    (code_default,) = defaults
+
     env = _env(_services(QUICKSTART).get("api-gateway") or {})
     raw = env.get(TIMEOUT_VAR)
     assert raw, (
-        f"docker-compose.quickstart.yml never delivers {TIMEOUT_VAR}, leaving the 10s "
-        f"code default against CPU Ollama, where a first token takes 60-100s. Every "
-        f"plain-English message then returns the canned fallback."
+        f"docker-compose.quickstart.yml never delivers {TIMEOUT_VAR}, leaving the "
+        f"{code_default}s code default against CPU Ollama, where a first token takes "
+        f"60-100s. Every plain-English message then says the model did not answer."
     )
 
     match = re.search(r"(\d+)", raw)
     assert match, f"{TIMEOUT_VAR} is {raw!r}, which carries no number to compare"
     seconds = int(match.group(1))
-    assert seconds > 10, f"{TIMEOUT_VAR}={seconds}s does not raise the 10s code default"
+    assert seconds > code_default, (
+        f"{TIMEOUT_VAR}={seconds}s does not raise the {code_default}s code default"
+    )
 
     # cmd/server/main.go caps the whole response. A longer upstream deadline cannot
     # help -- it just moves the cut to a place with no error message.

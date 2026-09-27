@@ -13,6 +13,8 @@ pytest.importorskip("langgraph")  # service module imports LangGraph
 from src.agents.suggestions.service import (  # noqa: E402
     detect_schema_transforms_node,
     finalize_suggestions_node,
+    optimize_suggestions_node,
+    _destination_has_indexes,
     _expand_column_name,
     _is_string_type,
     _recommend_type,
@@ -149,3 +151,32 @@ def test_is_string_type(declared, expected):
 ])
 def test_recommend_type(name, expected):
     assert _recommend_type(name) == expected
+
+
+# Prod 2026-09-26: a Postgres -> GCS pipeline was offered 14 "Add index on ..."
+# tips. An object store has no indexes, the dialog sent the placeholder
+# destination "storage", and a substring test on table-qualified names matched
+# "provider", "paid_at" and every column of a table named *id*/*key*.
+def _optimizations(names, dest):
+    state = {
+        "columns": [{"name": n, "type": "int"} for n in names],
+        "intent": {"destination_type": dest, "operation": "Data pipeline sync"},
+        "optimization_suggestions": [],
+    }
+    return optimize_suggestions_node(state)["optimization_suggestions"]
+
+
+def _indexed(names, dest):
+    return [o["column"] for o in _optimizations(names, dest) if o["type"] == "indexing"]
+
+
+@pytest.mark.parametrize("dest", ["gcs", "GCS", "aws-s3", "azure_blob", "minio", "storage", "unknown", "", None])
+def test_no_index_advice_for_a_destination_without_indexes(dest):
+    assert not _destination_has_indexes(dest)
+    assert _indexed(["users.id", "orders.user_id"], dest) == []
+
+
+def test_index_advice_only_for_real_id_key_columns_on_a_database():
+    assert _destination_has_indexes("postgresql")
+    names = ["users.id", "orders.user_id", "api_keys.key", "users.provider", "orders.paid_at", "customer_ids.email"]
+    assert _indexed(names, "postgresql") == ["users.id", "orders.user_id", "api_keys.key"]

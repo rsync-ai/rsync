@@ -19,6 +19,7 @@ from src.utils.openai_client import (
     make_async_client as _create_async_client,
     client_egress_host as _client_egress_host,
     explorer_llm_configured as _explorer_llm_configured,
+    with_reasoning_headroom,
 )
 from src.utils.llm_gate import require_explorer_llm
 
@@ -252,7 +253,7 @@ async def resolve_tables(request: TableLinkRequest):
             model=EXPLORER_TABLE_LINK_MODEL,
             messages=messages,
             temperature=cfg["parameters"].get("temperature", 0.1),
-            max_tokens=cfg["parameters"].get("max_tokens", 1024),
+            max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
         )
 
         result_text = (response.choices[0].message.content or "").strip()
@@ -331,7 +332,7 @@ async def resolve_columns(request: ColumnLinkRequest):
             model=EXPLORER_COLUMN_LINK_MODEL,
             messages=messages,
             temperature=cfg["parameters"].get("temperature", 0.1),
-            max_tokens=cfg["parameters"].get("max_tokens", 1024),
+            max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 1024)),
         )
 
         result_text = (response.choices[0].message.content or "").strip()
@@ -418,7 +419,7 @@ async def get_next_steps(request: NextStepsRequest):
             model=EXPLORER_NEXT_STEPS_MODEL,
             messages=messages,
             temperature=cfg["parameters"].get("temperature", 0.3),
-            max_tokens=cfg["parameters"].get("max_tokens", 512),
+            max_tokens=with_reasoning_headroom(cfg["parameters"].get("max_tokens", 512)),
         )
 
         result_text = (response.choices[0].message.content or "").strip()

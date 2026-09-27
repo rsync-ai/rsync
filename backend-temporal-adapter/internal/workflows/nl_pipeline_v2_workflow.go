@@ -18,7 +18,7 @@ import (
 // 1. Temporal is the sole state authority (no Kafka-driven state)
 // 2. HITL is implemented as Temporal wait states
 // 3. Intent is cached and never re-executed on resume
-// 4. Activities use request/reply pattern (no KafkaAdapter signals)
+// 4. Activities use request/reply pattern (no Kafka-driven workflow signals)
 // 5. All errors are typed and deterministically handled
 
 const (

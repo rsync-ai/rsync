@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rsync-ai/backend-orchestrator/internal/cdc"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
 	log "github.com/sirupsen/logrus"
 )
@@ -500,4 +501,77 @@ func toInt64(v interface{}) (int64, bool) {
 		return int64(n), true
 	}
 	return 0, false
+}
+
+// UndeliveredVerdict is the producer-side counterpart to SilentDropResult: what
+// the run must report when rows it read from the source never reached the bus.
+type UndeliveredVerdict struct {
+	// Failed is true when the run must not report success.
+	Failed bool
+	// Status is the executor status to report (empty when Failed is false).
+	Status string
+	// Reason is what the operator sees on the failed run.
+	Reason string
+}
+
+// classifyUndelivered turns the executor's produce-failure counters into a verdict.
+//
+// A produce failure is definitive, not ambiguous: the producer is a sarama
+// SyncProducer, so an error means the broker never acknowledged the message after
+// the configured retries. The batch's outbox row is then marked 'failed' — and
+// nothing in this system ever reads a 'failed' outbox row again. sumDispatchedRows
+// counts only ('produced','acked'), there is no reaper, and no code path retries
+// one. The rows are gone.
+//
+// This is checked BEFORE the ack-ledger reconciliation because it needs no ledger
+// and no deadline: producer-side evidence of loss cannot be improved by waiting for
+// acks that were never going to arrive. It also closes the hole that reconciliation
+// alone could not see — when EVERY produce fails, directKafkaMessages,
+// minioFilesCreated and outboxBatches are all 0, so reconcileInputs reported
+// viaSink=false, the whole landing check was skipped, and the run reported success
+// with rows_processed = the full read count and an empty destination.
+//
+// readRows is the run's read+dispatch-attempted count (totalRows), which includes
+// the undelivered rows; undeliveredRows can therefore never legitimately exceed it,
+// and an equal count means the run put nothing at all on the bus.
+func classifyUndelivered(readRows, undeliveredRows int64, undeliveredBatches int) UndeliveredVerdict {
+	if undeliveredRows <= 0 {
+		return UndeliveredVerdict{}
+	}
+	batches := "batch"
+	if undeliveredBatches != 1 {
+		batches = "batches"
+	}
+	if undeliveredRows >= readRows {
+		return UndeliveredVerdict{
+			Failed: true,
+			Status: "silent_drop_detected",
+			Reason: fmt.Sprintf("no data reached the destination lane: all %d row(s) read from source failed to produce to Kafka across %d %s; these rows are not retried (the producer outbox marks them 'failed' and nothing re-reads a failed row) — fix the broker/connectivity error in the logs and re-run",
+				readRows, undeliveredBatches, batches),
+		}
+	}
+	return UndeliveredVerdict{
+		Failed: true,
+		Status: "silent_partial_drop_detected",
+		Reason: fmt.Sprintf("partial data loss: %d of %d row(s) read from source failed to produce to Kafka across %d %s (%.1f%% lost); these rows are not retried (the producer outbox marks them 'failed' and nothing re-reads a failed row) — fix the broker/connectivity error in the logs and re-run",
+			undeliveredRows, readRows, undeliveredBatches, batches,
+			float64(undeliveredRows)*100.0/float64(readRows)),
+	}
+}
+
+// rewindAfterLostBatches puts the checkpoints this run wrote back to where the run
+// started, once the ack ledger proves the sink lost batches. Checkpoints advance
+// when a batch is produced, so without this the lost batches sit behind the
+// checkpoint and a Resume reads nothing (B-RESUME-DLQ). Returns the text appended
+// to the failure reason, telling the user what Resume will now do.
+func rewindAfterLostBatches(ctx context.Context, db *sql.DB, pipelineID, executionID string) string {
+	n, err := cdc.RewindCheckpointsOfExecution(ctx, db, pipelineID, executionID)
+	if err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).Error("could not rewind the checkpoints of a run that lost batches; a Resume may skip the lost rows — run a Reload")
+		return "; the resume position could not be rewound, so run a Reload to re-read every row"
+	}
+	if n == 0 {
+		return ""
+	}
+	return fmt.Sprintf("; %d table(s) were rewound to where this run started, so Resume re-reads the lost rows", n)
 }

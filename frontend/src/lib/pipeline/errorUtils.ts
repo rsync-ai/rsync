@@ -51,11 +51,3 @@ export function extractErrorMessage(state: PipelineStateError): string | null {
 
   return null
 }
-
-/**
- * Check if pipeline state has any error
- */
-export function hasError(state: PipelineStateError): boolean {
-  return extractErrorMessage(state) !== null
-}
-

@@ -104,10 +104,24 @@ func chatStub(t *testing.T, delay time.Duration, intentContent, helpContent stri
 	return called
 }
 
-// The canned fallback handleNewIntent returns when parseIntent fails. This
-// sentence is the entire user-visible symptom of defect F, and before this file
-// no test in either repo mentioned it.
+// The canned fallback handleNewIntent used to return when parseIntent failed.
+// This sentence was the entire user-visible symptom of defect F, and it read as
+// the assistant ignoring the question. It must never come back.
 const cannedIntentFallbackPrefix = "I can help you move data between systems."
+
+// isLLMUnavailableReply reports whether resp is the reply handleNewIntent gives
+// when parseIntent fails for any reason other than "no LLM set up", and not the
+// old canned examples.
+func isLLMUnavailableReply(resp ChatMessageResponse) bool {
+	flagged, _ := resp.Data["llm_unavailable"].(bool)
+	return flagged && !strings.HasPrefix(resp.Message, cannedIntentFallbackPrefix)
+}
+
+// llmUnavailableReason is the "reason" an llm-unavailable reply carries.
+func llmUnavailableReason(resp ChatMessageResponse) string {
+	reason, _ := resp.Data["reason"].(string)
+	return reason
+}
 
 func newIntentTestContext(t *testing.T) *gin.Context {
 	t.Helper()
@@ -177,8 +191,8 @@ func TestNonCanonicalPhrasingsMissEveryRegexFastPath(t *testing.T) {
 // The configured deadline must reach the actual outbound request, not merely be
 // returned by llmServiceTimeout(). Proven the only way that does not need a
 // 60-100s CPU inference: a stub slower than a deliberately short deadline must
-// produce the canned fallback, and the same stub under the default deadline must
-// produce the model's real answer.
+// produce the model-did-not-answer reply, and the same stub under the default
+// deadline must produce the model's real answer.
 //
 // Re-hard-coding either literal in parseIntent back to 10*time.Second makes the
 // first subtest fail -- the 1s deadline stops biting.
@@ -187,7 +201,7 @@ func TestConfiguredDeadlineReachesTheRequestForANonCanonicalMessage(t *testing.T
 	const msg = "can you move everything from our orders database over to the lake"
 	const stubDelay = 1500 * time.Millisecond
 
-	t.Run("a deadline shorter than inference yields the canned fallback", func(t *testing.T) {
+	t.Run("a deadline shorter than inference says the model timed out", func(t *testing.T) {
 		t.Setenv("LLM_SERVICE_TIMEOUT_SECONDS", "1")
 		called := chatStub(t, stubDelay, fencedIntent, fencedHelp)
 
@@ -197,10 +211,13 @@ func TestConfiguredDeadlineReachesTheRequestForANonCanonicalMessage(t *testing.T
 		if len(called.snapshot()) == 0 {
 			t.Fatal("llm-service was never called: a regex fast path swallowed the message")
 		}
-		if !strings.HasPrefix(resp.Message, cannedIntentFallbackPrefix) {
+		if !isLLMUnavailableReply(resp) || llmUnavailableReason(resp) != "timeout" {
 			t.Errorf("a 1s deadline against a %v reply did not time out; the configured\n"+
 				"deadline is not reaching the request (a hard-coded literal is back).\n"+
-				"got reply: %q", stubDelay, resp.Message)
+				"got reply: %q data: %v", stubDelay, resp.Message, resp.Data)
+		}
+		if !strings.Contains(resp.Message, "didn't answer within 1s") {
+			t.Errorf("the timeout reply does not name the deadline that fired: %q", resp.Message)
 		}
 	})
 
@@ -214,8 +231,8 @@ func TestConfiguredDeadlineReachesTheRequestForANonCanonicalMessage(t *testing.T
 		if len(called.snapshot()) == 0 {
 			t.Fatal("llm-service was never called: a regex fast path swallowed the message")
 		}
-		if strings.HasPrefix(resp.Message, cannedIntentFallbackPrefix) {
-			t.Fatalf("the default deadline produced the canned fallback for a %v reply", stubDelay)
+		if isLLMUnavailableReply(resp) || strings.HasPrefix(resp.Message, cannedIntentFallbackPrefix) {
+			t.Fatalf("the default deadline gave up on a %v reply: %q", stubDelay, resp.Message)
 		}
 	})
 }
@@ -224,7 +241,7 @@ func TestConfiguredDeadlineReachesTheRequestForANonCanonicalMessage(t *testing.T
 // isolation: a non-canonical message must come back as the model's own answer.
 // Both chat prompts on this route fence their JSON here, so dropping
 // llmjson.ExtractObject at either the parseIntent or the callHelpResponseLLM
-// site turns this into the canned/generic reply.
+// site turns this into the model-did-not-answer reply.
 func TestNonCanonicalMessageGetsTheModelsAnswerThroughTheWholeRoute(t *testing.T) {
 	pinNoCatalogDB(t)
 	const msg = "can you move everything from our orders database over to the lake"
@@ -243,8 +260,8 @@ func TestNonCanonicalMessageGetsTheModelsAnswerThroughTheWholeRoute(t *testing.T
 		t.Fatalf("prompts called = %v, want [chat/intent_classification chat/help_response]", names)
 	}
 
-	if strings.HasPrefix(resp.Message, cannedIntentFallbackPrefix) {
-		t.Fatalf("fenced intent reply produced the canned fallback: %q", resp.Message)
+	if isLLMUnavailableReply(resp) || strings.HasPrefix(resp.Message, cannedIntentFallbackPrefix) {
+		t.Fatalf("fenced intent reply was treated as a failed model call: %q", resp.Message)
 	}
 	if resp.Message != realHelpAnswer {
 		t.Errorf("reply = %q, want the model's own answer %q", resp.Message, realHelpAnswer)

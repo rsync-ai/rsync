@@ -105,10 +105,12 @@ services:
   # nothing is stored — the supported story here is `docker compose logs`.
 
   # Read-only Docker socket proxy. Lets api-gateway surface LIVE MCP container
-  # status (docker_status=running, port) without mounting the raw socket or
-  # running as root — it can only GET /containers/json (POST disabled). Wired
-  # via MCP_DOCKER_API_URL on api-gateway. Prod defines its own copy for Traefik
-  # in docker-compose.prod.yml; this base copy also serves api-gateway locally.
+  # status (docker_status=running, port), and lets the orchestrator's sentinel tell
+  # a connector this host never deployed from one that is deployed and broken —
+  # both without mounting the raw socket or running as root, since it can only GET
+  # /containers/json (POST disabled). Wired via MCP_DOCKER_API_URL on both. Prod
+  # defines its own copy for Traefik in docker-compose.prod.yml; this base copy
+  # also serves api-gateway and the orchestrator locally.
   docker-socket-proxy:
     # Pinned, not `latest`. This container IS the docker-socket boundary, and `latest`
     # moved v0.4.2 -> v0.5.0 on 2026-07-27 with no change on our side; deploy-service.sh
@@ -226,8 +228,26 @@ services:
       # (kafka-connect, producer side) and the kafka-sink-worker ReaderConfig.MaxBytes
       # (consumer side, which must exceed this). Topics inherit this broker default.
       KAFKA_MESSAGE_MAX_BYTES: 15728640
+      # Retention policy for topics rsync does NOT create itself.
+      #
+      # This is not redundant with kafka/topology.go: Debezium auto-creates the
+      # rsync.cdc-* topics before the orchestrator's topology manager would, so
+      # those topics carry NO per-topic overrides and take whatever the broker
+      # says. Verified on the GCP host 2026-09-23 — `kafka-configs.sh --describe`
+      # returns an empty dynamic config set for the live CDC topic, so the code's
+      # values had never applied to it. This line is therefore the only place the
+      # 7-day policy actually reaches them.
+      #
+      # 168h/delete matches Apache's own defaults, so this changes no behaviour
+      # today. It pins it: an image whose defaults differ can no longer silently
+      # re-open the unbounded-growth hole that fills the disk and stops BOTH data
+      # planes. Topics rsync creates explicitly still carry their own config, and
+      # the one deliberate never-expire exception (the Debezium schema-history
+      # topic) sets retention.ms=-1 per topic and overrides this.
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_CLEANUP_POLICY: 'delete'
       CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
-      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m -XX:+ExitOnOutOfMemoryError"
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
@@ -237,7 +257,8 @@ services:
       retries: 5
       start_period: 60s
 
-  # One-shot topic bootstrapper for the agentic architecture.
+  # One-shot bootstrapper for the platform topics (pipeline.domain.events,
+  # pii.scan.request, pii.scan.response); see scripts/kafka-init-new-topics.sh.
   # Ensures test suites that expect topics to exist are deterministic.
   kafka-init:
     image: apache/kafka:3.7.0
@@ -364,7 +385,7 @@ services:
   
   # Temporal Server
   temporal:
-    image: temporalio/auto-setup:1.22.4
+    image: temporalio/auto-setup:1.22.7
     container_name: temporal
     logging:
       driver: json-file
@@ -413,7 +434,7 @@ services:
 
   # Temporal Admin Tools
   temporal-admin-tools:
-    image: temporalio/admin-tools:1.22.4
+    image: temporalio/admin-tools:1.22.7
     container_name: temporal-admin-tools
     logging:
       driver: json-file
@@ -445,8 +466,6 @@ services:
         # Other half of docker-compose.byo-kafka.yml — see that file's header:
         # profiles: without required:false = "depends on undefined service".
         required: false
-      fluent-bit:
-        condition: service_started
     environment:
       # Kafka client security for a BYO/managed broker. See x-kafka-security at
       # the top of this file; every key defaults to empty and empty means unset,
@@ -484,7 +503,7 @@ services:
       # OpenTelemetry
       OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
       OTEL_SERVICE_NAME: "temporal-adapter"
-      OTEL_ENABLED: "true"
+      OTEL_ENABLED: "${OTEL_ENABLED:-false}"
     ports:
       - "127.0.0.1:${RSYNC_HP_TEMPORAL_ADAPTER:-8082}:8082"
     volumes:
@@ -697,7 +716,7 @@ services:
       CONNECT_CONFIG_PROVIDERS_FILE_PARAM_ALLOWED_PATHS: "/connect-secrets"
 
       # JVM heap (avoid OOM exit 137 on dev machines)
-      KAFKA_HEAP_OPTS: "-Xms256M -Xmx768M"
+      KAFKA_HEAP_OPTS: "-Xms256M -Xmx768M -XX:+ExitOnOutOfMemoryError"
 
     volumes:
       # Read-only: the worker only RESOLVES secrets that debezium-mcp writes.
@@ -771,10 +790,18 @@ services:
   # Without this, minio-mcp and kafka-mcp-sink fall back to chunked inline Kafka writes.
   minio:
     # Pinned: an unpinned object store silently changes under a re-pull, and this one
-    # holds staged pipeline data. Digest-identical to `latest` at the time of pinning.
-    # quay.io, not Docker Hub: docker.io/minio/* stopped serving anonymous pulls
-    # (2026-09-12). Same release tag, byte-identical manifest digest.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # holds staged pipeline data. Pinned by digest because cgr.dev/chainguard serves
+    # only `latest` (and `latest-dev`) anonymously, so a digest is the only pin there is.
+    # Chainguard's build, not MinIO's: MinIO withdrew anonymous pulls from
+    # docker.io/minio/* (2026-09-12) and then from quay.io/minio/* (401). One multi-arch
+    # image carries both `minio` (its entrypoint) and `mc`, so the healthcheck below
+    # and minio-lifecycle-init use it too. It has no curl: health checks go through mc.
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    # Root, like the image this replaces. A volume written by v0.1.5 is root-owned
+    # 0755, and this image's default user (65532) cannot write it: the server exits
+    # "Unable to write to the backend" and restarts forever, and everything that
+    # waits on its health never starts.
+    user: "0:0"
     container_name: rsync-ai-minio
     logging:
       driver: json-file
@@ -808,10 +835,11 @@ services:
   # for hours/days on a multi-million-row backfill, so the old 2-day default was
   # SHORTER than retention and opened a loss window — default raised to 7 days.
   minio-lifecycle-init:
-    # Pinned for the same reason as the minio server above; mc writes the lifecycle rule.
-    # quay.io, not Docker Hub, for the same reason as the server image above:
-    # docker.io/minio/* no longer serves anonymous pulls.
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    # The server image above, same digest, for the same reasons; mc writes the
+    # lifecycle rule. Chainguard's mc-only image is distroless (no /bin/sh for the
+    # entrypoint below), so the server image, which ships both, serves here too.
+    # No `user:` needed: nothing here writes the data volume.
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
     container_name: rsync-ai-minio-lifecycle-init
     logging:
       driver: json-file
@@ -879,6 +907,14 @@ services:
       - MINIO_REGION=${MINIO_REGION:-us-east-1}
       - MINIO_BUCKET=${MINIO_BUCKET:-pipeline-data}
       - MINIO_PREFIX=${MINIO_PREFIX:-staging}
+      # Same class of silent disagreement as RSYNC_LLM_DIAGNOSER_ENABLED above:
+      # connector.py:36 reads RSYNC_CLAIM_CHECK_GZIP, and no compose file passed
+      # it through, so an operator who set it in .env got plain JSON and no error
+      # said why. Default stays empty (= off), so wiring it changes nothing until
+      # someone sets it deliberately. The reader is flag-INDEPENDENT magic-byte
+      # autodetect, so turning it on mid-flight still reads back legacy plain
+      # objects -- it is safe to flip without draining staging.
+      - RSYNC_CLAIM_CHECK_GZIP=${RSYNC_CLAIM_CHECK_GZIP:-}
     depends_on:
       minio:
         condition: service_healthy
@@ -923,6 +959,12 @@ services:
       # switch. Raising it opens more concurrent connections to the DESTINATION, which
       # is somebody else's database — 4 is deliberately modest.
       RSYNC_SINK_FLUSH_LANES: ${RSYNC_SINK_FLUSH_LANES:-}
+      # Mirror of the orchestrator's schema-drift switch. The sink worker reports the
+      # columns CDC adds on its own to rsync.healer.schema-changes only when this is
+      # "true" (newSchemaDriftWriter); off, it writes nothing there, because the
+      # orchestrator then neither creates nor consumes that topic. Must stay
+      # byte-identical to the orchestrator line; a census test pins it.
+      RSYNC_SCHEMA_DRIFT_ENABLED: "${RSYNC_SCHEMA_DRIFT_ENABLED:-false}"
       MCP_PORT: "8000"
       MCP_HTTP_MODE: "true"
       DOCKER_CONTAINER: "true"
@@ -1017,9 +1059,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
-    depends_on:
-      fluent-bit:
-        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
     logging:
@@ -1073,26 +1112,21 @@ services:
       args: *build-info
     container_name: rsync-ai-orchestrator
     restart: unless-stopped
+    # How long `docker compose stop/down/restart` waits after SIGTERM before it
+    # SIGKILLs, which skips every deferred Stop/Close in main.go. Left unset,
+    # the daemon decides: 10 s on Docker Engine, 1 s on the Docker Desktop
+    # (engine 28.5.1) this was measured on. Shutdown drains HTTP for up to
+    # 10 s, then gives the Kafka consumer groups up to 15 s to leave
+    # (consumerCloseTimeout in backend-orchestrator/internal/kafka/manager.go),
+    # on top of the agents' own Stop calls; an idle dev stack takes 3-9 s.
+    # backend-orchestrator/internal/kafka/stop_grace_test.go pins this value
+    # and its copies in docker-compose.quickstart.yml and the Helm chart.
+    stop_grace_period: 45s
     deploy:
       # SCALING:
-      #   Each agent topic (agent.control.commands.<type>) is created with
-      #   3 partitions (see docker-compose.quickstart.yml:486 and the topic
-      #   provisioner). Multiple orchestrator replicas in the same consumer
-      #   group safely split partitions, so this service scales horizontally
-      #   up to 3 replicas with no code changes.
-      #
-      #   Static membership is OPT-IN via KAFKA_STATIC_MEMBERSHIP=true and
-      #   derives instance_id from $HOSTNAME (unique per pod), so it does
-      #   not block scaling either — it just reduces rebalance churn on
-      #   restarts.
-      #
-      #   Producer-side: temporal-adapter publishes to per-agent topics
-      #   keyed by pipeline_id (see publishAgentCommand), so all commands
-      #   for the same pipeline land on the same partition → ordering is
-      #   preserved across replicas.
-      #
-      #   To scale beyond 3 replicas, increase partition count on each
-      #   agent.control.commands.<type> topic (kafka-topics --alter ...).
+      #   One replica. Static membership is OPT-IN via
+      #   KAFKA_STATIC_MEMBERSHIP=true and derives instance_id from $HOSTNAME
+      #   (unique per pod); it only reduces rebalance churn on restarts.
       replicas: 1
     ports:
       - "127.0.0.1:${RSYNC_HP_ORCHESTRATOR:-8081}:8080" # Internal port for debugging
@@ -1211,6 +1245,15 @@ services:
       TOOLS_DIR: "/app/shared/mcp-connectors"
       # Self-healing MCP deployment (tool-generator has Docker access via docker.sock)
       TOOL_GENERATOR_URL: "http://tool-generator:5010"
+      # Sentinel core-service probes (sentinel/service_probes.go). Each is probed only
+      # when its address is set; after 3 failed 30s checks the service is recorded
+      # unhealthy and every admin gets an INFRASTRUCTURE_DOWN alert. Redis is always
+      # probed, at the address the correlation client uses. TEMPORAL_ADDRESS is also the
+      # (parked) native Temporal worker's dial address, whose default is this same value.
+      TEMPORAL_ADDRESS: "temporal:7233"
+      SENTINEL_PROBE_TEMPORAL_ADAPTER_URL: "http://temporal-adapter:8082"
+      SENTINEL_PROBE_CONNECTOR_DEPLOYER_URL: "http://connector-deployer:5011"
+      SENTINEL_PROBE_LLM_SERVICE_URL: "http://llm-service:5000"
       # Redis Configuration (State Store)
       REDIS_HOST: "redis"
       REDIS_PORT: "6379"
@@ -1233,7 +1276,7 @@ services:
       # OpenTelemetry Configuration (exports to the bundled OTel Collector)
       OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
       OTEL_SERVICE_NAME: "orchestrator"
-      OTEL_ENABLED: "true"
+      OTEL_ENABLED: "${OTEL_ENABLED:-false}"
       OTEL_TRACES_EXPORTER: "otlp"
       OTEL_METRICS_EXPORTER: "otlp"
       # Enable Debezium topic consumer that emits "captured" CDC table stats
@@ -1262,6 +1305,18 @@ services:
       # Hard per-table runaway ceiling (rows). Empty/0 = unlimited; the chunk loop
       # runs to natural EOF. Set >0 only to bound a suspected pagination bug.
       EXECUTOR_TABLE_MAX_ROWS: "${EXECUTOR_TABLE_MAX_ROWS:-}"
+      # Which MCP connector containers exist on THIS host, for sentinel's connector
+      # health sweep (see the docker-socket-proxy service above). The sweep used to
+      # infer "not deployed here" from a name failing to resolve, which is only sound
+      # on a resolver that answers an unknown name with a clean NXDOMAIN. On a GCP VM
+      # it is not: /etc/resolv.conf carries `search ....internal` with ndots:0, Docker's
+      # resolver forwards those variants upstream, and one non-NXDOMAIN answer left
+      # every undeployed connector looking like a fault — 18 of them on prod. The
+      # Docker API needs no resolver semantics, and `all=true` additionally tells a
+      # stopped container (a real fault) from one that was never here, which DNS
+      # cannot. Unset (quickstart/self-host runs no proxy) → the resolver fallback,
+      # which now records nothing rather than guessing.
+      MCP_DOCKER_API_URL: "http://docker-socket-proxy:2375"
     depends_on:
       postgres:
         condition: service_healthy
@@ -1275,7 +1330,8 @@ services:
         required: false
       redis:
         condition: service_healthy
-      fluent-bit:
+      # Read-only Docker socket proxy for the connector-deployment census above.
+      docker-socket-proxy:
         condition: service_started
     networks:
       - default
@@ -1407,7 +1463,7 @@ services:
       # OpenTelemetry Configuration (exports to the bundled OTel Collector)
       OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
       OTEL_SERVICE_NAME: "api-gateway"
-      OTEL_ENABLED: "true"
+      OTEL_ENABLED: "${OTEL_ENABLED:-false}"
       OTEL_TRACES_EXPORTER: "otlp"
       OTEL_METRICS_EXPORTER: "otlp"
       # Monitoring UI feature flags (V1)
@@ -1435,8 +1491,6 @@ services:
       temporal:
         condition: service_healthy
       orchestrator:
-        condition: service_started
-      fluent-bit:
         condition: service_started
       # Read-only Docker socket proxy for live MCP container status.
       docker-socket-proxy:
@@ -1517,14 +1571,11 @@ services:
       # OpenTelemetry Configuration (exports to the bundled OTel Collector)
       OTEL_EXPORTER_OTLP_ENDPOINT: otel-collector:4317
       OTEL_SERVICE_NAME: llm-service
-      OTEL_ENABLED: "true"
+      OTEL_ENABLED: "${OTEL_ENABLED:-false}"
       OTEL_TRACES_EXPORTER: otlp
       OTEL_METRICS_EXPORTER: otlp
     # No host port exposed - accessed internally by planner/tool-generator via Docker network
     command: ["python", "-m", "src.gateway.main"]
-    depends_on:
-      fluent-bit:
-        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
     logging:
@@ -1557,6 +1608,10 @@ services:
       - ENVIRONMENT=development
       - LOG_FORMAT=json
       - LOG_LEVEL=info
+      # Rotation for the connector containers THIS service creates -- compose's
+      # `logging:` blocks only reach the services compose itself starts.
+      - RSYNC_LOG_MAX_SIZE=${RSYNC_LOG_MAX_SIZE:-10m}
+      - RSYNC_LOG_MAX_FILE=${RSYNC_LOG_MAX_FILE:-3}
       # S2S shared secret — callers send it as X-Internal-Secret. Unset in dev =>
       # the deployer allows with a warning (CONTRACT auth table); the prod overlay
       # fail-closes it with :? (mirrors the MinIO C3 pattern).
@@ -1568,6 +1623,10 @@ services:
       # here, so the also-join is a no-op (matches tool-generator's prior
       # MCP_SHARED_NETWORK default of rsync-ai-mcp).
       - MCP_SHARED_NETWORK=${STACK_PREFIX:-rsync-ai}-mcp
+      # Connector container-name prefix (<STACK_PREFIX>-<id>-vX-Y-Z-mcp). Without it
+      # an isolated stack's compose-managed connectors are not recognised as
+      # protected, so a stopped one can never be restarted.
+      - STACK_PREFIX=${STACK_PREFIX:-rsync-ai}
       # Named volume for the OAuth TokenManager, mounted at /root/.rsync-ai below.
       # SAME value tool-generator passed to connectors (docker_builder.py default),
       # so persisted connector OAuth tokens survive the tool-generator → deployer move.
@@ -1597,8 +1656,6 @@ services:
       - ./docker-compose.mcp.yml:/app/docker-compose.mcp.yml:ro
       # The SAME OAuth TokenManager volume tool-generator used, for token persistence.
       - tool_generator_oauth_tokens:/root/.rsync-ai
-    depends_on:
-      - fluent-bit
     logging:
       driver: json-file
       options:
@@ -1693,10 +1750,13 @@ services:
       # workaround is obsolete now that kafka-mcp-sink bridges into rsync-ai-mcp
       # (see its networks: block above).
       - DOCKER_NETWORK=${STACK_PREFIX:-rsync-ai}-mcp
-      # OpenTelemetry Configuration (exports to the bundled OTel Collector)
+      # Connector container-name prefix: the orchestrator looks for
+      # <STACK_PREFIX>-<id>-vX-Y-Z-mcp, so /v1/deploy must start that name.
+      - STACK_PREFIX=${STACK_PREFIX:-rsync-ai}
+      # OpenTelemetry Configuration (off by default; set OTEL_ENABLED=true to export to your own collector)
       - OTEL_EXPORTER_OTLP_ENDPOINT=otel-collector:4317
       - OTEL_SERVICE_NAME=tool-generator
-      - OTEL_ENABLED=true
+      - OTEL_ENABLED=${OTEL_ENABLED:-false}
       - OTEL_TRACES_EXPORTER=otlp
       - OTEL_METRICS_EXPORTER=otlp
     # No host port — tool-generator is internal only, accessed via api-gateway
@@ -1730,8 +1790,6 @@ services:
       llm-service:
         condition: service_started
       context7-mcp:
-        condition: service_started
-      fluent-bit:
         condition: service_started
       connector-deployer:
         condition: service_started
@@ -1779,17 +1837,12 @@ services:
       # an explicit empty value means "disable" (keep pre-prefix topic names) and
       # `:-` would silently turn that back into the default.
       KAFKA_TOPIC_PREFIX: "${KAFKA_TOPIC_PREFIX-rsync.}"
-      ENABLE_KAFKA_CONSUMER: "false"
       # JIT Integration: Planner needs access to check connector existence
       CONNECTORS_DIR: "/app/shared/mcp-connectors"
-      # Serialization (Demo-2 default: JSON; Schema Registry is optional behind a profile)
-      KAFKA_USE_AVRO: "false"
-      SCHEMA_REGISTRY_URL: "http://schema-registry:8080"
-      AVRO_AUTO_REGISTER_SCHEMAS: "false"
-      # OpenTelemetry Configuration (exports to the bundled OTel Collector)
+      # OpenTelemetry Configuration (off by default; set OTEL_ENABLED=true to export to your own collector)
       OTEL_EXPORTER_OTLP_ENDPOINT: "otel-collector:4317"
       OTEL_SERVICE_NAME: "planner"
-      OTEL_ENABLED: "true"
+      OTEL_ENABLED: "${OTEL_ENABLED:-false}"
       OTEL_TRACES_EXPORTER: "otlp"
       OTEL_METRICS_EXPORTER: "otlp"
       # Sent to the orchestrator's /api/v1/topology (strategies.py), which
@@ -1816,8 +1869,6 @@ services:
         # Other half of docker-compose.byo-kafka.yml — see that file's header:
         # profiles: without required:false = "depends on undefined service".
         required: false
-      fluent-bit:
-        condition: service_started
     extra_hosts:
       - "host.docker.internal:host-gateway"
     logging:
@@ -1863,7 +1914,6 @@ services:
       - NEXT_PUBLIC_FEATURE_MONITORING_TRACES=true
     depends_on:
       - api-gateway
-      - fluent-bit
     extra_hosts:
       - "host.docker.internal:host-gateway"
     logging:
@@ -1871,105 +1921,8 @@ services:
       options:
         max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
-
-  # ============================================
-  # OBSERVABILITY - LOG COLLECTOR & OTEL
-  # ============================================
-  
-  # Fluent Bit for Docker log collection.
-  #
-  # Every service in this stack now writes json-file, so fluent-bit collects
-  # them by TAILING /var/lib/docker/containers rather than receiving pushes on
-  # 24224. The forward input is kept for a third-party container that opts into
-  # the fluentd driver itself, but nothing rsync ships uses it any more.
-  #
-  # Why the stack moved off the fluentd driver -- NOT because `docker logs`
-  # was broken. Docker writes to its local cache as well as to the remote
-  # driver, so `docker logs` worked the whole time (verified on Docker 28.5.1:
-  # a throwaway container with driver=fluentd + fluentd-async=true still
-  # replayed every line, exit 0). The reasons are:
-  #
-  #   1. `fluentd-address: localhost:24224` is a push to a collector that a
-  #      self-host box does not run -- the quickstart compose ships no
-  #      fluent-bit at all -- and `fluentd-async: "true"` turns that into a
-  #      SILENT failure: the daemon buffers instead of refusing to start.
-  #   2. The fluentd driver takes no max-size/max-file, so its local cache is
-  #      whatever the daemon default is. Unbounded log growth is the measured
-  #      failure mode here, not a theoretical one: rsync-ai-otel-collector was
-  #      found at 106 MB with driver=json-file and options={} -- no cap at all.
-  #      Every service in this file now carries an explicit bounded block, so
-  #      the worst case is max-size x max-file per container and nothing on the
-  #      box can silently eat the disk.
-  #   3. Parity with the 21 MCP connectors, which #790 already moved to
-  #      json-file for exactly these reasons.
-  #
-  # Trade-off, recorded rather than hidden: the fluentd driver carried a clean
-  # `tag: <service>`, and the tail path tags by container-log PATH instead, so a
-  # deployment that does forward to a backend gets a less readable service
-  # label. Bounded disk on an unattended self-host box is the requirement that
-  # wins, and no telemetry backend ships with this bundle, so nothing is losing
-  # a label it was using.
-  fluent-bit:
-    image: fluent/fluent-bit:2.2
-    container_name: rsync-ai-fluent-bit
-    logging:
-      driver: json-file
-      options:
-        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
-        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
-    volumes:
-      - ./deploy/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
-      - ./deploy/parsers.conf:/fluent-bit/etc/parsers.conf:ro
-      # Read-only source for the tail input: containers on the json-file driver
-      # (the MCP connectors) are collected from disk instead of pushing over
-      # 24224. Writable sibling for the tail DB so restarts resume at the last
-      # offset rather than replaying every log on the box.
-      - /var/lib/docker/containers:/var/lib/docker/containers:ro
-      - fluentbit_state:/var/log/flb-state
-    ports:
-      - "127.0.0.1:${RSYNC_HP_FLUENT:-24224}:24224"
-      - "127.0.0.1:${RSYNC_HP_FLUENT:-24224}:24224/udp"
-    depends_on:
-      - otel-collector
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
-
-  # OpenTelemetry Collector for trace-log correlation
-  # Receives logs from fluent-bit and maps trace context for an OTLP backend
-  otel-collector:
-    # 0.111.0: OTTL `set(trace_id.string, ...)` reliably promotes parsed log
-    # attributes into the typed LogRecord trace_id/span_id fields (no-op in 0.92).
-    # Required for trace↔log correlation downstream. F-Obs-2.
-    image: otel/opentelemetry-collector-contrib:0.111.0
-    container_name: rsync-ai-otel-collector
-    logging:
-      driver: json-file
-      options:
-        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
-        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
-    command: ["--config=/etc/otel-collector-config.yaml"]
-    environment:
-      # Where this collector ships all telemetry (logs/traces/metrics). No
-      # telemetry backend ships with this repo — point OTLP_BACKEND_ENDPOINT at
-      # one you run yourself (e.g. 10.0.0.20:4317) in the root .env. The
-      # collector config reads ${env:OTLP_BACKEND_ENDPOINT}; this compose default
-      # guarantees it is never empty, and with nothing listening on the host the
-      # exports simply fail and are dropped.
-      - OTLP_BACKEND_ENDPOINT=${OTLP_BACKEND_ENDPOINT:-host.docker.internal:4317}
-    volumes:
-      - ./deploy/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
-    ports:
-      - "127.0.0.1:${RSYNC_HP_OTEL_GRPC:-14317}:4317"  # OTLP gRPC receiver (avoid conflict with a local collector)
-      - "127.0.0.1:${RSYNC_HP_OTEL_HTTP:-14318}:4318"  # OTLP HTTP receiver  
-      - "127.0.0.1:${RSYNC_HP_OTEL_FLUENTFWD:-8006}:8006"   # Fluentforward receiver
-      - "127.0.0.1:${RSYNC_HP_OTEL_HEALTH:-13133}:13133" # Health check
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    restart: unless-stopped
 
 volumes:
-  fluentbit_state:
   postgres_data:
   kafka_data:
   redis_data:

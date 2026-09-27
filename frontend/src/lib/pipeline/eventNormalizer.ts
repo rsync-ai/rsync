@@ -213,6 +213,42 @@ export function healSucceeded(a: HealerActivity): boolean {
 }
 
 /**
+ * Verdicts that close an escalation. The verifier grades EVERY decision, a
+ * hand-off to a person included (worker.go Attempts.Record, verifier.go Verify):
+ * `healed` / `self_resolved` mean the pipeline recovered, and `failed_again` /
+ * `superseded` mean a newer failure took over, which gets a decision of its own.
+ * Only `inconclusive` (nothing ran since, or the run was stopped) and no verdict
+ * yet leave it waiting on a person.
+ */
+const SETTLING_VERDICTS = new Set(["healed", "self_resolved", "superseded", "failed_again"])
+
+/**
+ * The escalations and approval requests still waiting on a person.
+ *
+ * "N need you" used to count every one in the pipeline's history, so a pipeline
+ * that recovered days ago still read "2 need you". A decision is joined to its
+ * verdict by `attemptId`. A decision written before it carried one cannot be
+ * joined, so it stays open only while it is the healer's latest word on this
+ * pipeline: anything newer means the healer has looked again since.
+ *
+ * `activity` is newest first, as extractHealerActivity returns it.
+ */
+export function openEscalations(activity: HealerActivity[]): HealerActivity[] {
+  const settled = new Set(
+    activity.flatMap((a) =>
+      a.kind === "verdict" && a.attemptId && SETTLING_VERDICTS.has(a.verdict || "") ? [a.attemptId] : []
+    )
+  )
+  const newest = activity[0]
+  return activity.filter((a) => {
+    if (a.kind !== "decision") return false
+    if (a.outcome !== "escalated" && a.outcome !== "hitl_requested") return false
+    if (a.attemptId) return !settled.has(a.attemptId)
+    return a === newest
+  })
+}
+
+/**
  * Extract every self-healing event, newest first.
  *
  * Deliberately tolerant: an event whose payload is missing the fields this
@@ -317,8 +353,8 @@ export const STATUS_EVENT_TYPES = [
 const STATUS_EVENT_TYPE_SET = new Set<string>(STATUS_EVENT_TYPES)
 
 // Two copies of one transition are emitted within moments of each other; a real
-// retry of the same stage is separated by a different transition (FAILED ->
-// STARTED), so it is never collapsed by the "same type as the last kept" test.
+// retry of the same stage is separated by the end of the attempt before it
+// (STARTED -> FAILED -> STARTED), so it is never collapsed (`isAttemptBoundary`).
 const LIFECYCLE_DUPLICATE_WINDOW_MS = 120_000
 
 const CANONICAL_STAGE: Record<string, string> = {
@@ -428,14 +464,65 @@ function hasHumanTitle(e: StageLifecycleEvent): boolean {
   return Boolean(e.payload?.summary || e.payload?.message || e.payload?.stage_summary)
 }
 
+// The orchestrator stamped its lifecycle events to the whole second until
+// 2026-09-25 (progress_events.go, RFC3339), and those rows stay in the history.
+// Such a time is a floor: the transition happened somewhere in the second after
+// it. So the orchestrator's end of a sub-second stage (14:58:25Z) sorts before
+// the adapter's start of the same stage (14:58:25.368Z), and read in that order
+// the adapter's start looked like a second attempt: "Retry 2/2" on five stages
+// that each ran once (prod pipeline c228373b).
+const WHOLE_SECOND_SLOP_MS = 1000
+const WHOLE_SECOND_TIME = /T\d{2}:\d{2}:\d{2}(?:Z|[+-]\d{2}:?\d{2})$/
+
+function isWholeSecond(e: StageLifecycleEvent): boolean {
+  return WHOLE_SECOND_TIME.test(String(e.occurred_at || e.received_at || "").trim())
+}
+
+/**
+ * Whether `b` may really have happened after `e` though it sorts before it: `b`
+ * is a whole-second floor and `e`, precisely stamped, falls inside that second.
+ * Two whole-second rows are one producer's and their seq orders them, so the
+ * order between those is kept.
+ */
+function mayFollow(b: StageLifecycleEvent, e: StageLifecycleEvent): boolean {
+  if (!isWholeSecond(b) || isWholeSecond(e)) return false
+  const d = eventTime(e) - eventTime(b)
+  return d >= 0 && d < WHOLE_SECOND_SLOP_MS
+}
+
+/** A start closes nothing but an end; an end closes nothing but a start. */
+function isAttemptBoundary(type: string, between: string): boolean {
+  return type === "STAGE_STARTED" ? between !== "STAGE_STARTED" : between === "STAGE_STARTED"
+}
+
+/**
+ * When the collapsed row happened. A start is timed from its first report and
+ * an end from its last: the producers report one transition seconds apart, and
+ * taking the earlier end timed Executing at 33.3s where the Overview (last
+ * completion) said 36.5s. A whole-second floor loses to a precise report inside
+ * that second, which is the better reading of the same moment.
+ */
+function collapsedTime(type: string, kept: StageLifecycleEvent, e: StageLifecycleEvent): string | undefined {
+  if (mayFollow(kept, e)) return e.occurred_at || kept.occurred_at
+  return type === "STAGE_STARTED" ? kept.occurred_at || e.occurred_at : e.occurred_at || kept.occurred_at
+}
+
 /**
  * Collapse the two producers' copies of one stage transition into one row,
  * returning events in chronological order. Non-lifecycle events pass through.
+ *
+ * A copy joins the last kept row of its type for the stage unless an attempt
+ * ended or began in between: a STAGE_FAILED (or STAGE_COMPLETED) between two
+ * starts makes the second a retry, and a start between two ends makes the
+ * second a new attempt's end. The other producer's copy of the neighbouring
+ * transition does not count as in between when only its whole-second floor put
+ * it there (`mayFollow`).
  */
 export function dedupeStageLifecycleEvents<T extends StageLifecycleEvent>(events: T[]): T[] {
   const sorted = [...events].sort(compareRunEventsAsc)
   const out: T[] = []
-  const lastKept = new Map<string, { index: number; type: string; at: number }>()
+  // Indexes into `out` of each stage's kept lifecycle rows, oldest first.
+  const keptByStage = new Map<string, number[]>()
   let retimed = false
   for (const e of sorted) {
     const type = String(e.event_type || "").toUpperCase()
@@ -444,24 +531,36 @@ export function dedupeStageLifecycleEvents<T extends StageLifecycleEvent>(events
       continue
     }
     const key = `${e.execution_id || ""}|${canonicalStageId(e.stage_id)}`
-    const prev = lastKept.get(key)
-    const at = eventTime(e)
-    if (prev && prev.type === type && Math.abs(at - prev.at) <= LIFECYCLE_DUPLICATE_WINDOW_MS) {
-      const kept = out[prev.index]
-      // Keep whichever copy carries the human-readable summary, timed from the
-      // first report of a start and the last report of an end. The producers
-      // report one transition seconds apart; taking the earlier end timed
-      // Executing at 33.3s where the Overview (last completion) said 36.5s.
-      const base = !hasHumanTitle(kept) && hasHumanTitle(e) ? e : kept
-      const occurredAt =
-        type === "STAGE_STARTED" ? kept.occurred_at || e.occurred_at : e.occurred_at || kept.occurred_at
-      if (base !== kept || occurredAt !== kept.occurred_at) {
-        out[prev.index] = { ...base, occurred_at: occurredAt }
+    const kept = keptByStage.get(key) ?? []
+    keptByStage.set(key, kept)
+
+    let prevAt = -1
+    for (let i = kept.length - 1; i >= 0; i--) {
+      if (String(out[kept[i]].event_type || "").toUpperCase() === type) {
+        prevAt = i
+        break
+      }
+    }
+    const prev = prevAt >= 0 ? out[kept[prevAt]] : undefined
+    const isCopy =
+      prev !== undefined &&
+      Math.abs(eventTime(e) - eventTime(prev)) <= LIFECYCLE_DUPLICATE_WINDOW_MS &&
+      !kept.slice(prevAt + 1).some((j) => {
+        const between = out[j]
+        return isAttemptBoundary(type, String(between.event_type || "").toUpperCase()) && !mayFollow(between, e)
+      })
+
+    if (prev !== undefined && isCopy) {
+      // Keep whichever copy carries the human-readable summary.
+      const base = !hasHumanTitle(prev) && hasHumanTitle(e) ? e : prev
+      const occurredAt = collapsedTime(type, prev, e)
+      if (base !== prev || occurredAt !== prev.occurred_at) {
+        out[kept[prevAt]] = { ...base, occurred_at: occurredAt }
         retimed = true
       }
       continue
     }
-    lastKept.set(key, { index: out.length, type, at })
+    kept.push(out.length)
     out.push(e)
   }
   // A later end can move a row past the ones after it; restore the order.

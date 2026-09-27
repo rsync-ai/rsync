@@ -109,6 +109,23 @@ def _infer_type(value: Any) -> str:
     return "string"
 
 
+def _widen_type(prev: Optional[str], new: Optional[str]) -> Optional[str]:
+    """Merge two sampled types for one field (``None`` = only nulls seen so far).
+
+    Collections are schemaless: a field can be an int in one document and an
+    ObjectId in the next. First-seen-wins declared that field an integer and every
+    later string then failed the destination write. A conflict now widens to the one
+    type every sampled value fits: int + double -> double, anything else -> string.
+    """
+    if prev is None:
+        return new
+    if new is None or new == prev:
+        return prev
+    if {prev, new} == {"integer", "double"}:
+        return "double"
+    return "string"
+
+
 # --------------------------------------------------------------------------- #
 # Document browse (`find`): request validation                                #
 # --------------------------------------------------------------------------- #
@@ -391,14 +408,121 @@ def _export_cursor(last_id: Any) -> Any:
     A numeric _id (int / Int64 / float) stays a JSON number. str() would turn it
     into "10000", and {"_id": {"$gt": "10000"}} matches no numeric _id (BSON
     compares a string above every number), so paging silently stopped after the
-    first page. Anything else (ObjectId, string, ...) keeps the str() form the
-    executor already checkpoints; a 24-hex string resumes as an ObjectId.
+    first page. An int beyond 2**53 would lose precision as a JSON number, so it
+    goes out as Extended JSON like every other type.
+
+    Every other type goes out as canonical Extended JSON `{"_id": ...}`, which
+    keeps the exact BSON type: str() made a 24-hex STRING _id resume as an
+    ObjectId, and a date/bool/UUID _id resume as a string that matches nothing.
+    Legacy str() cursors in existing checkpoints still decode (see
+    _decode_export_cursor).
     """
     if last_id is None:
         return None
-    if isinstance(last_id, (int, float)) and not isinstance(last_id, bool):
+    if isinstance(last_id, bool):
+        return _encode_find_cursor(last_id)
+    if isinstance(last_id, float) or (isinstance(last_id, int) and abs(last_id) < 2 ** 53):
         return last_id
-    return str(last_id)
+    return _encode_find_cursor(last_id)
+
+
+def _decode_export_cursor(value: Any) -> Any:
+    """Inverse of _export_cursor, also used for the executor's `since_cursor`.
+
+    A number stays a number; a 24-hex string resumes as an ObjectId (the form
+    _export_cursor writes, and the form the executor reads off a JSON-safe row);
+    a canonical Extended JSON `{"_id": ...}` string keeps its exact BSON type.
+    Anything else is compared as the raw value.
+    """
+    if isinstance(value, str):
+        if len(value) == 24:
+            try:
+                from bson import ObjectId
+                return ObjectId(value)
+            except Exception:
+                return value
+        if value.startswith('{"_id"'):
+            try:
+                return _decode_find_cursor(value)
+            except FindRequestError:
+                return value
+    return value
+
+
+# BSON's cross-type sort order, lowest first, as `$type` aliases. `_id` sorts in
+# this order, but a comparison operator only matches values of the SAME type
+# bracket: `{"_id": {"$gt": 21085}}` never matches an ObjectId. A keyset page
+# that crossed from int to ObjectId _ids therefore saw nothing after the last int
+# and reported the end of the collection (1.1 M ObjectId docs silently skipped).
+_BSON_TYPE_ORDER: List[Tuple[str, ...]] = [
+    ("minKey",),
+    ("null", "undefined"),
+    ("double", "int", "long", "decimal"),
+    ("symbol", "string"),
+    ("object",),
+    ("array",),
+    ("binData",),
+    ("objectId",),
+    ("bool",),
+    ("date",),
+    ("timestamp",),
+    ("regex",),
+    ("maxKey",),
+]
+
+
+def _bson_type_rank(value: Any) -> Optional[int]:
+    """Index of `value`'s type bracket in _BSON_TYPE_ORDER; None when unknown."""
+    import re
+    import uuid
+    from bson import ObjectId, Binary, Int64, Decimal128, Timestamp, Regex
+    from bson.min_key import MinKey
+    from bson.max_key import MaxKey
+    if value is None:
+        return 1
+    if isinstance(value, bool):  # before int: bool is an int subclass
+        return 8
+    if isinstance(value, (int, float, Int64, Decimal128)):
+        return 2
+    if isinstance(value, str):
+        return 3
+    if isinstance(value, dict):
+        return 4
+    if isinstance(value, (list, tuple)):
+        return 5
+    if isinstance(value, (bytes, Binary, uuid.UUID)):
+        return 6
+    if isinstance(value, ObjectId):
+        return 7
+    if isinstance(value, (datetime, date)):
+        return 9
+    if isinstance(value, Timestamp):
+        return 10
+    if isinstance(value, (Regex, re.Pattern)):
+        return 11
+    if isinstance(value, MinKey):
+        return 0
+    if isinstance(value, MaxKey):
+        return 12
+    return None
+
+
+def _id_after(value: Any, direction: int = 1) -> Dict[str, Any]:
+    """Filter for every _id strictly after `value` in `_id` sort order.
+
+    `$gt` covers the rest of value's own type bracket; the `$type` branch adds
+    every bracket that sorts after it (before it, for a descending page). Each
+    branch is an _id index range, so the query stays an index scan.
+    """
+    op = "$gt" if direction == 1 else "$lt"
+    rank = _bson_type_rank(value)
+    if rank is None:
+        return {"_id": {op: value}}
+    brackets = _BSON_TYPE_ORDER[rank + 1:] if direction == 1 else _BSON_TYPE_ORDER[:rank]
+    later = [alias for bracket in brackets for alias in bracket]
+    if not later:
+        return {"_id": {op: value}}
+    return {"$or": [{"_id": {op: value}}, {"_id": {"$type": later}}]}
 
 
 def _encode_find_cursor(last_id: Any) -> str:
@@ -1030,14 +1154,16 @@ class MongodbMCPServer(BaseMCPConnector):
                 coll = client[table_db][coll_name]
                 columns: List[Dict[str, Any]] = []
                 if include_columns:
-                    seen: Dict[str, str] = {}
+                    seen: Dict[str, Optional[str]] = {}
                     try:
                         for doc in coll.find(limit=sample_size, max_time_ms=left_ms):
                             for key, val in doc.items():
-                                if key not in seen:
-                                    seen[key] = _infer_type(val)
+                                t = None if val is None else _infer_type(val)
+                                seen[key] = _widen_type(seen.get(key), t)
                     except Exception as e:
                         result["warnings_messages"].append(f"{label}: sample failed: {e}")
+                    # A field that was null in every sampled document stays a string.
+                    seen = {k: (t or "string") for k, t in seen.items()}
                     # _id first, then the rest in first-seen order.
                     if "_id" not in seen:
                         seen = {"_id": "string", **seen}
@@ -1154,6 +1280,10 @@ class MongodbMCPServer(BaseMCPConnector):
                  "description": "Delete documents by key field(s) (CDC delete)"},
                 {"name": "drop_table", "method": "mongodb_drop_table", "type": "destination",
                  "description": "Drop a collection (reload-mode cleanup)"},
+                {"name": "get_cdc_offsets", "method": "mongodb_get_cdc_offsets",
+                 "type": "destination",
+                 "description": "Return durable per-partition Kafka high-water offsets so the "
+                                "CDC sink can seed its skip-map on restart"},
             ],
             "capabilities": {
                 "max_batch_size": self.max_batch_size,
@@ -1208,26 +1338,27 @@ class MongodbMCPServer(BaseMCPConnector):
             limit = self.max_batch_size
         limit = max(1, min(limit, self.max_batch_size))
         cursor_val = prepared.get("cursor", params.get("cursor"))
+        # PK high-water of the last COMPLETED sweep (INCREMENTAL.md §5). Without
+        # it every Resume re-exported the whole collection, and an object-store
+        # destination got every document a second time.
+        since_val = prepared.get("since_cursor", params.get("since_cursor"))
 
         client = None
         try:
             client = self._get_client(config)
             coll = client[db_name][collection]
 
+            # Resume after the last _id (paging) AND after the previous sweep's
+            # high-water (delta). _id_after crosses BSON type brackets, which a
+            # bare $gt does not. A numeric _id arrives as a JSON number (see
+            # _export_cursor), so it compares against int/long/double _ids.
+            bounds = [_id_after(_decode_export_cursor(v))
+                      for v in (cursor_val, since_val) if v not in (None, "")]
             query: Dict[str, Any] = {}
-            if cursor_val not in (None, ""):
-                # Resume after the last _id. Prefer ObjectId comparison when the
-                # cursor is a 24-hex string; otherwise compare as the raw value.
-                # A numeric _id arrives as a JSON number (see _export_cursor), so
-                # it compares against int/long/double _ids, not as a string.
-                oid = None
-                try:
-                    from bson import ObjectId
-                    if isinstance(cursor_val, str) and len(cursor_val) == 24:
-                        oid = ObjectId(cursor_val)
-                except Exception:
-                    oid = None
-                query = {"_id": {"$gt": oid if oid is not None else cursor_val}}
+            if len(bounds) == 1:
+                query = bounds[0]
+            elif bounds:
+                query = {"$and": bounds}
 
             docs = list(coll.find(query).sort("_id", 1).limit(limit))
 
@@ -1256,7 +1387,10 @@ class MongodbMCPServer(BaseMCPConnector):
                     "row_count": len(rows),
                 }
             result["has_more"] = len(docs) >= limit
-            if next_cursor is not None and result.get("has_more"):
+            # Emitted on the LAST (short) page too, like the SQL connectors: the
+            # executor folds it into the PK high-water, and without it the next
+            # Resume's since_cursor stopped one page early and re-copied it.
+            if next_cursor is not None:
                 result["next_cursor"] = next_cursor
                 result["paging_mode"] = "keyset"
                 result["cursor_column"] = "_id"
@@ -1323,7 +1457,7 @@ class MongodbMCPServer(BaseMCPConnector):
                 direction = sort[0][1] if sort else 1
                 query = user_filter
                 if has_cursor:
-                    bound = {"_id": {"$gt" if direction == 1 else "$lt": _decode_find_cursor(cursor_raw)}}
+                    bound = _id_after(_decode_find_cursor(cursor_raw), direction)
                     query = {"$and": [user_filter, bound]} if user_filter else bound
                 sort_keys = [("_id", direction)]
             else:
@@ -1553,6 +1687,146 @@ class MongodbMCPServer(BaseMCPConnector):
         if cache_key is not None:
             self._indexed_keys.add(cache_key)
 
+    # ------------------------------------------------------------------ #
+    # CDC exactly-once offsets (Tier B)                                   #
+    # ------------------------------------------------------------------ #
+    #
+    # Contract: docs/connectors/cdc-exactly-once-offsets.md. The kafka-mcp-sink
+    # passes the Kafka high-water offset it is about to apply as
+    # params["kafka_offset"] on EVERY CDC write, and on startup reads them back
+    # via get_cdc_offsets to seed the skip-map that suppresses redelivered
+    # messages. Until this existed MongoDB was the one destination family with no
+    # durable high-water mark, so every sink restart (OOM kill, crash-loop
+    # respawn, container restart) replayed the whole uncommitted window and each
+    # KEYLESS row was inserted again (KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES).
+    #
+    # MongoDB is TIER B, not Tier A: a standalone mongod has no multi-document
+    # transaction, so the offset cannot commit atomically with the data. It is
+    # written AFTER the data and best-effort — the model is the BigQuery adapter
+    # in shared/mcp-connectors/public/warehouse_adapters.py.
+    #
+    # RESIDUAL, recorded because Tier B's safety argument does not fully cover
+    # this connector: best-effort offsets are safe only for an IDEMPOTENT load.
+    # upsert_data/delete_data are idempotent (ReplaceOne(upsert=True) /
+    # delete_many by key); import_data's KEYLESS append is not, so a crash
+    # strictly between insert_many returning and the offset write below still
+    # duplicates those rows on replay. That window is one in-process round-trip
+    # instead of the entire uncommitted batch window it replaces, but it is not
+    # zero, and closing it needs either per-ROW identity from the sink (it sends
+    # one high-water mark per BATCH) or a replica-set transaction.
+
+    _CDC_OFFSETS_COLLECTION = "_rsync_cdc_offsets"
+
+    def _offsets_database(self, config: Dict[str, Any], params: Dict = None) -> str:
+        """Which database holds the offsets collection.
+
+        It is per-CONNECTION control-plane state keyed by pipeline_id, so it
+        deliberately stays in the CONNECTION's database even when
+        destination_namespace routes the DATA elsewhere: the sink's seed call
+        (``callGetCDCOffsets``, kafka-sink-worker) forwards NO namespace, so
+        offsets that followed the data could never be read back and the restart
+        seed would silently return empty. Same reasoning and same choice as the
+        BigQuery adapter's ``_offsets_fq``.
+
+        A server-level connection names no database, leaving only the namespace to
+        fall back to — such a pipeline records offsets its namespace-less seed read
+        cannot reach, i.e. it keeps today's behaviour rather than gaining a seed.
+        """
+        db = self._database_name(config)
+        return db or self._target_database(config, params or {})
+
+    def _write_cdc_offsets(self, client, config: Dict[str, Any], params: Dict,
+                           prepared: Dict = None) -> None:
+        """Record this batch's Kafka high-water offset(s). No-op without one, so a
+        plain (non-CDC) batch load never grows an offsets collection.
+
+        ``kafka_offset`` is read from the RAW params, never from ``prepared``:
+        ``prepare_import_data`` returns a fixed key whitelist
+        (success/config/table/data/mode/schema/database/row_count) that drops it —
+        the same trap ``_prepared_with_namespace`` exists for.
+
+        Never raises. Tier B's offset write is best-effort by design (see above):
+        a failure here costs reprocessing from the previous mark on the next
+        restart, and must not fail a data write that has already landed.
+        """
+        ko = (params or {}).get("kafka_offset")
+        if not ko:
+            return
+        try:
+            from pymongo import UpdateOne
+            now = datetime.now(timezone.utc)
+            ops = []
+            for o in (ko if isinstance(ko, list) else [ko]):
+                if not isinstance(o, dict):
+                    continue
+                pid = str(o.get("pipeline_id") or "")
+                topic = o.get("topic") or ""
+                part = o.get("partition")
+                off = o.get("offset")
+                if not topic or part is None or off is None:
+                    continue
+                part, off = int(part), int(off)
+                # (pipeline_id, topic, kafka_partition) is the contract's primary
+                # key. Folding it into _id borrows Mongo's own unique index rather
+                # than creating a second one, and makes the upsert atomic. The
+                # separator cannot collide: a Kafka topic name is [a-zA-Z0-9._-].
+                # $max (not $set) is what keeps last_offset monotonic — a
+                # redelivered batch carries a LOWER mark, and writing it would
+                # un-skip messages the sink had already applied.
+                ops.append(UpdateOne(
+                    {"_id": f"{pid}|{topic}|{part}"},
+                    {"$max": {"last_offset": off},
+                     "$set": {"pipeline_id": pid, "topic": str(topic),
+                              "kafka_partition": part, "updated_at": now}},
+                    upsert=True,
+                ))
+            if not ops:
+                return
+            db = self._offsets_database(config, prepared if prepared is not None else params)
+            client[db][self._CDC_OFFSETS_COLLECTION].bulk_write(ops, ordered=False)
+        except Exception as e:
+            self.log(f"CDC offset write failed (the batch itself landed; the sink will "
+                     f"reprocess from the previous high-water mark on restart): {e}",
+                     level="warning")
+
+    def get_cdc_offsets(self, params: Dict = None) -> Dict[str, Any]:
+        """Return this pipeline's durable per-partition Kafka high-water marks.
+
+        The sink calls this once at startup to seed its skip-map, sending only
+        ``{config, pipeline_id}``. Shape: ``{"success": True, "offsets":
+        [{topic, partition, offset}, ...]}``.
+
+        A pipeline that has never written has no offsets collection, and in MongoDB
+        a find on a missing collection is an empty cursor rather than an error — so
+        a first run returns ``[]`` without any special case, as the contract
+        requires.
+
+        A genuine connection failure DOES return ``success: False``: the sink logs
+        "high-water seed skipped" and carries on, which is honest. Returning an
+        empty list there would assert a clean slate this connector never read.
+        """
+        params = params or {}
+        config = self._get_config(params)
+        pipeline_id = str(params.get("pipeline_id") or "")
+        client = None
+        try:
+            client = self._get_client(config)
+            coll = client[self._offsets_database(config, params)][self._CDC_OFFSETS_COLLECTION]
+            offsets: List[Dict[str, Any]] = []
+            for row in coll.find({"pipeline_id": pipeline_id}):
+                topic = row.get("topic")
+                part = row.get("kafka_partition")
+                off = row.get("last_offset")
+                if not topic or part is None or off is None:
+                    continue
+                offsets.append({"topic": str(topic), "partition": int(part),
+                                "offset": int(off)})
+            return {"success": True, "offsets": offsets}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+        finally:
+            self._close_client(client)
+
     def import_data(self, params: Dict = None) -> Dict[str, Any]:
         """Insert documents into a collection (batch / CDC insert).
 
@@ -1573,7 +1847,7 @@ class MongodbMCPServer(BaseMCPConnector):
         mode = str(prepared.get("mode") or "append").lower()
         if mode == "upsert":
             return self._upsert_nosql(collection, prepared.get("data") or [],
-                                      self._key_fields(params, prepared), prepared)
+                                      self._key_fields(params, prepared), prepared, params)
 
         data = prepared.get("data") or []
         docs = [self._prepare_doc(d) for d in data if isinstance(d, dict)]
@@ -1600,6 +1874,7 @@ class MongodbMCPServer(BaseMCPConnector):
                     inserted = int(bulk_err.details.get("nInserted", 0))
                 else:
                     raise
+            self._write_cdc_offsets(client, config, params, prepared)
             return {"success": True, "rows_inserted": inserted}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1616,13 +1891,19 @@ class MongodbMCPServer(BaseMCPConnector):
         if not collection:
             return {"success": False, "error": "Missing 'collection'/'table' parameter"}
         return self._upsert_nosql(collection, prepared.get("data") or [],
-                                  self._key_fields(params, prepared), prepared)
+                                  self._key_fields(params, prepared), prepared, params)
 
     def _upsert_nosql(self, collection: str, data: List[Any], key_fields: List[str],
-                      prepared: Dict[str, Any]) -> Dict[str, Any]:
+                      prepared: Dict[str, Any],
+                      params: Dict[str, Any] = None) -> Dict[str, Any]:
         docs = [d for d in data if isinstance(d, dict)]
         if not docs:
-            return {"success": True, "rows_upserted": 0, "message": "No data to upsert"}
+            out = {"success": True, "rows_upserted": 0, "message": "No data to upsert"}
+            if data:
+                # Records, but none a document: skipped like the loop below skips one.
+                out["skipped"] = len(data)
+                out["skipped_indexes"] = list(range(len(data)))
+            return out
 
         config = self._get_config(prepared)
         client = None
@@ -1633,12 +1914,18 @@ class MongodbMCPServer(BaseMCPConnector):
             self._ensure_key_index(coll, key_fields)
 
             ops = []
-            skipped = 0
-            for d in docs:
+            # Positions in ``data`` of the records NOT written: no key to match on (or
+            # not a document). The CDC sink dead-letters exactly these, so report the
+            # positions and never a value.
+            skipped_indexes: List[int] = []
+            for i, d in enumerate(data):
+                if not isinstance(d, dict):
+                    skipped_indexes.append(i)
+                    continue
                 doc = self._prepare_doc(d)
                 flt = self._key_filter(doc, key_fields)
                 if flt is None:
-                    skipped += 1
+                    skipped_indexes.append(i)
                     continue
                 ops.append(ReplaceOne(flt, doc, upsert=True))
 
@@ -1648,9 +1935,16 @@ class MongodbMCPServer(BaseMCPConnector):
 
             result = coll.bulk_write(ops, ordered=False)
             rows = int((result.upserted_count or 0) + (result.matched_count or 0))
+            # The high-water mark says "everything up to here landed". With a skipped
+            # row that is false, and a restart would seed the sink's skip-map past it,
+            # so the row could never be dead-lettered. Leave the mark where it was: a
+            # redelivery re-applies the batch idempotently and reports the skip again.
+            if not skipped_indexes:
+                self._write_cdc_offsets(client, config, params, prepared)
             out = {"success": True, "rows_upserted": rows}
-            if skipped:
-                out["skipped"] = skipped
+            if skipped_indexes:
+                out["skipped"] = len(skipped_indexes)
+                out["skipped_indexes"] = skipped_indexes
             return out
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -1667,21 +1961,29 @@ class MongodbMCPServer(BaseMCPConnector):
         if not collection:
             return {"success": False, "error": "Missing 'collection'/'table' parameter"}
         return self._delete_nosql(collection, prepared.get("data") or [],
-                                  self._key_fields(params, prepared), prepared)
+                                  self._key_fields(params, prepared), prepared, params)
 
     def _delete_nosql(self, collection: str, data: List[Any], key_fields: List[str],
-                      prepared: Dict[str, Any]) -> Dict[str, Any]:
+                      prepared: Dict[str, Any],
+                      params: Dict[str, Any] = None) -> Dict[str, Any]:
         filters: List[Dict[str, Any]] = []
-        for rec in data:
+        # Positions in ``data`` of the deletes NOT applied (no key to match on) —
+        # reported, never valued, so the CDC sink can dead-letter them (as upsert).
+        skipped_indexes: List[int] = []
+        for i, rec in enumerate(data):
             keydoc = self._extract_key_doc(rec)
-            if not isinstance(keydoc, dict):
+            flt = self._key_filter(keydoc, key_fields) if isinstance(keydoc, dict) else None
+            if flt is None:
+                skipped_indexes.append(i)
                 continue
-            flt = self._key_filter(keydoc, key_fields)
-            if flt is not None:
-                filters.append(flt)
+            filters.append(flt)
 
         if not filters:
-            return {"success": True, "rows_deleted": 0, "message": "No deletable keys"}
+            out = {"success": True, "rows_deleted": 0, "message": "No deletable keys"}
+            if skipped_indexes:
+                out["skipped"] = len(skipped_indexes)
+                out["skipped_indexes"] = skipped_indexes
+            return out
 
         config = self._get_config(prepared)
         client = None
@@ -1695,7 +1997,14 @@ class MongodbMCPServer(BaseMCPConnector):
                 result = coll.delete_many({k: {"$in": [f[k] for f in filters]}})
             else:
                 result = coll.delete_many({"$or": filters})
-            return {"success": True, "rows_deleted": int(result.deleted_count)}
+            # Same rule as _upsert_nosql: no high-water mark past a skipped delete.
+            if not skipped_indexes:
+                self._write_cdc_offsets(client, config, params, prepared)
+            out = {"success": True, "rows_deleted": int(result.deleted_count)}
+            if skipped_indexes:
+                out["skipped"] = len(skipped_indexes)
+                out["skipped_indexes"] = skipped_indexes
+            return out
         except Exception as e:
             return {"success": False, "error": str(e)}
         finally:

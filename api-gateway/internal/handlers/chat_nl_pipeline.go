@@ -8,9 +8,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -146,27 +146,19 @@ func connectorSupportsIncrementalBatch(connectorType string) bool {
 		return false
 	}
 
-	// Prefer public connectors
-	publicPath := GetMCPPublicConnectorsPath()
-	if resolvedName, err := resolveConnectorDirName(publicPath, ct); err == nil {
-		metadataPath := filepath.Join(publicPath, resolvedName, "metadata.json")
-		if b, err := os.ReadFile(metadataPath); err == nil {
-			if checkMetadata(b) {
-				return true
-			}
+	// Resolve metadata through the connector index, as connectorSupportsCDC does. A bare
+	// os.ReadFile(<dir>/metadata.json) read the connector root, which holds only
+	// latest.json + versions/, so every connector answered false.
+	for _, base := range []string{GetMCPPublicConnectorsPath(), GetMCPInternalConnectorsPath()} {
+		if base == "" {
+			continue
 		}
-	}
-
-	// Also check internal connectors (best-effort).
-	internalPath := GetMCPInternalConnectorsPath()
-	if internalPath != "" {
-		if resolvedName, err := resolveConnectorDirName(internalPath, ct); err == nil {
-			metadataPath := filepath.Join(internalPath, resolvedName, "metadata.json")
-			if b, err := os.ReadFile(metadataPath); err == nil {
-				if checkMetadata(b) {
-					return true
-				}
-			}
+		resolvedName, err := resolveConnectorDirName(base, ct)
+		if err != nil {
+			continue
+		}
+		if sc, ok := findScannedConnector(getConnectorIndex(base), resolvedName); ok && checkMetadata(sc.Metadata) {
+			return true
 		}
 	}
 
@@ -919,6 +911,53 @@ func llmNotConfiguredChatReply(gated *llmNotConfiguredError, traceID string) Cha
 	}
 }
 
+// llmUnavailableChatReply answers a chat message when the model call it needed
+// failed: a timeout, a provider error, or a reply that was not the JSON the
+// prompt asks for. It says the model did not answer, and couldNot says what that
+// cost the user ("work out what you're asking", "answer your question"). The
+// generic pipeline examples it replaces read as the assistant ignoring the
+// question. The raw error stays in the log only, because it can carry internal
+// URLs. A model that is not set up at all gets llmNotConfiguredChatReply.
+func llmUnavailableChatReply(err error, traceID, couldNot string) ChatMessageResponse {
+	var gated *llmNotConfiguredError
+	if errors.As(err, &gated) {
+		return llmNotConfiguredChatReply(gated, traceID)
+	}
+	reason := "error"
+	what := "I couldn't get an answer from the AI model"
+	if isLLMTimeout(err) {
+		reason = "timeout"
+		what = fmt.Sprintf("The AI model didn't answer within %s", llmServiceTimeout())
+	}
+	msg := what + ", so I couldn't " + couldNot + ". Please try again in a moment."
+	if traceID != "" {
+		msg += " If it keeps happening, share trace id `" + traceID + "` with your admin."
+	}
+	msg += "\n\nTo set up a pipeline without the model, name the source and the destination directly, " +
+		"for example **\"" + chatNoLLMExample + "\"**."
+	return ChatMessageResponse{
+		Message:   msg,
+		Type:      "text",
+		TraceID:   traceID,
+		Timestamp: time.Now().Format(time.RFC3339),
+		Data: map[string]interface{}{
+			"llm_unavailable": true,
+			"reason":          reason,
+		},
+		Suggestions: []string{chatNoLLMExample},
+	}
+}
+
+// isLLMTimeout reports whether an llm-service call failed on its deadline:
+// the request context's or the http.Client's, whichever fired first.
+func isLLMTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 // handleNewIntent processes a new message when conversation is idle
 func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv *chat.ConversationContext, message, traceID, sessionID, userID string) ChatMessageResponse {
 	// Fast path: "why did pipeline X fail" / "diagnose execution Y". This
@@ -980,31 +1019,19 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 		}
 	}
 
+	// Classification and the help answer below run back to back. With a deadline
+	// each, one question could take twice llmServiceTimeout(), past Cloudflare's
+	// 100s proxy timeout; so the model calls in this turn share one deadline.
+	llmCtx, cancelLLM := context.WithTimeout(ctx, llmServiceTimeout())
+	defer cancelLLM()
+
 	if intent == nil {
 		// Call LLM for intent classification
 		var err error
-		intent, err = h.parseIntent(ctx, message)
+		intent, err = h.parseIntent(llmCtx, message)
 		if err != nil {
 			log.WithError(err).Warn("Failed to parse intent")
-			var gated *llmNotConfiguredError
-			if errors.As(err, &gated) {
-				return llmNotConfiguredChatReply(gated, traceID)
-			}
-			return ChatMessageResponse{
-				Message: "I can help you move data between systems. Try something like:\n\n" +
-					"• **\"Sync MySQL to BigQuery\"**\n" +
-					"• **\"Copy PostgreSQL orders table to S3 every hour\"**\n" +
-					"• **\"Stream changes from MySQL to Snowflake\"**\n\n" +
-					"What data would you like to move?",
-				Type:      "text",
-				TraceID:   traceID,
-				Timestamp: time.Now().Format(time.RFC3339),
-				Suggestions: []string{
-					"mysql to s3",
-					"postgresql to bigquery",
-					"mysql to snowflake",
-				},
-			}
+			return llmUnavailableChatReply(err, traceID, "work out what you're asking")
 		}
 	}
 
@@ -1018,28 +1045,17 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 		conv.SetState(chat.StateIdle)
 		conv.SetPendingIntent(nil)
 
-		helpMsg, helpSuggestions, helpErr := h.callHelpResponseLLM(ctx, message)
-		if helpErr == nil && strings.TrimSpace(helpMsg) != "" {
-			return ChatMessageResponse{
-				Message:     helpMsg,
-				Type:        "text",
-				TraceID:     traceID,
-				Timestamp:   time.Now().Format(time.RFC3339),
-				Suggestions: helpSuggestions,
-			}
+		helpMsg, helpSuggestions, helpErr := h.callHelpResponseLLM(llmCtx, message)
+		if helpErr != nil {
+			log.WithError(helpErr).Warn("Help response LLM call failed")
+			return llmUnavailableChatReply(helpErr, traceID, "answer your question")
 		}
-
 		return ChatMessageResponse{
-			Message:   "To create a pipeline, tell me **your source** and **destination**.\n\nExamples:\n- `mysql to aws-s3`\n- `postgres to bigquery`\n- `replicate mongodb to snowflake` (CDC)\n\nIf you want, tell me what you’re moving (e.g. “users and orders”) and whether it should be **batch** or **CDC**.",
-			Type:      "text",
-			TraceID:   traceID,
-			Timestamp: time.Now().Format(time.RFC3339),
-			Suggestions: []string{
-				"mysql to aws-s3",
-				"postgres to bigquery",
-				"mysql users table to snowflake",
-				"stream postgres to redshift",
-			},
+			Message:     helpMsg,
+			Type:        "text",
+			TraceID:     traceID,
+			Timestamp:   time.Now().Format(time.RFC3339),
+			Suggestions: helpSuggestions,
 		}
 	}
 
@@ -1050,15 +1066,17 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 
 		// If user is asking for guidance, give a dynamic help response rather than a hard-coded limitation.
 		if looksHelpish {
-			helpMsg, helpSuggestions, helpErr := h.callHelpResponseLLM(ctx, message)
-			if helpErr == nil && strings.TrimSpace(helpMsg) != "" {
-				return ChatMessageResponse{
-					Message:     helpMsg,
-					Type:        "text",
-					TraceID:     traceID,
-					Timestamp:   time.Now().Format(time.RFC3339),
-					Suggestions: helpSuggestions,
-				}
+			helpMsg, helpSuggestions, helpErr := h.callHelpResponseLLM(llmCtx, message)
+			if helpErr != nil {
+				log.WithError(helpErr).Warn("Help response LLM call failed")
+				return llmUnavailableChatReply(helpErr, traceID, "answer your question")
+			}
+			return ChatMessageResponse{
+				Message:     helpMsg,
+				Type:        "text",
+				TraceID:     traceID,
+				Timestamp:   time.Now().Format(time.RFC3339),
+				Suggestions: helpSuggestions,
 			}
 		}
 
@@ -1356,6 +1374,30 @@ var (
 // Anchored to word boundaries so connector names like "top" are not affected.
 var reToTypo = regexp.MustCompile(`\b(tod|tpo|tto|t0)\b`)
 
+// reSampleData matches the demo source's display spelling ("Sample data (demo)",
+// "sample data to postgres") in canonicalized text. Word-bounded, unlike the
+// substring replacer in canonicalizeForPairParse, so a word that merely ends in
+// "sample" ("resample data") is left alone. There is no single-word "sample"
+// alias: "sample" alone is too common in ordinary requests.
+var reSampleData = regexp.MustCompile(`\bsample data\b`)
+
+// foldSampleData returns the canonicalized message with the phrase "sample data"
+// rewritten to the demo connector id, or "" when the phrase is absent. It is a
+// second reading, never the first: callers parse the plain message and fold only
+// when that finds no pair (or no connector at all). "sample data" is ordinary
+// English, sample-data is an active catalog connector on every install
+// (migration 120), and this runs before the LLM, so an unconditional fold let the
+// demo displace a connector the user named beside the phrase: "copy my postgres
+// sample data to s3" became sample-data -> aws-s3, and "sync mysql sample data"
+// counted two connectors and fell through to the LLM.
+func foldSampleData(message string) string {
+	lc := canonicalizeForPairParse(message)
+	if !reSampleData.MatchString(lc) {
+		return ""
+	}
+	return reSampleData.ReplaceAllString(lc, "sample-data")
+}
+
 func canonicalizeForPairParse(message string) string {
 	// Normalize common multi-word connector mentions so regex can catch them.
 	// Also collapse repeated whitespace so phrases like "aws  s3" normalize correctly.
@@ -1375,6 +1417,21 @@ func canonicalizeForPairParse(message string) string {
 }
 
 func (h *ChatHandler) quickParseDataSyncIntent(message string) *Intent {
+	if intent := h.quickParsePairIntent(message); intent != nil {
+		return intent
+	}
+	// Only now may "sample data" name the demo source ("sample data to postgres").
+	// A pair the plain reading found above always wins, so a connector named
+	// beside the phrase keeps its side (see foldSampleData).
+	if folded := foldSampleData(message); folded != "" {
+		return h.quickParsePairIntent(folded)
+	}
+	return nil
+}
+
+// quickParsePairIntent is one reading of quickParseDataSyncIntent: the pair
+// regexes, then the token-stream fallback, over the message as given.
+func (h *ChatHandler) quickParsePairIntent(message string) *Intent {
 	m := canonicalizeForPairParse(message)
 
 	tryMatch := func(re *regexp.Regexp) (string, string, bool) {
@@ -1446,6 +1503,18 @@ func (h *ChatHandler) knownConnectorToken(tok string) string {
 		return ""
 	}
 	return norm
+}
+
+// firstKnownConnectorToken returns the canonical id of the first token that names
+// a catalog connector, or "". It stops at the first hit: one catalog query per
+// token up to it.
+func (h *ChatHandler) firstKnownConnectorToken(tokens []string) string {
+	for _, tok := range tokens {
+		if id := h.knownConnectorToken(tok); id != "" {
+			return id
+		}
+	}
+	return ""
 }
 
 // parseConnectorPairFromTokens recovers a source→destination connector pair from the
@@ -1536,8 +1605,26 @@ func tokenizeForConnectorScan(message string) []string {
 // count of DISTINCT known connectors found. Callers use distinctCount to decide:
 // 0 → no connector (fall to LLM/help), 1 → single-connector path, ≥2 → a pair
 // (handled earlier by quickParseDataSyncIntent / the LLM).
+//
+// "sample data" counts as the demo connector only when the plain message names
+// no connector at all ("sync sample data"), so "sync mysql sample data" stays a
+// single mysql source instead of a two-connector pair (see foldSampleData). The
+// returned tokens are those of the reading that was used, so tokenIdx indexes them.
 func (h *ChatHandler) detectSingleKnownConnector(message string) (id string, tokenIdx int, tokens []string, distinctCount int) {
 	tokens = tokenizeForConnectorScan(message)
+	id, tokenIdx, distinctCount = h.scanKnownConnectors(tokens)
+	if distinctCount == 0 {
+		if folded := foldSampleData(message); folded != "" {
+			tokens = tokenizeForConnectorScan(folded)
+			id, tokenIdx, distinctCount = h.scanKnownConnectors(tokens)
+		}
+	}
+	return id, tokenIdx, tokens, distinctCount
+}
+
+// scanKnownConnectors returns the first known connector in tokens, its index, and
+// the count of distinct known connectors (see detectSingleKnownConnector).
+func (h *ChatHandler) scanKnownConnectors(tokens []string) (id string, tokenIdx int, distinctCount int) {
 	seen := map[string]bool{}
 	firstID := ""
 	firstIdx := -1
@@ -1557,7 +1644,7 @@ func (h *ChatHandler) detectSingleKnownConnector(message string) (id string, tok
 			}
 		}
 	}
-	return firstID, firstIdx, tokens, len(seen)
+	return firstID, firstIdx, len(seen)
 }
 
 // inferConnectorRole decides whether the lone connector at tokens[idx] is the
@@ -1790,6 +1877,9 @@ func (h *ChatHandler) callHelpResponseLLM(ctx context.Context, userMessage strin
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if gated, ok := llmNotConfiguredBody(resp.StatusCode, body); ok {
+			return "", nil, &llmNotConfiguredError{body: gated}
+		}
 		return "", nil, fmt.Errorf("help prompt returned %d: %s", resp.StatusCode, string(body))
 	}
 
@@ -1806,6 +1896,9 @@ func (h *ChatHandler) callHelpResponseLLM(ctx context.Context, userMessage strin
 	}
 	if err := json.Unmarshal([]byte(llmjson.ExtractObject(llmResponse.Content)), &parsed); err != nil {
 		return "", nil, fmt.Errorf("failed to parse help prompt content: %w", err)
+	}
+	if strings.TrimSpace(parsed.Message) == "" {
+		return "", nil, errors.New("help prompt returned an empty message")
 	}
 
 	// Keep suggestions small and safe
@@ -2438,30 +2531,36 @@ func (h *ChatHandler) connectorTypeForConnectionName(wsID, direction, name strin
 }
 
 // isKnownConnector checks if a connector exists in the catalog
+// commonConnectors answers isKnownConnector when connector_catalog cannot: no DB,
+// or the catalog query failed.
+var commonConnectors = map[string]bool{
+	"mysql": true, "postgresql": true, "mongodb": true, "oracle": true,
+	"sqlserver": true, "sqlite": true, "aws-s3": true, "snowflake": true,
+	"bigquery": true, "redshift": true, "kafka": true, "elasticsearch": true,
+	"redis": true, "google-cloud-storage": true, "azure-blob-storage": true,
+	"minio": true, "mariadb": true, "cassandra": true,
+	// The zero-credential demo source (migration 120 seeds its catalog row).
+	"sample-data": true,
+}
+
 func (h *ChatHandler) isKnownConnector(connectorName string) bool {
+	normalized := chat.NormalizeConnectorName(connectorName)
 	database := db.GetDB()
 	if database == nil {
-		// If DB not available, accept common connectors
-		commonConnectors := map[string]bool{
-			"mysql": true, "postgresql": true, "mongodb": true, "oracle": true,
-			"sqlserver": true, "sqlite": true, "aws-s3": true, "snowflake": true,
-			"bigquery": true, "redshift": true, "kafka": true, "elasticsearch": true,
-			"redis": true, "google-cloud-storage": true, "azure-blob-storage": true,
-			"minio": true, "mariadb": true, "cassandra": true,
-		}
-		normalized := chat.NormalizeConnectorName(connectorName)
 		return commonConnectors[normalized]
 	}
 
-	normalized := chat.NormalizeConnectorName(connectorName)
 	var count int
 	err := database.QueryRow(`
 		SELECT COUNT(*) FROM connector_catalog 
 		WHERE name = $1 AND status = 'active'
 	`, normalized).Scan(&count)
 	if err != nil {
+		// Fall back to the common set, never to "yes": the no-LLM paths ask this
+		// about every token of a message, so failing open during a catalog error
+		// made any word a connector ("I am not sure yet" filled a source slot "i").
 		log.WithError(err).Debug("Failed to check connector catalog")
-		return true // Fail open
+		return commonConnectors[normalized]
 	}
 	return count > 0
 }
@@ -2490,7 +2589,7 @@ func (h *ChatHandler) listKnownConnectors() []string {
 		"mysql", "postgresql", "mongodb", "oracle", "sqlserver", "sqlite",
 		"aws-s3", "snowflake", "bigquery", "redshift", "kafka", "elasticsearch",
 		"redis", "google-cloud-storage", "azure-blob-storage", "minio", "mariadb",
-		"cassandra", "shopify-admin-graphql",
+		"cassandra", "shopify-admin-graphql", "sample-data",
 	}
 }
 
@@ -2572,28 +2671,31 @@ func (h *ChatHandler) callSlotFillingLLM(ctx context.Context, conv *chat.Convers
 	return &result, nil
 }
 
-// extractConnectorFromMessage is a fallback when LLM is unavailable
+// extractConnectorFromMessage is a fallback when LLM is unavailable. It takes the
+// first token that names a catalog connector, through the same canonicalization
+// and catalog check the deterministic fast paths use (knownConnectorToken), so a
+// connector the catalog knows is never refused here merely because a hard-coded
+// list forgot it (sample-data was), and the answer is the canonical id
+// ("postgres" → "postgresql", "Sample Data" → "sample-data"). As everywhere else,
+// "sample data" is read as the demo only when the reply names no other connector
+// ("my mysql sample data" answers mysql; see foldSampleData).
 func (h *ChatHandler) extractConnectorFromMessage(message string, state chat.ConversationState) *chat.SlotFillingResult {
-	// Simple keyword matching as fallback
-	connectors := []string{
-		"mysql", "postgresql", "postgres", "mongodb", "oracle", "sqlserver",
-		"s3", "aws-s3", "snowflake", "bigquery", "redshift", "kafka",
-		"elasticsearch", "redis", "gcs", "minio", "azure-blob",
+	id := h.firstKnownConnectorToken(tokenizeForConnectorScan(message))
+	if id == "" {
+		if folded := foldSampleData(message); folded != "" {
+			id = h.firstKnownConnectorToken(tokenizeForConnectorScan(folded))
+		}
 	}
-
-	message = " " + message + " " // Add spaces for word boundary matching
-	for _, conn := range connectors {
-		if containsWord(message, conn) {
-			slot := "source"
-			if state == chat.StateAwaitingDestination {
-				slot = "destination"
-			}
-			return &chat.SlotFillingResult{
-				IsAnsweringPrevious: true,
-				ExtractedSlot:       slot,
-				ExtractedValue:      conn,
-				Confidence:          0.7,
-			}
+	if id != "" {
+		slot := "source"
+		if state == chat.StateAwaitingDestination {
+			slot = "destination"
+		}
+		return &chat.SlotFillingResult{
+			IsAnsweringPrevious: true,
+			ExtractedSlot:       slot,
+			ExtractedValue:      id,
+			Confidence:          0.7,
 		}
 	}
 
@@ -2602,31 +2704,6 @@ func (h *ChatHandler) extractConnectorFromMessage(message string, state chat.Con
 		Confidence:          0.0,
 		NextQuestion:        "I didn't catch that. Could you specify the connector name?",
 	}
-}
-
-// containsWord checks if a message contains a word (case-insensitive)
-func containsWord(message, word string) bool {
-	message = " " + message + " "
-	word = " " + word + " "
-	return len(message) >= len(word) && (message == word ||
-		len(message) > len(word) && (message[:len(word)] == word ||
-			message[len(message)-len(word):] == word ||
-			len(message) > len(word) && containsSubstring(message, word)))
-}
-
-// containsSubstring is a simple substring check
-func containsSubstring(s, substr string) bool {
-	return len(s) >= len(substr) && findSubstring(s, substr) >= 0
-}
-
-// findSubstring finds the index of a substring
-func findSubstring(s, substr string) int {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }
 
 // getSuggestionsForSlot returns connector suggestions based on the slot type
@@ -2683,10 +2760,15 @@ type Intent struct {
 // back as the canned fallback with one warning line, while the regex fast path
 // kept answering canonical phrasings in 0s so smoke tests never noticed.
 //
-// The default stays 10s (the cloud behaviour). Only docker-compose.quickstart.yml
-// raises it, per the OSS/cloud split rule in CLAUDE.md.
+// The default is 60s. It was 10s until prod's Gemini took 10.07s to classify a
+// chat question on 2026-09-25: the gateway gave up at 10.04s and the user got
+// the generic pipeline examples. 60s must stay under Cloudflare's 100s proxy
+// timeout on app.rsync.ai and the server's 300s WriteTimeout (cmd/server). One
+// chat turn can call the model twice (classification, then the help answer), so
+// handleNewIntent gives both calls one shared deadline of this length.
+// docker-compose.quickstart.yml raises it further for CPU Ollama.
 func llmServiceTimeout() time.Duration {
-	return getEnvDuration("LLM_SERVICE_TIMEOUT_SECONDS", 10)
+	return getEnvDuration("LLM_SERVICE_TIMEOUT_SECONDS", 60)
 }
 
 // parseIntent calls the Intent agent to parse natural language

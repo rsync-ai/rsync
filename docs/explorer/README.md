@@ -34,7 +34,7 @@ document has one: [Saved queries, models & schedules](saved-queries-and-models.m
         ▼                      ▼                      ▼
     export / share         save it            make it a model
     (csv/tsv/json,      (versions, diff,     (rebuild on cron,
-     Slack, email)       restore, approval)   interval, or pipeline)
+     Slack)              restore, approval)   interval, or pipeline)
 ```
 
 Two entry points converge on one execution path. Everything downstream — export, sharing,
@@ -53,7 +53,7 @@ saving, scheduling — hangs off the same validated SQL.
 | **Models: materialize a query as a table** | [§7](#7-saving-versioning-and-scheduling) → [deep dive](saved-queries-and-models.md) |
 | **Schedules: cron, interval, after-pipeline** | [§7](#7-saving-versioning-and-scheduling) → [deep dive](saved-queries-and-models.md) |
 | Export to CSV / TSV / JSON | [§8](#8-export-and-sharing) |
-| Share to Slack / email | [§8](#8-export-and-sharing) |
+| Share to Slack | [§8](#8-export-and-sharing) |
 | Create a Metabase dashboard | [§9](#9-metabase-dashboards) |
 | PII redaction, egress and LLM data rules | [§10](#10-data-protection) |
 | SQL editor, completions, statement splitting | [§11](#11-frontend) |
@@ -107,9 +107,9 @@ records who ran what, against which connection, with the row count and the state
 truncated to 2000 chars. Best-effort — an audit failure never fails the query.
 
 > **Known defect — `LIMIT` is silently downgraded.**
-> [`ensureLimit`](../../api-gateway/internal/handlers/explorer.go:1664) replaces a user's
-> explicit `LIMIT` with the server cap whenever theirs is larger
-> ([:1674-1676](../../api-gateway/internal/handlers/explorer.go:1674)), and says nothing.
+> [`validators.ClampLimit`](../../api-gateway/internal/validators/sql_validator.go:572) replaces a
+> user's explicit `LIMIT` with the server cap whenever theirs is larger
+> ([:581-584](../../api-gateway/internal/validators/sql_validator.go:581)), and says nothing.
 > Preview caps at 500 rows, export at 10 000. Tracked as **DX-LimitDowngrade**; the fix is to honour `min(user, cap)` *and* return a
 > "limited to N" flag.
 
@@ -237,7 +237,6 @@ In brief:
 | `POST /explorer/export` | [`ExportQueryHandler`](../../api-gateway/internal/handlers/explorer.go:3720) | csv / tsv / json |
 | `GET /explorer/export.csv` | [`ExportCSVHandler`](../../api-gateway/internal/handlers/explorer.go:3572) | legacy, kept for deep links |
 | `POST /explorer/share/slack` | [`ShareToSlack`](../../api-gateway/internal/handlers/explorer.go:3930) | via webhook |
-| `POST /explorer/share/email` | [`ShareViaEmail`](../../api-gateway/internal/handlers/explorer.go:4047) | via platform SMTP |
 
 Export re-validates the SQL server-side and clamps the limit to 10 000 regardless of what
 the client asked for ([:3732-3738](../../api-gateway/internal/handlers/explorer.go:3732)) —
@@ -358,7 +357,6 @@ Auth-required and workspace-scoped ([main.go:1095–1182](../../api-gateway/cmd/
 | `GET` | `/explorer/export.csv` | member (legacy) |
 | `POST` | `/explorer/export` | member |
 | `POST` | `/explorer/share/slack` | member |
-| `POST` | `/explorer/share/email` | member (capped + rate-limited) |
 | `POST` | `/explorer/metabase/dashboard` | member |
 | `GET`·`POST` | `/explorer/saved` | member |
 | `GET`·`PATCH`·`DELETE` | `/explorer/saved/:id` | creator or admin |

@@ -786,6 +786,11 @@ func (s *BatchSentinel) emitBatchIssue(
 	_ = s.kafkaManager.ProduceWithHeaders("pipeline.domain.events", []byte(pipelineID), b, map[string]string{
 		"trace_id": pipelineID,
 	})
+
+	// ...and tell the pipeline's owner, if this is one they need to act on.
+	// The batch sentinel has no separate alert type — the issue type is what it
+	// puts on the domain event — so the issue type is what the policy sees.
+	publishSentinelAlert(s.kafkaManager, issueType, severity, string(issueType), pipelineID, description, metadata)
 }
 
 // resolveStaleIssues deletes open issues in one class whose condition no longer

@@ -49,7 +49,7 @@ Avro (un)marshalling lives in the services, gated by `KAFKA_USE_AVRO`:
 
 - **Produce (API Gateway)**: `api-gateway/internal/kafka/avro_producer.go` (via `unified_producer.go`)
 - **Consume (Orchestrator)**: `backend-orchestrator/internal/kafka/manager.go` — `SmartDeserialize` auto-detects Avro vs JSON
-- **Python (Planner)**: `llm-service/src/utils/avro_serializer.py` + `avro_kafka.py`
+- **Python**: none. The llm-service Avro helpers had no caller and were deleted in v0.1.6; its one Kafka consumer (the PII scanner) reads JSON.
 - **Registry admin API (API Gateway)**: `api-gateway/internal/handlers/schema_registry.go`
 
 ## Schema Registry

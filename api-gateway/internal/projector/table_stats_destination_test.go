@@ -82,13 +82,16 @@ func projectTableStats(t *testing.T, ev map[string]interface{}) (driver.Value, d
 	destSchema := &capturedArg{}
 	destQualified := &capturedArg{}
 
-	args := make([]driver.Value, 0, 28)
+	args := make([]driver.Value, 0, 31)
 	for i := 0; i < 25; i++ {
 		args = append(args, sqlmock.AnyArg())
 	}
 	// $28 is orchestration_execution_id (migration 090), asserted in
 	// table_stats_orchestration_id_test.go.
 	args = append(args, destSchema, destQualified, sqlmock.AnyArg())
+	// $29-$31: snapshot_rows, applied_snapshot_rows, capturedFromApplied — asserted in
+	// table_stats_captured_test.go.
+	args = append(args, sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg())
 
 	mock.ExpectBegin()
 	mock.ExpectQuery(regexp.QuoteMeta("SELECT COALESCE(bytes_committed, 0)")).

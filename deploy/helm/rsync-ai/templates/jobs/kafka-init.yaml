@@ -14,10 +14,15 @@ disagrees by one character produces precisely the split this chart's other
 guards exist to prevent — topics created under one name, subscribed under
 another, nothing erroring.
 
-Two topics here are NOT in the compose list, deliberately: `pii.scan.request`
-and `pipeline.failed.dlq`. Both are auto-create-only on the compose path, which
-is survivable on the bundled broker (auto-create is on) and is not survivable on
-a BYO cluster — the shape this chart exists for.
+The topic list is the quickstart's list, name for name: `pipeline.domain.events`,
+`pii.scan.request` and `pii.scan.response`, each at 3 partitions with
+cleanup.policy=delete, retention.ms=604800000 (7 days) and compression.type=snappy.
+Those are the values the orchestrator's topology provisioner
+(backend-orchestrator/internal/kafka/topology.go) gives the same names, and they
+have to be: no creator alters a topic that already exists, so whichever one runs
+first fixes the config for good. `rsync.notifications` is created by the
+orchestrator alone, and the schema-drift healer topics are created only when
+RSYNC_SCHEMA_DRIFT_ENABLED=true, so neither belongs in this Job.
 */}}
 apiVersion: batch/v1
 kind: Job
@@ -324,7 +329,7 @@ spec:
               # chart holding a live, authenticated broker view, so it is the only
               # place that intent can be reconciled with reality. Unclamped, an RF
               # above the broker count fails every create with
-              # InvalidReplicationFactor and the install dies on topic 1 of 25.
+              # InvalidReplicationFactor and the install dies on its first topic.
               #
               # A count of 0 means the probe itself failed, and that is deliberately
               # NOT read as "zero brokers": guessing at a cluster we cannot see would
@@ -350,8 +355,8 @@ spec:
                 # the sink subscribes to it, and every acks=all produce returns
                 # NOT_ENOUGH_REPLICAS with nothing in any log naming the replication
                 # factor as the cause. The pipeline reports running and streams zero
-                # rows. These 14 topics carry the whole agent control plane, so that
-                # is not a corner: it is the platform failing to start work at all.
+                # rows. These topics carry the pipeline event log and the PII scan
+                # round trip, so that is not a corner case.
                 #
                 # min(2, RF) is the value the orchestrator already pins for its own
                 # topics (kafka/replication.go pinMinInsyncReplicas) and the one the
@@ -372,22 +377,20 @@ spec:
               MISR_ARG="--config min.insync.replicas=$MISR"
               echo "Replication factor: $RF (min ISR: $MISR$PINNED; live brokers: $BROKERS)"
 
+              # Every topic below shares one config, the one the orchestrator's
+              # topology provisioner gives the same names. Retention is bounded at
+              # 7 days for all three, pipeline.domain.events included.
+              TOPIC_CONFIG="--config cleanup.policy=delete --config retention.ms=604800000 --config compression.type=snappy"
               mk() {
                 kafka-topics.sh --create --if-not-exists \
                   --bootstrap-server "$BOOTSTRAP" $CC \
-                  --topic "$1" --partitions "${2:-3}" \
-                  --replication-factor "$RF" $MISR_ARG || exit 1
+                  --topic "$1" --partitions 3 \
+                  --replication-factor "$RF" $MISR_ARG $TOPIC_CONFIG || exit 1
               }
 
-              for agent in intent planner validator executor discovery resolver \
-                           capability_resolver connection_validator cost_estimator; do
-                mk "${P}agent.control.commands.$agent"
-              done
-              mk "${P}agent.planner.responses"
               mk "${P}pipeline.domain.events"
               mk "${P}pii.scan.request"
               mk "${P}pii.scan.response"
-              mk "${P}pipeline.failed.dlq"
               echo "Kafka topics ready"
           resources:
             requests: { cpu: 100m, memory: 256Mi }

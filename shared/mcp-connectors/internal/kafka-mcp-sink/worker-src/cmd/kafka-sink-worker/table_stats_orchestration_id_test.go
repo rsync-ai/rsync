@@ -31,7 +31,7 @@ func TestCDCTableStatsCarriesTheOrchestrationExecutionID(t *testing.T) {
 		Table:                    "pipeline_test.demo_products",
 	}
 
-	meta, ok := buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 0)["metadata"].(map[string]interface{})
+	meta, ok := buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 0, 0)["metadata"].(map[string]interface{})
 	if !ok {
 		t.Fatalf("event has no metadata map")
 	}
@@ -69,7 +69,7 @@ func TestTableStatsOmitOrchestrationIDWhenItSaysNothingNew(t *testing.T) {
 			Table:                    "public.orders",
 		},
 	} {
-		meta := buildCDCTableStatsEvent(sm, 1, 0, 0, 8, 0)["metadata"].(map[string]interface{})
+		meta := buildCDCTableStatsEvent(sm, 1, 0, 0, 8, 0, 0)["metadata"].(map[string]interface{})
 		if v, present := meta["orchestration_execution_id"]; present {
 			t.Errorf("%s: orchestration_execution_id present as %#v; it must be absent so the "+
 				"projector stores NULL and the COALESCE leaves an existing value alone", name, v)

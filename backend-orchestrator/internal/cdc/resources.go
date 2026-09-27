@@ -194,70 +194,72 @@ func MarkResourceFailed(ctx context.Context, db *sql.DB, resourceName string, re
 	return nil
 }
 
-// GetReapableSlots returns replication_slot resources that should have their
-// physical slot dropped on the source DB but are NOT live: either the owning
-// pipeline was deleted (pipeline_id became NULL via ON DELETE SET NULL) or the
-// owning pipeline is in 'stopped' status (intentional, non-resuming — the slot
-// must not be allowed to retain WAL on the source). Rows for 'running' and
-// 'paused' pipelines are deliberately excluded (their slot is the live position
-// anchor). 'inactive'/'failed' statuses are included so prior failed drops retry.
-func GetReapableSlots(ctx context.Context, db *sql.DB) ([]CDCResource, error) {
-	query := `
+// reapableResourceQuery selects PostgreSQL cdc_resources rows of one type whose
+// owning pipeline is gone (pipeline_id NULL via ON DELETE SET NULL, or the row
+// deleted) and, with includeStopped, also those of a 'stopped' pipeline.
+// 'inactive'/'failed' statuses are included so prior failed drops retry.
+func reapableResourceQuery(resourceType string, includeStopped bool) string {
+	owner := `cr.pipeline_id IS NULL OR p.id IS NULL`
+	if includeStopped {
+		owner += ` OR p.status = 'stopped'`
+	}
+	return `
 		SELECT cr.id, cr.pipeline_id, cr.connection_id, cr.source_table,
 		       cr.resource_type, cr.resource_name, cr.status,
 		       cr.database_type, cr.metadata, cr.created_at, cr.deleted_at, cr.last_verified_at
 		FROM cdc_resources cr
 		LEFT JOIN pipelines p ON p.id = cr.pipeline_id
-		WHERE cr.resource_type = 'replication_slot'
+		WHERE cr.resource_type = '` + resourceType + `'
 		  AND cr.database_type = 'postgresql'
 		  AND cr.status IN ('active', 'inactive', 'failed', 'orphaned')
-		  AND (cr.pipeline_id IS NULL OR p.id IS NULL OR p.status = 'stopped')
+		  AND (` + owner + `)
 	`
-	rows, err := db.QueryContext(ctx, query)
+}
+
+func queryReapableResources(ctx context.Context, db *sql.DB, resourceType string, includeStopped bool) ([]CDCResource, error) {
+	rows, err := db.QueryContext(ctx, reapableResourceQuery(resourceType, includeStopped))
 	if err != nil {
-		return nil, fmt.Errorf("failed to query reapable slots: %w", err)
+		return nil, fmt.Errorf("failed to query reapable %s resources: %w", resourceType, err)
 	}
 	defer rows.Close()
 	return scanCDCResources(rows)
+}
+
+// GetReapableSlots returns replication_slot resources whose owning pipeline was
+// deleted. A 'stopped' pipeline's slot is NOT returned: Stop keeps the slot as
+// the resume position, so Start continues where the stream stopped instead of
+// losing every change made while it was stopped. The one exception is WAL
+// pressure — GetWALPressureReapableSlots — because a stopped slot still retains
+// WAL on the source. Rows for 'running' and 'paused' pipelines are never returned.
+func GetReapableSlots(ctx context.Context, db *sql.DB) ([]CDCResource, error) {
+	return queryReapableResources(ctx, db, "replication_slot", false)
+}
+
+// GetWALPressureReapableSlots is GetReapableSlots plus the slots of 'stopped'
+// pipelines. Only the WAL watchdog uses it, and only for slots it has measured
+// past the CRITICAL retained-WAL threshold: losing a stopped pipeline's resume
+// position is recoverable (Reload), a source whose disk fills is not.
+func GetWALPressureReapableSlots(ctx context.Context, db *sql.DB) ([]CDCResource, error) {
+	return queryReapableResources(ctx, db, "replication_slot", true)
 }
 
 // GetReapablePublications is the publication analogue of GetReapableSlots (BUG-3):
-// it returns every PostgreSQL publication cdc_resources row whose owning pipeline
-// is gone (pipeline_id NULL via ON DELETE SET NULL, or the pipeline row deleted)
-// or 'stopped'. Publications are per-pipeline (debezium_pub_pipe_*), so each such
-// row is safe to DROP. Without this, a publication whose synchronous delete-time
-// cleanup did not run leaked forever — slots had a reaper, publications did not.
+// every PostgreSQL publication row whose owning pipeline is gone. Publications
+// are per-pipeline (debezium_pub_pipe_*), so each such row is safe to DROP.
+// A 'stopped' pipeline keeps its publication, like its slot, so Start can resume.
+// Without this, a publication whose synchronous delete-time cleanup did not run
+// leaked forever — slots had a reaper, publications did not.
 func GetReapablePublications(ctx context.Context, db *sql.DB) ([]CDCResource, error) {
-	query := `
-		SELECT cr.id, cr.pipeline_id, cr.connection_id, cr.source_table,
-		       cr.resource_type, cr.resource_name, cr.status,
-		       cr.database_type, cr.metadata, cr.created_at, cr.deleted_at, cr.last_verified_at
-		FROM cdc_resources cr
-		LEFT JOIN pipelines p ON p.id = cr.pipeline_id
-		WHERE cr.resource_type = 'publication'
-		  AND cr.database_type = 'postgresql'
-		  AND cr.status IN ('active', 'inactive', 'failed', 'orphaned')
-		  AND (cr.pipeline_id IS NULL OR p.id IS NULL OR p.status = 'stopped')
-	`
-	rows, err := db.QueryContext(ctx, query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query reapable publications: %w", err)
-	}
-	defer rows.Close()
-	return scanCDCResources(rows)
+	return queryReapableResources(ctx, db, "publication", false)
 }
 
-// GetReapableCaptureInstances is the SQL Server analogue of GetReapableSlots,
-// with ONE deliberate difference: it reaps only when the owning pipeline is
-// GONE (pipeline_id NULL via ON DELETE SET NULL, or the pipeline row deleted) —
-// never merely 'stopped'.
-//
-// A stopped PostgreSQL slot is unambiguously harmful (it pins WAL on the source
-// until the disk fills), so reaping it is the safe default. A SQL Server capture
-// instance is the opposite: it is where the change data LIVES. Disabling one on
-// a stopped-but-resumable pipeline discards every change row accumulated since
-// the stop and forces a full re-snapshot on resume. So 'stopped' stays out of
-// this predicate on purpose — do not "harmonize" it with GetReapableSlots.
+// GetReapableCaptureInstances is the SQL Server analogue of GetReapableSlots:
+// it reaps only when the owning pipeline is GONE (pipeline_id NULL via ON
+// DELETE SET NULL, or the pipeline row deleted) — never merely 'stopped'. A
+// capture instance is where the change data LIVES: disabling one on a
+// stopped-but-resumable pipeline discards every change row accumulated since
+// the stop and forces a full re-snapshot on resume. Unlike a PostgreSQL slot
+// it has no WAL-pressure exception, since it does not grow the source's log.
 //
 // SQL Server is the only non-PostgreSQL family that needs a reaper at all:
 // Oracle (supplemental log groups) and MySQL (server_id) cleanup is ledger-only

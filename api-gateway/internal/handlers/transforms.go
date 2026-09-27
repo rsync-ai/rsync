@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -119,11 +120,16 @@ type PIIColumnInfo struct {
 // parseTransformRequest parses NL into transform rules (rule-based)
 func parseTransformRequest(nl string, piiColumns []PIIColumnInfo) []TransformDefinition {
 	var transforms []TransformDefinition
-	nl = strings.ToLower(nl)
+	// Lowercase for KEYWORD DETECTION only. The condition is sliced out of the
+	// ORIGINAL text: lowercasing the whole request turned `status = 'Active'`
+	// into `status = 'active'`, and the filter it generated then matched nothing
+	// in a case-sensitive destination -- a rule the user could read back as
+	// correct, quietly selecting zero rows.
+	lower := strings.ToLower(nl)
 	order := 0
 
 	// Detect filter operations
-	if strings.Contains(nl, "filter") || strings.Contains(nl, "where") || strings.Contains(nl, "only") {
+	if strings.Contains(lower, "filter") || strings.Contains(lower, "where") || strings.Contains(lower, "only") {
 		// Extract condition (simplified)
 		condition := extractCondition(nl)
 		if condition != "" {
@@ -142,7 +148,7 @@ func parseTransformRequest(nl string, piiColumns []PIIColumnInfo) []TransformDef
 	}
 
 	// Detect masking operations
-	if strings.Contains(nl, "mask") || strings.Contains(nl, "hash") || strings.Contains(nl, "encrypt") {
+	if strings.Contains(lower, "mask") || strings.Contains(lower, "hash") || strings.Contains(lower, "encrypt") {
 		for _, col := range piiColumns {
 			if col.Confidence >= 0.5 {
 				transforms = append(transforms, TransformDefinition{
@@ -173,17 +179,21 @@ func parseTransformRequest(nl string, piiColumns []PIIColumnInfo) []TransformDef
 }
 
 // Helper functions for NL parsing
+// extractCondition pulls the filter condition out of the ORIGINAL, case-preserving
+// request text. Keywords are matched case-insensitively with indexFold rather than
+// against a lowercased copy, because the returned value is a literal the filter
+// engine compares byte-for-byte: `status = 'Active'` must survive as written.
 func extractCondition(nl string) string {
 	// Simple extraction - in production, use proper NLP
 	patterns := []string{"where ", "filter ", "only "}
 	for _, p := range patterns {
-		if idx := strings.Index(nl, p); idx != -1 {
+		if idx := indexFold(nl, p); idx != -1 {
 			rest := nl[idx+len(p):]
 			// Find end of condition
 			endPatterns := []string{" and ", " or ", " group", " aggregate", " join", " sort"}
 			endIdx := len(rest)
 			for _, ep := range endPatterns {
-				if eIdx := strings.Index(rest, ep); eIdx != -1 && eIdx < endIdx {
+				if eIdx := indexFold(rest, ep); eIdx != -1 && eIdx < endIdx {
 					endIdx = eIdx
 				}
 			}
@@ -191,6 +201,27 @@ func extractCondition(nl string) string {
 		}
 	}
 	return ""
+}
+
+// indexFold reports the first index in s at which the ASCII substring sub occurs
+// case-insensitively, or -1.
+//
+// The index refers to s itself, which is the whole point: strings.ToLower is not
+// length-preserving for every rune, so an index taken from a lowercased copy
+// cannot be used to slice the original. Scanning byte windows is safe here
+// because every pattern is ASCII, and a case-fold of ASCII only ever matches
+// ASCII.
+func indexFold(s, sub string) int {
+	if sub == "" {
+		return 0
+	}
+	n := len(sub)
+	for i := 0; i+n <= len(s); i++ {
+		if strings.EqualFold(s[i:i+n], sub) {
+			return i
+		}
+	}
+	return -1
 }
 
 // PreviewTransforms previews the result of transformations using the real transform engine
@@ -285,8 +316,17 @@ func (h *TransformHandler) PreviewTransforms(c *gin.Context) {
 	}
 
 	// Normalize + validate transforms (best-effort in preview mode).
-	canonical, normWarnings, _ := transforms.NormalizeAndValidate(req.Transforms, table, transforms.NormalizeModePreview)
+	//
+	// Preview mode is permissive by design, but the error was DISCARDED, so a
+	// rule that preview mode does reject would have previewed against an empty
+	// canonical list -- unchanged rows, no warning, and a user reading that as
+	// "this rule is a no-op" rather than "this rule is invalid". Surfacing it as
+	// a warning keeps preview non-blocking without inventing a clean result.
+	canonical, normWarnings, normErr := transforms.NormalizeAndValidate(req.Transforms, table, transforms.NormalizeModePreview)
 	warningsOut = append(warningsOut, normWarnings...)
+	if normErr != nil {
+		warningsOut = append(warningsOut, fmt.Sprintf("transform validation: %v", normErr))
+	}
 
 	transformList := make([]transforms.Transform, 0, len(canonical))
 	for _, t := range canonical {
@@ -308,6 +348,18 @@ func (h *TransformHandler) PreviewTransforms(c *gin.Context) {
 	// Execute preview with 3 second timeout
 	result, warnings, err := executor.Preview(sampleRows, transformList, 3*time.Second)
 	if err != nil {
+		// A timeout is not a server fault and must not be reported as one - the
+		// user's next move is to shrink the sample, not to file a bug. Same status
+		// and shape as the sampling timeout above.
+		if errors.Is(err, transforms.ErrPreviewTimeout) {
+			log.WithError(err).Warn("Transform preview timed out")
+			c.JSON(http.StatusRequestTimeout, gin.H{
+				"error":    "Transform preview timed out",
+				"hint":     "The transform chain took longer than 3 seconds on this sample. Try a smaller sample size or fewer transforms.",
+				"warnings": warnings,
+			})
+			return
+		}
 		log.WithError(err).Error("Transform preview failed")
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"error": fmt.Sprintf("Transform preview failed: %v", err),
@@ -392,6 +444,50 @@ func (h *TransformHandler) GetPipelineTransforms(c *gin.Context) {
 	})
 }
 
+// validateExecutableTransform rejects a transform that no engine can run.
+//
+// Until this existed, the write path was the ONLY path that did not validate:
+// NormalizeAndValidate ran in PreviewTransforms, in the batch executor
+// (executor.go applyTransformsToData) and in the CDC sink, but never on save.
+// So an operation the engine has no case for — aggregate, join, enrich,
+// deduplicate, sort, limit, sql, python_udf — saved cleanly and failed at run
+// time, far from whoever clicked Save.
+//
+// On the CDC path that failure is not a skipped rule: the sink validates
+// consumer rows in NormalizeModeCDC and fail-closes the WHOLE batch to the DLQ
+// (kafka-sink-worker/main.go), deliberately, because skipping the offending
+// rule could emit unmasked PII. One unrunnable rule therefore stops delivery
+// for that table silently.
+//
+// Two deliberate choices:
+//   - Validated as ENABLED whatever the row's own flag says. A disabled rule is
+//     inert today, but PUT /transforms/:id flips `enabled` without re-checking
+//     the config, so accepting a broken rule while disabled just defers the DLQ.
+//   - The config is copied first. normalizeOne mutates the map it is handed
+//     (it deletes `operation`, `table`, `requires_full_dataset` after mapping
+//     them), and this map is about to be marshalled into transform_config.
+func validateExecutableTransform(cfg map[string]interface{}, order int) error {
+	cfgCopy := make(map[string]interface{}, len(cfg))
+	for k, v := range cfg {
+		cfgCopy[k] = v
+	}
+
+	item := map[string]any{
+		"order":            order,
+		"enabled":          true,
+		"transform_config": cfgCopy,
+	}
+
+	// SaveCheck, not Execution: this is a shape check with no data and no table.
+	// Execution mode additionally refuses a table-scoped rule when the current
+	// table is unknown, which is the right call mid-pipeline and the wrong one
+	// here - at save time a rule scoped to "users" is exactly what was asked for.
+	_, _, err := transforms.NormalizeAndValidate(
+		[]map[string]any{item}, "", transforms.NormalizeModeSaveCheck,
+	)
+	return err
+}
+
 // SavePipelineTransforms saves transforms for a pipeline
 func (h *TransformHandler) SavePipelineTransforms(c *gin.Context) {
 	pipelineID, ok := requireUUIDParam(c, "pipeline_id", "invalid_pipeline_id", "Invalid pipeline ID format")
@@ -414,6 +510,23 @@ func (h *TransformHandler) SavePipelineTransforms(c *gin.Context) {
 
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "invalid_request", "Invalid request payload", err)
+		return
+	}
+
+	// Reject the whole plan before touching the table. The save is a REPLACE —
+	// DELETE then re-INSERT — so a partial accept would leave the pipeline with
+	// fewer transforms than the operator thinks they saved.
+	rejected := make([]string, 0)
+	for i, t := range req.Transforms {
+		if err := validateExecutableTransform(t.TransformConfig, i); err != nil {
+			rejected = append(rejected, fmt.Sprintf("transform[%d]: %v", i, err))
+		}
+	}
+	if len(rejected) > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"error":   "One or more transforms cannot be executed by any engine; nothing was saved.",
+			"details": rejected,
+		})
 		return
 	}
 
@@ -569,6 +682,34 @@ func (h *TransformHandler) UpdateTransform(c *gin.Context) {
 	if err := c.ShouldBindJSON(&req); err != nil {
 		respondError(c, http.StatusBadRequest, "invalid_request", "Invalid request payload", err)
 		return
+	}
+
+	// Same gate as the save path, for the two ways this endpoint can arm a
+	// transform the engine cannot run: a new config, or flipping `enabled` on a
+	// row that was stored broken. Enabling validates the STORED config, since
+	// the request carries none.
+	if req.TransformConfig != nil {
+		if err := validateExecutableTransform(req.TransformConfig, 0); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"error": fmt.Sprintf("This transform cannot be executed by any engine: %v", err),
+			})
+			return
+		}
+	} else if req.Enabled != nil && *req.Enabled {
+		var storedJSON []byte
+		if err := h.db.QueryRow(
+			`SELECT transform_config FROM transform_definitions WHERE id = $1`, transformID,
+		).Scan(&storedJSON); err == nil {
+			var stored map[string]interface{}
+			if json.Unmarshal(storedJSON, &stored) == nil {
+				if err := validateExecutableTransform(stored, 0); err != nil {
+					c.JSON(http.StatusBadRequest, gin.H{
+						"error": fmt.Sprintf("This transform cannot be enabled — no engine can execute it: %v", err),
+					})
+					return
+				}
+			}
+		}
 	}
 
 	query := "UPDATE transform_definitions SET updated_at = $1"

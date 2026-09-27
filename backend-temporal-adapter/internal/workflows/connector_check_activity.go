@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -328,6 +329,9 @@ func toolGeneratorBaseURL() string {
 	return "http://tool-generator:5010"
 }
 
+// mcpServerClassRe matches a top-level `class <Name>MCPServer` definition.
+var mcpServerClassRe = regexp.MustCompile(`(?m)^class\s+\w+MCPServer\b`)
+
 // verifyConnectorImplemented checks if connector is actually implemented (not stub)
 func verifyConnectorImplemented(connectorPath string) bool {
 
@@ -342,8 +346,10 @@ func verifyConnectorImplemented(connectorPath string) bool {
 		return false
 	}
 
-	// Our connectors should extend BaseMCPConnector and define a connector type.
-	hasBase := strings.Contains(contentStr, "BaseMCPConnector")
+	// Our connectors either extend BaseMCPConnector or, like sample-data and the
+	// internal minio connector, define a self-contained stdlib server class named
+	// <Name>MCPServer. Either way they must define a connector type.
+	hasBase := strings.Contains(contentStr, "BaseMCPConnector") || mcpServerClassRe.MatchString(contentStr)
 	hasType := strings.Contains(contentStr, "self.connector_type") || strings.Contains(contentStr, "connector_type")
 
 	// Check for actual implementation indicators (support both source + destination connectors).

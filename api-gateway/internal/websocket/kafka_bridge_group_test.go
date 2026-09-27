@@ -5,11 +5,11 @@ import (
 	"testing"
 )
 
-// The bridge runs one consumer group per bridged topic — four of them, after the
-// eleven producer-less subscriptions were pruned — which is still why a customer's
-// operator wants a PREFIXED grant rather than an enumerated one. Every id it mints has to carry
-// the namespace or the grant is half-covered, and a half-covered grant is worse
-// than none: the process stays healthy and only the live UI goes quiet.
+// The bridge runs one consumer group per bridged topic (bridgeTopics), which is
+// why a customer's operator wants a PREFIXED grant rather than an enumerated one.
+// Every id it mints has to carry the namespace or the grant is half-covered, and a
+// half-covered grant is worse than none: the process stays healthy and only the
+// live UI goes quiet.
 func TestBridgeGroupIDIsNamespaced(t *testing.T) {
 	t.Setenv("KAFKA_TOPIC_PREFIX", "rsync.")
 
@@ -58,10 +58,10 @@ func TestBridgeGroupIDIsDistinctPerTopic(t *testing.T) {
 	seen := map[string]string{}
 	for _, topic := range []string{
 		"rsync.pipeline.domain.events",
-		"rsync.pipeline.agent.telemetry",
-		"rsync.task.results",
-		"rsync.agent.planner.progress",
-		"rsync.cdc.status.updates",
+		"rsync.notifications",
+		"rsync.pii.scan.response",
+		"rsync.pipeline.domain",
+		"rsync.pipeline.domain.events.v2",
 	} {
 		id := bridgeGroupID(topic)
 		if prev, dup := seen[id]; dup {
@@ -80,5 +80,38 @@ func TestBridgeGroupIDInheritsThePrefixNormalization(t *testing.T) {
 	got := bridgeGroupID("acme.pipeline.domain.events")
 	if got != "acme.websocket-bridge-pipeline.domain.events" {
 		t.Fatalf("bridgeGroupID = %q, want %q", got, "acme.websocket-bridge-pipeline.domain.events")
+	}
+}
+
+// The bridge forwards exactly one topic. The telemetry and agent.* subscriptions
+// were removed with the agent control plane; a kafka-go reader auto-creates the
+// topic it subscribes to, so leaving any of them here would re-create a removed
+// topic on every gateway start and mint a consumer group nobody grants ACLs for.
+func TestBridgeTopicsIsOnlyTheDomainEventStream(t *testing.T) {
+	t.Setenv("KAFKA_TOPIC_PREFIX", "rsync.")
+
+	got := bridgeTopics()
+	if len(got) != 1 || got[0] != "rsync.pipeline.domain.events" {
+		t.Fatalf("bridgeTopics() = %v, want [rsync.pipeline.domain.events]", got)
+	}
+	for _, topic := range got {
+		if strings.Contains(topic, ".agent.") || strings.HasPrefix(topic, "rsync.agent.") ||
+			strings.Contains(topic, "telemetry") {
+			t.Errorf("bridgeTopics() still subscribes to removed topic %q", topic)
+		}
+	}
+}
+
+// bridgeTopics qualifies through kafkaclient.Topics, so an operator prefix
+// reaches the subscription and the group id derived from it.
+func TestBridgeTopicsHonoursThePrefix(t *testing.T) {
+	t.Setenv("KAFKA_TOPIC_PREFIX", "acme")
+
+	got := bridgeTopics()
+	if len(got) != 1 || got[0] != "acme.pipeline.domain.events" {
+		t.Fatalf("bridgeTopics() = %v, want [acme.pipeline.domain.events]", got)
+	}
+	if id := bridgeGroupID(got[0]); id != "acme.websocket-bridge-pipeline.domain.events" {
+		t.Fatalf("bridgeGroupID(%q) = %q, want %q", got[0], id, "acme.websocket-bridge-pipeline.domain.events")
 	}
 }

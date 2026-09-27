@@ -3,11 +3,11 @@ import { describe, expect, it } from "vitest"
 import {
   dataMovementVerdict,
   rollupFromSummary,
-  rollupTableStats,
   tableStatusBreakdown,
   TABLE_STATUS_WAITING_FOR_DATA,
   type TableStatusBreakdown,
 } from "../executionSummary"
+import { rollupTableStats } from "./rollupFixture"
 
 // The shape api-gateway's computeCDCSummary returns for a pipeline that just
 // finished setting up: every table is counted in total_tables, and a table with

@@ -471,7 +471,7 @@ func TestEveryConsumerGroupIDIsNamespaced(t *testing.T) {
 			"code any more and would pass without checking anything. Sites: %v", len(sites), wantAtLeast, siteFiles(sites))
 	}
 	for _, want := range []string{
-		"internal/kafka/consumer.go",            // agent responses + PII scan
+		"internal/kafka/consumer.go",            // PII scan results
 		"internal/websocket/kafka_bridge.go",    // one group per bridged topic
 		"internal/projector/event_projector.go", // pipeline.domain.events projection
 		"internal/notifier/notifier.go",         // Slack/email alert inbox

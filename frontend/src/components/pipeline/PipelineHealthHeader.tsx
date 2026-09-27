@@ -6,6 +6,8 @@ import { usePipelineRuntime, type PipelineRuntime, type RuntimeHealth } from "@/
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { DiagnosePanel } from "@/components/pipeline/DiagnosePanel"
+import { LoadStatusBadge } from "@/components/pipeline/LoadStatusBadge"
+import { backlogIncludesLoadRows, describeLoadStatus } from "@/lib/pipeline/loadStatus"
 import { RUNTIME_PHASE_WAITING_FOR_DATA, runtimePhaseLabel } from "@/lib/pipeline/statusNormalization"
 import { cn } from "@/lib/utils"
 
@@ -52,7 +54,8 @@ export interface BacklogVital {
 /**
  * backlogVital turns liveness.pending_events into the header's "changes waiting"
  * segment. It is what tells a quiet CDC stream (nothing waiting) from a stuck
- * one (changes waiting, nothing written). Returns null when there is nothing
+ * one (changes waiting, nothing written). While the initial load's rows are
+ * still being written it counts rows, not changes. Returns null when there is nothing
  * honest to say:
  *  - batch pipelines, or a CDC stream with no liveness yet;
  *  - an older gateway that does not send the field;
@@ -72,11 +75,14 @@ export function backlogVital(runtime: PipelineRuntime): BacklogVital | null {
     }
   }
   const stale = runtime.liveness.stale_seconds ?? 0
-  const noun = pending === 1 ? "change" : "changes"
+  // pending_events counts the initial load's rows too; they are not changes.
+  const loadRows = backlogIncludesLoadRows(runtime)
+  const noun = loadRows ? (pending === 1 ? "row" : "rows") : pending === 1 ? "change" : "changes"
+  const what = loadRows ? "read from the source (the initial load's rows included)" : "the source recorded"
   return {
     text: `${compactCount.format(pending)} ${noun} waiting`,
     tone: stale > BACKLOG_STALE_SECONDS ? "warn" : "muted",
-    title: `${exactCount.format(pending)} ${noun} the source recorded ${pending === 1 ? "has" : "have"} not been written to the destination yet.`,
+    title: `${exactCount.format(pending)} ${noun} ${what} ${pending === 1 ? "has" : "have"} not been written to the destination yet.`,
   }
 }
 
@@ -144,6 +150,7 @@ export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
   }
 
   const backlog = backlogVital(runtime)
+  const loadStatus = describeLoadStatus(runtime)
 
   const wrapperTone =
     health === "unhealthy"
@@ -164,6 +171,7 @@ export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
         >
           {runtimePhaseLabel(runtime.phase)}
         </Badge>
+        {loadStatus && <LoadStatusBadge status={loadStatus} testId="pipeline-load-status" />}
         <span className="flex min-w-0 flex-1 items-center gap-1.5 text-xs text-muted-foreground">
           <span className="truncate">{vital}</span>
           {backlog && (
@@ -212,6 +220,14 @@ export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
           </button>
         )}
       </div>
+
+      {/* The chip's tooltip is mouse-only, and this header shows on every tab,
+          so a failed load's recorded reason is said in words here too. */}
+      {loadStatus?.title && (
+        <p data-testid="pipeline-load-reason" className="break-words px-3 pb-2 text-xs text-muted-foreground">
+          {loadStatus.title}
+        </p>
+      )}
 
       {showDiagnose && (
         <div id={diagnosePanelId} className="border-t border-border/60 px-3 py-2">

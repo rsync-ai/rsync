@@ -7,6 +7,48 @@ All notable changes to Rsync AI are documented in this file.
      this file used to open with `## [1.0.0] - December 2025`, a version no tag
      has ever pointed at, and nothing in the repo could disagree with it. -->
 
+## [Unreleased]
+
+Changes since the last release. They move under a version heading when that version
+is tagged.
+
+### Self-hosting
+- MinIO now pulls `cgr.dev/chainguard/minio`, pinned by digest, for both the server and the
+  `mc` bucket/lifecycle job. MinIO stopped serving anonymous pulls from `docker.io/minio/*` and
+  then from `quay.io/minio/*`, so a v0.1.5 install, `docker compose pull`, or a Helm install
+  without registry credentials failed at MinIO. The compose MinIO server runs as root
+  (`user: "0:0"`) so a volume written by v0.1.5 stays writable. Helm chart 0.1.5 and older name
+  the withdrawn images: set `objectStorage.minio.image` and `objectStorage.minio.mcImage` as
+  shown in [docs/deployment/kubernetes.md](docs/deployment/kubernetes.md).
+
+### First-run demo
+- "Start with sample data" now reaches a pipeline confirmation with no language model
+  configured. The chat knows the `sample-data` connector, reads "sample data" as the demo
+  source only when no other connector is named ("copy my postgres sample data to s3" is still
+  PostgreSQL → Amazon S3), and onboarding opens the chat with the request already sent. The chat
+  home offers a "Sample data → Postgres" pipeline once both demo connections exist.
+- The first-run demo no longer fails with "Missing connector: sample-data". The connector check
+  required every connector to subclass `BaseMCPConnector`; the self-contained `sample-data`
+  connector does not, so the chat request stopped before planning. A top-level
+  `<Name>MCPServer` class now counts too; stubs are still rejected.
+
+### Kafka topics
+- **Breaking:** a default install provisions four platform topics — `domain.events`,
+  `rsync.notifications`, `pii.scan.request`, `pii.scan.response` — instead of the 28 a fresh
+  stack used to carry. The agent command bus (`rsync.agent.*`, `task.assignments`/`task.results`,
+  `pipeline.agent.telemetry`, `sentinel.audit`, `healer.actions`) had no live producer or
+  consumer and is removed, together with the planner's Kafka consumer (the planner is HTTP-only),
+  `POST /api/v1/topology/topics/pipeline` and the `ENABLE_KAFKA_CONSUMER` setting. Topics an
+  existing install already has are not deleted; per-pipeline topics go when their pipeline does.
+- `domain.events` keeps 7 days (`retention.ms=604800000`) instead of growing forever, so a
+  projector rebuild or replay reaches back 7 days.
+- Schema-drift topics are created only when `RSYNC_SCHEMA_DRIFT_ENABLED=true`.
+- A PostgreSQL or MongoDB CDC pipeline no longer gets a schema-history topic or an empty DDL
+  topic; only MySQL/MariaDB, SQL Server, Oracle and Db2 sources, which use them, do.
+- A pipeline's incremental-snapshot signals go to one topic with a fixed key.
+- Dead-letter topics are created up front (1 partition, 7 days), and a message that cannot be
+  dead-lettered is retried rather than skipped.
+
 ## [0.1.5] - 2026-09-23
 
 Everything since v0.1.4.

@@ -315,6 +315,36 @@ def _is_local_db_host(host: str) -> bool:
     return False
 
 
+
+def _group_rows_by_shape(data, columns):
+    """Split a batch into CONSECUTIVE runs of rows that carry the same columns.
+
+    A row whose key set is SMALLER than the batch union is not "the same row with
+    NULLs in the gaps" — it is a row the producer deliberately said nothing about
+    for those columns. The kafka sink depends on exactly that: its
+    filterDebeziumUnavailable DROPS the key of a TOAST-able column Debezium
+    reported unchanged (``__debezium_unavailable_value``), on the contract that an
+    absent key means "leave this column alone". Building one statement from the
+    union broke that contract — ``row.get(col)`` returned None and the UPDATE/SET
+    clause wrote NULL over the destination's good value. It only misfired when a
+    batch MIXED shapes (one row carrying the column, one not), which is the normal
+    shape of a CDC batch, so a single-row batch always looked correct.
+
+    Runs are CONSECUTIVE and never merged across the batch: two changes to the same
+    primary key must still be applied in arrival order, and regrouping by shape
+    would let the older change win. A uniform batch therefore yields exactly one
+    run — the previous single-statement, single-``executemany`` behaviour.
+    """
+    groups = []
+    for row in data:
+        sig = tuple(c for c in columns if isinstance(row, dict) and c in row)
+        if groups and groups[-1][0] == sig:
+            groups[-1][1].append(row)
+        else:
+            groups.append((sig, [row]))
+    return [(list(sig), rows) for sig, rows in groups]
+
+
 class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
     """MCP Server for MySQL"""
     
@@ -858,64 +888,79 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     if _k not in _seen_cols:
                         _seen_cols.add(_k)
                         columns.append(_k)
-            placeholders = ", ".join(["%s"] * len(columns))
-            col_str = ", ".join([f"`{c}`" for c in columns])
-            conflict_cols = [k for k in key_fields if k in columns]
-            if not conflict_cols:
-                conflict_cols = ["id"] if "id" in columns else [columns[0]]
+            def _build_upsert(shape_cols):
+                """One INSERT ... ON DUPLICATE KEY UPDATE for ONE row shape."""
+                placeholders = ", ".join(["%s"] * len(shape_cols))
+                col_str = ", ".join([f"`{c}`" for c in shape_cols])
+                conflict_cols = [k for k in key_fields if k in shape_cols]
+                if not conflict_cols:
+                    conflict_cols = ["id"] if "id" in shape_cols else [shape_cols[0]]
 
-            update_cols = [c for c in columns if c not in conflict_cols]
-            if update_cols:
-                update_clause = ", ".join([f"`{c}`=VALUES(`{c}`)" for c in update_cols])
-                upsert_query = (
-                    f"INSERT INTO {qualified_target} ({col_str}) VALUES ({placeholders}) "
-                    f"ON DUPLICATE KEY UPDATE {update_clause}"
-                )
-            else:
-                # All columns are conflict keys -> nothing to update on a dup. Use a
-                # no-op self-update (`k`=`k`) rather than INSERT IGNORE: IGNORE
-                # downgrades data truncation/coercion to a WARNING even under strict
-                # sql_mode, which would silently corrupt a drifted all-key row. A no-op
-                # ON DUPLICATE KEY UPDATE keeps the identical dedup semantics while
-                # letting strict mode RAISE on genuine data loss.
-                noop_col = conflict_cols[0]
-                upsert_query = (
-                    f"INSERT INTO {qualified_target} ({col_str}) VALUES ({placeholders}) "
-                    f"ON DUPLICATE KEY UPDATE `{noop_col}`=`{noop_col}`"
-                )
+                update_cols = [c for c in shape_cols if c not in conflict_cols]
+                if update_cols:
+                    update_clause = ", ".join([f"`{c}`=VALUES(`{c}`)" for c in update_cols])
+                    query = (
+                        f"INSERT INTO {qualified_target} ({col_str}) VALUES ({placeholders}) "
+                        f"ON DUPLICATE KEY UPDATE {update_clause}"
+                    )
+                else:
+                    # All columns are conflict keys -> nothing to update on a dup. Use a
+                    # no-op self-update (`k`=`k`) rather than INSERT IGNORE: IGNORE
+                    # downgrades data truncation/coercion to a WARNING even under strict
+                    # sql_mode, which would silently corrupt a drifted all-key row. A no-op
+                    # ON DUPLICATE KEY UPDATE keeps the identical dedup semantics while
+                    # letting strict mode RAISE on genuine data loss.
+                    noop_col = conflict_cols[0]
+                    query = (
+                        f"INSERT INTO {qualified_target} ({col_str}) VALUES ({placeholders}) "
+                        f"ON DUPLICATE KEY UPDATE `{noop_col}`=`{noop_col}`"
+                    )
+                return query, conflict_cols
 
             rows_upserted = 0
             batch_size = min(self.max_batch_size, 1000)
             type_lookup = col_types if isinstance(col_types, dict) else {}
-            for i in range(0, len(data), batch_size):
-                batch = data[i:i + batch_size]
-                values = [
-                    tuple(
-                        _mysql_bind_value(row.get(col), type_lookup.get(col))
-                        for col in columns
+            # One statement per SHAPE-RUN, not one per batch: a row that omits a
+            # column must not have that column in its SET clause. See
+            # _group_rows_by_shape. `columns` (the union) is still what DDL wants.
+            for shape_cols, shape_rows in _group_rows_by_shape(data, columns):
+                if not shape_cols:
+                    raise ValueError(
+                        f"upsert_data: a row in the batch for {table} carries no columns; "
+                        "refusing to write an all-NULL row"
                     )
-                    for row in batch
-                ]
-                try:
-                    cursor.executemany(upsert_query, values)
-                    rows_upserted += len(batch)
-                except Exception as e:
-                    msg = str(e)
-                    is_cdc = "cdc_metadata" in params or "operation" in params
-                    if is_cdc and ("doesn't exist" in msg.lower() or "table" in msg.lower() and "exist" in msg.lower()):
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            pass
-                        cursor = self._get_cursor(conn, as_dict=False)
-                        # Retry-create must resolve the SAME db as qualified_target
-                        # — pass params so the namespace resolves identically.
-                        self._ensure_table_for_cdc(cursor, config, table, columns, conflict_cols, col_types, params)
-                        conn.commit()
+                upsert_query, conflict_cols = _build_upsert(shape_cols)
+                for i in range(0, len(shape_rows), batch_size):
+                    batch = shape_rows[i:i + batch_size]
+                    values = [
+                        tuple(
+                            _mysql_bind_value(row.get(col), type_lookup.get(col))
+                            for col in shape_cols
+                        )
+                        for row in batch
+                    ]
+                    try:
                         cursor.executemany(upsert_query, values)
                         rows_upserted += len(batch)
-                    else:
-                        raise
+                    except Exception as e:
+                        msg = str(e)
+                        is_cdc = "cdc_metadata" in params or "operation" in params
+                        if is_cdc and ("doesn't exist" in msg.lower() or "table" in msg.lower() and "exist" in msg.lower()):
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            cursor = self._get_cursor(conn, as_dict=False)
+                            # Retry-create must resolve the SAME db as qualified_target
+                            # — pass params so the namespace resolves identically. DDL
+                            # takes the batch UNION, not this run's shape: the table
+                            # needs every column the batch will write.
+                            self._ensure_table_for_cdc(cursor, config, table, columns, conflict_cols, col_types, params)
+                            conn.commit()
+                            cursor.executemany(upsert_query, values)
+                            rows_upserted += len(batch)
+                        else:
+                            raise
 
             # Diagnostic mirror of import_data: surface the resolved target and the
             # submitted row count. Under STRICT_ALL_TABLES + the no-IGNORE dedup path

@@ -5,6 +5,7 @@ import userEvent from "@testing-library/user-event"
 import ModelSchedulePage from "@/app/(dashboard)/explorer/schedules/[id]/page"
 import ScheduledQueriesPage from "@/app/(dashboard)/explorer/schedules/page"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { formatAbsoluteTime } from "@/components/explorer/scheduleTime"
 
 // The per-model page: every run of one model, filterable and paged, with the controls
 // to act on it. The failure modes worth guarding are all quiet ones — a page that
@@ -99,6 +100,8 @@ function serve(route: Route, schedule: Record<string, unknown> | null = SCHEDULE
     if (url === "/api/v1/explorer/schedules?saved_query_id=q-1") {
       return res(200, { schedules: schedule ? [schedule] : [], count: schedule ? 1 : 0 })
     }
+    // The query's own row, which the page reads the model's name, author and dates from.
+    if (url === "/api/v1/explorer/saved/q-1" && schedule) return res(200, { ...schedule, id: "q-1" })
     if (url === "/api/v1/explorer/freshness") return res(200, { breaches: [] })
     // The Details card's own reads: who the schedule runs as, and the list the lineage
     // count walks. The list route here is the whole workspace's, with no query string.
@@ -430,6 +433,44 @@ describe("per-model schedule page", () => {
     expect(screen.getByRole("button", { name: /edit schedule/i })).toBeDisabled()
   })
 
+  // A schedule is a row of its own: made after the query, by whoever scheduled it, and its
+  // updated_at moves only when the trigger does. A SQL edit or a new freshness deadline
+  // changes the query's row — so Created, Updated and "by you" read that one, and so does
+  // the author's right to edit, whichever admin scheduled the query.
+  it("dates and credits the model from the query's own row, not its schedule's", async () => {
+    role.canSchedule = false
+    serve(
+      (url) =>
+        url === "/api/v1/explorer/saved/q-1"
+          ? res(200, {
+              ...SCHEDULE,
+              id: "q-1",
+              created_by: "u-1",
+              created_at: "2026-08-20T09:00:00Z",
+              updated_at: "2026-09-25T13:02:04Z",
+            })
+          : url.startsWith("/api/v1/explorer/saved/q-1/runs")
+            ? res(200, { runs: [] })
+            : undefined,
+      { ...SCHEDULE, created_by: "u-admin", created_at: "2026-09-01T00:00:00Z", updated_at: "2026-09-01T00:00:00Z" },
+    )
+    render(<ModelSchedulePage />)
+    expect(await detail("Updated")).toHaveTextContent(formatAbsoluteTime("2026-09-25T13:02:04Z"))
+    const created = await detail("Created")
+    expect(created).toHaveTextContent(formatAbsoluteTime("2026-08-20T09:00:00Z"))
+    expect(created).toHaveTextContent("by you")
+    expect(screen.getByRole("button", { name: /edit query/i })).toBeEnabled()
+  })
+
+  // Both rows are needed to say anything true about a scheduled model, and a failed read
+  // of the query's is a failure to retry — not a page that dates the model by its schedule.
+  it("offers a retry when a scheduled model's query row fails to load", async () => {
+    serve((url) => (url === "/api/v1/explorer/saved/q-1" ? res(500, {}) : undefined))
+    render(<ModelSchedulePage />)
+    expect(await screen.findByText("Could not load this model (HTTP 500).")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument()
+  })
+
   // Control for the gate above: a model whose runs would do nothing is not runnable by
   // anyone, so a disabled Run now is not only a role check.
   it("refuses Run now when a run would do nothing", async () => {
@@ -477,6 +518,41 @@ describe("per-model schedule page", () => {
     await user.click(screen.getByRole("tab", { name: "Runs" }))
     expect(await screen.findByRole("table")).toBeInTheDocument()
     expect(nav.replace).toHaveBeenCalledWith("/explorer/schedules/q-1?from=list", { scroll: false })
+  })
+
+  // The history itself is tested in model-freshness-history.test.tsx. Here: that it is
+  // reachable, linkable, only asked for once opened, and follows the page's Refresh.
+  it("opens the freshness history from the address, asks for it only then, and Refresh asks again", async () => {
+    const HISTORY = "/api/v1/explorer/freshness?include_resolved=true"
+    serve((url) => {
+      if (url.startsWith("/api/v1/explorer/saved/q-1/runs")) return res(200, { runs: [run("r-1")] })
+      if (url === HISTORY) return res(200, { breaches: [], count: 0 })
+      return undefined
+    })
+    const user = userEvent.setup()
+    render(<ModelSchedulePage />)
+
+    await screen.findByRole("table")
+    expect(requested(HISTORY)).toBe(0)
+
+    await user.click(screen.getByRole("tab", { name: "Freshness" }))
+    expect(await screen.findByText("No freshness misses recorded.")).toBeInTheDocument()
+    expect(nav.replace).toHaveBeenCalledWith("/explorer/schedules/q-1?tab=freshness", { scroll: false })
+    expect(requested(HISTORY)).toBe(1)
+
+    await user.click(screen.getByRole("button", { name: "Refresh" }))
+    await waitFor(() => expect(requested(HISTORY)).toBe(2))
+  })
+
+  it("opens on the freshness tab when the address says so", async () => {
+    nav.search = "tab=freshness"
+    serve((url) =>
+      url === "/api/v1/explorer/freshness?include_resolved=true" ? res(200, { breaches: [], count: 0 }) : undefined,
+    )
+    render(<ModelSchedulePage />)
+
+    expect(await screen.findByText("No freshness misses recorded.")).toBeInTheDocument()
+    expect(screen.getByRole("tab", { name: "Freshness" })).toHaveAttribute("aria-selected", "true")
   })
 
   it("reloads the graph with the page's Refresh, and asks what is running while the graph is open", async () => {

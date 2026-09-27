@@ -9,16 +9,19 @@ Source: `docker-compose.yml` service `kafka`
 
 ### Topic Conventions (high level)
 Examples (not exhaustive):
-- agent control:
-  - `agent.control.commands`
-  - `agent.control.results`
-- planner:
-  - `agent.planner.response`
-- pipeline:
+- platform (created at orchestrator startup):
   - `pipeline.domain.events`
+  - `rsync.notifications`
+  - `pii.scan.request` / `pii.scan.response`
+  - `rsync.healer.*` (only with `RSYNC_SCHEMA_DRIFT_ENABLED=true`)
+- batch:
+  - `pipeline.<id8>.data`
 - CDC:
-  - `cdc.<connection>` (when SMT routes to single topic per connection)
+  - `cdc-<id8>.<db>.<table>`
 
-See also: `docs/architecture/kafka-topics.md` (may be archived during doc cleanup if superseded).
+The `agent.control.*` and `agent.*.response(s)` topics were removed with the agent Kafka
+bus in [#1227](https://github.com/rsync-ai/rsync-ai/pull/1227).
+
+See also: [kafka-topics.md](../../../architecture/kafka-topics.md).
 
 

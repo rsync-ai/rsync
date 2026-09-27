@@ -7,11 +7,12 @@
 // down by inverting them. That list is what the caller may see of the workspace: another
 // member's private model has no row in it, so it is never found as a downstream.
 
-import dagre from "dagre"
-
 import type { ScheduledQuery } from "@/components/explorer/scheduledModel"
 import { AFTER_UPSTREAM, liveCellFor, type Fetched, type RunningModelsResponse } from "@/components/explorer/liveState"
+import { layoutGraph, type GraphLayout, type Rect } from "@/lib/elk-layout"
 import { executionStatusConfig, normalizeExecutionStatus } from "@/lib/execution-status"
+
+export type { GraphLayout, Rect }
 
 /** The most nodes one graph draws, the model itself included. */
 export const MAX_LINEAGE_NODES = 50
@@ -681,44 +682,13 @@ function placeholder(
 export const LINEAGE_NODE_WIDTH = 216
 export const LINEAGE_NODE_HEIGHT = 76
 
-export interface Rect {
-  x: number
-  y: number
-  width: number
-  height: number
-}
-
 /** Upstreams on the left, downstreams on the right. Positions are top-left corners. */
-export function layoutLineage(
-  nodeKeys: string[],
-  edges: { from: string; to: string }[],
-): { positions: Map<string, { x: number; y: number }>; bounds: Rect } {
-  const g = new dagre.graphlib.Graph()
-  g.setGraph({ rankdir: "LR", nodesep: 20, ranksep: 56, marginx: 0, marginy: 0 })
-  g.setDefaultEdgeLabel(() => ({}))
-  for (const key of nodeKeys) g.setNode(key, { width: LINEAGE_NODE_WIDTH, height: LINEAGE_NODE_HEIGHT })
-  for (const e of edges) g.setEdge(e.from, e.to)
-  dagre.layout(g)
-
-  const positions = new Map<string, { x: number; y: number }>()
-  let minX = Infinity
-  let minY = Infinity
-  let maxX = -Infinity
-  let maxY = -Infinity
-  for (const key of nodeKeys) {
-    const n = g.node(key) as { x: number; y: number }
-    const x = n.x - LINEAGE_NODE_WIDTH / 2
-    const y = n.y - LINEAGE_NODE_HEIGHT / 2
-    positions.set(key, { x, y })
-    minX = Math.min(minX, x)
-    minY = Math.min(minY, y)
-    maxX = Math.max(maxX, x + LINEAGE_NODE_WIDTH)
-    maxY = Math.max(maxY, y + LINEAGE_NODE_HEIGHT)
-  }
-  const bounds = nodeKeys.length
-    ? { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
-    : { x: 0, y: 0, width: 0, height: 0 }
-  return { positions, bounds }
+export function layoutLineage(nodeKeys: string[], edges: { from: string; to: string }[]): Promise<GraphLayout> {
+  return layoutGraph(
+    nodeKeys.map((id) => ({ id, width: LINEAGE_NODE_WIDTH, height: LINEAGE_NODE_HEIGHT })),
+    edges,
+    { layerGap: 64, nodeGap: 20 },
+  )
 }
 
 /** Below this zoom a node's words are too small to read, so the model is shown instead of all of it. */
@@ -726,29 +696,39 @@ export const MIN_READABLE_FIT_ZOOM = 0.75
 
 const VIEWPORT_PADDING = 24
 
+/** The zoom that fits the whole drawing in the canvas, never above full size. */
+export function fitZoom(bounds: Rect, size: { width: number; height: number }): number {
+  return Math.min(
+    (size.width - 2 * VIEWPORT_PADDING) / bounds.width,
+    (size.height - 2 * VIEWPORT_PADDING) / bounds.height,
+    1,
+  )
+}
+
 /**
- * The first view: the whole chain when it fits at a readable size, otherwise the model
- * itself at full size, with the rest a pan away.
+ * The first view: the whole drawing when it fits at a readable size. Otherwise the root
+ * at full size, with the rest a pan away; or, with no root to centre on, the top-left
+ * of the drawing at the smallest readable size, so as much as can be read is in view.
  */
 export function initialViewport(
   bounds: Rect,
-  root: Rect,
+  root: Rect | null,
   size: { width: number; height: number },
 ): { x: number; y: number; zoom: number } {
   if (!(size.width > 0) || !(size.height > 0) || !(bounds.width > 0) || !(bounds.height > 0)) {
     return { x: 0, y: 0, zoom: 1 }
   }
-  const fit = Math.min(
-    (size.width - 2 * VIEWPORT_PADDING) / bounds.width,
-    (size.height - 2 * VIEWPORT_PADDING) / bounds.height,
-    1,
-  )
+  const fit = fitZoom(bounds, size)
   if (fit >= MIN_READABLE_FIT_ZOOM) {
     return {
       x: (size.width - bounds.width * fit) / 2 - bounds.x * fit,
       y: (size.height - bounds.height * fit) / 2 - bounds.y * fit,
       zoom: fit,
     }
+  }
+  if (!root) {
+    const zoom = MIN_READABLE_FIT_ZOOM
+    return { x: VIEWPORT_PADDING - bounds.x * zoom, y: VIEWPORT_PADDING - bounds.y * zoom, zoom }
   }
   return {
     x: size.width / 2 - (root.x + root.width / 2),

@@ -226,7 +226,7 @@ func TestGetPipelineRuntime_PausedPhaseDoesNotReportStaleStreamingMessage(t *tes
 // TestRuntimeMessage_OnlyRewritesThePausedPhase brackets the fix above: the substitution must
 // fire ONLY for status='paused' (whose message is derived, because no pause writer touches
 // pipeline_progress) and leave every other phase's progress-authored message alone. In
-// particular 'stopped' also maps to phase "paused" (computeRuntimePhase:308) but StopPipeline
+// particular phase "stopped" keeps its message: StopPipeline
 // already writes the more specific 'Cancelled by user' (pipelines.go:3241), and a HITL
 // blocker's description must never be masked. Without the rawStatus/phase narrowing these
 // cases regress to "Pipeline paused".
@@ -236,7 +236,7 @@ func TestRuntimeMessage_OnlyRewritesThePausedPhase(t *testing.T) {
 	}{
 		{"paused drops the stale streaming text", "paused", "paused", "Streaming pipeline active", "Pipeline paused"},
 		{"paused with an empty progress row still reads paused", "paused", "PAUSED", "", "Pipeline paused"},
-		{"stopped keeps the more specific cancel message", "paused", "stopped", "Cancelled by user", "Cancelled by user"},
+		{"stopped keeps the more specific cancel message", "stopped", "stopped", "Cancelled by user", "Cancelled by user"},
 		{"streaming message survives", "streaming", "completed", "Streaming pipeline active", "Streaming pipeline active"},
 		{"HITL blocker description survives", "validating", "running", "Select the tables to sync", "Select the tables to sync"},
 		{"failure message survives", "failed", "failed", "publication does not exist", "publication does not exist"},
@@ -525,5 +525,24 @@ func TestLoadRuntimeDeps_ScopesToCurrentRunAndKeepsUncheckedRows(t *testing.T) {
 	}
 	if health != "unknown" {
 		t.Fatalf("aggregate with only unchecked deps: want unknown, got %q", health)
+	}
+}
+
+// TestComputeRuntimePhase_StoppedIsNotPaused: a stopped CDC pipeline read
+// "Paused · Load completed, replication paused" (U-14, prod 2026-09-26). Stop and
+// Pause are different actions with different ways back, so each keeps its phase,
+// in both modes, and a failure still outranks either.
+func TestComputeRuntimePhase_StoppedIsNotPaused(t *testing.T) {
+	for _, mode := range []string{"cdc", "batch"} {
+		for _, tc := range []struct{ status, want string }{
+			{"stopped", "stopped"},
+			{"STOPPED", "stopped"},
+			{"paused", "paused"},
+			{"failed", "failed"},
+		} {
+			if got := computeRuntimePhase(mode, tc.status, "", "healthy", nil, nil, time.Time{}); got != tc.want {
+				t.Errorf("%s %q: phase = %q, want %q", mode, tc.status, got, tc.want)
+			}
+		}
 	}
 }

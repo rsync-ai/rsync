@@ -5,19 +5,26 @@
  * `CDCLagAlertsPanel` has three read outcomes and only two renders. On a 500,
  * or on a thrown fetch, it sets `available = true` and `issues = []`
  * (`CDCLagAlertsPanel.tsx:52-58`), which lands on the same branch as a genuine
- * empty list — a GREEN card reading "No replication lag alerts — source
- * database is keeping up".
+ * empty list — a GREEN card reading "No alerts for this pipeline — source, sink
+ * and connectors are keeping up".
  *
  * That string is a positive claim about the source database, derived from a
  * read that failed. It is the worst possible failure mode for a monitoring
  * panel: it does not merely omit the alarm, it actively tells the operator to
  * stop looking. A blank panel would have been safer.
  *
- * The `404 || 403` branch above it is DELIBERATE and must keep working — the
- * sentinel API returns those when the feature is disabled or the caller lacks
- * the role, and hiding the panel is the right answer there. This file guards
- * that branch too, because the obvious "fix" (route everything through a
- * throwing fetch helper) would delete it.
+ * The `404 || 403` branch above it is DELIBERATE and must keep working — a 404 is
+ * a gateway that predates GET /pipelines/:id/alerts and a 403 is a caller who may
+ * not read this pipeline, and hiding the panel is the right answer for both. This
+ * file guards that branch too, because the obvious "fix" (route everything through
+ * a throwing fetch helper) would delete it.
+ *
+ * The panel reads the PIPELINE's own alerts route, whose payload key is `alerts`.
+ * It used to read MONITORING.SENTINEL_ISSUES (`issues`), which is the admin
+ * infrastructure view — gated on FEATURE_MONITORING_INFRA, default off, plus a
+ * platform power_user/admin role. Both of those answered 404/403, i.e. the hide
+ * branch, so on a default deployment and for every ordinary workspace member this
+ * panel silently never rendered at all.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest"
@@ -41,13 +48,11 @@ function res(status: number, body: unknown) {
 }
 
 const ONE_ALERT = {
-  issues: [
+  alerts: [
     {
       id: "i1",
       type: "replication_lag",
       severity: "warning",
-      component_id: "p1",
-      component_type: "cdc_pipeline",
       description: "Replication slot is 512 MB behind",
       detected_at: "2026-08-05T12:00:00Z",
       occurrence_count: 3,
@@ -57,7 +62,7 @@ const ONE_ALERT = {
   ],
 }
 
-const ALL_CLEAR = /no replication lag alerts/i
+const ALL_CLEAR = /no alerts for this pipeline/i
 const UNAVAILABLE = /could not check/i
 
 describe("CDCLagAlertsPanel must not answer green when it could not read (F-280)", () => {
@@ -86,7 +91,7 @@ describe("CDCLagAlertsPanel must not answer green when it could not read (F-280)
   it("positive control: a real empty list still renders the green all-clear", async () => {
     // Without this the fix could pass by never showing green at all, which
     // would just be a different lie.
-    mockFetch.mockResolvedValue(res(200, { issues: [] }))
+    mockFetch.mockResolvedValue(res(200, { alerts: [] }))
 
     render(<CDCLagAlertsPanel pipelineId="p1" />)
 

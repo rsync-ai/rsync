@@ -7,6 +7,7 @@ import {
   extractHealerActivity,
   healSucceeded,
   isHealerEvent,
+  openEscalations,
   type PipelineRunEvent,
 } from "@/lib/pipeline/eventNormalizer"
 
@@ -324,7 +325,7 @@ describe("healSucceeded", () => {
       ])[0]
 
     expect(healSucceeded(verdict("healed"))).toBe(true)
-    for (const v of ["failed_again", "inconclusive", "superseded"]) {
+    for (const v of ["failed_again", "inconclusive", "superseded", "self_resolved"]) {
       expect(healSucceeded(verdict(v)), `verdict ${v} must not read as healed`).toBe(
         false
       )
@@ -340,5 +341,76 @@ describe("healSucceeded", () => {
     expect(healSucceeded(action("healer_cleanup_cdc_skipped"))).toBe(false)
     expect(healSucceeded(action("healer_repair_ownership_failed"))).toBe(false)
     expect(healSucceeded(action("healer_repair_ownership_skipped"))).toBe(false)
+  })
+})
+
+// ---------------------------------------------------------------------------
+// openEscalations — the "N need you" badge
+// ---------------------------------------------------------------------------
+
+describe("openEscalations", () => {
+  const decision = (id: number | undefined, at: string, outcome = "escalated") =>
+    evt({
+      event_id: `d${id ?? "x"}-${at}`,
+      received_at: at,
+      payload: { outcome, ...(id === undefined ? {} : { attempt_id: id }) },
+    })
+  const verdict = (id: number, v: string, at: string) =>
+    evt({
+      event_id: `v${id}-${at}`,
+      event_type: "healer_verified",
+      received_at: at,
+      payload: { attempt_id: id, verdict: v },
+    })
+  const open = (events: PipelineRunEvent[]) =>
+    openEscalations(extractHealerActivity(events)).map((a) => a.attemptId ?? "legacy")
+
+  it("closes an escalation once its verdict says the pipeline recovered or moved on", () => {
+    for (const v of ["healed", "self_resolved", "superseded", "failed_again"]) {
+      expect(
+        open([decision(7, "2026-08-01T10:00:00Z"), verdict(7, v, "2026-08-01T11:00:00Z")]),
+        `verdict ${v}`
+      ).toEqual([])
+    }
+  })
+
+  it("keeps it open with no verdict yet, or an inconclusive one", () => {
+    expect(open([decision(7, "2026-08-01T10:00:00Z")])).toEqual([7])
+    expect(
+      open([decision(7, "2026-08-01T10:00:00Z"), verdict(7, "inconclusive", "2026-08-01T11:00:00Z")])
+    ).toEqual([7])
+  })
+
+  it("joins on the attempt id, not on order", () => {
+    // Attempt 8's verdict must not close attempt 7.
+    expect(
+      open([
+        decision(7, "2026-08-01T10:00:00Z", "hitl_requested"),
+        decision(8, "2026-08-01T10:05:00Z"),
+        verdict(8, "healed", "2026-08-01T11:00:00Z"),
+      ])
+    ).toEqual([7])
+  })
+
+  it("never counts a decision that did not hand off to a person", () => {
+    expect(open([decision(7, "2026-08-01T10:00:00Z", "auto_executed")])).toEqual([])
+    expect(open([decision(7, "2026-08-01T10:00:00Z", "action_failed")])).toEqual([])
+  })
+
+  it("counts a legacy escalation (no attempt id) only while nothing newer exists", () => {
+    expect(open([decision(undefined, "2026-07-16T18:52:00Z")])).toEqual(["legacy"])
+    expect(
+      open([decision(undefined, "2026-07-16T18:52:00Z"), decision(7, "2026-08-01T10:00:00Z", "auto_executed")])
+    ).toEqual([])
+  })
+
+  it("has an answer for every verdict the verifier can write", () => {
+    // attempts.go is the source of the verdict vocabulary. A new verdict must be
+    // placed on one side of "still needs a person" deliberately, so this fails
+    // until a test above names it.
+    const goVerdicts = [
+      ...goSource("internal/agents/heal/attempts.go").matchAll(/\bVerdict\w+\s+Verdict\s*=\s*"([a-z_]+)"/g),
+    ].map((m) => m[1])
+    expect(goVerdicts.sort()).toEqual(["failed_again", "healed", "inconclusive", "self_resolved", "superseded"])
   })
 })

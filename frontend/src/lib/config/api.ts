@@ -8,10 +8,9 @@
 
 // Base URLs - Server-side (internal Docker network)
 // Defaults target host-exposed ports so `next dev` outside Docker works without env config.
-// In Docker, compose explicitly sets API_GATEWAY_INTERNAL_URL=http://api-gateway:8080
-// (and the equivalent for the orchestrator), so the fallback only kicks in for local dev.
+// In Docker, compose explicitly sets API_GATEWAY_INTERNAL_URL=http://api-gateway:8080,
+// so the fallback only kicks in for local dev.
 export const API_GATEWAY_URL_INTERNAL = process.env.API_GATEWAY_INTERNAL_URL || "http://localhost:5001"
-export const ORCHESTRATOR_URL_INTERNAL = process.env.ORCHESTRATOR_INTERNAL_URL || "http://localhost:8081"
 
 // Base URLs - Client-side (browser access)
 //
@@ -251,6 +250,9 @@ export const API_ENDPOINTS = {
     TRENDS: (id: string, limit = 10) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/trends?limit=${limit}`,
     CDC_RECOVER: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/cdc/recover`,
     CDC_BACKFILL: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/cdc/backfill`,
+    // The latest (≤ 10, newest first) queued/sent snapshot loads of this CDC
+    // pipeline — Re-snapshot and Edit tables with load — and how far each got.
+    CDC_SNAPSHOT_REQUESTS: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/cdc/snapshot-requests`,
     GET: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}`,
     GET_INTERNAL: (id: string) => `${API_GATEWAY_URL_INTERNAL}/api/v1/pipelines/${id}`,
     UPDATE: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}`,
@@ -268,6 +270,9 @@ export const API_ENDPOINTS = {
     HITL_NODE_INPUT: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/hitl/node-input`,
     // Persisted pipeline configuration helpers
     TABLES: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/tables`,
+    // Per-table resume positions (LSN / resume token / watermark) — "where did
+    // this pipeline get to on each table". Viewer-gated server-side.
+    CHECKPOINTS: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/checkpoints`,
     MONITORING_OVERVIEW: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/monitoring/overview`,
     // Canonical runtime view — single source of truth for "what is this pipeline
     // doing right now". Replaces UI-side state derivation.
@@ -275,6 +280,22 @@ export const API_ENDPOINTS = {
     RUNTIME_INTERNAL: (id: string) => `${API_GATEWAY_URL_INTERNAL}/api/v1/pipelines/${id}/runtime`,
     DIAGNOSE: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/diagnose`,
     TABLE_STATS: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/table-stats`,
+    /**
+     * This pipeline's own Sentinel findings (source lag, sink drain lag, connector
+     * down). Prefer this over MONITORING.SENTINEL_ISSUES for anything on a pipeline
+     * page: that route is the ADMIN infrastructure view, gated on
+     * FEATURE_MONITORING_INFRA (default off) plus a platform power_user/admin role,
+     * so on a default deployment it 404s and any panel reading it hides itself —
+     * which is how a stalled sink went unreported to the person who owns it.
+     */
+    ALERTS: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/alerts`,
+    /**
+     * This pipeline's Kafka consumer groups and their per-topic lag. Viewer, no
+     * feature flag. Distinct from MONITORING.SENTINEL_HEALTH, whose consumer rows
+     * are the PLATFORM's own workers (the topics the orchestrator process itself
+     * consumes, keyed by topic, admin-only) and contain no pipeline topic at all.
+     */
+    CONSUMERS: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/consumers`,
     EVENTS: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/events`,
     SCHEMA_CHANGES: (id: string) => `${API_GATEWAY_URL}/api/v1/pipelines/${id}/schema-changes`,
     SCHEMA_CHANGE_APPROVE: (id: string, changeId: string) =>
@@ -311,59 +332,6 @@ export const API_ENDPOINTS = {
     ROLLUP: (pipelineId: string) => `${API_GATEWAY_URL}/api/v1/transforms/pipeline/${pipelineId}/rollup`,
     // config_snapshot revision timeline per transform slot (deduped to real changes).
     CONFIG_HISTORY: (pipelineId: string) => `${API_GATEWAY_URL}/api/v1/transforms/pipeline/${pipelineId}/config-history`,
-  },
-}
-
-// Orchestrator Endpoints (port 8081) - New Architecture
-export const ORCHESTRATOR_ENDPOINTS = {
-  // New Architecture - Control Plane + Workers
-  PIPELINES: {
-    LIST: `${ORCHESTRATOR_URL}/api/v1/pipelines`,
-    LIST_INTERNAL: `${ORCHESTRATOR_URL_INTERNAL}/api/v1/pipelines`,
-    CREATE: `${ORCHESTRATOR_URL}/api/v1/pipelines`,
-    CREATE_INTERNAL: `${ORCHESTRATOR_URL_INTERNAL}/api/v1/pipelines`,
-    GET: (id: string) => `${ORCHESTRATOR_URL}/api/v1/pipelines/${id}`,
-    GET_INTERNAL: (id: string) => `${ORCHESTRATOR_URL_INTERNAL}/api/v1/pipelines/${id}`,
-    CANCEL: (id: string) => `${ORCHESTRATOR_URL}/api/v1/pipelines/${id}/cancel`,
-    RESUME: (id: string) => `${ORCHESTRATOR_URL}/api/v1/pipelines/${id}/resume`,
-    EVENTS: (id: string) => `${ORCHESTRATOR_URL}/api/v1/pipelines/${id}/events`,
-    EVENTS_INTERNAL: (id: string) => `${ORCHESTRATOR_URL_INTERNAL}/api/v1/pipelines/${id}/events`,
-    TELEMETRY: (id: string) => `${ORCHESTRATOR_URL}/api/v1/pipelines/${id}/telemetry`,
-    TELEMETRY_INTERNAL: (id: string) => `${ORCHESTRATOR_URL_INTERNAL}/api/v1/pipelines/${id}/telemetry`,
-    TEST: `${ORCHESTRATOR_URL}/api/v1/test/pipeline`, // Test endpoint
-  },
-  
-  // Direct orchestrator calls (if needed)
-  CONNECTIONS: {
-    LIST: `${ORCHESTRATOR_URL}/api/v1/connections`,
-    CREATE: `${ORCHESTRATOR_URL}/api/v1/connections`,
-    GET: (id: string) => `${ORCHESTRATOR_URL}/api/v1/connections/${id}`,
-    DELETE: (id: string) => `${ORCHESTRATOR_URL}/api/v1/connections/${id}`,
-    TEST: `${ORCHESTRATOR_URL}/api/v1/connections/test`,
-  },
-  
-  // Status & Health
-  HEALTH: `${ORCHESTRATOR_URL}/health`,
-  WORKERS: `${ORCHESTRATOR_URL}/workers`,
-  
-  // CDC Pipelines (Legacy)
-  CDC_PIPELINES: {
-    LIST: `${ORCHESTRATOR_URL}/api/v1/cdc/data-pipelines`,
-    LIST_INTERNAL: `${ORCHESTRATOR_URL_INTERNAL}/api/v1/cdc/data-pipelines`,
-    GET: (id: string) => `${ORCHESTRATOR_URL}/api/v1/cdc/data-pipelines/${id}`,
-  },
-  
-  // Agentic endpoints
-  AGENTIC: {
-    CONNECTIONS: `${ORCHESTRATOR_URL}/api/v1/connections`,
-  },
-  
-  // NEW: HITL Decision Management
-  DECISIONS: {
-    LIST_BY_PIPELINE: (pipelineId: string) => `${ORCHESTRATOR_URL}/api/v1/pipelines/${pipelineId}/decisions`,
-    GET: (decisionId: string) => `${ORCHESTRATOR_URL}/api/v1/decisions/${decisionId}`,
-    RESPOND: (decisionId: string) => `${ORCHESTRATOR_URL}/api/v1/decisions/${decisionId}/respond`,
-    CANCEL: (decisionId: string) => `${ORCHESTRATOR_URL}/api/v1/decisions/${decisionId}`,
   },
 }
 

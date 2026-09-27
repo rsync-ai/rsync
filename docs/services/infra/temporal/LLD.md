@@ -4,7 +4,7 @@
 Source: `docker-compose.yml`
 
 Temporal server:
-- image: `temporalio/auto-setup:1.22.4`
+- image: `temporalio/auto-setup:1.22.7`
 - env uses Postgres (`DB=postgresql`, seeds `postgres`)
 - dynamic config mounted from: `deploy/temporal/`
 
@@ -14,7 +14,7 @@ Temporal UI:
 - CORS origins include frontend host
 
 Admin tools:
-- image: `temporalio/admin-tools:1.22.4`
+- image: `temporalio/admin-tools:1.22.7`
 
 ### Task Queue (rsync-ai)
 Temporal Adapter registers workflows/activities on:

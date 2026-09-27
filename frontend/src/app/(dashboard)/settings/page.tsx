@@ -69,12 +69,22 @@ export default function SettingsPage() {
         body: JSON.stringify({ name }),
       })
       if (!res.ok) {
-        toast.error("Failed to save profile")
+        // The password handler right below already reads the body; this one
+        // threw it away, so a rejected name ("name is required", "workspace is
+        // read-only") arrived as a bare "Failed to save profile" and the user
+        // had nothing to act on.
+        const data = (await res.json().catch(() => null)) as { error?: string; message?: string } | null
+        const reason = (data?.error ?? data?.message ?? "").trim()
+        toast.error("Failed to save profile", {
+          description: reason || `The server answered ${res.status}.`,
+        })
         return
       }
       toast.success("Profile updated")
-    } catch {
-      toast.error("Failed to save profile")
+    } catch (error) {
+      toast.error("Failed to save profile", {
+        description: error instanceof Error ? error.message : "The request never reached the server.",
+      })
     } finally {
       setSaving(false)
     }

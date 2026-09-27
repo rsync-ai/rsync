@@ -25,7 +25,7 @@ It also supports **JIT connector generation** (trigger tool-generator when a req
 - **LLM Service**: `LLM_GATEWAY_URL`
 - **Tool Generator**: `TOOL_GENERATOR_URL`
 - **API Gateway**: `API_GATEWAY_URL`
-- **Kafka**: optional consumer/producer path (feature-flagged)
+- **Kafka**: none at runtime — planning requests arrive over `POST /plan`; the broker address only goes into generated Debezium configs (the `ENABLE_KAFKA_CONSUMER` request loop was removed)
 - **Shared volume**: read-only connector existence checks
 
 ### Observability

@@ -17,7 +17,7 @@ import (
 // Activities write requests with a correlation ID, then block waiting for the
 // correlated response. Workers write responses to Redis.
 //
-// This replaces the anti-pattern of KafkaAdapter signaling workflows.
+// This replaces the anti-pattern of a Kafka consumer signaling workflows.
 
 const (
 	// Redis key prefixes
@@ -187,58 +187,4 @@ func (s *Store) WaitForResponse(ctx context.Context, correlationID string, timeo
 	s.redis.Del(context.Background(), requestPrefix+correlationID)
 
 	return &response, nil
-}
-
-// WriteResponse writes a response (called by workers)
-func (s *Store) WriteResponse(ctx context.Context, resp Response) error {
-	if resp.CorrelationID == "" {
-		return fmt.Errorf("correlation_id is required")
-	}
-
-	resp.ReceivedAt = time.Now()
-	data, err := json.Marshal(resp)
-	if err != nil {
-		return fmt.Errorf("failed to marshal response: %w", err)
-	}
-
-	responseKey := responsePrefix + resp.CorrelationID
-
-	// Use LPUSH to push response (BRPOP waits on the other end)
-	if err := s.redis.LPush(ctx, responseKey, data).Err(); err != nil {
-		return fmt.Errorf("failed to write response: %w", err)
-	}
-
-	// Set expiry on response key (in case BRPOP already timed out)
-	s.redis.Expire(ctx, responseKey, 10*time.Minute)
-
-	log.WithFields(log.Fields{
-		"correlation_id": resp.CorrelationID,
-		"status":         resp.Status,
-	}).Debug("📝 Wrote correlated response")
-
-	return nil
-}
-
-// GetRequest retrieves a request by correlation ID (for workers)
-func (s *Store) GetRequest(ctx context.Context, correlationID string) (*Request, error) {
-	key := requestPrefix + correlationID
-	data, err := s.redis.Get(ctx, key).Result()
-	if err != nil {
-		if err == redis.Nil {
-			return nil, fmt.Errorf("request not found: correlation_id=%s", correlationID)
-		}
-		return nil, fmt.Errorf("failed to get request: %w", err)
-	}
-
-	var req Request
-	if err := json.Unmarshal([]byte(data), &req); err != nil {
-		return nil, fmt.Errorf("failed to unmarshal request: %w", err)
-	}
-
-	return &req, nil
-}
-
-// Close closes the Redis connection
-func (s *Store) Close() error {
-	return s.redis.Close()
 }

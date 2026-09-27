@@ -178,7 +178,6 @@ func TestTopologyRoutesRequireAPrincipal(t *testing.T) {
 		{"list topics", http.MethodGet, "/api/v1/topology/topics", ""},
 		{"read topic", http.MethodGet, "/api/v1/topology/topics/" + topic, ""},
 		{"create topic", http.MethodPost, "/api/v1/topology/topics", `{"topic_name":"` + topic + `","partitions":3,"replication_factor":1}`},
-		{"provision for pipeline", http.MethodPost, "/api/v1/topology/topics/pipeline", `{"pipeline_id":"abd8a64d-0000-0000-0000-000000000000","sync_mode":"cdc"}`},
 		{"delete topic", http.MethodDelete, "/api/v1/topology/topics/" + topic, ""},
 		{"repartition topic", http.MethodPut, "/api/v1/topology/topics/" + topic + "/partitions", `{"partitions":64}`},
 	}

@@ -1,0 +1,13 @@
+# Build context for Dockerfile, Dockerfile.community and Dockerfile.oss (all three use
+# ./llm-service). None of them COPYs tests or bytecode, and nothing runs pytest inside the
+# image; the tests run from the checkout in CI. Without this file `COPY src/` carried the
+# tool-generator test suite and every local __pycache__ into the image.
+**/__pycache__
+**/*.pyc
+**/.pytest_cache
+.venv
+tests/
+src/agents/tool_generator/tests/
+# The planner's unit tests sit next to the modules they test; CI runs them from the
+# checkout (ci.yml), so the image never needs them.
+src/agents/planner/test_*.py

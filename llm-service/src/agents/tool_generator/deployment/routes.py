@@ -28,6 +28,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from src.utils.connector_paths import iter_connector_dirs, resolve_current_dir
+from .container_names import versioned_container_name
 from .service import DeploymentService
 
 logger = logging.getLogger(__name__)
@@ -334,8 +335,8 @@ async def deploy_connector_v1(request: DeployRequestV1) -> Dict[str, Any]:
     #
     # We resolve "latest" to a concrete version above, so runtime should never depend on a
     # stable container name like `rsync-ai-<id>-mcp` (which would break pinned pipelines).
-    version_part = concrete_version.lstrip("v").replace(".", "-")
-    container_name = f"rsync-ai-{connector_id}-v{version_part}-mcp"
+    # The prefix is STACK_PREFIX, matching the name the orchestrator looks for.
+    container_name = versioned_container_name(connector_id, concrete_version)
 
     deploy_service = DeploymentService()
 
@@ -344,11 +345,14 @@ async def deploy_connector_v1(request: DeployRequestV1) -> Dict[str, Any]:
     started = False
     built = False
     # Every JIT-deployed connector claims the unversioned hostname first, matching
-    # mcp_generate_compose.py. The map below only adds legacy extras (aws_s3).
-    net_aliases = [f"rsync-ai-{connector_id}-mcp"] + [
+    # mcp_generate_compose.py. The map below only adds legacy extras (aws_s3). The
+    # alias stays `rsync-ai-` on every stack: kafka-mcp-sink resolves it without
+    # reading STACK_PREFIX.
+    unversioned_alias = f"rsync-ai-{connector_id}-mcp"
+    net_aliases = [unversioned_alias] + [
         a
         for a in _NETWORK_ALIASES_BY_CONNECTOR_ID.get(connector_id, [])
-        if a != f"rsync-ai-{connector_id}-mcp"
+        if a != unversioned_alias
     ]
 
     # Regenerate path: the on-disk code for this version was just (re)written, but an

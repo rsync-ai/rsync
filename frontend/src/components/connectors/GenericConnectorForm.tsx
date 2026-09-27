@@ -1,6 +1,6 @@
 "use client"
 
-import { useState, useEffect, useRef } from "react"
+import { useState, useEffect, useRef, useId } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
@@ -389,7 +389,20 @@ export function GenericConnectorForm({
     suggestion?: string
     field?: string
     code?: string
+    /** The connector's own reason a pre-save test failed. */
+    cause?: string
   } | null>(null)
+  // A failed save with no field to point at moves focus to the banner, so a
+  // keyboard or screen-reader user lands on the reason instead of staying on
+  // the Save button with nothing said.
+  const errorBannerRef = useRef<HTMLDivElement>(null)
+  const focusErrorBanner = useRef(false)
+  useEffect(() => {
+    if (error && focusErrorBanner.current) {
+      focusErrorBanner.current = false
+      errorBannerRef.current?.focus()
+    }
+  }, [error])
   
   // OAuth state
   const [oauthTokenId, setOauthTokenId] = useState<string | null>(null)
@@ -459,7 +472,9 @@ export function GenericConnectorForm({
   // booleans. `kind === "fallback"` is exactly the former `showAuthFallback`.
   const authUI = computeAuthUI(connector, authMethod)
 
-  // Is the active auth path missing its credential? Drives Test/Save disabled.
+  // What the active auth path is still missing. Drives Test/Save disabled AND the
+  // sentence beside them that says why — a bare boolean left both buttons greyed
+  // out with no reason (prod 2026-09-26, Postgres with an empty password).
   // - fallback   → the synthesized field(s) must be filled
   // - oauth path → a completed authorization is required (fixes the old bypass
   //                where oauth_provider + auth_type!=oauth skipped this gate)
@@ -468,12 +483,20 @@ export function GenericConnectorForm({
   //                with no resolvable provider is unusable.
   //                Edit mode relies on handleSave's own validation since stored
   //                credentials aren't re-sent to the form.
-  const authIncomplete = (() => {
+  const authGate = ((): { missing: string[]; step: string | null } => {
     if (authUI.kind === "fallback") {
-      return authFallback.fields.some((f) => !String(formData[f.key] ?? "").trim())
+      return {
+        missing: authFallback.fields
+          .filter((f) => !String(formData[f.key] ?? "").trim())
+          .map((f) => f.label),
+        step: null,
+      }
     }
     if (authUI.requiresOAuthConnected) {
-      return !oauthConnected
+      return {
+        missing: [],
+        step: oauthConnected ? null : `Click Connect ${connector.display_name} above.`,
+      }
     }
     // An oauth2 method with no resolvable provider can never be completed (no
     // Connect button, no paste-token) — block in BOTH create and edit mode so
@@ -481,25 +504,43 @@ export function GenericConnectorForm({
     // unauthenticated connection. (No shipping connector hits this; it guards
     // future connectors whose oauth2 method ships without a registered provider.)
     if (authUI.oauthUnconfigured) {
-      return true
+      return {
+        missing: [],
+        step: "OAuth isn't configured for this connector, so it can't be tested or saved.",
+      }
     }
     if (authUI.kind === "picker" && !isEditing) {
       // Reachable only for a NON-oauth method (oauth2 was handled above). Edit
       // mode is skipped because stored credentials aren't re-sent to the form.
       const active =
         supportedAuthMethods.find((m) => m.method === authMethod) || supportedAuthMethods[0]
-      if (!active) return false
+      if (!active) return { missing: [], step: null }
       // Gate on the connector's OWN contract — the credential fields its
       // configuration_schema marks `required`, which is exactly what the
       // orchestrator's pre-start gate checks. See missingRequiredCredentials in
       // lib/types/mcp-connector.ts for why the form agrees with the server here
       // instead of requiring every field the method happens to name.
-      return (
-        missingRequiredCredentials(active, schemaKeys, requiredFields, authValues).length > 0
-      )
+      return {
+        missing: missingRequiredCredentials(active, schemaKeys, requiredFields, authValues).map(
+          formatLabel,
+        ),
+        step: null,
+      }
     }
-    return false
+    return { missing: [], step: null }
   })()
+  const authIncomplete = authGate.missing.length > 0 || authGate.step !== null
+  const saveBlocked = !connectionName.trim() || authIncomplete
+  // Why Test / Save are disabled, in words. Rendered beside the buttons and tied to
+  // them with aria-describedby (a disabled button can't be focused to ask).
+  const stillRequired = [
+    ...(connectionName.trim() ? [] : ["Connection Name"]),
+    ...authGate.missing,
+  ]
+  const blockedReason =
+    authGate.step ?? (stillRequired.length > 0 ? `Still required: ${stillRequired.join(", ")}.` : null)
+  const blockedReasonId = useId()
+  const requiredKeySet = new Set(requiredFields.map((k) => k.toLowerCase()))
 
   // Keep a ref to the latest formData so async handlers
   // don't accidentally operate on stale values.
@@ -1071,7 +1112,11 @@ export function GenericConnectorForm({
             : undefined,
         field: firstMissing,
       })
-      document.getElementById(firstMissing)?.focus()
+      // Picker credentials render as credential-<key> (AuthMethodPicker), not <key>.
+      ;(
+        document.getElementById(firstMissing) ??
+        document.getElementById(`credential-${firstMissing}`)
+      )?.focus()
       return
     }
 
@@ -1155,28 +1200,29 @@ export function GenericConnectorForm({
               ? "connector_type"
               : err.field
 
+        // Focus the problematic field if identified; otherwise the banner.
+        const fieldElement = field ? document.getElementById(field) : null
+        focusErrorBanner.current = !fieldElement
         setError({
           message: err.message,
           suggestion: err.suggestion,
           field,
           code: err.code,
+          cause: err.cause,
         })
-        
-        // Focus the problematic field if identified
-        if (field) {
-          const fieldElement = document.getElementById(field)
-          if (fieldElement) {
-            fieldElement.focus()
-            fieldElement.scrollIntoView({ behavior: 'smooth', block: 'center' })
-          }
+        if (fieldElement) {
+          fieldElement.focus()
+          fieldElement.scrollIntoView({ behavior: 'smooth', block: 'center' })
         }
       } else {
         const parsed = parseAPIError(err)
+        focusErrorBanner.current = true
         setError({
           message: parsed.message,
           suggestion: parsed.suggestion,
           field: parsed.field,
           code: parsed.code,
+          cause: parsed.cause,
         })
       }
     } finally {
@@ -2065,6 +2111,7 @@ export function GenericConnectorForm({
             }
             oauthProvider={connector.oauth_provider}
             schemaKeys={schemaKeys}
+            requiredKeys={isEditing ? undefined : requiredKeySet}
           />
         </div>
       )}
@@ -2178,14 +2225,26 @@ export function GenericConnectorForm({
       )}
 
       {/* Error */}
+      {/* role="alert" so a failed save is announced, not only drawn. */}
       {error && (
-        <div className="p-4 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
+        <div
+          ref={errorBannerRef}
+          role="alert"
+          tabIndex={-1}
+          data-testid="connector-form-error"
+          className="p-4 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500"
+        >
           <div className="flex items-start gap-3">
             <AlertCircle className="h-5 w-5 text-red-600 dark:text-red-400 mt-0.5 flex-shrink-0" />
-            <div className="flex-1 space-y-1">
+            <div className="flex-1 min-w-0 space-y-1">
               <p className="text-sm font-medium text-red-700 dark:text-red-300">
                 {error.message}
               </p>
+              {error.cause && (
+                <p className="text-xs font-mono break-words text-red-700 dark:text-red-300">
+                  {error.cause}
+                </p>
+              )}
               {error.suggestion && (
                 <p className="text-sm text-red-600 dark:text-red-400 flex items-center gap-1.5">
                   <Info className="h-3.5 w-3.5" />
@@ -2203,7 +2262,16 @@ export function GenericConnectorForm({
       )}
 
       {/* Actions */}
-      <div className="flex items-center justify-end gap-3 pt-4 border-t border-zinc-200 dark:border-zinc-800">
+      <div className="flex flex-wrap items-center justify-end gap-3 pt-4 border-t border-zinc-200 dark:border-zinc-800">
+        {blockedReason && (
+          <p
+            id={blockedReasonId}
+            data-testid="connector-form-blocked-reason"
+            className="mr-auto text-xs text-zinc-500 dark:text-zinc-400"
+          >
+            {blockedReason}
+          </p>
+        )}
         <Button variant="outline" onClick={onCancel}>
           Cancel
         </Button>
@@ -2214,6 +2282,7 @@ export function GenericConnectorForm({
             testing ||
             authIncomplete
           }
+          aria-describedby={authIncomplete ? blockedReasonId : undefined}
         >
           {testing ? (
             <>
@@ -2234,11 +2303,8 @@ export function GenericConnectorForm({
         </Button>
         <Button
           onClick={handleSave}
-          disabled={
-            saving ||
-            !connectionName.trim() ||
-            authIncomplete
-          }
+          disabled={saving || saveBlocked}
+          aria-describedby={saveBlocked ? blockedReasonId : undefined}
           className="bg-gradient-to-r from-violet-600 to-indigo-600"
         >
           {saving ? (

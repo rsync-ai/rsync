@@ -27,7 +27,7 @@ import {
 import { formatDateTime, formatRelativeTime } from "@/lib/utils"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { authFetch } from "@/lib/api/auth-fetch"
-import { formatDuration } from "./DAGVisualization"
+import { formatDuration } from "./dagHelpers"
 import {
   buildRunTimeline,
   computeRunDelta,
@@ -232,7 +232,7 @@ export function ExecutionDetailDialog({
       authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/table-stats?${statsParams}`, {
         cache: "no-store",
       }).catch(() => null),
-      authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events?${eventParams}`, {
+      authFetch(`${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?${eventParams}`, {
         cache: "no-store",
       }).catch(() => null),
     ])
