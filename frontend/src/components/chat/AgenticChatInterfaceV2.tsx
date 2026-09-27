@@ -29,6 +29,9 @@ import { useHITLState } from "@/lib/hooks/useHITLState"
 import { resetSessionId, sendChatMessage, type PipelinePlan } from "@/lib/api/chat"
 import { getPipeline, type DestinationConfig } from "@/lib/api/pipelines"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { FeedOutageNotice } from "@/components/pipeline/FeedOutageNotice"
+import { feedFailed, feedSucceeded, healthyFeed, type FeedHealth } from "@/lib/polling/feedHealth"
+import { isTerminalPipelineStatus, normalizePipelineStatus } from "@/lib/pipeline/statusNormalization"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { readResponseErrorMessage } from "@/lib/utils/error-handling"
 import type { BlockingReason } from "@/lib/pipeline/stageDefinitions"
@@ -97,8 +100,11 @@ export function AgenticChatInterfaceV2() {
   const stickToBottomRef = useRef<boolean>(true)
   const prevPipelineIdRef = useRef<string | null>(null)
   const autoOpenedHitlKeyRef = useRef<string>("")
+  // The run end the state poll last dispatched (pipeline:execution:status).
+  const lastTerminalKeyRef = useRef<string>("")
 
   const [activeIntent, setActiveIntent] = useState<string>("")
+  const [feedHealth, setFeedHealth] = useState<FeedHealth>(healthyFeed)
   const [authoritativePipelineState, setAuthoritativePipelineState] =
     useState<AuthoritativePipelineState | null>(null)
 
@@ -196,7 +202,9 @@ export function AgenticChatInterfaceV2() {
   const [destinationConfig, setDestinationConfig] = useState<DestinationConfig | null>(null)
   const [destinationType, setDestinationType] = useState<string | undefined>(undefined)
   useEffect(() => {
-    if (!pipelineId || !tableSelectorOpen) return
+    // The suggestions dialog needs the type too (index advice), including after a
+    // reload that lands straight on the suggestions pause.
+    if (!pipelineId || !(tableSelectorOpen || suggestionsReviewOpen)) return
     let cancelled = false
     void (async () => {
       try {
@@ -219,7 +227,7 @@ export function AgenticChatInterfaceV2() {
     return () => {
       cancelled = true
     }
-  }, [pipelineId, tableSelectorOpen])
+  }, [pipelineId, tableSelectorOpen, suggestionsReviewOpen])
 
   // ── Restore persisted chat on mount ───────────────────────────────────────
   useEffect(() => {
@@ -355,28 +363,43 @@ export function AgenticChatInterfaceV2() {
     }
   }, [pathname, router, searchParams])
 
-  // ── Authoritative state polling (2 s) ─────────────────────────────────────
+  // ── Authoritative state polling (2 s; 30 s once the run has ended) ────────
   useEffect(() => {
     if (!pipelineId) {
       setAuthoritativePipelineState(null)
+      setFeedHealth(healthyFeed)
       return
     }
 
     let cancelled = false
+    let timer: ReturnType<typeof setTimeout> | undefined
+    // The last status read. A run that has ended is read every 30 s rather than
+    // every 2 s: only a new run moves it on, and that is still picked up.
+    let lastStatus = ""
 
     const poll = async () => {
       try {
         const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, {
           cache: "no-store",
         })
-        if (!res.ok) return
+        // A failed poll used to `return` in silence. This view is driven
+        // entirely by this poll, so the last state received simply stayed on
+        // screen -- a stage still marked "running", its clock still ticking --
+        // for as long as the tab stayed open, asserting live progress about a
+        // pipeline it had stopped hearing from. See lib/polling/feedHealth.
+        if (!res.ok) {
+          if (!cancelled) setFeedHealth(feedFailed)
+          return
+        }
         const raw: unknown = await res.json()
         if (cancelled) return
 
+        setFeedHealth(feedSucceeded())
         setAuthoritativePipelineState(raw as AuthoritativePipelineState)
 
         const data = asRecord(raw)
         const status = String(data["status"] || "")
+        lastStatus = status
         const stageFromState = String(data["current_stage"] || "unknown")
         const summary = String(data["summary"] || data["error"] || "")
         const pipelineName = String(data["name"] || "")
@@ -394,15 +417,21 @@ export function AgenticChatInterfaceV2() {
           })
         }
 
-        if (status === "failed") {
-          dispatch({
-            type: "PIPELINE_FAILED",
-            payload: { stage: stageFromState, error: summary || "Pipeline failed", timestamp: Date.now() },
-          })
-          return
-        }
-        if (status === "completed") {
-          dispatch({ type: "PIPELINE_COMPLETED", payload: { summary: data, timestamp: Date.now() } })
+        // A run's end is dispatched once, not on every read after it: each
+        // dispatch re-rendered the chat and re-stamped completedAt. A new run
+        // (another execution id) or a state that moved off it dispatches again.
+        if (status === "failed" || status === "completed") {
+          const key = `${pipelineId}:${String(data["execution_id"] || "")}:${status}`
+          if (lastTerminalKeyRef.current === key && pipelineState.executionState === status) return
+          lastTerminalKeyRef.current = key
+          if (status === "failed") {
+            dispatch({
+              type: "PIPELINE_FAILED",
+              payload: { stage: stageFromState, error: summary || "Pipeline failed", timestamp: Date.now() },
+            })
+          } else {
+            dispatch({ type: "PIPELINE_COMPLETED", payload: { summary: data, timestamp: Date.now() } })
+          }
           return
         }
         if (status === "processing" && pipelineState.executionState !== "running") {
@@ -415,7 +444,7 @@ export function AgenticChatInterfaceV2() {
         // another tab) ends this chat's run. Before, only the HITL branch below
         // reacted: it resolved the park, which the reducer turns into "running", so
         // the composer stayed locked with nothing left to wait for.
-        if (status === "stopped") {
+        if (status === "stopped" && pipelineState.executionState !== "cancelled") {
           dispatch({
             type: "EXECUTION_STATE_CHANGE",
             payload: { executionState: "cancelled", timestamp: Date.now() },
@@ -450,15 +479,27 @@ export function AgenticChatInterfaceV2() {
           }
         }
       } catch {
-        // Best-effort polling; ignore errors
+        // Transport failure. Still best-effort -- the poll keeps trying -- but
+        // no longer silent: a run of these makes the view say so.
+        if (!cancelled) setFeedHealth(feedFailed)
       }
     }
 
-    const interval = setInterval(poll, 2000)
-    poll()
+    // A hidden tab skips its reads and reads once on return.
+    const loop = async () => {
+      if (document.visibilityState !== "hidden") await poll()
+      if (cancelled) return
+      timer = setTimeout(loop, isTerminalPipelineStatus(normalizePipelineStatus(lastStatus)) ? 30_000 : 2000)
+    }
+    const onVisibility = () => {
+      if (document.visibilityState !== "hidden") void poll()
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    void loop()
     return () => {
       cancelled = true
-      clearInterval(interval)
+      clearTimeout(timer)
+      document.removeEventListener("visibilitychange", onVisibility)
     }
   }, [dispatch, pipelineId, pipelineState.executionState, pipelineState.hitl, pipelineState.metadata.executionId, suppressHitlUntilRef, lastBlockingKeyRef, updatePipeline])
 
@@ -838,6 +879,7 @@ export function AgenticChatInterfaceV2() {
                 ? prefetchedSchemaForSuggestions
                 : undefined
             }
+            destinationType={destinationType}
           />
         )}
 
@@ -922,6 +964,7 @@ export function AgenticChatInterfaceV2() {
                     </TabsList>
 
                     <TabsContent value="pipeline" className="space-y-4">
+                      <FeedOutageNotice health={feedHealth} />
                       {authoritativePipelineState ? (
                         <PipelineAccordionView
                           key={`${authoritativePipelineState.pipeline_id}:${authoritativePipelineState.execution_id || ""}:${authoritativePipelineState.status}:${authoritativePipelineState.current_stage || ""}`}

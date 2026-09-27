@@ -52,12 +52,16 @@ func TestSimpleTransformEngine_JSONFlatten_FromString(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if got := out[0]["a"]; got != "x" {
-		t.Fatalf("expected a=x, got %#v", got)
+	// Keys are namespaced under the source column: the default prefix is
+	// col+separator, which is what the suggestion engine emits and what the UI
+	// has always rendered for an unset prefix. The old "" default lifted these
+	// straight to the top level, where "a" could land on a real column.
+	if got := out[0]["payload_a"]; got != "x" {
+		t.Fatalf("expected payload_a=x, got %#v", got)
 	}
 	// Unlimited depth (default): nested object flattens fully.
-	if got := out[0]["b_c"]; got != "y" {
-		t.Fatalf("expected b_c=y, got %#v", got)
+	if got := out[0]["payload_b_c"]; got != "y" {
+		t.Fatalf("expected payload_b_c=y, got %#v", got)
 	}
 }
 
@@ -79,14 +83,14 @@ func TestSimpleTransformEngine_JSONFlatten_MaxDepth(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	// depth 1 = top key "a"; depth 2 = "a_b"; deeper than max_depth stays nested
-	// and is scalarized to a JSON string.
-	v, ok := out[0]["a_b"]
+	// and is scalarized to a JSON string. Names carry the default col+sep prefix.
+	v, ok := out[0]["j_a_b"]
 	if !ok {
-		t.Fatalf("expected a_b key present, got row %#v", out[0])
+		t.Fatalf("expected j_a_b key present, got row %#v", out[0])
 	}
 	s, ok := v.(string)
 	if !ok || !strings.Contains(s, `"c"`) {
-		t.Fatalf("expected a_b to be a JSON string containing c, got %#v", v)
+		t.Fatalf("expected j_a_b to be a JSON string containing c, got %#v", v)
 	}
 }
 

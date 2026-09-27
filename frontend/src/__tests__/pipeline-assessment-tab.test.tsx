@@ -422,4 +422,60 @@ describe("PreMigrationAssessmentModal", () => {
     fireEvent.click(link)
     expect(onOpenChange).toHaveBeenCalledWith(false)
   })
+
+  // Regression: the modal SORTS each table's findings by severity for display,
+  // but the acknowledgement bookkeeping walked the RAW array. Both sides keyed
+  // the ack on the array index, so for any table whose findings do not already
+  // arrive in severity order the checkbox wrote a key the bookkeeping never
+  // looked up — "Run anyway" stayed disabled no matter how many boxes the user
+  // ticked, under a label that counted down to "Acknowledge 0 more".
+  it("enables the run once a warning that sorts ahead of an earlier info finding is acked", () => {
+    const onProceed = vi.fn()
+    render(
+      <PreMigrationAssessmentModal
+        open
+        onOpenChange={vi.fn()}
+        onProceed={onProceed}
+        report={report({
+          summary: "1 warning",
+          tables: [
+            {
+              name: "orders",
+              schema: "public",
+              // Deliberately NOT in severity order: display sorting moves the
+              // warning from index 1 to index 0.
+              findings: [
+                {
+                  code: "JSON_COLUMNS",
+                  severity: "info",
+                  message: "2 JSON columns will be stored as strings.",
+                },
+                {
+                  code: "NO_DECLARED_PK",
+                  severity: "warning",
+                  message: "No declared primary key; rows will be hashed.",
+                },
+              ],
+              primary_keys: [],
+              primary_key_source: "declared",
+              column_count: 4,
+              json_column_count: 2,
+              mode: "upsert",
+            },
+          ],
+        })}
+      />,
+    )
+
+    const ack = screen.getByRole("checkbox", {
+      name: "Acknowledge NO_DECLARED_PK for orders",
+    })
+    fireEvent.click(ack)
+    expect(ack).toBeChecked()
+
+    const start = screen.getByRole("button", { name: "Run anyway" })
+    expect(start).toBeEnabled()
+    fireEvent.click(start)
+    expect(onProceed).toHaveBeenCalledTimes(1)
+  })
 })

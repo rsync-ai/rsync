@@ -24,10 +24,10 @@ import (
 //
 // Two call sites had already forgotten:
 //
-//   - internal/notifier/notifier.go subscribed to the bare consts
-//     rsync.notifications / rsync.healer.actions / rsync.healer.results. Their
-//     producers (healer.go:1318, :1383; cdc_wal_watchdog.go:369) publish through
-//     the Manager, so under KAFKA_TOPIC_PREFIX=acme. they wrote acme.rsync.*
+//   - internal/notifier/notifier.go subscribed to bare topic consts such as
+//     rsync.notifications and rsync.healer.results. Their producers (the
+//     orchestrator healer and CDC WAL watchdog) publish through the Manager,
+//     so under KAFKA_TOPIC_PREFIX=acme. they wrote acme.rsync.*
 //     while this consumer sat on rsync.*. Every Slack and email alert stopped,
 //     including the one that would have reported the outage.
 //   - internal/handlers/schema_evolution.go published approvals to a bare
@@ -216,7 +216,6 @@ var producerTopicArg = map[string]int{
 	"SendPipelineRequestWithContext": 1,
 	"SendPipelineRequestAvro":        1,
 	"SendAgentMessage":               1,
-	"SendIntentTask":                 1,
 }
 
 func collectTopicSites(files map[string]*ast.File, ctxs map[string]fileCtx, fset *token.FileSet) []topicSite {
@@ -550,7 +549,7 @@ func TestTopicScanSeesEveryKafkaBoundary(t *testing.T) {
 			len(sites), wantAtLeast, topicSiteFiles(sites))
 	}
 	for _, want := range []string{
-		"cmd/server/main.go",                    // the agent/PII consumer topics
+		"cmd/server/main.go",                    // the PII scan-result consumer topic
 		"internal/notifier/notifier.go",         // the alert inbox subscription
 		"internal/handlers/schema_evolution.go", // approved-DDL publish
 		"internal/websocket/kafka_bridge.go",    // one reader per bridged topic
@@ -630,7 +629,7 @@ import (
 
 const (
 	notifyTopic   = "rsync.notifications"
-	healerActions = "rsync.healer.actions"
+	healerResults = "rsync.healer.results"
 )
 
 // The schema_evolution.go shape: a literal straight into a producer.
@@ -640,7 +639,7 @@ func strandedLiteral(p *prod) {
 
 // The notifier.go shape: consts collected into a local, then subscribed.
 func strandedConstList(group sarama.ConsumerGroup) {
-	topics := []string{notifyTopic, healerActions}
+	topics := []string{notifyTopic, healerResults}
 	_ = group.Consume(ctx, topics, handler)
 }
 
@@ -649,7 +648,7 @@ func qualifiedInline(p *prod) {
 }
 
 func qualifiedViaLocal(group sarama.ConsumerGroup) {
-	topics := kafkaclient.Topics(notifyTopic, healerActions)
+	topics := kafkaclient.Topics(notifyTopic, healerResults)
 	_ = group.Consume(ctx, topics, handler)
 }
 

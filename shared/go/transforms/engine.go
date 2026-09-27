@@ -7,9 +7,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -45,14 +47,32 @@ func NewTransformCoordinator(tier1 TransformEngine, tier2 TransformEngine) *Tran
 	}
 }
 
-// Apply applies a list of transforms sequentially
+// Apply applies a list of transforms sequentially, discarding the non-fatal
+// warnings. Callers that can show a warning to a user should call
+// ApplyWithWarnings instead.
 func (c *TransformCoordinator) Apply(ctx context.Context, data []Row, transforms []Transform) ([]Row, error) {
+	result, _, err := c.ApplyWithWarnings(ctx, data, transforms)
+	return result, err
+}
+
+// ApplyWithWarnings applies a list of transforms sequentially and returns the
+// non-fatal warnings raised along the way.
+//
+// The column check runs against the rows ENTERING each step, so a column that an
+// earlier rename_columns / select_columns / exclude_columns removed is caught
+// exactly, with no need to model those transforms' semantics here.
+func (c *TransformCoordinator) ApplyWithWarnings(ctx context.Context, data []Row, transforms []Transform) ([]Row, []string, error) {
 	result := data
+	warnings := []string{}
 
 	for i, transform := range transforms {
+		for _, w := range MissingColumnWarnings(transform, result) {
+			warnings = append(warnings, fmt.Sprintf("transform %d (%s): %s", i, transform.Type, w))
+		}
+
 		select {
 		case <-ctx.Done():
-			return nil, fmt.Errorf("transform cancelled at step %d: %w", i, ctx.Err())
+			return nil, warnings, fmt.Errorf("transform cancelled at step %d: %w", i, ctx.Err())
 		default:
 		}
 
@@ -65,16 +85,152 @@ func (c *TransformCoordinator) Apply(ctx context.Context, data []Row, transforms
 		} else if c.tier2Engine != nil && c.tier2Engine.CanHandle(transform.Type) {
 			engine = c.tier2Engine
 		} else {
-			return nil, fmt.Errorf("no engine available for transform type: %s", transform.Type)
+			return nil, warnings, fmt.Errorf("no engine available for transform type: %s", transform.Type)
 		}
 
 		result, err = engine.Apply(ctx, result, transform)
 		if err != nil {
-			return nil, fmt.Errorf("transform %d (%s) failed: %w", i, transform.Type, err)
+			return nil, warnings, fmt.Errorf("transform %d (%s) failed: %w", i, transform.Type, err)
 		}
 	}
 
-	return result, nil
+	return result, warnings, nil
+}
+
+// MissingColumnWarnings reports each column a transform names that is absent
+// from every row given it. Such a rule cannot do what the operator asked.
+//
+// This used to be gated to null_handle, because that is the rule whose missing
+// column was found deleting whole datasets
+// (KI-NULL-HANDLE-MISSING-COLUMN-DROPS-EVERY-ROW). The gate was the bug, not the
+// check: filter, validate and select_columns had the same defect and the same
+// symptom, and the warning that would have named it was sitting three lines
+// away, switched off for them. Every column-naming rule is covered now.
+//
+// Pass the rows ENTERING the rule, not the original input: that is what catches
+// a column an earlier rename_columns / select_columns / exclude_columns removed,
+// with no need to model those transforms' semantics. An empty input is not
+// evidence of anything, so it raises nothing, and neither does a column that at
+// least one row carries — a sparse document is normal.
+//
+// The message carries no position, because only the caller knows one: a chain
+// passed whole to ApplyWithWarnings has step indices, while the batch executor
+// and the CDC sink feed rules in one at a time and number them by Order.
+func MissingColumnWarnings(transform Transform, data []Row) []string {
+	if len(data) == 0 {
+		return nil
+	}
+	var out []string
+	for _, col := range columnsReferenced(transform) {
+		present := false
+		for _, row := range data {
+			if _, ok := row[col]; ok {
+				present = true
+				break
+			}
+		}
+		if present {
+			continue
+		}
+		out = append(out, fmt.Sprintf(
+			"column %q is not present in any input row, so the rule has no effect. Check for a rename_columns, select_columns or exclude_columns earlier in the chain that renamed or removed it.",
+			col))
+	}
+	return out
+}
+
+// columnsReferenced names the columns a transform's config reads, deduplicated
+// and in config order.
+//
+// mask_pii is deliberately absent: its targets can be nested paths and `deep`
+// wildcards, so a top-level name missing from the rows is not evidence of a
+// mismatch. Its own accounting lives in mask_guard.go, which is the thing that
+// must not go quiet — an unmatched mask is a PII leak, not a no-op.
+func columnsReferenced(t Transform) []string {
+	var raw []string
+	switch t.Type {
+	case "filter":
+		cond, _ := t.Config["condition"].(string)
+		raw = conditionColumns(cond)
+	case "validate":
+		raw = configStrings(t.Config["required_columns"])
+	case "select_columns", "exclude_columns":
+		raw = configStrings(t.Config["columns"])
+	case "rename_columns":
+		raw = renameSources(t.Config)
+	case "null_handle", "truncate", "type_convert", "json_flatten", "array_expand":
+		if col, ok := t.Config["column"].(string); ok {
+			raw = []string{col}
+		}
+	default:
+		return nil
+	}
+
+	seen := map[string]bool{}
+	out := []string{}
+	for _, c := range raw {
+		c = lastIdent(strings.TrimSpace(c))
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		out = append(out, c)
+	}
+	return out
+}
+
+// renameSources lists the columns a rename_columns rule reads, from either
+// config shape (a mappings map, or a single from/to pair).
+func renameSources(config map[string]interface{}) []string {
+	out := []string{}
+	switch v := config["mappings"].(type) {
+	case map[string]string:
+		for from := range v {
+			out = append(out, from)
+		}
+	case map[string]interface{}:
+		for from := range v {
+			out = append(out, from)
+		}
+	}
+	if from, ok := config["from"].(string); ok && strings.TrimSpace(from) != "" {
+		out = append(out, from)
+	}
+	// Map iteration order is random, so a warning list built from one would come
+	// out shuffled between runs and read as flapping in a log.
+	sort.Strings(out)
+	return out
+}
+
+// configStrings reads a list of column names from a config value, accepting both
+// []string and the []interface{} that JSON decoding yields.
+func configStrings(v interface{}) []string {
+	switch list := v.(type) {
+	case []string:
+		return list
+	case []interface{}:
+		out := make([]string, 0, len(list))
+		for _, item := range list {
+			if s, ok := item.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
+}
+
+// presentColumns reports which of cols at least one row carries.
+func presentColumns(cols []string, data []Row) map[string]bool {
+	present := map[string]bool{}
+	for _, row := range data {
+		for _, c := range cols {
+			if _, ok := row[c]; ok {
+				present[c] = true
+			}
+		}
+	}
+	return present
 }
 
 // SimpleTransformEngine implements Tier 1 transforms (filter, mask_pii, select_columns, validate)
@@ -87,20 +243,7 @@ func NewSimpleTransformEngine() *SimpleTransformEngine {
 
 // CanHandle returns true if this engine can handle the transform type
 func (e *SimpleTransformEngine) CanHandle(transformType string) bool {
-	supportedTypes := []string{
-		"filter",
-		"mask_pii",
-		"select_columns",
-		"validate",
-		"rename_columns",
-		"exclude_columns",
-		"null_handle",
-		"truncate",
-		"type_convert",
-		"json_flatten",
-		"array_expand",
-	}
-	for _, t := range supportedTypes {
+	for _, t := range SupportedTransformTypes() {
 		if t == transformType {
 			return true
 		}
@@ -143,6 +286,29 @@ func (e *SimpleTransformEngine) applyFilter(ctx context.Context, data []Row, con
 	condition, ok := config["condition"].(string)
 	if !ok || condition == "" {
 		return data, nil // No filter condition, return all data
+	}
+
+	// A column that NO row carries cannot produce a filter result, only an
+	// unsatisfiable comparison. `status = 'active'` after an earlier step renamed
+	// or dropped `status` used to match zero rows and empty the batch — HTTP 200,
+	// no error, no warning, destination silently truncated. It now passes its
+	// rows through untouched, which is what every other rule in this engine does
+	// with a missing column (applyNullHandle, applyTruncate, applyTypeConvert,
+	// applyJSONFlatten), and MissingColumnWarnings names the column.
+	//
+	// The test is deliberately "absent from every row", not "absent from this
+	// row": a column missing from SOME rows is an ordinary sparse document, and
+	// a non-match there is correct SQL semantics, kept in evaluateLeaf.
+	//
+	// Conservative on purpose. `a = 1 OR b = 2` with `b` gone would still filter
+	// correctly on `a`, and passing every row through is looser than that — but
+	// the alternative direction deletes data, and a filter that lets too much
+	// through is visible at the destination and recoverable by re-running.
+	if cols := conditionColumns(condition); len(cols) > 0 {
+		present := presentColumns(cols, data)
+		if len(present) < len(cols) && len(data) > 0 {
+			return data, nil
+		}
 	}
 
 	result := make([]Row, 0, len(data))
@@ -188,12 +354,43 @@ func (e *SimpleTransformEngine) applySelect(ctx context.Context, data []Row, con
 				columns = append(columns, colStr)
 			}
 		}
+	case string:
+		// "id, name, email" — the shape the Transform Builder stores.
+		// normalizeConfigAliases (validate.go) splits it before the engine ever
+		// sees it, but applyExcludeColumns has always accepted the string form
+		// directly and the asymmetry was itself the bug: a select saved cleanly
+		// (validateConfig splits a string too) and then failed the run here.
+		for _, part := range strings.Split(v, ",") {
+			if s := strings.TrimSpace(part); s != "" {
+				columns = append(columns, s)
+			}
+		}
 	default:
 		return nil, fmt.Errorf("invalid columns config type")
 	}
 
 	if len(columns) == 0 {
 		return data, nil
+	}
+
+	// A selection where NOT ONE requested column exists emits {} for every row.
+	// The row COUNT is preserved, so every row-count invariant in the executor,
+	// the sink and the UI reads healthy while the batch carries no data at all —
+	// which is how a single typo in a column name became the quietest failure in
+	// the engine. Pass the rows through instead and let MissingColumnWarnings
+	// name the columns.
+	//
+	// A selection where SOME requested columns exist is left alone: that is a
+	// sparse document, and dropping the absent names from the projection is the
+	// right answer.
+	if len(data) > 0 {
+		keys := make([]string, 0, len(columns))
+		for _, col := range columns {
+			keys = append(keys, lastIdent(col))
+		}
+		if len(presentColumns(keys, data)) == 0 {
+			return data, nil
+		}
 	}
 
 	result := make([]Row, len(data))
@@ -234,6 +431,30 @@ func (e *SimpleTransformEngine) applyValidate(ctx context.Context, data []Row, c
 		return data, nil
 	}
 
+	// A required column absent from EVERY row is a configuration mismatch, not a
+	// dataset where every row is invalid. Enforcing it drops the whole batch
+	// silently — the same shape as the filter and select_columns defects above.
+	// The requirement is skipped and MissingColumnWarnings names it; the other
+	// required columns are still enforced, so one stale name in a list of five
+	// no longer disables the other four AND no longer empties the table.
+	if len(data) > 0 {
+		keys := make([]string, 0, len(requiredColumns))
+		for _, col := range requiredColumns {
+			keys = append(keys, lastIdent(col))
+		}
+		present := presentColumns(keys, data)
+		kept := make([]string, 0, len(requiredColumns))
+		for _, col := range requiredColumns {
+			if present[lastIdent(col)] {
+				kept = append(kept, col)
+			}
+		}
+		requiredColumns = kept
+		if len(requiredColumns) == 0 {
+			return data, nil
+		}
+	}
+
 	result := make([]Row, 0)
 	for _, row := range data {
 		valid := true
@@ -257,7 +478,17 @@ func (e *SimpleTransformEngine) applyValidate(ctx context.Context, data []Row, c
 	return result, nil
 }
 
-func (e *SimpleTransformEngine) applyRenameColumns(ctx context.Context, data []Row, config map[string]interface{}) ([]Row, error) {
+// parseRenameMappings extracts the source -> destination column table from a
+// rename_columns config, accepting every shape the API and the UI have emitted:
+// a mappings object (typed or JSON-decoded), a mappings array of {from,to}, or a
+// bare from/to pair. Identity and half-empty entries are dropped, and names are
+// unqualified, so "users.email" and "email" mean the same column.
+//
+// Split out of applyRenameColumns so the CDC path can rename a message's KEY
+// FIELDS through exactly the same table that renames its rows. Two parsers would
+// eventually disagree, and the way that shows up is a destination told to key on
+// a column its rows no longer carry.
+func parseRenameMappings(config map[string]interface{}) map[string]string {
 	mappings := map[string]string{}
 
 	// Preferred: mappings map
@@ -311,24 +542,55 @@ func (e *SimpleTransformEngine) applyRenameColumns(ctx context.Context, data []R
 		}
 	}
 
+	return mappings
+}
+
+func (e *SimpleTransformEngine) applyRenameColumns(ctx context.Context, data []Row, config map[string]interface{}) ([]Row, error) {
+	mappings := parseRenameMappings(config)
 	if len(mappings) == 0 {
 		return data, nil
 	}
 
+	// SIMULTANEOUS rename, computed from the SOURCE row.
+	//
+	// This used to copy the row and then apply each mapping to the copy, walking
+	// `mappings` with a bare map range — so the result depended on Go's randomized
+	// map order, redrawn for every row. With {a->b, b->c} on {a:1, b:2}, the order
+	// (a->b, b->c) destroys b's value and yields {c:1}, while (b->c, a->b) yields
+	// {b:1, c:2}. Six runs in one process gave {c:1} four times and {b:1,c:2} twice:
+	// the same rule, the same input, two different destination tables, chosen by a
+	// hash seed. A chain that reshapes a primary key this way splits the partition
+	// the same way #1155 did.
+	//
+	// Reading each source column once and writing it to its destination name makes
+	// the mapping a function of the input alone: {a->b, b->c} is always {b:1, c:2},
+	// which is also what SQL and every dataframe library mean by a rename.
 	result := make([]Row, len(data))
 	for i, row := range data {
 		newRow := make(Row, len(row))
+		// dest column -> the source column that already claimed it.
+		claimed := make(map[string]string, len(row))
 		for k, v := range row {
-			newRow[k] = v
-		}
-		for from, to := range mappings {
-			if from == "" || to == "" || from == to {
-				continue
+			dst := k
+			if to, ok := mappings[k]; ok {
+				dst = to
 			}
-			if val, ok := newRow[from]; ok {
-				newRow[to] = val
-				delete(newRow, from)
+			if prev, taken := claimed[dst]; taken {
+				// Two source columns want one destination name. Silently letting
+				// the last writer win is how a rename deleted a column nobody
+				// asked to lose; there is no answer here that keeps both, so the
+				// chain is refused instead of guessing. Sorted so the message is
+				// the same every run even though the row walk is not.
+				a, b := prev, k
+				if b < a {
+					a, b = b, a
+				}
+				return nil, fmt.Errorf(
+					"rename_columns: columns %q and %q would both become %q, which would destroy one of them; exclude or rename the other column first",
+					a, b, dst)
 			}
+			claimed[dst] = k
+			newRow[dst] = v
 		}
 		result[i] = newRow
 	}
@@ -390,16 +652,26 @@ func (e *SimpleTransformEngine) applyNullHandle(ctx context.Context, data []Row,
 		return nil, fmt.Errorf("null_handle requires 'column' config")
 	}
 
-	strategy := "default"
-	if s, ok := config["strategy"].(string); ok && strings.TrimSpace(s) != "" {
-		strategy = strings.ToLower(strings.TrimSpace(s))
-	}
+	strategy := nullHandleStrategy(config)
 
 	switch strategy {
 	case "default", "fill", "fill_default":
 		defaultValue, ok := config["default_value"]
 		if !ok {
 			return nil, fmt.Errorf("null_handle strategy=default requires 'default_value'")
+		}
+		// A column absent from EVERY row is a configuration mismatch, and filling
+		// it here does not fill anything: it FABRICATES a new column, carrying the
+		// default value, on every row of the table, and ships it to the
+		// destination. One typo in a column name became a schema change.
+		// MissingColumnWarnings names the column, and its wording — "the rule has
+		// no effect" — is only true once this branch stops having one.
+		//
+		// A column absent from SOME rows is an ordinary sparse document, and
+		// filling the default there is the entire point of the rule, so that case
+		// is untouched.
+		if len(data) > 0 && len(presentColumns([]string{col}, data)) == 0 {
+			return data, nil
 		}
 		result := make([]Row, len(data))
 		for i, row := range data {
@@ -416,8 +688,15 @@ func (e *SimpleTransformEngine) applyNullHandle(ctx context.Context, data []Row,
 	case "drop_row":
 		out := make([]Row, 0, len(data))
 		for _, row := range data {
-			val, ok := row[col]
-			if !ok || isNullish(val) {
+			// A column that is ABSENT from the row is not a null value. Treating
+			// it as one let a single rule naming a column no row carries delete
+			// the whole dataset, silently (HTTP 200, no warning, zero rows) —
+			// KI-NULL-HANDLE-MISSING-COLUMN-DROPS-EVERY-ROW. Every other branch
+			// of this engine fails open on a missing column (applyTruncate,
+			// applyTypeConvert, applyJSONFlatten); drop_row now does too, and
+			// TransformCoordinator.ApplyWithWarnings surfaces the mismatch
+			// instead of consuming it.
+			if val, ok := row[col]; ok && isNullish(val) {
 				continue
 			}
 			out = append(out, row)
@@ -543,14 +822,30 @@ func (e *SimpleTransformEngine) applyJSONFlatten(ctx context.Context, data []Row
 		return nil, fmt.Errorf("json_flatten requires 'column' config")
 	}
 
-	prefix := ""
-	if p, ok := config["prefix"].(string); ok {
-		prefix = p
-	}
-
 	sep := "_"
 	if s, ok := config["separator"].(string); ok && s != "" {
 		sep = s
+	}
+
+	// The default prefix namespaces the flattened keys under the source column.
+	// It used to default to "", which lifts the nested keys straight into the top
+	// level: flattening meta on {id:7, meta:{id:99}} wrote id=99 over the row's
+	// own primary key and returned HTTP 200.
+	//
+	// col+sep is not a new convention — it is the one the rest of the product
+	// already stated. applyArrayExpand defaults to col+"_", the suggestion engine
+	// emits prefix=<col>_ on every json_flatten it proposes
+	// (llm-service/src/agents/suggestions/service.py), and the UI RENDERS an unset
+	// prefix as `${column}_` (frontend/src/lib/transform-display.ts). The engine
+	// was the only component that believed the default was flat, and it was the
+	// one holding the data.
+	//
+	// An EXPLICIT "" is still honoured — the key is present in config, so it is a
+	// deliberate request for the flat namespace, and the collision check below
+	// makes it safe rather than silent.
+	prefix := col + sep
+	if p, ok := config["prefix"].(string); ok {
+		prefix = p
 	}
 
 	maxDepth := 0
@@ -579,8 +874,29 @@ func (e *SimpleTransformEngine) applyJSONFlatten(ctx context.Context, data []Row
 		}
 
 		delete(newRow, col)
+
+		// Flatten into a side map first so a key that would land on an existing
+		// column is caught BEFORE it overwrites one. Writing straight into newRow
+		// made the overwrite unobservable: the column count looked right and the
+		// old value was simply gone.
+		flat := make(Row, len(m))
 		for k, v := range m {
-			flattenValue(newRow, prefix+k, v, sep, 1, maxDepth)
+			flattenValue(flat, prefix+k, v, sep, 1, maxDepth)
+		}
+		var clashes []string
+		for k := range flat {
+			if _, taken := newRow[k]; taken {
+				clashes = append(clashes, k)
+			}
+		}
+		if len(clashes) > 0 {
+			sort.Strings(clashes) // map order would otherwise reshuffle the message
+			return nil, fmt.Errorf(
+				"json_flatten: flattening %q would overwrite existing column(s) %s; set a distinct 'prefix' or exclude the column(s) first",
+				col, strings.Join(clashes, ", "))
+		}
+		for k, v := range flat {
+			newRow[k] = v
 		}
 		result[i] = newRow
 	}
@@ -653,7 +969,17 @@ func (e *SimpleTransformEngine) applyArrayExpand(ctx context.Context, data []Row
 			limit = maxElems
 		}
 		for j := 0; j < limit; j++ {
-			newRow[prefix+strconv.Itoa(j)] = scalarize(arr[j])
+			// A row that already carries <prefix><j> — a legitimate column named
+			// tags_0 alongside an array column tags — had it silently replaced by
+			// the expansion. Refuse rather than overwrite; the operator picks a
+			// different output_prefix.
+			key := prefix + strconv.Itoa(j)
+			if _, taken := newRow[key]; taken {
+				return nil, fmt.Errorf(
+					"array_expand: expanding %q would overwrite existing column %q; set a distinct 'output_prefix'",
+					col, key)
+			}
+			newRow[key] = scalarize(arr[j])
 		}
 		result[i] = newRow
 	}
@@ -746,14 +1072,50 @@ var condRe = regexp.MustCompile(`^(\w+)\s*(>=|<=|!=|<>|=|>|<)\s*(.+)$`)
 // likeRe captures "column LIKE 'pattern'" (LIKE keyword is case-insensitive).
 var likeRe = regexp.MustCompile(`^(\w+)\s+(?i:LIKE)\s+['"](.*)['"]\s*$`)
 
-// evaluateCondition evaluates a simple "column <op> value" condition against a
-// row. Supported operators: =, != (or <>), >, >=, <, <=, and LIKE. A comparison
-// is numeric when BOTH operands parse as numbers (so numeric values arriving as
-// strings — e.g. decimals from DB drivers — compare correctly); otherwise it is
-// a lexicographic string comparison. A missing column is a non-match (not an
-// error). An unrecognized condition format returns an error so the caller can
-// fail loudly instead of silently discarding every row.
+// evaluateCondition evaluates a filter condition against one row.
+//
+// A condition is an OR of AND-groups of leaf comparisons, with SQL's precedence
+// (AND binds tighter than OR) and no parentheses; parseCondition in condition.go
+// owns the splitting and explains why. Each leaf is "column <op> value" with
+// =, != (or <>), >, >=, <, <= or LIKE.
+//
+// A missing column is a non-match (not an error): that is correct per-row SQL
+// semantics for a sparse document, and applyFilter separately refuses to let a
+// column missing from EVERY row masquerade as a filter result.
+//
+// An unrecognized leaf returns an error so the caller can fail loudly instead of
+// silently discarding every row.
 func evaluateCondition(row Row, condition string) (bool, error) {
+	expr, err := parseCondition(condition)
+	if err != nil {
+		return false, err
+	}
+	if len(expr.orGroups) == 0 {
+		return true, nil
+	}
+	for _, group := range expr.orGroups {
+		groupMatches := true
+		for _, leaf := range group {
+			ok, err := evaluateLeaf(row, leaf)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				groupMatches = false
+				break
+			}
+		}
+		if groupMatches {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// evaluateLeaf evaluates one "column <op> value" comparison. A comparison is
+// integer when both operands are whole numbers, numeric when both parse as
+// numbers, and lexicographic otherwise.
+func evaluateLeaf(row Row, condition string) (bool, error) {
 	condition = strings.TrimSpace(condition)
 	if condition == "" {
 		return true, nil
@@ -765,10 +1127,7 @@ func evaluateCondition(row Row, condition string) (bool, error) {
 		if !exists {
 			return false, nil
 		}
-		// Naive SQL-LIKE → regex: % => any run, _ => any single char.
-		pattern := strings.Replace(m[2], "%", ".*", -1)
-		pattern = strings.Replace(pattern, "_", ".", -1)
-		matched, err := regexp.MatchString("^"+pattern+"$", fmt.Sprintf("%v", val))
+		matched, err := regexp.MatchString(likeToRegex(m[2]), fmt.Sprintf("%v", val))
 		if err != nil {
 			return false, fmt.Errorf("invalid LIKE pattern %q: %w", m[2], err)
 		}
@@ -790,7 +1149,16 @@ func evaluateCondition(row Row, condition string) (bool, error) {
 }
 
 // compareValue applies op between a row value and a right-hand string literal.
+//
+// Whole numbers are compared as int64 before the float64 path is considered,
+// because float64 is exact only below 2^53 -- see integerValue.
 func compareValue(val interface{}, op, rhs string) (bool, error) {
+	if li, lok := integerValue(val); lok {
+		if ri, rok := integerString(rhs); rok {
+			return compareOrdered(li, ri, op)
+		}
+	}
+
 	lf, lok := numericValue(val)
 	rf, rok := numericFloat(rhs)
 	numeric := lok && rok
@@ -832,6 +1200,25 @@ func compareValue(val interface{}, op, rhs string) (bool, error) {
 	return false, fmt.Errorf("unsupported operator: %q", op)
 }
 
+// compareOrdered applies op to two already-ordered operands.
+func compareOrdered(l, r int64, op string) (bool, error) {
+	switch op {
+	case "=":
+		return l == r, nil
+	case "!=", "<>":
+		return l != r, nil
+	case ">":
+		return l > r, nil
+	case ">=":
+		return l >= r, nil
+	case "<":
+		return l < r, nil
+	case "<=":
+		return l <= r, nil
+	}
+	return false, fmt.Errorf("unsupported operator: %q", op)
+}
+
 // applyMask applies masking to a value.
 // hashFunc selects the digest used when maskType=hash ("sha256" default,
 // "hmac_sha256" keyed by RSYNC_PII_HASH_SALT, or "md5" for legacy systems).
@@ -852,8 +1239,14 @@ func applyMask(value interface{}, maskType string, hashFunc string) interface{} 
 	case "redact":
 		return "***"
 	case "partial", "mask", "partial_mask":
-		if len(str) > 4 {
-			return str[:2] + "***" + str[len(str)-2:]
+		// Runes, not bytes. str[:2] cuts a multi-byte character in half and emits
+		// the fragments as replacement characters, so masking a non-ASCII value
+		// produced mojibake instead of a readable prefix — and on a 3-byte-per-
+		// character script the "len > 4" guard let a 2-character value through the
+		// slice path at all. truncateRunes in this file has always done it right.
+		r := []rune(str)
+		if len(r) > 4 {
+			return string(r[:2]) + "***" + string(r[len(r)-2:])
 		}
 		return "***"
 	default:
@@ -960,6 +1353,18 @@ func truncateRunes(s string, maxLen int) string {
 func convertValue(v interface{}, to string) (interface{}, error) {
 	switch to {
 	case "string":
+		// fmt.Sprintf("%v") on an object or array emits GO syntax —
+		// "map[a:1 b:x]", "[1 2 3]" — which is not JSON, round-trips through
+		// nothing, and is what landed in the destination whenever a nested column
+		// was converted to string. scalarize (this file) is the encoder the wide
+		// transforms already use for the same job.
+		switch t := v.(type) {
+		case []byte:
+			return string(t), nil
+		}
+		if s, ok := scalarize(v).(string); ok {
+			return s, nil
+		}
 		return fmt.Sprintf("%v", v), nil
 	case "int", "integer":
 		switch n := v.(type) {
@@ -1055,6 +1460,12 @@ func (e *DuckDBTransformEngine) Apply(ctx context.Context, data []Row, transform
 	return nil, fmt.Errorf("DuckDB engine not implemented yet (Phase 2)")
 }
 
+// ErrPreviewTimeout reports that a preview run hit its deadline before the
+// transform chain finished. Callers need to tell this apart from a chain that
+// legitimately produced no rows, so it is a sentinel rather than a free-text
+// error: errors.Is(err, ErrPreviewTimeout).
+var ErrPreviewTimeout = errors.New("transform preview timed out")
+
 // PreviewExecutor runs transforms with timeouts for preview
 type PreviewExecutor struct {
 	coordinator *TransformCoordinator
@@ -1074,13 +1485,18 @@ func (e *PreviewExecutor) Preview(sampleData []Row, transforms []Transform, time
 
 	warnings := []string{}
 
-	result, err := e.coordinator.Apply(ctx, sampleData, transforms)
+	result, stepWarnings, err := e.coordinator.ApplyWithWarnings(ctx, sampleData, transforms)
+	warnings = append(warnings, stepWarnings...)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			warnings = append(warnings, "Preview timed out - results may be incomplete")
-		} else {
-			return nil, warnings, err
+			// ApplyWithWarnings returns nil rows on error, so falling through to a
+			// nil error here answered a timed-out preview with an empty result set
+			// and no error at all. The UI renders that as "0 rows", which reads as
+			// "your transforms dropped every row" - the one conclusion a run that
+			// never finished cannot support. Report the timeout instead.
+			return nil, warnings, fmt.Errorf("%w after %s", ErrPreviewTimeout, timeout)
 		}
+		return nil, warnings, err
 	}
 
 	return result, warnings, nil

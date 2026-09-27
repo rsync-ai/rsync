@@ -60,9 +60,9 @@ const cdcCounterSeedQuery = `
 	GROUP BY 1, 2`
 
 // seedCDCCountersFromLedger loads the ledger's per-table totals into the empty
-// counters: c and r into inserts, u into updates, d into deletes. Best-effort: on
-// any error it logs and leaves the counters as they were.
-func seedCDCCountersFromLedger(ctx context.Context, db *sql.DB, pipelineID, executionID string, inserts, updates, deletes *sync.Map) {
+// counters: c into inserts, r (snapshot reads) into snapshotRows, u into updates, d
+// into deletes. Best-effort: on any error it logs and leaves the counters as they were.
+func seedCDCCountersFromLedger(ctx context.Context, db *sql.DB, pipelineID, executionID string, inserts, updates, deletes, snapshotRows *sync.Map) {
 	pipelineID = strings.TrimSpace(pipelineID)
 	executionID = strings.TrimSpace(executionID)
 	if db == nil || !looksLikeUUID(pipelineID) || !looksLikeUUID(executionID) {
@@ -93,8 +93,10 @@ func seedCDCCountersFromLedger(ctx context.Context, db *sql.DB, pipelineID, exec
 		}
 		var m *sync.Map
 		switch op {
-		case "c", "r":
+		case "c":
 			m = inserts
+		case "r":
+			m = snapshotRows
 		case "u":
 			m = updates
 		case "d":

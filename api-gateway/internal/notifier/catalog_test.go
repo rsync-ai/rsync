@@ -24,7 +24,6 @@ func TestResolve_NeverLeaksInternalIdentifiers(t *testing.T) {
 		{"unknown error code", "UNKNOWN_ERROR", "structured_error_notification", notifyTopic, "error"},
 		{"code not in catalog", "SOME_FUTURE_CODE_NOT_MAPPED", "structured_error_notification", notifyTopic, "error"},
 		{"healer results with nothing set", "", "", healerResults, ""},
-		{"healer actions with nothing set", "", "", healerActions, ""},
 		{"notifications topic with nothing set", "", "", notifyTopic, ""},
 		{"unrecognized topic with nothing set", "", "", "rsync.brand.new.topic", "warning"},
 		{"carrier type only", "", "structured_error_notification", notifyTopic, "warning"},

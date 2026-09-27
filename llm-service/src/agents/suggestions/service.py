@@ -12,7 +12,9 @@ import logging
 import json
 
 try:
-    from ...utils.openai_client import make_sync_client, resolve_provider, get_default_model, llm_configured
+    from ...utils.openai_client import (
+        make_sync_client, resolve_provider, get_default_model, llm_configured, with_reasoning_headroom,
+    )
 except ImportError:
     import importlib.util as _ilu, os as _os
     _spec = _ilu.spec_from_file_location(
@@ -25,6 +27,7 @@ except ImportError:
     resolve_provider  = _m.resolve_provider
     get_default_model = _m.get_default_model
     llm_configured = _m.llm_configured
+    with_reasoning_headroom = _m.with_reasoning_headroom
     del _ilu, _os, _spec, _m
 
 from ..pii_scanner.ml_detector import MLPIIDetector
@@ -63,6 +66,18 @@ def _is_object_storage(connector_type: Any) -> bool:
     if not t:
         return False
     return any(hint in t for hint in OBJECT_STORAGE_HINTS)
+
+
+# A blank or generic destination is not evidence of indexes; "storage" is the
+# placeholder SuggestionsReviewDialog sent before it passed the real type.
+_UNKNOWN_DESTINATIONS = {"", "unknown", "storage"}
+
+
+def _destination_has_indexes(connector_type: Any) -> bool:
+    """Index advice only for a destination known to have indexes: never an
+    object store (gcs / aws-s3 / azure-blob / minio) and never an unknown type."""
+    t = _normalize_connector_type(connector_type)
+    return t not in _UNKNOWN_DESTINATIONS and not _is_object_storage(t)
 
 
 def _stable_json(value: Any) -> str:
@@ -646,7 +661,7 @@ Available column names (UNTRUSTED data - use only these):
                 {"role": "user", "content": prompt},
             ],
             temperature=0.7,
-            max_tokens=2000,  # Limit response tokens
+            max_tokens=with_reasoning_headroom(2000),  # Limit response tokens
         )
         
         content = response.choices[0].message.content
@@ -784,15 +799,20 @@ def optimize_suggestions_node(state: SuggestionState) -> SuggestionState:
             "reason": "Large tables benefit from partitioning",
         })
     
-    # Suggest indexing on common columns
-    for col in columns:
-        if "id" in col["name"].lower() or "key" in col["name"].lower():
-            optimizations.append({
-                "type": "indexing",
-                "column": col["name"],
-                "suggestion": f"Add index on {col['name']} for faster lookups",
-                "reason": "ID/key columns are frequently queried",
-            })
+    # Index advice only where the destination has indexes, and only for real
+    # id/key columns. Names arrive table-qualified ("orders.paid_at"), so a
+    # substring test matched "provider", "paid_at" and every column of a table
+    # named *id*/*key*: 14 "Add index" tips for a GCS destination (prod 2026-09-26).
+    if _destination_has_indexes(intent.get("destination_type")):
+        for col in columns:
+            bare = _bare_column(col.get("name")).lower()
+            if bare in ("id", "key") or bare.endswith(("_id", "_key")):
+                optimizations.append({
+                    "type": "indexing",
+                    "column": col["name"],
+                    "suggestion": f"Add index on {col['name']} for faster lookups",
+                    "reason": "ID/key columns are frequently queried",
+                })
     
     # Suggest batch size optimization
     if intent.get("operation") == "sync":

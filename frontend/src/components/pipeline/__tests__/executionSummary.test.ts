@@ -7,9 +7,9 @@ import {
   movementHeadline,
   planStagesFromEvents,
   rollupFromSummary,
-  rollupTableStats,
   rowsWrittenForTable,
 } from "../executionSummary"
+import { rollupTableStats } from "./rollupFixture"
 
 describe("rowsWrittenForTable", () => {
   it("reads the batch family", () => {

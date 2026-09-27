@@ -1,10 +1,13 @@
 package handlers
 
 import (
+	"encoding/json"
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"api-gateway/internal/db"
 
@@ -106,5 +109,97 @@ func TestGetPipelineTrends_TheCDCStreamIsNotARun(t *testing.T) {
 	}
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+// Prod 2026-09-26: a run the postflight check failed after PIPELINE_COMPLETED had
+// been emitted read "1 of the last 1 finished run succeeded" on the pipeline page
+// while the live panel said FAILED. The events cannot say a run failed, so the
+// executions row decides; a run with no executions row keeps the events' answer.
+func TestGetPipelineTrends_TheExecutionsRowDecidesTheStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	sqlDB, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock: %v", err)
+	}
+	prev := db.DB
+	db.DB = sqlDB
+	t.Cleanup(func() { db.DB = prev; _ = sqlDB.Close() })
+
+	const failedRun = "11111111-1111-4111-8111-111111111111"
+	const legacyRun = "22222222-2222-4222-8222-222222222222"
+	now := time.Now()
+
+	mock.ExpectQuery(gateRoleQuery).
+		WithArgs(gatePipeID, gateUserID, activeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"role"}).AddRow("viewer"))
+	mock.ExpectQuery(`SELECT e.execution_id::text, MAX\(e.received_at\)`).
+		WithArgs(gatePipeID).
+		WillReturnRows(sqlmock.NewRows([]string{"execution_id", "last_seen"}).
+			AddRow(failedRun, now).AddRow(legacyRun, now.Add(-time.Hour)))
+	mock.ExpectQuery(`SELECT COUNT\(DISTINCT e.execution_id\)`).
+		WithArgs(gatePipeID).
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+
+	eventCols := []string{"start_time", "end_time", "event_count", "error_count", "retry_count", "has_completed", "has_failed"}
+	statusQuery := `FROM executions e.*WHERE e.id = \$1::uuid AND e.pipeline_id = \$2::uuid`
+	for _, run := range []struct {
+		id         string
+		execStatus *string
+	}{{failedRun, strptr("failed")}, {legacyRun, nil}} {
+		mock.ExpectQuery(`MIN\(COALESCE\(e.occurred_at, e.received_at\)\)`).
+			WithArgs(gatePipeID, run.id).
+			WillReturnRows(sqlmock.NewRows(eventCols).
+				AddRow(now.Add(-time.Minute), now, 9, 0, 0, true, false))
+		rows := sqlmock.NewRows([]string{"status"})
+		if run.execStatus != nil {
+			rows.AddRow(*run.execStatus)
+		}
+		mock.ExpectQuery(statusQuery).WithArgs(run.id, gatePipeID).WillReturnRows(rows)
+	}
+
+	rr := httptest.NewRecorder()
+	newGateRouter("/api/v1/pipelines/:id/trends", GetPipelineTrends).
+		ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/v1/pipelines/"+gatePipeID+"/trends", nil))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rr.Code, rr.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+
+	var got PipelineTrends
+	if err := json.Unmarshal(rr.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	statuses := []string{}
+	for _, e := range got.RecentExecutions {
+		statuses = append(statuses, e.Status)
+	}
+	if strings.Join(statuses, ",") != "failed,completed" {
+		t.Fatalf("statuses = %v, want [failed completed] (executions row for the first, events for the legacy run)", statuses)
+	}
+	if got.FinishedRuns != 2 || got.SucceededRuns != 1 {
+		t.Fatalf("finished/succeeded = %d/%d, want 2/1", got.FinishedRuns, got.SucceededRuns)
+	}
+}
+
+func TestTrendStatusFromExecution(t *testing.T) {
+	for in, want := range map[string]string{
+		"completed":                    "completed",
+		"success":                      "completed",
+		"failed":                       "failed",
+		"error":                        "failed",
+		"silent_drop_detected":         "failed",
+		"silent_partial_drop_detected": "failed",
+		"credential_check_failed":      "failed",
+		"cancelled":                    "cancelled",
+		"running":                      "running",
+		"waiting_for_user":             "running",
+		"pending":                      "running",
+	} {
+		if got := trendStatusFromExecution(in); got != want {
+			t.Errorf("trendStatusFromExecution(%q) = %q, want %q", in, got, want)
+		}
 	}
 }

@@ -29,7 +29,10 @@ type ServerInfo struct {
 	// inside the connector fails with a bare "No module named 'X'" that reads as a broken
 	// connector. Callers MUST attach this to any failure they surface.
 	DepsError string
-	mu        sync.RWMutex // Protect concurrent access
+	// verifiedAt is when an HTTP server last answered /health. StartServer trusts a
+	// cached HTTP entry for cachedHTTPVerifyInterval after it and asks again after that.
+	verifiedAt time.Time
+	mu         sync.RWMutex // Protect concurrent access
 }
 
 // ServerConfig holds configuration for starting an MCP server

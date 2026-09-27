@@ -121,32 +121,19 @@ echo ""
 # from a working one on the broker, and it is the same silent-divergence bug as
 # a misspelled name -- it just fails in the other direction.
 #
-# Fourteen names were removed here in the `rsync.` cutover because the grep came
-# back empty across api-gateway, backend-orchestrator, backend-temporal-adapter,
-# llm-service and shared: agent.{intent,resolver,discovery,validator,telemetry}
-# .requests, agent.telemetry.responses, all six agent.*.requests.dlq topics, and
-# system.status.updates / pipeline.events. The live DLQ names are
-# pipeline.failed.dlq and agent.failed.dlq (backend-temporal-adapter/internal/
-# workflows/activities.go:169,200), which this script never created.
-
-# Agent Request Topics
-# Entry points that a service actually consumes.
-AGENT_REQUEST_TOPICS=(
-    "agent.planner.requests"      # llm-service/src/agents/planner/kafka_consumer.py:58
-    "agent.executor.requests"     # backend-orchestrator/internal/agents/executor/executor.go:983
+# The list and the config are the ones every other bootstrapper uses
+# (scripts/kafka-init-new-topics.sh, the quickstart kafka-init service and the
+# Helm kafka-init Job), which are the values the orchestrator's topology
+# provisioner (backend-orchestrator/internal/kafka/topology.go) gives the same
+# names. No creator alters a topic that already exists, so whichever runs first
+# fixes the config for good; they must agree.
+PLATFORM_TOPICS=(
+    "pipeline.domain.events"      # pipeline lifecycle events
+    "pii.scan.request"            # api-gateway -> llm-service PII scanner
+    "pii.scan.response"           # llm-service PII scanner -> api-gateway
 )
-
-# Agent Response Topics
-# Where agents publish results; consumed by the api-gateway WebSocket bridge
-# (api-gateway/internal/websocket/kafka_bridge.go:62-80).
-AGENT_RESPONSE_TOPICS=(
-    "agent.intent.responses"      # Parsed intent
-    "agent.resolver.responses"    # Resolved connections
-    "agent.discovery.responses"   # Discovered schema
-    "agent.planner.responses"     # Generated plan
-    "agent.validator.responses"   # Validation result
-    "agent.executor.responses"    # Execution result
-)
+PLATFORM_PARTITIONS=3
+PLATFORM_CONFIG="--config cleanup.policy=delete --config retention.ms=604800000 --config compression.type=snappy"
 
 # =============================================================================
 # CREATE TOPICS
@@ -159,6 +146,7 @@ create_topic() {
     # multi-broker cluster RF=1 topics go unavailable during routine rolling
     # maintenance (an MSK patch takes one broker down at a time).
     local replication=${3:-$REPLICATION_FACTOR}
+    local topic_config=${4:-}
     local misr_arg=""
 
     # Pin min.insync.replicas only when asked. Clamped per-topic as well, because
@@ -192,6 +180,7 @@ create_topic() {
         --partitions $partitions \
         --replication-factor $replication \
         $misr_arg \
+        $topic_config \
         --if-not-exists 2>&1); then
         echo "✅"
     else
@@ -201,15 +190,9 @@ create_topic() {
     fi
 }
 
-echo "📨 Creating Agent Request Topics..."
-for topic in "${AGENT_REQUEST_TOPICS[@]}"; do
-    create_topic "$topic"
-done
-echo ""
-
-echo "📬 Creating Agent Response Topics..."
-for topic in "${AGENT_RESPONSE_TOPICS[@]}"; do
-    create_topic "$topic"
+echo "📨 Creating Platform Topics..."
+for topic in "${PLATFORM_TOPICS[@]}"; do
+    create_topic "$topic" "$PLATFORM_PARTITIONS" "" "$PLATFORM_CONFIG"
 done
 echo ""
 
@@ -229,24 +212,6 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 echo "✅ Total topics: $TOTAL_TOPICS"
 echo ""
-echo "🔄 Agentic Pipeline Flow:"
-echo ""
-echo "   User Request"
-echo "        │"
-echo "        ▼"
-echo "   [${TOPIC_PREFIX}agent.control.commands.<agent>] ──► Intent · Resolver · Discovery"
-echo "        │                                              Planner · Validator · Executor"
-echo "        │   (created by the kafka-init service, not this script)"
-echo "        ▼"
-echo "   [${TOPIC_PREFIX}agent.<agent>.responses] ──► api-gateway WebSocket bridge"
-echo "        │"
-echo "        ▼"
-echo "   [${TOPIC_PREFIX}pipeline.domain.events] ──► projector · sink · UI"
-echo "        │"
-echo "        ▼"
-echo "   Pipeline Complete! 🎉"
-echo ""
-
 if [ "$FAILED_TOPICS" -gt 0 ]; then
     echo "❌ $FAILED_TOPICS topic(s) were REJECTED by the broker (see the messages above)."
     echo "   The most common cause is KAFKA_REPLICATION_FACTOR=$REPLICATION_FACTOR being"

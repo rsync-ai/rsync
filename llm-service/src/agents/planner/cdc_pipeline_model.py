@@ -133,7 +133,7 @@ class TopicConfig:
     strategy: TopicStrategy = TopicStrategy.HYBRID
     
     # Topic naming
-    topic_prefix: str = ""  # e.g., "cdc.{tenant}.{source}.{pipeline}"
+    topic_prefix: str = ""
     
     # Per-table or unified
     unified_topic_name: Optional[str] = None
@@ -240,9 +240,10 @@ class CDCPipelineConfig:
         """Validate and normalize configuration after initialization"""
         if not self.connector_name:
             self.connector_name = f"cdc-{self.tenant_id}-{self.pipeline_id}"
-        
-        if not self.topic_config.topic_prefix:
-            self.topic_config.topic_prefix = f"cdc.{self.tenant_id}.{self.source.database}.{self.pipeline_id}"
+        # No default topic_prefix. This model used to invent
+        # "cdc.<tenant>.<db>.<pipeline>", a name no Kafka client in the product
+        # creates or reads: the CDC topic prefix is set by the debezium connector
+        # (_build_config, "<KAFKA_TOPIC_PREFIX>cdc-<id8>"), not here.
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for serialization"""

@@ -6,6 +6,10 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"reflect"
+	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,8 +18,8 @@ import (
 	"github.com/rsync-ai/shared/kafkaclient"
 )
 
-// A MongoDB Debezium source now emits heartbeats (connector.py, _build_config
-// mongodb branch). That is the fix for KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL: a
+// MongoDB and PostgreSQL Debezium sources emit heartbeats (connector.py
+// _enable_heartbeat). For MongoDB that is the fix for KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL: a
 // heartbeat commits a FRESH resume token on a timer, so an idle pipeline's stored token
 // never ages past the oplog window and dies on the next reconnect. It is also the
 // liveness beacon the Sentinel's freshness watchdog measures against
@@ -239,10 +243,11 @@ func TestHeartbeatTopicQualificationIsIdempotent(t *testing.T) {
 //   - The pre-create runs before start_sync. Afterwards the connector is already up and
 //     producing, so on an auto-creating broker the topic exists with the broker's
 //     geometry and the pre-create silently succeeds against it.
-//   - It is gated on MongoDB, because the CONNECTOR gates heartbeats on MongoDB. The
-//     two gates have to name the same sources: widen one without the other and either a
-//     source heartbeats into a topic nobody created, or a topic is created that nothing
-//     ever writes to.
+//   - It is gated on the sources the CONNECTOR enables heartbeats for (MongoDB, and
+//     PostgreSQL since #12). The two gates have to name the same sources: widen one
+//     without the other and either a source heartbeats into a topic nobody created, or
+//     a topic is created that nothing ever writes to.
+//     TestHeartbeatGateNamesTheSourcesTheConnectorHeartbeats compares the two.
 //   - heartbeat_topics_prefix is handed to the connector rather than re-derived there,
 //     the same anti-drift rule as schema_history_topic.
 func TestHeartbeatTopicIsPreCreatedBeforeStartSync(t *testing.T) {
@@ -336,30 +341,15 @@ func TestHeartbeatTopicIsPreCreatedBeforeStartSync(t *testing.T) {
 			"created is not the one Debezium publishes to")
 	}
 
-	// The MongoDB gate: some enclosing condition must name the source type the connector
-	// enables heartbeats for.
-	var gated bool
-	ast.Inspect(fn, func(n ast.Node) bool {
-		ifs, ok := n.(*ast.IfStmt)
-		if !ok || ifs.Cond == nil || ifs.Body == nil {
-			return true
-		}
-		if ensurePos <= ifs.Body.Lbrace || ensurePos >= ifs.Body.Rbrace {
-			return true
-		}
-		if strings.Contains(strings.ToLower(exprText(ifs.Cond)), "mongodb") {
-			gated = true
-		}
-		return true
-	})
-	if !gated {
-		t.Error("the heartbeat pre-create is not inside a MongoDB-gated branch. The " +
-			"connector enables heartbeats for MongoDB sources only (connector.py, " +
-			"_build_config mongodb branch); the two gates must name the same " +
-			"set of sources, or a source heartbeats into a topic nobody created — or a " +
-			"topic is created that nothing ever writes to. If heartbeats were " +
-			"deliberately widened to another source family, widen the connector and this " +
-			"assertion together.")
+	// The source gate: an enclosing condition must name the source types the connector
+	// enables heartbeats for. TestHeartbeatGateNamesTheSourcesTheConnectorHeartbeats
+	// checks it names exactly those.
+	if gate := heartbeatGateSources(fn, ensurePos); len(gate) == 0 {
+		t.Error("the heartbeat pre-create is not inside a branch gated on source type. " +
+			"The connector enables heartbeats for some sources only (connector.py " +
+			"_enable_heartbeat); the two gates must name the same set of sources, or a " +
+			"source heartbeats into a topic nobody created — or a topic is created that " +
+			"nothing ever writes to.")
 	}
 
 	// Geometry. Deliberately NOT the schema history's: nothing replays this topic.
@@ -471,5 +461,98 @@ func TestConnectorWritesTheKeyDebeziumNamesTheTopicFrom(t *testing.T) {
 		!strings.Contains(src, `cfg.setdefault("topic.heartbeat.prefix", _hb_prefix)`) {
 		t.Errorf("%s sets both heartbeat-prefix keys from different expressions; they "+
 			"must be assigned one shared value so they cannot drift apart", path)
+	}
+}
+
+// heartbeatGateSources returns the string literals in the conditions of the if
+// statements whose body holds the heartbeat pre-create: the source types it runs for.
+func heartbeatGateSources(fn *ast.FuncDecl, ensurePos token.Pos) []string {
+	var out []string
+	ast.Inspect(fn, func(n ast.Node) bool {
+		ifs, ok := n.(*ast.IfStmt)
+		if !ok || ifs.Cond == nil || ifs.Body == nil {
+			return true
+		}
+		if ensurePos <= ifs.Body.Lbrace || ensurePos >= ifs.Body.Rbrace {
+			return true
+		}
+		ast.Inspect(ifs.Cond, func(c ast.Node) bool {
+			if v, err := basicString(asExpr(c)); err == nil && v != "" {
+				out = append(out, strings.ToLower(v))
+			}
+			return true
+		})
+		return true
+	})
+	sort.Strings(out)
+	return out
+}
+
+func asExpr(n ast.Node) ast.Expr {
+	e, _ := n.(ast.Expr)
+	return e
+}
+
+// connectorHeartbeatSources returns the database types whose _build_config branch in
+// connector.py calls _enable_heartbeat: the nearest `db_type == "<x>"` above each call.
+func connectorHeartbeatSources(t *testing.T) []string {
+	t.Helper()
+	path, src := debeziumConnectorSource(t)
+	branch := regexp.MustCompile(`db_type == "([a-z_]+)"`)
+	var out []string
+	var current string
+	calls := 0
+	for _, line := range strings.Split(src, "\n") {
+		if m := branch.FindStringSubmatch(line); m != nil {
+			current = m[1]
+		}
+		if strings.Contains(line, "_enable_heartbeat(cfg,") {
+			calls++
+			if current == "" {
+				t.Fatalf("%s calls _enable_heartbeat outside any db_type branch", path)
+			}
+			out = append(out, current)
+		}
+	}
+	if calls == 0 {
+		t.Fatalf("%s has no _enable_heartbeat(cfg, …) call — if heartbeats moved, move "+
+			"this parser with them rather than deleting the comparison", path)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// The orchestrator pre-creates the heartbeat topic for exactly the sources the
+// connector heartbeats. #12 added PostgreSQL to the connector; this is what makes
+// adding it to one side only fail.
+func TestHeartbeatGateNamesTheSourcesTheConnectorHeartbeats(t *testing.T) {
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "executor.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse executor.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if f, ok := d.(*ast.FuncDecl); ok && f.Name.Name == "executeStreamingDataTransfer" {
+			fn = f
+		}
+	}
+	if fn == nil {
+		t.Fatal("executeStreamingDataTransfer not found in executor.go")
+	}
+	ensurePos, _ := findEnsureTopicCall(fn, closureFilter(fn), "hbTopic")
+	if !ensurePos.IsValid() {
+		t.Fatal("no heartbeat pre-create found (EnsureTopicExistsWithConfig taking hbTopic)")
+	}
+
+	gate := heartbeatGateSources(fn, ensurePos)
+	want := connectorHeartbeatSources(t)
+	if !reflect.DeepEqual(gate, want) {
+		t.Fatalf("executor.go pre-creates the heartbeat topic for %v, but connector.py "+
+			"enables heartbeats for %v. Widen or narrow both together.", gate, want)
+	}
+	if !slices.Contains(want, "postgresql") {
+		t.Errorf("connector.py no longer heartbeats PostgreSQL (%v); #12 needs it so the "+
+			"slot acknowledges WAL it decoded and filtered out", want)
 	}
 }

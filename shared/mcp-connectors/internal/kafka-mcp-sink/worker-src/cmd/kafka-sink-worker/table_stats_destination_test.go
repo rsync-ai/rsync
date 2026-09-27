@@ -46,7 +46,7 @@ func TestCDCTableStatsNamesTheDestinationNotJustTheSource(t *testing.T) {
 		DestNamespace: "rsync_verify_cdc",            // where the rows actually landed
 	}
 
-	table := statsTable(t, buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 0))
+	table := statsTable(t, buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 0, 0))
 
 	// Unchanged — and load-bearing. See the file header: cdcstats writes the captured
 	// counters into the row keyed by this exact value.
@@ -80,7 +80,7 @@ func TestTableStatsOmitDestinationWhenTheSinkCannotNameOne(t *testing.T) {
 	sm := &SinkMessage{PipelineID: "p1", ExecutionID: "e1", Table: "public.orders"}
 
 	for name, table := range map[string]map[string]interface{}{
-		"cdc":   statsTable(t, buildCDCTableStatsEvent(sm, 1, 0, 0, 8, 0)),
+		"cdc":   statsTable(t, buildCDCTableStatsEvent(sm, 1, 0, 0, 8, 0, 0)),
 		"batch": statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 1, 1, 8)),
 	} {
 		for _, k := range []string{"destination_schema", "destination_qualified_name"} {
@@ -145,7 +145,7 @@ func TestBatchAndCDCTableStatsAgreeOnTableIdentity(t *testing.T) {
 		{PipelineID: "p", ExecutionID: "e", Table: "public.public.orders"},               // doubled qualifier
 		{PipelineID: "p", ExecutionID: "e", Table: "orders", DestNamespace: "warehouse"}, // bare + destination
 	} {
-		cdc := statsTable(t, buildCDCTableStatsEvent(sm, 1, 0, 0, 8, 0))
+		cdc := statsTable(t, buildCDCTableStatsEvent(sm, 1, 0, 0, 8, 0, 0))
 		batch := statsTable(t, buildTableStatsEvent(sm, "batch", "completed", 1, 1, 8))
 		if !reflect.DeepEqual(cdc, batch) {
 			t.Errorf("table identity diverges for %q: cdc=%#v batch=%#v", sm.Table, cdc, batch)

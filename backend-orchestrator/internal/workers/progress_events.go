@@ -124,6 +124,14 @@ func (e *ProgressEmitter) StartStageHeartbeat(ctx context.Context, base Progress
 	}
 }
 
+// progressEventTimeLayout is RFC3339 with milliseconds, the precision the
+// temporal adapter stamps its copy of the same stage transition with. Whole
+// seconds put this producer's STAGE_COMPLETED of a sub-second stage BEFORE the
+// adapter's STAGE_STARTED of it (14:58:25Z vs 14:58:25.368Z), and the Overview
+// read the second start as a retry: "Retry 2/2" on five stages that ran once.
+// Fixed width, so the strings still sort as the times do; time.RFC3339 parses it.
+const progressEventTimeLayout = "2006-01-02T15:04:05.000Z07:00"
+
 // normalizeProgressEvent fills in everything a caller may legitimately leave off:
 // the envelope (schema_version, timestamp, occurred_at, trace_id, seq, event_id),
 // the derived severity/state, and the stage-field normalisations.
@@ -141,7 +149,7 @@ func normalizeProgressEvent(ctx context.Context, event *ProgressEvent) error {
 
 	// Set timestamp if not provided
 	if event.Timestamp == "" {
-		event.Timestamp = time.Now().UTC().Format(time.RFC3339)
+		event.Timestamp = time.Now().UTC().Format(progressEventTimeLayout)
 	}
 
 	// Ensure occurred_at is set for consistent event ordering/replay.
@@ -323,188 +331,4 @@ func stateForEventType(eventType string, status string) string {
 			return "running"
 		}
 	}
-}
-
-// enrichFromDB fills started_at/heartbeat/duration/attempt fields when possible.
-// This keeps the event contract deterministic even for completed events.
-func (e *ProgressEmitter) enrichFromDB(event *ProgressEvent) {
-	if e.db == nil || event == nil || event.PipelineID == "" {
-		return
-	}
-
-	// These columns are added by migration 015; treat missing columns as non-fatal.
-	var (
-		dbStartedAt   sql.NullTime
-		dbHeartbeatAt sql.NullTime
-		dbAttempt     sql.NullInt32
-		dbMaxAttempts sql.NullInt32
-	)
-
-	err := e.db.QueryRow(`
-		SELECT stage_started_at, stage_last_heartbeat_at, stage_attempt, stage_max_attempts
-		FROM pipeline_progress
-		WHERE pipeline_id = $1
-	`, event.PipelineID).Scan(&dbStartedAt, &dbHeartbeatAt, &dbAttempt, &dbMaxAttempts)
-	if err != nil {
-		return
-	}
-
-	if event.StartedAt == "" && dbStartedAt.Valid {
-		event.StartedAt = dbStartedAt.Time.UTC().Format(time.RFC3339)
-	}
-	if event.LastHeartbeatAt == "" && dbHeartbeatAt.Valid {
-		event.LastHeartbeatAt = dbHeartbeatAt.Time.UTC().Format(time.RFC3339)
-	}
-	if event.Attempt == 0 && dbAttempt.Valid {
-		event.Attempt = int(dbAttempt.Int32)
-	}
-	if event.MaxAttempts == 0 && dbMaxAttempts.Valid {
-		event.MaxAttempts = int(dbMaxAttempts.Int32)
-	}
-
-	// Compute duration_ms when we have started_at
-	if event.DurationMs == 0 && event.StartedAt != "" {
-		if started, err := time.Parse(time.RFC3339, event.StartedAt); err == nil {
-			if now, err := time.Parse(time.RFC3339, event.Timestamp); err == nil {
-				if now.After(started) {
-					event.DurationMs = now.Sub(started).Milliseconds()
-				}
-			}
-		}
-	}
-}
-
-// updateStateTable updates the pipeline_states table
-func (e *ProgressEmitter) updateStateTable(event ProgressEvent) error {
-	// Build update map
-	update := map[string]interface{}{
-		"execution_id":  event.ExecutionID,
-		"status":        event.Status,
-		"current_stage": event.Progress.Stage,
-		"message":       event.Message,
-		"progress": map[string]interface{}{
-			"percent":      event.Progress.Percent,
-			"current_step": event.Progress.CurrentStep,
-			"total_steps":  event.Progress.TotalSteps,
-		},
-	}
-
-	if event.BlockingReason != nil {
-		update["blocking_reason"] = map[string]interface{}{
-			"type":              event.BlockingReason.Type,
-			"description":       event.BlockingReason.Description,
-			"estimated_seconds": event.BlockingReason.EstimatedSeconds,
-		}
-	}
-
-	if event.Metadata != nil {
-		update["metadata"] = event.Metadata
-	}
-
-	// Merge metadata (artifacts/metrics/stage data must persist across events)
-	mergedMeta := map[string]interface{}{}
-	if e.db != nil {
-		var existing sql.NullString
-		// Non-fatal if the row doesn't exist yet (first event)
-		_ = e.db.QueryRow(`SELECT metadata FROM pipeline_progress WHERE pipeline_id = $1`, event.PipelineID).Scan(&existing)
-		if existing.Valid && existing.String != "" {
-			_ = json.Unmarshal([]byte(existing.String), &mergedMeta)
-		}
-	}
-	if event.Metadata != nil {
-		mergedMeta = deepMergeMaps(mergedMeta, event.Metadata)
-	}
-
-	metadataJSON := "{}"
-	if metaBytes, err := json.Marshal(mergedMeta); err == nil {
-		metadataJSON = string(metaBytes)
-	}
-
-	var blockingType, blockingDesc sql.NullString
-	var blockingSec sql.NullInt32
-	if event.BlockingReason != nil {
-		blockingType = sql.NullString{String: event.BlockingReason.Type, Valid: true}
-		blockingDesc = sql.NullString{String: event.BlockingReason.Description, Valid: true}
-		if event.BlockingReason.EstimatedSeconds != nil {
-			blockingSec = sql.NullInt32{Int32: int32(*event.BlockingReason.EstimatedSeconds), Valid: true}
-		}
-	}
-
-	// Upsert
-	_, err := e.db.Exec(`
-		INSERT INTO pipeline_progress (
-			pipeline_id, execution_id, status, current_stage, schema_version,
-			stage_group, stage_state, stage_started_at, stage_last_heartbeat_at,
-			stage_duration_ms, stage_attempt, stage_max_attempts, stage_summary,
-			progress_percent, progress_current_step, progress_total_steps,
-			blocking_reason_type, blocking_reason_description, blocking_reason_estimated_seconds,
-			message, metadata, updated_at
-		) VALUES (
-			$1, $2, $3, $4, $5,
-			$6, $7, NULLIF($8,'')::timestamp, NULLIF($9,'')::timestamp,
-			$10, $11, $12, $13,
-			$14, $15, $16, $17, $18, $19, $20, $21::jsonb, NOW()
-		)
-		ON CONFLICT (pipeline_id) DO UPDATE SET
-			execution_id = COALESCE(EXCLUDED.execution_id, pipeline_progress.execution_id),
-			status = EXCLUDED.status,
-			current_stage = EXCLUDED.current_stage,
-			schema_version = EXCLUDED.schema_version,
-			stage_group = EXCLUDED.stage_group,
-			stage_state = EXCLUDED.stage_state,
-			stage_started_at = COALESCE(EXCLUDED.stage_started_at, pipeline_progress.stage_started_at),
-			stage_last_heartbeat_at = COALESCE(EXCLUDED.stage_last_heartbeat_at, pipeline_progress.stage_last_heartbeat_at),
-			stage_duration_ms = EXCLUDED.stage_duration_ms,
-			stage_attempt = EXCLUDED.stage_attempt,
-			stage_max_attempts = EXCLUDED.stage_max_attempts,
-			stage_summary = EXCLUDED.stage_summary,
-			progress_percent = EXCLUDED.progress_percent,
-			progress_current_step = EXCLUDED.progress_current_step,
-			progress_total_steps = EXCLUDED.progress_total_steps,
-			blocking_reason_type = EXCLUDED.blocking_reason_type,
-			blocking_reason_description = EXCLUDED.blocking_reason_description,
-			blocking_reason_estimated_seconds = EXCLUDED.blocking_reason_estimated_seconds,
-			message = EXCLUDED.message,
-			metadata = EXCLUDED.metadata,
-			updated_at = NOW()
-	`, event.PipelineID, event.ExecutionID, event.Status, event.Progress.Stage, event.SchemaVersion,
-		event.StageGroup, event.State, event.StartedAt, event.LastHeartbeatAt,
-		event.DurationMs, event.Attempt, event.MaxAttempts, event.Summary,
-		event.Progress.Percent, event.Progress.CurrentStep, event.Progress.TotalSteps,
-		blockingType, blockingDesc, blockingSec,
-		event.Message, metadataJSON)
-
-	return err
-}
-
-func deepMergeMaps(dst map[string]interface{}, src map[string]interface{}) map[string]interface{} {
-	if dst == nil {
-		dst = map[string]interface{}{}
-	}
-	for k, v := range src {
-		if v == nil {
-			// Treat explicit nil as "set", but keep existing if present.
-			if _, exists := dst[k]; !exists {
-				dst[k] = nil
-			}
-			continue
-		}
-
-		// If both are objects, merge recursively
-		if dstMap, ok := dst[k].(map[string]interface{}); ok {
-			if srcMap, ok := v.(map[string]interface{}); ok {
-				dst[k] = deepMergeMaps(dstMap, srcMap)
-				continue
-			}
-		}
-
-		// Otherwise replace
-		dst[k] = v
-	}
-	return dst
-}
-
-// Helper function to create a pointer to int
-func ptr(i int) *int {
-	return &i
 }

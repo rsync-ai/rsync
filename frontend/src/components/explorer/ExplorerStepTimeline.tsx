@@ -1,6 +1,7 @@
 "use client"
 
 import { cn } from "@/lib/utils"
+import { formatDuration } from "@/lib/duration"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -287,8 +288,18 @@ function StepNode({ step, isLast, isExpanded, onToggle }: StepNodeProps) {
                     </Tooltip>
                   </TooltipProvider>
                 )}
+                {/* A step's status was readable only as the colour of a 12px
+                    icon. It matters most for the two statuses that look
+                    identical there — a direct SQL run skips three steps it
+                    never performs, and a clock icon on those reads "still to
+                    come" on a run that has already finished. */}
+                {(step.status === "skipped" || step.status === "pending") && (
+                  <span className="text-[10px] uppercase tracking-wide text-zinc-400">
+                    {status.label}
+                  </span>
+                )}
                 {step.durationMs !== undefined && (
-                  <span className="text-[10px] text-zinc-400">{step.durationMs}ms</span>
+                  <span className="text-[10px] text-zinc-400">{formatDuration(step.durationMs)}</span>
                 )}
               </div>
               {step.description && (
@@ -379,6 +390,43 @@ interface ExplorerStepTimelineProps {
   className?: string
 }
 
+/**
+ * Summarise how long a run took, WITHOUT inventing the parts nobody measured.
+ *
+ * The header used to read `steps.reduce((sum, s) => sum + (s.durationMs || 0), 0)`
+ * and print the result as "Nms total". A step that never reported a duration
+ * contributes 0 to that sum, so a run whose timings all went missing rendered a
+ * confident "0ms total" -- a measurement of nothing, typeset exactly like a
+ * measurement of everything. Only steps that actually ran can be timed, so those
+ * are the denominator; when some of them have no timing the total is a floor,
+ * and it is labelled as one.
+ */
+export function summarizeRunDuration(steps: ExplorerStep[]): { label: string; detail: string } {
+  const ranSteps = steps.filter((s) => s.status === "success" || s.status === "failed")
+  const timedSteps = ranSteps.filter((s) => typeof s.durationMs === "number")
+  const measuredMs = timedSteps.reduce((sum, s) => sum + (s.durationMs ?? 0), 0)
+
+  if (ranSteps.length === 0) {
+    return { label: "not timed yet", detail: "No step has finished, so there is nothing to total." }
+  }
+  if (timedSteps.length === 0) {
+    return {
+      label: "timing unavailable",
+      detail: `${ranSteps.length} step(s) ran but none reported a duration.`,
+    }
+  }
+  if (timedSteps.length < ranSteps.length) {
+    return {
+      label: `\u2265 ${formatDuration(measuredMs)}`,
+      detail: `Only ${timedSteps.length} of ${ranSteps.length} completed steps reported a duration, so the real total is higher.`,
+    }
+  }
+  return {
+    label: `${formatDuration(measuredMs)} total`,
+    detail: `All ${ranSteps.length} completed step(s) reported a duration.`,
+  }
+}
+
 export function ExplorerStepTimeline({ run, onRetry, className }: ExplorerStepTimelineProps) {
   const [expandedSteps, setExpandedSteps] = useState<Set<string>>(new Set())
 
@@ -412,7 +460,7 @@ export function ExplorerStepTimeline({ run, onRetry, className }: ExplorerStepTi
     setExpandedSteps(new Set())
   }
 
-  const totalDuration = run.steps.reduce((sum, s) => sum + (s.durationMs || 0), 0)
+  const duration = summarizeRunDuration(run.steps)
   const failedStep = run.steps.find((s) => s.status === "failed")
 
   return (
@@ -434,7 +482,9 @@ export function ExplorerStepTimeline({ run, onRetry, className }: ExplorerStepTi
             {run.status === "waiting" && <MessageSquare className="h-3 w-3 mr-1" />}
             {run.status.charAt(0).toUpperCase() + run.status.slice(1)}
           </Badge>
-          <span className="text-xs text-zinc-400">{totalDuration}ms total</span>
+          <span className="text-xs text-zinc-400" title={duration.detail}>
+            {duration.label}
+          </span>
         </div>
         <div className="flex items-center gap-1">
           <Button variant="ghost" size="sm" className="h-6 px-2 text-xs" onClick={expandAll}>

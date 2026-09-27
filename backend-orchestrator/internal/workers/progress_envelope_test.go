@@ -2,6 +2,7 @@ package workers
 
 import (
 	"context"
+	"regexp"
 	"testing"
 	"time"
 
@@ -46,6 +47,35 @@ func TestNormalizeProgressEventStampsTheSharedEnvelope(t *testing.T) {
 	if event.SchemaVersion != 1 {
 		t.Fatalf("schema_version = %d, want 1 — the projector's only way to tell the two "+
 			"producers apart", event.SchemaVersion)
+	}
+}
+
+func TestNormalizeProgressEventStampsMilliseconds(t *testing.T) {
+	// The adapter's copy of each stage transition carries milliseconds. A
+	// whole-second stamp here sorted a sub-second stage's end before the
+	// adapter's start of it, and the Overview called the stage retried.
+	event := ProgressEvent{
+		EventType:  "STAGE_COMPLETED",
+		PipelineID: "12c3579c-8a1e-4f2b-9d70-6b5e2f0a1c34",
+		Stage:      "resolver",
+	}
+	before := time.Now().UTC().Truncate(time.Millisecond)
+	if err := normalizeProgressEvent(context.Background(), &event); err != nil {
+		t.Fatalf("normalizeProgressEvent: %v", err)
+	}
+	after := time.Now().UTC()
+
+	if !regexp.MustCompile(`^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$`).MatchString(event.Timestamp) {
+		t.Fatalf("timestamp = %q, want RFC3339 with exactly three fractional digits", event.Timestamp)
+	}
+	// The api-gateway projector parses occurred_at with time.RFC3339.
+	got, err := time.Parse(time.RFC3339, event.OccurredAt)
+	if err != nil {
+		t.Fatalf("occurred_at %q does not parse as RFC3339: %v", event.OccurredAt, err)
+	}
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("occurred_at %s is not a millisecond reading taken during the call (%s..%s)",
+			got.Format(time.RFC3339Nano), before.Format(time.RFC3339Nano), after.Format(time.RFC3339Nano))
 	}
 }
 

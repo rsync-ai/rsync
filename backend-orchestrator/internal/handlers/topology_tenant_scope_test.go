@@ -328,15 +328,6 @@ func TestMutatingTopologyRoutesRefuseAnotherTenantsTopic(t *testing.T) {
 			wantStatus: http.StatusForbidden,
 		},
 		{
-			// CreateTopicForPipeline was confined only by name construction: it
-			// never checked the supplied pipeline_id at all.
-			name: "provision a topic for another tenant's pipeline", method: http.MethodPost,
-			path:  "/api/v1/topology/topics/pipeline",
-			body:  `{"pipeline_id":"33333333-3333-3333-3333-333333333333","sync_mode":"cdc","table_count":4}`,
-			query: `FROM pipelines p`, args: []driver.Value{"33333333-3333-3333-3333-333333333333", scopeStranger},
-			wantStatus: http.StatusForbidden,
-		},
-		{
 			name: "read another tenant's topic config", method: http.MethodGet,
 			path:  "/api/v1/topology/topics/rsync.cdc." + scopeID8,
 			query: `FROM pipelines p`, args: []driver.Value{scopeID8, scopeStranger},

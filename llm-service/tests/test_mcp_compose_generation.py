@@ -268,16 +268,11 @@ def test_ci_runs_these_guards_when_the_release_workflow_changes():
     """
     import yaml
 
-    with open(os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")) as fh:
-        ci = yaml.safe_load(fh)
-
-    step = next(
-        s
-        for j in ci["jobs"].values()
-        for s in (j.get("steps") or [])
-        if isinstance(s, dict) and "filters" in (s.get("with") or {})
-    )
-    globs = yaml.safe_load(step["with"]["filters"])["llm"]
+    # The filters used to be an inline block in ci.yml's `changes` job. They are
+    # .github/paths-filters.yml now, read by each job that gates itself -- see
+    # llm-service/tests/test_ci_inline_change_filters.py for why the job went away.
+    with open(os.path.join(REPO_ROOT, ".github", "paths-filters.yml")) as fh:
+        globs = yaml.safe_load(fh)["llm"]
     assert globs, "the llm path filter parsed empty -- this check would pass vacuously"
 
     def covered(rel):

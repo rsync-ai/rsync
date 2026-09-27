@@ -15,6 +15,7 @@ import (
 	"github.com/IBM/sarama"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/rsync-ai/backend-orchestrator/internal/cdcsnapshot"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	kafkaclient "github.com/rsync-ai/shared/kafkaclient"
 	"github.com/rsync-ai/shared/kafkaclient/saramaauth"
@@ -42,6 +43,54 @@ type Agent struct {
 	mu      sync.Mutex
 	workers map[string]*pipelineWorker // pipeline_id -> worker
 	started bool
+
+	// snapshotObserver receives each flush window's snapshot reads (op "r") so
+	// the snapshot request tracker can tell a sent execute-snapshot signal
+	// started and finished. Optional; set before Start.
+	obsMu            sync.RWMutex
+	snapshotObserver func(pipelineID, connectorName string, obs []cdcsnapshot.Observation)
+
+	// excluded holds topics of tables removed from a connector: the consumer
+	// stops reading them (the 5 s topic watch re-joins without them) so the topic
+	// can be deleted without this group re-creating it.
+	exclMu   sync.RWMutex
+	excluded map[string]struct{}
+
+	// ensureDDLTopic pre-creates a connector's bare topic.prefix topic before the
+	// schema-change consumer subscribes to it. Nil means kafka.EnsureDDLTopic; tests
+	// swap it (see ensureSchemaChangeTopic).
+	ensureDDLTopic func(topic string) error
+}
+
+// ExcludeTopic stops the stats consumer reading topic, within one topic-watch tick.
+func (a *Agent) ExcludeTopic(topic string) {
+	a.exclMu.Lock()
+	if a.excluded == nil {
+		a.excluded = map[string]struct{}{}
+	}
+	a.excluded[topic] = struct{}{}
+	a.exclMu.Unlock()
+}
+
+// IncludeTopic undoes ExcludeTopic: a table added back is read again.
+func (a *Agent) IncludeTopic(topic string) {
+	a.exclMu.Lock()
+	delete(a.excluded, topic)
+	a.exclMu.Unlock()
+}
+
+func (a *Agent) isExcluded(topic string) bool {
+	a.exclMu.RLock()
+	defer a.exclMu.RUnlock()
+	_, ok := a.excluded[topic]
+	return ok
+}
+
+// SetSnapshotObserver registers the receiver of per-table snapshot progress.
+func (a *Agent) SetSnapshotObserver(fn func(pipelineID, connectorName string, obs []cdcsnapshot.Observation)) {
+	a.obsMu.Lock()
+	a.snapshotObserver = fn
+	a.obsMu.Unlock()
 }
 
 type pipelineWorker struct {
@@ -364,20 +413,30 @@ func (a *Agent) ensureWorker(pipelineID string, executionID string, destNamespac
 		return
 	}
 	w.consumer = cg
+	a.seedFromStoredStats(w, groupID)
 
 	// Source DDL reporting is best-effort and strictly additive: if the group cannot be
 	// created we still want table stats, so this failure is logged and dropped rather
-	// than aborting ensureWorker.
-	ddlGroupID := schemaChangeGroupID(pipelineID)
-	ddlCfg, derr := a.secured(newSchemaChangeConsumerConfig())
-	if derr != nil {
-		log.WithError(derr).WithField("pipeline_id", pipelineID).
-			Warn("cdc schema changes: invalid Kafka security configuration; source DDL will not be reported")
-	} else if dcg, derr := a.consumerGroup(ddlGroupID, ddlCfg); derr == nil {
-		w.ddlConsumer = dcg
+	// than aborting ensureWorker. It is also only for connectors that publish DDL at
+	// all (schemaChangeConsumerWanted): a PostgreSQL or MongoDB connector never writes
+	// the bare topic.prefix topic, so subscribing there would only create an empty one.
+	if !schemaChangeConsumerWanted(cfg) {
+		log.WithFields(log.Fields{
+			"pipeline_id":     pipelineID,
+			"connector.class": cfg["connector.class"],
+		}).Debug("cdc schema changes: connector publishes no schema-change topic; source DDL consumer not started")
 	} else {
-		log.WithError(derr).WithField("pipeline_id", pipelineID).
-			Warn("cdc schema changes: failed to create consumer group; source DDL will not be reported")
+		ddlGroupID := schemaChangeGroupID(pipelineID)
+		ddlCfg, derr := a.secured(newSchemaChangeConsumerConfig())
+		if derr != nil {
+			log.WithError(derr).WithField("pipeline_id", pipelineID).
+				Warn("cdc schema changes: invalid Kafka security configuration; source DDL will not be reported")
+		} else if dcg, derr := a.consumerGroup(ddlGroupID, ddlCfg); derr == nil {
+			w.ddlConsumer = dcg
+		} else {
+			log.WithError(derr).WithField("pipeline_id", pipelineID).
+				Warn("cdc schema changes: failed to create consumer group; source DDL will not be reported")
+		}
 	}
 
 	a.mu.Lock()
@@ -461,10 +520,15 @@ func (a *Agent) topicsForPrefix(prefix string) []string {
 	if err != nil {
 		return nil
 	}
+	return a.prefixTopics(all, prefix)
+}
+
+// prefixTopics keeps the topics under prefix that are not excluded.
+func (a *Agent) prefixTopics(all []string, prefix string) []string {
 	want := prefix + "."
 	out := make([]string, 0, 64)
 	for _, t := range all {
-		if strings.HasPrefix(t, want) {
+		if strings.HasPrefix(t, want) && !a.isExcluded(t) {
 			out = append(out, t)
 		}
 	}
@@ -504,8 +568,80 @@ func (a *Agent) flushLoop(w *pipelineWorker) {
 					"trace_id": w.pipelineID,
 				})
 			}
+			if obs := w.stats.DrainSnapshots(); len(obs) > 0 {
+				a.obsMu.RLock()
+				fn := a.snapshotObserver
+				a.obsMu.RUnlock()
+				if fn != nil {
+					fn(w.pipelineID, w.connectorName, obs)
+				}
+			}
 		}
 	}
+}
+
+// storedStatsQuery reads the captured counters an earlier worker reported.
+// last_event_ts is written only by this agent, so a row without one holds the
+// sink's applied counts copied over, not captured ones, and must not seed.
+const storedStatsQuery = `
+	SELECT COALESCE(schema_name, ''), COALESCE(table_name, ''), qualified_name,
+	       COALESCE(inserts, 0), COALESCE(updates, 0), COALESCE(deletes, 0),
+	       COALESCE(total_events, 0), COALESCE(snapshot_rows, 0), last_event_ts
+	FROM pipeline_run_table_stats
+	WHERE pipeline_id = $1::uuid AND execution_id = $1::uuid AND last_event_ts IS NOT NULL`
+
+// seedFromStoredStats starts a new worker's counters where the previous one
+// stopped. A worker is recreated on every resume and orchestrator restart, and
+// its consumer group continues from the committed offset; the projector keeps
+// the captured counters monotone, so a worker counting from zero froze every
+// table's numbers until its own count passed the stored one.
+//
+// A group with nothing committed re-reads its topics from the oldest offset and
+// will count everything again itself, so seeding it would double every number.
+func (a *Agent) seedFromStoredStats(w *pipelineWorker, groupID string) {
+	logger := log.WithField("pipeline_id", w.pipelineID)
+	if a.kafka != nil {
+		drain, err := a.kafka.GetConsumerGroupDrain(groupID)
+		if err != nil {
+			logger.WithError(err).Warn("cdc table stats: could not read the stats group's committed offsets; continuing from the stored counts")
+		} else if drain.Committed <= 0 {
+			return
+		}
+	}
+	rows, err := loadStoredStats(w.ctx, a.db, w.pipelineID)
+	if err != nil {
+		logger.WithError(err).Warn("cdc table stats: could not read the stored counts; counting from zero")
+		return
+	}
+	w.stats.Seed(rows)
+	if len(rows) > 0 {
+		logger.WithField("tables", len(rows)).Info("cdc table stats: continuing from the stored counts")
+	}
+}
+
+func loadStoredStats(ctx context.Context, db *sql.DB, pipelineID string) ([]TableStats, error) {
+	if db == nil {
+		return nil, nil
+	}
+	rs, err := db.QueryContext(ctx, storedStatsQuery, pipelineID)
+	if err != nil {
+		return nil, err
+	}
+	defer rs.Close()
+	var out []TableStats
+	for rs.Next() {
+		var st TableStats
+		var last sql.NullTime
+		if err := rs.Scan(&st.SchemaName, &st.TableName, &st.QualifiedName,
+			&st.Inserts, &st.Updates, &st.Deletes, &st.TotalEvents, &st.Reads, &last); err != nil {
+			return nil, err
+		}
+		if last.Valid {
+			st.LastEventTs = last.Time
+		}
+		out = append(out, st)
+	}
+	return out, rs.Err()
 }
 
 // secured stamps the resolved SASL/TLS onto a freshly-built consumer config.

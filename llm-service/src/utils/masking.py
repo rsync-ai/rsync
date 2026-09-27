@@ -354,7 +354,88 @@ def scrub_error_for_llm(text: Optional[str], max_len: int = 0) -> str:
     return result
 
 
+# Fields of a connection record an LLM prompt may carry. Allowlist, not denylist:
+# see connections_for_llm.
+LLM_CONNECTION_FIELDS = ("id", "name", "connector_type")
+
+
+def connections_for_llm(connections: Optional[list]) -> list:
+    """Project connection records down to the fields a planner prompt may see.
+
+    The planners need to name a connection ("use connection X as the source"),
+    which takes an id, a display name and a connector type -- and nothing else.
+    Everything else on the record is either a credential or a description of the
+    customer's infrastructure: host, port, database and bucket names, and
+    ``last_test_error``, which is free-form error text and therefore the same
+    leak path ``scrub_error_for_llm`` exists to close.
+
+    Allowlist by construction. The API gateway masks the config it hands out
+    (``maskSensitiveFields``), but that is a *denylist* of key names, so a
+    connector that stores a secret under a name nobody has added to it yet
+    fails open. On the way into a prompt the failure has to go the other way:
+    a field nobody has thought about is dropped, not forwarded.
+
+    Non-dict entries are dropped rather than passed through -- the callers feed
+    this straight to ``json.dumps``.
+    """
+    if not connections:
+        return []
+    out = []
+    for c in connections:
+        if not isinstance(c, dict):
+            continue
+        out.append({field: c.get(field) for field in LLM_CONNECTION_FIELDS})
+    return out
+
+
 # Convenience function for trace context with masked config
+# Keys in a diagnose-evidence object whose string values are free-form error or log
+# text. Anything NOT named here is treated as metadata and passed to the prompt
+# verbatim, which is what keeps a diagnosis readable: table and column names, stage
+# ids, statuses and counts are exactly what the model needs.
+#
+# The second line of this set is what makes it a backstop rather than a decoration.
+# An audit found the original set naming keys no producer writes while missing the
+# ones it does. Every log line the API gateway attaches arrives under "body", a blocked stage's explanation under "blocking_description", and a
+# dependency probe's free-form output under "details" (diagnose.go) -- precisely the
+# fields a forgotten Scrub on the Go side would leak through.
+EVIDENCE_FREETEXT_KEYS = {
+    "error", "last_error", "error_message", "stderr", "stdout", "logs", "log",
+    "message", "detail", "exception", "traceback", "output", "reason",
+    "body", "blocking_description", "details", "sink_error_detail", "stalled_stage_logs",
+}
+
+
+def scrub_evidence_for_llm(evidence: Any, _inherited: bool = False) -> Any:
+    """Scrub the free-text strings in an LLM diagnose-evidence object.
+
+    Defense in depth for ``POST /v1/diagnose/pipeline``. The producer in api-gateway
+    scrubs each free-text field at source; this catches the field it forgets, and it
+    is the ONLY check on the path when the evidence object comes from somewhere else
+    -- the endpoint accepts an arbitrary object from any caller that can reach
+    llm-service.
+
+    The free-text verdict is inherited DOWNWARD. A dependency's ``details`` map is
+    built per-probe out of whatever that probe returned, and a log line is a list
+    element, so neither can be covered by naming leaf keys: the decision has to be
+    made at the subtree. Once a key says "this is log or error text", every string
+    beneath it is treated as such no matter what it is called.
+    """
+    if isinstance(evidence, dict):
+        out = {}
+        for k, v in evidence.items():
+            freetext = _inherited or k in EVIDENCE_FREETEXT_KEYS
+            out[k] = (
+                scrub_error_for_llm(v)
+                if (freetext and isinstance(v, str))
+                else scrub_evidence_for_llm(v, freetext)
+            )
+        return out
+    if isinstance(evidence, list):
+        return [scrub_evidence_for_llm(v, _inherited) for v in evidence]
+    return evidence
+
+
 def log_context(trace_id: str, config: Optional[Dict[str, Any]] = None, **extra) -> Dict[str, Any]:
     """
     Create a log context dictionary with trace_id and masked config.

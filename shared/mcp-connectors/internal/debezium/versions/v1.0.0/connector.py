@@ -67,6 +67,50 @@ def _normalize_db_type(db_type: str) -> str:
     return aliases.get(s, s)
 
 
+def _wire_kafka_signal_channel(
+    cfg: Dict[str, Any], signal_topic: str, kafka_bootstrap: str, connector_name: str, read_only: bool = True
+) -> None:
+    """Point the connector's signal channel at a Kafka topic.
+
+    read.only=true keeps an incremental snapshot's low/high watermarks in the
+    transaction log (PG LSN / MySQL GTID) rather than a signal table, so a
+    re-snapshot writes NOTHING to the customer's source database. MongoDB passes
+    read_only=False: read.only is a relational-connector property, and a MongoDB
+    connector only ever receives BLOCKING snapshot signals, which write nothing.
+    """
+    cfg["signal.enabled.channels"] = "kafka"
+    cfg["signal.kafka.topic"] = signal_topic
+    cfg["signal.kafka.bootstrap.servers"] = kafka_bootstrap
+    cfg["signal.kafka.groupId"] = f"{_safe_name(connector_name, 60)}-signal"
+    # The signal consumer does not inherit the Connect worker's TLS/SASL settings.
+    cfg.update(_signal_consumer_security())
+    if read_only:
+        cfg["read.only"] = "true"
+
+
+def _incremental_strategy_requested(args: Dict[str, Any], db_type: str) -> bool:
+    """The orchestrator asked for the incremental strategy on an engine that has it:
+    skip the blocking initial snapshot and load history via an execute-snapshot
+    signal once the connector is RUNNING. Neither a Kafka signal channel nor
+    snapshot.mode=no_data means this on its own — every PostgreSQL connector now
+    carries the channel, and streaming_only runs no_data with nothing to load."""
+    strategy = str(args.get("snapshot_strategy") or "").strip().lower()
+    return strategy in ("incremental", "incremental_snapshot", "chunked") and db_type in ("postgresql", "mysql")
+
+
+# Engines whose Debezium connector is HISTORIZED: it replays a schema-history
+# topic to rebuild table schemas on restart, and it publishes source DDL to the
+# bare topic.prefix topic when include.schema.changes is on. Only these get the
+# schema.history.internal.* keys and include.schema.changes. PostgreSQL decodes
+# the WAL against the live catalog and MongoDB has no relational schema, so
+# neither keeps a history topic or emits DDL: giving them the keys named a
+# schema-history topic the orchestrator had to pre-create and no connector
+# wrote. Keys are _normalize_db_type output (mariadb arrives here as mysql).
+# Mirrored by the orchestrator, which pre-creates the history topic and the
+# bare DDL topic for these engines only; change both or neither.
+_HISTORIZED_ENGINES = frozenset({"mysql", "sqlserver", "oracle"})
+
+
 def _safe_name(s: str, max_len: int = 120) -> str:
     s = (s or "").strip().lower()
     s = re.sub(r"[^a-z0-9_-]+", "_", s)
@@ -117,8 +161,8 @@ def _qualify_topic(name: str) -> str:
 _DEFAULT_MAX_RETRIES = "30"
 _DEFAULT_RETRIABLE_RESTART_WAIT_MS = "10000"
 
-# How often a MongoDB source emits a heartbeat, and the namespace its heartbeat topic
-# lives in. See the mongodb branch of _build_config.
+# How often a MongoDB or PostgreSQL source emits a heartbeat, and the namespace its
+# heartbeat topic lives in. Each source's reason is in its branch of _build_config.
 _DEFAULT_HEARTBEAT_INTERVAL_MS = "300000"  # 5 minutes
 _DEFAULT_HEARTBEAT_TOPICS_PREFIX = "heartbeat"
 
@@ -127,6 +171,47 @@ def _env_or(name: str, default: str) -> str:
     """An operator override from the environment, else the shipped default."""
     raw = (os.getenv(name) or "").strip()
     return raw or default
+
+
+def _enable_heartbeat(cfg: Dict[str, Any], args: Dict[str, Any], interval_env: str) -> None:
+    """Turn on Debezium heartbeats and name their topic.
+
+    The topic is <prefix>.<topic.prefix> — prefix FIRST, the opposite of what the key
+    name suggests — and the prefix is product-namespaced so the topic lands inside the
+    `rsync.*` grant that a BYO-Kafka cluster gives us. An unqualified
+    `__debezium-heartbeat.*` topic falls outside that grant and is exactly the
+    KI-KAFKA-DATAPLANE-AUTOCREATE-ONLY failure mode; with errors.tolerance=none the
+    refused write fails the task. The orchestrator pre-creates it (executor.go
+    heartbeatTopicFor) for the same reason it pre-creates the schema-history topic:
+    nothing else would, and relying on broker auto-create is a setting this platform
+    does not own.
+
+    TWO KEYS, AND ONLY ONE OF THEM NAMES THE TOPIC. `heartbeat.topics.prefix` is a live,
+    non-deprecated ConfigDef entry (io/debezium/heartbeat/Heartbeat.java), which is why
+    setting only it looks correct and validates cleanly — but the name is built by the
+    topic-naming strategy (io/debezium/schema/AbstractTopicNamingStrategy.java) from
+    `topic.heartbeat.prefix`, default `__debezium-heartbeat`. #1098 set only the first
+    key, so heartbeats fired on schedule and landed on
+    `__debezium-heartbeat.<topic.prefix>` while the pre-created, ACL-granted
+    `rsync.heartbeat.<topic.prefix>` stayed at offset 0 forever
+    (KI-CDC-HEARTBEAT-TOPIC-PREFIX-KEY-IGNORED, observed live 2026-09-20). Set BOTH to
+    the same qualified value: the naming key is what actually decides the topic, and
+    keeping the legacy key costs nothing and stays correct if a future Debezium
+    reverses which one wins.
+    """
+    cfg.setdefault(
+        "heartbeat.interval.ms",
+        str(args.get("heartbeat_interval_ms") or "").strip()
+        or _env_or(interval_env, _DEFAULT_HEARTBEAT_INTERVAL_MS),
+    )
+    _hb_prefix = _qualify_topic(
+        str(args.get("heartbeat_topics_prefix") or "").strip()
+        or _DEFAULT_HEARTBEAT_TOPICS_PREFIX
+    )
+    # The key Debezium's topic-naming strategy actually reads.
+    cfg.setdefault("topic.heartbeat.prefix", _hb_prefix)
+    # The legacy key, kept in lockstep so the two can never disagree.
+    cfg.setdefault("heartbeat.topics.prefix", _hb_prefix)
 
 
 def _default_max_retries() -> str:
@@ -754,6 +839,27 @@ def _schema_history_security() -> Dict[str, str]:
     SASL cluster, a connector whose history client is unconfigured starts, runs,
     and only fails on restart, when the consumer half replays history. Both the
     producer and the consumer need the properties for that reason.
+    """
+    return _kafka_client_security(
+        ("schema.history.internal.producer.", "schema.history.internal.consumer.")
+    )
+
+
+def _signal_consumer_security() -> Dict[str, str]:
+    """Kafka security properties for Debezium's Kafka signal-channel consumer.
+
+    The signal channel is another client of its own inside the connector task,
+    configured through Debezium's `signal.consumer.*` passthrough. Without these
+    it loops on "Bootstrap broker ... disconnected" against a TLS or SASL cluster:
+    the connector streams normally, and every Reload, Re-snapshot and backfill of
+    an added table is a signal nobody reads.
+    """
+    return _kafka_client_security(("signal.consumer.",))
+
+
+def _kafka_client_security(prefixes: Tuple[str, ...]) -> Dict[str, str]:
+    """Kafka security properties for a client inside the connector task, set under
+    each of `prefixes`.
 
     Mirrors llm-service/src/utils/kafka_security.py (same env vars, same
     defaults); the two must be changed together. Returns {} for PLAINTEXT, so an
@@ -771,7 +877,7 @@ def _schema_history_security() -> Dict[str, str]:
         mechanism = (_env("KAFKA_SASL_MECHANISM") or "PLAIN").upper()
         if mechanism not in _JAAS_MODULES:
             raise ValueError(
-                f"unsupported KAFKA_SASL_MECHANISM {mechanism!r} for Debezium schema history"
+                f"unsupported KAFKA_SASL_MECHANISM {mechanism!r} for the Debezium connector's Kafka clients"
             )
         oauth_props: Dict[str, str] = {}
         if mechanism in _TOKEN_MECHANISMS:
@@ -809,8 +915,7 @@ def _schema_history_security() -> Dict[str, str]:
         if cert and not keystore:
             keystore = CONNECT_IMAGE_CLIENT_PEM
     skip_verify = _env("KAFKA_SSL_SKIP_VERIFY").lower() in ("1", "true", "yes", "on")
-    for role in ("producer", "consumer"):
-        prefix = f"schema.history.internal.{role}."
+    for prefix in prefixes:
         props[prefix + "security.protocol"] = protocol
         if uses_sasl:
             props[prefix + "sasl.mechanism"] = mechanism
@@ -1007,37 +1112,12 @@ class DebeziumConnector:
         kafka_bootstrap = self._bootstrap_from_args(args)
         topic_prefix = _qualify_topic(str(args.get("topic_prefix") or connector_name).strip() or connector_name)
 
-        # Schema-history topic name.
-        #
-        # The orchestrator PRE-CREATES this topic before calling start_sync (see
-        # executor.go schemaHistoryTopicFor), because nothing else does: this image has
-        # no Kafka client, no topic.creation.* policy is set on the connector, and the
-        # topic's retention/cleanup policy is a Debezium correctness requirement rather
-        # than a default worth inheriting from the broker. It passes the name it created
-        # in schema_history_topic so the two sides cannot drift — two independent copies
-        # of _safe_name that disagree would have the orchestrator create one topic and
-        # Connect write to another, and the connector would work until its first restart.
-        #
-        # The fallback is byte-identical to what this line computed before, so a direct
-        # caller (a test, an operator hitting the MCP by hand, an older orchestrator)
-        # keeps working unchanged. _qualify_topic is idempotent, so an explicit value
-        # that already carries the prefix is not prefixed twice.
-        schema_history_topic = _qualify_topic(
-            str(args.get("schema_history_topic") or "").strip()
-            or f"schemahistory.{_safe_name(connector_name, 80)}"
-        )
-
         # Base config shared across DBs
         cfg: Dict[str, Any] = {
             "connector.class": connector_class,
             "tasks.max": str(args.get("tasks_max") or args.get("tasks.max") or "1"),
             "topic.prefix": topic_prefix,
-            # Needed for schema evolution visibility (GA-min: auto-add columns, halt on others)
-            "include.schema.changes": "true",
             "snapshot.mode": snapshot_mode,
-            # schema history (safe default for relational connectors)
-            "schema.history.internal.kafka.bootstrap.servers": kafka_bootstrap,
-            "schema.history.internal.kafka.topic": schema_history_topic,
             # Bound the retry loop so a PERMANENT error becomes visible.
             #
             # Debezium's default for errors.max.retries is -1: retry a retriable error
@@ -1067,8 +1147,40 @@ class DebeziumConnector:
             "errors.max.retries": _default_max_retries(),
             "retriable.restart.connector.wait.ms": _default_retriable_restart_wait_ms(),
         }
-        # Applied before the caller's overrides so an explicit override still wins.
-        cfg.update(_schema_history_security())
+        if db_type in _HISTORIZED_ENGINES:
+            # Schema history and the DDL topic, for historized engines only (see
+            # _HISTORIZED_ENGINES). Applied before the caller's overrides so an
+            # explicit override still wins.
+            #
+            # Schema-history topic name. The orchestrator PRE-CREATES this topic
+            # before calling start_sync (executor.go schemaHistoryTopicFor), because
+            # nothing else does: this image has no Kafka client, no topic.creation.*
+            # policy is set on the connector, and the topic's retention/cleanup
+            # policy is a Debezium correctness requirement rather than a default
+            # worth inheriting from the broker. It passes the name it created in
+            # schema_history_topic so the two sides cannot drift — two independent
+            # copies of _safe_name that disagree would have the orchestrator create
+            # one topic and Connect write to another, and the connector would work
+            # until its first restart.
+            #
+            # The fallback is the name this connector has always derived, so a
+            # direct caller (a test, an operator hitting the MCP by hand) keeps
+            # working. _qualify_topic is idempotent, so an explicit value that
+            # already carries the prefix is not prefixed twice.
+            schema_history_topic = _qualify_topic(
+                str(args.get("schema_history_topic") or "").strip()
+                or f"schemahistory.{_safe_name(connector_name, 80)}"
+            )
+            cfg.update(
+                {
+                    # Publishes source DDL to the bare topic.prefix topic, which the
+                    # orchestrator's cdcstats schema-change consumer reads.
+                    "include.schema.changes": "true",
+                    "schema.history.internal.kafka.bootstrap.servers": kafka_bootstrap,
+                    "schema.history.internal.kafka.topic": schema_history_topic,
+                }
+            )
+            cfg.update(_schema_history_security())
         cfg.update(self.json_converters)
         cfg.update(_topic_creation(args))
 
@@ -1166,6 +1278,31 @@ class DebeziumConnector:
             # If user didn't qualify schema in tables, keep it explicit in include list.
             if all("." not in t for t in tables) and tables:
                 cfg["table.include.list"] = ",".join([f"{schema}.{t}" for t in tables])
+            # Heartbeats, so the replication slot acknowledges WAL the connector decoded
+            # and filtered out (#12). The publication is FOR ALL TABLES, so every write
+            # to a table OUTSIDE the pipeline is decoded and dropped. Debezium only
+            # commits an LSN when it emits a record, so a pipeline whose own tables are
+            # quiet never moves confirmed_flush_lsn, and the slot pins that WAL on the
+            # source's disk for as long as they stay quiet. Seen on prod 2026-09-24: the
+            # committed LSN stayed at 0/1F585C18 from 14:58 to 18:30 while about 14.8 MB
+            # of WAL was decoded and not acknowledged, and Debezium itself logged that the
+            # events "were all filtered out" and to "enable heartbeat events". A
+            # heartbeat commits the last LSN received, filtered or not.
+            #
+            # It does NOT make the position a liveness beacon: on a database with no
+            # writes at all there is no new LSN, and the heartbeat repeats the old one.
+            # Only heartbeat.action.query would move it, and that writes to the source,
+            # which rsync never does. The Sentinel's freshness watchdog therefore still
+            # skips PostgreSQL (cdc_source_freshness.go heartbeatAdvancesAnIdlePosition).
+            #
+            # The same commit clears a finished incremental snapshot from the stored
+            # offset (#25). Debezium 3.1 closes the snapshot in memory while idle
+            # (EventDispatcher.dispatchHeartbeatEventAlsoToIncrementalSnapshot runs its
+            # processHeartbeat either way), but without a heartbeat record nothing
+            # carries the new offset to Kafka, so the committed one kept saying "in
+            # progress" until the next captured write, and a restart in that window
+            # resumed the snapshot.
+            _enable_heartbeat(cfg, args, "CDC_PG_HEARTBEAT_INTERVAL_MS")
 
         elif db_type == "mongodb":
             # Debezium 2.x+/3.x MongoDB uses a single mongodb.connection.string (URI);
@@ -1245,47 +1382,10 @@ class DebeziumConnector:
             # (cdc_source_freshness.go) a liveness beacon, so "idle but alive" stops
             # looking like "dead".
             #
-            # MongoDB-only on purpose. A PostgreSQL replication slot pins WAL on the
-            # server, so an idle Postgres source cannot lose its position the way a
-            # capped oplog does. MySQL's time-based binlog expiry is the same class of
-            # risk and is tracked separately in BACKLOG.md rather than changed blind here.
-            #
-            # The topic is <prefix>.<topic.prefix> — prefix FIRST, the opposite of what
-            # the key name suggests — and the prefix is product-namespaced so the topic
-            # lands inside the `rsync.*` grant that a BYO-Kafka cluster gives us. An
-            # unqualified `__debezium-heartbeat.*` topic falls outside that grant and is
-            # exactly the KI-KAFKA-DATAPLANE-AUTOCREATE-ONLY failure mode; with
-            # errors.tolerance=none the refused write fails the task. The orchestrator
-            # pre-creates it (executor.go heartbeatTopicFor) for the same reason it
-            # pre-creates the schema-history topic: nothing else would, and relying on
-            # broker auto-create is a setting this platform does not own.
-            #
-            # TWO KEYS, AND ONLY ONE OF THEM NAMES THE TOPIC. `heartbeat.topics.prefix`
-            # is a live, non-deprecated ConfigDef entry (io/debezium/heartbeat/Heartbeat
-            # .java), which is why setting only it looks correct and validates cleanly —
-            # but the name is built by the topic-naming strategy
-            # (io/debezium/schema/AbstractTopicNamingStrategy.java) from
-            # `topic.heartbeat.prefix`, default `__debezium-heartbeat`. #1098 set only
-            # the first key, so heartbeats fired on schedule and landed on
-            # `__debezium-heartbeat.<topic.prefix>` while the pre-created, ACL-granted
-            # `rsync.heartbeat.<topic.prefix>` stayed at offset 0 forever
-            # (KI-CDC-HEARTBEAT-TOPIC-PREFIX-KEY-IGNORED, observed live 2026-09-20).
-            # Set BOTH to the same qualified value: the naming key is what actually
-            # decides the topic, and keeping the legacy key costs nothing and stays
-            # correct if a future Debezium reverses which one wins.
-            cfg.setdefault(
-                "heartbeat.interval.ms",
-                str(args.get("heartbeat_interval_ms") or "").strip()
-                or _env_or("CDC_MONGO_HEARTBEAT_INTERVAL_MS", _DEFAULT_HEARTBEAT_INTERVAL_MS),
-            )
-            _hb_prefix = _qualify_topic(
-                str(args.get("heartbeat_topics_prefix") or "").strip()
-                or _DEFAULT_HEARTBEAT_TOPICS_PREFIX
-            )
-            # The key Debezium's topic-naming strategy actually reads.
-            cfg.setdefault("topic.heartbeat.prefix", _hb_prefix)
-            # The legacy key, kept in lockstep so the two can never disagree.
-            cfg.setdefault("heartbeat.topics.prefix", _hb_prefix)
+            # PostgreSQL heartbeats too, for a different reason (see its branch). MySQL's
+            # time-based binlog expiry is the same class of risk as the oplog and is
+            # tracked separately in BACKLOG.md rather than changed blind here.
+            _enable_heartbeat(cfg, args, "CDC_MONGO_HEARTBEAT_INTERVAL_MS")
             # Every database the collections come from (a server-level
             # connection spans several); the connection's database otherwise.
             mongo_dbs = mongo_capture_databases(mongo_include)
@@ -1305,11 +1405,12 @@ class DebeziumConnector:
             if len(mongo_dbs) == 1:
                 cfg["capture.scope"] = "database"
                 cfg["capture.target"] = mongo_dbs[0]
-            # MongoDB has no relational schema history or DDL change stream; these
-            # relational-only base keys make the MongoDB connector fail validation.
-            # Prefix match, not a fixed list: the security properties above add
-            # more schema.history.* keys, and any relational-only key left on a
-            # MongoDB connector fails Connect's config validation.
+            # MongoDB has no relational schema history or DDL change stream, and
+            # any schema.history.* or include.schema.changes key fails the MongoDB
+            # connector's config validation. The base config no longer sets them
+            # for MongoDB (_HISTORIZED_ENGINES); this strips any that a caller's
+            # connector_config_overrides put back. Prefix match, not a fixed list:
+            # the schema-history security properties are schema.history.* keys too.
             for _k in [k for k in cfg if k.startswith("schema.history.")] + ["include.schema.changes"]:
                 cfg.pop(_k, None)
 
@@ -1405,21 +1506,49 @@ class DebeziumConnector:
         # Kafka Connect ignores an unknown property, so a mismatch degrades to "no
         # backfill" (streaming still works) rather than a broken connector — confirm that
         # snapshot 'r' events flow on staging before relying on this for PG.
-        _snapshot_strategy = str(args.get("snapshot_strategy") or "").strip().lower()
-        if _snapshot_strategy in ("incremental", "incremental_snapshot", "chunked") and db_type in ("postgresql", "mysql"):
+        if _incremental_strategy_requested(args, db_type):
+            # The signal topic comes from the caller, always. The orchestrator names
+            # it (cdcSignalTopicFor), pre-creates it, and produces the history-loading
+            # execute-snapshot signal to it; this connector only listens. There is no
+            # derived fallback: the one this used to build, "<prefix>signals.<connector
+            # name>", was a topic nobody created or produced to. With snapshot.mode
+            # no_data that is a connector that streams new changes and never loads the
+            # table's existing rows, reported as healthy. Refusing the request is the
+            # visible version of that failure.
+            signal_topic = str(args.get("signal_kafka_topic") or "").strip()
+            if not signal_topic:
+                raise ValueError(
+                    "snapshot_strategy=incremental needs signal_kafka_topic: the existing rows "
+                    "are loaded by an execute-snapshot signal the caller sends to that topic"
+                )
             cfg["snapshot.mode"] = "no_data"
-            signal_topic = str(
-                args.get("signal_kafka_topic") or _qualify_topic(f"signals.{_safe_name(connector_name, 60)}")
-            ).strip()
-            cfg["signal.enabled.channels"] = "kafka"
-            cfg["signal.kafka.topic"] = signal_topic
-            cfg["signal.kafka.bootstrap.servers"] = kafka_bootstrap
-            cfg["signal.kafka.groupId"] = f"{_safe_name(connector_name, 60)}-signal"
-            # Watermark via the transaction log instead of a source signal table.
-            cfg["read.only"] = "true"
+            _wire_kafka_signal_channel(cfg, signal_topic, kafka_bootstrap, connector_name)
             _chunk = str(args.get("incremental_snapshot_chunk_size") or "").strip()
             if _chunk.isdigit() and int(_chunk) > 0:
                 cfg["incremental.snapshot.chunk.size"] = _chunk
+        elif db_type == "postgresql" and str(args.get("signal_kafka_topic") or "").strip():
+            # Signal channel WITHOUT the incremental strategy: the blocking initial
+            # snapshot (snapshot.mode) is untouched, and the channel sits idle until
+            # someone asks to re-snapshot a table or backfill a newly added one — the
+            # orchestrator's BackfillCDCTables produces the execute-snapshot signal
+            # here. Without it those controls are refused with
+            # cdc_backfill_not_supported on every pipeline below the incremental size
+            # gate. MySQL is not wired: its read-only watermarks need GTID mode, and
+            # the orchestrator falls back to its source signal table instead.
+            _wire_kafka_signal_channel(
+                cfg, str(args.get("signal_kafka_topic")).strip(), kafka_bootstrap, connector_name
+            )
+        elif db_type == "mongodb" and str(args.get("signal_kafka_topic") or "").strip():
+            # Same idle channel for MongoDB, but it only ever carries BLOCKING
+            # snapshot signals (the orchestrator refuses incremental for it). A
+            # MongoDB incremental snapshot has no read-only mode: it writes window
+            # watermark documents into a signal collection in the source. A blocking
+            # one pauses streaming, re-reads the requested collections, then resumes
+            # from the stored resume token — nothing is written to the source, and
+            # no extra role is needed. snapshot.mode is untouched.
+            _wire_kafka_signal_channel(
+                cfg, str(args.get("signal_kafka_topic")).strip(), kafka_bootstrap, connector_name, read_only=False
+            )
 
         # Validate a few derived requirements
         if db_type in ("mysql", "postgresql", "sqlserver", "oracle") and not (db_name or first_db):
@@ -1539,13 +1668,18 @@ class DebeziumConnector:
         url = self._connect_url_from_args(args)
 
         # Incremental-snapshot orchestration hints for the caller. When the config uses
-        # the Kafka signal channel (snapshot_strategy=incremental → snapshot.mode=no_data),
+        # the incremental strategy (snapshot.mode=no_data + the Kafka signal channel),
         # the orchestrator must send an execute-snapshot signal to `signal_topic` for
         # `data_collections` AFTER the connector reaches RUNNING; otherwise history is
-        # never backfilled. Blocking-snapshot connectors report incremental_snapshot=False.
+        # never backfilled. A signal topic alone does NOT mean incremental: every
+        # PostgreSQL connector carries one for Re-snapshot, and a blocking-snapshot
+        # connector that reported True here would load its history twice.
         _incr_signal_topic = str(cfg.get("signal.kafka.topic", "") or "")
+        _incr_db_type = _normalize_db_type(str(args.get("database_type") or args.get("source_type") or ""))
         _incr_info = {
-            "incremental_snapshot": bool(_incr_signal_topic),
+            "incremental_snapshot": bool(_incr_signal_topic)
+            and _incremental_strategy_requested(args, _incr_db_type)
+            and str(cfg.get("snapshot.mode", "") or "").strip().lower() == "no_data",
             "signal_topic": _incr_signal_topic,
             "data_collections": [t for t in str(cfg.get("table.include.list", "") or "").split(",") if t.strip()],
         }
@@ -1589,6 +1723,11 @@ class DebeziumConnector:
             # the existing config, PRESERVE its database.server.id (the running
             # binlog identity), and only PUT when something actually changed.
             if r.status_code == 409:
+                # Read whether a Stop parked the connector BEFORE any config PUT. A
+                # PUT restarts the connector, and a status read in the next few ms
+                # returns UNASSIGNED/RESTARTING, not STOPPED: Start then skipped the
+                # resume and the pipeline read streaming while nothing was captured.
+                parked = _parked_state(client, url, connector_name)
                 existing = {}
                 try:
                     g = client.get(f"{url}/connectors/{connector_name}/config")
@@ -1600,23 +1739,27 @@ class DebeziumConnector:
                 if existing.get("database.server.id"):
                     cfg["database.server.id"] = existing["database.server.id"]
                 if existing == cfg:
-                    return {
-                        "success": True,
-                        "connector_name": connector_name,
-                        "kafka_topic": kafka_topic,
-                        "config": _redact_config(cfg),
-                        "message": "connector already running with identical config (no-op)",
-                        "already_running": True,
-                        **_incr_info,
-                    }
-                u = client.put(f"{url}/connectors/{connector_name}/config", json=cfg)
-                u.raise_for_status()
+                    message = "connector already running with identical config (no-op)"
+                else:
+                    u = client.put(f"{url}/connectors/{connector_name}/config", json=cfg)
+                    u.raise_for_status()
+                    message = "updated existing connector (server.id preserved)"
+                # A Stop parks the connector in STOPPED (a Pause in PAUSED) with its
+                # offsets; a config PUT keeps that target state. Start has to resume
+                # it, or the pipeline reads running while nothing is captured.
+                resumed, resume_err = _resume_parked(client, url, connector_name, parked)
+                if resume_err:
+                    return {"success": False, "connector_name": connector_name, "error": resume_err}
+                if resumed:
+                    message += f"; resumed from {resumed}"
                 return {
                     "success": True,
                     "connector_name": connector_name,
                     "kafka_topic": kafka_topic,
                     "config": _redact_config(cfg),
-                    "message": "updated existing connector (server.id preserved)",
+                    "message": message,
+                    **({"already_running": True} if existing == cfg and not resumed else {}),
+                    **({"resumed_from": resumed} if resumed else {}),
                     **_incr_info,
                 }
 
@@ -1627,6 +1770,31 @@ class DebeziumConnector:
             safe_body = _scrub_secrets(r.text[:2000], cfg.get("database.password"), cfg.get("database.user"))
             safe_body = _mask_uri_credentials(safe_body)
             return {"success": False, "connector_name": connector_name, "error": f"create failed: HTTP {r.status_code}", "body": safe_body}
+
+
+def _parked_state(client: Any, url: str, connector_name: str) -> str:
+    """"STOPPED" or "PAUSED" when a Stop (or Pause) parked the connector, else ""."""
+    try:
+        s = client.get(f"{url}/connectors/{connector_name}/status")
+        body = s.json() if s.status_code == 200 else {}
+    except Exception:
+        # Status unreadable: leave the connector as it is, as before this check.
+        return ""
+    state = str(((body or {}).get("connector") or {}).get("state") or "").upper()
+    return state if state in ("STOPPED", "PAUSED") else ""
+
+
+def _resume_parked(client: Any, url: str, connector_name: str, state: str) -> Tuple[str, str]:
+    """Resume a connector `_parked_state` found STOPPED or PAUSED. Returns (former
+    state, "") after a resume, ("", "") when there was nothing to resume, or
+    ("", error). A config PUT in between keeps the parked target state, so the
+    resume is still needed after it."""
+    if not state:
+        return "", ""
+    r = client.put(f"{url}/connectors/{connector_name}/resume")
+    if not (200 <= r.status_code < 300):
+        return "", f"connector {connector_name} is {state} and kafka connect refused to resume it (HTTP {r.status_code})"
+    return state.lower(), ""
 
 
 def _dispatch_tool(server: DebeziumConnector, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:

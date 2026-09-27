@@ -2,15 +2,21 @@
 
 import { useRouter } from "next/navigation"
 import { Sparkles, AlertTriangle, Clock } from "lucide-react"
-import type { ExecutionPlanStage } from "./DAGVisualization"
+import type { ExecutionPlanStage } from "./dagTypes"
 import { detectDurationAnomaly, stageDurationMs } from "./dagHelpers"
 
 interface PipelineInsightsBarProps {
   pipelineName?: string
+  // Written into the problem chips' prompts so the chat's diagnose fast path
+  // (chat_diagnose.go reDiagWithUUID: a "why"/"fail"/"check" word, then a
+  // UUID) answers from this pipeline's own evidence. Without it, those
+  // questions went to intent classification, which cannot tell which pipeline
+  // they mean.
+  pipelineId?: string
   stages: ExecutionPlanStage[]
 }
 
-export function PipelineInsightsBar({ pipelineName, stages }: PipelineInsightsBarProps) {
+export function PipelineInsightsBar({ pipelineName, pipelineId, stages }: PipelineInsightsBarProps) {
   const router = useRouter()
 
   // Aggregate insights across all stages
@@ -28,13 +34,19 @@ export function PipelineInsightsBar({ pipelineName, stages }: PipelineInsightsBa
 
   const explainPrompt = `Explain my pipeline${pipelineName ? ` "${pipelineName}"` : ""} in plain English. It has ${stages.length} stages: ${stages.map((s) => s.display_name).join(" → ")}. What does it do, what's flowing through it, and is anything unusual?`
 
+  // Stays at the end of the prompt: the diagnose regex needs its keyword
+  // BEFORE the id, on the same line.
+  const idSuffix = pipelineId ? ` (pipeline ${pipelineId})` : ""
+
+  // The chip reads "Investigate failures" when nothing is slow, so that prompt
+  // asks about the failed stages, not about performance.
   const anomalyPrompt = anomalies.length > 0
-    ? `In my pipeline, these stages are taking unusually long: ${anomalies.map((s) => s.display_name).join(", ")}. Why might that be, and what should I check?`
-    : `Are there any performance anomalies in my pipeline${pipelineName ? ` "${pipelineName}"` : ""}? Walk me through the slowest stage.`
+    ? `In my pipeline, these stages are taking unusually long: ${anomalies.map((s) => s.display_name).join(", ")}. Why might that be, and what should I check?${idSuffix}`
+    : `Why did ${failed.length === 1 ? "this stage" : "these stages"} fail in my pipeline${pipelineName ? ` "${pipelineName}"` : ""}: ${failed.map((s) => s.display_name).join(", ")}? What should I check?${idSuffix}`
 
   const slowestPrompt = longest
-    ? `Why did the "${longest.stage.display_name}" stage take ${Math.round(longest.ms / 1000)}s? What does that stage do and what would speed it up?`
-    : `Which stage in my pipeline is the bottleneck and why?`
+    ? `Why did the "${longest.stage.display_name}" stage take ${Math.round(longest.ms / 1000)}s? What does that stage do and what would speed it up?${idSuffix}`
+    : `Which stage in my pipeline is the bottleneck and why?${idSuffix}`
 
   return (
     <div className="rounded-lg border border-violet-200 dark:border-violet-900/50 bg-gradient-to-r from-violet-50 to-indigo-50 dark:from-violet-950/30 dark:to-indigo-950/30 p-3">

@@ -21,6 +21,9 @@ const DISPLAY_NAMES: Record<string, string> = {
   dynamodb: "DynamoDB",
   redis: "Redis",
 
+  // Built-in zero-credential demo source (its metadata.json display_name)
+  "sample-data": "Sample Data (Demo)",
+
   // Warehouses
   snowflake: "Snowflake",
   bigquery: "BigQuery",

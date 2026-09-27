@@ -90,6 +90,21 @@ LINE_SUFFIX = re.compile(r":\d+(?:-\d+)?$")
 # ~1700 findings that no published page can ever 404 on.
 EXCLUDE_DIRS = (".claude/",)
 
+# docs/capabilities.d/*.md are drop-ins: scripts/fold-capabilities-drops.py copies their blocks
+# VERBATIM into CAPABILITIES.md / CAPABILITIES-ARCHIVE.md at the repo root, so a link inside one
+# is written for where the text lands, not for where the file sits. Resolving it from its own
+# directory inverts the gate: `../../CAPABILITIES-ARCHIVE.md` would pass here and be dead the
+# moment it is folded, while the correct `CAPABILITIES-ARCHIVE.md` fails. Same class as .claude/
+# above -- paths addressed from the repo root -- but these stay checked rather than excluded,
+# against the root. README.md documents the directory and is never folded, so it keeps the
+# normal rule.
+ROOT_RELATIVE_DIR = "docs/capabilities.d/"
+
+def link_base(md):
+    if md.startswith(ROOT_RELATIVE_DIR) and not md.endswith("/README.md"):
+        return ""
+    return os.path.dirname(md)
+
 total = 0
 dead = []
 md_files = sorted(
@@ -119,7 +134,7 @@ for md in md_files:
         if not t:
             continue
         total += 1
-        resolved = os.path.normpath(os.path.join(os.path.dirname(md), t))
+        resolved = os.path.normpath(os.path.join(link_base(md), t))
         if resolved.startswith(".."):
             dead.append((md, raw, "escapes the repo"))
         elif resolved not in tracked and resolved not in tracked_dirs:

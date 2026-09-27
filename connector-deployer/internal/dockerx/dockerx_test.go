@@ -244,6 +244,49 @@ func TestDeploy_ProtectedComposeStopped_Restart(t *testing.T) {
 	}
 }
 
+// On an isolated stack (STACK_PREFIX=rsync-ci) the orchestrator names the container
+// "rsync-ci-postgresql-v1-0-0-mcp". It is the same compose-managed connector, so a
+// stopped one is restarted — not rebuilt, and never removed.
+// KI-MCP-REDEPLOY-IGNORES-STACK-PREFIX-AND-FAILED-DEPLOY-READS-AS-SUCCESS.
+func TestDeploy_ProtectedComposeStopped_RestartOnAPrefixedStack(t *testing.T) {
+	tools := writeToolsWithLatest(t, "postgresql", "v1.0.0")
+	fb := &fakeBackend{snap: &ContainerSnapshot{ID: "pgid123456789", Status: "exited", Running: false}}
+	d := NewDeployer(fb, tools).WithStackPrefix("rsync-ci")
+
+	req := validReq()
+	req.Name = "rsync-ci-postgresql-v1-0-0-mcp"
+	res, err := d.Deploy(context.Background(), req, testDcfg, baseOpts())
+	if err != nil {
+		t.Fatalf("Deploy: %v", err)
+	}
+	if fb.buildCalled || fb.createCalled || len(fb.removed) > 0 {
+		t.Errorf("compose-managed restart must not build/create/remove (build=%v create=%v removed=%v)",
+			fb.buildCalled, fb.createCalled, fb.removed)
+	}
+	if res.Built {
+		t.Error("Built must be false for a compose restart")
+	}
+}
+
+func TestUndeploy_ProtectedRefusedOnAPrefixedStack(t *testing.T) {
+	tools := writeToolsWithLatest(t, "mysql", "v1.0.0")
+	fb := &fakeBackend{}
+	d := NewDeployer(fb, tools).WithStackPrefix("rsync-ci")
+	err := d.Undeploy(context.Background(), "rsync-ci-mysql-v1-0-0-mcp")
+	if err == nil || KindOf(err) != KindProtectedMissing {
+		t.Fatalf("want KindProtectedMissing, got %v", err)
+	}
+}
+
+// Blank STACK_PREFIX keeps the default, so an unset env var changes nothing.
+func TestWithStackPrefix_BlankKeepsDefault(t *testing.T) {
+	for _, p := range []string{"", "   "} {
+		if got := NewDeployer(&fakeBackend{}, "/x").WithStackPrefix(p).stackPrefix; got != "rsync-ai" {
+			t.Errorf("WithStackPrefix(%q) → %q, want rsync-ai", p, got)
+		}
+	}
+}
+
 func TestUndeploy_ProtectedRefused(t *testing.T) {
 	tools := writeToolsWithLatest(t, "mysql", "v1.0.0")
 	fb := &fakeBackend{}
@@ -265,20 +308,26 @@ func TestUndeploy_MissingIsIdempotent(t *testing.T) {
 func TestParseContainerName(t *testing.T) {
 	cases := []struct {
 		name   string
+		prefix string
 		id     string
 		ver    string
 		parses bool
 	}{
-		{"rsync-ai-postgresql-v1-0-0-mcp", "postgresql", "1-0-0", true},
-		{"rsync-ai-aws-s3-v1-0-2-mcp", "aws-s3", "1-0-2", true},
-		{"rsync-ai-postgresql-mcp", "", "", false}, // unversioned → does not parse
-		{"postgresql", "", "", false},
-		{"rsync-ai-foo-vX-mcp", "", "", false},
+		{"rsync-ai-postgresql-v1-0-0-mcp", "rsync-ai", "postgresql", "1-0-0", true},
+		{"rsync-ai-aws-s3-v1-0-2-mcp", "rsync-ai", "aws-s3", "1-0-2", true},
+		{"rsync-ai-postgresql-mcp", "rsync-ai", "", "", false}, // unversioned → does not parse
+		{"postgresql", "rsync-ai", "", "", false},
+		{"rsync-ai-foo-vX-mcp", "rsync-ai", "", "", false},
+		{"rsync-ai-mcp", "rsync-ai", "", "", false}, // prefix and suffix overlap: no panic
+		// STACK_PREFIX=rsync-ci: its own names parse, the default stack's do not.
+		{"rsync-ci-postgresql-v1-0-0-mcp", "rsync-ci", "postgresql", "1-0-0", true},
+		{"rsync-ai-postgresql-v1-0-0-mcp", "rsync-ci", "", "", false},
+		{"rsync-ci-postgresql-v1-0-0-mcp", "rsync-ai", "", "", false},
 	}
 	for _, tc := range cases {
-		id, ver, ok := parseContainerName(tc.name)
+		id, ver, ok := parseContainerName(tc.name, tc.prefix)
 		if ok != tc.parses || id != tc.id || ver != tc.ver {
-			t.Errorf("parse(%q) = (%q,%q,%v), want (%q,%q,%v)", tc.name, id, ver, ok, tc.id, tc.ver, tc.parses)
+			t.Errorf("parse(%q, %q) = (%q,%q,%v), want (%q,%q,%v)", tc.name, tc.prefix, id, ver, ok, tc.id, tc.ver, tc.parses)
 		}
 	}
 }

@@ -71,6 +71,44 @@ describe("updateSavedQuery", () => {
     })
   })
 
+  // expected_updated_at is the server's guard against the long window — an edit left
+  // open while a teammate saved (saved_queries.go UpdateSavedQuery). It only works if
+  // the caller's token goes out untouched.
+  it("sends the version the caller loaded, untouched", async () => {
+    mockFetch.mockResolvedValue(res(200, { id: "q1" }))
+
+    await updateSavedQuery("q1", { sql_text: "SELECT 2", expected_updated_at: "2026-09-01T10:00:00.123456Z" })
+
+    const [, init] = mockFetch.mock.calls[0]
+    expect(JSON.parse(init.body)).toEqual({ sql_text: "SELECT 2", expected_updated_at: "2026-09-01T10:00:00.123456Z" })
+  })
+
+  it("marks a stale_write refusal as stale, and still as an error", async () => {
+    mockFetch.mockResolvedValue(
+      res(409, {
+        error: "this query changed since you loaded it; reload it and re-apply your change",
+        code: "stale_write",
+        current_updated_at: "2026-09-01T10:05:00Z",
+      }),
+    )
+
+    const out = await updateSavedQuery("q1", { sql_text: "SELECT 2", expected_updated_at: "2026-09-01T10:00:00Z" })
+
+    expect(out).toEqual({
+      kind: "error",
+      message: "this query changed since you loaded it; reload it and re-apply your change",
+      stale: true,
+    })
+  })
+
+  it("does not call every 409 a stale write", async () => {
+    mockFetch.mockResolvedValue(res(409, { error: "a query with this name already exists" }))
+
+    const out = await updateSavedQuery("q1", { name: "Taken" })
+
+    expect(out).toEqual({ kind: "error", message: "a query with this name already exists" })
+  })
+
   it("does not read a failure as a success just because the body is unparseable", async () => {
     mockFetch.mockResolvedValue({
       ok: false,

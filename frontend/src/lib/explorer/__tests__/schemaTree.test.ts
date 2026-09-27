@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest"
-import { groupTablesByDatabase, type SchemaTableLike } from "../schemaTree"
+import {
+  groupForeignKeysByTable,
+  groupTablesByDatabase,
+  isInferredForeignKey,
+  relationshipsFor,
+  type SchemaForeignKeyLike,
+  type SchemaTableLike,
+} from "../schemaTree"
 
 const tbl = (name: string, schema?: string, extra: Partial<SchemaTableLike> = {}): SchemaTableLike => ({
   name,
@@ -58,5 +65,64 @@ describe("groupTablesByDatabase", () => {
     expect(groups).toHaveLength(1)
     expect(groups[0].database).toBe("(default)")
     expect(groups[0].tables.map((t) => t.name)).toEqual(["a", "b"])
+  })
+})
+
+describe("groupForeignKeysByTable", () => {
+  const fk = (
+    fromTable: string,
+    fromColumn: string,
+    toTable: string,
+    toColumn: string,
+    extra: Partial<SchemaForeignKeyLike> = {},
+  ): SchemaForeignKeyLike => ({
+    from_schema: "sales",
+    from_table: fromTable,
+    from_column: fromColumn,
+    to_schema: "sales",
+    to_table: toTable,
+    to_column: toColumn,
+    ...extra,
+  })
+
+  it("indexes both endpoints so each table sees both directions", () => {
+    const index = groupForeignKeysByTable([fk("orders", "user_id", "users", "id")])
+    const orders = relationshipsFor(index, { name: "orders", schema: "sales" })
+    const users = relationshipsFor(index, { name: "users", schema: "sales" })
+    expect(orders.outgoing.map((f) => f.to_table)).toEqual(["users"])
+    expect(orders.incoming).toEqual([])
+    expect(users.incoming.map((f) => f.from_table)).toEqual(["orders"])
+    expect(users.outgoing).toEqual([])
+  })
+
+  it("matches case-insensitively and falls back to the bare table name", () => {
+    const index = groupForeignKeysByTable([
+      fk("Orders", "user_id", "Users", "id", { from_schema: "", to_schema: "" }),
+    ])
+    // Table carries a schema the foreign key does not — bare-name fallback.
+    expect(relationshipsFor(index, { name: "orders", schema: "sales" }).outgoing).toHaveLength(1)
+  })
+
+  it("reports a table with no relationships as empty, not undefined", () => {
+    const index = groupForeignKeysByTable([fk("orders", "user_id", "users", "id")])
+    expect(relationshipsFor(index, { name: "events", schema: "analytics" })).toEqual({
+      outgoing: [],
+      incoming: [],
+    })
+  })
+
+  it("separates inferred relationships from real constraints", () => {
+    expect(isInferredForeignKey(fk("orders", "user_id", "users", "id", { confidence: 1 }))).toBe(false)
+    expect(isInferredForeignKey(fk("orders", "user_id", "users", "id", { confidence: 0.8 }))).toBe(true)
+    // No confidence at all means the backend did not say — treat as a constraint.
+    expect(isInferredForeignKey(fk("orders", "user_id", "users", "id"))).toBe(false)
+  })
+
+  it("skips malformed entries and handles an absent list", () => {
+    expect(groupForeignKeysByTable(undefined).size).toBe(0)
+    const index = groupForeignKeysByTable([
+      { from_table: "", from_column: "x", to_table: "users", to_column: "id" },
+    ])
+    expect(index.size).toBe(0)
   })
 })

@@ -185,16 +185,20 @@ func TestChatNoLLMExampleParsesAgainstTheCatalog(t *testing.T) {
 	}
 }
 
-// Every other failure keeps today's generic examples.
-func TestChatIntentOtherFailuresKeepTheGenericReply(t *testing.T) {
+// Every other failure says the model did not answer, instead of the generic
+// pipeline examples that read as the assistant ignoring the question. The
+// service's own error text never reaches the user: it can carry internal URLs.
+func TestChatIntentOtherFailuresSayTheModelDidNotAnswer(t *testing.T) {
 	pinNoCatalogDB(t)
 	for name, tc := range map[string]struct {
 		status int
 		body   string
+		leak   string
 	}{
-		"busy 503":           {http.StatusServiceUnavailable, `{"detail":"busy"}`},
-		"other error code":   {http.StatusServiceUnavailable, `{"error":"rate_limited","message":"slow down"}`},
-		"500 with gate body": {http.StatusInternalServerError, `{"error":"llm_not_configured","message":"x"}`},
+		"busy 503":           {http.StatusServiceUnavailable, `{"detail":"busy"}`, "busy"},
+		"other error code":   {http.StatusServiceUnavailable, `{"error":"rate_limited","message":"slow down"}`, "slow down"},
+		"500 with gate body": {http.StatusInternalServerError, `{"error":"llm_not_configured","message":"x"}`, "llm_not_configured"},
+		"prose, not JSON":    {http.StatusOK, `{"content":"Stages can be slow when the source is busy."}`, "source is busy"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			calls := completionStub(t, tc.status, tc.body)
@@ -202,8 +206,25 @@ func TestChatIntentOtherFailuresKeepTheGenericReply(t *testing.T) {
 			if atomic.LoadInt64(calls) == 0 {
 				t.Fatal("llm-service was never called")
 			}
-			if !strings.HasPrefix(resp.Message, cannedIntentFallbackPrefix) {
-				t.Fatalf("want the generic examples, got %q", resp.Message)
+			if !isLLMUnavailableReply(resp) {
+				t.Fatalf("want the model-did-not-answer reply, got %q", resp.Message)
+			}
+			if got := llmUnavailableReason(resp); got != "error" {
+				t.Errorf("reason = %q, want \"error\" (not a timeout)", got)
+			}
+			if !strings.Contains(resp.Message, "couldn't get an answer from the AI model") {
+				t.Errorf("reply does not say the model did not answer: %q", resp.Message)
+			}
+			if !strings.Contains(resp.Message, "`trace`") {
+				t.Errorf("reply does not carry the trace id: %q", resp.Message)
+			}
+			if !strings.Contains(resp.Message, chatNoLLMExample) ||
+				len(resp.Suggestions) != 1 || resp.Suggestions[0] != chatNoLLMExample {
+				t.Errorf("reply does not offer the phrasing that works without the model: %q %v",
+					resp.Message, resp.Suggestions)
+			}
+			if strings.Contains(resp.Message, tc.leak) {
+				t.Errorf("reply leaks llm-service's own text %q: %q", tc.leak, resp.Message)
 			}
 		})
 	}

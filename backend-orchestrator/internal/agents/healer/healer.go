@@ -18,6 +18,7 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/cdc"
+	"github.com/rsync-ai/backend-orchestrator/internal/config"
 	"github.com/rsync-ai/backend-orchestrator/internal/connections"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
@@ -32,25 +33,16 @@ var healerTracer = otel.Tracer("healer-agent")
 const (
 	HealerTopic = "rsync.healer.schema-changes"
 
-	// ResultsTopic + NotifyTopic — producers exist (healer emits healing results
-	// + user-visible notifications) but no consumer service subscribes today.
-	// Wiring a notifier consumer that delivers to email / Slack / webhook is
-	// tracked as G1 / F-Obs-1 (P0) in CAPABILITIES.md. The PG-side
-	// `pipeline_run_events` writes in heal/worker.go + heal/executors.go are the
-	// current user-visible channel; these topics will become the delivery
-	// channel once the notifier service lands. Do NOT remove the produce calls —
-	// they're intentional infrastructure for the upcoming consumer.
+	// ResultsTopic carries one HealingResult per handled schema change
+	// (publishHealingResult); the api-gateway notifier consumes it. It belongs
+	// to the schema-drift path, so like HealerTopic and ApprovedChangeTopic it
+	// is produced to, consumed and provisioned (kafka.EnsurePlatformTopics) only
+	// when RSYNC_SCHEMA_DRIFT_ENABLED=true.
 	//
-	// ActionTopic is the reserved topic for execution-failure action records.
-	// Its producer cluster — publishAction, its helper actionOutcome, and the
-	// HealerAction struct they marshal — was reached solely from the reactive
-	// DLQ-error classifier that was removed when the healer consolidated on the
-	// canonical diagnose→heal path (the `heal` package's HealWorker). The topic
-	// name + that cluster are kept as reserved infra for the same future notifier
-	// consumer; they are currently unwired (no live caller of publishAction).
+	// NotifyTopic is rsync.notifications, the user-notification topic the
+	// api-gateway notifier always consumes (notifyUserStructured). Not gated.
 	ResultsTopic = "rsync.healer.results"
 	NotifyTopic  = "rsync.notifications"
-	ActionTopic  = "rsync.healer.actions"
 
 	LLMServiceURL   = "http://llm-service:5000"
 	AnalysisTimeout = 30 * time.Second
@@ -68,15 +60,6 @@ type Agent struct {
 	// SAME path the batch write uses, instead of running source-shaped DDL
 	// directly against the dest. See ensureColumnViaConnector.
 	mcpClient *mcp.Client
-}
-
-// HealerAction represents an action taken by the Healer agent
-type HealerAction struct {
-	PipelineID string `json:"pipeline_id"`
-	Action     string `json:"action"` // "retry", "notify", "replan"
-	Reason     string `json:"reason"`
-	Timestamp  string `json:"timestamp"`
-	Details    string `json:"details,omitempty"`
 }
 
 // SchemaChangeEvent represents a schema change event from kafka-mcp-sink
@@ -179,10 +162,18 @@ func (a *Agent) schemaDriftSubscriptions() []schemaSubscription {
 // Start() that also subscribed those DLQs and ran a second, divergent LLM error
 // classifier was removed when the healer consolidated on that canonical path.)
 // handleSchemaChangeMessage has no synchronous twin, so subscribing the two
-// schema topics in isolation is collision-free. Gated by RSYNC_SCHEMA_DRIFT_ENABLED
-// at the call site (workers/executor.go ExecutorWorker.Start); off → never
-// called → dormant.
+// schema topics in isolation is collision-free.
+//
+// Gated by config.SchemaDriftEnabled HERE as well as at the call site
+// (workers ExecutorWorker.Start): a consumer-group subscription auto-creates
+// its topic, so a caller that skipped the check would mint the rsync.healer.*
+// topics that kafka.EnsurePlatformTopics deliberately leaves out when the flag
+// is off. Off → no subscription → no topic.
 func (a *Agent) StartSchemaOnly() error {
+	if !config.SchemaDriftEnabled() {
+		log.Info("[HealerAgent] RSYNC_SCHEMA_DRIFT_ENABLED is not true; schema-drift consumers not started")
+		return nil
+	}
 	log.Info("[HealerAgent] Starting schema-drift consumers (drift-detect → approve)...")
 
 	for _, s := range a.schemaDriftSubscriptions() {
@@ -351,46 +342,6 @@ func (a *Agent) handleSchemaChangeMessage(ctx context.Context, msg *sarama.Consu
 	return nil
 }
 
-func (a *Agent) publishAction(pipelineID, action, reason, details string) {
-	healerAction := HealerAction{
-		PipelineID: pipelineID,
-		Action:     action,
-		Reason:     reason,
-		Details:    details,
-		Timestamp:  time.Now().UTC().Format(time.RFC3339),
-	}
-
-	actionBytes, err := json.Marshal(healerAction)
-	if err != nil {
-		log.Errorf("[HealerAgent] Failed to marshal action: %v", err)
-		return
-	}
-
-	if a.kafkaManager != nil {
-		if err := a.kafkaManager.Produce(ActionTopic, []byte(pipelineID), actionBytes); err != nil {
-			log.Errorf("[HealerAgent] Failed to publish action: %v", err)
-		}
-	}
-
-	// F-Obs-2: record the execution-failure healing action. A bounded set of
-	// actions (retry|notify|replan|unknown); anything other than an automated
-	// retry means recovery deferred to a human/re-plan → escalated. This feeds
-	// the same rsync_healer_actions_total series as the schema-change path.
-	appmetrics.HealerActionsTotal.
-		WithLabelValues(action, actionOutcome(action)).
-		Inc()
-}
-
-// actionOutcome maps a publishAction action to the bounded outcome label.
-// retry is an automated recovery attempt (success); every other action hands
-// off to a human or the planner → escalated.
-func actionOutcome(action string) string {
-	if action == "retry" {
-		return "success"
-	}
-	return "escalated"
-}
-
 // extractJSONObject delegates to the shared llmjson helper. The implementation
 // moved to pkg/llmjson so api-gateway's chat pipeline strips fences the same way
 // — a second copy is how one caller keeps the old behaviour. Kept as a local
@@ -481,7 +432,17 @@ Respond with JSON:
 		event.SchemaChange.Table,
 		event.SchemaChange.ColumnName,
 		event.SchemaChange.ColumnType,
-		event.SchemaChange.DDL,
+		// The one free-form field in this prompt. Table/column/type names are
+		// schema metadata, which the privacy contract allows verbatim; a DDL
+		// statement additionally carries LITERALS -- a DEFAULT value, a CHECK
+		// bound -- which are customer data. Scrub preserves the SQL shape and
+		// every identifier and replaces only the quoted literals, so the model
+		// still sees the change it is being asked to classify.
+		//
+		// This file already scrubbed what it sends OUT to the user (:630, :1112,
+		// :1222) while sending this IN to the model raw, which is the direction
+		// that leaves the platform.
+		llmscrub.Scrub(event.SchemaChange.DDL),
 		event.SchemaChange.RiskLevel,
 		event.Context["auto_apply_enabled"],
 		event.Context["skip_destructive_enabled"],
@@ -562,6 +523,26 @@ func shouldAutoApply(analysis *LLMAnalysisResponse, autoApplyEnabled bool) bool 
 	return autoApplyEnabled && analysis.SafeToAutoMigrate && !analysis.RequiresApproval
 }
 
+// resolveProposedDDL picks the statement processAnalysis is allowed to execute: the
+// model's suggestion when it made one, and otherwise the DDL the source actually
+// emitted.
+//
+// The bool is why this is a function and not an inline `if`. buildAnalysisPrompt now
+// hands the model a SCRUBBED DDL, so a suggestion that echoes a redaction marker back
+// would write "[redacted]" into the customer's schema the moment
+// RSYNC_SCHEMA_DRIFT_AUTOAPPLY is on. Such a suggestion is discarded exactly like an
+// empty one — the caller already holds the real, unscrubbed source DDL — and the bool
+// lets it say so in the log rather than swallowing the substitution.
+func resolveProposedDDL(suggested, sourceDDL string) (string, bool) {
+	if llmscrub.ContainsRedaction(suggested) {
+		return sourceDDL, true
+	}
+	if suggested == "" {
+		return sourceDDL, false
+	}
+	return suggested, false
+}
+
 func (a *Agent) processAnalysis(ctx context.Context, event *SchemaChangeEvent, analysis *LLMAnalysisResponse) *HealingResult {
 	result := &HealingResult{
 		PipelineID: event.PipelineID,
@@ -579,9 +560,9 @@ func (a *Agent) processAnalysis(ctx context.Context, event *SchemaChangeEvent, a
 	// would get a "Migration failed" alert for a change that asked nothing of them.
 	// Falling through routes it to the approval queue, which is where a notice
 	// belongs — visible in /schema-changes, dismissable, never executed.
-	proposedDDL := analysis.SuggestedDDL
-	if proposedDDL == "" {
-		proposedDDL = event.SchemaChange.DDL
+	proposedDDL, echoedRedaction := resolveProposedDDL(analysis.SuggestedDDL, event.SchemaChange.DDL)
+	if echoedRedaction {
+		log.Warnf("[HealerAgent] Ignoring suggested_ddl for pipeline %s: it echoes redacted input", event.PipelineID)
 	}
 
 	if shouldAutoApply(analysis, autoApplyEnabled) && !isAdvisoryDDL(proposedDDL) {
@@ -1347,7 +1328,14 @@ func healingOutcome(status string) string {
 	}
 }
 
+// publishHealingResult emits the result to ResultsTopic, but only when
+// RSYNC_SCHEMA_DRIFT_ENABLED=true: the topic is provisioned only then
+// (kafka.EnsurePlatformTopics), and the producer's auto-create would otherwise
+// bring it back at broker defaults on a default install.
 func (a *Agent) publishHealingResult(result *HealingResult) {
+	if !config.SchemaDriftEnabled() {
+		return
+	}
 	resultBytes, err := json.Marshal(result)
 	if err != nil {
 		log.Errorf("[HealerAgent] Failed to marshal result: %v", err)

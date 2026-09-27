@@ -117,6 +117,61 @@ describe("SyncModeChoiceInline destination field", () => {
   })
 })
 
+// Prod 2026-09-26: on a GCS destination the chat card said "Leave empty to use
+// the default" for the path prefix, but layout v2 (gcs / aws-s3 / azure-blob)
+// has no default and the gateway refused the empty prefix after Start.
+describe("SyncModeChoiceInline path prefix on a layout-v2 object store", () => {
+  function renderPrefix(destType: string, onChoice = vi.fn()) {
+    render(
+      <SyncModeChoiceInline
+        message="Confirm pipeline"
+        choiceType="sync_mode"
+        options={options}
+        sourceType="postgresql"
+        destType={destType}
+        requestedOptionId="batch"
+        destinationNamespace={{ kind: "path", requested: "", defaultName: "" }}
+        onChoice={onChoice}
+      />
+    )
+    return onChoice
+  }
+
+  it.each(["gcs", "aws-s3", "azure-blob"])("%s: the prefix is required, says so, and Start waits for it", async (destType) => {
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const onChoice = renderPrefix(destType)
+    const field = screen.getByLabelText(/Destination path prefix \(required\)/)
+    expect(field).toHaveAttribute("aria-required", "true")
+    expect(field.getAttribute("placeholder")).toMatch(/sales_orders/)
+    expect(screen.queryByText(/Leave empty/)).toBeNull()
+
+    const start = screen.getByRole("button", { name: /Start pipeline/ })
+    expect(start).toBeDisabled()
+    const help = document.getElementById(start.getAttribute("aria-describedby") || "")
+    expect(help?.textContent).toMatch(/^Required/)
+
+    await user.type(field, "Sales")
+    expect(field).toHaveAttribute("aria-invalid", "true")
+    expect(help?.textContent).toMatch(/lowercase letters/i)
+    expect(start).toBeDisabled()
+
+    await user.clear(field)
+    await user.type(field, "sales_eu")
+    expect(start).toBeEnabled()
+    await user.click(start)
+    expect(onChoice).toHaveBeenCalledTimes(1)
+    expect(onChoice.mock.calls[0][1].destination_namespace).toBe("sales_eu")
+  })
+
+  // Control: minio stays on layout v1, where an empty prefix has a default.
+  it("minio: the prefix stays optional", () => {
+    renderPrefix("minio")
+    expect(screen.getByLabelText("Destination path prefix")).not.toHaveAttribute("aria-required")
+    expect(screen.getByText(/Leave empty to use the default\./)).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: /Start pipeline/ })).toBeEnabled()
+  })
+})
+
 describe("confirmCommand", () => {
   it("appends the destination name to the mode command", () => {
     expect(confirmCommand("initial_plus_cdc", "datingapp_pg3")).toBe(

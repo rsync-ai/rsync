@@ -10,8 +10,10 @@ import {
   Clock,
   Zap,
   Database,
-  ArrowRightLeft
+  ArrowRightLeft,
+  AlertTriangle
 } from "lucide-react"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { QuickActions } from "@/components/dashboard/QuickActions"
 import Link from "next/link"
 import { API_GATEWAY_URL, API_GATEWAY_URL_INTERNAL } from "@/lib/config/api"
@@ -127,7 +129,24 @@ async function getStats() {
   }
 }
 
-function RecentPipelines({ pipelines }: { pipelines: any[] }) {
+function RecentPipelines({ pipelines, error }: { pipelines: any[]; error: string | null }) {
+  // An empty list because the account has no pipelines and an empty list
+  // because the gateway never answered are not the same thing, and the second
+  // one used to render as the first: "No CDC pipelines yet", next to a stat
+  // grid of confident zeroes.
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center py-8 text-center">
+        <AlertTriangle className="h-12 w-12 text-amber-500 mb-4" />
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">
+          Could not load your pipelines
+        </p>
+        <p className="text-xs text-zinc-400 mt-2">
+          This is not an empty account — the list is unknown until the backend answers.
+        </p>
+      </div>
+    )
+  }
   if (pipelines.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center py-8 text-center">
@@ -238,6 +257,17 @@ export default async function DashboardPage() {
         description="Overview of your pipelines and data connections"
       />
 
+      {error && (
+        <Alert variant="destructive">
+          <AlertTriangle className="h-4 w-4" />
+          <AlertTitle>Dashboard data unavailable</AlertTitle>
+          <AlertDescription>
+            {error}. The counts below are unknown, not zero — nothing here reflects the
+            state of your account until the backend responds.
+          </AlertDescription>
+        </Alert>
+      )}
+
       {/* Stats Grid */}
       <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
         {statCards.map((stat) => (
@@ -249,7 +279,7 @@ export default async function DashboardPage() {
                     {stat.title}
                   </p>
                   <p className="text-3xl font-bold tracking-tight">
-                    {stat.value}
+                    {error ? <span className="text-zinc-400" title="Unknown — the backend did not answer">—</span> : stat.value}
                   </p>
                 </div>
                 <div className={`rounded-full p-3 ${stat.bgColor}`}>
@@ -276,7 +306,7 @@ export default async function DashboardPage() {
           </CardHeader>
           <CardContent>
             <Suspense fallback={<div>Loading...</div>}>
-              <RecentPipelines pipelines={recentPipelines} />
+              <RecentPipelines pipelines={recentPipelines} error={error} />
             </Suspense>
           </CardContent>
         </Card>

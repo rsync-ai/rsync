@@ -24,6 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from enum import Enum
 
+from .container_names import teardown_name_patterns, versioned_container_name
+
 logger = logging.getLogger(__name__)
 
 # Lazy imports to avoid circular dependencies
@@ -325,9 +327,8 @@ class DeploymentService:
                     # Container naming: ALWAYS versioned.
                     #
                     # Even when callers ask for "latest", we resolve a concrete version earlier
-                    # (artifacts.version) and run `rsync-ai-<id>-vX-Y-Z-mcp` so pipelines remain immutable.
-                    version_part = artifacts.version.lstrip("v").replace(".", "-")
-                    container_name = f"rsync-ai-{artifacts.name}-v{version_part}-mcp"
+                    # (artifacts.version) and run `<STACK_PREFIX>-<id>-vX-Y-Z-mcp` so pipelines remain immutable.
+                    container_name = versioned_container_name(artifacts.name, artifacts.version)
                     
                     start_success, container_info = await self.docker_builder.start_container(
                         image_name=build_result.full_image_name,
@@ -792,16 +793,11 @@ class DeploymentService:
         # Stop and remove container
         if remove_docker:
             try:
-                # Versioned-only runtime: remove all versioned containers for this connector.
+                # Versioned-only runtime: remove all versioned containers for this
+                # connector — on THIS stack only (STACK_PREFIX), never another stack
+                # sharing the Docker host.
                 connector_id = (connector_name or "").strip().lower().replace("_", "-")
-                prefixes = [
-                    f"rsync-ai-{connector_id}-v",
-                    f"rsync-ai-{connector_id.replace('-', '_')}-v",
-                ]
-                legacy = [
-                    f"rsync-ai-{connector_id}-mcp",
-                    f"rsync-ai-{connector_id.replace('-', '_')}-mcp",
-                ]
+                prefixes, legacy = teardown_name_patterns(connector_id)
 
                 # Remove versioned containers (best-effort). Enumerate through the
                 # builder helper (not the raw .client) so this works in both the

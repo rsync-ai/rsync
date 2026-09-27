@@ -64,7 +64,7 @@ def test_unset_env_yields_rsync_prefix():
     That has to hold with nothing configured, which is how most deploys run."""
     assert topic_prefix() == DEFAULT_TOPIC_PREFIX
     assert DEFAULT_TOPIC_PREFIX.startswith("rsync")
-    assert topic("agent.chat.requests").startswith("rsync")
+    assert topic("pii.scan.request").startswith("rsync")
 
 
 def test_qualification_is_idempotent():
@@ -80,7 +80,7 @@ def test_qualification_is_idempotent():
 def test_producer_and_consumer_resolve_identically():
     """The failure this whole file guards: producer and consumer computing
     different names is not an error, it is silence."""
-    for name in ("agent.chat.requests", "pipeline.domain.events", "cdc.abc12345"):
+    for name in ("pii.scan.request", "pipeline.domain.events", "cdc.abc12345"):
         assert topic(name) == topic(name)
         assert topics(name) == [topic(name)]
 
@@ -90,20 +90,20 @@ def test_empty_prefix_leaves_names_untouched(monkeypatch):
     committed consumer-group offsets sets this empty to keep the old names."""
     monkeypatch.setenv(ENV_TOPIC_PREFIX, "")
     assert topic_prefix() == ""
-    assert topic("agent.chat.requests") == "agent.chat.requests"
+    assert topic("pii.scan.request") == "pii.scan.request"
 
 
 def test_prefix_without_separator_gains_one(monkeypatch):
-    """"rsync" + "agent.x" = "rsyncagent.x" is a LEGAL topic name, so this
+    """"rsync" + "pii.x" = "rsyncpii.x" is a LEGAL topic name, so this
     mistake would not fail -- it would just create a differently-named topic."""
     monkeypatch.setenv(ENV_TOPIC_PREFIX, "acme")
-    assert topic("agent.chat.requests") == "acme.agent.chat.requests"
+    assert topic("pii.scan.request") == "acme.pii.scan.request"
 
 
 @pytest.mark.parametrize("prefix", ["acme.", "acme-", "acme_"])
 def test_existing_separator_is_not_doubled(monkeypatch, prefix):
     monkeypatch.setenv(ENV_TOPIC_PREFIX, prefix)
-    assert topic("agent.chat.requests") == prefix + "agent.chat.requests"
+    assert topic("pii.scan.request") == prefix + "pii.scan.request"
 
 
 def test_illegal_prefix_characters_are_dropped(monkeypatch):
@@ -112,13 +112,13 @@ def test_illegal_prefix_characters_are_dropped(monkeypatch):
     not the prefix -- so the cause would be hidden."""
     monkeypatch.setenv(ENV_TOPIC_PREFIX, "rs ync/co:rp")
     assert topic_prefix() == "rsynccorp."
-    assert topic("agent.chat.requests") == "rsynccorp.agent.chat.requests"
+    assert topic("pii.scan.request") == "rsynccorp.pii.scan.request"
 
 
 def test_prefix_of_only_illegal_characters_disables_qualification(monkeypatch):
     monkeypatch.setenv(ENV_TOPIC_PREFIX, "///")
     assert topic_prefix() == ""
-    assert topic("agent.chat.requests") == "agent.chat.requests"
+    assert topic("pii.scan.request") == "pii.scan.request"
 
 
 def test_empty_name_stays_empty():

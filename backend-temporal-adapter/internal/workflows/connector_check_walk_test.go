@@ -319,7 +319,8 @@ func TestCheckConnectorExistsIn_RepoConnectorTree(t *testing.T) {
 	}
 	roots := walkFixtureRoots(base)
 
-	for _, connectorType := range []string{"mongodb", "gcs", "azure-blob"} {
+	// sample-data is the first-run demo source; it has no BaseMCPConnector.
+	for _, connectorType := range []string{"mongodb", "gcs", "azure-blob", "sample-data"} {
 		if !checkConnectorExistsIn(connectorType, roots) {
 			t.Errorf("checkConnectorExistsIn(%q) = false against the repo tree", connectorType)
 		}
@@ -332,5 +333,89 @@ func TestCheckConnectorExistsIn_RepoConnectorTree(t *testing.T) {
 		if checkConnectorExistsIn(connectorType, roots) {
 			t.Errorf("checkConnectorExistsIn(%q) = true against the repo tree; no connector folder has that key", connectorType)
 		}
+	}
+}
+
+// A self-contained stdlib connector, shaped like public/sample-data: no
+// BaseMCPConnector, a top-level <Name>MCPServer class, connector_type and the
+// MCP methods.
+const walkFixtureStdlibConnectorPy = `import json
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, Dict
+
+CONNECTOR_TYPE = "fixture"
+
+
+class FixtureMCPServer:
+    def __init__(self) -> None:
+        self.connector_type = CONNECTOR_TYPE
+
+    def test_connection(self, params: Dict = None) -> Dict[str, Any]:
+        return {"success": True}
+
+    def validate_config(self, params: Dict = None) -> Dict[str, Any]:
+        return {"success": True, "valid": True}
+
+    def discover_schema(self, params: Dict = None) -> Dict[str, Any]:
+        return {"success": True, "tables": []}
+
+    def export(self, params: Dict = None) -> Dict[str, Any]:
+        return {"success": True, "data": []}
+`
+
+// Names a server class but implements no MCP methods: still a stub.
+const walkFixtureServerClassStubPy = `# generated placeholder, long enough to pass the size floor ..................
+# ...............................................................................
+CONNECTOR_TYPE = "fixture"
+
+
+class FixtureMCPServer:
+    def __init__(self) -> None:
+        self.connector_type = CONNECTOR_TYPE
+`
+
+// Implements the methods but is neither a BaseMCPConnector nor an MCP server
+// class, so it is not an MCP connector.
+const walkFixturePlainClassPy = `from typing import Any, Dict
+
+CONNECTOR_TYPE = "fixture"
+
+
+class Helper:
+    def __init__(self) -> None:
+        self.connector_type = CONNECTOR_TYPE
+
+    def test_connection(self, params: Dict = None) -> Dict[str, Any]:
+        return {"success": True}
+
+    def discover_schema(self, params: Dict = None) -> Dict[str, Any]:
+        return {"success": True, "tables": []}
+`
+
+func TestVerifyConnectorImplemented(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "BaseMCPConnector subclass", body: walkFixtureConnectorPy, want: true},
+		{name: "stdlib MCPServer class (sample-data shape)", body: walkFixtureStdlibConnectorPy, want: true},
+		{name: "short stub", body: walkFixtureStubConnectorPy, want: false},
+		{name: "MCPServer class without MCP methods", body: walkFixtureServerClassStubPy, want: false},
+		{name: "methods without an MCP class", body: walkFixturePlainClassPy, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.body == walkFixtureServerClassStubPy && len(tc.body) < 200 {
+				t.Fatalf("fixture is %d bytes; it must clear the 200-byte floor to test the method check", len(tc.body))
+			}
+			path := filepath.Join(t.TempDir(), "connector.py")
+			if err := os.WriteFile(path, []byte(tc.body), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if got := verifyConnectorImplemented(path); got != tc.want {
+				t.Fatalf("verifyConnectorImplemented = %v, want %v", got, tc.want)
+			}
+		})
 	}
 }

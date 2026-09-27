@@ -20,8 +20,22 @@ import { useFeatureFlags } from "@/config/features"
 import { PipelineTableSelector } from "@/components/pipeline/PipelineTableSelector"
 import { getConnectionMetadata, truncatedTableTotal, type ConnectionTableMetadata } from "@/lib/api/connections"
 import { getPipeline, resumePipelineTables, updatePipelineCDCTables, updatePipelineTables } from "@/lib/api/pipelines"
-import { kindMeta } from "@/lib/pipeline/destinationNamespace"
-import { sameCounts } from "@/lib/pipeline/rowCounts"
+import {
+  isLayoutV2Destination,
+  isObjectStorageDestination,
+  kindMeta,
+  objectLayoutSourceFamily,
+  objectLayoutTableParts,
+  objectStorageTableFolder,
+} from "@/lib/pipeline/destinationNamespace"
+import {
+  describeTableEditResult,
+  fetchBackfillCapability,
+  isBlockingOnly,
+  type BackfillCapability,
+  type TableEditOutcome,
+} from "@/lib/pipeline/cdcBackfill"
+import { makeTableMatcher, parseTableStatsRows } from "@/lib/pipeline/tableStatsRows"
 import { extractLatestRowMetrics } from "@/lib/pipeline/dataPlaneRowMetrics"
 import {
   isWaitingForFirstData,
@@ -30,7 +44,7 @@ import {
   WAITING_FOR_FIRST_DATA_LABEL,
 } from "@/lib/pipeline/statusNormalization"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
-import { onPipelineRefresh } from "@/lib/events/pipelineRefresh"
+import { emitPipelineRefresh, onPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import { mergeNewestPage } from "@/lib/pipeline/mergeNewestEvents"
 import { STATUS_EVENT_TYPES } from "@/lib/pipeline/eventNormalizer"
 import { stepInfoFromEvents } from "@/components/pipeline/PipelineLiveStatePanel"
@@ -102,6 +116,59 @@ export function runTraceId(
   return events.find((e) => e.trace_id && e.execution_id !== pipelineId && e.trace_id !== pipelineId)?.trace_id
 }
 
+async function connectionConfig(id: string): Promise<Record<string, unknown> | null> {
+  try {
+    const r = await authFetch(API_ENDPOINTS.CONNECTIONS.GET(id), { cache: "no-store" })
+    if (!r?.ok) return null
+    const data = (await r.json()) as Record<string, unknown> | null
+    const cfg = data?.["config"]
+    return cfg && typeof cfg === "object" && !Array.isArray(cfg) ? (cfg as Record<string, unknown>) : null
+  } catch {
+    return null
+  }
+}
+
+function firstConfigString(cfg: Record<string, unknown> | null, ...keys: string[]): string | undefined {
+  for (const k of keys) {
+    const v = cfg?.[k]
+    if (typeof v === "string" && v.trim()) return v.trim()
+  }
+  return undefined
+}
+
+/**
+ * The parts of a layout v2 table folder that live in the connections, not the
+ * pipeline (#18): the bucket and the destination's own path prefix (the sink's
+ * firstStr lookup order), and the source database the <db> folder is named
+ * after (orchestrator objectLayoutV2SourceDatabase). Each part is best-effort.
+ */
+async function loadObjectLayoutInfo(
+  destConnectionId: string,
+  srcConnectionId: string,
+  srcType: string
+): Promise<{ bucket?: string; connPrefix?: string; database?: string }> {
+  const [dest, src] = await Promise.all([
+    connectionConfig(destConnectionId),
+    srcConnectionId ? connectionConfig(srcConnectionId) : Promise.resolve(null),
+  ])
+  const family = objectLayoutSourceFamily(srcType)
+  const database =
+    family === "mongodb"
+      ? firstConfigString(src, "database", "db_name", "db")
+      : family === "oracle"
+        ? firstConfigString(src, "database", "service_name", "sid")
+        : firstConfigString(src, "database")
+  return {
+    bucket: firstConfigString(dest, "bucket", "bucket_name", "container", "container_name"),
+    // undefined = the destination config could not be read, so its prefix is
+    // unknown; "" = read, and the connection writes at the bucket root.
+    connPrefix: dest
+      ? (firstConfigString(dest, "path_prefix", "prefix", "base_prefix", "key_prefix", "base_path", "path") ?? "")
+      : undefined,
+    database,
+  }
+}
+
 export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "monitoring" | "table_stats" }) {
   const { pipelineId } = props
   const variant = props.variant ?? "monitoring"
@@ -142,23 +209,16 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
   const [showEditTables, setShowEditTables] = useState(false)
   const [tablesLoading, setTablesLoading] = useState(false)
   const [tablesError, setTablesError] = useState<string | null>(null)
+  const [showSelectedTables, setShowSelectedTables] = useState(false)
   const [availableTables, setAvailableTables] = useState<ConnectionTableMetadata[]>([])
   const [tablesTruncatedTotal, setTablesTruncatedTotal] = useState<number | undefined>(undefined)
-  const [expectedRows, setExpectedRows] = useState<number | null>(null)
-  const [expectedReadRows, setExpectedReadRows] = useState<number | null>(null)
-  const [expectedRowsIsEstimate, setExpectedRowsIsEstimate] = useState<boolean>(true)
-  const [expectedRowsSource, setExpectedRowsSource] = useState<"source" | "run" | "mixed">("source")
   const [lastRunRowCounts, setLastRunRowCounts] = useState<Record<string, number>>({})
-  const [lastRunReadRowCounts, setLastRunReadRowCounts] = useState<Record<string, number>>({})
-  // Slow refresh tick for the two row-count effects below. They are keyed on
-  // identity — execution_id and the selected-table list — and on a CDC pipeline
-  // neither ever changes, so both ran exactly once and then froze: "Expected rows
-  // (source, estimate)" kept reporting the count read when the page loaded while
-  // the source table grew underneath it. The label says "source"; without this the
-  // number was a snapshot of the source at an arbitrary past moment, and the two
-  // disagreed. Deliberately NOT on the 2.5s state poll — the expected-rows path
-  // re-queries the source database for row counts, so it gets its own slow cadence.
-  const [rowCountRefreshTick, setRowCountRefreshTick] = useState(0)
+  // From the same table-stats rows (#5): tables no longer selected whose counts
+  // the stats still carry (a re-add defaults to loading its rows).
+  const [removedTables, setRemovedTables] = useState<string[]>([])
+  // Bumped after a CDC table edit: the edit keeps the execution, so the stats
+  // fetch below would otherwise not see a table that just became "removed".
+  const [tableStatsRefreshTick, setTableStatsRefreshTick] = useState(0)
   const [pipelineSyncMode, setPipelineSyncMode] = useState<"batch" | "cdc" | null>(null)
   const [pipelineSourceConnectionId, setPipelineSourceConnectionId] = useState<string | null>(null)
   const [pipelineSelectedTables, setPipelineSelectedTables] = useState<string[]>([])
@@ -168,7 +228,23 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
   // rows land on the destination without guessing.
   const [pipelineDestNamespace, setPipelineDestNamespace] = useState<string | null>(null)
   const [pipelineDestNamespaceKind, setPipelineDestNamespaceKind] = useState<string | null>(null)
+  // Object-storage destinations (#18): a table lands in a folder, not a schema, so
+  // the Tables card shows the folder path. The bucket, connection prefix and source
+  // database come from the two connections' configs (best-effort; the path is
+  // shown without whatever could not be read).
+  const [pipelineDestType, setPipelineDestType] = useState<string | null>(null)
+  const [pipelineSourceType, setPipelineSourceType] = useState<string | null>(null)
+  const [objectLayoutInfo, setObjectLayoutInfo] = useState<Awaited<ReturnType<typeof loadObjectLayoutInfo>> | null>(
+    null
+  )
   const [cdcBackfillNewTables, setCdcBackfillNewTables] = useState(true)
+  // Asked each time the CDC "Edit tables" dialog opens: can this connector
+  // backfill the tables you add? Same GET the Re-snapshot card makes.
+  const [cdcBackfillCapability, setCdcBackfillCapability] = useState<BackfillCapability>({ state: "unknown" })
+  // A saved table edit whose added tables did NOT get their existing rows.
+  // Kept on the Tables card until dismissed: a toast alone is gone in seconds,
+  // and this is a data-completeness problem, not a notification.
+  const [cdcEditWarning, setCdcEditWarning] = useState<TableEditOutcome | null>(null)
 
   function asObject(v: unknown): Record<string, unknown> | null {
     if (!v) return null
@@ -304,7 +380,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
         event_types: STATUS_EVENT_TYPES.join(","),
         limit: String(STATUS_EVENTS_LIMIT),
       })
-      const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events?${qs.toString()}`, {
+      const res = await authFetch(`${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?${qs.toString()}`, {
         cache: "no-store",
       })
       // A failed read leaves the badges to the loaded rows, which is all they
@@ -346,7 +422,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
         qs.set("before_seq", String(cursor.before_seq))
         qs.set("before_event_id", cursor.before_event_id)
       }
-      const url = `${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events?${qs.toString()}`
+      const url = `${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?${qs.toString()}`
 
       const res = await authFetch(url, {
         cache: "no-store",
@@ -390,7 +466,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     if (pollInflightRef.current || loadingMoreRef.current) return
     pollInflightRef.current = true
     try {
-      const url = `${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events?limit=${EVENTS_PAGE_SIZE}`
+      const url = `${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?limit=${EVENTS_PAGE_SIZE}`
       const res = await authFetch(url, { cache: "no-store" })
       if (!res.ok) {
         setEventsError(eventsReadError(res.status))
@@ -442,20 +518,13 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     if (!status) return
     if (!["processing", "waiting_for_user", "pending"].includes(status)) return
     const pollIntervalMs = status === "processing" ? 2500 : 5000
-    const t = setInterval(fetchState, pollIntervalMs)
+    const t = setInterval(() => {
+      // A hidden tab skips its reads (#13); the next visible tick reads.
+      if (typeof document !== "undefined" && document.visibilityState === "hidden") return
+      void fetchState()
+    }, pollIntervalMs)
     return () => clearInterval(t)
   }, [state?.status, fetchState])
-
-  // Row-count refresh, driven separately from the state poll above (see
-  // rowCountRefreshTick). A batch run ends and its counts stop moving; a CDC
-  // stream never does, which is where the frozen estimate was visible.
-  useEffect(() => {
-    const status = state?.status
-    if (!status) return
-    if (!["processing", "waiting_for_user", "pending"].includes(status)) return
-    const t = setInterval(() => setRowCountRefreshTick((n) => n + 1), 60_000)
-    return () => clearInterval(t)
-  }, [state?.status])
 
   const status = state?.status || (loading ? "loading" : "unknown")
 
@@ -479,6 +548,9 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
   const waitingForFirstData = isWaitingForFirstData(reconciledStatus, pipelineRuntime?.phase)
 
   const pausedByUser = state?.status === "waiting_for_user" && state?.blocking_reason?.type === "paused_by_user"
+  // #14: a paused pipeline keeps its last summary ("Streaming pipeline active"),
+  // and the stats card below counted its tables as Running. Both read paused now.
+  const pipelinePaused = reconciledStatus === "paused" || pausedByUser
 
   const canStop = ["processing", "waiting_for_user", "pending"].includes(String(state?.status || ""))
   const canPause = String(state?.status || "") === "processing"
@@ -503,9 +575,11 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
       toast.error(err.title, { description: err.hint ?? err.message })
     } finally {
       // Refresh either way: on failure the server's actual state is exactly
-      // what the user needs to see.
-      fetchState()
-      fetchEvents()
+      // what the user needs to see. Through the refresh bus (#13), not only this
+      // panel's own fetches: the header badge, the status strip and the Table
+      // statistics card each poll on their own and otherwise kept the old status
+      // until a full reload. This panel's own listener below runs onRefresh.
+      emitPipelineRefresh(pipelineId)
     }
   }
 
@@ -576,7 +650,31 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     return uniqStrings(src)
   }, [pipelineSelectedTables, inferredTables, uniqStrings])
   const inferredSourceConnectionId = useMemo(() => inferSourceConnectionId(state, events), [state, events])
-  const latestRowMetrics = useMemo(() => extractLatestRowMetrics(events), [events])
+  // #18: on GCS / S3 / Azure Blob (layout v2) a table lands in a folder, so the
+  // example is that folder, not "<namespace>.<table>". null = not layout v2, or a
+  // part the folder needs is unknown: the example falls back to the old form.
+  // The pipeline's recorded layout version is not exposed, so this is inferred
+  // the way the orchestrator decides it (destination, source family, prefix).
+  const destFolderExample = useMemo(() => {
+    if (!pipelineDestNamespace || !isLayoutV2Destination(pipelineDestType ?? undefined)) return null
+    const family = objectLayoutSourceFamily(pipelineSourceType ?? undefined)
+    const first = displaySelectedTables[0]
+    if (!family || !first) return null
+    const parts = objectLayoutTableParts(family, objectLayoutInfo?.database, first)
+    const folder = objectStorageTableFolder({
+      bucket: objectLayoutInfo?.bucket,
+      connPrefix: objectLayoutInfo?.connPrefix,
+      pipelinePrefix: pipelineDestNamespace,
+      sourceFamily: family,
+      database: parts.database,
+      schema: parts.schema,
+      table: parts.table,
+    })
+    if (!folder) return null
+    // The destination's own path prefix could not be read: say so rather than
+    // show a path that may be missing its first folders.
+    return objectLayoutInfo?.connPrefix === undefined ? `…/${folder}` : folder
+  }, [pipelineDestNamespace, pipelineDestType, pipelineSourceType, displaySelectedTables, objectLayoutInfo])
 
   // Best-effort: fetch pipeline sync_mode so we can enable CDC table editing.
   useEffect(() => {
@@ -595,6 +693,18 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
         setPipelineDestNamespaceKind(
           typeof p.destination_config?.namespace_kind === "string" ? p.destination_config.namespace_kind : null
         )
+        const destType = String(p.destination_connection?.connector_type || "").trim()
+        const srcType = String(p.source_connection?.connector_type || "").trim()
+        setPipelineDestType(destType || null)
+        setPipelineSourceType(srcType || null)
+        const destId = String(p.destination_connection_id || "").trim()
+        if (isLayoutV2Destination(destType) && destId) {
+          void loadObjectLayoutInfo(destId, src, srcType).then((info) => {
+            if (!cancelled) setObjectLayoutInfo(info)
+          })
+        } else {
+          setObjectLayoutInfo(null)
+        }
         const config = p.config as Record<string, unknown> | undefined
         const raw = config?.["selected_tables"] ?? config?.["selectedTables"] ?? p.selected_tables
         const arr = Array.isArray(raw) ? raw : []
@@ -612,6 +722,9 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
         setPipelineSelectedTables([])
         setPipelineDestNamespace(null)
         setPipelineDestNamespaceKind(null)
+        setPipelineDestType(null)
+        setPipelineSourceType(null)
+        setObjectLayoutInfo(null)
       })
     return () => {
       cancelled = true
@@ -632,14 +745,38 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     if (msg.includes("streaming") || summary.includes("streaming")) return "cdc"
     return null
   }, [pipelineSyncMode, state?.message, state?.summary])
+  // Batch: this run's rows only — the events span earlier runs too. CDC runs keep
+  // every metrics event (their counters belong to the stream, not one execution).
+  const latestRowMetrics = useMemo(
+    () => extractLatestRowMetrics(events, effectiveSyncMode === "cdc" ? undefined : state?.execution_id),
+    [events, effectiveSyncMode, state?.execution_id],
+  )
+
+  const isCdcTableEdit = showEditTables && effectiveSyncMode === "cdc" && !isWaitingForTableSelection
+  useEffect(() => {
+    if (!isCdcTableEdit) return
+    let cancelled = false
+    // "unknown" until first answered: the dialog then offers the option as
+    // before and the save result reports a refusal, so a slow check never
+    // blocks anyone. Re-asked on every open; the answer changes only when the
+    // connector is recreated, so showing the previous one meanwhile is safe.
+    void fetchBackfillCapability(pipelineId).then((cap) => {
+      if (!cancelled) setCdcBackfillCapability(cap)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [isCdcTableEdit, pipelineId])
+  const cdcBackfillUnavailableDetail =
+    cdcBackfillCapability.state === "unsupported" ? cdcBackfillCapability.detail : undefined
 
   // For table discovery (listing tables), prefer the pipeline's configured source connection ID.
   // Event inference is best-effort and may be unavailable early in the run.
   const effectiveSourceConnectionId = pipelineSourceConnectionId || inferredSourceConnectionId
 
-  // Fetch per-table stats for the latest execution (best-effort) so we can:
-  // - auto-select in "Edit tables" for older pipelines
-  // - compute "Expected rows" from last-run actuals (avoids bogus source estimates like MySQL TABLE_ROWS)
+  // Fetch per-table stats for the latest execution (best-effort) so "Edit tables"
+  // can auto-select for older pipelines, show last-run counts, and mark tables no
+  // longer selected.
   useEffect(() => {
     let cancelled = false
     async function run() {
@@ -655,50 +792,16 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
         if (!res.ok) return
         const data = (await res.json()) as { tables?: Array<Record<string, unknown>> }
         const rawTables = Array.isArray(data?.tables) ? data.tables : []
-        const out: string[] = []
-        const counts: Record<string, number> = {}
-        const readCounts: Record<string, number> = {}
-        for (const t of rawTables) {
-          const q = typeof t?.["qualified_name"] === "string" ? t["qualified_name"] : undefined
-          const schema = typeof t?.["schema_name"] === "string" ? t["schema_name"] : typeof t?.["schema"] === "string" ? t["schema"] : undefined
-          const name = typeof t?.["table_name"] === "string" ? t["table_name"] : typeof t?.["name"] === "string" ? t["name"] : undefined
-          const built = schema && name ? `${schema}.${name}` : name
-          const v = String(q || built || "").trim()
-          if (v) out.push(v)
-
-          // Best-effort: capture actual processed rows per table for this execution.
-          const inserted = t?.["inserted_rows"]
-          const n = typeof inserted === "number" ? inserted : typeof inserted === "string" ? Number(inserted) : undefined
-          if (v && typeof n === "number" && Number.isFinite(n) && n >= 0) {
-            counts[v] = n
-            // also store unqualified name for matching convenience
-            if (name) counts[String(name).trim()] = n
-          }
-          const readRows = t?.["read_rows"]
-          const rn = typeof readRows === "number" ? readRows : typeof readRows === "string" ? Number(readRows) : undefined
-          if (v && typeof rn === "number" && Number.isFinite(rn) && rn >= 0) {
-            readCounts[v] = rn
-            if (name) readCounts[String(name).trim()] = rn
-          }
-        }
-        const seen = new Set<string>()
-        const uniq: string[] = []
-        for (const t of out) {
-          if (seen.has(t)) continue
-          seen.add(t)
-          uniq.push(t)
-        }
+        // CDC rows carry no run counts (inserted_rows is batch-only):
+        // parseTableStatsRows ignores them there even if present (#9).
+        const parsed = parseTableStatsRows(rawTables, { cdc: effectiveSyncMode === "cdc" })
         if (cancelled) return
-        // Always set last-run counts (used for expected-rows computation), but
-        // keep the object identity when nothing moved: the expected-rows effect
-        // below depends on these, and that effect queries the SOURCE database.
-        // Handing it a new-but-identical object on every refresh tick would
-        // double the source load for no new information.
-        setLastRunRowCounts((prev) => (sameCounts(prev, counts) ? prev : counts))
-        setLastRunReadRowCounts((prev) => (sameCounts(prev, readCounts) ? prev : readCounts))
-        // Only infer selected tables when not already known/persisted.
-        if (pipelineSelectedTables.length === 0 && uniq.length > 0) {
-          setPipelineSelectedTables(uniq)
+        setLastRunRowCounts(parsed.written)
+        setRemovedTables(parsed.removed)
+        // Only infer selected tables when not already known/persisted. Removed
+        // tables are not in parsed.names: they are no longer selected.
+        if (pipelineSelectedTables.length === 0 && parsed.names.length > 0) {
+          setPipelineSelectedTables(parsed.names)
         }
       } catch {
         // ignore
@@ -708,86 +811,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     return () => {
       cancelled = true
     }
-  }, [pipelineId, state?.execution_id, pipelineSelectedTables.length, rowCountRefreshTick])
-
-  // Compute expected rows for selected tables (only).
-  useEffect(() => {
-    let cancelled = false
-    async function run() {
-      if (!effectiveSourceConnectionId) return
-      if (pipelineSelectedTables.length === 0) return
-
-      try {
-        const desired = new Set(pipelineSelectedTables.map((t) => String(t || "").trim()).filter(Boolean))
-        let sum = 0
-        let hasAny = false
-        let hasEstimate = false
-        let usedRunCounts = false
-
-        let sumRead = 0
-        let hasRead = false
-
-        // Prefer actual counts from the last execution (if we have them) for tables that were processed.
-        for (const sel of desired) {
-          const runCount = lastRunRowCounts[sel] ?? lastRunRowCounts[sel.split(".").slice(-1)[0]]
-          if (typeof runCount === "number" && Number.isFinite(runCount) && runCount >= 0) {
-            sum += runCount
-            hasAny = true
-            usedRunCounts = true
-          }
-          const runRead = lastRunReadRowCounts[sel] ?? lastRunReadRowCounts[sel.split(".").slice(-1)[0]]
-          if (typeof runRead === "number" && Number.isFinite(runRead) && runRead >= 0) {
-            sumRead += runRead
-            hasRead = true
-          }
-        }
-
-        // For any selected tables not found in run counts, fall back to metadata row_count (estimate).
-        // This keeps "Expected rows" useful when users add new tables that haven't been processed yet.
-        const resp = await getConnectionMetadata(effectiveSourceConnectionId, {
-          tables: pipelineSelectedTables.slice(0, 500),
-          limit: 5000,
-        })
-        for (const t of resp.tables || []) {
-          const key = `${t.schema ? `${t.schema}.` : ""}${t.name}`.trim()
-          const nameKey = String(t.name || "").trim()
-          if (!desired.has(key) && !desired.has(nameKey)) continue
-
-          // If we already have a run-derived count for this table, prefer it.
-          if (typeof (lastRunRowCounts[key] ?? lastRunRowCounts[nameKey]) === "number") continue
-
-          if (typeof t.row_count === "number" && Number.isFinite(t.row_count) && t.row_count >= 0) {
-            sum += t.row_count
-            hasAny = true
-            hasEstimate = true
-          }
-        }
-        if (!cancelled) {
-          if (hasAny) {
-            setExpectedRows(sum)
-            setExpectedRowsIsEstimate(hasEstimate)
-            setExpectedRowsSource(usedRunCounts && hasEstimate ? "mixed" : usedRunCounts ? "run" : "source")
-          } else {
-            setExpectedRows(null)
-            setExpectedRowsIsEstimate(true)
-            setExpectedRowsSource("source")
-          }
-          setExpectedReadRows(hasRead ? sumRead : null)
-        }
-      } catch {
-        if (!cancelled) {
-          setExpectedRows(null)
-          setExpectedReadRows(null)
-          setExpectedRowsIsEstimate(true)
-          setExpectedRowsSource("source")
-        }
-      }
-    }
-    void run()
-    return () => {
-      cancelled = true
-    }
-  }, [effectiveSourceConnectionId, pipelineSelectedTables, lastRunRowCounts, lastRunReadRowCounts, rowCountRefreshTick])
+  }, [pipelineId, state?.execution_id, pipelineSelectedTables.length, tableStatsRefreshTick, effectiveSyncMode])
 
   // UX decision:
   // - On the dedicated "Table statistics" page, ALWAYS show the tables section so users can manage selection.
@@ -827,10 +851,6 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     }
     setTablesError(null)
     setTablesLoading(true)
-    setExpectedRows(null)
-    setExpectedReadRows(null)
-    setExpectedRowsIsEstimate(true)
-    setExpectedRowsSource("source")
     // Avoid showing stale table lists while we fetch fresh metadata.
     // (This especially matters when the modal was previously opened during HITL table selection.)
     setAvailableTables([])
@@ -842,57 +862,6 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
       setAvailableTables(resp.tables || [])
       setTablesTruncatedTotal(truncatedTableTotal(resp))
 
-      // Best-effort expected rows (only if connector provides row_count).
-      // NOTE: For MySQL/Postgres this is often an estimate (TABLE_ROWS / reltuples).
-      let sum = 0
-      let hasAny = false
-      let hasEstimate = false
-      const desired = new Set(pipelineSelectedTables.map((x: any) => String(x || "").trim()).filter(Boolean))
-      // If we don't know which tables are selected, do NOT compute "expected rows" (it becomes misleading).
-      // This happens for older pipelines where table selection wasn't persisted or couldn't be inferred.
-      if (desired.size === 0) {
-        setExpectedRows(null)
-        setExpectedRowsIsEstimate(true)
-        setExpectedRowsSource("source")
-        return
-      }
-      let usedRunCounts = false
-      for (const sel of desired) {
-        const runCount = lastRunRowCounts[sel] ?? lastRunRowCounts[sel.split(".").slice(-1)[0]]
-        if (typeof runCount === "number" && Number.isFinite(runCount) && runCount >= 0) {
-          sum += runCount
-          hasAny = true
-          usedRunCounts = true
-        }
-      }
-      // Read rows are only available from last-run stats; don't mix with estimates.
-      let sumRead = 0
-      let hasRead = false
-      for (const sel of desired) {
-        const runRead = lastRunReadRowCounts[sel] ?? lastRunReadRowCounts[sel.split(".").slice(-1)[0]]
-        if (typeof runRead === "number" && Number.isFinite(runRead) && runRead >= 0) {
-          sumRead += runRead
-          hasRead = true
-        }
-      }
-      for (const t of resp.tables || []) {
-        // If we know which tables are selected, only sum those (avoids summing all tables in the source).
-        const key = `${t.schema ? `${t.schema}.` : ""}${t.name}`.trim()
-        const nameKey = String(t.name || "").trim()
-        if (!desired.has(key) && !desired.has(nameKey)) continue
-        if (typeof (lastRunRowCounts[key] ?? lastRunRowCounts[nameKey]) === "number") continue
-        if (typeof t.row_count === "number" && Number.isFinite(t.row_count) && t.row_count >= 0) {
-          sum += t.row_count
-          hasAny = true
-          hasEstimate = true
-        }
-      }
-      if (hasAny) {
-        setExpectedRows(sum)
-        setExpectedRowsIsEstimate(hasEstimate)
-        setExpectedRowsSource(usedRunCounts && hasEstimate ? "mixed" : usedRunCounts ? "run" : "source")
-      }
-      setExpectedReadRows(hasRead ? sumRead : null)
     } catch (e: any) {
       setTablesError(String(e?.message || e || "Failed to load tables"))
       setAvailableTables([])
@@ -989,7 +958,11 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
           {state?.blocking_reason?.type ? (
             <Badge variant="secondary">{state.blocking_reason.type}</Badge>
           ) : null}
-          {waitingForFirstData && pipelineRuntime?.message ? (
+          {pipelinePaused ? (
+            <span className="text-xs text-muted-foreground" data-testid="pipeline-paused-summary">
+              Paused — no changes stream until you resume the pipeline.
+            </span>
+          ) : waitingForFirstData && pipelineRuntime?.message ? (
             <span className="text-xs text-muted-foreground">{pipelineRuntime.message}</span>
           ) : state?.summary ? (
             <span className="text-xs text-muted-foreground">{state.summary}</span>
@@ -1089,56 +1062,121 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
 
           {variant === "table_stats" ? (
             <TabsContent value="table-stats" className="space-y-3">
-            {/* 
-              Use native vertical scrolling here.
-              Radix ScrollArea can swallow horizontal wheel gestures on nested overflow containers,
-              which makes wide tables (TableStatisticsPanel) feel "not scrollable" left/right.
+            {/*
+              No fixed-height scroll box here. This used to be `h-[500px] overflow-y-auto`
+              around the Tables card, the Summary AND the per-table grid, so past ~10
+              tables the rows — and the grid's horizontal scrollbar — sat below the fold
+              of a box inside the page. The grid now owns its scrolling (sticky header,
+              frozen name column, pages), and the card above it stays short.
             */}
-            <div className="h-[500px] overflow-y-auto pr-2">
+            <div className="space-y-3">
               {showTablesControls ? (
-                <div className="space-y-3 pb-3">
                   <Card className="border-zinc-200 dark:border-zinc-800">
-                    <CardHeader className="space-y-1">
-                      <CardTitle className="text-base">Tables</CardTitle>
-                      <CardDescription>
+                    <CardContent className="space-y-2 p-4">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex min-w-0 flex-wrap items-center gap-2">
+                          <CardTitle className="text-base">Tables</CardTitle>
+                          {displaySelectedTables.length > 0 ? (
+                            <Badge variant="secondary" className="text-xs tabular-nums">
+                              {displaySelectedTables.length} selected
+                            </Badge>
+                          ) : null}
+                        </div>
+                        <div className="flex items-center gap-2">
+                          {displaySelectedTables.length > 0 ? (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              aria-expanded={showSelectedTables}
+                              onClick={() => setShowSelectedTables((v) => !v)}
+                            >
+                              {showSelectedTables ? "Hide list" : "Show list"}
+                            </Button>
+                          ) : null}
+                          <Button size="sm" variant="outline" onClick={openEditTables} disabled={!canOpenTablesModal}>
+                            {isWaitingForTableSelection ? "Select tables" : "Edit tables"}
+                          </Button>
+                        </div>
+                      </div>
+                      <CardDescription className="text-xs">
                         {isWaitingForTableSelection
                           ? "Select what to sync to continue this run."
-                          : "Edit tables for future runs (enabled after a successful run)."}
+                          : effectiveSyncMode === "cdc"
+                            ? "Choose which tables this pipeline streams; you can also load the existing rows of tables you add. To re-read a table that is already streaming, use Re-snapshot tables below."
+                            : "Edit tables for future runs (enabled after a successful run)."}
+                        {!canOpenTablesModal
+                          ? isWaitingForTableSelection
+                            ? " (Waiting for table list…)"
+                            : " (Available after the first successful run.)"
+                          : null}
                       </CardDescription>
-                    </CardHeader>
-                    <CardContent className="space-y-2">
-                      {pipelineDestNamespace ? (
-                        <div className="flex items-center gap-2 rounded-md border border-zinc-200 bg-zinc-50 px-3 py-2 text-sm dark:border-zinc-800 dark:bg-zinc-900/40">
-                          <span className="text-muted-foreground">
-                            Destination {kindMeta(pipelineDestNamespaceKind || "schema").noun.toLowerCase()}:
-                          </span>
-                          <Badge variant="outline" className="font-mono text-xs">
-                            {pipelineDestNamespace}
-                          </Badge>
-                          <span className="text-xs text-muted-foreground">
-                            — tables land here on the destination (e.g. <span className="font-mono">{pipelineDestNamespace}.{displaySelectedTables[0]?.split(".").pop() || "<table>"}</span>)
-                          </span>
+
+                      {cdcEditWarning ? (
+                        <div
+                          role="alert"
+                          className="rounded-md border border-amber-200 bg-amber-50 p-3 text-amber-900 dark:border-amber-900 dark:bg-amber-950/30 dark:text-amber-200"
+                        >
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="text-sm font-medium">{cdcEditWarning.title}</div>
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className="h-6 px-2 text-xs"
+                              onClick={() => setCdcEditWarning(null)}
+                            >
+                              Dismiss
+                            </Button>
+                          </div>
+                          <div className="mt-1 text-xs">{cdcEditWarning.detail}</div>
+                          {cdcEditWarning.warnings && cdcEditWarning.warnings.length > 0 ? (
+                            <ul className="mt-1 list-disc pl-4 text-xs" data-testid="cdc-edit-warnings">
+                              {cdcEditWarning.warnings.map((w) => (
+                                <li key={w}>{w}</li>
+                              ))}
+                            </ul>
+                          ) : null}
+                          {cdcEditWarning.tables && cdcEditWarning.tables.length > 0 ? (
+                            <div className="mt-2 flex flex-wrap gap-1">
+                              {cdcEditWarning.tables.map((t) => (
+                                <Badge key={t} variant="outline" className="font-mono text-xs">
+                                  {t}
+                                </Badge>
+                              ))}
+                            </div>
+                          ) : null}
                         </div>
                       ) : null}
 
-                      {displaySelectedTables.length > 0 ? (
-                        <div className="flex flex-wrap gap-2">
-                          {displaySelectedTables.slice(0, 20).map((t) => (
+                      {pipelineDestNamespace && destFolderExample ? (
+                        <div className="text-xs text-muted-foreground" data-testid="destination-folder-example">
+                          Destination {kindMeta(pipelineDestNamespaceKind || "path").noun.toLowerCase()}:{" "}
+                          <span className="font-mono text-zinc-900 dark:text-zinc-100">{pipelineDestNamespace}</span>
+                          {" "}— each table is written to its own folder (e.g.{" "}
+                          <span className="font-mono break-all">{destFolderExample}</span>)
+                        </div>
+                      ) : pipelineDestNamespace ? (
+                        <div className="text-xs text-muted-foreground">
+                          Destination {kindMeta(pipelineDestNamespaceKind || "schema").noun.toLowerCase()}:{" "}
+                          <span className="font-mono text-zinc-900 dark:text-zinc-100">{pipelineDestNamespace}</span>
+                          {" "}— tables land here on the destination (e.g. <span className="font-mono">{pipelineDestNamespace}.{displaySelectedTables[0]?.split(".").pop() || "<table>"}</span>)
+                        </div>
+                      ) : null}
+
+                      {/* Collapsed by default: at 25+ tables the badge cloud pushed the
+                          statistics off screen, and the grid below lists every table anyway. */}
+                      {showSelectedTables && displaySelectedTables.length > 0 ? (
+                        <div className="flex max-h-40 flex-wrap gap-2 overflow-auto rounded-md border border-zinc-200 p-2 dark:border-zinc-800">
+                          {displaySelectedTables.map((t) => (
                             <Badge key={t} variant="secondary" className="font-mono text-xs">
                               {t}
                             </Badge>
                           ))}
-                          {displaySelectedTables.length > 20 ? (
-                            <Badge variant="outline" className="text-xs">
-                              +{displaySelectedTables.length - 20} more
-                            </Badge>
-                          ) : null}
                         </div>
                       ) : null}
 
                       {typeof latestRowMetrics?.read === "number" || typeof latestRowMetrics?.written === "number" ? (
                         <div className="text-xs text-muted-foreground">
-                          Latest data-plane rows:
+                          {effectiveSyncMode === "cdc" ? "Latest data-plane rows:" : "Rows this run:"}
                           {typeof latestRowMetrics.read === "number" ? (
                             <>
                               {" "}
@@ -1153,54 +1191,17 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
                           ) : null}
                         </div>
                       ) : null}
-                      {typeof expectedRows === "number" ? (
-                        <div className="text-xs text-muted-foreground">
-                          {expectedRowsSource === "run"
-                            ? "Rows written (last run): "
-                            : expectedRowsSource === "mixed"
-                              ? "Rows written (mixed: last run + estimate): "
-                              : `Expected rows (source, ${expectedRowsIsEstimate ? "estimate" : "exact"}): `}
-                          <span className="font-mono">{Math.round(expectedRows)}</span>
-                          {typeof expectedReadRows === "number" && expectedRowsSource !== "source" ? (
-                            <>
-                              <span className="ml-3">Rows read (last run): </span>
-                              <span className="font-mono">{Math.round(expectedReadRows)}</span>
-                            </>
-                          ) : null}
-                        {typeof latestRowMetrics?.written === "number" &&
-                        expectedRowsSource === "source" &&
-                        !expectedRowsIsEstimate &&
-                        Math.round(expectedRows) !== Math.round(latestRowMetrics.written) ? (
-                            <span className="ml-2 text-yellow-700 dark:text-yellow-300">
-                              (mismatch: {Math.round(latestRowMetrics.written) - Math.round(expectedRows)})
-                            </span>
-                          ) : null}
-                        </div>
-                      ) : null}
 
-                      <div className="flex gap-2">
-                        <Button size="sm" variant="outline" onClick={openEditTables} disabled={!canOpenTablesModal}>
-                          {isWaitingForTableSelection ? "Select tables" : "Edit tables"}
-                        </Button>
-                        {!canOpenTablesModal ? (
-                          <div className="text-xs text-muted-foreground self-center">
-                            {isWaitingForTableSelection
-                              ? "(Waiting for table list…)"
-                              : "(Available after the first successful run.)"}
-                          </div>
-                        ) : null}
-                      </div>
                       {tablesLoading ? <div className="text-xs text-muted-foreground">Loading tables…</div> : null}
                       {tablesError ? <div className="text-xs text-red-600">{tablesError}</div> : null}
                     </CardContent>
                   </Card>
-                </div>
               ) : null}
 
               <TableStatisticsPanel
                 pipelineId={pipelineId}
                 executionId={state?.execution_id}
-                pipelineStatus={state?.status}
+                pipelineStatus={reconciledStatus}
                 blockingReasonType={state?.blocking_reason?.type ?? state?.blocking_reason_type}
                 mode={effectiveSyncMode ?? undefined}
               />
@@ -1233,11 +1234,37 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
 
           // 2) CDC: update Debezium connector (and persist config).
           if (effectiveSyncMode === "cdc") {
-            await updatePipelineCDCTables(pipelineId, tables, { backfill_newly_added: cdcBackfillNewTables })
+            // Don't ask for a backfill the capability check already said will
+            // be refused; the outcome below still says the rows were not loaded.
+            const result = await updatePipelineCDCTables(pipelineId, tables, {
+              backfill_newly_added: cdcBackfillNewTables && !cdcBackfillUnavailableDetail,
+            })
+            // The gateway answers 200 even when the backfill was refused (the
+            // table list DID change), so the result has to be read, not assumed.
+            // An older gateway does not name the removed tables (#16) or say the
+            // pipeline is paused (#17): both are worked out here as a fallback.
+            const stillSelected = makeTableMatcher(tables)
+            const removed = pipelineSelectedTables.filter((t) => !stillSelected(t))
+            const outcome = describeTableEditResult(result, {
+              unavailableDetail: cdcBackfillUnavailableDetail,
+              removed,
+              paused: pipelinePaused,
+            })
+            setCdcEditWarning(outcome.tone === "warning" ? outcome : null)
+            const notify =
+              outcome.tone === "warning" ? toast.warning : outcome.tone === "info" ? toast.info : toast.success
+            notify(outcome.title, {
+              description: [outcome.detail, ...(outcome.warnings || [])].filter(Boolean).join(" "),
+              duration: outcome.tone === "warning" ? 15000 : undefined,
+            })
             setPipelineSelectedTables(tables)
             setShowEditTables(false)
-            fetchState()
-            fetchEvents()
+            // #15: the Table statistics card and the Re-snapshot card fetch on
+            // their own and stayed stale until a reload; the refresh bus reaches
+            // them (and this panel's own onRefresh). The tick re-reads the table
+            // stats behind "previously loaded".
+            emitPipelineRefresh(pipelineId)
+            setTableStatsRefreshTick((n) => n + 1)
             return
           }
 
@@ -1260,6 +1287,14 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
         showCdcBackfillToggle={effectiveSyncMode === "cdc" && !isWaitingForTableSelection}
         cdcBackfillNewTables={cdcBackfillNewTables}
         onCdcBackfillNewTablesChange={setCdcBackfillNewTables}
+        cdcBackfillUnavailableDetail={cdcBackfillUnavailableDetail}
+        cdcBackfillBlockingOnly={isBlockingOnly(cdcBackfillCapability)}
+        cdcBackfillObjectStorage={
+          (cdcBackfillCapability.state === "supported" && cdcBackfillCapability.objectStorage === true) ||
+          isObjectStorageDestination(pipelineDestType ?? undefined)
+        }
+        pipelineStatus={pipelinePaused ? "paused" : reconciledStatus}
+        previouslyLoadedTables={removedTables}
         availableTables={(availableTables || []).map((t) => ({
           name: t.name,
           schema: t.schema,

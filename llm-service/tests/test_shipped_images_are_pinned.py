@@ -20,6 +20,20 @@ floating tag cannot be introduced anywhere in the delivery surface.
 WHAT COUNTS AS FLOATING. `:latest` explicitly, any of the other conventional
 moving aliases, and -- the sneakiest form -- NO TAG AT ALL, which Docker
 resolves to `:latest` while reading in a diff as if it were a considered choice.
+A registry that publishes nothing but moving tags can still be pinned, by
+digest. Chainguard's registry serves only `latest` anonymously, so the MinIO
+image (server and `mc` jobs alike) is written `@sha256:...` on the delivery
+surface, while the e2e fixtures in ALLOWLIST float on its `latest`.
+
+A PIN FIXES WHICH BUILD ARRIVES, NOT WHAT IS IN IT. The MinIO image that replaced
+the walled one ships `mc`, a shell and coreutils, and no curl, wget, nc,
+busybox, grep or find. A healthcheck copied from another service or an older
+branch -- `curl -f .../minio/health/live` was the e2e fixture's until the swap
+-- then never passes, and everything that waits on `service_healthy` never
+starts: minio-init in the e2e stack, minio-lifecycle-init and minio-mcp in the
+base one. Nothing about that is visible to a test that only reads tags, so
+IMAGE_TOOLS records what each such image ships and every healthcheck and init
+script that runs in it is checked against that, in compose and in the chart.
 
 FIRST-PARTY IMAGES ARE OUT OF SCOPE, DELIBERATELY. `ghcr.io/rsync-ai/*` images
 are written `:${RSYNC_VERSION:-latest}` by convention, and install.sh derives
@@ -46,6 +60,7 @@ import fnmatch
 import glob
 import os
 import re
+import shutil
 import subprocess
 
 import pytest
@@ -321,33 +336,328 @@ def test_every_allowlisted_entry_actually_needed_the_exemption():
 
 
 # --------------------------------------------------------------------------
+# What the image can run. See "A PIN FIXES WHICH BUILD ARRIVES" above.
+# --------------------------------------------------------------------------
+
+# Image repository (tag and digest stripped) -> what it ships. Read off the image,
+# not assumed -- 2026-09-26, the digest the delivery surface pins:
+#   docker run --rm --entrypoint /bin/sh cgr.dev/chainguard/minio@sha256:bd0143... \
+#     -c 'for t in mc curl wget nc busybox grep find; do command -v $t || echo MISSING $t; done'
+# `probes` is what a healthcheck may run. `lacks` is what nothing may run: the
+# tools a healthcheck or a wait loop reaches for by habit that this image does not
+# have. Extend either set only from a listing like the one above.
+IMAGE_TOOLS = {
+    "cgr.dev/chainguard/minio": {
+        "probes": frozenset({"mc"}),
+        "lacks": frozenset({"curl", "wget", "nc", "busybox", "grep", "find"}),
+    },
+}
+
+CHART_DIR = os.path.join(REPO_ROOT, "deploy", "helm", "rsync-ai")
+
+# Allowed in a CMD-SHELL healthcheck on top of `probes`: the shell supplies them.
+_SHELL_BUILTINS = frozenset({"exit", "test", "[", "true", "false", "echo", ":"})
+
+# Words that open a clause rather than name a command, and commands that run the
+# next word as the real one -- `timeout 3 curl ...` runs curl. Every wrapper here
+# is in the image above (coreutils, or a bash builtin/keyword).
+_RESERVED = frozenset({"if", "then", "else", "elif", "fi", "do", "done", "while", "until", "!", "{", "}"})
+_WRAPPERS = frozenset({"exec", "command", "time", "timeout", "nohup", "nice", "env", "stdbuf"})
+_ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_WRAPPER_ARG = re.compile(r"^(?:-.*|\d+(?:\.\d+)?[smhd]?)$")
+
+# `["CMD", "/bin/sh", "-c", "<script>"]` is a shell healthcheck spelled as exec,
+# and so is a k8s exec probe written that way; judge the script, not the shell.
+_SHELLS = frozenset({"sh", "bash"})
+_SHELL_C = re.compile(r"^-[a-z]*c[a-z]*$")
+
+_COMMENT = re.compile(r"(?m)(?:^|(?<=\s))#.*$")
+_QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+_ARITHMETIC = re.compile(r"\$\(\([^)]*\)\)")
+_REDIRECT = re.compile(r"\d*(?:&?>{1,2}|<{1,3})&?[\d-]*")
+_SEPARATOR = re.compile(r"&&|\|\||\$\(|[;&|()`\n]")
+
+
+def _repo_of(image):
+    """`host/repo:tag` or `host/repo@sha256:...` -> `host/repo`."""
+    head, _, last = image.split("@", 1)[0].rpartition("/")
+    return f"{head}/{last.split(':', 1)[0]}" if head else last.split(":", 1)[0]
+
+
+def _unwrap(words):
+    """-> the command a list of words runs, past keywords, `VAR=x` and wrappers."""
+    words = list(words)
+    while words:
+        if words[0] in _RESERVED or _ASSIGNMENT.match(words[0]):
+            words.pop(0)
+        elif os.path.basename(words[0]) in _WRAPPERS:
+            words.pop(0)
+            while words and (_WRAPPER_ARG.match(words[0]) or _ASSIGNMENT.match(words[0])):
+                words.pop(0)
+        else:
+            return os.path.basename(words[0])
+    return None
+
+
+def _commands(script):
+    """-> every command a shell script runs, in order.
+
+    A lexer, not a shell: it finds the word in command position of each clause,
+    which is all the checks below ask. Comments go first (an apostrophe in one
+    would otherwise open a quote), then quoted text -- `echo "no curl here"` runs
+    echo -- so `mc find` is mc and `# curl ...` is nothing. Compose's `$$` is
+    the shell's `$`, which makes `$$(curl ...)` a substitution that runs curl.
+    """
+    s = script.replace("$$", "$").replace("\\\n", " ")
+    s = _COMMENT.sub("", s)
+    s = _QUOTED.sub("''", s)
+    s = _ARITHMETIC.sub("0", s)
+    s = _REDIRECT.sub(" ", s)
+    return [c for c in (_unwrap(part.split()) for part in _SEPARATOR.split(s)) if c]
+
+
+def _healthcheck_misses(test, tools):
+    """-> what this healthcheck runs that the image cannot; [] when it can run.
+
+    Judged against `probes`, an allowlist: a healthcheck is one command, and one
+    that is not the image's own probe is a copy from somewhere else.
+    """
+    if isinstance(test, str):
+        test = ["CMD-SHELL", test]
+    if not test or test[0] == "NONE":
+        return []
+    argv = [str(a) for a in test[1:]]
+    if test[0] == "CMD" and len(argv) > 2 and os.path.basename(argv[0]) in _SHELLS and _SHELL_C.match(argv[1]):
+        test = ["CMD-SHELL", argv[2]]
+    if test[0] == "CMD":
+        ran, allowed = [_unwrap(test[1:])], tools["probes"]
+    else:
+        ran, allowed = _commands(" ".join(test[1:])), tools["probes"] | _SHELL_BUILTINS
+    ran = [c for c in ran if c]
+    if not ran:
+        return ["<no command found>"]
+    return [c for c in ran if c not in allowed]
+
+
+def _lacking(values, tools):
+    """-> the tools the image lacks that these entrypoint/command values run.
+
+    Each value may be a string or a list of them, as compose writes both forms.
+    """
+    strings = [x for v in values for x in (v if isinstance(v, list) else [v]) if isinstance(x, str)]
+    return sorted({c for s in strings for c in _commands(s) if c in tools["lacks"]})
+
+
+def _services_running_a_listed_image():
+    """-> [(file, service, repo, spec)] for every compose service an IMAGE_TOOLS image runs.
+
+    A service that names no `image:` and no `build:` is an overlay fragment: it
+    runs whatever image the file it merges onto gives that name, so it is judged
+    against every image any compose file gives it. docker-compose.prod.yml and
+    docker-compose.ci-isolate.yml both carry a `minio` like that; a healthcheck
+    added there runs in the MinIO image all the same, and a per-file check that
+    asked only for `image:` would never look at it.
+    """
+    docs = {name: _load_compose(name) for name in _compose_files()}
+    named = {}
+    for doc in docs.values():
+        for svc, spec in (doc.get("services") or {}).items():
+            if isinstance(spec, dict) and isinstance(spec.get("image"), str):
+                named.setdefault(svc, set()).add(_repo_of(spec["image"].strip()))
+    out = []
+    for name, doc in docs.items():
+        for svc, spec in (doc.get("services") or {}).items():
+            if not isinstance(spec, dict) or ("build" in spec and "image" not in spec):
+                continue
+            if isinstance(spec.get("image"), str):
+                repos = {_repo_of(spec["image"].strip())}
+            else:
+                repos = named.get(svc, set())
+            out.extend((name, svc, repo, spec) for repo in sorted(repos & IMAGE_TOOLS.keys()))
+    return out
+
+
+def _chart_templates_naming_a_listed_image():
+    """-> the chart templates that render an IMAGE_TOOLS image, repo-relative."""
+    keys = {k for _, k, img in _chart_image_refs() if _repo_of(img) in IMAGE_TOOLS}
+    out = set()
+    for path in glob.glob(os.path.join(CHART_DIR, "templates", "**", "*"), recursive=True):
+        if os.path.isfile(path):
+            with open(path) as fh:
+                if any(f".Values.{k}" in fh.read() for k in keys):
+                    out.add(os.path.relpath(path, REPO_ROOT))
+    return out
+
+
+# The chart marks these required. A render that errors would leave the chart case
+# below with nothing to judge, so it asserts the render instead of skipping.
+_CHART_REQUIRED = [
+    "secrets.jwtSecret=FAKEPLACEHOLDER",
+    "secrets.encryptionKey=FAKEPLACEHOLDERFAKEPLACEHOLDER32",
+    "secrets.postgresPassword=FAKEPLACEHOLDER",
+    "secrets.minioAccessKey=FAKEPLACEHOLDER",
+    "secrets.minioSecretKey=FAKEPLACEHOLDER",
+    "secrets.redisPassword=FAKEPLACEHOLDER",
+    "frontend.apiUrl=https://rsync.example.com",
+    "frontend.publicUrl=https://rsync.example.com",
+]
+
+
+def _pod_spec(doc):
+    if not isinstance(doc, dict):
+        return {}
+    spec = doc.get("spec") or {}
+    if doc.get("kind") == "CronJob":
+        spec = (spec.get("jobTemplate") or {}).get("spec") or {}
+    if doc.get("kind") == "Pod":
+        return spec
+    return (spec.get("template") or {}).get("spec") or {}
+
+
+@pytest.mark.parametrize(
+    "script,command,runs",
+    [
+        # Controls that must be SEEN. Without them a lexer returning [] passes
+        # every case below while checking nothing.
+        ("until curl -sf http://minio:9000/minio/health/live; do sleep 2; done", "curl", True),
+        ("timeout 3 wget -qO- http://minio:9000 >/dev/null 2>&1 || exit 1", "wget", True),
+        ("if ! nc -z minio 9000; then exit 1; fi", "nc", True),
+        ("ok=$$(busybox wget -q -O- http://minio:9000)", "busybox", True),
+        ("/usr/bin/curl -f http://localhost:9000/minio/health/live", "curl", True),
+        ("set -e\nmc alias set local http://minio:9000 a b \\\n  || curl -f http://x", "curl", True),
+        # ... and ones that must NOT be.
+        ('echo "curl is not in this image"', "curl", False),
+        ("mc find local/b --name '*.parquet' | head -1", "find", False),
+        ("# curl http://minio:9000 -- don't\nmc ready local", "curl", False),
+    ],
+)
+def test_the_command_lexer_sees_what_a_script_runs(script, command, runs):
+    assert (command in _commands(script)) is runs, (
+        f"_commands({script!r}) = {_commands(script)}; expected `{command}` "
+        f"{'among' if runs else 'absent from'} them"
+    )
+
+
+@pytest.mark.parametrize(
+    "test,misses",
+    [
+        (["CMD", "mc", "ready", "local"], []),
+        (["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"], ["curl"]),
+        (["CMD", "/bin/sh", "-c", "mc ready local || exit 1"], []),
+        (["CMD", "/bin/sh", "-lc", "wget -qO- http://localhost:9000/minio/health/live"], ["wget"]),
+        (["CMD-SHELL", "curl -f http://localhost:9000/minio/health/live || exit 1"], ["curl"]),
+        ("mc ready local", []),
+        (["NONE"], []),
+    ],
+)
+def test_a_healthcheck_is_judged_by_what_it_runs(test, misses):
+    tools = IMAGE_TOOLS["cgr.dev/chainguard/minio"]
+    assert _healthcheck_misses(test, tools) == misses
+
+
+def test_the_tool_check_has_subjects():
+    """The denominators for the two cases below."""
+    svcs = _services_running_a_listed_image()
+    assert len(svcs) >= 5, f"only {len(svcs)} compose services run an IMAGE_TOOLS image: {svcs}"
+    probed = [s for s in svcs if "test" in (s[3].get("healthcheck") or {})]
+    assert len(probed) >= 3, f"only {len(probed)} of them carry a healthcheck to judge: {probed}"
+    assert _chart_templates_naming_a_listed_image(), "no chart template renders an IMAGE_TOOLS image"
+
+
+@pytest.mark.parametrize(
+    "compose_file,service,repo,spec",
+    [pytest.param(f, s, r, sp, id=f"{f}::{s}") for f, s, r, sp in _services_running_a_listed_image()],
+)
+def test_no_compose_service_runs_a_tool_its_image_lacks(compose_file, service, repo, spec):
+    tools = IMAGE_TOOLS[repo]
+    problems = []
+    hc = spec.get("healthcheck")
+    if isinstance(hc, dict) and not hc.get("disable") and "test" in hc:
+        bad = _healthcheck_misses(hc["test"], tools)
+        if bad:
+            problems.append(
+                f"healthcheck {hc['test']!r} runs {bad}; in this image a healthcheck "
+                f"may run only {sorted(tools['probes'])} (e.g. [\"CMD\", \"mc\", \"ready\", \"local\"])"
+            )
+    lacking = _lacking([spec.get("entrypoint"), spec.get("command")], tools)
+    if lacking:
+        problems.append(f"entrypoint/command runs {lacking}, which the image does not ship")
+    assert not problems, (
+        f"{compose_file} service '{service}' runs in `{repo}`, which has "
+        f"no {', '.join(sorted(tools['lacks']))}:\n  " + "\n  ".join(problems) + "\n"
+        f"A healthcheck that cannot run never passes, so every service waiting on "
+        f"`service_healthy` never starts; a wait loop on a missing tool spins forever."
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_no_chart_container_runs_a_tool_its_image_lacks():
+    cmd = ["helm", "template", "r", CHART_DIR]
+    for v in _CHART_REQUIRED:
+        cmd += ["--set", v]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    assert proc.returncode == 0, f"helm template failed:\n{proc.stderr[-3000:]}"
+    checked, problems = 0, []
+    for doc in yaml.safe_load_all(proc.stdout):
+        pod = _pod_spec(doc)
+        for c in (pod.get("initContainers") or []) + (pod.get("containers") or []):
+            repo = _repo_of(c.get("image") or "")
+            if repo not in IMAGE_TOOLS:
+                continue
+            checked += 1
+            tools = IMAGE_TOOLS[repo]
+            where = f"{doc['kind']}/{doc['metadata']['name']} container '{c['name']}'"
+            for probe in ("livenessProbe", "readinessProbe", "startupProbe"):
+                argv = ((c.get(probe) or {}).get("exec") or {}).get("command")
+                if argv and _healthcheck_misses(["CMD", *argv], tools):
+                    problems.append(f"{where} {probe} runs {argv!r}; allowed: {sorted(tools['probes'])}")
+            lacking = _lacking([c.get("command"), c.get("args")], tools)
+            if lacking:
+                problems.append(f"{where} command/args run {lacking}, which `{repo}` does not ship")
+    # Two today: the server StatefulSet and the bucket hook Job.
+    assert checked >= 2, f"only {checked} rendered containers run an IMAGE_TOOLS image"
+    assert not problems, "\n".join(problems)
+
+
+# --------------------------------------------------------------------------
 # Reach. Everything above is worthless on a PR that does not run it.
 # --------------------------------------------------------------------------
 
 CI_WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "ci.yml")
 
 
+# The filters left ci.yml with the `changes` job -- see "Why there is no
+# `changes` job" in ci.yml. This file is now the one definition.
+CI_FILTERS = os.path.join(REPO_ROOT, ".github", "paths-filters.yml")
+
+
 def _llm_filter_patterns():
     """-> the `llm` paths-filter patterns that decide whether this file runs.
 
-    ci.yml gates `llm-service-unit` on `needs.changes.outputs.llm == 'true'`,
-    and that output is the `llm` key of the dorny/paths-filter step's inline
-    `filters` block -- a YAML string nested inside the workflow YAML.
+    `llm-service-unit` runs dorny/paths-filter against CI_FILTERS itself and
+    gates every step on `steps.filter.outputs.llm`; the `llm` key of that file
+    is therefore the list that decides whether this file executes at all.
     """
-    doc = yaml.safe_load(open(CI_WORKFLOW))
-    job = doc["jobs"]["changes"]
-    step = next(
-        st for st in job["steps"]
-        if "paths-filter" in str(st.get("uses", "")) and "filters" in (st.get("with") or {})
-    )
-    return yaml.safe_load(step["with"]["filters"])["llm"]
+    return yaml.safe_load(open(CI_FILTERS))["llm"]
 
 
 def test_the_llm_job_is_still_the_one_gated_on_that_filter():
     """The premise of the next test: change the gate and it stops meaning anything."""
     doc = yaml.safe_load(open(CI_WORKFLOW))
     job = doc["jobs"]["llm-service-unit"]
-    assert "needs.changes.outputs.llm == 'true'" in str(job.get("if", "")), (
+    # Two halves, and both are needed. The job must still consult the `llm`
+    # filter, AND it must consult it from CI_FILTERS -- a job pointing
+    # dorny/paths-filter at some other `filters:` would make the patterns read
+    # above describe a list CI does not use.
+    assert any(
+        (st.get("with") or {}).get("filters") == ".github/paths-filters.yml"
+        for st in job["steps"]
+    ), (
+        "llm-service-unit no longer runs dorny/paths-filter against "
+        ".github/paths-filters.yml, so the patterns read from that file decide "
+        "nothing here."
+    )
+    assert "steps.filter.outputs.llm == 'true'" in yaml.safe_dump(job), (
         "llm-service-unit is no longer gated on the `llm` paths filter, so the "
         "reach test below is asserting against a filter that decides nothing. "
         "Point it at whatever gates the job now."
@@ -361,6 +671,7 @@ def test_the_llm_job_is_still_the_one_gated_on_that_filter():
     [pytest.param(f, id=f) for f in sorted(
         set(_compose_files())
         | {f for f, _, _ in _chart_image_refs()}
+        | _chart_templates_naming_a_listed_image()
     )],
 )
 def test_the_ci_filter_covers_every_file_this_guard_reads(subject):
@@ -374,9 +685,9 @@ def test_the_ci_filter_covers_every_file_this_guard_reads(subject):
     pats = _llm_filter_patterns()
     assert any(fnmatch.fnmatch(subject, p) for p in pats), (
         f"`{subject}` is read by this guard, but no `llm` paths-filter pattern in "
-        f"ci.yml matches it. A PR touching only that file would skip "
+        f".github/paths-filters.yml matches it. A PR touching only that file would skip "
         f"llm-service-unit, so the guard would not run on exactly the change it "
         f"exists to catch -- and a skipped check reads as a passing one.\n"
-        f"Add a pattern covering it to the `llm:` filter in {os.path.relpath(CI_WORKFLOW, REPO_ROOT)}.\n"
+        f"Add a pattern covering it to the `llm:` filter in {os.path.relpath(CI_FILTERS, REPO_ROOT)}.\n"
         f"Patterns today: {pats}"
     )

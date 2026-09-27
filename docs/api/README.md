@@ -215,8 +215,9 @@ session auth → email-verified gate → CSRF → rate limiting
 
 - `GET /pii/scan/results`
 - `GET /pii/scan/results/:pipeline_id`
-- `POST /pii/scan`
+- `POST /pii/scan` — sends column names and types only, never row values
 - `GET /pii/scan/jobs/:id`
+- `GET /pii/masked-columns` — columns the workspace's pipelines mask or hash, read from their saved transforms (read-only)
 - `GET /pii/approvals`
 - `POST /pii/approvals`
 - `POST /pii/approvals/:id/decide`
@@ -282,7 +283,6 @@ session auth → email-verified gate → CSRF → rate limiting
 - `GET /explorer/export.csv` (legacy)
 - `POST /explorer/export`
 - `POST /explorer/share/slack`
-- `POST /explorer/share/email`
 
 ### Admin — `/api/v1/admin` *(admin role required)*
 
@@ -374,7 +374,7 @@ authenticated. A guard test keeps them gone.
 - `GET /health/connector-versions`
 - `POST /health/connector-versions/refresh`
 
-### Consumers — `/api/v1/consumers` *(only registered when `ENABLE_CONSUMER_AGENT=true`, the default)*
+### Consumers — `/api/v1/consumers` *(only registered when `ENABLE_CONSUMER_AGENT=true`; off by default since v0.1.6)*
 
 - `GET /consumers/status` · `POST /consumers/start` · `POST /consumers/stop`
 - `POST /consumers/consumers/spawn` · `POST /consumers/consumers/terminate` · `POST /consumers/consumers/restart`
@@ -402,7 +402,7 @@ authenticated. A guard test keeps them gone.
 
 ### Topology — `/api/v1/topology` *(only registered when the topology manager is enabled)*
 
-- `POST /topology/topics` · `POST /topology/topics/pipeline`
+- `POST /topology/topics`
 - `GET /topology/topics` · `GET /topology/topics/:name` · `DELETE /topology/topics/:name`
 - `PUT /topology/topics/:name/partitions`
 - `GET /topology/calculate-partitions`

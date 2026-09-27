@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IBM/sarama"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -98,12 +97,8 @@ func NewConnectionValidatorWorker(kafkaManager *kafka.Manager, db *sql.DB, tools
 	}
 }
 
-// AgentName returns the worker name
-func (w *ConnectionValidatorWorker) AgentName() string {
-	return "connection_validator"
-}
-
-// Start begins consuming tasks
+// Start begins claiming "connection_validator" requests from the Redis
+// correlation store (startRedisPoller).
 func (w *ConnectionValidatorWorker) Start() error {
 	log.Info("🚀 Starting Connection Validator Worker")
 
@@ -111,12 +106,8 @@ func (w *ConnectionValidatorWorker) Start() error {
 	if w.correlationClient != nil {
 		go w.startRedisPoller()
 		log.Info("✅ ConnectionValidatorWorker: Redis poller started for V2 correlation requests")
-	}
-
-	// Consume from dedicated topic (no consumer group = no rebalancing)
-	err := w.kafkaManager.ConsumeWithContext("agent.control.commands.connection_validator", w.handleTask)
-	if err != nil {
-		return fmt.Errorf("failed to consume agent.control.commands: %w", err)
+	} else {
+		log.Warn("⚠️  ConnectionValidatorWorker: Correlation client not initialized - V2 workflows will not work")
 	}
 
 	log.Info("✅ Connection Validator Worker started")
@@ -132,41 +123,6 @@ func (w *ConnectionValidatorWorker) Stop() {
 	if w.executorAgent != nil {
 		w.executorAgent.Stop()
 	}
-}
-
-// handleTask processes incoming task assignments
-func (w *ConnectionValidatorWorker) handleTask(ctx context.Context, msg *sarama.ConsumerMessage) error {
-	var assignment Task
-	if err := json.Unmarshal(msg.Value, &assignment); err != nil {
-		log.WithError(err).Error("Failed to unmarshal task assignment")
-		return err
-	}
-
-	// V2 tasks are handled by the Redis correlation poller; the Kafka path is V1-only.
-	// Skipping here prevents double-execution (see KI-HYBRID-1).
-	if assignment.CorrelationID != "" {
-		return nil
-	}
-
-	// Filter: only process connection validation tasks
-	if assignment.TaskType != "validate_connection" {
-		return nil // Not for us
-	}
-
-	log.WithFields(log.Fields{
-		"pipeline_id": assignment.PipelineID,
-		"task_id":     assignment.TaskID,
-	}).Info("🔐 Processing connection validation task")
-
-	result, err := w.ProcessTask(ctx, assignment)
-	if err != nil {
-		log.WithError(err).Error("Connection validation failed")
-		result.Status = "failed"
-		result.Error = err.Error()
-	}
-
-	// Route result to correlation store (V2) or Kafka (V1)
-	return RouteResult(ctx, assignment, result, w.kafkaManager)
 }
 
 // ProcessTask implements the connection validation logic

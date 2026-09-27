@@ -34,18 +34,28 @@ type sinkDrainState struct {
 // that went backwards (the group was reset or recreated), because neither says how long
 // the sink has been stuck. Having no backlog also restarts the clock, so a burst that lands
 // just before a tick on a sink idle for hours is not reported as hours of being stuck.
-func decideSinkDrainAlarm(prev sinkDrainState, seen bool, committed int64, lagging bool, now time.Time, stallAfter time.Duration) (sinkDrainState, bool) {
+// The third return, `moved`, is narrower than the alarm and is reported separately
+// because the UI needs the raw fact, not the verdict. It says only "this reading's
+// committed offset differs from the previous one" -- so it is false on the FIRST
+// reading for a pipeline (nothing to compare against) and false when the offset went
+// backwards (a reset group), neither of which is evidence the sink is working. It is
+// what lets a tile distinguish a sink chewing through a first load from a sink that
+// has died, and it is deliberately independent of `lagging`: a caught-up sink with
+// nothing to do is not moving, and that is not a fault.
+func decideSinkDrainAlarm(prev sinkDrainState, seen bool, committed int64, lagging bool, now time.Time, stallAfter time.Duration) (sinkDrainState, bool, bool) {
+	moved := seen && committed > prev.committed
 	next := sinkDrainState{committed: committed, movingAt: prev.movingAt}
 	if !seen || !lagging || committed != prev.committed {
 		next.movingAt = now
-		return next, false
+		return next, false, moved
 	}
-	return next, now.Sub(prev.movingAt) >= stallAfter
+	return next, now.Sub(prev.movingAt) >= stallAfter, moved
 }
 
 // observeSinkDrain records this tick's committed position for a pipeline and returns
-// whether its sink-lag alarm should be raised, and for how long the sink has not moved.
-func (s *CDCSentinel) observeSinkDrain(pipelineID string, committed int64, lagging bool, now time.Time) (bool, time.Duration) {
+// whether its sink-lag alarm should be raised, for how long the sink has not moved,
+// and whether its committed offset advanced since the previous reading.
+func (s *CDCSentinel) observeSinkDrain(pipelineID string, committed int64, lagging bool, now time.Time) (bool, time.Duration, bool) {
 	stallAfter := walDurationFromEnv("CDC_SINK_DRAIN_STALL_AFTER", DefaultSinkDrainStallAfter)
 
 	s.mu.Lock()
@@ -54,7 +64,7 @@ func (s *CDCSentinel) observeSinkDrain(pipelineID string, committed int64, laggi
 		s.sinkDrain = make(map[string]sinkDrainState)
 	}
 	prev, seen := s.sinkDrain[pipelineID]
-	next, alarm := decideSinkDrainAlarm(prev, seen, committed, lagging, now, stallAfter)
+	next, alarm, moved := decideSinkDrainAlarm(prev, seen, committed, lagging, now, stallAfter)
 	s.sinkDrain[pipelineID] = next
-	return alarm, now.Sub(next.movingAt)
+	return alarm, now.Sub(next.movingAt), moved
 }

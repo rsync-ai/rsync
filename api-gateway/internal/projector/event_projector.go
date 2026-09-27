@@ -766,7 +766,7 @@ func (p *EventProjector) storeRunEvent(msg kafka.Message, raw map[string]interfa
 		p.noteEnvelopeGap(raw, "event_id")
 	}
 
-	// seq: prefer payload.seq; else assign projector-local increment per execution_id.
+	// seq: prefer payload.seq; else invent one on the producers' scale (inventSeq).
 	var seq int64
 	if v, ok := raw["seq"]; ok && v != nil {
 		switch tv := v.(type) {
@@ -783,12 +783,7 @@ func (p *EventProjector) storeRunEvent(msg kafka.Message, raw map[string]interfa
 		}
 	}
 	if seq == 0 && executionID != "" {
-		p.seqMu.Lock()
-		last := p.lastSeq[executionID]
-		next := last + 1
-		p.lastSeq[executionID] = next
-		p.seqMu.Unlock()
-		seq = next
+		seq = p.inventSeq(executionID, receivedAt)
 		p.noteEnvelopeGap(raw, "seq")
 	}
 
@@ -840,6 +835,28 @@ func (p *EventProjector) storeRunEvent(msg kafka.Message, raw map[string]interfa
 		return false, nil
 	}
 	return n == 1, nil
+}
+
+// inventSeq supplies seq for an event whose producer left it out. It derives the value
+// the way every producer does (kafkaclient.DomainEventSeq, UnixNano) because readers
+// order by (occurred_at, seq) and occurred_at is often whole-second: an invented
+// per-execution counter of 3 sorts below a producer's 1.7e18 on every tie, so an event
+// that arrived last was drawn first. On prod (2026-09-26) one batch run carried
+// counter values 1–26 on its TABLE_STATS, executor STAGE_PROGRESS and
+// DATA_PLANE_METRICS rows, interleaved with nanosecond stamps on everything else.
+//
+// Arrival time stands in for production time; it trails it only by transport latency.
+// The value stays strictly increasing per execution, so two events that arrive within
+// the same nanosecond keep their arrival order.
+func (p *EventProjector) inventSeq(executionID string, receivedAt time.Time) int64 {
+	next := kafkaclient.DomainEventSeq(receivedAt)
+	p.seqMu.Lock()
+	defer p.seqMu.Unlock()
+	if last := p.lastSeq[executionID]; next <= last {
+		next = last + 1
+	}
+	p.lastSeq[executionID] = next
+	return next
 }
 
 // noteEnvelopeGap records that a producer left an envelope field off an event and
@@ -1012,6 +1029,14 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 	// CDC applied counters (destination-truth)
 	var appliedInserts, appliedUpdates, appliedDeletes, appliedTotalEvents sql.NullInt64
 	var lastAppliedTs sql.NullString
+	// Initial-load rows (Debezium op "r"), counted apart from inserts on both sides:
+	// captured from ops.reads, applied from counts.snapshot_rows. NULL when the event
+	// does not carry the field, so an older producer leaves the column untouched.
+	var snapshotRows, appliedSnapshotRows sql.NullInt64
+	// True when the captured columns below were copied from the sink's applied counts
+	// (no cdcstats ops on this event). The upsert then keeps whatever a captured-side
+	// writer already stored — see the CASE on the captured columns.
+	capturedFromApplied := false
 	if mode == "cdc" {
 		source, _ := meta["source"].(string)
 		source = strings.ToLower(strings.TrimSpace(source))
@@ -1029,6 +1054,9 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 			}
 			if v, ok := ops["total"].(float64); ok {
 				totalEvents = sql.NullInt64{Int64: int64(v), Valid: true}
+			}
+			if v, ok := ops["reads"].(float64); ok {
+				snapshotRows = sql.NullInt64{Int64: int64(v), Valid: true}
 			}
 		}
 		if ts, ok := meta["last_event_ts"].(string); ok && ts != "" {
@@ -1066,6 +1094,9 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 				} else if v, ok := counts["total"].(float64); ok {
 					appliedTotalEvents = sql.NullInt64{Int64: int64(v), Valid: true}
 				}
+				if v, ok := counts["snapshot_rows"].(float64); ok {
+					appliedSnapshotRows = sql.NullInt64{Int64: int64(v), Valid: true}
+				}
 
 				// Applied "rows added/modified" for CDC. The sink emits
 				// counts.inserted_rows = inserts + updates; the batch branch reads
@@ -1092,7 +1123,13 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 				// When cdcstats agent is disabled (ENABLE_CDC_TABLE_STATS != true), no events
 				// with metadata.ops are emitted, so "captured" stays 0 while "applied" advances.
 				// Backfill captured from applied so the UI shows consistent numbers (captured = applied).
+				// Only while no captured-side writer has touched the row (BUG #10): with
+				// cdcstats enabled, copying on every sink event made captured a copy of
+				// applied, so a stalled sink hid its own lag. capturedFromApplied lets the
+				// upsert keep the stored captured values once cdcstats has written them.
 				if meta["ops"] == nil {
+					capturedFromApplied = true
+					snapshotRows = appliedSnapshotRows
 					if v, ok := counts["inserts"].(float64); ok {
 						inserts = sql.NullInt64{Int64: int64(v), Valid: true}
 					}
@@ -1203,7 +1240,8 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 			inserts, updates, deletes, total_events, last_event_ts,
 			applied_inserts, applied_updates, applied_deletes, applied_total_events, last_applied_ts,
 			started_at, completed_at, bytes_committed, dlq_rows,
-			destination_schema, destination_qualified_name, orchestration_execution_id, updated_at
+			destination_schema, destination_qualified_name, orchestration_execution_id,
+			snapshot_rows, applied_snapshot_rows, updated_at
 		)
 		SELECT
 			$1::uuid, $2::uuid, NULLIF($3,''), $4, $5,
@@ -1212,7 +1250,8 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 			$12, $13, $14, $15, NULLIF($16,'')::timestamptz,
 			$17, $18, $19, $20, NULLIF($21,'')::timestamptz,
 			NULLIF($22,'')::timestamptz, NULLIF($23,'')::timestamptz, $24, COALESCE($25, 0),
-			$26, $27, $28::uuid, NOW()
+			$26, $27, $28::uuid,
+			$29, $30, NOW()
 		WHERE EXISTS (SELECT 1 FROM pipelines WHERE id = $1::uuid)
 		ON CONFLICT (pipeline_id, execution_id, qualified_name)
 		DO UPDATE SET
@@ -1241,11 +1280,47 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 			files_written = GREATEST(COALESCE(pipeline_run_table_stats.files_written, 0), COALESCE(EXCLUDED.files_written, 0)),
 			bytes_committed = GREATEST(COALESCE(pipeline_run_table_stats.bytes_committed, 0), COALESCE(EXCLUDED.bytes_committed, 0)),
 			dlq_rows = GREATEST(COALESCE(pipeline_run_table_stats.dlq_rows, 0), COALESCE(EXCLUDED.dlq_rows, 0)),
-			inserts = GREATEST(COALESCE(pipeline_run_table_stats.inserts, 0), COALESCE(EXCLUDED.inserts, 0)),
-			updates = GREATEST(COALESCE(pipeline_run_table_stats.updates, 0), COALESCE(EXCLUDED.updates, 0)),
-			deletes = GREATEST(COALESCE(pipeline_run_table_stats.deletes, 0), COALESCE(EXCLUDED.deletes, 0)),
-			total_events = GREATEST(COALESCE(pipeline_run_table_stats.total_events, 0), COALESCE(EXCLUDED.total_events, 0)),
-			applied_inserts = GREATEST(COALESCE(pipeline_run_table_stats.applied_inserts, 0), COALESCE(EXCLUDED.applied_inserts, 0)),
+			-- Captured counters. $31 = these values were copied from the sink's applied
+			-- counts; last_event_ts is written only by cdcstats (metadata.last_event_ts,
+			-- which the sink never sends), so a stored one proves a captured-side writer
+			-- owns the row and the applied copy must not overwrite it (BUG #10).
+			inserts = CASE WHEN $31::boolean AND pipeline_run_table_stats.last_event_ts IS NOT NULL
+				THEN pipeline_run_table_stats.inserts
+				-- The first event that counts snapshot rows apart, on a row an older
+				-- producer filled: see applied_inserts below.
+				WHEN pipeline_run_table_stats.snapshot_rows IS NULL AND EXCLUDED.snapshot_rows IS NOT NULL
+				THEN GREATEST(COALESCE(EXCLUDED.inserts, 0), COALESCE(pipeline_run_table_stats.inserts, 0) - EXCLUDED.snapshot_rows)
+				ELSE GREATEST(COALESCE(pipeline_run_table_stats.inserts, 0), COALESCE(EXCLUDED.inserts, 0)) END,
+			updates = CASE WHEN $31::boolean AND pipeline_run_table_stats.last_event_ts IS NOT NULL
+				THEN pipeline_run_table_stats.updates
+				ELSE GREATEST(COALESCE(pipeline_run_table_stats.updates, 0), COALESCE(EXCLUDED.updates, 0)) END,
+			deletes = CASE WHEN $31::boolean AND pipeline_run_table_stats.last_event_ts IS NOT NULL
+				THEN pipeline_run_table_stats.deletes
+				ELSE GREATEST(COALESCE(pipeline_run_table_stats.deletes, 0), COALESCE(EXCLUDED.deletes, 0)) END,
+			total_events = CASE WHEN $31::boolean AND pipeline_run_table_stats.last_event_ts IS NOT NULL
+				THEN pipeline_run_table_stats.total_events
+				ELSE GREATEST(COALESCE(pipeline_run_table_stats.total_events, 0), COALESCE(EXCLUDED.total_events, 0)) END,
+			-- Snapshot (op "r") rows: monotone like the counters above, but NULL until a
+			-- producer that counts them reports — NULL means "not counted", not zero.
+			snapshot_rows = CASE
+				WHEN EXCLUDED.snapshot_rows IS NULL THEN pipeline_run_table_stats.snapshot_rows
+				WHEN $31::boolean AND pipeline_run_table_stats.last_event_ts IS NOT NULL THEN pipeline_run_table_stats.snapshot_rows
+				ELSE GREATEST(COALESCE(pipeline_run_table_stats.snapshot_rows, 0), EXCLUDED.snapshot_rows)
+			END,
+			applied_snapshot_rows = CASE
+				WHEN EXCLUDED.applied_snapshot_rows IS NULL THEN pipeline_run_table_stats.applied_snapshot_rows
+				ELSE GREATEST(COALESCE(pipeline_run_table_stats.applied_snapshot_rows, 0), EXCLUDED.applied_snapshot_rows)
+			END,
+			-- A sink from before migration 114 counted snapshot rows as inserts. After
+			-- the upgrade the sink re-reads its ledger and reports the same rows again as
+			-- applied_snapshot_rows, so on the row's first such event GREATEST would keep
+			-- them in both columns. Take them out of the stored inserts once, never going
+			-- below what the new sink reports (if its ledger seed failed, the old value stays).
+			applied_inserts = CASE
+				WHEN pipeline_run_table_stats.applied_snapshot_rows IS NULL AND EXCLUDED.applied_snapshot_rows IS NOT NULL
+				THEN GREATEST(COALESCE(EXCLUDED.applied_inserts, 0), COALESCE(pipeline_run_table_stats.applied_inserts, 0) - EXCLUDED.applied_snapshot_rows)
+				ELSE GREATEST(COALESCE(pipeline_run_table_stats.applied_inserts, 0), COALESCE(EXCLUDED.applied_inserts, 0))
+			END,
 			applied_updates = GREATEST(COALESCE(pipeline_run_table_stats.applied_updates, 0), COALESCE(EXCLUDED.applied_updates, 0)),
 			applied_deletes = GREATEST(COALESCE(pipeline_run_table_stats.applied_deletes, 0), COALESCE(EXCLUDED.applied_deletes, 0)),
 			applied_total_events = GREATEST(COALESCE(pipeline_run_table_stats.applied_total_events, 0), COALESCE(EXCLUDED.applied_total_events, 0)),
@@ -1281,6 +1356,7 @@ func (p *EventProjector) upsertTableStatsProgress(raw map[string]interface{}) (a
 		appliedInserts, appliedUpdates, appliedDeletes, appliedTotalEvents, lastAppliedTs,
 		startedAt, completedAt, bytesCommitted, dlqRows,
 		destSchema, destQualifiedName, orchestrationExecutionID,
+		snapshotRows, appliedSnapshotRows, capturedFromApplied,
 	); err != nil {
 		return appliedProgress{}, err
 	}

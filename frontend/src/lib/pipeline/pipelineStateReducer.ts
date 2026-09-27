@@ -374,17 +374,3 @@ export function selectLastUpdate(state: PipelineUIState): string {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`
   return `${Math.floor(seconds / 3600)}h ago`
 }
-
-export function selectEstimatedDuration(state: PipelineUIState): number {
-  const stages = Object.values(state.stages)
-  const totalEstimated = stages.reduce((sum, stage) => {
-    return sum + (stage.estimatedDuration || 30)
-  }, 0)
-  return totalEstimated
-}
-
-export function selectElapsedTime(state: PipelineUIState): number | null {
-  if (!state.metadata.startedAt) return null
-  const endTime = state.metadata.completedAt || Date.now()
-  return Math.floor((endTime - state.metadata.startedAt) / 1000)
-}

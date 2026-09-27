@@ -38,8 +38,6 @@ const (
 	IssueTypeMissingHeartbeat    IssueType = "missing_heartbeat"
 	IssueTypeHighLag             IssueType = "high_lag"
 	IssueTypeConsumerGroupClosed IssueType = "consumer_group_closed"
-	IssueTypeProtocolMismatch    IssueType = "protocol_mismatch"
-	IssueTypeDLQGrowth           IssueType = "dlq_growth"
 	IssueTypeConnectorDown       IssueType = "connector_down"
 	IssueTypeInfrastructureDown  IssueType = "infrastructure_down"
 	IssueTypeRepeatedFailure     IssueType = "repeated_failure"
@@ -89,8 +87,6 @@ const (
 	HealingActionRestartAgent    HealingAction = "restart_agent"
 	HealingActionRestartConsumer HealingAction = "restart_consumer"
 	HealingActionProvisionTopic  HealingAction = "provision_topic"
-	HealingActionFixProtocol     HealingAction = "fix_protocol"
-	HealingActionReplayMessages  HealingAction = "replay_messages"
 	HealingActionScaleUp         HealingAction = "scale_up"
 	HealingActionAlert           HealingAction = "alert"
 	HealingActionCircuitBreak    HealingAction = "circuit_break"
@@ -145,22 +141,10 @@ type HealingResult struct {
 	Details       map[string]interface{} `json:"details,omitempty"`
 }
 
-// AgentHeartbeat represents a heartbeat message from an agent
-type AgentHeartbeat struct {
-	Agent             string    `json:"agent"`
-	Status            string    `json:"status"`
-	LastMessageAt     string    `json:"last_message_at"`
-	MessagesProcessed int64     `json:"messages_processed"`
-	ErrorCount        int64     `json:"error_count"`
-	ConsumerLag       int64     `json:"consumer_lag"`
-	Timestamp         time.Time `json:"timestamp"`
-}
-
 // SentinelConfig holds configuration for the sentinel agent
 type SentinelConfig struct {
 	// Heartbeat monitoring
-	HeartbeatTimeout       time.Duration
-	HeartbeatCheckInterval time.Duration
+	HeartbeatTimeout time.Duration
 
 	// Consumer lag thresholds
 	ConsumerLagWarningThreshold  int64
@@ -197,7 +181,6 @@ type SentinelConfig struct {
 func DefaultSentinelConfig() *SentinelConfig {
 	return &SentinelConfig{
 		HeartbeatTimeout:             30 * time.Second,
-		HeartbeatCheckInterval:       10 * time.Second,
 		ConsumerLagWarningThreshold:  5000,
 		ConsumerLagCriticalThreshold: 10000,
 		DLQWarningThreshold:          50,

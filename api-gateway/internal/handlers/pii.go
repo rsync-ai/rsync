@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"github.com/rsync-ai/shared/kafkaclient"
+	"github.com/rsync-ai/shared/transforms"
 	"net/http"
 	"strings"
 	"time"
@@ -120,6 +121,9 @@ func (h *PIIHandler) RegisterRoutes(r *gin.RouterGroup) {
 		pii.GET("/scan/results/:pipeline_id", h.GetScanResultsByPipeline)
 		pii.POST("/scan", h.TriggerScan)
 		pii.GET("/scan/jobs/:id", h.GetScanJob)
+
+		// Columns the workspace's pipelines already mask or hash (read-only)
+		pii.GET("/masked-columns", h.ListMaskedColumns)
 
 		// Approvals
 		pii.GET("/approvals", h.GetApprovals)
@@ -250,6 +254,136 @@ func (h *PIIHandler) GetScanResultsByPipeline(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"results": results})
 }
 
+// PIIMaskedColumn is one column a pipeline's saved transforms mask or hash.
+// A pipeline that masks `email` has already found PII there, but that finding
+// lives in transform_definitions, never in pii_scan_results, so the PII page
+// showed none of it.
+type PIIMaskedColumn struct {
+	PipelineID   string `json:"pipeline_id"`
+	PipelineName string `json:"pipeline_name"`
+	// Table is the rule's scope.table; empty when the rule applies to every
+	// table the pipeline moves.
+	Table string `json:"table,omitempty"`
+	// Column is the masked column, or the dotted path for a nested target.
+	Column string `json:"column"`
+	// Action is the mask_type the engine applies: hash, redact, partial, ...
+	Action string `json:"action"`
+}
+
+// piiStoredTransform is one transform_definitions row, as ListMaskedColumns
+// reads it.
+type piiStoredTransform struct {
+	PipelineID   string
+	PipelineName string
+	Config       []byte
+	Enabled      bool
+}
+
+// maxPIIMaskedTransformRows bounds the transform rows one request reads.
+const maxPIIMaskedTransformRows = 5000
+
+// ListMaskedColumns lists the columns the active workspace's pipelines mask or
+// hash, read from their saved transforms. It reports rules as saved, not as
+// run, and writes nothing.
+func (h *PIIHandler) ListMaskedColumns(c *gin.Context) {
+	if _, ok := requireWorkspaceRole(c, security.WSViewer); !ok {
+		return
+	}
+	wsID := activeWorkspaceID(c)
+
+	// transform_definitions has no workspace_id; the pipeline carries it.
+	rows, err := h.db.QueryContext(c.Request.Context(), `
+		SELECT td.pipeline_id::text, COALESCE(p.name, ''), td.transform_config, COALESCE(td.enabled, true)
+		FROM transform_definitions td
+		JOIN pipelines p ON p.id = td.pipeline_id
+		WHERE p.workspace_id = $1
+		ORDER BY p.name, td.pipeline_id, td.transform_type, td.transform_order
+		LIMIT $2`, wsID, maxPIIMaskedTransformRows+1)
+	if err != nil {
+		log.WithError(err).Error("Failed to query pipeline transforms for masked columns")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch masked columns"})
+		return
+	}
+	defer rows.Close()
+
+	var stored []piiStoredTransform
+	for rows.Next() {
+		var st piiStoredTransform
+		if err := rows.Scan(&st.PipelineID, &st.PipelineName, &st.Config, &st.Enabled); err != nil {
+			log.WithError(err).Error("Failed to scan pipeline transform row")
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch masked columns"})
+			return
+		}
+		stored = append(stored, st)
+	}
+	if err := rows.Err(); err != nil {
+		log.WithError(err).Error("Failed to read pipeline transforms for masked columns")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch masked columns"})
+		return
+	}
+
+	truncated := len(stored) > maxPIIMaskedTransformRows
+	if truncated {
+		stored = stored[:maxPIIMaskedTransformRows]
+	}
+	c.JSON(http.StatusOK, gin.H{"columns": piiMaskedColumnsFrom(stored), "truncated": truncated})
+}
+
+// piiMaskedColumnsFrom reads mask targets out of stored transforms through the
+// same normalizer the pipelines run them through, so every alias the engine
+// accepts (mask, hash, mask_pii; field for column; hash implying
+// mask_type=hash) is read the way it runs. A rule the engine would refuse
+// masks nothing and is not listed.
+func piiMaskedColumnsFrom(stored []piiStoredTransform) []PIIMaskedColumn {
+	out := []PIIMaskedColumn{}
+	seen := map[string]struct{}{}
+	for _, st := range stored {
+		cfg := map[string]any{}
+		if len(st.Config) == 0 || json.Unmarshal(st.Config, &cfg) != nil || len(cfg) == 0 {
+			continue
+		}
+		// SaveCheck: there is no current table here, and Execution would refuse
+		// every table-scoped rule for that.
+		canonical, _, err := transforms.NormalizeAndValidate(
+			[]map[string]any{{"enabled": st.Enabled, "transform_config": cfg}}, "", transforms.NormalizeModeSaveCheck,
+		)
+		if err != nil {
+			continue
+		}
+		for _, ct := range canonical {
+			targets, err := transforms.MaskTargets([]transforms.CanonicalTransform{ct})
+			if err != nil {
+				continue
+			}
+			// parseMaskSpec's default: an unset mask_type hashes.
+			action := "hash"
+			if mt, ok := ct.Config["mask_type"].(string); ok && strings.TrimSpace(mt) != "" {
+				action = strings.TrimSpace(mt)
+			}
+			for _, t := range targets {
+				col := t.Column
+				if col == "" {
+					col = t.Path
+				}
+				m := PIIMaskedColumn{
+					PipelineID:   st.PipelineID,
+					PipelineName: st.PipelineName,
+					Table:        ct.Scope.Table,
+					Column:       col,
+					Action:       action,
+				}
+				key := strings.ToLower(strings.Join([]string{m.PipelineID, m.Table, m.Column, m.Action}, "\x00"))
+				if _, dup := seen[key]; dup {
+					continue
+				}
+				seen[key] = struct{}{}
+				out = append(out, m)
+			}
+		}
+	}
+	return out
+}
+
 // TriggerScan triggers an async PII scan for a connection.
 // It persists a pending scan job, publishes a request to Kafka, and returns
 // immediately with the job ID. Clients poll GET /pii/scan/jobs/:id for status.
@@ -272,6 +406,31 @@ func (h *PIIHandler) TriggerScan(c *gin.Context) {
 		return
 	}
 	wsID := activeWorkspaceID(c)
+	userID, ok := resolveUserID(c)
+	if !ok {
+		return
+	}
+
+	// The scan classifies columns by name, so it needs the names. Resolved
+	// before the job exists: a scan that cannot see the schema would only
+	// ever report every table as not scanned.
+	schema, err := loadPIIScanSchema(c.Request.Context(), h.db, wsID, req.ConnectionID, userID)
+	if err != nil {
+		respondError(c, http.StatusBadGateway, "schema_unavailable",
+			"Could not read this connection's schema, so no scan was started: "+err.Error(), err)
+		return
+	}
+	tables := piiScanTablesFor(schema, req.Tables)
+	if len(tables) == 0 {
+		respondError(c, http.StatusUnprocessableEntity, "no_tables",
+			"This connection has no tables to scan.", nil)
+		return
+	}
+	if b, _ := json.Marshal(tables); len(b) > maxPIIScanRequestBytes {
+		respondError(c, http.StatusRequestEntityTooLarge, "schema_too_large",
+			fmt.Sprintf("This connection has too many columns to scan in one request (%d tables). Name the tables to scan in \"tables\".", len(tables)), nil)
+		return
+	}
 
 	scanID := uuid.New().String()
 	traceID := c.GetHeader("X-Trace-ID")
@@ -280,7 +439,7 @@ func (h *PIIHandler) TriggerScan(c *gin.Context) {
 	}
 
 	// Persist pending job record for status polling, stamped with the workspace.
-	_, err := h.db.ExecContext(c.Request.Context(), `
+	_, err = h.db.ExecContext(c.Request.Context(), `
 		INSERT INTO pii_scan_jobs (id, connection_id, tables, include_ml, status, workspace_id)
 		VALUES ($1, $2, $3, $4, 'pending', $5)`,
 		scanID, req.ConnectionID, req.Tables, req.IncludeML, wsID,
@@ -293,12 +452,7 @@ func (h *PIIHandler) TriggerScan(c *gin.Context) {
 
 	// Publish async scan request to Kafka
 	if h.producer != nil {
-		payload := map[string]interface{}{
-			"scan_id":       scanID,
-			"connection_id": req.ConnectionID,
-			"tables":        req.Tables,
-			"include_ml":    req.IncludeML,
-		}
+		payload := piiScanRequestPayload(scanID, req.ConnectionID, tables, req.IncludeML)
 		if err := h.producer.SendAgentMessage(c.Request.Context(), kafkaclient.Topic("pii.scan.request"), traceID, payload); err != nil {
 			log.WithError(err).Warn("Failed to publish pii.scan.request to Kafka; scan job remains pending")
 		}
@@ -311,6 +465,116 @@ func (h *PIIHandler) TriggerScan(c *gin.Context) {
 		"status":  "pending",
 		"message": "Scan queued for async processing",
 	})
+}
+
+// piiScanColumn and piiScanTable are the tables of a pii.scan.request, in the
+// shape llm-service's table_requests_from_payload reads (kafka_consumer.py).
+// Names and declared types only: the scan classifies a column by what it is
+// called, and no row value is sent for it.
+type piiScanColumn struct {
+	ColumnName string `json:"column_name"`
+	DataType   string `json:"data_type,omitempty"`
+}
+
+type piiScanTable struct {
+	TableName string          `json:"table_name"`
+	Columns   []piiScanColumn `json:"columns"`
+}
+
+// piiScanRequestPayload is the pii.scan.request message. Its shape is pinned
+// against llm-service by shared/pii_scan_contract_golden.json.
+func piiScanRequestPayload(scanID, connectionID string, tables []piiScanTable, includeML bool) map[string]interface{} {
+	return map[string]interface{}{
+		"scan_id":       scanID,
+		"connection_id": connectionID,
+		"tables":        tables,
+		"include_ml":    includeML,
+	}
+}
+
+// maxPIIScanRequestBytes keeps a pii.scan.request under the broker's default
+// 1 MB message limit, with room for the envelope.
+const maxPIIScanRequestBytes = 900 << 10
+
+// loadPIIScanSchema returns a connection's tables with their columns: from the
+// schema cache when it holds any, else from a live discovery. A var so tests
+// can stand in for both.
+var loadPIIScanSchema = func(ctx context.Context, database *sql.DB, wsID, connectionID, userID string) ([]TableMetadata, error) {
+	if schemaCache != nil {
+		if b, err := schemaCache.Get(ctx, connectionID); err == nil && b != nil {
+			var cached struct {
+				Tables []TableMetadata `json:"tables"`
+			}
+			if json.Unmarshal(b, &cached) == nil && len(cached.Tables) > 0 {
+				return cached.Tables, nil
+			}
+		}
+	}
+	var connectorType string
+	config, err := decryptedConnectionConfig(database, wsID, connectionID, &connectorType)
+	if err != nil {
+		return nil, err
+	}
+	return fetchSourceTables(ctx, connectionID, connectorType, config, userID)
+}
+
+// piiScanTablesFor narrows a discovered schema to the requested tables, or
+// takes all of it when none were named. A name matches a table's qualified
+// name or its bare name, ignoring case, so a bare name found in two schemas
+// scans both. A requested table the schema does not have is still sent, with
+// no columns: the scanner then reports it as not scanned rather than the
+// request dropping it without a word.
+func piiScanTablesFor(schema []TableMetadata, requested []string) []piiScanTable {
+	qualified := func(t TableMetadata) string {
+		if s := strings.TrimSpace(t.Schema); s != "" {
+			return s + "." + strings.TrimSpace(t.Name)
+		}
+		return strings.TrimSpace(t.Name)
+	}
+	toScan := func(t TableMetadata) piiScanTable {
+		out := piiScanTable{TableName: qualified(t), Columns: []piiScanColumn{}}
+		for _, col := range t.Columns {
+			if name := strings.TrimSpace(col.Name); name != "" {
+				out.Columns = append(out.Columns, piiScanColumn{ColumnName: name, DataType: col.Type})
+			}
+		}
+		return out
+	}
+
+	var out []piiScanTable
+	if len(requested) == 0 {
+		for _, t := range schema {
+			if strings.TrimSpace(t.Name) != "" {
+				out = append(out, toScan(t))
+			}
+		}
+		return out
+	}
+
+	taken := map[string]bool{}
+	for _, raw := range requested {
+		want := strings.ToLower(strings.TrimSpace(raw))
+		if want == "" {
+			continue
+		}
+		found := false
+		for _, t := range schema {
+			q := qualified(t)
+			if strings.ToLower(q) != want && strings.ToLower(strings.TrimSpace(t.Name)) != want {
+				continue
+			}
+			found = true
+			if !taken[strings.ToLower(q)] {
+				taken[strings.ToLower(q)] = true
+				out = append(out, toScan(t))
+			}
+		}
+		if !found && !taken[want] {
+			taken[want] = true
+			out = append(out, piiScanTable{TableName: strings.TrimSpace(raw), Columns: []piiScanColumn{}})
+		}
+	}
+	return out
 }
 
 // GetScanJob returns the status and result of an async PII scan job in the
@@ -523,7 +787,9 @@ func (h *PIIHandler) projectScanResults(ctx context.Context, scanID string, resu
 // PII-positive columns, and the names of every table the scan reported on.
 //
 // The two are returned separately because a table that was scanned and came back
-// clean carries no findings but still has to be pruned.
+// clean carries no findings but still has to be pruned. A table reported with
+// no column is not counted as scanned: nothing was looked at, and the prune
+// would otherwise delete every stored finding for it, approvals included.
 func piiFindingsFrom(result map[string]interface{}) (findings []piiFinding, scanned []string) {
 	rawTables, _ := result["tables"].([]interface{})
 	for _, rt := range rawTables {
@@ -535,20 +801,21 @@ func piiFindingsFrom(result map[string]interface{}) (findings []piiFinding, scan
 		if tableName == "" {
 			continue
 		}
-		scanned = append(scanned, tableName)
 
 		rawCols, _ := tm["columns"].([]interface{})
+		looked := 0
 		for _, rc := range rawCols {
 			cm, ok := rc.(map[string]interface{})
 			if !ok {
 				continue
 			}
-			// The scanner reports every column it looked at, PII or not.
-			if isPII, _ := cm["is_pii"].(bool); !isPII {
-				continue
-			}
 			columnName := piiTruncate(piiString(cm, "column_name"), 255)
 			if columnName == "" {
+				continue
+			}
+			looked++
+			// The scanner reports every column it looked at, PII or not.
+			if isPII, _ := cm["is_pii"].(bool); !isPII {
 				continue
 			}
 			f := piiFinding{
@@ -567,6 +834,9 @@ func piiFindingsFrom(result map[string]interface{}) (findings []piiFinding, scan
 				f.method = "unknown"
 			}
 			findings = append(findings, f)
+		}
+		if looked > 0 {
+			scanned = append(scanned, tableName)
 		}
 	}
 	return findings, scanned

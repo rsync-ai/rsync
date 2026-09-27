@@ -31,7 +31,32 @@ type PipelineRuntime struct {
 	Liveness    *RuntimeLiveness `json:"liveness,omitempty"`
 	Blocker     *RuntimeBlocker  `json:"blocker,omitempty"`
 	Deps        []RuntimeDep     `json:"dependencies"`
-	UpdatedAt   time.Time        `json:"updated_at"`
+	// Load is the pipeline's initial (full) load, when one was recorded
+	// (loadInitialLoad). Absent, not zero, when none was.
+	Load      *RuntimeLoad `json:"load,omitempty"`
+	UpdatedAt time.Time    `json:"updated_at"`
+}
+
+// RuntimeLoad is the latest initial load of a CDC pipeline (cdc_snapshot_requests,
+// source 'initial', migration 118), plus how many tables a Re-snapshot or table
+// edit is loading again right now.
+type RuntimeLoad struct {
+	Status      string     `json:"status"` // sent | started | completed | unconfirmed | failed
+	Mode        string     `json:"mode"`   // blocking | incremental
+	TablesTotal int        `json:"tables_total"`
+	TablesDone  int        `json:"tables_done"`
+	StartedAt   *time.Time `json:"started_at,omitempty"`
+	CompletedAt *time.Time `json:"completed_at,omitempty"`
+	// LastError says why the load is unconfirmed or failed. It is connector state
+	// only, never row data (migration 113).
+	LastError       string `json:"last_error,omitempty"`
+	ReloadingTables int    `json:"reloading_tables"`
+	// SnapshotRowsWaiting is the snapshot rows the source was read for that the
+	// destination has not written yet, summed per table and never below zero. A
+	// blocking load completes at Debezium's last snapshot marker, which is the end
+	// of the SOURCE read, so a completed load with rows waiting is still being
+	// written. Zero is sent, not omitted: it is the "all written" answer.
+	SnapshotRowsWaiting int64 `json:"snapshot_rows_waiting"`
 }
 
 type RuntimeProgress struct {
@@ -51,6 +76,38 @@ type RuntimeLiveness struct {
 	// value ("nothing is waiting"), and omitting it would leave a client unable to
 	// tell "no backlog" from "field absent".
 	PendingEvents int64 `json:"pending_events"`
+
+	// The CDC sink's live Kafka drain reading, from pipeline_sink_lag (migration
+	// 116), written by the orchestrator Sentinel each tick.
+	//
+	// PendingEvents above and SinkLagMessages here are DIFFERENT measurements and
+	// both are needed. PendingEvents is captured-minus-applied out of our own
+	// counters, so it reads 0 whenever nothing has been counted — which is
+	// indistinguishable from a caught-up stream, and is why a pipeline with no
+	// stats rows at all renders a confident "Caught up". SinkLagMessages is the
+	// broker's own answer to "how far behind is the sink's consumer group", so it
+	// is true even when our counters are empty.
+	//
+	// SinkCommittedMoving is the second fact that makes a lag of 0 interpretable.
+	// With Debezium dead, every topic drains to lag 0 and a lag-only reading
+	// reports perfect health across a capture hole
+	// (KI-DEBEZIUM-WORKER-DEATH-NOT-SURFACED). A sink that is caught up because
+	// there is nothing to do, and one that is caught up because nothing is being
+	// produced any more, differ in whether the committed offset ever advances —
+	// and in the state of the debezium_task dependency, which this endpoint
+	// already reports in Deps.
+	//
+	// All four are pointers with omitempty: absent means "no reading", which the
+	// UI must render as unknown rather than as a green zero. SinkLagMeasuredAt is
+	// how a client tells a fresh reading from one left behind by a Sentinel that
+	// stopped running.
+	SinkLagMessages     *int64     `json:"sink_lag_messages,omitempty"`
+	SinkLagMeasuredAt   *time.Time `json:"sink_lag_measured_at,omitempty"`
+	SinkCommittedMoving *bool      `json:"sink_committed_moving,omitempty"`
+	SinkStalled         *bool      `json:"sink_stalled,omitempty"`
+	// Only meaningful while SinkStalled; the writer zeroes it otherwise.
+	SinkStalledSeconds int64  `json:"sink_stalled_seconds,omitempty"`
+	SinkConsumerGroup  string `json:"sink_consumer_group,omitempty"`
 }
 
 type RuntimeBlocker struct {
@@ -199,8 +256,29 @@ func GetPipelineRuntime(c *gin.Context) {
 	rt.Health = depAggregate
 	if rt.Phase == "failed" || rt.Phase == "error" {
 		rt.Health = "unhealthy"
-	} else if rt.Phase == "paused" && rt.Health == "healthy" {
+	} else if (rt.Phase == "paused" || rt.Phase == "stopped") && rt.Health == "healthy" {
 		rt.Health = "degraded"
+	}
+
+	// 6) Attach the broker-side sink drain reading, DELIBERATELY after phase and
+	// health are computed.
+	//
+	// Two reasons for the ordering. First, rt.Liveness == nil is itself a signal
+	// above — it is how a CDC stream that has never delivered a row reaches
+	// waiting_for_data (issue #20) — so creating the block earlier to hold a lag
+	// reading would silently reclassify those pipelines. Second, that same
+	// never-delivered pipeline is exactly the one whose sink lag matters most: if
+	// changes are piling up in Kafka and nothing is arriving, the number that says
+	// so must still be served. So the block is created here when a reading exists
+	// and liveness was otherwise absent, once nothing else can read its nilness.
+	if mode == "cdc" {
+		if reading := loadSinkLag(database, pipelineID); reading.found {
+			if rt.Liveness == nil {
+				rt.Liveness = &RuntimeLiveness{PendingEvents: pendingEvents}
+			}
+			applySinkLag(rt.Liveness, reading)
+		}
+		rt.Load = loadInitialLoad(database, pipelineID)
 	}
 
 	c.JSON(http.StatusOK, rt)
@@ -225,8 +303,8 @@ func GetPipelineRuntime(c *gin.Context) {
 // (pipeline_state.go:296), so the two views of a paused pipeline now agree.
 //
 // Deliberately narrow — only status='paused'. A HITL blocker outranks paused in
-// computeRuntimePhase, so a blocker description is never masked; and 'stopped' (which also
-// maps to phase "paused") is left alone because StopPipeline already reconciles
+// computeRuntimePhase, so a blocker description is never masked; and phase "stopped" is
+// left alone because StopPipeline already reconciles
 // pipeline_progress.message to the more specific 'Cancelled by user' (pipelines.go:3241).
 //
 // waiting_for_data is derived the same way (from the absence of any delivered row, not from
@@ -326,6 +404,123 @@ func loadCDCLiveness(database *sql.DB, pipelineID string) (sql.NullTime, int64) 
 		log.Debugf("runtime: cdc liveness query failed (treating as unknown): %v", err)
 	}
 	return lastAppliedAt, pending
+}
+
+// sinkLagReading is the pipeline's latest CDC sink drain reading, or the zero value
+// when nothing has measured it. `found` false is a first-class answer: it means "no
+// reading", which the UI must render as unknown, not as a healthy zero.
+type sinkLagReading struct {
+	found          bool
+	consumerGroup  string
+	totalLag       int64
+	committed      bool
+	stalled        bool
+	stalledSeconds int64
+	measuredAt     time.Time
+}
+
+// loadSinkLag reads pipeline_sink_lag (migration 116) — the broker-side lag the
+// Sentinel's checkSinkConsumerLag tick recorded for this pipeline.
+//
+// Why this is read here rather than on the monitoring overview: this endpoint is the
+// pipeline's own, workspace-scoped, unflagged and already polled every 5s, while
+// GET /pipelines/:id/monitoring/overview sits behind FEATURE_MONITORING_OVERVIEW
+// (default off) and its lag value came from a DATA_PLANE_METRICS event written only
+// when somebody opened the page. A safety signal — "your changes are captured but
+// not arriving" — must not depend on an infrastructure feature flag or on somebody
+// having recently visited.
+//
+// A query error degrades to "no reading" and is logged, never propagated: the rest
+// of the runtime view is independently useful and must not 500 because one table is
+// missing on a deployment that has not run migration 116 yet.
+func loadSinkLag(database *sql.DB, pipelineID string) sinkLagReading {
+	var r sinkLagReading
+	err := database.QueryRow(`
+		SELECT consumer_group, total_lag, committed_moving, stalled, stalled_seconds, measured_at
+		FROM pipeline_sink_lag
+		WHERE pipeline_id = $1::uuid
+	`, pipelineID).Scan(&r.consumerGroup, &r.totalLag, &r.committed, &r.stalled, &r.stalledSeconds, &r.measuredAt)
+	switch {
+	case err == sql.ErrNoRows:
+		return sinkLagReading{}
+	case err != nil:
+		log.Debugf("runtime: sink lag query failed (treating as no reading): %v", err)
+		return sinkLagReading{}
+	}
+	r.found = true
+	return r
+}
+
+// applySinkLag copies a drain reading onto the liveness block. Split out so the
+// "no reading leaves every field absent" rule lives in one place: assigning a zero
+// here would publish an unmeasured pipeline as a caught-up one, which is the exact
+// class of bug this whole change is about.
+// loadInitialLoad reads the pipeline's latest initial load and counts the
+// distinct tables an open Re-snapshot / table edit / auto-pickup request is
+// loading again, and how many snapshot rows the destination has yet to write
+// (capturedSnapshotSQL, as the table-stats reader counts them, minus
+// applied_snapshot_rows). The orchestrator records the load from the snapshot rows it
+// sees (or around the hybrid batch), so a pipeline that streamed before that
+// existed has no row: that is "no load recorded" (nil), never a finished one.
+// Errors degrade to nil like loadSinkLag: a deployment without migration 118 still
+// serves the rest of the runtime view.
+func loadInitialLoad(database *sql.DB, pipelineID string) *RuntimeLoad {
+	var (
+		l                    RuntimeLoad
+		startedAt, completed sql.NullTime
+	)
+	err := database.QueryRow(`
+		SELECT l.status, l.mode,
+		       jsonb_array_length(l.tables), jsonb_array_length(l.completed_tables),
+		       COALESCE(l.started_at, l.sent_at), l.completed_at, COALESCE(l.last_error, ''),
+		       (SELECT COUNT(DISTINCT t.name)
+		          FROM cdc_snapshot_requests r, jsonb_array_elements_text(r.tables) AS t(name)
+		         WHERE r.pipeline_id = l.pipeline_id AND r.source <> 'initial'
+		           AND r.status IN ('queued', 'sent', 'started')),
+		       (SELECT COALESCE(SUM(GREATEST(COALESCE(`+capturedSnapshotSQL+`, 0) - COALESCE(s.applied_snapshot_rows, 0), 0)), 0)::bigint
+		          FROM pipeline_run_table_stats s
+		         WHERE s.pipeline_id = l.pipeline_id AND s.mode = 'cdc')
+		FROM cdc_snapshot_requests l
+		WHERE l.pipeline_id = $1::uuid AND l.source = 'initial'
+		ORDER BY l.requested_at DESC
+		LIMIT 1
+	`, pipelineID).Scan(&l.Status, &l.Mode, &l.TablesTotal, &l.TablesDone,
+		&startedAt, &completed, &l.LastError, &l.ReloadingTables, &l.SnapshotRowsWaiting)
+	switch {
+	case err == sql.ErrNoRows:
+		return nil
+	case err != nil:
+		log.Debugf("runtime: initial load query failed (treating as none recorded): %v", err)
+		return nil
+	}
+	if startedAt.Valid {
+		l.StartedAt = &startedAt.Time
+	}
+	if completed.Valid {
+		l.CompletedAt = &completed.Time
+	}
+	// An incremental snapshot marks no table done and the hybrid batch reports
+	// none, so completed_tables can be short; a finished load read every table.
+	if l.Status == "completed" {
+		l.TablesDone = l.TablesTotal
+	}
+	return &l
+}
+
+func applySinkLag(liveness *RuntimeLiveness, r sinkLagReading) {
+	if liveness == nil || !r.found {
+		return
+	}
+	lag := r.totalLag
+	moving := r.committed
+	stalled := r.stalled
+	measuredAt := r.measuredAt
+	liveness.SinkLagMessages = &lag
+	liveness.SinkCommittedMoving = &moving
+	liveness.SinkStalled = &stalled
+	liveness.SinkLagMeasuredAt = &measuredAt
+	liveness.SinkStalledSeconds = r.stalledSeconds
+	liveness.SinkConsumerGroup = r.consumerGroup
 }
 
 // loadRuntimeDeps reads the dependency manifest + health for a pipeline and
@@ -450,8 +645,13 @@ func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, livene
 	}
 
 	switch status {
-	case "paused", "stopped":
+	case "paused":
 		return "paused"
+	case "stopped":
+		// Its own phase since a CDC Stop parks the connector and keeps the slot and
+		// position (orchestrator cdc_stop.go): the page must say Stopped, not
+		// Paused, and Start resumes it.
+		return "stopped"
 	case "pending", "":
 		return "initializing"
 	}

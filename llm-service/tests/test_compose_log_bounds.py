@@ -35,6 +35,7 @@ OVERLAY_COMPOSE = [
     "docker-compose.vps-2c8g.yml",
     "docker-compose.oss.yml",
     "docker-compose.ci-isolate.yml",
+    "docker-compose.observability.yml",
 ]
 
 

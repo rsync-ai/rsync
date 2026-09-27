@@ -242,18 +242,6 @@ func (p *AvroProducer) SendAgentMessage(ctx context.Context, topic string, trace
 	return p.sendAvro(ctx, topic, schemaName, traceID, request)
 }
 
-// SendIntentTask sends an Intent Task message using the proper Avro schema
-func (p *AvroProducer) SendIntentTask(ctx context.Context, topic string, traceID string, request map[string]interface{}) error {
-	schemaName := "com.rsync.agent.IntentTask"
-
-	// Ensure timestamp is a string (not int64)
-	if request["timestamp"] == nil {
-		request["timestamp"] = time.Now().Format(time.RFC3339)
-	}
-
-	return p.sendAvro(ctx, topic, schemaName, traceID, request)
-}
-
 // sendAvro is the core Avro sending function
 func (p *AvroProducer) sendAvro(ctx context.Context, topic, schemaName, key string, data map[string]interface{}) error {
 	ctx, span := p.tracer.Start(ctx, "kafka.send.avro",

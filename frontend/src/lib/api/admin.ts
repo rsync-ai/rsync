@@ -111,6 +111,43 @@ export async function adminUpdateUserRole(id: string, role: string): Promise<{ m
   return res.json()
 }
 
+/**
+ * The plan names shipped by the migrations, in the order an admin reads them
+ * (cheapest first). There is NO plans-listing endpoint — `plans` is a DB table
+ * the API never exposes — so this list is seeded from
+ * api-gateway/migrations/060_user_plans.sql and 071_starter_plan_and_workspace_plans.sql
+ * rather than fetched.
+ *
+ * That makes it drift-prone in one direction only: a plan added to the catalogue
+ * later is missing here. The caller therefore unions this list with the plans it
+ * can actually SEE in the usage payload, and the server is the real authority —
+ * it validates against the `plans` table and answers 400 {"error":"unknown plan"}
+ * for anything it does not know (admin_plans.go). So a stale entry here fails
+ * loudly on save instead of writing a typo'd tier.
+ */
+export const KNOWN_PLAN_NAMES = ["trial", "free", "starter", "pro"] as const
+
+/**
+ * Sets a workspace's billing plan (the interim manual-upgrade path until Stripe).
+ *
+ * Side effect worth surfacing in the UI: the server also clears plan_expires_at,
+ * so a manual grant never auto-expires.
+ */
+export async function adminSetWorkspacePlan(
+  workspaceId: string,
+  plan: string
+): Promise<{ success: boolean; workspace_id: string; plan: string }> {
+  const res = await authFetch(`/api/v1/admin/workspaces/${workspaceId}/plan`, {
+    method: "POST",
+    body: JSON.stringify({ plan }),
+  })
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: "Request failed" }))
+    throw new Error(err.error || `HTTP ${res.status}`)
+  }
+  return res.json()
+}
+
 export async function adminUpdateUserStatus(id: string, status: string): Promise<{ message: string; status: string }> {
   const res = await authFetch(`/api/v1/admin/users/${id}/status`, {
     method: "PATCH",

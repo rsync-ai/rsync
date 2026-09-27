@@ -237,6 +237,23 @@ export function PipelineScheduleCreateDialogLauncher({ pipelineId }: { pipelineI
   )
 }
 
+/**
+ * The server's own reason for refusing, phrased for a toast description.
+ *
+ * Four of the five schedule handlers used to answer every non-2xx with a flat
+ * "Failed to pause schedule" and drop the body on the floor -- while that body
+ * was saying "schedule not found", "pipeline is still running", or "temporal
+ * unreachable". Those are the difference between retry, wait, and call someone,
+ * and the user was shown none of it. (The update handler already read the body;
+ * this is that behaviour, factored out and given to its four siblings.)
+ */
+export async function serverReason(response: Response): Promise<string> {
+  const body = (await response.json().catch(() => null)) as Record<string, unknown> | null
+  const raw = body?.error ?? body?.message ?? body?.detail
+  const text = typeof raw === "string" ? raw.trim() : ""
+  return text || `The server answered ${response.status}.`
+}
+
 export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps) {
   const [schedules, setSchedules] = useState<Schedule[]>([])
   const [loading, setLoading] = useState(true)
@@ -411,10 +428,12 @@ export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps
         toast.success("Schedule paused")
         refreshSchedules()
       } else {
-        toast.error("Failed to pause schedule")
+        toast.error("Failed to pause schedule", { description: await serverReason(response) })
       }
     } catch (error) {
-      toast.error("Failed to pause schedule")
+      toast.error("Failed to pause schedule", {
+        description: error instanceof Error ? error.message : "The request never reached the server.",
+      })
       console.error(error)
     } finally {
       setBusyScheduleId(null)
@@ -436,10 +455,12 @@ export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps
         toast.success("Schedule resumed")
         refreshSchedules()
       } else {
-        toast.error("Failed to resume schedule")
+        toast.error("Failed to resume schedule", { description: await serverReason(response) })
       }
     } catch (error) {
-      toast.error("Failed to resume schedule")
+      toast.error("Failed to resume schedule", {
+        description: error instanceof Error ? error.message : "The request never reached the server.",
+      })
       console.error(error)
     } finally {
       setBusyScheduleId(null)
@@ -460,10 +481,12 @@ export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps
       if (response.ok) {
         toast.success("Pipeline execution triggered")
       } else {
-        toast.error("Failed to trigger execution")
+        toast.error("Failed to trigger execution", { description: await serverReason(response) })
       }
     } catch (error) {
-      toast.error("Failed to trigger execution")
+      toast.error("Failed to trigger execution", {
+        description: error instanceof Error ? error.message : "The request never reached the server.",
+      })
       console.error(error)
     } finally {
       setBusyScheduleId(null)
@@ -485,10 +508,12 @@ export function PipelineSchedulePanel({ pipelineId }: PipelineSchedulePanelProps
         toast.success("Schedule deleted")
         refreshSchedules()
       } else {
-        toast.error("Failed to delete schedule")
+        toast.error("Failed to delete schedule", { description: await serverReason(response) })
       }
     } catch (error) {
-      toast.error("Failed to delete schedule")
+      toast.error("Failed to delete schedule", {
+        description: error instanceof Error ? error.message : "The request never reached the server.",
+      })
       console.error(error)
     } finally {
       setBusyScheduleId(null)

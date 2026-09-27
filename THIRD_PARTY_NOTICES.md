@@ -31,7 +31,7 @@ production dependencies._
 
 A scan of the **language-level** dependencies (Go modules, Python packages, npm production deps)
 found **no strong-copyleft (GPL / AGPL / SSPL / BUSL)** among them; the only copyleft language
-deps are **weak-copyleft** (MPL-2.0 / LGPL-3.0), which ELv2 redistribution permits because each is
+deps are **weak-copyleft** (MPL-2.0 / LGPL-3.0 / EPL-2.0), which ELv2 redistribution permits because each is
 consumed as a separable, dynamically-linked pre-compiled component (no static linking of
 rsync-ai's own code into the copyleft work). **Separately, OS/system packages baked into the
 connector container images (see § "Container image / OS packages") add two attention items —
@@ -47,6 +47,7 @@ must remain separable and replaceable.
 | [`certifi`](https://github.com/certifi/python-certifi) | transitive (requests/httpx/boto3), Python connector images | **MPL-2.0** | CA-bundle data; weak copyleft, unmodified, redistributed as-is. Transitive — enumerated fully at release-time regen. |
 | [`sharp`](https://github.com/lovell/sharp) (`@img/sharp-*`, libvips) | frontend image optimization (Next.js) | **LGPL-3.0-or-later** (libvips; npm reports `Apache-2.0 AND LGPL-3.0-or-later [AND MIT]`) | Weak copyleft; the libvips native lib is a dynamically-linked, separable pre-built binary — ELv2-redistributable. Surfaced by the Trivy license scan (the direct-dep frontend scan missed the transitive libvips). Its licenses are covered by `licenses.yml`'s package.json grep + the release-time `license-checker`; the frontend npm lockfile is scoped out of the blocking Trivy license gate (a Trivy 3-component-compound bug — see `.github/workflows/security.yml`). |
 | [`msodbcsql18`](https://learn.microsoft.com/sql/connect/odbc/) | `sqlserver` connector image (apt) | **Proprietary — Microsoft ODBC Driver EULA** | Installed with `ACCEPT_EULA=Y`. Redistribution inside a published image is governed by the Microsoft EULA, **not** ELv2 — **flag for legal review before public distribution.** No other connector bundles it. |
+| [`elkjs`](https://github.com/kieler/elkjs) | frontend graph layout (Explorer lineage + model graphs) | **EPL-2.0 OR GPL-3.0-or-later** — rsync-ai **elects EPL-2.0** | File-level weak copyleft. Shipped unmodified, as its own JS chunks (a Web Worker script, plus a main-thread fallback loaded only when a worker cannot start), never merged into rsync-ai source. The minifier strips source comments (elkjs's own licence header included), so the notice ships as a served file, `/third-party/elkjs-LICENSE.txt` (`frontend/public/`): the upstream copyright, a link to the release's source (<https://github.com/kieler/elkjs/tree/0.12.0>) and the full EPL-2.0 text; `elk-license.test.ts` fails when it stops matching the installed elkjs. The GPL-3.0 alternative is not elected. A change to elkjs itself would be EPL-2.0 and its source would have to be offered. |
 | [`unixODBC`](https://www.unixodbc.org/) (`unixodbc`/`unixodbc-dev`) | `sqlserver` connector image (apt) | **LGPL-2.1** (libs); **GPL-2.0** (some CLI tools, e.g. `isql`) | pyodbc's driver manager. The linked libraries are LGPL; the GPL-2.0 CLI tools ship in the image but are not invoked by the connector. |
 | `mysql-connector-python` | -- (removed) | GPL-2.0 | **No longer shipped.** Swapped to MIT `PyMySQL` in #499; remains only in dev/test manifests (`e2e/`, `tests/`) which are not part of any distributed image. |
 | `pymssql` | -- (not installed) | LGPL-2.1 | Present only as an inert commented line in some connector manifests. The SQL Server connector uses `pyodbc` (MIT-0). Do not uncomment without review. |
@@ -55,7 +56,7 @@ must remain separable and replaceable.
 
 - **Go** (137 module@version rows): Apache-2.0 x 58; MIT x 43; BSD-3-Clause x 25; BSD-2-Clause x 7; ISC x 2; MPL-2.0 x 2
 - **Python** (27 packages): Apache-2.0 x 9; MIT x 7; BSD-3-Clause x 6; Apache-2.0 OR BSD-3-Clause x 2; LGPL-3.0-or-later x 1; MIT-0 x 1; UPL-1.0 OR Apache-2.0 x 1
-- **Frontend** (49 direct prod deps): MIT x 46; Apache-2.0 x 2; ISC x 1
+- **Frontend** (50 direct prod deps): MIT x 46; Apache-2.0 x 2; ISC x 1; EPL-2.0 x 1 (elected)
 
 ## Go modules
 
@@ -69,7 +70,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | Component | Version | License |
 |---|---|---|
 | [filippo.io/edwards25519](https://filippo.io/edwards25519) | v1.2.0 | BSD-3-Clause |
-| [github.com/IBM/sarama](https://github.com/IBM/sarama) | v1.60.2 | MIT |
+| [github.com/IBM/sarama](https://github.com/IBM/sarama) | v1.61.0 | MIT |
 | [github.com/aws/aws-msk-iam-sasl-signer-go](https://github.com/aws/aws-msk-iam-sasl-signer-go) | v1.0.4 | Apache-2.0 |
 | [github.com/aws/aws-sdk-go-v2](https://github.com/aws/aws-sdk-go-v2) | v1.32.4 | Apache-2.0 |
 | [github.com/aws/aws-sdk-go-v2/config](https://github.com/aws/aws-sdk-go-v2) | v1.28.2 | Apache-2.0 |
@@ -107,7 +108,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/go-logr/stdr](https://github.com/go-logr/stdr) | v1.2.2 | Apache-2.0 |
 | [github.com/go-playground/locales](https://github.com/go-playground/locales) | v0.14.1 | MIT |
 | [github.com/go-playground/universal-translator](https://github.com/go-playground/universal-translator) | v0.18.1 | MIT |
-| [github.com/go-playground/validator/v10](https://github.com/go-playground/validator) | v10.30.4 | MIT |
+| [github.com/go-playground/validator/v10](https://github.com/go-playground/validator) | v10.30.5 | MIT |
 | [github.com/go-redis/redis/v8](https://github.com/go-redis/redis) | v8.11.5 | BSD-2-Clause |
 | [github.com/go-sql-driver/mysql](https://github.com/go-sql-driver/mysql) | v1.10.1 | MPL-2.0 |
 | [github.com/go-viper/mapstructure/v2](https://github.com/go-viper/mapstructure) | v2.5.0 | MIT |
@@ -132,11 +133,11 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/jcmturner/gokrb5/v8](https://github.com/jcmturner/gokrb5) | v8.4.4 | Apache-2.0 |
 | [github.com/jcmturner/rpc/v2](https://github.com/jcmturner/rpc) | v2.0.3 | Apache-2.0 |
 | [github.com/klauspost/compress](https://github.com/klauspost/compress) | v1.19.1 | BSD-3-Clause |
-| [github.com/klauspost/compress](https://github.com/klauspost/compress) | v1.19.2 | BSD-3-Clause |
+| [github.com/klauspost/compress](https://github.com/klauspost/compress) | v1.20.0 | BSD-3-Clause |
 | [github.com/leodido/go-urn](https://github.com/leodido/go-urn) | v1.5.0 | MIT |
 | [github.com/linkedin/goavro/v2](https://github.com/linkedin/goavro) | v2.15.0 | Apache-2.0 |
 | [github.com/mattn/go-isatty](https://github.com/mattn/go-isatty) | v0.0.20 | MIT |
-| [github.com/microsoft/go-mssqldb](https://github.com/microsoft/go-mssqldb) | v1.11.0 | BSD-3-Clause |
+| [github.com/microsoft/go-mssqldb](https://github.com/microsoft/go-mssqldb) | v1.11.2 | BSD-3-Clause |
 | [github.com/moby/docker-image-spec](https://github.com/moby/docker-image-spec) | v1.3.1 | Apache-2.0 |
 | [github.com/munnerz/goautoneg](https://github.com/munnerz/goautoneg) | v0.0.0-20191010083416-a7dc8b61c822 | BSD-3-Clause |
 | [github.com/nexus-rpc/nexus-proto-annotations](https://github.com/nexus-rpc/api) | v0.1.0 | MIT |
@@ -145,7 +146,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [github.com/opencontainers/image-spec](https://github.com/opencontainers/image-spec) | v1.1.1 | Apache-2.0 |
 | [github.com/pelletier/go-toml/v2](https://github.com/pelletier/go-toml) | v2.2.4 | MIT |
 | [github.com/pierrec/lz4/v4](https://github.com/pierrec/lz4) | v4.1.27 | BSD-3-Clause |
-| [github.com/pierrec/lz4/v4](https://github.com/pierrec/lz4) | v4.1.29 | BSD-3-Clause |
+| [github.com/pierrec/lz4/v4](https://github.com/pierrec/lz4) | v4.1.30 | BSD-3-Clause |
 | [github.com/pkg/errors](https://github.com/pkg/errors) | v0.9.1 | BSD-2-Clause |
 | [github.com/prometheus/client_golang](https://github.com/prometheus/client_golang) | v1.24.1 | Apache-2.0 |
 | [github.com/prometheus/client_model](https://github.com/prometheus/client_model) | v0.6.2 | Apache-2.0 |
@@ -192,7 +193,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [go.uber.org/atomic](https://github.com/uber-go/atomic) | v1.11.0 | MIT |
 | [go.yaml.in/yaml/v3](https://github.com/yaml/go-yaml) | v3.0.5 | Apache-2.0 |
 | [golang.org/x/crypto](https://cs.opensource.google/go/x/crypto) | v0.57.0 | BSD-3-Clause |
-| [golang.org/x/net](https://cs.opensource.google/go/x/net) | v0.58.0 | BSD-3-Clause |
+| [golang.org/x/net](https://cs.opensource.google/go/x/net) | v0.59.0 | BSD-3-Clause |
 | [golang.org/x/sync](https://cs.opensource.google/go/x/sync) | v0.22.0 | BSD-3-Clause |
 | [golang.org/x/sync](https://cs.opensource.google/go/x/sync) | v0.23.0 | BSD-3-Clause |
 | [golang.org/x/sys](https://cs.opensource.google/go/x/sys) | v0.48.0 | BSD-3-Clause |
@@ -202,7 +203,7 @@ own build list, and both binaries ship) -- e.g. `go.opentelemetry.io/otel` at v1
 | [golang.org/x/time](https://cs.opensource.google/go/x/time) | v0.5.0 | BSD-3-Clause |
 | [google.golang.org/genproto/googleapis/api](https://github.com/googleapis/go-genproto) | v0.0.0-20260819154853-08b0e4226688 | Apache-2.0 |
 | [google.golang.org/genproto/googleapis/rpc](https://github.com/googleapis/go-genproto) | v0.0.0-20260819154853-08b0e4226688 | Apache-2.0 |
-| [google.golang.org/grpc](https://github.com/grpc/grpc-go) | v1.83.2 | Apache-2.0 |
+| [google.golang.org/grpc](https://github.com/grpc/grpc-go) | v1.84.0 | Apache-2.0 |
 | [google.golang.org/protobuf](https://github.com/protocolbuffers/protobuf-go) | v1.36.12 | BSD-3-Clause |
 | [gopkg.in/yaml.v3](https://github.com/go-yaml/yaml) | v3.0.1 | Apache-2.0 |
 
@@ -287,6 +288,7 @@ license-checker). Notable transitive: `caniuse-lite` -- CC-BY-4.0 (attribution-o
 | `clsx` | ^2.1.1 | MIT |
 | `dagre` | ^0.8.5 | MIT |
 | `date-fns` | ^4.1.0 | MIT |
+| `elkjs` | ^0.12.0 | EPL-2.0 (elected from `EPL-2.0 OR GPL-3.0-or-later`) |
 | `framer-motion` | ^12.23.24 | MIT |
 | [lucide-react](https://www.npmjs.com/package/lucide-react) | ^0.555.0 | ISC |
 | `next` | 16.2.10 | MIT |

@@ -32,7 +32,7 @@ func TestCDCTableStatsResponseCarriesTheDestination(t *testing.T) {
 
 	cols := []string{
 		"schema_name", "table_name", "qualified_name", "mode", "status",
-		"read_rows", "inserted_rows",
+		"snapshot_rows", "applied_snapshot_rows",
 		"inserts", "updates", "deletes", "total_events", "last_event_ts",
 		"applied_inserts", "applied_updates", "applied_deletes", "applied_total_events", "last_applied_ts",
 		"dlq_rows",
@@ -65,7 +65,7 @@ func TestCDCTableStatsResponseCarriesTheDestination(t *testing.T) {
 		WillReturnRows(rows)
 
 	stats, _, _, err := buildCDCTableStatsResponse(db, "p1", "e1",
-		[]string{"pipeline_test.demo_products", "pipeline_test.demo_orders"},
+		[]string{"pipeline_test.demo_products", "pipeline_test.demo_orders"}, nil,
 		"", "", 50, 0, "")
 	if err != nil {
 		t.Fatalf("buildCDCTableStatsResponse: %v", err)

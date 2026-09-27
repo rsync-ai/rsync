@@ -103,30 +103,6 @@ func InitTracerWithConfig(cfg TelemetryConfig) (func(context.Context) error, err
 	return tp.Shutdown, nil
 }
 
-// GetTracer returns the global tracer
-func GetTracer() trace.Tracer {
-	if tracer == nil {
-		return otel.Tracer("default")
-	}
-	return tracer
-}
-
-// AddSpanAttributes adds attributes to the current span
-func AddSpanAttributes(ctx context.Context, attrs ...attribute.KeyValue) {
-	span := trace.SpanFromContext(ctx)
-	if span.IsRecording() {
-		span.SetAttributes(attrs...)
-	}
-}
-
-// RecordError records an error on the current span
-func RecordError(ctx context.Context, err error) {
-	span := trace.SpanFromContext(ctx)
-	if span.IsRecording() {
-		span.RecordError(err)
-	}
-}
-
 // Helper to get environment variable with default
 func getEnv(key, defaultValue string) string {
 	if value := os.Getenv(key); value != "" {
@@ -185,17 +161,6 @@ func NormalizeTraceID(traceID string, format string) string {
 		return TraceIDToUUID(cleanID)
 	}
 	return cleanID
-}
-
-// CreateSpanFromKafkaHeaders creates a new span from Kafka message headers
-func CreateSpanFromKafkaHeaders(ctx context.Context, headers map[string]string, spanName string) (context.Context, trace.Span) {
-	// Extract trace context from headers
-	propagator := otel.GetTextMapPropagator()
-	carrier := propagation.MapCarrier(headers)
-	ctx = propagator.Extract(ctx, carrier)
-
-	// Start new span as child of extracted context
-	return GetTracer().Start(ctx, spanName, trace.WithSpanKind(trace.SpanKindConsumer))
 }
 
 // InjectTraceToHeaders injects trace context into headers map

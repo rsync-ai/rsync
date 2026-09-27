@@ -6,7 +6,8 @@ like a safety net and is not one -- constructing a gRPC exporter opens no
 connection, so nothing raises, the service logs the green
 "OpenTelemetry initialized" line, and the batch processor then retries every span
 batch at ``localhost:4317`` for the life of the process, blocking its worker for
-the full export timeout each time. ``init_metrics`` in the telemetry agent had the
+the full export timeout each time. ``init_metrics`` in the telemetry agent (deleted
+in v0.1.6 -- nothing ran it) had the
 identical shape with a reader that wakes every 10 seconds.
 
 Both are now gated on ``otel_enabled()``. The default is ENABLED, matching cloud,
@@ -128,22 +129,3 @@ def test_disabled_still_returns_a_usable_tracer(monkeypatch):
     tracer, _, _ = _init_with_flag(monkeypatch, "false")
     with tracer.start_as_current_span("probe") as span:
         span.set_attribute("k", "v")  # must not raise
-
-
-def test_telemetry_agent_metrics_use_the_same_gate(monkeypatch):
-    """init_metrics had the identical unguarded shape, with a 10s retry loop."""
-    svc = pytest.importorskip("src.agents.telemetry.service")
-
-    exporter = _Recorder()
-    monkeypatch.setattr(svc, "OTLPMetricExporter", exporter)
-    monkeypatch.setattr(svc, "PeriodicExportingMetricReader", lambda *a, **k: None)
-    monkeypatch.setattr(svc, "MeterProvider", lambda *a, **k: None)
-    monkeypatch.setattr(svc.metrics, "set_meter_provider", lambda *a, **k: None)
-
-    monkeypatch.setenv("OTEL_ENABLED", "false")
-    svc.init_metrics()
-    assert exporter.calls == 0, "an OTLPMetricExporter was built with OTEL_ENABLED=false"
-
-    monkeypatch.setenv("OTEL_ENABLED", "true")
-    svc.init_metrics()
-    assert exporter.calls == 1, "the gate must not disable metrics for cloud"

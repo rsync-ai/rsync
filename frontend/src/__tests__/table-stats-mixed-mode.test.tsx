@@ -150,7 +150,7 @@ describe("F-281 — mixed mode keeps every row under its own headings", () => {
     )
 
     render(<TableStatisticsPanel pipelineId="p1" />)
-    await waitFor(() => expect(screen.getByText(/events/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText("events")).toBeInTheDocument())
 
     expect(screen.queryByText(/^Read$/)).toBeNull()
     const { headerCells, bodyRowCells } = columnCounts()
@@ -355,7 +355,7 @@ describe("#21 — a CDC table with nothing captured reads 'No data yet', not Run
     )
 
     render(<TableStatisticsPanel pipelineId="p1" />)
-    await waitFor(() => expect(screen.getByText(/events/)).toBeInTheDocument())
+    await waitFor(() => expect(screen.getByText("events")).toBeInTheDocument())
 
     expect(cellUnder("Captured I")).toBe("—")
     expect(cellUnder("Captured U")).toBe("5")

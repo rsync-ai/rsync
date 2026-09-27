@@ -116,6 +116,28 @@ const sinkGroupsToStopQuery = `
 	  AND TRIM(identifier) <> ''
 `
 
+// RegisteredSinkConsumerGroups returns EVERY sink consumer group this pipeline
+// registered, deduplicated — the manifest rows only, with no derived names.
+//
+// It exists for the per-consumer census the pipeline page reads. The census wants
+// groups that actually exist: a derived name for a shape this pipeline never ran
+// (`-batch` on a pure streaming pipeline) would appear as a consumer with no data,
+// which reads as a broken consumer rather than an absent one. SinkConsumerGroupsToStop
+// deliberately does include the derived spellings, because stopping a worker that
+// isn't there costs one "Worker not found" while missing one leaves it writing.
+//
+// ResolveSinkConsumerGroup answers the same question with LIMIT 1, which is right for
+// "which group does the alarm watch" and wrong for a census: a hybrid pipeline holds a
+// -batch worker AND a streaming one, so exactly one of its two sinks was ever measured
+// and the other could be wedged with nothing reporting it.
+//
+// An empty result means the manifest has no row (a pipeline from before the sink
+// registered itself, or a failed upsert — upsertDependency only logs). The caller
+// falls back to the resolved single group rather than reporting no consumers at all.
+func RegisteredSinkConsumerGroups(ctx context.Context, db *sql.DB, pipelineID string) []string {
+	return uniqueSinkGroups(manifestSinkGroups(ctx, db, pipelineID))
+}
+
 // manifestSinkGroups returns the sink consumer groups this pipeline registered, in the
 // order the manifest query returns them. A failed lookup returns nothing and is logged:
 // the caller still has the derived names.

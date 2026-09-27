@@ -6,7 +6,9 @@ import (
 )
 
 // newConsumerGroupIDs builds a Consumer the way main() does and returns the
-// group id every one of its per-topic readers ended up with.
+// group id every one of its per-topic readers ended up with. main() passes one
+// topic today; the fixture passes two so the one-group-across-readers property
+// is exercised by more than a single reader.
 //
 // The readers are closed on cleanup: kafka-go starts a coordinator goroutine
 // per reader, and 127.0.0.1:1 refuses at once, so nothing here waits on a
@@ -19,7 +21,7 @@ func newConsumerGroupIDs(t *testing.T, prefix, logical string) []string {
 
 	c := NewConsumer(
 		[]string{"127.0.0.1:1"},
-		[]string{"rsync.agent.planner.responses", "rsync.pii.scan.response"},
+		[]string{"rsync.pii.scan.response", "rsync.pipeline.domain.events"},
 		logical,
 	)
 	t.Cleanup(func() { _ = c.Close() })
@@ -34,7 +36,7 @@ func newConsumerGroupIDs(t *testing.T, prefix, logical string) []string {
 	return ids
 }
 
-// The agent-response consumer is the one whose group id main() spells as a bare
+// The PII scan-result consumer is the one whose group id main() spells as a bare
 // logical name. Namespacing it is the constructor's job, so this asserts the
 // value that actually reaches kafka-go rather than the literal in main().
 func TestNewConsumerNamespacesTheGroupID(t *testing.T) {

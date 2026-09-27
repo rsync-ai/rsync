@@ -265,7 +265,10 @@ func (h *Hub) BroadcastEvent(eventType EventType, data map[string]interface{}, t
 		TraceID:   traceID,
 	}
 
-	log.Printf("📤 Broadcasting WebSocket event: type=%s, data=%+v", eventType, data)
+	// Debug, and the type only: this ran at Info with the whole payload on every
+	// progress tick, so a running pipeline filled the gateway log with row counts,
+	// table names and error text.
+	log.Debugf("Broadcasting WebSocket event: type=%s", eventType)
 
 	eventJSON, err := json.Marshal(event)
 	if err != nil {
@@ -301,45 +304,14 @@ func extractPipelineID(data map[string]interface{}) (string, bool) {
 	return s, true
 }
 
-// BroadcastPipelineProgress sends a normalized pipeline progress event.
-// This is intended to be stable across all connectors/services.
-func (h *Hub) BroadcastPipelineProgress(data map[string]interface{}, traceID string) {
-	h.BroadcastEvent(EventPipelineProgress, data, traceID)
-}
-
 // BroadcastDataPlaneMetrics broadcasts a high-signal data-plane metrics update.
 // These events are expected to be low-frequency (e.g., every 5–10s) and safe for UI consumption.
 func (h *Hub) BroadcastDataPlaneMetrics(data map[string]interface{}, traceID string) {
 	h.BroadcastEvent(EventDataPlaneMetrics, data, traceID)
 }
 
-// BroadcastCDCUpdate sends a CDC connector status update
-func (h *Hub) BroadcastCDCUpdate(connectorName, status string, details map[string]interface{}) {
-	data := map[string]interface{}{
-		"connector_name": connectorName,
-		"status":         status,
-	}
-	for k, v := range details {
-		data[k] = v
-	}
-	h.BroadcastEvent(EventCDCStatus, data, "")
-}
-
-// BroadcastAgentActivity sends an agent activity update
-func (h *Hub) BroadcastAgentActivity(agent, status, pipelineID string, details map[string]interface{}, traceID string) {
-	data := map[string]interface{}{
-		"agent":       agent,
-		"status":      status, // Changed from "action" to "status" to match frontend expectations
-		"pipeline_id": pipelineID,
-	}
-	for k, v := range details {
-		data[k] = v
-	}
-	h.BroadcastEvent(EventAgentActivity, data, traceID)
-}
-
 // ============================================================================
-// NEW ARCHITECTURE: Domain Events & Telemetry
+// NEW ARCHITECTURE: Domain Events
 // ============================================================================
 
 // BroadcastDomainEvent broadcasts a canonical domain event (new architecture)
@@ -356,24 +328,6 @@ func (h *Hub) BroadcastDomainEvent(pipelineID string, event map[string]interface
 	message, err := json.Marshal(wsEvent)
 	if err != nil {
 		log.Printf("Failed to marshal domain event: %v", err)
-		return
-	}
-	h.sendScopedToPipeline(pipelineID, message, traceID)
-}
-
-// BroadcastTelemetryEvent broadcasts agent telemetry (debug only). Even
-// though telemetry is developer-facing, the payload still references a
-// specific pipeline so we scope delivery to that pipeline's owner.
-func (h *Hub) BroadcastTelemetryEvent(pipelineID string, event map[string]interface{}, traceID string) {
-	wsEvent := WebSocketEvent{
-		Type:      "telemetry_event",
-		Timestamp: time.Now().UTC().Format(time.RFC3339),
-		Data:      event,
-		TraceID:   traceID,
-	}
-	message, err := json.Marshal(wsEvent)
-	if err != nil {
-		log.Printf("Failed to marshal telemetry event: %v", err)
 		return
 	}
 	h.sendScopedToPipeline(pipelineID, message, traceID)

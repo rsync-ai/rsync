@@ -150,6 +150,15 @@ func pgDSCases() []pgDSCase {
 			execStatus: strp("completed"), execClosed: true, ppStatus: strp("completed"),
 			wantList: "passed", wantState: "passed",
 		},
+		{
+			// Prod 2026-09-26: the postflight failed the run after PIPELINE_COMPLETED
+			// had been emitted, and a late projection of that event left pp at
+			// 'completed'. Home badged it 'passed' while the pipeline page said failed.
+			id: "d5d5d5d5-0000-4000-8000-000000000110", name: "batch-postflight-failed",
+			pStatus: "failed", syncMode: strp("batch"),
+			execStatus: strp("failed"), execClosed: true, ppStatus: strp("completed"),
+			wantList: "failed", wantState: "failed",
+		},
 	}
 }
 
@@ -371,5 +380,45 @@ func TestPG_DerivedStatus_ListCountStatsAndStateAgree(t *testing.T) {
 	}
 	if compared == 0 {
 		t.Fatalf("no /state comparisons ran")
+	}
+}
+
+// The trends summary runs executionStatusSQL for one run (the sqlmock test only
+// matches its text). Seeds PIPELINE_COMPLETED for the postflight-failed run and
+// the healthy run. (fk_pipeline_run_events_execution_id means an event always has
+// its executions row here.)
+func TestPG_Trends_ExecutionsRowDecidesTheStatus(t *testing.T) {
+	conn := pgDSOpen(t)
+	cases := pgDSCases()
+	pgDSSeed(t, conn, cases)
+
+	execOf := func(pipelineID string) string {
+		return pipelineID[:len(pipelineID)-3] + "e" + pipelineID[len(pipelineID)-2:]
+	}
+	const failedPipe = "d5d5d5d5-0000-4000-8000-000000000110"
+	const donePipe = "d5d5d5d5-0000-4000-8000-000000000109"
+
+	for _, ev := range []struct{ pipe, exec string }{
+		{failedPipe, execOf(failedPipe)},
+		{donePipe, execOf(donePipe)},
+	} {
+		pgDSExec(t, conn, `
+			INSERT INTO pipeline_run_events (pipeline_id, execution_id, event_id, event_type, occurred_at)
+			VALUES ($1, $2, $3, 'PIPELINE_COMPLETED', NOW())`, ev.pipe, ev.exec, "probe-"+ev.exec)
+	}
+
+	for _, tc := range []struct {
+		name, pipe, exec, want string
+	}{
+		{"postflight-failed run", failedPipe, execOf(failedPipe), "failed"},
+		{"healthy run (control)", donePipe, execOf(donePipe), "completed"},
+	} {
+		s, err := getExecutionSummary(conn, tc.pipe, tc.exec)
+		if err != nil {
+			t.Fatalf("%s: %v", tc.name, err)
+		}
+		if s.Status != tc.want {
+			t.Errorf("%s: trends status = %q, want %q", tc.name, s.Status, tc.want)
+		}
 	}
 }

@@ -3,6 +3,7 @@ import {
   LINEAGE_NODE_HEIGHT,
   LINEAGE_NODE_WIDTH,
   MAX_LINEAGE_NODES,
+  MIN_READABLE_FIT_ZOOM,
   buildModelLineage,
   describeLineageNode,
   initialViewport,
@@ -654,8 +655,8 @@ describe("describeLineageNode: pipelines", () => {
 })
 
 describe("layoutLineage", () => {
-  it("places upstreams left of the model and downstreams right of it", () => {
-    const { positions, bounds } = layoutLineage(
+  it("places upstreams left of the model and downstreams right of it", async () => {
+    const { positions, bounds } = await layoutLineage(
       ["up", "root", "down"],
       [
         { from: "up", to: "root" },
@@ -670,8 +671,8 @@ describe("layoutLineage", () => {
     expect(bounds.width).toBeGreaterThanOrEqual(3 * LINEAGE_NODE_WIDTH)
   })
 
-  it("gives zero bounds for no nodes", () => {
-    expect(layoutLineage([], []).bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
+  it("gives zero bounds for no nodes", async () => {
+    expect((await layoutLineage([], [])).bounds).toEqual({ x: 0, y: 0, width: 0, height: 0 })
   })
 })
 
@@ -692,6 +693,20 @@ describe("initialViewport", () => {
   it("centres the model at full size when fitting would make the words too small", () => {
     const v = initialViewport({ x: 0, y: 0, width: 4000, height: 76 }, root, { width: 1000, height: 420 })
     expect(v).toEqual({ x: 500 - (300 + LINEAGE_NODE_WIDTH / 2), y: 210 - LINEAGE_NODE_HEIGHT / 2, zoom: 1 })
+  })
+
+  it("with nothing to centre on, starts at the top-left at the smallest readable size", () => {
+    // A 25-asset workspace is 1304 x 1756: fitting it in 480px would draw words at a quarter size.
+    const v = initialViewport({ x: 10, y: 20, width: 1304, height: 1756 }, null, { width: 1250, height: 480 })
+    expect(v.zoom).toBe(MIN_READABLE_FIT_ZOOM)
+    expect(v.x).toBeCloseTo(24 - 10 * MIN_READABLE_FIT_ZOOM)
+    expect(v.y).toBeCloseTo(24 - 20 * MIN_READABLE_FIT_ZOOM)
+    // Still fits and centres when the drawing is readable whole.
+    expect(initialViewport({ x: 0, y: 0, width: 500, height: 100 }, null, { width: 1000, height: 420 })).toEqual({
+      x: 250,
+      y: 160,
+      zoom: 1,
+    })
   })
 
   it("falls back to the origin before the canvas has a size", () => {

@@ -5,10 +5,11 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/IBM/sarama"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -18,11 +19,6 @@ import (
 )
 
 var sentinelTracer = otel.Tracer("sentinel-agent")
-
-const (
-	HeartbeatTopic = "rsync.agents.heartbeat"
-	AuditTopic     = "rsync.sentinel.audit"
-)
 
 // Agent is the main Sentinel Agent that monitors and heals the system
 type Agent struct {
@@ -39,7 +35,6 @@ type Agent struct {
 	predictor     *AnomalyPredictor
 
 	// State
-	components   map[string]*ComponentHealth
 	activeIssues map[string]*Issue
 	mu           sync.RWMutex
 
@@ -74,7 +69,6 @@ func NewAgent(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelConfig, a
 		kafkaManager: kafkaManager,
 		db:           db,
 		agentManager: agentManager,
-		components:   make(map[string]*ComponentHealth),
 		activeIssues: make(map[string]*Issue),
 		ctx:          ctx,
 		cancel:       cancel,
@@ -82,8 +76,15 @@ func NewAgent(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelConfig, a
 	}
 
 	// Initialize sub-components
-	agent.logger = NewAuditLogger(kafkaManager, db, config)
+	agent.logger = NewAuditLogger(db, config)
 	agent.healthMonitor = NewHealthMonitor(kafkaManager, db, config, agent.logger)
+	// An evicted component's issue is deleted from the table by the monitor; this drops
+	// the matching entry from the map below, which is what decides whether a later
+	// recurrence is persisted at all (handleDetectedIssue returns early for a repeat).
+	agent.healthMonitor.onComponentsEvicted = agent.forgetIssuesForComponents
+	// Built here rather than in NewHealthMonitor: the Redis probe holds a client, and a
+	// monitor built directly (as the tests do) should not open one it never closes.
+	agent.healthMonitor.serviceProbes = serviceProbesFromEnv(os.Getenv)
 	agent.issueDetector = NewIssueDetector(config, agent.logger)
 	agent.healer = NewHealer(kafkaManager, db, config, agent.logger, agentManager)
 	agent.predictor = NewAnomalyPredictor(config, agent.logger)
@@ -94,12 +95,6 @@ func NewAgent(kafkaManager *kafka.Manager, db *sql.DB, config *SentinelConfig, a
 // Start starts the Sentinel Agent
 func (a *Agent) Start() error {
 	log.Info("🛡️  Starting Sentinel Agent (System Health & Auto-Healing)")
-
-	// Start consuming heartbeats
-	if err := a.kafkaManager.ConsumeWithContext(HeartbeatTopic, a.handleHeartbeat); err != nil {
-		return fmt.Errorf("failed to start heartbeat consumer: %w", err)
-	}
-	log.Infof("✅ Sentinel listening for heartbeats on %s", HeartbeatTopic)
 
 	// Start health monitor
 	if err := a.healthMonitor.Start(a.ctx); err != nil {
@@ -132,10 +127,8 @@ func (a *Agent) Start() error {
 	log.Info("✅ Audit Logger started")
 
 	// Start background loops
-	a.wg.Add(3)
-	go a.healthCheckLoop()
+	a.wg.Add(1)
 	go a.issueDetectionLoop()
-	go a.heartbeatPublishLoop()
 
 	log.Info("✅ Sentinel Agent fully operational")
 
@@ -169,177 +162,6 @@ func (a *Agent) Stop() {
 	log.Info("✅ Sentinel Agent stopped")
 }
 
-// handleHeartbeat processes incoming heartbeat messages from agents
-func (a *Agent) handleHeartbeat(ctx context.Context, msg *sarama.ConsumerMessage) error {
-	ctx, span := sentinelTracer.Start(ctx, "handle_heartbeat")
-	defer span.End()
-
-	// Parse heartbeat using smart deserialization
-	var heartbeat AgentHeartbeat
-	if err := kafka.SmartDeserialize(msg.Value, &heartbeat); err != nil {
-		log.WithError(err).Warn("Failed to deserialize heartbeat message")
-		return nil // Don't retry bad messages
-	}
-
-	span.SetAttributes(
-		attribute.String("agent", heartbeat.Agent),
-		attribute.String("status", heartbeat.Status),
-	)
-
-	// Update component health
-	a.mu.Lock()
-	componentID := fmt.Sprintf("agent:%s", heartbeat.Agent)
-	health, exists := a.components[componentID]
-	if !exists {
-		health = &ComponentHealth{
-			ComponentID:   componentID,
-			ComponentType: ComponentTypeAgent,
-			Metadata:      make(map[string]interface{}),
-		}
-		a.components[componentID] = health
-	}
-
-	// Update health from heartbeat
-	health.LastHeartbeat = heartbeat.Timestamp
-	health.MessagesProcessed = heartbeat.MessagesProcessed
-	health.ErrorCount = heartbeat.ErrorCount
-	health.ConsumerLag = heartbeat.ConsumerLag
-	health.UpdatedAt = time.Now()
-
-	// Map status
-	switch heartbeat.Status {
-	case "healthy":
-		health.Status = HealthStatusHealthy
-	case "degraded":
-		health.Status = HealthStatusDegraded
-	case "unhealthy":
-		health.Status = HealthStatusUnhealthy
-	default:
-		health.Status = HealthStatusUnknown
-	}
-
-	a.mu.Unlock()
-
-	log.WithFields(log.Fields{
-		"agent":              heartbeat.Agent,
-		"status":             heartbeat.Status,
-		"messages_processed": heartbeat.MessagesProcessed,
-		"error_count":        heartbeat.ErrorCount,
-		"consumer_lag":       heartbeat.ConsumerLag,
-	}).Debug("Received agent heartbeat")
-
-	// Feed to health monitor for analysis
-	a.healthMonitor.RecordHeartbeat(componentID, health)
-
-	return nil
-}
-
-// healthCheckLoop periodically checks all components for issues
-func (a *Agent) healthCheckLoop() {
-	defer a.wg.Done()
-
-	ticker := time.NewTicker(a.config.HeartbeatCheckInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-ticker.C:
-			a.performHealthCheck()
-		}
-	}
-}
-
-// performHealthCheck checks all monitored components
-func (a *Agent) performHealthCheck() {
-	_, span := sentinelTracer.Start(a.ctx, "health_check")
-	defer span.End()
-
-	// Extract trace context for logging
-	traceID := span.SpanContext().TraceID().String()
-	spanID := span.SpanContext().SpanID().String()
-
-	a.mu.RLock()
-	components := make([]*ComponentHealth, 0, len(a.components))
-	for _, c := range a.components {
-		components = append(components, c)
-	}
-	a.mu.RUnlock()
-
-	now := time.Now()
-	var staleIDs []string
-
-	for _, component := range components {
-		// Evict components that have been dead long enough to be considered garbage
-		if component.Status == HealthStatusDead && now.Sub(component.UpdatedAt) > a.config.StaleComponentTTL {
-			staleIDs = append(staleIDs, component.ComponentID)
-			continue
-		}
-
-		// Check for missing heartbeats
-		if now.Sub(component.LastHeartbeat) > a.config.HeartbeatTimeout {
-			if component.Status != HealthStatusDead {
-				log.WithFields(log.Fields{
-					"component_id":   component.ComponentID,
-					"last_heartbeat": component.LastHeartbeat,
-					"timeout":        a.config.HeartbeatTimeout,
-					"trace_id":       traceID,
-					"span_id":        spanID,
-				}).Warn("🚨 Component heartbeat timeout")
-
-				a.mu.Lock()
-				component.Status = HealthStatusDead
-				component.UpdatedAt = now
-				a.mu.Unlock()
-
-				// Report to health monitor with trace context
-				a.healthMonitor.RecordHealthChange(component.ComponentID, component)
-
-				// Log status change with trace context
-				log.WithFields(log.Fields{
-					"component_id": component.ComponentID,
-					"status":       "dead",
-					"trace_id":     traceID,
-					"span_id":      spanID,
-				}).Info("Component health changed")
-			}
-		}
-
-		// Feed metrics to predictor
-		a.predictor.RecordMetric(component.ComponentID, "consumer_lag", float64(component.ConsumerLag), now)
-		a.predictor.RecordMetric(component.ComponentID, "error_count", float64(component.ErrorCount), now)
-	}
-
-	// Evict stale dead components to prevent unbounded map growth
-	if len(staleIDs) > 0 {
-		a.mu.Lock()
-		for _, id := range staleIDs {
-			delete(a.components, id)
-		}
-		a.mu.Unlock()
-
-		log.WithFields(log.Fields{
-			"evicted":  len(staleIDs),
-			"trace_id": traceID,
-		}).Info("Evicted stale dead components from sentinel")
-
-		a.healthMonitor.EvictStaleComponents(staleIDs)
-	}
-
-	span.SetAttributes(
-		attribute.Int("components_checked", len(components)),
-		attribute.String("trace_id", traceID),
-	)
-
-	// Log health check summary with trace context
-	log.WithFields(log.Fields{
-		"components_checked": len(components),
-		"trace_id":           traceID,
-		"span_id":            spanID,
-	}).Debug("Health check completed")
-}
-
 // issueDetectionLoop periodically runs issue detection
 func (a *Agent) issueDetectionLoop() {
 	defer a.wg.Done()
@@ -366,12 +188,7 @@ func (a *Agent) detectIssues() {
 	traceID := span.SpanContext().TraceID().String()
 	spanID := span.SpanContext().SpanID().String()
 
-	a.mu.RLock()
-	components := make([]*ComponentHealth, 0, len(a.components))
-	for _, c := range a.components {
-		components = append(components, c)
-	}
-	a.mu.RUnlock()
+	components := a.snapshotComponents()
 
 	// Run detection
 	issues := a.issueDetector.DetectIssues(ctx, components)
@@ -380,6 +197,9 @@ func (a *Agent) detectIssues() {
 	for _, issue := range issues {
 		a.handleDetectedIssue(ctx, issue)
 	}
+
+	// Close whatever the components that are healthy again had open.
+	a.resolveRecoveredIssues(ctx, components)
 
 	span.SetAttributes(
 		attribute.Int("issues_detected", len(issues)),
@@ -391,6 +211,21 @@ func (a *Agent) detectIssues() {
 		"trace_id":        traceID,
 		"span_id":         spanID,
 	}).Debug("Issue detection completed")
+}
+
+// snapshotComponents returns every component the detector should consider: the
+// HealthMonitor's view, copied so the detector can read fields the polling loops are
+// still writing.
+//
+// This used to be the union of that view and a second map, Agent.components, filled from
+// agent heartbeats on rsync.agents.heartbeat. Nothing produced that topic — the only
+// publisher was the executor agent's, and its Start() was never called — so the second
+// map was always empty. Both are gone.
+func (a *Agent) snapshotComponents() []*ComponentHealth {
+	if a.healthMonitor == nil {
+		return nil
+	}
+	return a.healthMonitor.snapshotComponents()
 }
 
 // handleDetectedIssue processes a newly detected issue
@@ -431,8 +266,128 @@ func (a *Agent) handleDetectedIssue(ctx context.Context, issue *Issue) {
 	// Log to audit
 	a.logger.LogIssueDetected(ctx, issue)
 
+	// Tell a human. Until this call existed, every IssueDetector finding went to
+	// the database, the audit log and the healer and to nobody at all: the two
+	// publishers in this package (emitCDCIssue, emitBatchIssue) cover the pipeline
+	// lane only, and infrastructure_down and missing_heartbeat have no other
+	// producer anywhere, so a downed Kafka or a worker that stopped sending
+	// heartbeats was silent unless somebody happened to be looking at
+	// /admin/health.
+	//
+	// Safe to put here rather than in detectIssues: this is the only caller, and it
+	// has already returned above for a repeat occurrence, so an issue that persists
+	// across ticks publishes once. The pipeline lane reaches publishSentinelAlert by
+	// its own path and never comes through here, so this cannot double-publish.
+	a.publishInstanceIssueAlert(issue)
+
 	// Trigger healing
 	go a.triggerHealing(issue)
+}
+
+// forgetIssuesForComponents drops active issues whose component has been evicted.
+//
+// Called by the health monitor after it deletes the rows, so the two stores agree.
+// Without it the Agent would still hold the issue, handleDetectedIssue would take its
+// "already active" early return on the next detection, and the row would never come
+// back — a fault against a component that came back would be invisible in the table
+// the UI reads for the rest of the process's life.
+func (a *Agent) forgetIssuesForComponents(componentIDs []string) {
+	if len(componentIDs) == 0 {
+		return
+	}
+	gone := make(map[string]struct{}, len(componentIDs))
+	for _, id := range componentIDs {
+		gone[id] = struct{}{}
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for id, issue := range a.activeIssues {
+		if _, ok := gone[issue.ComponentID]; ok {
+			delete(a.activeIssues, id)
+		}
+	}
+}
+
+// recoverableIssueTypes are the IssueDetector findings that a component's own health
+// row decides: each is filed because that row went unhealthy, so the row going healthy
+// again is the end of it.
+var recoverableIssueTypes = []IssueType{
+	IssueTypeInfrastructureDown,
+	IssueTypeConnectorDown,
+	IssueTypeMissingHeartbeat,
+	IssueTypeConsumerGroupClosed,
+}
+
+// resolveRecoveredIssues closes the findings of every component that is healthy again.
+//
+// Nothing did before. A finding left a.activeIssues only when a heal succeeded or its
+// component was evicted, and its sentinel_active_issues row only on eviction — so a
+// Redis that came back after ten minutes stayed "down" in the issues table indefinitely,
+// and because handleDetectedIssue returns early for an issue still in activeIssues, the
+// NEXT outage of the same service was never persisted or alerted at all.
+//
+// Only HealthStatusHealthy resolves. Degraded is a service between probe misses
+// (service_probes.go), unknown is "could not find out", and neither is a recovery.
+//
+// The row is deleted rather than stamped resolved_at, as the CDC, batch and WAL-watchdog
+// lanes resolve theirs: persistIssueToDB's upsert never clears resolved_at, so a stamped
+// row would read resolved through the next outage. The delete runs over every candidate
+// id each tick, not just those found in memory, so rows a previous process left behind
+// are closed too.
+func (a *Agent) resolveRecoveredIssues(ctx context.Context, components []*ComponentHealth) {
+	var ids []string
+	for _, c := range components {
+		if c == nil || c.Status != HealthStatusHealthy {
+			continue
+		}
+		for _, t := range recoverableIssueTypes {
+			ids = append(ids, generateIssueID(c.ComponentID, t))
+		}
+	}
+	if len(ids) == 0 {
+		return
+	}
+
+	now := time.Now()
+	var resolved []*Issue
+	a.mu.Lock()
+	for _, id := range ids {
+		if issue, ok := a.activeIssues[id]; ok {
+			issue.ResolvedAt = &now
+			delete(a.activeIssues, id)
+			a.issuesResolved++
+			resolved = append(resolved, issue)
+		}
+	}
+	a.mu.Unlock()
+
+	for _, issue := range resolved {
+		log.WithFields(log.Fields{
+			"issue_id":     issue.ID,
+			"issue_type":   issue.Type,
+			"component_id": issue.ComponentID,
+		}).Info("✅ Issue resolved — component is healthy again")
+	}
+
+	a.deleteIssueRows(ctx, ids)
+}
+
+// deleteIssueRows removes the given issue ids from sentinel_active_issues.
+func (a *Agent) deleteIssueRows(ctx context.Context, ids []string) {
+	if a.db == nil || len(ids) == 0 {
+		return
+	}
+	placeholders := make([]string, len(ids))
+	args := make([]interface{}, len(ids))
+	for i, id := range ids {
+		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		args[i] = id
+	}
+	query := fmt.Sprintf(`DELETE FROM sentinel_active_issues WHERE id IN (%s)`, strings.Join(placeholders, ", "))
+	if _, err := a.db.ExecContext(ctx, query, args...); err != nil {
+		log.WithError(err).Debug("Failed to delete resolved issues")
+	}
 }
 
 // triggerHealing triggers healing action for an issue
@@ -479,6 +434,18 @@ func (a *Agent) triggerHealing(issue *Issue) {
 			"trace_id":     traceID,
 			"span_id":      spanID,
 		}).Warn("⏭️  Healing action skipped — issue left open")
+	} else if result.Success && action == HealingActionAlert {
+		// Delivered, not repaired. An alert fixes nothing, so the issue stays open until
+		// resolveRecoveredIssues sees the component healthy again. Resolving it here
+		// dropped it from activeIssues while the service was still down, and the next
+		// detection after the cooldown filed it as new and alerted again every five
+		// minutes for the length of the outage.
+		log.WithFields(log.Fields{
+			"issue_id":     issue.ID,
+			"component_id": issue.ComponentID,
+			"trace_id":     traceID,
+			"span_id":      spanID,
+		}).Info("📣 Alert delivered — issue left open until the component recovers")
 	} else if result.Success {
 		log.WithFields(log.Fields{
 			"issue_id":     issue.ID,
@@ -511,58 +478,6 @@ func (a *Agent) triggerHealing(issue *Issue) {
 
 	// Log result
 	a.logger.LogHealingResult(ctx, result)
-}
-
-// heartbeatPublishLoop publishes Sentinel's own heartbeat
-func (a *Agent) heartbeatPublishLoop() {
-	defer a.wg.Done()
-
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-a.ctx.Done():
-			return
-		case <-ticker.C:
-			a.publishSentinelHeartbeat()
-		}
-	}
-}
-
-// publishSentinelHeartbeat publishes Sentinel's own health status
-func (a *Agent) publishSentinelHeartbeat() {
-	a.mu.RLock()
-	activeIssueCount := len(a.activeIssues)
-	componentCount := len(a.components)
-	a.mu.RUnlock()
-
-	status := "healthy"
-	if activeIssueCount > 10 {
-		status = "degraded"
-	}
-	if activeIssueCount > 50 {
-		status = "unhealthy"
-	}
-
-	// TODO: Publish heartbeat to Kafka topic
-	// heartbeat := &AgentHeartbeat{
-	// 	Agent:             "sentinel",
-	// 	Status:            status,
-	// 	LastMessageAt:     time.Now().Format(time.RFC3339),
-	// 	MessagesProcessed: a.issuesResolved,
-	// 	ErrorCount:        a.issuesDetected - a.issuesResolved,
-	// 	ConsumerLag:       int64(activeIssueCount),
-	// 	Timestamp:         time.Now(),
-	// }
-	log.WithFields(log.Fields{
-		"status":          status,
-		"active_issues":   activeIssueCount,
-		"components":      componentCount,
-		"issues_detected": a.issuesDetected,
-		"issues_resolved": a.issuesResolved,
-		"healing_actions": a.healingActions,
-	}).Debug("📡 Sentinel heartbeat")
 }
 
 // persistIssueToDB persists an issue to the database

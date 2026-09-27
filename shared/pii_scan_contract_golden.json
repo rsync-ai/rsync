@@ -1,0 +1,163 @@
+{
+  "_comment": "The async PII scan's two Kafka messages, pinned from both ends. 'request' is what the API gateway publishes on pii.scan.request: piiScanRequestPayload + piiScanTablesFor (api-gateway/internal/handlers/pii.go), built in pii_scan_contract_test.go from a discovered schema of public.customers and public.orders, asked for 'public.customers', 'orders' and 'public.archived' (not in the schema, so sent with no columns). Column names and declared types only; no row value is ever in it. 'response' is what llm-service publishes back on pii.scan.response for that request: handle_scan_request (llm-service/src/agents/pii_scanner/kafka_consumer.py), asserted equal in llm-service/tests/test_pii_scan_names_only.py. The gateway test decodes 'response' the way cmd/server/main.go does and projects it with piiFindingsFrom. public.archived is reported under errors and left out of tables, so the gateway's prune cannot read it as a clean scan (KI-PII-ASYNC-SCAN-ALWAYS-FAILS).",
+  "request": {
+    "scan_id": "5c0e1d2a-0000-4000-8000-000000000001",
+    "connection_id": "5c0e1d2a-0000-4000-8000-0000000000c1",
+    "tables": [
+      {
+        "table_name": "public.customers",
+        "columns": [
+          {
+            "column_name": "id",
+            "data_type": "integer"
+          },
+          {
+            "column_name": "email",
+            "data_type": "text"
+          },
+          {
+            "column_name": "email_verified",
+            "data_type": "boolean"
+          },
+          {
+            "column_name": "customerPAN",
+            "data_type": "varchar"
+          },
+          {
+            "column_name": "company_name",
+            "data_type": "text"
+          },
+          {
+            "column_name": "cell_phone",
+            "data_type": "text"
+          }
+        ]
+      },
+      {
+        "table_name": "public.orders",
+        "columns": [
+          {
+            "column_name": "id",
+            "data_type": "integer"
+          },
+          {
+            "column_name": "total",
+            "data_type": "numeric"
+          },
+          {
+            "column_name": "distinct_ids",
+            "data_type": "text"
+          }
+        ]
+      },
+      {
+        "table_name": "public.archived",
+        "columns": []
+      }
+    ],
+    "include_ml": true
+  },
+  "response": {
+    "trace_id": "5c0e1d2a-0000-4000-8000-000000000001",
+    "pipeline_id": "",
+    "correlation_id": "5c0e1d2a-0000-4000-8000-000000000001",
+    "status": "completed",
+    "agent": "pii_scanner",
+    "result": {
+      "scan_id": "5c0e1d2a-0000-4000-8000-000000000001",
+      "connection_id": "5c0e1d2a-0000-4000-8000-0000000000c1",
+      "tables_scanned": 2,
+      "total_pii_columns_found": 3,
+      "scan_method": "column_name",
+      "errors": [
+        "Table public.archived: no columns were supplied, so it was not scanned"
+      ],
+      "tables": [
+        {
+          "table_name": "public.customers",
+          "columns": [
+            {
+              "column_name": "id",
+              "is_pii": false,
+              "pii_type": null,
+              "confidence": 0.0,
+              "detection_method": "none",
+              "suggested_masking": "hash"
+            },
+            {
+              "column_name": "email",
+              "is_pii": true,
+              "pii_type": "email",
+              "confidence": 0.6,
+              "detection_method": "column_name",
+              "suggested_masking": "hash"
+            },
+            {
+              "column_name": "email_verified",
+              "is_pii": false,
+              "pii_type": null,
+              "confidence": 0.0,
+              "detection_method": "none",
+              "suggested_masking": "hash"
+            },
+            {
+              "column_name": "customerPAN",
+              "is_pii": true,
+              "pii_type": "credit_card",
+              "confidence": 0.6,
+              "detection_method": "column_name",
+              "suggested_masking": "hash"
+            },
+            {
+              "column_name": "company_name",
+              "is_pii": false,
+              "pii_type": null,
+              "confidence": 0.0,
+              "detection_method": "none",
+              "suggested_masking": "hash"
+            },
+            {
+              "column_name": "cell_phone",
+              "is_pii": true,
+              "pii_type": "phone",
+              "confidence": 0.6,
+              "detection_method": "column_name",
+              "suggested_masking": "partial_mask"
+            }
+          ]
+        },
+        {
+          "table_name": "public.orders",
+          "columns": [
+            {
+              "column_name": "id",
+              "is_pii": false,
+              "pii_type": null,
+              "confidence": 0.0,
+              "detection_method": "none",
+              "suggested_masking": "hash"
+            },
+            {
+              "column_name": "total",
+              "is_pii": false,
+              "pii_type": null,
+              "confidence": 0.0,
+              "detection_method": "none",
+              "suggested_masking": "hash"
+            },
+            {
+              "column_name": "distinct_ids",
+              "is_pii": false,
+              "pii_type": null,
+              "confidence": 0.0,
+              "detection_method": "none",
+              "suggested_masking": "hash"
+            }
+          ]
+        }
+      ]
+    },
+    "error": "",
+    "timestamp": ""
+  }
+}

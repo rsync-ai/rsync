@@ -2,12 +2,11 @@ package workers
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sync"
 
-	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/shared/correlation"
 	log "github.com/sirupsen/logrus"
 )
@@ -15,11 +14,15 @@ import (
 // ==============================================================================
 // CORRELATION ROUTER (V2 Request/Reply Pattern)
 // ==============================================================================
-// This routes worker results to either:
-// - Correlation store (V2 workflows) - Activities wait on Redis
-// - Kafka topic (V1 workflows) - KafkaAdapter signals workflows
-//
-// Decision: If CorrelationID present → Redis, else → Kafka
+// Workers claim requests from the Redis correlation store (each worker's
+// startRedisPoller) and write their result back to it; the Temporal activity
+// waiting on that correlation ID picks it up. There is no Kafka reply path: a
+// task without a CorrelationID has nowhere to be delivered, so RouteResult
+// rejects it (ErrNoCorrelationID) rather than dropping it silently.
+
+// ErrNoCorrelationID is returned by RouteResult for a task that carries no
+// CorrelationID. Every live dispatch path (the Redis pollers) sets one.
+var ErrNoCorrelationID = errors.New("task has no correlation_id: results are delivered only through the correlation store")
 
 var (
 	correlationClient *correlation.Client
@@ -54,48 +57,26 @@ func InitCorrelationClient() error {
 	return correlationErr
 }
 
-// RouteResult routes task result to correlation store (V2) or Kafka (V1)
-// This is the ONLY function workers should call to return results
-func RouteResult(
-	ctx context.Context,
-	task Task,
-	result TaskResult,
-	kafkaManager *kafka.Manager,
-) error {
-	// V2 Path: Write to correlation store if correlation_id present
-	if task.CorrelationID != "" {
-		if correlationClient == nil {
-			return fmt.Errorf("correlation client not initialized (V2 workflow but no Redis)")
-		}
-
-		log.WithFields(log.Fields{
-			"correlation_id": task.CorrelationID,
-			"task_id":        task.TaskID,
-			"status":         result.Status,
-		}).Debug("📝 Routing result to correlation store (V2)")
-
-		return correlationClient.WriteResponse(ctx, correlation.WorkerResponse{
-			CorrelationID: task.CorrelationID,
-			Status:        result.Status,
-			Output:        result.Output,
-			Error:         result.Error,
-		})
+// RouteResult writes a task result to the correlation store under the task's
+// CorrelationID. This is the ONLY function workers should call to return results.
+func RouteResult(ctx context.Context, task Task, result TaskResult) error {
+	if task.CorrelationID == "" {
+		return fmt.Errorf("route result for task %q: %w", task.TaskID, ErrNoCorrelationID)
+	}
+	if correlationClient == nil {
+		return fmt.Errorf("correlation client not initialized (V2 workflow but no Redis)")
 	}
 
-	// V1 Path: Publish to Kafka topic (backward compatibility)
 	log.WithFields(log.Fields{
-		"task_id": task.TaskID,
-		"status":  result.Status,
-	}).Debug("📝 Routing result to Kafka (V1)")
+		"correlation_id": task.CorrelationID,
+		"task_id":        task.TaskID,
+		"status":         result.Status,
+	}).Debug("📝 Routing result to correlation store")
 
-	resultJSON, err := json.Marshal(result)
-	if err != nil {
-		return fmt.Errorf("failed to marshal result: %w", err)
-	}
-
-	return kafkaManager.Produce(
-		"agent.control.results",
-		[]byte(task.PipelineID),
-		resultJSON,
-	)
+	return correlationClient.WriteResponse(ctx, correlation.WorkerResponse{
+		CorrelationID: task.CorrelationID,
+		Status:        result.Status,
+		Output:        result.Output,
+		Error:         result.Error,
+	})
 }

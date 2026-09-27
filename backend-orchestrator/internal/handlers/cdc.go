@@ -5,14 +5,18 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
+	"github.com/rsync-ai/backend-orchestrator/internal/agents/executor"
 	"github.com/rsync-ai/backend-orchestrator/internal/cdc"
+	"github.com/rsync-ai/backend-orchestrator/internal/cdcsnapshot"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
 
 	"github.com/gin-gonic/gin"
@@ -51,8 +55,14 @@ type CDCUpdateTablesRequest struct {
 // for one or more tables.
 type CDCBackfillRequest struct {
 	Tables []string `json:"tables" binding:"required"`
-	// Mode can be "incremental" (default) or "blocking".
+	// Mode can be "incremental" or "blocking". Empty picks the connector's
+	// default: incremental where it is allowed, blocking on MongoDB
+	// (backfillModes).
 	Mode string `json:"mode"`
+	// Source says who asked: "resnapshot" (the Re-snapshot card), "table_edit"
+	// (Edit tables loading newly added tables) or "auto_pickup" (the CDC table
+	// watcher). Empty reads as "resnapshot".
+	Source string `json:"source"`
 }
 
 // ProvisionCDCResources provisions CDC resources for a pipeline
@@ -291,8 +301,10 @@ func cleanupCDCSources(ctx context.Context, db *sql.DB, pipelineID string) []str
 	return errs
 }
 
-// UpdateCDCTables updates the table.include.list for a CDC connector
-func UpdateCDCTables(db *sql.DB) gin.HandlerFunc {
+// UpdateCDCTables updates the table.include.list for a CDC connector. reaper
+// (nil-safe) deletes the Kafka topics of removed tables once the sink has
+// applied them (#20).
+func UpdateCDCTables(db *sql.DB, reaper *RemovedTopicReaper) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		var req CDCUpdateTablesRequest
 		if err := c.ShouldBindJSON(&req); err != nil {
@@ -364,7 +376,7 @@ func UpdateCDCTables(db *sql.DB) gin.HandlerFunc {
 				c.JSON(http.StatusBadRequest, gin.H{
 					"success": false,
 					"error":   "missing_primary_key",
-					"message": "CDC requires PRIMARY KEY for relational destinations (upsert/delete). Add PKs or remove these tables.",
+					"message": missingPrimaryKeyMessage,
 					"tables":  missing,
 				})
 				return
@@ -373,7 +385,7 @@ func UpdateCDCTables(db *sql.DB) gin.HandlerFunc {
 
 		// Update connector configuration via Kafka Connect API
 		kafkaConnectURL := getKafkaConnectURL()
-		err = updateConnectorTableList(ctx, kafkaConnectURL, connectorName, req.Tables)
+		change, err := updateConnectorTableList(ctx, kafkaConnectURL, connectorName, req.Tables)
 		if err != nil {
 			log.WithError(err).Error("Failed to update CDC connector table list")
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -383,23 +395,53 @@ func UpdateCDCTables(db *sql.DB) gin.HandlerFunc {
 			return
 		}
 
+		// The diff is taken against the list the connector actually held, not the
+		// caller's idea of it (#6): a table edit whose earlier persist failed would
+		// otherwise re-announce old additions and miss real removals.
+		added, removed := diffTableLists(change.Previous, change.Written)
+		reaper.Readd(change.Config, added)
+		reaper.Schedule(req.PipelineID, connectorName, change.Config, removed)
+
 		log.WithFields(log.Fields{
 			"pipeline_id":    req.PipelineID,
 			"connector_name": connectorName,
 			"tables":         req.Tables,
+			"added":          added,
+			"removed":        removed,
 		}).Info("Successfully updated CDC connector table list")
 
+		previous := []string{}
+		for _, p := range change.Previous {
+			if plain := unescapeIncludeEntry(p); plain != "" {
+				previous = append(previous, plain)
+			}
+		}
 		c.JSON(http.StatusOK, gin.H{
-			"success":        true,
-			"connector_name": connectorName,
-			"tables":         req.Tables,
-			"message":        "Connector table list updated successfully. Connector will restart automatically.",
+			"success":         true,
+			"connector_name":  connectorName,
+			"tables":          req.Tables,
+			"live_list_read":  true,
+			"previous_tables": tableNamesAsRequested(change.Config, req.Tables, previous),
+			"added":           tableNamesAsRequested(change.Config, req.Tables, added),
+			"removed":         tableNamesAsRequested(change.Config, req.Tables, removed),
+			"message":         "Connector table list updated successfully. Connector will restart automatically.",
 		})
 	}
 }
 
+// missingPrimaryKeyMessage is the refusal text for a keyless table headed to a
+// database destination. CDC auto-pickup keys on the "missing_primary_key" error
+// code, not on this text.
+const missingPrimaryKeyMessage = "CDC to a database destination (PostgreSQL, MySQL or MongoDB) needs a PRIMARY KEY on every table: the destination upserts and deletes on it. Add a PRIMARY KEY or remove these tables."
+
 func pipelineDestinationRequiresPKValidation(ctx context.Context, db *sql.DB, pipelineID string) (bool, string, error) {
-	// Only enforce PKs when destination is a relational DB (upsert/delete semantics).
+	// Enforce PKs for every DATABASE destination: relational (upsert/delete on the
+	// key) and MongoDB, where the sink upserts on the key too — a keyless table
+	// there either gets a guessed key (rows sharing it replace each other) or is
+	// inserted blind (every re-snapshot duplicates it). Object storage is
+	// append-only, so a keyless table there is only a warning. The product rule:
+	// keyless → blocked for any DB destination (the executor's hard-block and
+	// assessor.CDCBlocksWithoutPrimaryKey carry the same list).
 	var destConnectorType sql.NullString
 	err := db.QueryRowContext(ctx, `
 		SELECT c.connector_type
@@ -411,13 +453,40 @@ func pipelineDestinationRequiresPKValidation(ctx context.Context, db *sql.DB, pi
 		return false, "", err
 	}
 	dest := strings.ToLower(strings.TrimSpace(destConnectorType.String))
-	if dest == "postgres" {
-		dest = "postgresql"
+	return cdcDestinationRequiresPrimaryKeys(dest), normalizeCDCDestType(dest), nil
+}
+
+// normalizeCDCDestType folds destination connector_type aliases the same way the
+// executor's normalizeDBType does (postgres→postgresql, mariadb→mysql).
+func normalizeCDCDestType(dest string) string {
+	switch dest {
+	case "postgres":
+		return "postgresql"
+	case "mariadb":
+		return "mysql"
+	default:
+		return dest
 	}
-	return dest == "postgresql" || dest == "mysql", dest, nil
+}
+
+// cdcDestinationRequiresPrimaryKeys is the destination list of the keyless-table
+// block: every database destination rsync upserts into.
+func cdcDestinationRequiresPrimaryKeys(dest string) bool {
+	switch normalizeCDCDestType(strings.ToLower(strings.TrimSpace(dest))) {
+	case "postgresql", "mysql", "mongodb":
+		return true
+	default:
+		return false
+	}
 }
 
 func inferDebeziumDatabaseType(connCfg map[string]interface{}) string {
+	// MongoDB first: its config carries none of the relational keys below, and the
+	// database.dbname fallback reads a missing key as "<nil>" — so a MongoDB
+	// connector used to come back as "postgresql".
+	if isMongoDebeziumConfig(connCfg) {
+		return "mongodb"
+	}
 	class := strings.ToLower(strings.TrimSpace(fmt.Sprint(connCfg["connector.class"])))
 	switch {
 	case strings.Contains(class, "debezium") && strings.Contains(class, "mysql"):
@@ -601,10 +670,19 @@ func qualifyMongoCollections(config map[string]interface{}, tables []string) []s
 	return out
 }
 
+// tableListChange is what updateConnectorTableList replaced: the include list
+// the connector held before the write (nil when it had none, i.e. captured
+// everything), the entries written, and the config as written.
+type tableListChange struct {
+	Previous []string
+	Written  []string
+	Config   map[string]interface{}
+}
+
 // updateConnectorTableList updates the captured table list of a Debezium
 // connector: table.include.list for relational sources, collection.include.list
 // for MongoDB.
-func updateConnectorTableList(ctx context.Context, kafkaConnectURL, connectorName string, tables []string) error {
+func updateConnectorTableList(ctx context.Context, kafkaConnectURL, connectorName string, tables []string) (tableListChange, error) {
 	// Build table.include.list (format: db1.table1,db1.table2,...)
 	tableIncludeList := strings.Join(tables, ",")
 
@@ -614,67 +692,133 @@ func updateConnectorTableList(ctx context.Context, kafkaConnectURL, connectorNam
 
 	resp, err := httpClient.Get(getURL)
 	if err != nil {
-		return fmt.Errorf("failed to fetch connector config: %w", err)
+		return tableListChange{}, fmt.Errorf("failed to fetch connector config: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to fetch connector config (status %d): %s", resp.StatusCode, string(body))
+		return tableListChange{}, fmt.Errorf("failed to fetch connector config (status %d): %s", resp.StatusCode, string(body))
 	}
 
 	var config map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
-		return fmt.Errorf("failed to decode connector config: %w", err)
+		return tableListChange{}, fmt.Errorf("failed to decode connector config: %w", err)
 	}
 
 	// The MongoDB connector ignores table.include.list and captures
 	// collection.include.list, which the sink respawn also reads
 	// (connectorIncludeList). Writing only table.include.list left Debezium on
 	// the old collections while a respawned sink followed the new ones (#26).
+	change := tableListChange{}
 	if isMongoDebeziumConfig(config) {
-		tableIncludeList = strings.Join(qualifyMongoCollections(config, tables), ",")
+		change.Previous = includeListEntries(config, "collection.include.list")
+		change.Written = qualifyMongoCollections(config, tables)
+		tableIncludeList = strings.Join(change.Written, ",")
 		config["collection.include.list"] = tableIncludeList
 		delete(config, "table.include.list")
 	} else {
+		change.Previous = includeListEntries(config, "table.include.list")
+		change.Written = splitCommaList(tableIncludeList)
 		config["table.include.list"] = tableIncludeList
 	}
+	change.Config = config
 
 	// Send updated config back to Kafka Connect
 	putURL := fmt.Sprintf("%s/connectors/%s/config", kafkaConnectURL, connectorName)
 	configBytes, err := json.Marshal(config)
 	if err != nil {
-		return fmt.Errorf("failed to marshal updated config: %w", err)
+		return tableListChange{}, fmt.Errorf("failed to marshal updated config: %w", err)
 	}
 
 	putReq, err := http.NewRequestWithContext(ctx, http.MethodPut, putURL, bytes.NewReader(configBytes))
 	if err != nil {
-		return fmt.Errorf("failed to create PUT request: %w", err)
+		return tableListChange{}, fmt.Errorf("failed to create PUT request: %w", err)
 	}
 	putReq.Header.Set("Content-Type", "application/json")
 
 	putResp, err := httpClient.Do(putReq)
 	if err != nil {
-		return fmt.Errorf("failed to update connector config: %w", err)
+		return tableListChange{}, fmt.Errorf("failed to update connector config: %w", err)
 	}
 	defer putResp.Body.Close()
 
 	if putResp.StatusCode != http.StatusOK && putResp.StatusCode != http.StatusCreated {
 		body, _ := io.ReadAll(putResp.Body)
-		return fmt.Errorf("failed to update connector config (status %d): %s", putResp.StatusCode, string(body))
+		return tableListChange{}, fmt.Errorf("failed to update connector config (status %d): %s", putResp.StatusCode, string(body))
 	}
 
 	// Kafka Connect will automatically restart the connector when config changes
 	log.Infof("Successfully updated connector %s table list to: %s", connectorName, tableIncludeList)
 
-	return nil
+	return change, nil
+}
+
+// includeListEntries returns the entries of an include-list property, or nil
+// when the connector has none (it captures every table).
+func includeListEntries(config map[string]interface{}, key string) []string {
+	entries := splitCommaList(connectorConfigString(config, key))
+	if len(entries) == 0 {
+		return nil
+	}
+	return entries
+}
+
+// diffTableLists compares an include list before and after an edit the way
+// Debezium matches it (regular expressions, case-insensitive). added are the
+// written entries the previous list did not capture; removed are the previous
+// entries, unescaped, that the new list no longer captures.
+func diffTableLists(previous, written []string) (added, removed []string) {
+	added, removed = []string{}, []string{}
+	for _, w := range written {
+		plain := unescapeIncludeEntry(w)
+		if plain != "" && !cdcsnapshot.IncludeListCaptures(previous, plain) {
+			added = append(added, plain)
+		}
+	}
+	for _, p := range previous {
+		plain := unescapeIncludeEntry(p)
+		if plain != "" && !cdcsnapshot.IncludeListCaptures(written, plain) {
+			removed = append(removed, plain)
+		}
+	}
+	return added, removed
+}
+
+// unescapeIncludeEntry turns an include-list entry rsync wrote ("public\.users")
+// back into the table name it stands for.
+func unescapeIncludeEntry(e string) string {
+	return strings.TrimSpace(strings.ReplaceAll(e, `\`, ""))
+}
+
+// tableNamesAsRequested renders connector-side names the way the caller named
+// its tables: a MongoDB connector qualifies bare collections with its single
+// database, so when every requested name was bare the "db." prefix goes again.
+func tableNamesAsRequested(config map[string]interface{}, requested, names []string) []string {
+	if !isMongoDebeziumConfig(config) {
+		return names
+	}
+	dbs := splitCommaList(connectorConfigString(config, "database.include.list"))
+	if len(dbs) != 1 {
+		return names
+	}
+	for _, t := range requested {
+		if strings.Contains(strings.TrimSpace(t), ".") {
+			return names
+		}
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, strings.TrimPrefix(n, dbs[0]+"."))
+	}
+	return out
 }
 
 // cdcSignalProducer is the slice of the Kafka manager the backfill needs. It is
 // an interface so the handler can be tested without a broker, and so the
 // orchestrator keeps exactly one Kafka client.
 type cdcSignalProducer interface {
-	EnsureTopicExists(topic string, partitions int32) error
+	EnsureSignalTopic(topic string) error
 	ProduceWithContext(ctx context.Context, topic string, key, value []byte) error
 }
 
@@ -683,14 +827,23 @@ type cdcSignalProducer interface {
 // There are two signalling channels, and which one a connector has is decided
 // when it is created:
 //
-//   - Kafka signal channel (snapshot_strategy=incremental — PostgreSQL, MySQL):
-//     the signal is a Kafka message, so NOTHING is written to the customer's
-//     source database. Preferred whenever the connector has it.
+//   - Kafka signal channel (every PostgreSQL-family and MongoDB connector, plus
+//     MySQL connectors created with snapshot_strategy=incremental): the signal is
+//     a Kafka message, so NOTHING is written to the customer's source database.
+//     Preferred whenever the connector has it. MongoDB accepts BLOCKING snapshots
+//     only (backfillModes).
 //   - Source signal table (<db>.debezium_signal): MySQL only, because it needs a
 //     writable signal table in the source.
 //
 // Engines with neither are refused with cdc_backfill_not_supported.
-func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
+//
+// Over the Kafka channel the request is QUEUED (cdc_snapshot_requests), not
+// sent: the cdcsnapshot dispatcher sends it once the connector's running task
+// captures every requested table. Sent straight away, a signal right after Edit
+// tables reached the OLD task — which does not capture the new table and drops
+// the signal — or was lost in the restart. requests may be nil (or its table
+// missing): the signal is then sent directly, as before.
+func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer, requests *cdcsnapshot.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		pipelineID := strings.TrimSpace(c.Param("pipeline_id"))
 		if pipelineID == "" {
@@ -723,11 +876,10 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 			return
 		}
 
+		// An empty mode is resolved once the connector is known: the default
+		// depends on the engine (backfillModes).
 		mode := strings.ToLower(strings.TrimSpace(req.Mode))
-		if mode == "" {
-			mode = "incremental"
-		}
-		if mode != "incremental" && mode != "blocking" {
+		if mode != "" && mode != "incremental" && mode != "blocking" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "mode must be 'incremental' or 'blocking'"})
 			return
 		}
@@ -763,8 +915,40 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 
 		// Prefer the Kafka signal channel when the connector has one: it works for
 		// every engine that wires it, and it writes nothing to the source.
-		if signalTopic := connCfgString(connCfg, "signal.kafka.topic"); signalTopic != "" &&
-			strings.Contains(strings.ToLower(connCfgString(connCfg, "signal.enabled.channels")), "kafka") {
+		channel := backfillSignalChannel(connCfg)
+
+		// One destination lookup serves the primary-key gate and the object
+		// storage rules. A failed lookup keeps the old fail-open behaviour: no
+		// PK gate, no object-storage rules.
+		requiresPK, destType, destErr := pipelineDestinationRequiresPKValidation(ctx, db, pipelineID)
+		if destErr != nil {
+			log.WithError(destErr).WithField("pipeline_id", pipelineID).Warn("CDC backfill: could not read the destination type")
+		}
+		objectStorage := destErr == nil && isObjectStorageDest(destType)
+		if channel == backfillChannelKafka && objectStorage {
+			// Object storage re-snapshots are BLOCKING only: the folder is emptied
+			// and re-written in one pass with streaming paused, and a blocking
+			// snapshot marks its last row, so the request is seen to finish. An
+			// incremental one interleaves with live changes and never says it is
+			// done (PostgreSQL sends no end marker for it).
+			mode = "blocking"
+		}
+		if modes := backfillModesFor(connCfg, channel, objectStorage); len(modes) > 0 {
+			if mode == "" {
+				mode = modes[0]
+			}
+			if !slices.Contains(modes, mode) {
+				c.JSON(http.StatusBadRequest, gin.H{
+					"error":           "cdc_backfill_mode_not_supported",
+					"message":         backfillModeNotSupportedMessage(mode),
+					"modes":           modes,
+					"connector_class": connectorClass,
+				})
+				return
+			}
+		}
+		if channel == backfillChannelKafka {
+			signalTopic := connCfgString(connCfg, "signal.kafka.topic")
 			if signals == nil {
 				c.JSON(http.StatusServiceUnavailable, gin.H{
 					"error":   "signal_channel_unavailable",
@@ -772,24 +956,68 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 				})
 				return
 			}
-			if halt := backfillMissingPKs(ctx, c, db, pipelineID, sourceConnID, dbType, defaultDB, defaultSchema, tables); halt {
+			if halt := backfillMissingPKs(ctx, c, db, requiresPK, sourceConnID, dbType, defaultDB, defaultSchema, tables); halt {
 				return
 			}
 
 			collections := normalizeDebeziumCollections(pkNamespaceFor(dbType, defaultDB, defaultSchema), tables)
+			if dbType == "mongodb" {
+				// "db.collection", qualified exactly as the Edit tables include-list
+				// update qualifies it (updateConnectorTableList), so the signal names
+				// the collections the connector captures.
+				collections = qualifyMongoCollections(connCfg, tables)
+			}
+			cleansFolder := objectStorage && executor.PipelineCleansFolderOnResnapshot(ctx, db, pipelineID, destType)
+			source := cdcsnapshot.NormalizeSource(req.Source)
+			notBefore := time.Now()
+			if source != cdcsnapshot.SourceResnapshot {
+				// Edit tables and auto-pickup have just rewritten the include list;
+				// give Connect time to begin restarting the task before the
+				// dispatcher starts judging whether the new one is running.
+				notBefore = notBefore.Add(15 * time.Second)
+			}
+			queued, qerr := requests.Insert(ctx, cdcsnapshot.Request{
+				PipelineID: pipelineID, ConnectorName: connectorName, Mode: mode, Tables: collections,
+				Source: source, CleansFolder: cleansFolder, NotBefore: notBefore,
+			})
+			if qerr == nil {
+				log.WithFields(log.Fields{
+					"pipeline_id": pipelineID,
+					"request_id":  queued.ID,
+					"source":      source,
+					"tables":      len(collections),
+				}).Info("📸 CDC backfill queued; the snapshot dispatcher sends it once the connector runs with these tables")
+				c.JSON(http.StatusOK, gin.H{
+					"success":          true,
+					"status":           queued.Status,
+					"request_id":       queued.ID,
+					"pipeline_id":      pipelineID,
+					"connector_name":   connectorName,
+					"signal_channel":   "kafka",
+					"signal_topic":     signalTopic,
+					"snapshot_mode":    mode,
+					"data_collections": collections,
+					"cleans_folder":    cleansFolder,
+					"message":          backfillQueuedMessage(cleansFolder),
+				})
+				return
+			}
+			if !errors.Is(qerr, cdcsnapshot.ErrUnavailable) {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "snapshot_request_failed", "message": qerr.Error()})
+				return
+			}
+			// No queue (migration 113 not applied, or no store wired): send now.
+
 			// Per the Debezium signalling contract the message KEY is the
 			// connector's topic.prefix; the connector name is the prefix here, and
 			// the explicit property wins when present.
-			key := connCfgString(connCfg, "topic.prefix")
-			if key == "" {
-				key = connectorName
-			}
+			key := cdcsnapshot.SignalKey(connCfg, connectorName)
 			value, merr := buildExecuteSnapshotSignal(mode, collections)
 			if merr != nil {
 				c.JSON(http.StatusInternalServerError, gin.H{"error": "signal_encode_failed", "message": merr.Error()})
 				return
 			}
-			if terr := signals.EnsureTopicExists(signalTopic, 1); terr != nil {
+			if terr := signals.EnsureSignalTopic(signalTopic); terr != nil {
 				// Non-fatal: the produce below is the authoritative delivery check
 				// (broker auto-create may still succeed).
 				log.WithError(terr).WithField("topic", signalTopic).Warn("⚠️  CDC backfill: could not ensure the signal topic exists (producing anyway)")
@@ -808,6 +1036,7 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 			}).Info("📸 CDC backfill triggered over the Kafka signal channel")
 			c.JSON(http.StatusOK, gin.H{
 				"success":          true,
+				"status":           cdcsnapshot.StatusSent,
 				"pipeline_id":      pipelineID,
 				"connector_name":   connectorName,
 				"signal_channel":   "kafka",
@@ -819,10 +1048,10 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 			return
 		}
 
-		if !strings.Contains(connectorClass, "mysql") {
+		if channel == backfillChannelNone {
 			c.JSON(http.StatusBadRequest, gin.H{
 				"error":           "cdc_backfill_not_supported",
-				"message":         "CDC backfill needs either a Kafka signal channel (create the pipeline with snapshot_strategy=incremental) or a MySQL source signal table",
+				"message":         backfillNotSupportedMessage,
 				"connector_class": connectorClass,
 			})
 			return
@@ -855,8 +1084,8 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 			}
 		}
 
-		// P0 guard: for relational destinations, ensure PKs exist before emitting snapshot signals.
-		if requiresPK, _, derr := pipelineDestinationRequiresPKValidation(ctx, db, pipelineID); derr == nil && requiresPK {
+		// P0 guard: for database destinations (relational and MongoDB), ensure PKs exist before emitting snapshot signals.
+		if requiresPK {
 			mgr := cdc.NewMySQLManager(db)
 			missing, verr := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, dbName, tables)
 			if verr != nil {
@@ -866,7 +1095,7 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 			if len(missing) > 0 {
 				c.JSON(http.StatusBadRequest, gin.H{
 					"error":   "missing_primary_key",
-					"message": "CDC requires PRIMARY KEY for relational destinations (upsert/delete). Add PKs or remove these tables.",
+					"message": missingPrimaryKeyMessage,
 					"tables":  missing,
 				})
 				return
@@ -910,6 +1139,169 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer) gin.HandlerFunc {
 			"data_collections": collections,
 			"message":          "CDC backfill triggered (Debezium ad-hoc snapshot).",
 		})
+	}
+}
+
+// The channel a re-snapshot of a connector would go through. Decided once, by
+// backfillSignalChannel, for both BackfillCDCTables (which acts on it) and
+// GetCDCBackfillCapability (which lets the UI say so before anyone clicks) — two
+// copies of this rule would drift, and the UI would offer what the POST refuses.
+const (
+	backfillChannelKafka  = "kafka"  // Kafka signal channel wired at connector creation
+	backfillChannelSource = "source" // MySQL source signal table, wired on demand
+	backfillChannelNone   = ""       // neither → cdc_backfill_not_supported
+)
+
+// backfillNotSupportedMessage is what both Re-snapshot and "backfill newly added
+// tables" show when the connector has no channel. Every PostgreSQL-family and
+// MongoDB connector now gets a Kafka signal channel when it is created, whatever
+// its snapshot strategy (executor.go cdcSignalTopicFor); before that only the
+// PostgreSQL incremental strategy (>= CDC_INCREMENTAL_SNAPSHOT_MIN_ROWS rows)
+// wired one, so every smaller pipeline was refused. A refusal therefore now means
+// a connector created before that change — which recreating the pipeline fixes —
+// or an engine with no channel at all. The handler cannot tell which, so the
+// message names both without claiming either.
+const backfillNotSupportedMessage = "This pipeline's CDC connector has no signal channel, so it cannot be asked to re-read tables: " +
+	"neither Re-snapshot nor the backfill of newly added tables can run. " +
+	"PostgreSQL and MongoDB pipelines get a Kafka signal channel when their connector is created, but connectors created before that was added have none; recreating the pipeline adds it. " +
+	"MySQL pipelines use a signal table instead, and other sources have no re-snapshot path."
+
+// backfillModes lists the snapshot modes BackfillCDCTables accepts for this
+// connector, the default first; nil when there is no channel at all. The one
+// rule for both the POST (which enforces it) and GetCDCBackfillCapability (which
+// lets the UI offer only these).
+//
+// MongoDB over the Kafka channel is blocking only. Debezium's incremental
+// snapshot for MongoDB has no read-only mode: it writes low/high watermark
+// documents into a signal collection in the source (signal.data.collection),
+// which rsync never configures. Without one the signal fails inside the
+// connector (Debezium 3.1.3: a NullPointerException in emitWindowOpen) while the
+// task stays RUNNING, so a request accepted here would silently load nothing;
+// configuring one would mean writing to the customer's database. A blocking snapshot
+// pauses streaming, re-reads the requested collections, then resumes from the
+// stored resume token, and writes nothing.
+func backfillModes(connCfg map[string]interface{}, channel string) []string {
+	switch {
+	case channel == backfillChannelNone:
+		return nil
+	case channel == backfillChannelKafka && isMongoDebeziumConfig(connCfg) &&
+		connCfgString(connCfg, "signal.data.collection") == "":
+		return []string{"blocking"}
+	default:
+		return []string{"incremental", "blocking"}
+	}
+}
+
+// backfillModesFor is backfillModes for a known destination: object storage
+// takes BLOCKING re-snapshots only (see BackfillCDCTables).
+func backfillModesFor(connCfg map[string]interface{}, channel string, objectStorage bool) []string {
+	modes := backfillModes(connCfg, channel)
+	if objectStorage && channel == backfillChannelKafka && slices.Contains(modes, "blocking") {
+		return []string{"blocking"}
+	}
+	return modes
+}
+
+// isObjectStorageDest reports a destination that appends files rather than
+// upserting rows, so re-reading a table there adds a second copy of it.
+func isObjectStorageDest(dest string) bool {
+	switch strings.ReplaceAll(strings.ToLower(strings.TrimSpace(dest)), "_", "-") {
+	case "gcs", "aws-s3", "s3", "azure-blob", "minio":
+		return true
+	}
+	return false
+}
+
+// backfillQueuedMessage is the answer to a queued re-snapshot.
+func backfillQueuedMessage(cleansFolder bool) string {
+	msg := "Queued: the snapshot starts once the CDC connector is running with these tables, usually within a minute."
+	if cleansFolder {
+		msg += " Each table's existing files in the destination folder are deleted when its snapshot starts, then written again."
+	}
+	return msg
+}
+
+// backfillModeNotSupportedMessage explains a refused mode. Only MongoDB refuses
+// one today (incremental), so the message says why in its terms.
+func backfillModeNotSupportedMessage(mode string) string {
+	if mode == "incremental" {
+		return "MongoDB pipelines re-read collections with a blocking snapshot only: change streaming for this pipeline pauses " +
+			"while the requested collections are read again, then resumes where it stopped. An incremental snapshot is not " +
+			"offered because it would write watermark documents into your MongoDB database. Retry with mode \"blocking\"."
+	}
+	return fmt.Sprintf("Snapshot mode %q is not supported for this pipeline's CDC connector.", mode)
+}
+
+// backfillSignalChannel reports which channel BackfillCDCTables would use for
+// this connector config.
+func backfillSignalChannel(connCfg map[string]interface{}) string {
+	if connCfgString(connCfg, "signal.kafka.topic") != "" &&
+		strings.Contains(strings.ToLower(connCfgString(connCfg, "signal.enabled.channels")), "kafka") {
+		return backfillChannelKafka
+	}
+	if strings.Contains(strings.ToLower(connCfgString(connCfg, "connector.class")), "mysql") {
+		return backfillChannelSource
+	}
+	return backfillChannelNone
+}
+
+// GetCDCBackfillCapability answers "can this pipeline be re-snapshotted?"
+// without doing it. Read-only: one Kafka Connect config GET, no signal, no
+// write to the source. The UI calls it when the Re-snapshot card loads, so a
+// pipeline with no signal channel says so up front instead of offering a mode
+// choice and a button that can only ever return cdc_backfill_not_supported.
+func GetCDCBackfillCapability(db *sql.DB) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		pipelineID := strings.TrimSpace(c.Param("pipeline_id"))
+		if pipelineID == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "pipeline_id is required"})
+			return
+		}
+		if !assertPipelineOwnerForHandlers(c, db, pipelineID) {
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(c.Request.Context(), 15*time.Second)
+		defer cancel()
+
+		connectorName, err := findConnectorName(ctx, db, pipelineID)
+		if err != nil {
+			c.JSON(http.StatusNotFound, gin.H{"error": "connector not found for pipeline: " + err.Error()})
+			return
+		}
+		connCfg, err := fetchKafkaConnectConfig(ctx, strings.TrimRight(getKafkaConnectURL(), "/"), connectorName)
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+
+		channel := backfillSignalChannel(connCfg)
+		_, destType, destErr := pipelineDestinationRequiresPKValidation(ctx, db, pipelineID)
+		objectStorage := destErr == nil && isObjectStorageDest(destType)
+		modes := backfillModesFor(connCfg, channel, objectStorage)
+		resp := gin.H{
+			"destination_type": destType,
+			"object_storage":   objectStorage,
+			// Whether a re-snapshot first deletes each table's existing files.
+			"cleans_folder": channel == backfillChannelKafka && objectStorage &&
+				executor.PipelineCleansFolderOnResnapshot(ctx, db, pipelineID, destType),
+			"pipeline_id":     pipelineID,
+			"connector_name":  connectorName,
+			"connector_class": strings.ToLower(connCfgString(connCfg, "connector.class")),
+			"supported":       channel != backfillChannelNone,
+			"signal_channel":  channel,
+			// The modes the POST accepts, default first ([] when unsupported), so the
+			// UI never offers one it would refuse.
+			"modes": append([]string{}, modes...),
+		}
+		if len(modes) > 0 {
+			resp["default_mode"] = modes[0]
+		}
+		if channel == backfillChannelNone {
+			resp["error"] = "cdc_backfill_not_supported"
+			resp["message"] = backfillNotSupportedMessage
+		}
+		c.JSON(http.StatusOK, resp)
 	}
 }
 
@@ -995,20 +1387,7 @@ func deriveDebeziumDatabaseName(connCfg map[string]interface{}, tables []string)
 // anywhere. The message KEY is the connector's topic.prefix, supplied by the
 // caller.
 func buildExecuteSnapshotSignal(mode string, collections []string) ([]byte, error) {
-	if len(collections) == 0 {
-		return nil, fmt.Errorf("execute-snapshot signal: no data collections")
-	}
-	snapshotType := "INCREMENTAL"
-	if strings.EqualFold(strings.TrimSpace(mode), "blocking") {
-		snapshotType = "BLOCKING"
-	}
-	return json.Marshal(map[string]interface{}{
-		"type": "execute-snapshot",
-		"data": map[string]interface{}{
-			"type":             snapshotType,
-			"data-collections": collections,
-		},
-	})
+	return cdcsnapshot.BuildExecuteSnapshotSignal(mode, collections)
 }
 
 // connCfgString reads a Kafka Connect config value as a trimmed string. A
@@ -1041,9 +1420,8 @@ func pkNamespaceFor(dbType, defaultDB, defaultSchema string) string {
 // halt=true, so the caller just returns. The refusal shape is identical to
 // UpdateCDCTables' — CDC auto-pickup reads {"error":"missing_primary_key",
 // "tables":[…]} from both.
-func backfillMissingPKs(ctx context.Context, c *gin.Context, db *sql.DB, pipelineID, sourceConnID, dbType, defaultDB, defaultSchema string, tables []string) (halt bool) {
-	requiresPK, _, derr := pipelineDestinationRequiresPKValidation(ctx, db, pipelineID)
-	if derr != nil || !requiresPK {
+func backfillMissingPKs(ctx context.Context, c *gin.Context, db *sql.DB, requiresPK bool, sourceConnID, dbType, defaultDB, defaultSchema string, tables []string) (halt bool) {
+	if !requiresPK {
 		return false
 	}
 	mgr, ok := cdc.NewProvider(dbType, db)
@@ -1062,7 +1440,7 @@ func backfillMissingPKs(ctx context.Context, c *gin.Context, db *sql.DB, pipelin
 	if len(missing) > 0 {
 		c.JSON(http.StatusBadRequest, gin.H{
 			"error":   "missing_primary_key",
-			"message": "CDC requires PRIMARY KEY for relational destinations (upsert/delete). Add PKs or remove these tables.",
+			"message": missingPrimaryKeyMessage,
 			"tables":  missing,
 		})
 		return true

@@ -7,22 +7,23 @@ import {
   Loader2,
   RefreshCw,
   ArrowDown,
+  ChevronDown,
+  ChevronRight,
   GitBranch,
   Zap,
 } from "lucide-react"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import { withoutPassedOverStages } from "@/lib/pipeline/stageDefinitions"
 import { authFetch } from "@/lib/api/auth-fetch"
-import {
-  LinearTimeline,
-  type ExecutionPlanStage,
-  type ExecutionPlan,
-} from "./DAGVisualization"
+import { LinearTimeline } from "./DAGVisualization"
+import type { ExecutionPlan, ExecutionPlanStage } from "./dagTypes"
 import { DAGVisualizationV2 } from "./DAGVisualizationV2"
 import { StageDetailPanel } from "./StageDetailPanel"
 import { PipelineInsightsBar } from "./PipelineInsightsBar"
 import { PipelineCopilotDock } from "./PipelineCopilotDock"
 import { SchemaEvolutionPanel } from "./SchemaEvolutionPanel"
+import { LiveStreamGraph } from "./LiveStreamGraph"
+import { displayConnectorName } from "@/lib/connector-display"
 import {
   normalizeStrategyMode,
   type DataLoadingStrategy,
@@ -92,18 +93,11 @@ function normalizeStageStatus(status: string | undefined): string {
   return s || "pending"
 }
 
-function prettyConnectorLabel(connectorType: string): string {
-  const s = String(connectorType || "").trim()
-  if (!s) return ""
-  const lc = s.toLowerCase()
-  if (lc === "aws-s3") return "AWS S3"
-  if (lc === "mysql") return "MySQL"
-  if (lc === "postgresql") return "PostgreSQL"
-  return lc
-    .split(/[-_]/g)
-    .filter(Boolean)
-    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
-    .join(" ")
+// The app-wide connector names ("MongoDB", "Google Cloud Storage"). This tab
+// canonicalises connector ids to dashes, and the name table is keyed with
+// underscores ("azure_blob"), so the dashes go back before the lookup.
+function connectorLabel(connectorType: string): string {
+  return displayConnectorName(String(connectorType || "").replace(/-/g, "_"))
 }
 
 function statusFromEventType(eventType: string): string | null {
@@ -139,6 +133,9 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
   const [viewMode, setViewMode] = useState<"auto" | "dag" | "timeline">("auto")
   const [selectedStageId, setSelectedStageId] = useState<string | null>(null)
   const [pipelineName, setPipelineName] = useState<string | undefined>(undefined)
+  // Whether the one-time setup graph is expanded. Only consulted for a stream;
+  // a batch pipeline's plan describes its run and stays open.
+  const [setupOpen, setSetupOpen] = useState(false)
   // The pipeline's real sync mode. The plan's own `mode` is the planner's guess and
   // is often absent, and the old `|| "batch"` fallback labelled CDC pipelines batch.
   const [pipelineMode, setPipelineMode] = useState<StrategyMode | null>(null)
@@ -179,7 +176,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
     try {
       const [stateRes, eventsRes] = await Promise.all([
         authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, { cache: "no-store" }),
-        authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events?limit=250`, { cache: "no-store" }).catch(() => null),
+        authFetch(`${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}?limit=250`, { cache: "no-store" }).catch(() => null),
       ])
 
       if (!stateRes.ok) {
@@ -356,8 +353,8 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
       }
 
       let displayName = s.display_name
-      if (nodeKind === "source" && resolvedConnector) displayName = `Extract from ${prettyConnectorLabel(resolvedConnector)}`
-      if (nodeKind === "destination" && resolvedConnector) displayName = `Load to ${prettyConnectorLabel(resolvedConnector)}`
+      if (nodeKind === "source" && resolvedConnector) displayName = `Extract from ${connectorLabel(resolvedConnector)}`
+      if (nodeKind === "destination" && resolvedConnector) displayName = `Load to ${connectorLabel(resolvedConnector)}`
 
       return {
         ...s,
@@ -474,7 +471,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
       if (connectorOverrides.source) {
         out.push({
           id: "source",
-          display_name: `Extract from ${prettyConnectorLabel(connectorOverrides.source)}`,
+          display_name: `Extract from ${connectorLabel(connectorOverrides.source)}`,
           description: "Reading rows from the source connector",
           status: s.status,
           started_at: s.started_at,
@@ -489,7 +486,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
       if (connectorOverrides.destination) {
         out.push({
           id: "destination",
-          display_name: `Load to ${prettyConnectorLabel(connectorOverrides.destination)}`,
+          display_name: `Load to ${connectorLabel(connectorOverrides.destination)}`,
           description: "Writing rows to the destination connector",
           status: s.status,
           completed_at: s.completed_at,
@@ -505,6 +502,24 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
 
   const hasStages = displayStages.length > 0
 
+  const isStream = summaryMode === "cdc"
+  const setupFailed = displayStages.some((st) => st.status === "failed")
+
+  // A failed setup opens itself. That is the "my pipeline hangs" case, and this
+  // graph is then the most useful thing on the page — it must not be one click
+  // away. Adjusted during render rather than in an effect, which would paint the
+  // collapsed state first and snap open; and latched, so a user who reads it and
+  // closes it again does not have it reopened under them on the next poll.
+  const [autoOpenedSetup, setAutoOpenedSetup] = useState(false)
+  if (setupFailed && !autoOpenedSetup) {
+    setAutoOpenedSetup(true)
+    setSetupOpen(true)
+  }
+  const sourceLabel = connectorOverrides.source ? connectorLabel(connectorOverrides.source) : undefined
+  const destinationLabel = connectorOverrides.destination
+    ? connectorLabel(connectorOverrides.destination)
+    : undefined
+
   // Determine actual view mode
   const actualViewMode = useMemo(() => {
     if (viewMode === "auto") {
@@ -518,9 +533,32 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
     ? displayStages.find((s) => s.id === selectedStageId) ?? null
     : null
 
+  const viewSwitch = (
+    <div role="group" aria-label="Steps view" className="flex items-center gap-1 rounded-md border p-1">
+      <Button
+        variant={actualViewMode === "dag" ? "default" : "ghost"}
+        size="sm"
+        aria-pressed={actualViewMode === "dag"}
+        onClick={() => setViewMode("dag")}
+      >
+        <GitBranch className="h-4 w-4 mr-1" aria-hidden="true" />
+        Graph
+      </Button>
+      <Button
+        variant={actualViewMode === "timeline" ? "default" : "ghost"}
+        size="sm"
+        aria-pressed={actualViewMode === "timeline"}
+        onClick={() => setViewMode("timeline")}
+      >
+        <ArrowDown className="h-4 w-4 mr-1" aria-hidden="true" />
+        Timeline
+      </Button>
+    </div>
+  )
+
   return (
     <div className="space-y-6" onWheelCapture={markUserInteraction} onScrollCapture={markUserInteraction} onTouchStartCapture={markUserInteraction}>
-      {hasStages && (
+      {hasStages && (!isStream || setupOpen) && (
         <PipelineCopilotDock
           pipelineId={pipelineId}
           pipelineName={pipelineName}
@@ -532,7 +570,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
       <div className="flex items-center justify-between">
         <div>
           <h3 className="text-lg font-semibold flex items-center gap-2">
-            Pipeline Execution Steps
+            Pipeline steps
             {isFastRerun && (
               <Badge variant="outline" className="ml-2 border-amber-400/60 text-amber-600 dark:text-amber-400">
                 <Zap className="h-3 w-3 mr-1" />
@@ -555,26 +593,7 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          {hasStages && (
-            <div className="flex items-center gap-1 border rounded-md p-1">
-              <Button
-                variant={actualViewMode === "dag" ? "default" : "ghost"}
-                size="sm"
-                onClick={() => setViewMode("dag")}
-              >
-                <GitBranch className="h-4 w-4 mr-1" />
-                Graph
-              </Button>
-              <Button
-                variant={actualViewMode === "timeline" ? "default" : "ghost"}
-                size="sm"
-                onClick={() => setViewMode("timeline")}
-              >
-                <ArrowDown className="h-4 w-4 mr-1" />
-                Timeline
-              </Button>
-            </div>
-          )}
+          {hasStages && !isStream && viewSwitch}
           <Button variant="outline" size="sm" onClick={() => fetchExecutionPlan({ background: false })} disabled={initialLoading || refreshing}>
             <RefreshCw className={`h-4 w-4 mr-2 ${refreshing ? "animate-spin" : ""}`} />
             Refresh
@@ -608,35 +627,88 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
           {/* Schema evolution — pending DDL approvals from healer agent */}
           <SchemaEvolutionPanel pipelineId={pipelineId} />
 
-          {/* Insights bar — quick-action chips for live pipeline observability */}
-          <PipelineInsightsBar stages={displayStages} />
+          {/* Insights bar — quick-action chips about the plan's stages.
+              pipelineName was in scope all along and never passed, so every chip
+              it generated asked about "this pipeline" without naming it. For a
+              stream those stages are the one-time setup, so the chips live inside
+              Setup below rather than above the live view. */}
+          {!isStream && <PipelineInsightsBar stages={displayStages} pipelineName={pipelineName} pipelineId={pipelineId} />}
 
-          {/* Render DAG or Timeline + detail panel side-by-side */}
-          <div className="flex flex-col lg:flex-row gap-4">
-            <div className="flex-1 min-w-0">
-              {actualViewMode === "dag" ? (
-                <DAGVisualizationV2
-                  stages={displayStages}
-                  selectedStageId={selectedStageId}
-                  onStageClick={(id) => setSelectedStageId((prev) => (prev === id ? null : id))}
-                />
-              ) : (
-                <LinearTimeline
-                  stages={displayStages}
-                  selectedStageId={selectedStageId}
-                  onStageClick={(id) => setSelectedStageId((prev) => (prev === id ? null : id))}
+          {/* For a stream, the plan above is a record of a setup that finished:
+              the Temporal workflow writes no stage after the executor completes,
+              so these nodes are all green forever and none of them is about the
+              data now moving. Fold them away once they have all succeeded, and
+              lead with the live view instead — but open them automatically when
+              one FAILED, because that is exactly when this graph is the most
+              useful thing on the page. */}
+          {isStream && (
+            <LiveStreamGraph
+              pipelineId={pipelineId}
+              sourceLabel={sourceLabel}
+              destinationLabel={destinationLabel}
+            />
+          )}
+
+          {isStream && (
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setSetupOpen((v) => !v)}
+                aria-expanded={setupOpen}
+                data-testid="setup-toggle"
+                className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border/60 px-3 py-2 text-left text-sm hover:bg-muted/50"
+              >
+                {setupOpen ? <ChevronDown className="h-4 w-4 shrink-0" /> : <ChevronRight className="h-4 w-4 shrink-0" />}
+                <span aria-hidden="true" className={setupFailed ? "text-red-600 dark:text-red-400" : "text-green-600 dark:text-green-400"}>
+                  {setupFailed ? "●" : "✓"}
+                </span>
+                <span className="font-medium">Setup</span>
+                <span className="text-xs text-muted-foreground">
+                  {setupFailed
+                    ? `${displayStages.length} steps — one did not finish`
+                    : `completed · ${displayStages.length} steps, run once when this pipeline was created`}
+                </span>
+              </button>
+              {/* The switch flips the view inside Setup, so it is offered only
+                  while Setup is open. In the header it was a no-op for a stream:
+                  it changed a view that was folded away. */}
+              {setupOpen && viewSwitch}
+            </div>
+          )}
+
+          {isStream && setupOpen && <PipelineInsightsBar stages={displayStages} pipelineName={pipelineName} pipelineId={pipelineId} />}
+
+          {/* Render DAG or Timeline + detail panel side-by-side. Mounted only
+              while visible, never kept under display:none: React Flow fits the
+              graph when its nodes are first measured, and a graph that mounted
+              hidden fitted itself to a 0×0 pane — tiny, at the left edge. */}
+          {(!isStream || setupOpen) && (
+            <div className="flex flex-col lg:flex-row gap-4">
+              <div className="flex-1 min-w-0">
+                {actualViewMode === "dag" ? (
+                  <DAGVisualizationV2
+                    stages={displayStages}
+                    selectedStageId={selectedStageId}
+                    onStageClick={(id) => setSelectedStageId((prev) => (prev === id ? null : id))}
+                  />
+                ) : (
+                  <LinearTimeline
+                    stages={displayStages}
+                    selectedStageId={selectedStageId}
+                    onStageClick={(id) => setSelectedStageId((prev) => (prev === id ? null : id))}
+                  />
+                )}
+              </div>
+              {selectedStageId && (
+                <StageDetailPanel
+                  stage={selectedStage}
+                  allStages={displayStages}
+                  onClose={() => setSelectedStageId(null)}
+                  onSelectStage={(id) => setSelectedStageId(id)}
                 />
               )}
             </div>
-            {selectedStageId && (
-              <StageDetailPanel
-                stage={selectedStage}
-                allStages={displayStages}
-                onClose={() => setSelectedStageId(null)}
-                onSelectStage={(id) => setSelectedStageId(id)}
-              />
-            )}
-          </div>
+          )}
 
           {/* Summary */}
           <div className="flex items-center gap-4 pt-4 border-t text-sm text-zinc-600 dark:text-zinc-400">
@@ -656,16 +728,12 @@ export function StepsDAGTab({ pipelineId }: StepsDAGTabProps) {
                 </span>
               </span>
             ) : null}
-            {executionPlan.metadata?.node_count && (
-              <span>
-                Nodes: <span className="font-medium">{executionPlan.metadata.node_count}</span>
-              </span>
-            )}
-            {executionPlan.metadata?.edge_count && (
-              <span>
-                Edges: <span className="font-medium">{executionPlan.metadata.edge_count}</span>
-              </span>
-            )}
+            {/* The steps drawn above, not the plan's stored node_count: the tab
+                drops passed-over stages and synthesises source/destination
+                nodes, so the planner's count disagreed with the picture. */}
+            <span data-testid="steps-count">
+              Steps: <span className="font-medium">{displayStages.length}</span>
+            </span>
           </div>
         </div>
       )}

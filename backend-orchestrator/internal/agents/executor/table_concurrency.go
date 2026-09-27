@@ -112,18 +112,13 @@ func tableConcurrencyOverride() int {
 	return 0
 }
 
-// resolveTableConcurrency returns the resource-aware per-table worker-pool size.
+// resolveTableConcurrencyWithReason returns the resource-aware per-table worker-pool
+// size, plus a human-readable account of the inputs and the binding constraint for
+// the dispatch log line.
 //
 // EXECUTOR_TABLE_CONCURRENCY overrides everything; otherwise the size is derived
 // from GOMAXPROCS — cgroup-CPU-aware on Go 1.25+, so it reflects the container's
 // CPU allocation, not the bare host — and capped by the detected memory limit.
-func resolveTableConcurrency() int {
-	size, _ := resolveTableConcurrencyWithReason()
-	return size
-}
-
-// resolveTableConcurrencyWithReason is resolveTableConcurrency plus a human-readable
-// account of the inputs and the binding constraint, for the dispatch log line.
 func resolveTableConcurrencyWithReason() (int, string) {
 	cpu := runtime.GOMAXPROCS(0)
 	mem := detectMemoryLimitBytes()

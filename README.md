@@ -117,7 +117,7 @@ shipped connectors still work; the LLM features say `Set up an LLM first` until 
 the stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
-> **Which code you get.** `v0.1.5`, the current release. Both halves of the install come
+> **Which code you get.** `v0.1.6`, the current release. Both halves of the install come
 > from that one tag: the compose file is fetched from `RSYNC_REF` and the images are
 > pulled at a tag derived from it, so the file and the containers it starts are the same
 > commit. Every image the default compose starts is published at that tag and pullable
@@ -211,9 +211,13 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > The two `frontend.*` flags are not optional on either path — the chart refuses to
 > render without them, because the browser calls the API directly and NextAuth
 > builds its callback URLs from `publicUrl`. Point them at the hostnames your
-> ingress will serve. No MinIO image override is needed: chart **0.1.2** onward was
-> repackaged after MinIO withdrew `docker.io/minio/*` and its `values.yaml` names
-> quay.io already. Both paths pull rsync's own images at `.Chart.AppVersion`
+> ingress will serve. MinIO withdrew anonymous pulls from `docker.io/minio/*` and then
+> from `quay.io/minio/*`, and chart **0.1.5** and older name those images, so their
+> MinIO pod and bucket job cannot pull. Add
+> `--set objectStorage.minio.image=cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1`
+> and the same value for `objectStorage.minio.mcImage` to the OCI install. A checkout
+> needs no override: its `values.yaml` already names that image, as the chart will
+> from **0.1.6**. Both paths pull rsync's own images at `.Chart.AppVersion`
 > (**0.1.5**), and every `ghcr.io/rsync-ai` image the chart names is published at
 > that tag for both `amd64` and `arm64` (0.1.2 and older are `amd64` only, so they will
 > not start on Apple Silicon, Graviton, Axion or Ampere nodes).

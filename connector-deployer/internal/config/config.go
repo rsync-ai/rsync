@@ -34,6 +34,10 @@ type Config struct {
 	ToolsDir string
 	// DockerHost is the daemon socket (DOCKER_HOST).
 	DockerHost string
+	// StackPrefix is the connector container-name prefix (STACK_PREFIX):
+	// "<StackPrefix>-<id>-vX-Y-Z-mcp". It must match the orchestrator's, or the
+	// protected compose-managed check cannot recognise an isolated stack's containers.
+	StackPrefix string
 
 	// ConnectorMemoryLimitMB caps each connector container's memory, in MiB.
 	// 0 = no cap (the pre-existing behaviour, kept reachable so an operator whose
@@ -59,6 +63,11 @@ type Config struct {
 	// Logging (mirrors the other services' LOG_FORMAT / LOG_LEVEL knobs).
 	LogFormat string
 	LogLevel  string
+
+	// Log rotation applied to every connector container this service creates;
+	// the same env and defaults as the compose files' `logging:` blocks.
+	ConnectorLogMaxSize string
+	ConnectorLogMaxFile string
 }
 
 // Load reads the deployer configuration from the environment, applying the
@@ -74,6 +83,7 @@ func Load() *Config {
 		OAuthVolumeTarget: env("OAUTH_TOKENS_TARGET", "/root/.rsync-ai"),
 		ToolsDir:          env("TOOLS_DIR", "/app/shared/mcp-connectors"),
 		DockerHost:        strings.TrimSpace(os.Getenv("DOCKER_HOST")),
+		StackPrefix:       env("STACK_PREFIX", "rsync-ai"),
 		// 512 MiB: above the steady-state RSS of every shipped connector archetype
 		// (REST/GraphQL clients sit well under 200 MiB; the heaviest DB connectors
 		// peak while materialising one export page) and low enough that the
@@ -87,6 +97,8 @@ func Load() *Config {
 		RegistryPull:           env("DEPLOYER_REGISTRY_PULL", "127.0.0.1:5000"),
 		LogFormat:              env("LOG_FORMAT", "json"),
 		LogLevel:               env("LOG_LEVEL", "info"),
+		ConnectorLogMaxSize:    env("RSYNC_LOG_MAX_SIZE", "10m"),
+		ConnectorLogMaxFile:    env("RSYNC_LOG_MAX_FILE", "3"),
 	}
 	return c
 }
@@ -113,6 +125,8 @@ func (c *Config) DeployerConfig() spec.DeployerConfig {
 		// would turn one typo'd env var into every connector deploy failing.
 		ConnectorMemoryBytes: mib(c.ConnectorMemoryLimitMB),
 		ConnectorPidsLimit:   nonNegative(c.ConnectorPidsLimit),
+		ConnectorLogMaxSize:  c.ConnectorLogMaxSize,
+		ConnectorLogMaxFile:  c.ConnectorLogMaxFile,
 	}
 }
 

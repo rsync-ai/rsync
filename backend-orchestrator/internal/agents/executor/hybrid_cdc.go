@@ -133,6 +133,10 @@ func (a *Agent) recordHybridBackfillDone(ctx context.Context, task ExecutorTask,
 // worker reads. It matches OFFSET_STORAGE_TOPIC on the kafka-connect container
 // (docker-compose.yml). The orchestrator does not run Connect, so the value is
 // configured here with a default; override via KAFKA_CONNECT_OFFSET_TOPIC.
+//
+// The name is Connect's, used verbatim: it is NOT an orchestrator topic and must not
+// be qualified with the platform prefix (kafkaclient.Topic), which is why
+// seedDebeziumMySQLOffsetTo produces through ProduceToExactTopic.
 func hybridOffsetTopic() string {
 	if v := strings.TrimSpace(os.Getenv("KAFKA_CONNECT_OFFSET_TOPIC")); v != "" {
 		return v
@@ -154,7 +158,10 @@ func buildDebeziumMySQLOffsetRecord(connectorName, topicPrefix string, pos cdc.B
 		return nil, nil, fmt.Errorf("invalid offset record args (connector=%q, binlog_file=%q)", connectorName, pos.File)
 	}
 	if strings.TrimSpace(topicPrefix) == "" {
-		topicPrefix = connectorName
+		// The Debezium MCP qualifies topic.prefix (connector.py _qualify_topic), and
+		// the MySQL source partition's "server" IS topic.prefix, so the default is the
+		// qualified connector name, the same prediction debeziumTopicPrefixFor makes.
+		topicPrefix = kafkaclient.Topic(connectorName)
 	}
 	// key = [connectorName, {"server": topicPrefix}] — the Kafka Connect source partition.
 	keyObj := []interface{}{connectorName, map[string]string{"server": topicPrefix}}
@@ -185,9 +192,10 @@ func buildDebeziumMySQLOffsetRecord(connectorName, topicPrefix string, pos cdc.B
 //	value: {"file":"<binlog_file>","pos":<pos>[,"gtids":"<gtid_set>"]}
 //
 // connectorName is the Kafka Connect connector name (also the registration name).
-// topicPrefix is the Debezium topic.prefix (equals connector_name in our executor
-// unless overridden). BOTH must match what the Debezium MCP _build_config will set,
-// or Connect's offset store won't associate the seeded offset with the connector.
+// topicPrefix is the Debezium topic.prefix, which the Debezium MCP qualifies
+// (debeziumTopicPrefixFor predicts it: kafkaclient.Topic of topic_prefix, else of
+// connector_name). BOTH must match what the Debezium MCP will set, or Connect's
+// offset store won't associate the seeded offset with the connector.
 //
 // Timing: the executor seeds the offset BEFORE the (multi-minute) batch load and only
 // creates the connector AFTER the batch completes, so Connect's offset backing store
@@ -196,12 +204,25 @@ func (a *Agent) seedDebeziumMySQLOffset(ctx context.Context, connectorName, topi
 	if a.kafkaManager == nil {
 		return fmt.Errorf("kafka manager unavailable for offset seeding")
 	}
+	return seedDebeziumMySQLOffsetTo(ctx, a.kafkaManager, connectorName, topicPrefix, pos)
+}
+
+// exactTopicProducer is the one Kafka call the offset seed needs. Its only method
+// sends to the topic exactly as named; there is deliberately no qualifying Produce in
+// it, because the Connect offset topic is not in the platform namespace.
+type exactTopicProducer interface {
+	ProduceToExactTopic(ctx context.Context, topic string, key, value []byte) error
+}
+
+// seedDebeziumMySQLOffsetTo is seedDebeziumMySQLOffset past the nil-manager check,
+// split out so a test can see the topic, key and value that reach Kafka.
+func seedDebeziumMySQLOffsetTo(ctx context.Context, p exactTopicProducer, connectorName, topicPrefix string, pos cdc.BinlogPosition) error {
 	connectorName = strings.TrimSpace(connectorName)
 	if connectorName == "" || pos.IsZero() {
 		return fmt.Errorf("invalid offset seed args (connector=%q, binlog_file=%q)", connectorName, pos.File)
 	}
 	if strings.TrimSpace(topicPrefix) == "" {
-		topicPrefix = connectorName
+		topicPrefix = kafkaclient.Topic(connectorName)
 	}
 
 	keyBytes, valBytes, err := buildDebeziumMySQLOffsetRecord(connectorName, topicPrefix, pos)
@@ -209,8 +230,11 @@ func (a *Agent) seedDebeziumMySQLOffset(ctx context.Context, connectorName, topi
 		return err
 	}
 
+	// Exact name: a qualified produce (ProduceWithContext) would write the record to
+	// rsync._rsync-connect-offsets, which Connect never reads, and the connector would
+	// then start from wherever recovery puts it instead of the captured position.
 	offsetTopic := hybridOffsetTopic()
-	if err := a.kafkaManager.ProduceWithContext(ctx, offsetTopic, keyBytes, valBytes); err != nil {
+	if err := p.ProduceToExactTopic(ctx, offsetTopic, keyBytes, valBytes); err != nil {
 		return fmt.Errorf("produce seed offset to %s: %w", offsetTopic, err)
 	}
 
@@ -356,7 +380,9 @@ func (a *Agent) executeHybridCDCDataTransfer(ctx context.Context, task ExecutorT
 	// ── Phase 2: batch historical load. Reuse the batch data plane (its own sink, upsert). ──
 	batchTopic := kafkaclient.Topic(fmt.Sprintf("pipeline.%s.data", utils.SafeID8(task.PipelineID)))
 	log.WithFields(log.Fields{"pipeline_id": task.PipelineID, "batch_topic": batchTopic}).Info("📦 Hybrid CDC: starting batch historical load")
+	load := a.beginHybridInitialLoad(ctx, task, connectorName)
 	batchResp := a.executeBatchDataTransfer(ctx, task, batchTopic, traceID)
+	a.finishHybridInitialLoad(ctx, load, batchResp.Status == "success")
 	if batchResp.Status != "success" {
 		return fail(fmt.Sprintf("hybrid CDC: batch historical load failed (CDC not started, no data loss): %s", batchResp.Error))
 	}
@@ -387,7 +413,10 @@ func (a *Agent) executeHybridCDCDataTransfer(ctx context.Context, task ExecutorT
 	}
 	if !isPG {
 		// MySQL: seed the offset so Debezium resumes from P instead of re-snapshotting.
-		if err := a.seedDebeziumMySQLOffset(ctx, connectorName, connectorName, mysqlPos); err != nil {
+		// topic.prefix as the Debezium MCP will set it for these start_sync params
+		// (connector_name, no topic_prefix): the qualified connector name.
+		topicPrefix := debeziumTopicPrefixFor(map[string]interface{}{"connector_name": connectorName})
+		if err := a.seedDebeziumMySQLOffset(ctx, connectorName, topicPrefix, mysqlPos); err != nil {
 			return fail(fmt.Sprintf("hybrid CDC: failed to seed Debezium offset at P: %v", err))
 		}
 	}

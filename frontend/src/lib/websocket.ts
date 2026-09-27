@@ -16,7 +16,6 @@ export type EventType =
   | 'agent_clarification'
   | 'sync_mode_question'
   | 'domain_event'      // NEW ARCHITECTURE: Canonical pipeline state changes
-  | 'telemetry_event'   // NEW ARCHITECTURE: Optional agent debugging telemetry
 
 // Generic event structure
 export interface WebSocketEvent {
@@ -54,6 +53,8 @@ export class AgentWebSocket {
   private maxReconnectDelay = 30000
   private reconnectTimer: NodeJS.Timeout | null = null
   private isIntentionalClose = false
+  private gaveUp = false
+  private giveUpHandlers: Set<ConnectionHandler> = new Set()
 
   constructor(
     // Self-correcting (see @/lib/config/api WS_ENDPOINTS): a mis-baked localhost
@@ -65,11 +66,22 @@ export class AgentWebSocket {
   ) {}
 
   connect(): void {
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    // CONNECTING counts as connected for this guard. It did not, so a caller
+    // arriving during the handshake opened a second socket whose close event
+    // then started a reconnect ladder of its own.
+    if (this.ws?.readyState === WebSocket.OPEN || this.ws?.readyState === WebSocket.CONNECTING) {
       return
     }
 
+    // An explicit connect supersedes a scheduled retry; otherwise the pending
+    // timer fires on top of the socket this call is about to create.
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+
     this.isIntentionalClose = false
+    this.gaveUp = false
 
     try {
       this.ws = new WebSocket(this.url)
@@ -114,6 +126,15 @@ export class AgentWebSocket {
 
   private attemptReconnect(): void {
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      // Out of budget. This was a bare `return`: the client fell permanently
+      // silent, and nothing above it could tell that apart from a quiet server.
+      // Eight attempts of capped-30s full jitter is a couple of minutes, so a
+      // laptop that slept came back to a socket that had already given up --
+      // and every view driven by it went on rendering its last received state
+      // as though it were current. Record it and announce it, so the provider
+      // can re-arm when the tab is visible or the network returns.
+      this.gaveUp = true
+      this.giveUpHandlers.forEach(handler => handler())
       return
     }
 
@@ -152,6 +173,35 @@ export class AgentWebSocket {
     return () => this.closeHandlers.delete(handler)
   }
 
+  /** Fires once when the retry budget is exhausted with no successful open. */
+  onGiveUp(handler: ConnectionHandler): () => void {
+    this.giveUpHandlers.add(handler)
+    return () => this.giveUpHandlers.delete(handler)
+  }
+
+  /** True once the ladder has been exhausted; cleared by any connect attempt. */
+  hasGivenUp(): boolean {
+    return this.gaveUp
+  }
+
+  /** True while a backoff retry is already scheduled, so callers can leave it be. */
+  isReconnecting(): boolean {
+    return this.reconnectTimer !== null
+  }
+
+  /**
+   * Restore the full retry budget and reconnect now.
+   *
+   * The caller for this is a tab becoming visible or the network coming back:
+   * both mean the reason the ladder was burned through has probably gone away,
+   * and neither is something the ladder itself can observe.
+   */
+  reconnectNow(): void {
+    this.reconnectAttempts = 0
+    this.gaveUp = false
+    this.connect()
+  }
+
   disconnect(): void {
     this.isIntentionalClose = true
 
@@ -169,7 +219,9 @@ export class AgentWebSocket {
     this.errorHandlers.clear()
     this.openHandlers.clear()
     this.closeHandlers.clear()
+    this.giveUpHandlers.clear()
     this.reconnectAttempts = 0
+    this.gaveUp = false
   }
 
   // Get connection state

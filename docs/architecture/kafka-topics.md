@@ -8,6 +8,10 @@ cited to a `file:line`; if you change a name, change the citation with it.
 > `agent.{name}.requests` fan-out with per-agent DLQs that the code has not used for
 > a long time: 14 of the names it documented had zero producers and zero consumers
 > across all five services. Don't restore it from git history.
+>
+> Revised again when the agent Kafka bus was removed in
+> [#1227](https://github.com/rsync-ai/rsync-ai/pull/1227): agent stages hand off through
+> Redis, and a default install provisions four platform topics.
 
 ## 1. The namespace prefix
 
@@ -25,10 +29,10 @@ All three implementations must agree byte-for-byte. They share four behaviours:
 - **Default** `rsync.` when the variable is unset.
 - **Normalize** — strip anything outside Kafka's `[a-zA-Z0-9._-]` charset, then append
   `.` if the last character is not already `.`, `_` or `-`. Without this, prefix `acme`
-  yields `acmetask.results` on one side and `acme.task.results` on the other — both
+  yields `acmepipeline.domain.events` on one side and `acme.pipeline.domain.events` on the other — both
   legal topic names, so the split surfaces only as a consumer that receives nothing.
-- **Idempotent** — `Topic("rsync.cdc.abc12345")` is unchanged, never
-  `rsync.rsync.cdc.abc12345`. Topic names are persisted (`pipelines.kafka_topic`,
+- **Idempotent** — `Topic("rsync.pipeline.abc12345.data")` is unchanged, never
+  `rsync.rsync.pipeline.abc12345.data`. Topic names are persisted (`pipelines.kafka_topic`,
   connector configs) and read back on the next run.
 - **Empty means empty.** Setting `KAFKA_TOPIC_PREFIX=""` disables qualification. That is
   the migration lever for a deployment with live topics and committed offsets under the
@@ -46,7 +50,7 @@ deployment mid-migration has some of each.
 | `KAFKA_ALLOW_LEGACY_UNPREFIXED_TOPICS` | unset (false) | upgrading a deployment that has **adopted** the prefix but still has topics minted under the old bare names, and only until those are reclaimed |
 
 The orchestrator's topology API only accepts topic names inside a namespace the
-platform owns ([topology.go:185](../../backend-orchestrator/internal/handlers/topology.go:185)).
+platform owns ([topology.go:176](../../backend-orchestrator/internal/handlers/topology.go)).
 Since f1ee815e that allowlist is
 the configured prefix plus the branded `_rsync-`. The seven pre-namespace prefixes —
 `agent.` `pipeline.` `cdc.` `cdc-` `schemahistory.` `pii.` `task.` — are **out of it by
@@ -79,15 +83,16 @@ that names topics differently. It adds to the built-ins and never replaces them.
 Logical names are written **unprefixed** everywhere in code and in this document. The
 helper adds the prefix at the call site — except inside the orchestrator, where
 `Manager.ProduceWithContext` and `ProduceWithHeadersAndContext` qualify the name
-themselves ([internal/kafka/manager.go:281](../../backend-orchestrator/internal/kafka/manager.go),
-[:356](../../backend-orchestrator/internal/kafka/manager.go)). That is why ~60 orchestrator
-call sites pass a bare `"pipeline.agent.telemetry"` and still land in the namespace. It
-works because `Topic()` is idempotent, so a name already qualified by `generateTopicName`
-passes through unchanged.
+themselves ([internal/kafka/manager.go:337](../../backend-orchestrator/internal/kafka/manager.go),
+[:465](../../backend-orchestrator/internal/kafka/manager.go)). That is why orchestrator
+call sites such as [workers/progress_events.go:268](../../backend-orchestrator/internal/workers/progress_events.go)
+pass a bare `"pipeline.domain.events"` and still land in the namespace. It works because
+`Topic()` is idempotent, so an already-qualified name (a stored `pipelines.kafka_topic`,
+say) passes through unchanged.
 
 ## 2. Who creates what
 
-Four mechanisms create topics. Nothing else does.
+The platform creates topics in the places below.
 
 Every programmatic creation in the orchestrator funnels through one function —
 `TopologyManager.ensureTopicLocked` — which is the invariant
@@ -97,91 +102,102 @@ clamping unavoidable rather than opt-in: a second creator would be a second plac
 topic to be born with a floor above its replication factor, which produces a topic that
 is created, listed, subscribable and permanently unwritable.
 
-### 2a. `TopologyManager.EnsureAgentControlTopics` — the startup creator
+### 2a. `TopologyManager.EnsurePlatformTopics` — the startup creator
 
-[backend-orchestrator/internal/kafka/topology.go:337](../../backend-orchestrator/internal/kafka/topology.go),
-called once at orchestrator startup
-([cmd/orchestrator/main.go:489](../../backend-orchestrator/cmd/orchestrator/main.go)).
-Creates 25 topics through `EnsureTopic` → `kafkaclient.Topic()`, so they are correctly
-prefixed:
+[backend-orchestrator/internal/kafka/topology.go:413](../../backend-orchestrator/internal/kafka/topology.go),
+called at orchestrator startup through `ensurePlatformTopicsWithRetry`
+([cmd/orchestrator/platform_topics.go](../../backend-orchestrator/cmd/orchestrator/platform_topics.go),
+[main.go:513-520](../../backend-orchestrator/cmd/orchestrator/main.go)) **before any
+consumer starts** — a consumer-group subscription auto-creates the topic it joins at the
+broker's defaults, and this function never re-sizes an existing topic. It creates the
+names `PlatformTopicNames()` returns (topology.go:375), through `EnsureTopic` →
+`kafkaclient.Topic()`, so they are correctly prefixed:
 
-- `agent.control.commands.{intent,resolver,discovery,planner,validator,executor,cost_estimator,capability_resolver,connection_validator}` — 9 topics, `retention.ms=86400000`, `compression.type=snappy`
-- `agent.control.results`
-- `agent.failed.dlq`
-- `agent.executor.responses`, `pipeline.domain.events`, `pipeline.agent.telemetry`
-- `rsync.notifications`, `rsync.healer.{actions,results,approved-changes,schema-changes}`, `rsync.agents.heartbeat`, `rsync.sentinel.audit`
-- `agent.planner.responses`, `pii.scan.{request,response}`, `pipeline.failed.dlq`
+| Topic | Always? |
+|---|---|
+| `pipeline.domain.events` | yes |
+| `rsync.notifications` | yes |
+| `pii.scan.request` | yes |
+| `pii.scan.response` | yes |
+| `rsync.healer.schema-changes` | only with `RSYNC_SCHEMA_DRIFT_ENABLED=true` |
+| `rsync.healer.approved-changes` | only with `RSYNC_SCHEMA_DRIFT_ENABLED=true` |
+| `rsync.healer.results` | only with `RSYNC_SCHEMA_DRIFT_ENABLED=true` |
 
-Everything after the first eleven carries `KeepExistingPartitions: true`: those topics
-hold KEYED records, and widening a live topic re-hashes keys onto other partitions, so
-creating one and re-sizing an existing one are deliberately different decisions. The
-retention values are not free choices either — where `kafka-init` or the quickstart
-compose also creates the topic, the value here matches it verbatim, because neither
-creator ALTERs an existing topic and whichever runs first on a given deployment wins
-permanently.
+The healer topics are gated because their producers and consumers are: with the flag off
+nothing reads or writes them.
 
-Partitions come from `KAFKA_AGENT_TOPIC_PARTITIONS` (default 3, clamped);
-replication factor is `min(3, brokerCount)` when the cluster has more than one broker,
-else 1. **Partition count is the point** — auto-created topics get 1 partition, and a
-1-partition command topic means only one orchestrator replica ever receives work.
+Every platform topic gets 3 partitions and `cleanup.policy=delete`,
+`retention.ms=604800000` (7 days), `compression.type=snappy` (topology.go:345-358), with
+`KeepExistingPartitions: true`: the records are keyed, and widening a live topic re-hashes
+keys onto other partitions, so creating one and re-sizing an existing one are deliberately
+different decisions. The values are not free choices either — §2b and §2c create three of
+the same names with the same config, and no creator ALTERs an existing topic, so whichever
+runs first on a given deployment wins permanently.
 
-Failure is logged at **Warn** and startup continues
-(`"⚠️  Failed to ensure agent control topics (scaling may be limited)"`). On a broker
-with `auto.create.topics.enable=false` that warning is the whole control plane failing
-open — see §4.
+Replication factor is `KAFKA_REPLICATION_FACTOR` if set, else derived from the live broker
+count, and clamped either way.
 
-`TopologyManager.CreateTopicForPipeline` (topology.go:334) exists and would create
-per-pipeline topics with tuned partition counts, but its only caller is the HTTP route
-`POST /api/v1/topology/topics/pipeline`
-([internal/handlers/topology.go:146](../../backend-orchestrator/internal/handlers/topology.go)),
-which **no service, job or frontend in this repo calls.** It is an operator endpoint, not
-part of the pipeline flow.
+A failed create does not stop the others (the errors come back through `errors.Join`).
+The startup wrapper retries up to 5 times with a doubling backoff from 1 s, then logs
+`"⚠️  Failed to ensure platform topics"` at **Warn** and startup continues — the services
+that use the topic surface their own produce or consume error.
 
-### 2b. `kafka-init` — the compose bootstrapper
+This replaced `EnsureAgentControlTopics`, which created the agent bus
+(`agent.control.*`, `agent.*.responses`, `pipeline.agent.telemetry`, the two
+`*.failed.dlq` topics and the `rsync.healer.actions` / `rsync.sentinel.audit` pair), and
+the `CreateTopicForPipeline` operator route. Both were removed in
+[#1227](https://github.com/rsync-ai/rsync-ai/pull/1227); agent stages now hand off
+through Redis, not Kafka.
+
+### 2b. `kafka-init` — the compose and Helm bootstrappers
 
 One-shot container in [docker-compose.yml](../../docker-compose.yml) (`kafka-init`),
 running [scripts/kafka-init-new-topics.sh](../../scripts/kafka-init-new-topics.sh) after
-the broker passes its healthcheck. Creates 4:
-
-| Topic | Retention |
-|---|---|
-| `task.assignments` | broker default |
-| `task.results` | broker default |
-| `pipeline.domain.events` | `-1` (infinite — canonical event log) |
-| `pipeline.agent.telemetry` | 7 days |
+the broker passes its healthcheck. It creates `pipeline.domain.events`,
+`pii.scan.request` and `pii.scan.response`, each at 3 partitions, `cleanup.policy=delete`,
+7 days' retention — the §2a config.
 
 [docker-compose.quickstart.yml](../../docker-compose.quickstart.yml) has its own inline
-variant creating 12 (the 9 control commands + `agent.planner.responses` +
-`pipeline.domain.events` + `pii.scan.response`). It overlaps §2a harmlessly —
-`--if-not-exists`.
+variant and the Helm chart a `kafka-init` Job
+([deploy/helm/rsync-ai/templates/jobs/kafka-init.yaml](../../deploy/helm/rsync-ai/templates/jobs/kafka-init.yaml));
+both create the same three with the same config. All of them overlap §2a harmlessly —
+`--if-not-exists`. `rsync.notifications` and the healer topics are created by §2a only.
 
 ### 2c. `scripts/create_kafka_topics.sh` — dev setup only
 
-Invoked by [scripts/setup.sh:79](../../scripts/setup.sh); not part of any compose file,
-so **it never runs on a deployed stack.** Creates 8: `agent.planner.requests`,
-`agent.executor.requests`, and the six `agent.{intent,resolver,discovery,planner,validator,executor}.responses`.
+Invoked by [scripts/setup.sh:83](../../scripts/setup.sh); not part of any compose file,
+so **it never runs on a deployed stack.** Creates the same three topics as §2b with the
+same config.
 
-### 2d. `Manager.EnsureTopicExists` — runtime pre-creation on the pipeline path
+### 2d. Runtime pre-creation on the pipeline path
 
 The topics above are known at startup. The data-plane topics are not: their names carry a
 pipeline id or a connector name, so they can only be created when a pipeline runs.
-[`Manager.EnsureTopicExists`](../../backend-orchestrator/internal/kafka/manager.go) (:1260)
-and its config-carrying sibling `EnsureTopicExistsWithConfig` (:1277) are that path. Both
-delegate to `TopologyManager.EnsureTopic` with `NameIsAuthoritative` and
-`KeepExistingPartitions` set, so the name the caller chose is created verbatim — these
-names are owned by Debezium and by the sink's subscription config, and re-qualifying one
-would create a topic nobody reads — while the replication clamping still applies.
+[`Manager.EnsureTopicExists`](../../backend-orchestrator/internal/kafka/manager.go) (:1671)
+and its config-carrying sibling `EnsureTopicExistsWithConfig` (:1675) are that path, with
+two wrappers that fix the config: `EnsureSignalTopic` (:1733) and `EnsureDDLTopic` (:1770).
+They create the name the caller chose verbatim — these names are owned by Debezium and by
+the sink's subscription config, and re-qualifying one would create a topic nobody reads —
+while the replication clamping still applies.
 
 | Call site | Topic | Partitions | Config |
 |---|---|---|---|
-| [executor.go:3987](../../backend-orchestrator/internal/agents/executor/executor.go) | `pipeline.<id8>.data` | 1 | — |
-| [executor.go:6314](../../backend-orchestrator/internal/agents/executor/executor.go) | `cdc.<id8>` / `cdc-<id>.<db>.<table>` | 3 | — |
-| [executor.go:3416](../../backend-orchestrator/internal/agents/executor/executor.go) | `schemahistory.<connector>` | 1 | `cleanup.policy=delete`, `retention.ms=-1` |
-| [cdc_incremental.go:322](../../backend-orchestrator/internal/agents/executor/cdc_incremental.go) | `<connector>.signals` | 1 | — |
+| [executor.go:4054](../../backend-orchestrator/internal/agents/executor/executor.go) | `pipeline.<id8>.data` (batch) | 1 | — |
+| [executor.go:6437](../../backend-orchestrator/internal/agents/executor/executor.go) | `cdc-<id8>.<db>.<table>`, or one unified topic for dimension tables | resolved per pipeline, fallback 1 (executor.go:6278) | — |
+| [executor.go:3351](../../backend-orchestrator/internal/agents/executor/executor.go) | `schemahistory.<connector>` — historized engines only (MySQL/MariaDB, SQL Server, Oracle, Db2) | 1 | `cleanup.policy=delete`, `retention.ms=-1` |
+| [executor.go:3371](../../backend-orchestrator/internal/agents/executor/executor.go) | the connector's DDL topic, its bare `topic.prefix` `cdc-<id8>` — historized engines only | 1 | `EnsureDDLTopic`: delete, 7 days |
+| [executor.go:3403](../../backend-orchestrator/internal/agents/executor/executor.go) | `heartbeat.<topic.prefix>` (so `rsync.heartbeat.rsync.cdc-<id8>` under the default prefix) — PostgreSQL and MongoDB only | 1 | `cleanup.policy=delete` |
+| [executor.go:2968](../../backend-orchestrator/internal/agents/executor/executor.go), [cdc_incremental.go:357](../../backend-orchestrator/internal/agents/executor/cdc_incremental.go) | `signals.<id8>` — PostgreSQL family and MongoDB only | 1 | `EnsureSignalTopic`: delete, 1 day, hourly segments |
+| [manager.go:1016](../../backend-orchestrator/internal/kafka/manager.go) | `<consumed topic>.dlq` for each orchestrator consumer | 1 | `DLQTopicConfig`: delete, 7 days |
 
-All four are **best-effort**: a failure is logged at Warn and the run continues, so a
-broker that does auto-create behaves exactly as it did before. That is deliberate — the
-pre-creation removes a dependency, it does not add a new way to fail a pipeline.
+The sink worker creates its own `<source_topic>.dlq` before the first write, 1 partition
+and 7 days' retention
+([kafka-sink-worker main.go `ensureDLQTopic`](../../shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go)).
+
+Every pre-create above is **best-effort**: a failure is logged at Warn and the run
+continues, so a broker that does auto-create behaves exactly as it did before. That is
+deliberate — the pre-creation removes a dependency, it does not add a new way to fail a
+pipeline.
 
 The schema-history entry is the one with a geometry that is a correctness requirement
 rather than a preference. Debezium replays that topic in order to rebuild the source DDL,
@@ -198,68 +214,60 @@ side and by `test_topic_naming.py` on the connector side.
 
 ## 3. Topic catalogue
 
-### Control plane
+### Platform topics
 
 | Topic | Producer | Consumer | Created by |
 |---|---|---|---|
-| `agent.control.commands.<agent>` (×9) | orchestrator dispatch | orchestrator agent workers — list pinned in [sentinel/health_monitor.go:248](../../backend-orchestrator/internal/agents/sentinel/health_monitor.go) and guarded by `consumed_topics_test.go` | §2a |
-| `agent.control.results` | agent workers | Temporal adapter (V1 signal path) | §2a |
-| `task.assignments` | **none** | **none** — named only in [sentinel/healer.go:294](../../backend-orchestrator/internal/agents/sentinel/healer.go) | §2b |
-| `task.results` | agent workers | **none** — the WebSocket bridge stopped subscribing when the producer-less subscriptions were pruned | §2b |
+| `pipeline.domain.events` | orchestrator ([progress_events.go:268](../../backend-orchestrator/internal/workers/progress_events.go), [main.go:333](../../backend-orchestrator/cmd/orchestrator/main.go)); temporal-adapter ([activities.go:144](../../backend-temporal-adapter/internal/workflows/activities.go)); sink worker ([main.go:3933](../../shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go)) | api-gateway WebSocket bridge, event projector, domain-events consumer | §2a, §2b |
+| `rsync.notifications` | orchestrator schema-drift healer ([healer.go:1274](../../backend-orchestrator/internal/agents/healer/healer.go)); temporal-adapter ([pipeline_failure_notification.go:61](../../backend-temporal-adapter/internal/workflows/pipeline_failure_notification.go)) | api-gateway notifier ([notifier.go:61](../../api-gateway/internal/notifier/notifier.go)) | §2a |
+| `pii.scan.request` | api-gateway ([handlers/pii.go:302](../../api-gateway/internal/handlers/pii.go)) | llm-service ([pii_scanner/kafka_consumer.py:21](../../llm-service/src/agents/pii_scanner/kafka_consumer.py)) | §2a, §2b |
+| `pii.scan.response` | llm-service PII scanner | api-gateway ([cmd/server/main.go:539](../../api-gateway/cmd/server/main.go)) | §2a, §2b |
 
-`task.assignments` has no producer and no consumer anywhere. It is created because the
-healer's `newArchTopics` list expects it to exist; deleting it would make the healer
-report a missing topic.
-
-### Events and telemetry
+### Schema-drift topics (only with `RSYNC_SCHEMA_DRIFT_ENABLED=true`)
 
 | Topic | Producer | Consumer | Created by |
 |---|---|---|---|
-| `pipeline.domain.events` | orchestrator workers | api-gateway WebSocket bridge; projector | §2a, §2b |
-| `pipeline.agent.telemetry` | `workers/planner.go:512`, `intent.go:615`, `resolver.go:314` | bridge (debug mode) | §2a, §2b |
+| `rsync.healer.schema-changes` | sink worker ([main.go:8462](../../shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/main.go)), executor, cdcstats (per [topology.go:368](../../backend-orchestrator/internal/kafka/topology.go)) | orchestrator healer ([healer.go:180](../../backend-orchestrator/internal/agents/healer/healer.go)) | §2a |
+| `rsync.healer.approved-changes` | api-gateway ([handlers/schema_evolution.go:390](../../api-gateway/internal/handlers/schema_evolution.go)) | orchestrator healer | §2a |
+| `rsync.healer.results` | orchestrator healer ([healer.go:1346](../../backend-orchestrator/internal/agents/healer/healer.go)) | api-gateway notifier ([notifier.go:62](../../api-gateway/internal/notifier/notifier.go)) | §2a |
 
-### Agent responses
+The orchestrator's agent workers no longer consume Kafka at all: they poll the Redis
+correlation store. Its remaining consumers are these healer subscriptions and the cdcstats
+agent's per-pipeline schema-change reader (Data plane, below).
 
-[api-gateway/internal/websocket/kafka_bridge.go:83](../../api-gateway/internal/websocket/kafka_bridge.go)
-subscribes to 4 topics, each of which has a real in-repo producer and is created by §2a:
+### The WebSocket bridge
 
-`pipeline.domain.events` · `pipeline.agent.telemetry` · `agent.planner.responses` ·
-`agent.executor.responses`
-
-It used to subscribe to 15. The other 11 —
-`agent.{intent,resolver,discovery,validator}.responses` ·
-`agent.{resolver,orchestrator,discovery,planner}.progress` ·
-`pipeline.status.updates` · `cdc.status.updates` · `task.results` — had **no producer
-anywhere in the repo**, and the bridge's own comment marked the `agent.*` set
-`LEGACY: … will be deprecated`. They are gone.
+[api-gateway/internal/websocket/kafka_bridge.go:74](../../api-gateway/internal/websocket/kafka_bridge.go)
+subscribes to one topic, `pipeline.domain.events`. It used to subscribe to many more; the
+producer-less ones were pruned first, and the rest (`pipeline.agent.telemetry`,
+`agent.planner.responses`, `agent.executor.responses`) went with the agent bus in
+[#1227](https://github.com/rsync-ai/rsync-ai/pull/1227).
 
 That was not cosmetic. A subscription is a topic dependency: the bridge opens one consumer
 group per topic, and on a broker with `auto.create.topics.enable=true` a *fetch* against a
-non-existent topic creates it. Eleven topics were therefore being brought into existence by
-the act of watching for messages that nothing ever sent — which both hid the auto-create
+non-existent topic creates it. Topics were therefore being brought into existence by the
+act of watching for messages that nothing ever sent — which both hid the auto-create
 dependency (the topics existed, so nothing looked wrong) and made the grant a customer's
-Kafka operator has to write eleven entries longer than it needed to be. The remaining group
-ids are pinned by
-[`kafka_bridge_group_test.go`](../../api-gateway/internal/websocket/kafka_bridge_group_test.go).
+Kafka operator has to write longer than it needed to be. The remaining group id is pinned
+by [`kafka_bridge_group_test.go`](../../api-gateway/internal/websocket/kafka_bridge_group_test.go).
 
 ### Data plane
 
 | Topic | Shape | Producer | Consumer | Created by |
 |---|---|---|---|---|
-| `pipeline.<id8>.data` | batch row chunks / MinIO claim-check URLs | [executor.go:2439](../../backend-orchestrator/internal/agents/executor/executor.go) | `kafka-mcp-sink` | §2d |
-| `cdc.<id8>` | Debezium envelopes | Debezium via Kafka Connect | `kafka-mcp-sink` | §2d |
-| `cdc-<id>.<db>.<table>` | Debezium per-table stream | Debezium | `kafka-mcp-sink` | §2d |
+| `pipeline.<id8>.data` | batch row chunks / MinIO claim-check URLs | executor ([executor.go:2410](../../backend-orchestrator/internal/agents/executor/executor.go) names it) | `kafka-mcp-sink` | §2d |
+| `cdc-<id8>.<db>.<table>` | Debezium per-table stream | Debezium via Kafka Connect | `kafka-mcp-sink` | §2d |
 | `schemahistory.<connector>` | Debezium source-DDL history | Kafka Connect | Kafka Connect (on connector restart) | §2d |
-| the CDC signal topic | incremental-snapshot signals | [cdc_incremental.go:327](../../backend-orchestrator/internal/agents/executor/cdc_incremental.go) | Debezium | §2d |
-| `pipeline.failed.dlq` | dead-lettered pipeline messages | [activities.go:169](../../backend-temporal-adapter/internal/workflows/activities.go) | operator | §2a |
-| `agent.failed.dlq` | dead-lettered agent activities | [activities.go:200](../../backend-temporal-adapter/internal/workflows/activities.go) | operator | §2a |
-| `pii.scan.request` | scan job | [handlers/pii.go:300](../../api-gateway/internal/handlers/pii.go) | [llm-service pii_scanner/kafka_consumer.py:18](../../llm-service/src/agents/pii_scanner/kafka_consumer.py) | §2a |
-| `pii.scan.response` | scan result | llm-service | api-gateway ([cmd/server/main.go:437](../../api-gateway/cmd/server/main.go)) | §2a, §2b (quickstart) |
+| `cdc-<id8>` | Debezium DDL events (historized engines) | Kafka Connect | orchestrator cdcstats ([schema_changes.go](../../backend-orchestrator/internal/agents/cdcstats/schema_changes.go)) | §2d |
+| `heartbeat.<topic.prefix>` | Debezium heartbeats (PostgreSQL, MongoDB) | Kafka Connect | none — it exists so Debezium can commit its position on an idle source | §2d |
+| `signals.<id8>` | incremental / blocking snapshot signals | orchestrator ([cdc_incremental.go:362](../../backend-orchestrator/internal/agents/executor/cdc_incremental.go)) | Debezium | §2d |
+| `<topic>.dlq` | dead-lettered messages of one consumed topic | sink worker, orchestrator consumers | operator | §2d |
 
-The naming rule for the per-pipeline topic is
-[topology.go:400 `generateTopicName`](../../backend-orchestrator/internal/kafka/topology.go):
-`cdc`/`streaming` → `cdc.<id8>`, everything else → `pipeline.<id8>.data`, where `<id8>` is
-the first 8 characters of the pipeline UUID.
+`<id8>` is the first 8 characters of the pipeline UUID. The batch topic name is built at
+[executor.go:2410](../../backend-orchestrator/internal/agents/executor/executor.go)
+unless the pipeline carries a pre-provisioned one; there is no `cdc.<id8>` topic. The
+fixed `pipeline.failed.dlq` and `agent.failed.dlq` were removed in
+[#1227](https://github.com/rsync-ai/rsync-ai/pull/1227).
 
 ## 4. What this means for `auto.create.topics.enable=false`
 
@@ -273,10 +281,10 @@ and it mattered because the setting is one this platform does **not own** on a
 customer-managed cluster — several managed offerings ship it off, and a customer may
 simply have turned it off.
 
-Every topic in §3 now has a named creator: §2a provisions the whole control, event,
-notification and healer set at startup, and §2d pre-creates the per-pipeline data topics
-when a pipeline runs. The producer-less bridge subscriptions that were creating eleven
-topics by fetching from them are gone. The remaining hole is a documented one:
+Every topic in §3 now has a named creator: §2a provisions the platform topics (event,
+notification, PII and, when enabled, healer) at startup, and §2d pre-creates the
+per-pipeline data topics when a pipeline runs. The producer-less bridge subscriptions that
+were creating topics by fetching from them are gone. The remaining hole is a documented one:
 `schemahistory.<connector>` is pre-created by §2d, but Kafka Connect is what writes to it,
 and if the pre-create fails Connect still expects the broker to have it.
 

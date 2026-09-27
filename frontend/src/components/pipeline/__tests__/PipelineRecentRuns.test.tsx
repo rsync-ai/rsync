@@ -85,6 +85,19 @@ describe("PipelineRecentRuns", () => {
     expect(await screen.findByTestId("pipeline-recent-runs-summary")).toHaveTextContent("No run has finished yet · 1 running")
   })
 
+  // The gateway reads each run's executions row since the postflight-failed fix,
+  // so it can now say "cancelled". That must not render as a pulsing Running pill.
+  it("a cancelled run is its own pill, not a running one", async () => {
+    respond({ finished_runs: 1, succeeded_runs: 1, recent_executions: [run("c1", "cancelled"), run("d1", "completed", 1000)] })
+    render(<PipelineRecentRuns pipelineId="p1" />)
+    const summary = await screen.findByTestId("pipeline-recent-runs-summary")
+    const pill = screen.getByRole("link", { name: /^Cancelled/ })
+    expect(pill).toHaveAttribute("href", "/executions/c1")
+    expect(pill.className).not.toContain("animate-pulse")
+    expect(summary).toHaveTextContent("1 of the last 1 finished run succeeded")
+    expect(summary).not.toHaveTextContent("running")
+  })
+
   it("shows an error line instead of vanishing when the request fails", async () => {
     respond({}, false)
     render(<PipelineRecentRuns pipelineId="p1" />)

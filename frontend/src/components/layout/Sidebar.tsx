@@ -23,6 +23,7 @@ import {
   MessageSquareText,
   Sparkles,
   Shield,
+  Wand2,
   Building2,
   Gauge,
   X,
@@ -55,6 +56,10 @@ const navigation: Array<{
     items: [
       { name: "All Pipelines", href: "/pipelines", icon: GitBranch },
       { name: "Executions", href: "/executions", icon: History },
+      // /transforms had no link anywhere in the app — the page existed and was
+      // reachable only by typing the URL. It belongs here rather than under
+      // "Data": a transform plan is saved to one pipeline.
+      { name: "Transform Builder", href: "/transforms", icon: Wand2 },
     ],
   },
   {

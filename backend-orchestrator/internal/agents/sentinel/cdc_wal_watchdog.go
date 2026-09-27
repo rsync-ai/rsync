@@ -25,18 +25,19 @@ import (
 // taking down not just CDC but the entire source database. Azure/RDS managed
 // Postgres are especially unforgiving here (fixed disk, hard to grow live).
 //
-// The Part A reconciler reaps slots for stopped/deleted pipelines on a fixed 5m
-// cadence regardless of WAL pressure. The watchdog is the WAL-pressure-driven
-// safety net layered on top: it measures retained WAL directly and (a) ALERTS in
-// two tiers so an operator sees the problem early, and (b) for a stopped/deleted
-// pipeline whose slot has crossed the CRITICAL threshold, it auto-drops the slot
-// immediately rather than waiting for the next reconciler tick.
+// The Part A reconciler reaps slots of DELETED pipelines on a fixed 5m cadence.
+// A STOPPED pipeline keeps its slot — it is the position Start resumes from — so
+// its WAL keeps growing while it is stopped. The watchdog is the WAL-pressure
+// safety net for exactly that: it measures retained WAL directly and (a) ALERTS
+// in two tiers so an operator sees the problem early, and (b) for a
+// stopped/deleted pipeline whose slot has crossed the CRITICAL threshold, it
+// auto-drops the slot (ReapSlotsUnderWALPressure). The pipeline then needs a
+// Reload; the source's disk stays safe.
 //
 // SAFETY: the watchdog NEVER drops a slot whose pipeline is 'running' or 'paused'
 // — dropping a live/anchored slot would lose the CDC position and break the
-// pipeline. For those it only alerts. Auto-drop is reserved for slots that are
-// already eligible for reaping (pipeline stopped or deleted), which is exactly
-// the policy chosen for this work: "Alert + auto-drop slot" for stopped pipelines.
+// pipeline. For those it only alerts. Auto-drop is reserved for slots of a
+// stopped or deleted pipeline: "Alert + auto-drop slot" for stopped pipelines.
 // ============================================================================
 
 func walDurationFromEnv(name string, def time.Duration) time.Duration {
@@ -200,11 +201,13 @@ func (s *CDCSentinel) checkWALRetention(ctx context.Context) {
 		}
 	}
 
-	// One drop pass for all reapable slots that crossed CRITICAL. ReapOrphanedSlots
-	// is idempotent and only ever touches stopped/deleted slots (never running/
-	// paused), so this can never drop a live slot. Reuses the Part A reaper.
+	// One drop pass for the reapable slots that crossed CRITICAL. The periodic
+	// reaper keeps a stopped pipeline's slot as its resume position; this is the
+	// only path that drops one, and only under WAL pressure. It is idempotent,
+	// limited to the named slots, and re-checks that each still belongs to a
+	// stopped/deleted pipeline (never running/paused), so it cannot drop a live slot.
 	if needReap && s.walAutoAct {
-		dropped, derr := cdc.NewPostgreSQLManager(s.db).ReapOrphanedSlots(ctx)
+		dropped, derr := cdc.NewPostgreSQLManager(s.db).ReapSlotsUnderWALPressure(ctx, criticalReaped)
 		if derr != nil {
 			log.WithError(derr).Warn("🛡️ WAL watchdog: auto-drop of critical stopped slots failed")
 		} else {

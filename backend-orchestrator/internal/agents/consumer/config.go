@@ -216,7 +216,7 @@ func FromEnv() *Config {
 //
 // Only the second name was read here, and no shipped compose file gives the
 // orchestrator that variable — it is handed KAFKA_BROKERS (docker-compose.yml:713).
-// This agent is on by default (ENABLE_CONSUMER_AGENT, config.go:239), so in every
+// This agent was on by default then (ENABLE_CONSUMER_AGENT, now opt-in), so in every
 // deployment including prod it resolved localhost:9092: a Kafka client pointed at
 // an address the container can never reach, whose lag readings and auto-restart
 // decisions therefore describe a phantom cluster, and whose address spawner.go

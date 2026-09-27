@@ -8,6 +8,7 @@ import { Prec } from "@codemirror/state"
 import { oneDark } from "@codemirror/theme-one-dark"
 import { useTheme } from "next-themes"
 import { buildSchemaLookup, type ForeignKeyLike } from "@/lib/explorer/sqlCompletions"
+import { cn } from "@/lib/utils"
 import {
   buildSqlCompletionSources,
   createSchemaCompletionSource,
@@ -61,6 +62,13 @@ export interface SqlEditorProps {
   minHeight?: number
   /** Max auto-grow height in px before the editor scrolls (default 400). */
   maxHeight?: number
+  /** Fill the parent instead of sizing to the content, so a resizable pane owns
+   *  the height. The wrapper becomes a `flex-1 min-h-0` flex item (the parent
+   *  MUST be a `flex flex-col` box with a definite height) and CodeMirror's
+   *  root takes 100% of it, which is what makes `.cm-editor { height: 100% }`
+   *  resolve. `height`/`minHeight`/`maxHeight` are ignored — they are px caps
+   *  and would fight the pane. */
+  fill?: boolean
   /** Optional className applied to the wrapper div. */
   className?: string
   /** Hides line numbers + the gutter for compact use. */
@@ -132,6 +140,7 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
     height,
     minHeight = 72,
     maxHeight = 400,
+    fill = false,
     className,
     minimal,
   } = props
@@ -284,15 +293,15 @@ export const SqlEditor = forwardRef<SqlEditorHandle, SqlEditorProps>(function Sq
   }, [sqlDialect, schemaCompletions, onSubmit, onCancel, onFocus, onBlur, onSelectionChange])
 
   return (
-    <div className={className}>
+    <div className={cn(fill && "min-h-0 flex-1 [&>div]:h-full", className)}>
       <CodeMirror
         ref={cmRef}
         value={value}
         onChange={onChange}
         placeholder={placeholder}
-        height={height != null ? `${height}px` : undefined}
-        minHeight={`${minHeight}px`}
-        maxHeight={`${maxHeight}px`}
+        height={fill ? "100%" : height != null ? `${height}px` : undefined}
+        minHeight={fill ? undefined : `${minHeight}px`}
+        maxHeight={fill ? undefined : `${maxHeight}px`}
         theme={isDark ? oneDark : "light"}
         editable={!readOnly}
         readOnly={readOnly}

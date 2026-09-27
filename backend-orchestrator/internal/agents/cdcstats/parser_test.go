@@ -38,7 +38,6 @@ func TestParseDebeziumChange_FallbacksToTopicSuffix(t *testing.T) {
 	}
 }
 
-
 // Debezium runs with JsonConverter schemas.enable=true, so the change event sits
 // under "payload". Before the unwrap every such message was dropped.
 func TestParseDebeziumChange_UnwrapsSchemaEnvelope(t *testing.T) {
@@ -75,5 +74,40 @@ func TestParseDebeziumChange_EnvelopeWithoutOpIsRejected(t *testing.T) {
 	}
 	if _, ok := ParseDebeziumChange(envelope, "cdc-shop.shop.orders"); ok {
 		t.Fatalf("expected a payload with no op to be rejected")
+	}
+}
+
+func TestParseDebeziumChange_ReadsSnapshotMarker(t *testing.T) {
+	for _, c := range []struct {
+		snap interface{}
+		want string
+	}{
+		{"last_in_data_collection", "last_in_data_collection"},
+		{"incremental", "incremental"},
+		{"false", "false"},
+		{true, "true"},
+		{false, ""},
+		{nil, ""},
+	} {
+		src := map[string]interface{}{"schema": "public", "table": "users"}
+		if c.snap != nil {
+			src["snapshot"] = c.snap
+		}
+		u, ok := ParseDebeziumChange(map[string]interface{}{"payload": map[string]interface{}{"op": "r", "source": src}}, "p.public.users")
+		if !ok || u.Snapshot != c.want {
+			t.Errorf("snapshot %v: got %q (ok=%v), want %q", c.snap, u.Snapshot, ok, c.want)
+		}
+	}
+}
+
+// MongoDB's source block names the collection "collection", not "table", so
+// the name comes from the topic: db.collection, the signal's data-collection.
+func TestParseDebeziumChange_MongoNamesMatchTheSignal(t *testing.T) {
+	payload := map[string]interface{}{"op": "r", "source": map[string]interface{}{
+		"connector": "mongodb", "db": "shop", "collection": "orders", "snapshot": "true",
+	}}
+	u, ok := ParseDebeziumChange(payload, "rsync_cdc_ab12cd34.shop.orders")
+	if !ok || u.QualifiedName != "shop.orders" || u.Snapshot != "true" {
+		t.Fatalf("got %+v ok=%v", u, ok)
 	}
 }

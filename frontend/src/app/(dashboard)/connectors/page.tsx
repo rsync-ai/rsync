@@ -84,9 +84,10 @@ export default function ConnectorsPage() {
       // Dormant described the DEPLOYMENT, not the connector: it is the only
       // auth_type "none" source in the catalog and the seed image has always
       // baked it, but no compose file started a container for it, so choosing it
-      // failed at connection test with a DNS miss. The quickstart now runs it
-      // (docker-compose.quickstart.yml, service `sample-data-mcp`), which makes
-      // it the one source a fresh install can connect to without first producing
+      // failed at connection test with a DNS miss. It is now deployed on demand
+      // by the first connection that needs it (docker-compose.quickstart.yml,
+      // service `sample-data-mcp`, pre-starts it only under the opt-in
+      // "connectors" profile), which makes it the one source a fresh install can connect to without first producing
       // a credential -- so hiding it from the browse catalog would now hide the
       // only thing a brand-new user can actually try.
       const visibleConnectors = (data.connectors || []).filter(

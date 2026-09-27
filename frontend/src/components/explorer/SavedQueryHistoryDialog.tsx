@@ -211,12 +211,25 @@ export function SavedQueryHistoryDialog({
       // undoable; and a restore to a SCHEDULED query goes through the same approval
       // gate as any other SQL change, because "put the old SQL back" alters what
       // runs unattended exactly as much as any other edit does.
+      //
+      // The diff on screen is against `current` as this panel read it, so that version
+      // goes with the restore: one that lands after a teammate's save would undo their
+      // edit behind a diff that never showed it.
       const result = await updateSavedQuery(savedQueryId, {
         sql_text: selectedVersion.sql_text,
         note: `Restore of version ${selectedVersion.version}.`,
+        ...(current?.updated_at ? { expected_updated_at: current.updated_at } : {}),
       })
       if (result.kind === "error") {
-        toast.error(result.message)
+        if (result.stale) {
+          toast.error("This query changed since this history was loaded, so nothing was restored.", {
+            description: "The history has been reloaded. Compare again before restoring.",
+          })
+          await load()
+          onChanged()
+        } else {
+          toast.error(result.message)
+        }
         return
       }
       if (result.kind === "proposed") {

@@ -51,7 +51,14 @@ vi.mock("@/components/chat/ChatMessageItem", () => ({
 vi.mock("@/components/chat/PipelineAccordionView", () => ({ PipelineAccordionView: () => <div /> }))
 vi.mock("@/components/chat/ChatRightPanel", () => ({ ChatRightPanel: () => null }))
 vi.mock("@/components/chat/ActivePipelinesList", () => ({ ActivePipelinesList: () => null }))
-vi.mock("@/components/chat/SuggestionsReviewDialog", () => ({ SuggestionsReviewDialog: () => null }))
+// Records what the chat hands the suggestions step (see the destination-type test).
+const suggestionsProps = vi.hoisted(() => ({ last: null as null | Record<string, unknown> }))
+vi.mock("@/components/chat/SuggestionsReviewDialog", () => ({
+  SuggestionsReviewDialog: (p: Record<string, unknown>) => {
+    suggestionsProps.last = p
+    return null
+  },
+}))
 vi.mock("@/components/pipeline/PipelineMonitoringPanel", () => ({ PipelineMonitoringPanel: () => null }))
 vi.mock("@/components/pipeline/PipelineConnectionSelector", () => ({
   PipelineConnectionSelector: () => null,
@@ -196,5 +203,39 @@ describe("chat: a server-level source leaves the destination name optional", () 
     const dialog = await openPickerFromChat()
     await waitFor(() => expect(within(dialog).getByLabelText(/Schema name/i)).toHaveValue("public"))
     expect(within(dialog).queryByText(/\(optional\)/i)).toBeNull()
+  })
+})
+
+// Prod 2026-09-26: the suggestions step told the service the destination was
+// "storage" and offered "Add index" tips for a GCS destination. The chat must
+// hand it the pipeline's real destination type.
+describe("chat: the suggestions step learns the destination type", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    suggestionsProps.last = null
+    try {
+      window.localStorage.clear()
+    } catch {
+      // storage unavailable: nothing persisted to clear
+    }
+    primeNamespaceModels(repoNamespaceModels())
+    ;(getPipeline as Mock).mockResolvedValue({
+      destination_config: { namespace: "billing_eu", namespace_kind: "path", create_if_not_exists: false },
+      destination_connection: { connector_type: "gcs" },
+    })
+  })
+
+  it("passes the pipeline's destination connector type to the suggestions dialog", async () => {
+    installBackend(pauseDetails)
+    const dialog = await openPickerFromChat()
+    const user = userEvent.setup({ pointerEventsCheck: 0 })
+    const invoices = within(dialog).getByText("public.invoices").closest("label") as HTMLElement
+    await user.click(within(invoices).getByRole("checkbox"))
+    const sync = within(dialog).getByRole("button", { name: /Sync 1 table/i })
+    await waitFor(() => expect(sync).toBeEnabled())
+    await user.click(sync)
+
+    await waitFor(() => expect(suggestionsProps.last?.["isOpen"]).toBe(true))
+    expect(suggestionsProps.last?.["destinationType"]).toBe("gcs")
   })
 })

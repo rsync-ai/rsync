@@ -97,9 +97,10 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 5
             timeoutSeconds: 5
+          # -d as in postgresql.yaml: without it every probe logs a FATAL.
           livenessProbe:
             exec:
-              command: ["pg_isready", "-U", {{ .Values.demo.username | quote }}]
+              command: ["pg_isready", "-U", {{ .Values.demo.username | quote }}, "-d", {{ .Values.demo.database | quote }}]
             initialDelaySeconds: 30
             periodSeconds: 15
             timeoutSeconds: 5

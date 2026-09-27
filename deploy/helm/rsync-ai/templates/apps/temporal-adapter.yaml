@@ -43,9 +43,9 @@ spec:
         Same local-filesystem dependency as the api-gateway: the connector-check
         activity resolves a connector by stat-ing the catalog on THIS pod's disk
         (backend-temporal-adapter/internal/workflows/connector_check_activity.go
-        :79-135 walks /app/shared/mcp-connectors{,/public,/internal} and /app/tools).
+        :92-183 walks /app/shared/mcp-connectors{,/public,/internal} and /app/tools).
         Without the catalog every connector reads as missing, and
-        nl_pipeline_v2_workflow.go:869-880 then transitions the run to
+        nl_pipeline_v2_workflow.go:887-893 then transitions the run to
         StateFailed with "Missing connector: <type>" -- the workflow-side twin of
         the gateway's 422. Invisible on compose, where this arrives as a bind mount.
         */}}
@@ -74,6 +74,17 @@ spec:
             # entry in api-gateway.yaml.
             - name: LLM_SERVICE_URL
               value: "http://{{ $fullname }}-llm-service:5000"
+            # connector_check_activity.go toolGeneratorBaseURL() falls back to
+            # the bare compose name "tool-generator" when this is empty. Its
+            # callers are the /health probe that decides whether a missing
+            # connector can be generated (canGenerateConnector) and the
+            # /v1/generate call itself (GenerateConnectorActivityV2). Without
+            # this the probe fails DNS, and every missing connector reads as
+            # "Missing connector: <type>" with the generator's reason never
+            # asked for. api-gateway.yaml and orchestrator.yaml set the same
+            # value under the same guard.
+            - name: TOOL_GENERATOR_URL
+              value: "http://{{ $fullname }}-tool-generator:5010"
             {{- end }}
             # This service reads POSTGRES_* (not the DB_* the orchestrator uses).
             # The names are not interchangeable — it refuses to start when it

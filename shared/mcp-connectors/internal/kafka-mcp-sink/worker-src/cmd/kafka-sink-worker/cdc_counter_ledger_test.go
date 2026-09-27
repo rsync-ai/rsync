@@ -60,12 +60,17 @@ func (okDestination) RoundTrip(r *http.Request) (*http.Response, error) {
 	}, nil
 }
 
+// cdcTestCounters are one sink process's per-table counters. Snapshot reads live on
+// its Metrics (cdcSnapshotRowsByTable), so the process's Metrics travels with them.
 type cdcTestCounters struct {
-	inserts, updates, deletes *sync.Map
+	inserts, updates, deletes, snapshotRows *sync.Map
+	metrics                                 *Metrics
 }
 
 func newCDCTestCounters() cdcTestCounters {
-	return cdcTestCounters{inserts: &sync.Map{}, updates: &sync.Map{}, deletes: &sync.Map{}}
+	m := &Metrics{}
+	return cdcTestCounters{inserts: &sync.Map{}, updates: &sync.Map{}, deletes: &sync.Map{},
+		snapshotRows: &m.cdcSnapshotRowsByTable, metrics: m}
 }
 
 // flushObjectBatch runs one successful cdcObjectBatcher.flushBatch — the object
@@ -84,7 +89,7 @@ func flushObjectBatch(t *testing.T, pgDB *sql.DB, c cdcTestCounters, sms []*Sink
 		pgDB:         pgDB,
 		httpClient:   &http.Client{Transport: okDestination{}},
 		eventsWriter: &kafka.Writer{}, // no address: the stats emit fails, the counters are still updated
-		metrics:      &Metrics{},
+		metrics:      c.metrics,
 		cdcInserts:   c.inserts,
 		cdcUpdates:   c.updates,
 		cdcDeletes:   c.deletes,
@@ -170,7 +175,7 @@ func flushDBBatch(t *testing.T, pgDB *sql.DB, c cdcTestCounters, sms []*SinkMess
 		httpClient:   &http.Client{Transport: dest},
 		ddl:          &DDLSupport{},
 		eventsWriter: &kafka.Writer{},
-		metrics:      &Metrics{},
+		metrics:      c.metrics,
 		cdcInserts:   c.inserts,
 		cdcUpdates:   c.updates,
 		cdcDeletes:   c.deletes,
@@ -214,7 +219,7 @@ func deliverDeletes(t *testing.T, pgDB *sql.DB, c cdcTestCounters, sms []*SinkMe
 		sm.PK = map[string]interface{}{"id": msgs[i].Offset}
 		sm.KeyFields = []string{"id"}
 		commit, err := processCDCEvent(context.Background(), newHighWaterTracker(), pgDB, client, cfg,
-			&DDLSupport{Enabled: false, resolved: true}, &kafka.Writer{}, nil, msgs[i], sm, &Metrics{},
+			&DDLSupport{Enabled: false, resolved: true}, &kafka.Writer{}, nil, msgs[i], sm, c.metrics,
 			c.inserts, c.updates, c.deletes, &sync.Map{}, time.Minute)
 		if err != nil || !commit {
 			t.Fatalf("delete at offset %d was not applied (commit=%v): %v", msgs[i].Offset, commit, err)
@@ -245,7 +250,7 @@ func storedAfterRestartAndReplay(t *testing.T, withLedger bool, op string, count
 	// Restart: fresh counters, seeded the way main() seeds them.
 	p2 := newCDCTestCounters()
 	if withLedger {
-		seedCDCCountersFromLedger(context.Background(), db, ackFKPipelineID, ackFKExecID, p2.inserts, p2.updates, p2.deletes)
+		seedCDCCountersFromLedger(context.Background(), db, ackFKPipelineID, ackFKExecID, p2.inserts, p2.updates, p2.deletes, p2.snapshotRows)
 	}
 	sms, msgs = ledgerTestMessages(2, 7, op)
 	deliver(t, db, p2, sms, msgs)
@@ -271,16 +276,24 @@ func assertRestartAndReplayCountsDistinctRows(t *testing.T, op string, counter f
 	}
 }
 
-func insertCounter(c cdcTestCounters) *sync.Map { return c.inserts }
-func updateCounter(c cdcTestCounters) *sync.Map { return c.updates }
-func deleteCounter(c cdcTestCounters) *sync.Map { return c.deletes }
+func insertCounter(c cdcTestCounters) *sync.Map   { return c.inserts }
+func updateCounter(c cdcTestCounters) *sync.Map   { return c.updates }
+func deleteCounter(c cdcTestCounters) *sync.Map   { return c.deletes }
+func snapshotCounter(c cdcTestCounters) *sync.Map { return c.snapshotRows }
 
 // Object storage destinations (GCS and the other object stores).
 func TestCDCCounters_SurviveRestartAndReplay(t *testing.T) {
-	assertRestartAndReplayCountsDistinctRows(t, "c", insertCounter,
-		func(t *testing.T, db *sql.DB, c cdcTestCounters, sms []*SinkMessage, msgs []kafka.Message) {
-			flushObjectBatch(t, db, c, sms, msgs)
+	for _, tc := range []struct {
+		op      string
+		counter func(cdcTestCounters) *sync.Map
+	}{{"c", insertCounter}, {"r", snapshotCounter}} {
+		t.Run(tc.op, func(t *testing.T) {
+			assertRestartAndReplayCountsDistinctRows(t, tc.op, tc.counter,
+				func(t *testing.T, db *sql.DB, c cdcTestCounters, sms []*SinkMessage, msgs []kafka.Message) {
+					flushObjectBatch(t, db, c, sms, msgs)
+				})
 		})
+	}
 }
 
 // Relational and document destinations: inserts and updates through the DB batcher.
@@ -288,7 +301,7 @@ func TestCDCCounters_DBBatcherSurvivesRestartAndReplay(t *testing.T) {
 	for _, tc := range []struct {
 		op      string
 		counter func(cdcTestCounters) *sync.Map
-	}{{"c", insertCounter}, {"r", insertCounter}, {"u", updateCounter}} {
+	}{{"c", insertCounter}, {"r", snapshotCounter}, {"u", updateCounter}} {
 		t.Run(tc.op, func(t *testing.T) {
 			assertRestartAndReplayCountsDistinctRows(t, tc.op, tc.counter,
 				func(t *testing.T, db *sql.DB, c cdcTestCounters, sms []*SinkMessage, msgs []kafka.Message) {
@@ -508,7 +521,7 @@ func TestSeedCDCCountersFromLedger_MapsOpsToCounters(t *testing.T) {
 	defer db.Close()
 	c := newCDCTestCounters()
 
-	seedCDCCountersFromLedger(context.Background(), db, " "+ackFKPipelineID+" ", ackFKExecID+"\n", c.inserts, c.updates, c.deletes)
+	seedCDCCountersFromLedger(context.Background(), db, " "+ackFKPipelineID+" ", ackFKExecID+"\n", c.inserts, c.updates, c.deletes, c.snapshotRows)
 
 	checks := []struct {
 		name  string
@@ -516,12 +529,14 @@ func TestSeedCDCCountersFromLedger_MapsOpsToCounters(t *testing.T) {
 		table string
 		want  int64
 	}{
-		{"orders inserts (c + r)", c.inserts, "public.orders", 10},
+		{"orders inserts (c only)", c.inserts, "public.orders", 7},
+		{"orders snapshot rows (r)", c.snapshotRows, "public.orders", 3},
 		{"orders updates", c.updates, "public.orders", 2},
 		{"orders deletes", c.deletes, "public.orders", 1},
 		{"users inserts", c.inserts, "public.users", 5},
 		{"users updates", c.updates, "public.users", 0},
 		{"users deletes", c.deletes, "public.users", 0},
+		{"users snapshot rows", c.snapshotRows, "public.users", 0},
 	}
 	for _, ch := range checks {
 		if got := loadCounter(ch.m, ch.table); got != ch.want {
@@ -556,7 +571,7 @@ func TestSeedCDCCountersFromLedger_SkipsWithoutUsableIDs(t *testing.T) {
 			db := newAckFKDB(t, conn)
 			defer db.Close()
 			c := newCDCTestCounters()
-			seedCDCCountersFromLedger(context.Background(), db, tc.pipelineID, tc.executionID, c.inserts, c.updates, c.deletes)
+			seedCDCCountersFromLedger(context.Background(), db, tc.pipelineID, tc.executionID, c.inserts, c.updates, c.deletes, c.snapshotRows)
 			if got := conn.recorded(); len(got) != 0 {
 				t.Fatalf("expected no query, got %v", got)
 			}
@@ -564,7 +579,7 @@ func TestSeedCDCCountersFromLedger_SkipsWithoutUsableIDs(t *testing.T) {
 	}
 	t.Run("nil db does not panic", func(t *testing.T) {
 		c := newCDCTestCounters()
-		seedCDCCountersFromLedger(context.Background(), nil, ackFKPipelineID, ackFKExecID, c.inserts, c.updates, c.deletes)
+		seedCDCCountersFromLedger(context.Background(), nil, ackFKPipelineID, ackFKExecID, c.inserts, c.updates, c.deletes, c.snapshotRows)
 	})
 }
 
@@ -584,7 +599,7 @@ func TestSeedCDCCountersFromLedger_ReadFailureSeedsNothing(t *testing.T) {
 			db := newAckFKDB(t, tc.conn)
 			defer db.Close()
 			c := newCDCTestCounters()
-			seedCDCCountersFromLedger(context.Background(), db, ackFKPipelineID, ackFKExecID, c.inserts, c.updates, c.deletes)
+			seedCDCCountersFromLedger(context.Background(), db, ackFKPipelineID, ackFKExecID, c.inserts, c.updates, c.deletes, c.snapshotRows)
 			if got := loadCounter(c.inserts, "public.orders"); got != 0 {
 				t.Errorf("orders inserts = %d, want 0", got)
 			}

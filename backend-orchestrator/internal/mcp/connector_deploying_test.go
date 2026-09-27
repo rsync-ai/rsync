@@ -5,6 +5,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -165,6 +166,74 @@ func TestStartServerStillUsesStdioWithoutOptInOrWithoutDeployer(t *testing.T) {
 	})
 }
 
+// failedToolGenerator answers /v1/deploy the way tool-generator does when the deploy
+// fails (deployment/routes.py): HTTP 200 with success=false and the reason.
+func failedToolGenerator(t *testing.T, reason string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":false,"started":false,"built":false,"building":false,"error_message":` + strconv.Quote(reason) + `}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A deploy that tool-generator reports as failed must not be waited on as if it were
+// starting. Before the fix the orchestrator read only the status code and `building`,
+// so a 200 {"success":false} sent every caller into the full DeployWaitTimeout poll,
+// after which a CDC caller got a generic "no container is reachable" and Test
+// Connection got "still being set up" — neither carrying the reason the deploy failed.
+// See KI-MCP-REDEPLOY-IGNORES-STACK-PREFIX-AND-FAILED-DEPLOY-READS-AS-SUCCESS.
+func TestStartServerFailsFastWithTheReasonWhenToolGeneratorReportsDeployFailed(t *testing.T) {
+	const id = "zzfakedeployconn"
+	const reason = "Deployer failed: compose-managed container rsync-ai-zzfakedeployconn-v1-0-0-mcp not found"
+	tools := writeFakeConnector(t, id, "Fake DB")
+	srv := failedToolGenerator(t, reason)
+	t.Setenv("TOOL_GENERATOR_URL", srv.URL)
+
+	// Long enough that a caller which polls cannot finish inside it by accident.
+	const wait = 4 * time.Second
+
+	for _, tc := range []struct {
+		name string
+		cfg  ServerConfig
+	}{
+		{"require HTTP (CDC)", ServerConfig{Name: id, Version: "latest", RequireHTTP: true, DeployWaitTimeout: wait}},
+		{"no stdio while deploying (Test Connection)", ServerConfig{Name: id, Version: "latest", NoStdioWhileDeploying: true, DeployWaitTimeout: wait}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			start := time.Now()
+			_, err := NewServerManager(tools).StartServer(tc.cfg)
+			elapsed := time.Since(start)
+			if err == nil {
+				t.Fatal("expected an error, got nil")
+			}
+			if !strings.Contains(err.Error(), reason) {
+				t.Errorf("error does not carry the deploy failure reason:\n got: %v\nwant substring: %s", err, reason)
+			}
+			if IsConnectorDeploying(err) {
+				t.Errorf("a failed deploy was reported as still deploying: %v", err)
+			}
+			if elapsed >= wait {
+				t.Errorf("StartServer took %s — it polled the full DeployWaitTimeout (%s) for a deploy that had already failed", elapsed.Round(time.Millisecond), wait)
+			}
+		})
+	}
+
+	// Control: a caller that can use stdio (batch) keeps the stdio fallback, and also
+	// stops waiting on the failed deploy.
+	t.Run("batch caller keeps the stdio fallback", func(t *testing.T) {
+		start := time.Now()
+		_, err := NewServerManager(tools).StartServer(ServerConfig{Name: id, Version: "latest", DeployWaitTimeout: wait})
+		if err == nil || !strings.Contains(err.Error(), "connector script not found") {
+			t.Fatalf("expected the stdio path (connector script not found), got %v", err)
+		}
+		if elapsed := time.Since(start); elapsed >= wait {
+			t.Errorf("StartServer took %s — it polled for a deploy that had already failed", elapsed.Round(time.Millisecond))
+		}
+	})
+}
+
 func TestTryDeployConnectorContainerTreatsTimeoutAsInProgress(t *testing.T) {
 	oldTimeout := deployCallTimeout
 	deployCallTimeout = 100 * time.Millisecond
@@ -174,8 +243,8 @@ func TestTryDeployConnectorContainerTreatsTimeoutAsInProgress(t *testing.T) {
 
 	srv := slowToolGenerator(t)
 	t.Setenv("TOOL_GENERATOR_URL", srv.URL)
-	if deployed, building := sm.tryDeployConnectorContainer("mongodb", "v1.0.0"); !deployed || building {
-		t.Errorf("timed-out deploy call: got (deployed=%v, building=%v), want (true, false)", deployed, building)
+	if deployed, building, err := sm.tryDeployConnectorContainer("mongodb", "v1.0.0"); !deployed || building || err != nil {
+		t.Errorf("timed-out deploy call: got (deployed=%v, building=%v, err=%v), want (true, false, nil)", deployed, building, err)
 	}
 
 	// Control: a refused connection is a real failure, not a deploy in progress.
@@ -183,7 +252,44 @@ func TestTryDeployConnectorContainerTreatsTimeoutAsInProgress(t *testing.T) {
 	url := closed.URL
 	closed.Close()
 	t.Setenv("TOOL_GENERATOR_URL", url)
-	if deployed, _ := sm.tryDeployConnectorContainer("mongodb", "v1.0.0"); deployed {
+	if deployed, _, _ := sm.tryDeployConnectorContainer("mongodb", "v1.0.0"); deployed {
 		t.Error("refused deploy call was treated as deployed")
+	}
+}
+
+// tryDeployConnectorContainer reads the /v1/deploy body: success=false is a failure with
+// its reason, and a body without "success" (an older tool-generator) is still accepted.
+func TestTryDeployConnectorContainerReadsTheDeployOutcome(t *testing.T) {
+	sm := NewServerManager(t.TempDir())
+	for _, tc := range []struct {
+		name         string
+		body         string
+		wantDeployed bool
+		wantBuilding bool
+		wantErr      string
+	}{
+		{"failed with a reason", `{"success":false,"building":false,"error_message":"Deployer failed: boom"}`, false, false, "Deployer failed: boom"},
+		{"failed without a reason", `{"success":false}`, false, false, "without a reason"},
+		{"started", `{"success":true,"started":true,"building":false}`, true, false, ""},
+		{"building", `{"success":true,"building":true}`, true, true, ""},
+		{"no success field (older tool-generator)", `{"building":true}`, true, true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			t.Cleanup(srv.Close)
+			t.Setenv("TOOL_GENERATOR_URL", srv.URL)
+			deployed, building, err := sm.tryDeployConnectorContainer("mongodb", "v1.0.0")
+			if deployed != tc.wantDeployed || building != tc.wantBuilding {
+				t.Errorf("got (deployed=%v, building=%v), want (%v, %v)", deployed, building, tc.wantDeployed, tc.wantBuilding)
+			}
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Errorf("unexpected error: %v", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Errorf("error = %v, want one containing %q", err, tc.wantErr)
+			}
+		})
 	}
 }

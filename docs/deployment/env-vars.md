@@ -254,6 +254,7 @@ Authorization is separate and is not covered by any of the above: see
 | `AZURE_OPENAI_DEPLOYMENT` | `gpt-4o-mini` | Deployment name, used when `LLM_MODEL` is unset |
 | `AZURE_OPENAI_API_VERSION` | `2024-10-21` | Azure OpenAI API version |
 | `LLM_MODEL` | — | Overrides the model for **every** provider. On Azure this is the *deployment* name. Unset ⇒ the provider's default: `gpt-4o-mini` on OpenAI (prompt-registry calls use the prompt's `gpt-4o`), `llama-3.3-70b-versatile` on Groq, `AZURE_OPENAI_DEPLOYMENT` on Azure, `OLLAMA_MODEL` on Ollama. Needed with `OPENAI_BASE_URL`, whose endpoint does not serve OpenAI's model names. |
+| `LLM_REASONING_TOKEN_HEADROOM` | `4096` | Tokens added to every prompt's `max_tokens`. A thinking model (e.g. Gemini 3.x) spends `max_tokens` reasoning before it answers, so without room its reply is cut off. `max_tokens` is a ceiling: a model that does not think pays nothing extra. Set `0` for a model whose output limit is smaller than the prompt cap plus this, such as `gpt-3.5-turbo` (4096) or a short-context vLLM model. A cut-off reply logs `was cut off at max_tokens`. |
 | `OLLAMA_BASE_URL` | `http://host.docker.internal:11434` | Ollama server URL (wins over `OLLAMA_URL`; `/v1` appended automatically) |
 | `OLLAMA_MODEL` | `qwen2.5:7b` | Default Ollama model for general agents |
 | `EXPLORER_OFFLINE_ONLY` | **`false`** | Forces **only** the Explorer to Ollama. Set `LLM_PROVIDER=ollama` to take the whole stack offline. |
@@ -323,6 +324,24 @@ called that, the last step is a 404.
 | `API_GATEWAY_PORT` | `5001` | API gateway listen port |
 | `LOG_LEVEL` | `info` | Log level: debug / info / warn / error |
 
+### Run-history retention (opt-in)
+
+The api-gateway can prune old rows from `pipeline_run_events`, `pipeline_run_metrics`
+and `pipeline_run_table_stats` once a day
+([pipeline_run_retention.go](../../api-gateway/internal/retention/pipeline_run_retention.go)).
+It is **off by default** and stays off: `pipeline_run_table_stats` is also where the
+usage page sums transfer totals, so with the sweep on, the "to-date" totals cover only the
+retention window, not the pipeline's lifetime
+([usage.go `pipelineStatsRetentionEnabled`](../../api-gateway/internal/handlers/usage.go)).
+Turn it on when disk matters more than lifetime totals.
+
+| Variable | Default | Description |
+|---|---|---|
+| `ENABLE_PIPELINE_RUN_RETENTION` | unset (off) | `true` starts the daily sweep |
+| `PIPELINE_RUN_RETENTION_DAYS` | `90` | Rows older than this are deleted |
+| `PIPELINE_RUN_RETENTION_BATCH_SIZE` | `10000` | Rows per DELETE batch |
+| `PIPELINE_RUN_RETENTION_INTERVAL_HOURS` | `24` | Time between sweeps |
+
 ### Container log rotation
 
 Every service in `docker-compose.yml` and `docker-compose.quickstart.yml` writes
@@ -330,7 +349,9 @@ to the `json-file` driver with an explicit cap. Worst-case disk per container is
 `max-size` x `max-file`, so the 27-service base stack is bounded at roughly
 `27 x 10m x 3` = **810 MB** at the defaults. A service with no cap inherits the
 daemon default, which has none — that is how one collector container was found
-holding 106 MB on its own.
+holding 106 MB on its own. The same two variables reach `connector-deployer`, which
+applies them to every connector container it starts on demand; compose's
+`logging:` blocks cannot, since compose does not create those containers.
 
 | Variable | Default | Description |
 |---|---|---|

@@ -189,7 +189,7 @@ describe("ModelLineageGraph", () => {
       expect(el.getAttribute("aria-label")).not.toMatch(/\b[ne]\d+\b|Edge from/)
     }
     // The zoom controls sit outside the hidden canvas, so they can be reached.
-    for (const name of ["Zoom in", "Zoom out", "Fit the whole chain"]) {
+    for (const name of ["Zoom in", "Zoom out", "Reset view", "Full screen"]) {
       expect(screen.getByRole("button", { name })).toBeInTheDocument()
     }
   })

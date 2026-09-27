@@ -32,10 +32,36 @@ var (
 func LoadFeatures() *FeatureFlags {
 	featuresOnce.Do(func() {
 		features = &FeatureFlags{
-			// Monitoring Overview - defaults to OFF for safety
-			MonitoringOverview: getBoolEnv("FEATURE_MONITORING_OVERVIEW", false),
+			// Monitoring Overview - the pipeline page's own health tiles.
+			//
+			// Defaults to the CLOUD behaviour (on), per the OSS/cloud rule in
+			// CLAUDE.md: a flag defaults to what cloud does and is set to the
+			// non-default only in the OSS compose. Both docker-compose.yml and
+			// docker-compose.prod.yml already set it "true", so OFF was never
+			// what any real deployment ran -- it was a rollout default that
+			// outlived its rollout.
+			//
+			// It gates GET /pipelines/:id/monitoring/overview, and the frontend
+			// twin hides the Overview sub-tab outright, which means it also hid
+			// the tiles that say "Capture stopped" when Debezium has died. A
+			// safety signal must not be off by default. The lag tile itself no
+			// longer depends on this endpoint (it reads /runtime), so flipping
+			// this only restores the tiles it was hiding.
+			MonitoringOverview: getBoolEnv("FEATURE_MONITORING_OVERVIEW", true),
 			
-			// Monitoring Infrastructure tab - defaults to OFF for safety
+			// Monitoring Infrastructure tab - the ADMIN view of the platform's own
+			// workers (sentinel_component_health: Kafka consumers, MCP connectors,
+			// infrastructure). Stays OFF by default, deliberately and unlike
+			// MonitoringOverview above: that table has no workspace column and its
+			// component ids name topics and containers across every workspace, so
+			// it is admin-only by construction and there is no reason for a
+			// self-host deployment to serve it unasked.
+			//
+			// Nothing on a PIPELINE page depends on it any more. It used to gate
+			// the lag alerts panel, which is why a default-off deployment never
+			// told a pipeline's owner their sink had stalled; those now come from
+			// GET /pipelines/:id/alerts, and the consumer view from
+			// GET /pipelines/:id/consumers, both unflagged and workspace-scoped.
 			MonitoringInfra: getBoolEnv("FEATURE_MONITORING_INFRA", false),
 			
 			// Monitoring Traces tab - defaults to OFF in production, ON in dev

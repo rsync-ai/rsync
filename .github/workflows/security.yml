@@ -565,9 +565,40 @@ jobs:
           # branch. Also pin the installed binary to the same version.
           TRIVY_VERSION=v0.72.0
           TRIVY_INSTALL_SHA256=e00df553be558995b994758bc8995956554a16937f456dc6615b0cc411bfec7a
-          curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" -o "$RUNNER_TEMP/trivy-install.sh"
+          # Two of the three steps below cross the network, and on 2026-09-24 the
+          # second one -- install.sh fetching the release tarball -- exited 1 on a
+          # docs-only commit after printing nothing past "found version". It turned
+          # a BLOCKING gate red for a reason no diff contained, and the same commit
+          # had passed eleven minutes earlier. A single transient fetch must not be
+          # able to do that, so both fetches retry and announce each retry.
+          #
+          # The checksum between them is deliberately NOT retried: a mismatch is a
+          # moved tag or a tampered installer, and retrying a supply-chain red flag
+          # only buries it. It is the one failure here that should be believed the
+          # first time.
+          for attempt in 1 2 3; do
+            if curl -sfL "https://raw.githubusercontent.com/aquasecurity/trivy/${TRIVY_VERSION}/contrib/install.sh" -o "$RUNNER_TEMP/trivy-install.sh"; then break; fi
+            echo "::warning::fetching the pinned Trivy installer failed (attempt ${attempt}/3)"
+            [ "$attempt" -eq 3 ] || sleep $(( attempt * 10 ))
+          done
+          # Assert the fetch rather than letting the checksum below infer it. A
+          # failed `curl -o` can leave a zero-length file behind, and leaning on a
+          # LATER command to notice an EARLIER one failed is how a step ends up
+          # reporting the wrong cause -- or, if the file is somehow present from
+          # anywhere else, no cause at all.
+          [ -s "$RUNNER_TEMP/trivy-install.sh" ] || { echo "::error::could not fetch the pinned Trivy installer after 3 attempts"; exit 1; }
           echo "${TRIVY_INSTALL_SHA256}  $RUNNER_TEMP/trivy-install.sh" | shasum -a 256 -c -
-          sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin" "${TRIVY_VERSION}"
+          for attempt in 1 2 3; do
+            rm -rf "$RUNNER_TEMP/bin"
+            if sh "$RUNNER_TEMP/trivy-install.sh" -b "$RUNNER_TEMP/bin" "${TRIVY_VERSION}"; then break; fi
+            echo "::warning::installing Trivy ${TRIVY_VERSION} failed (attempt ${attempt}/3)"
+            [ "$attempt" -eq 3 ] || sleep $(( attempt * 10 ))
+          done
+          # Neither loop can fail this step on its own -- each ends in a `sleep` or a
+          # `[`, both of which succeed -- so assert the artifact they were supposed
+          # to produce, and RUN it: a truncated download unpacks into a file that
+          # exists, is executable, and dies on the first scan instead of here.
+          "$RUNNER_TEMP/bin/trivy" --version
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
       - name: Pull Trivy's databases anonymously
         # Trivy fetches both of its databases as OCI artifacts

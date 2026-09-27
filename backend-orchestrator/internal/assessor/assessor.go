@@ -215,7 +215,7 @@ func (in Input) RequiresTablePrimaryKeys() bool {
 //
 // It mirrors, deliberately and literally, the gate in
 // agents/executor/executor.go executeStreamingDataTransfer: CDC plus a
-// destination normalising to "postgresql" or "mysql" runs
+// destination normalising to "postgresql", "mysql" or "mongodb" runs
 // ValidateTablesHavePrimaryKeys and fails the run with "CDC requires PRIMARY
 // KEY for DB destinations; missing PK on: …" for every keyless table. No
 // override reaches that validator — not the sink's content-hash surrogate key,
@@ -227,13 +227,16 @@ func (in Input) RequiresTablePrimaryKeys() bool {
 // Keep the destination list in step with executor.go's normalizeDBType + the
 // hard-block condition: postgres→postgresql and mariadb→mysql are aliases, and
 // oracle/sqlserver destinations are deliberately NOT here — the executor lets
-// those through, so a keyless table there really is only a warning.
+// those through, so a keyless table there really is only a warning. MongoDB IS
+// here: its CDC sink upserts on the key too, so a keyless source table either
+// gets a guessed key (rows sharing it replace each other) or is inserted blind
+// (every re-snapshot duplicates it) — the product rule blocks both.
 func (in Input) CDCBlocksWithoutPrimaryKey() bool {
 	if !in.IsCDC() {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(in.DestinationType)) {
-	case "postgresql", "postgres", "mysql", "mariadb":
+	case "postgresql", "postgres", "mysql", "mariadb", "mongodb":
 		return true
 	default:
 		return false

@@ -19,18 +19,31 @@
 # Why a repo script and not a crontab on the VM:
 #   A crontab lives on one machine and dies with it. This has to survive the
 #   infrastructure being rebuilt, so it lives in the repo and the runbook points
-#   at it. Wire it to whatever scheduler the new environment has; nothing here
-#   assumes one.
+#   at it. The runbook carries the crontab line that schedules it on the current VM;
+#   a rebuilt environment re-adds that line or wires its own scheduler.
 #
 # Usage (run on the prod VM, from anywhere):
 #   scripts/reindex-batch-acks.sh              # measure and report — changes nothing
 #   scripts/reindex-batch-acks.sh --apply      # reindex, but only if over threshold
 #   scripts/reindex-batch-acks.sh --apply --force   # reindex regardless of size
 #
+# How it reaches the database -- two modes, picked in this order:
+#   1. PG_CONTAINER (default `postgres`, the compose service's container_name) is
+#      running: `docker exec` psql inside it, as the role and database the container
+#      was created with (its own POSTGRES_USER / POSTGRES_DB, which differ between the
+#      dev compose and prod). No credential is read or passed, because the image
+#      trusts its own local socket. This is the
+#      mode on a host that runs the bundled postgres, which is every compose install.
+#   2. Otherwise ENV_FILE holds DATABASE_URL for an external database, reached from a
+#      throwaway PG_IMAGE container on the host network.
+#
 # Environment:
-#   ENV_FILE        path to the env file holding DATABASE_URL (default /root/rsync-ai/.env.prod)
+#   PG_CONTAINER    local postgres container to exec into (default postgres)
+#   PG_USER, PG_DB  override the container's POSTGRES_USER / POSTGRES_DB
+#   ENV_FILE        path to the env file holding DATABASE_URL (default ./.env.prod)
+#   PG_IMAGE        postgres image to run psql from in mode 2 (default postgres:16-alpine)
+#   DOCKER          docker command (default `docker`; set `sudo docker` where needed)
 #   THRESHOLD_MB    reindex at or above this total index size (default 16)
-#   PG_IMAGE        postgres image to run psql from (default postgres:16-alpine)
 #
 # Exit codes: 0 = healthy, or reindexed and verified · 1 = over threshold and not
 # applied (report mode) · 2 = setup error, pre-flight refusal, or the database could
@@ -40,16 +53,21 @@
 # not running exits 125 on its own, and 1 already means "over threshold" — every
 # database call therefore goes through run_query, which maps any such failure to 2.
 #
-# The credential never reaches a command line. DATABASE_URL is passed into the
+# The credential never reaches a command line. Mode 1 uses none. In mode 2,
+# DATABASE_URL is passed into the
 # container through --env-file and dereferenced INSIDE the container by a
 # single-quoted shell string, so it never appears in this host's process table,
 # shell history, or any log line this script writes.
 
 set -euo pipefail
 
-ENV_FILE="${ENV_FILE:-/root/rsync-ai/.env.prod}"
+ENV_FILE="${ENV_FILE:-.env.prod}"
 THRESHOLD_MB="${THRESHOLD_MB:-16}"
 PG_IMAGE="${PG_IMAGE:-postgres:16-alpine}"
+PG_CONTAINER="${PG_CONTAINER:-postgres}"
+PG_USER="${PG_USER:-}"
+PG_DB="${PG_DB:-}"
+read -r -a DOCKER_CMD <<<"${DOCKER:-docker}"
 
 APPLY=0
 FORCE=0
@@ -69,8 +87,16 @@ for arg in "$@"; do
   esac
 done
 
-if [[ ! -f "$ENV_FILE" ]]; then
-  echo "ERROR: $ENV_FILE not found — run this on the prod VM, or set ENV_FILE=..." >&2
+# Picked by NAME and IMAGE together: an MCP connector container can carry "postgres"
+# in its name and has no psql in it.
+MODE=""
+if [[ "$("${DOCKER_CMD[@]}" inspect -f '{{.State.Running}} {{.Config.Image}}' "$PG_CONTAINER" 2>/dev/null)" == "true postgres:"* ]]; then
+  MODE=exec
+elif [[ -f "$ENV_FILE" ]]; then
+  MODE=envfile
+else
+  echo "ERROR: no running '$PG_CONTAINER' postgres container and no $ENV_FILE —" >&2
+  echo "       set PG_CONTAINER=... or ENV_FILE=..." >&2
   exit 2
 fi
 
@@ -83,8 +109,15 @@ fi
 # those on whitespace silently shifts every later field by one.
 psql_q() {
   local sql="$1"
-  sudo docker run --rm --network host --env-file "$ENV_FILE" "$PG_IMAGE" \
-    sh -c 'psql "$DATABASE_URL" -qtAX -F"~" -c "$1"' sh "$sql"
+  if [[ "$MODE" == exec ]]; then
+    # No -i: stdin stays with the caller, so a script piped into bash is not eaten.
+    # The SQL and any overrides travel as env, expanded inside the container.
+    "${DOCKER_CMD[@]}" exec -e SQL="$sql" -e PG_USER="$PG_USER" -e PG_DB="$PG_DB" "$PG_CONTAINER" \
+      sh -c 'psql -U "${PG_USER:-$POSTGRES_USER}" -d "${PG_DB:-$POSTGRES_DB}" -qtAX -F"~" -c "$SQL"'
+  else
+    "${DOCKER_CMD[@]}" run --rm --network host --env-file "$ENV_FILE" "$PG_IMAGE" \
+      sh -c 'psql "$DATABASE_URL" -qtAX -F"~" -c "$1"' sh "$sql"
+  fi
 }
 
 # run_query <varname> <sql> — run a query and assign the result, or exit 2.
@@ -111,14 +144,14 @@ run_query() {
   local __var="$1" __out
   if ! __out="$(psql_q "$2")"; then
     echo "ERROR: database query failed — could not reach the database, or it refused" >&2
-    echo "       the query. Check the docker daemon, ENV_FILE ($ENV_FILE) and the" >&2
-    echo "       DATABASE_URL inside it." >&2
+    echo "       the query (mode: $MODE). Check the docker daemon, then PG_CONTAINER" >&2
+    echo "       ($PG_CONTAINER) or ENV_FILE ($ENV_FILE) and the DATABASE_URL inside it." >&2
     exit 2
   fi
   printf -v "$__var" '%s' "$__out"
 }
 
-echo "=== pipeline_batch_acks index bloat check ==="
+echo "=== pipeline_batch_acks index bloat check (mode: $MODE) ==="
 echo
 
 # -------------------------------------------------------------------------

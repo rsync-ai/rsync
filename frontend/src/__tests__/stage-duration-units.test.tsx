@@ -32,7 +32,8 @@ vi.mock("next/navigation", () => ({
 }))
 
 import { stageDurationMs } from "@/components/pipeline/dagHelpers"
-import { formatDuration, type ExecutionPlanStage } from "@/components/pipeline/DAGVisualization"
+import { formatDuration } from "@/components/pipeline/dagHelpers"
+import type { ExecutionPlanStage } from "@/components/pipeline/dagTypes"
 import { StageDetailPanel } from "@/components/pipeline/StageDetailPanel"
 
 function stage(over: Partial<ExecutionPlanStage>): ExecutionPlanStage {

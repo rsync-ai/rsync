@@ -13,6 +13,14 @@ const (
 	NormalizeModePreview   NormalizeMode = "preview"
 	NormalizeModeExecution NormalizeMode = "execution"
 	NormalizeModeCDC       NormalizeMode = "cdc"
+
+	// NormalizeModeSaveCheck validates a transform's SHAPE at save time, with no
+	// data flowing and no table in hand. It is as strict as execution about
+	// anything intrinsic to the rule (unknown type, bad config,
+	// requires_full_dataset) and says nothing about scope: a table-scoped rule
+	// being saved is correct, not a mismatch, so the scope check is skipped
+	// rather than failed.
+	NormalizeModeSaveCheck NormalizeMode = "save_check"
 )
 
 // CanonicalTransform is the normalized, validated transform shape used across
@@ -71,9 +79,27 @@ func NormalizeAndValidate(raw []map[string]any, currentTable string, mode Normal
 			continue
 		}
 
-		if strings.TrimSpace(ct.Scope.Table) != "" && strings.TrimSpace(currentTable) != "" {
-			if !tableMatches(currentTable, ct.Scope.Table) {
-				continue
+		// A table-scoped rule needs to know which table it is looking at. When the
+		// caller could not name one, the old code dropped the scope check and ran
+		// the rule on everything - so a mask_pii scoped to `customers` also rewrote
+		// `orders`, and a filter scoped to one table silently emptied another.
+		// Preview is advisory and routinely runs on pasted sample_data with no
+		// table, so there it warns and still applies; execution and CDC write to a
+		// destination, so there it is an error.
+		if scopeTable := strings.TrimSpace(ct.Scope.Table); scopeTable != "" && mode != NormalizeModeSaveCheck {
+			switch {
+			case strings.TrimSpace(currentTable) != "":
+				if !tableMatches(currentTable, ct.Scope.Table) {
+					continue
+				}
+			case mode == NormalizeModePreview:
+				warnings = append(warnings, fmt.Sprintf(
+					"transform[%d] (%s): scoped to table %q but no current table was supplied, so the scope could not be checked - this preview applies the rule unconditionally",
+					idx, ct.Type, scopeTable))
+			default:
+				return nil, warnings, fmt.Errorf(
+					"transform[%d] (%s): scoped to table %q but the current table is unknown; refusing to run a table-scoped transform against an unidentified table",
+					idx, ct.Type, scopeTable)
 			}
 		}
 
@@ -82,7 +108,7 @@ func NormalizeAndValidate(raw []map[string]any, currentTable string, mode Normal
 			case NormalizeModePreview:
 				warnings = append(warnings, fmt.Sprintf("transform[%d] (%s): requires_full_dataset is not supported in MVP (skipped)", idx, ct.Type))
 				continue
-			case NormalizeModeExecution, NormalizeModeCDC:
+			default: // execution, cdc, save_check
 				return nil, warnings, fmt.Errorf("transform type %q is marked requires_full_dataset and is blocked in MVP", ct.Type)
 			}
 		}
@@ -205,29 +231,8 @@ func normalizeOne(item map[string]any, idx int) (CanonicalTransform, []string, e
 	}
 	delete(config, "requires_full_dataset")
 
-	// Normalize common config aliases.
-	switch engineType {
-	case "mask_pii":
-		if _, ok := config["column"]; !ok {
-			if v, ok := config["field"]; ok {
-				config["column"] = v
-			}
-		}
-	case "select_columns":
-		if _, ok := config["columns"]; !ok {
-			if v, ok := config["columns_to_keep"]; ok {
-				config["columns"] = v
-			} else if v, ok := config["keep_columns"]; ok {
-				config["columns"] = v
-			}
-		}
-	case "filter":
-		if _, ok := config["condition"]; !ok {
-			if v, ok := config["where"]; ok {
-				config["condition"] = v
-			}
-		}
-	}
+	// Normalize common config aliases, and the Transform Builder's own key names.
+	normalizeConfigAliases(strings.ToLower(strings.TrimSpace(rawType)), engineType, config)
 
 	// Stored transform_config includes operation; strip it after mapping.
 	// delete is a no-op when the key is absent, so no existence guard is needed.
@@ -246,6 +251,138 @@ func normalizeOne(item map[string]any, idx int) (CanonicalTransform, []string, e
 	}, warnings, nil
 }
 
+// normalizeConfigAliases rewrites config in place, from the key names a caller
+// wrote to the ones the engine reads. rawType is the verb as it was stored
+// (transform_config.operation); engineType is its normalizeType result.
+//
+// Most of this exists because the Transform Builder names several config keys
+// differently from the engine, and until now only the PREVIEW path translated
+// them (frontend transformOps.ts toEngineTransform). Save wrote the builder's
+// raw shape straight into transform_definitions, so every reader that starts
+// from the STORED row — this validator, the batch executor
+// (executor.go:9000) and the CDC sink (kafka-sink-worker main.go:744) — was
+// handed a shape no engine accepts. Translating here, on the stored shape, is
+// what makes all four paths agree; the preview mapping is now a second opinion
+// rather than the only one.
+func normalizeConfigAliases(rawType, engineType string, config map[string]any) {
+	switch engineType {
+	case "mask_pii":
+		if _, ok := config["column"]; !ok {
+			if v, ok := config["field"]; ok {
+				config["column"] = v
+			}
+		}
+		// The builder's "Hash Column" card is mask_pii with mask_type=hash, and
+		// carries no mask_type of its own. Supplying it is not cosmetic: with
+		// mask_type absent, applyMask's default branch REDACTS to "***", so a
+		// bare hash->mask_pii alias would quietly store a digest-shaped promise
+		// and write a constant instead.
+		if rawType == "hash" {
+			if s, ok := config["mask_type"].(string); !ok || strings.TrimSpace(s) == "" {
+				config["mask_type"] = "hash"
+			}
+		}
+	case "select_columns":
+		if _, ok := config["columns"]; !ok {
+			if v, ok := config["columns_to_keep"]; ok {
+				config["columns"] = v
+			} else if v, ok := config["keep_columns"]; ok {
+				config["columns"] = v
+			}
+		}
+		// The builder captures columns as "id, name, email". validateConfig has
+		// always accepted that string (asStringSlice splits it), but
+		// SimpleTransformEngine.applySelect rejects anything that is not a
+		// slice — so a select saved cleanly and then failed mid-run with
+		// "invalid columns config type".
+		if s, ok := config["columns"].(string); ok {
+			config["columns"] = splitCommaList(s)
+		}
+	case "exclude_columns":
+		// applyExcludeColumns splits a string itself; normalizing here means the
+		// two column operations reach the engine in the same shape.
+		if s, ok := config["columns"].(string); ok {
+			config["columns"] = splitCommaList(s)
+		}
+	case "filter":
+		if _, ok := config["condition"]; !ok {
+			if v, ok := config["where"]; ok {
+				config["condition"] = v
+			}
+		}
+	case "rename_columns":
+		// Builder shape: "old:new, old2:new2". Both validateConfig
+		// (asStringStringMap) and applyRenameColumns read a map and ignore a
+		// string, so the string form was rejected on save.
+		if s, ok := config["mappings"].(string); ok {
+			config["mappings"] = parseMappingList(s)
+		}
+	case "type_convert":
+		// Builder key: to_type. Engine key: to.
+		if _, ok := config["to"]; !ok {
+			if v, ok := config["to_type"]; ok {
+				config["to"] = v
+			}
+		}
+		delete(config, "to_type")
+	case "null_handle":
+		// Builder key: action ("default" | "skip"). Engine key: strategy
+		// ("default"/"fill"/"fill_default" | "drop_row"). Untranslated, strategy
+		// fell back to "default" and the rule FILLED the rows the operator asked
+		// it to drop — the one member of this family that saved cleanly and then
+		// did the opposite of what the card said.
+		if s, ok := config["strategy"].(string); !ok || strings.TrimSpace(s) == "" {
+			if a, ok := config["action"].(string); ok && strings.TrimSpace(a) != "" {
+				switch strings.ToLower(strings.TrimSpace(a)) {
+				case "default", "fill", "fill_default":
+					config["strategy"] = "default"
+				default:
+					config["strategy"] = "drop_row"
+				}
+			}
+		}
+		delete(config, "action")
+	}
+}
+
+// splitCommaList turns "id, name, email" into ["id","name","email"], dropping
+// blanks. An all-blank input returns an empty slice, which validateConfig then
+// rejects — better than silently reaching the engine as a no-op.
+func splitCommaList(s string) []string {
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if v := strings.TrimSpace(p); v != "" {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// parseMappingList turns "email:user_email, name:full_name" into a map. A pair
+// missing either side is skipped rather than guessed at; if nothing parses, the
+// empty map fails validateConfig instead of renaming nothing at run time.
+func parseMappingList(s string) map[string]string {
+	out := map[string]string{}
+	for _, pair := range strings.Split(s, ",") {
+		p := strings.TrimSpace(pair)
+		if p == "" {
+			continue
+		}
+		from, to, found := strings.Cut(p, ":")
+		if !found {
+			continue
+		}
+		from = strings.TrimSpace(from)
+		to = strings.TrimSpace(to)
+		if from == "" || to == "" {
+			continue
+		}
+		out[from] = to
+	}
+	return out
+}
+
 func normalizeType(t string) string {
 	tt := strings.ToLower(strings.TrimSpace(t))
 	switch tt {
@@ -256,6 +393,11 @@ func normalizeType(t string) string {
 		return tt
 	// Common aliases
 	case "mask":
+		return "mask_pii"
+	// The builder's "Hash Column" card. Hashing IS mask_pii with mask_type=hash
+	// — there has never been a `hash` engine case — and normalizeConfigAliases
+	// supplies the mask_type the card does not carry.
+	case "hash":
 		return "mask_pii"
 	case "select":
 		return "select_columns"

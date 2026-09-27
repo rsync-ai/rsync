@@ -17,7 +17,7 @@ curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM
 ```
 
 The full stack includes the change-data-capture services, so streaming pipelines work
-on a fresh install with nothing extra to run. Those three containers reserve 2816 MB
+on a fresh install with nothing extra to run. Those three containers reserve 3328 MB
 between them, which is why the installer asks for 8 GB. To leave them out on a machine
 that will only ever run batch syncs, put an empty `RSYNC_PROFILES` on the `bash` side
 of the pipe — before `curl` it would set the variable for `curl`, which never reads it:

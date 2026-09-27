@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -18,6 +17,7 @@ import (
 
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/executor"
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/healer"
+	"github.com/rsync-ai/backend-orchestrator/internal/config"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	appmetrics "github.com/rsync-ai/backend-orchestrator/internal/metrics"
 	"github.com/rsync-ai/shared/correlation"
@@ -785,14 +785,12 @@ func (w *ExecutorWorker) Start() error {
 	log.Info("🚀 Starting Executor Worker (with REAL MCP integration)")
 
 	// Phase 3: dispatch path is selected PER-WORKFLOW via NLPipelineWorkflowV2Input.
-	// ExecutorDispatch (resolved at workflow-start, never here), so the Redis poller and
-	// the Kafka consumer ALWAYS run. A "temporal"-dispatched workflow invokes the native
+	// ExecutorDispatch (resolved at workflow-start, never here), so the Redis poller
+	// ALWAYS runs. A "temporal"-dispatched workflow invokes the native
 	// ExecutorNativeActivity (executor-tasks queue) and never writes its executor task to
-	// Redis or Kafka — so the legacy paths simply idle for those runs; no double-execution
-	// (guaranteed by the deterministic per-workflow branch + the CorrelationID guard in
-	// handleTask + Phase 2 not publishing V2 commands). Keeping both consumers up also
-	// preserves the V1 (empty-CorrelationID) Kafka fallback and removes the rolling-deploy
-	// strand window that a global EXECUTOR_DISPATCH gate here would create.
+	// Redis — so the poller simply idles for those runs; no double-execution. The
+	// executor stage has no Kafka command topic: the Redis correlation store is its
+	// only request channel.
 
 	// Start Redis poller for V2 workflows (correlation pattern)
 	if w.correlationClient != nil {
@@ -805,77 +803,16 @@ func (w *ExecutorWorker) Start() error {
 	// Self-healing schema drift (P0): activate the dormant healer's schema-change
 	// + approved-change consumers. RSYNC_SCHEMA_DRIFT_ENABLED gates the whole path;
 	// off (default) → never called → zero behavior change. StartSchemaOnly subscribes
-	// ONLY the two schema topics — NOT the executor/planner DLQs the full Start()
-	// registers — so it never double-reacts to execution failures already handled by
-	// executeWithHealer. Non-fatal: a consumer-start failure must not stop the worker.
+	// ONLY the two schema topics — no executor/planner DLQ — so it never
+	// double-reacts to execution failures already handled by executeWithHealer. Non-fatal: a consumer-start failure must not stop the worker.
 	// Teardown is symmetric via Stop() → w.healerAgent.Stop().
-	if os.Getenv("RSYNC_SCHEMA_DRIFT_ENABLED") == "true" && w.healerAgent != nil {
+	if config.SchemaDriftEnabled() && w.healerAgent != nil {
 		if err := w.healerAgent.StartSchemaOnly(); err != nil {
 			log.WithError(err).Warn("⚠️  ExecutorWorker: healer schema-drift consumer failed to start (non-fatal)")
 		} else {
 			log.Info("✅ ExecutorWorker: schema-drift consumers started (RSYNC_SCHEMA_DRIFT_ENABLED=true)")
 		}
 	}
-
-	// Consume from dedicated topic (no consumer group = no rebalancing)
-	return w.kafkaManager.ConsumeWithContext("agent.control.commands.executor", w.handleTask)
-}
-
-func (w *ExecutorWorker) handleTask(ctx context.Context, msg *sarama.ConsumerMessage) error {
-	log.WithFields(log.Fields{
-		"topic":     msg.Topic,
-		"partition": msg.Partition,
-		"offset":    msg.Offset,
-	}).Info("🔍 Executor Worker: Received message")
-
-	var task Task
-	if err := json.Unmarshal(msg.Value, &task); err != nil {
-		log.WithError(err).Error("❌ Failed to unmarshal task")
-		return err
-	}
-
-	// V2 tasks (carrying a CorrelationID) are dispatched via the Redis correlation
-	// poller (startRedisPoller → processCorrelationRequest). The Kafka command path is
-	// V1-only. Without this guard the same task executes twice — once here, once from
-	// the Redis poller — which is the root of the hybrid-CDC double-dispatch (KI-HYBRID-1).
-	if task.CorrelationID != "" {
-		log.WithField("correlation_id", task.CorrelationID).
-			Debug("⏭️  Skipping Kafka path for V2 task (handled by Redis correlation poller)")
-		return nil
-	}
-
-	log.WithFields(log.Fields{
-		"task_id":     task.TaskID,
-		"task_type":   task.TaskType,
-		"pipeline_id": task.PipelineID,
-	}).Info("✅ Task unmarshaled successfully")
-
-	// Filter: only process execution tasks
-	if task.TaskType != "execute_pipeline" && task.TaskType != "execute_plan" {
-		log.WithFields(log.Fields{
-			"received_type": task.TaskType,
-			"expected_type": "execute_pipeline or execute_plan",
-		}).Warn("⏭️  Task type mismatch, skipping")
-		return nil
-	}
-
-	// Execute the task
-	result := w.Execute(ctx, task)
-
-	// Route result to correlation store (V2) or Kafka (V1)
-	if err := RouteResult(ctx, task, result, w.kafkaManager); err != nil {
-		log.WithError(err).WithFields(log.Fields{
-			"task_id":        task.TaskID,
-			"correlation_id": task.CorrelationID,
-		}).Error("Failed to route result")
-		return err
-	}
-
-	log.WithFields(log.Fields{
-		"task_id":     task.TaskID,
-		"pipeline_id": task.PipelineID,
-		"status":      result.Status,
-	}).Info("📤 Sent result to orchestrator")
 
 	return nil
 }

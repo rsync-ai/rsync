@@ -501,8 +501,12 @@ func summarise(tables []AssessmentTable) string {
 			}
 		}
 	}
+	across := ""
+	if n := countSourceTables(tables); n > 0 {
+		across = fmt.Sprintf(" across %d %s", n, pluralise("table", n))
+	}
 	if errors == 0 && warnings == 0 && infos == 0 {
-		return fmt.Sprintf("All checks passed across %d tables", len(tables))
+		return "All checks passed" + across
 	}
 	parts := []string{}
 	if errors > 0 {
@@ -514,7 +518,21 @@ func summarise(tables []AssessmentTable) string {
 	if infos > 0 {
 		parts = append(parts, fmt.Sprintf("%d %s", infos, pluralise("note", infos)))
 	}
-	return fmt.Sprintf("%s across %d %s", strings.Join(parts, ", "), len(tables), pluralise("table", len(tables)))
+	return strings.Join(parts, ", ") + across
+}
+
+// countSourceTables counts the report's real tables. The report also carries
+// check rows named in parentheses — "(source readiness)", "(destination
+// namespace)", "(source)", "(catalog)" — which a 6-table pipeline showed as
+// "across 8 tables" (U-19).
+func countSourceTables(tables []AssessmentTable) int {
+	n := 0
+	for _, t := range tables {
+		if !(strings.HasPrefix(t.Name, "(") && strings.HasSuffix(t.Name, ")")) {
+			n++
+		}
+	}
+	return n
 }
 
 func pluralise(word string, n int) string {
@@ -575,6 +593,11 @@ func fetchSourceReadiness(ctx context.Context, pipelineID string) (*orchestrator
 		return nil, fmt.Errorf("build assess request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	// The orchestrator's assessment routes are gated by requirePrincipal. This
+	// proxy was the one orchestrator call site that omitted the header, which
+	// worked only because those routes were anonymous — so this line and the
+	// gate must land together. Pinned by TestFetchSourceReadinessSendsInternalSecret.
+	setInternalServiceSecret(req)
 
 	client := &http.Client{Timeout: 60 * time.Second}
 	resp, err := client.Do(req)

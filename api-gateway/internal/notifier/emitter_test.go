@@ -97,12 +97,16 @@ func TestEmitterPublishPersistsAnAssessmentIssue(t *testing.T) {
 	mock.ExpectQuery(`SELECT id::text FROM pipeline_notifications\s+WHERE dedup_key = \$1`).
 		WithArgs(dedupKey).
 		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	// The fan-out is transactional (see handleMessage): a half-written set of
+	// recipient rows would be hidden by the dedup check on redelivery.
+	mock.ExpectBegin()
 	mock.ExpectExec(`INSERT INTO pipeline_notifications`).
 		WithArgs(sqlmock.AnyArg(), emitterPipeline, emitterOwner, "pre_migration_assessment", "critical",
 			"The assessment found a new issue in PostgreSQL",
 			"The pre-migration assessment found 1 new issue: Table primary key (high): public.orders.",
 			actionURL, jsonCapture{&meta}, dedupKey).
 		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
 	mock.ExpectQuery(`FROM notification_channel_settings`).WillReturnRows(sqlmock.NewRows(channelColumns))
 	mock.ExpectExec(`UPDATE pipeline_notifications`).
 		WithArgs(StatusSuppressed, sqlmock.AnyArg(), sqlmock.AnyArg()).

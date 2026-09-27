@@ -30,8 +30,3 @@ export function isInternalExplorerTable(name?: string | null): boolean {
   const bare = (dot >= 0 ? name.slice(dot + 1) : name).toLowerCase()
   return INTERNAL_TABLE_PREFIXES.some((p) => bare.startsWith(p))
 }
-
-/** Drop rsync-internal tables, preserving the order of the rest. */
-export function excludeInternalTables<T extends { name: string }>(tables: T[]): T[] {
-  return tables.filter((t) => !isInternalExplorerTable(t.name))
-}

@@ -228,8 +228,13 @@ spec:
               value: "org.apache.kafka.common.config.provider.FileConfigProvider"
             - name: CONNECT_CONFIG_PROVIDERS_FILE_PARAM_ALLOWED_PATHS
               value: "/connect-secrets"
+            {{- /*
+              -XX:+ExitOnOutOfMemoryError is appended here, not in values.yaml, so a
+              heapOpts override cannot drop it: a JVM whose heap fills exits and the pod
+              restarts from its committed offsets, instead of lingering half-alive.
+            */}}
             - name: KAFKA_HEAP_OPTS
-              value: {{ .Values.connectors.cdc.kafkaConnect.heapOpts | quote }}
+              value: {{ printf "%s -XX:+ExitOnOutOfMemoryError" (trim .Values.connectors.cdc.kafkaConnect.heapOpts) | quote }}
             {{- if not .Values.kafka.enabled }}
             {{- $proto := .Values.kafka.external.securityProtocol | default "PLAINTEXT" }}
             {{- /*
@@ -562,6 +567,14 @@ spec:
               value: "8000"
             - name: MCP_HTTP_MODE
               value: "true"
+            {{- if .Values.connectors.minio.enabled }}
+            # Batches too large to ride inline are claim-checked to MinIO and
+            # fetched through the minio connector. The worker's default is the
+            # Compose name `minio-mcp`, which no Service here carries, so without
+            # this every claim-checked batch is DLQ'd with "no such host".
+            - name: MINIO_MCP_URL
+              value: {{ printf "http://%s:8000/mcp" (include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "minio" "version" "v1.0.0")) | quote }}
+            {{- end }}
             # The sink owns the durable ACK ledger (pipeline_batch_acks). With
             # no POSTGRES_URL the DB handle is nil, the ledger stays empty, and
             # the post-flight silent-drop invariant falls back to sink-emitted

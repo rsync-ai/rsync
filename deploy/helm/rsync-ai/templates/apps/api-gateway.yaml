@@ -103,6 +103,20 @@ spec:
               value: "http://{{ $fullname }}-orchestrator:{{ .Values.orchestrator.service.port }}"
             - name: AGENT_ORCHESTRATOR_URL
               value: "http://{{ $fullname }}-orchestrator:{{ .Values.orchestrator.service.port }}"
+            {{- if .Values.connectors.cdc.enabled }}
+            # The same gap orchestrator.yaml closed for KAFKA_CONNECT_URL, on the
+            # gateway. kafkaConnectURL() (cdc_tables.go) falls back to
+            # "kafka-connect" and kafkaSinkURL() (admin_health.go) to
+            # "kafka-mcp-sink-mcp"; neither Service exists under that name here.
+            # findDebeziumConnectorName needs Connect on every CDC table edit and
+            # answers 502 connect_unreachable without it; admin/health probes
+            # both. The sink value is a base URL, since the gateway appends
+            # /health itself. Names mirror cdc.yaml, which this block must track.
+            - name: KAFKA_CONNECT_URL
+              value: "http://{{ $fullname }}-kafka-connect:8083"
+            - name: KAFKA_SINK_URL
+              value: "http://{{ include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "kafka-mcp-sink" "version" "v1.0.0") }}:8000"
+            {{- end }}
             {{- if .Values.generation.enabled }}
             - name: TOOL_GENERATOR_URL
               value: "http://{{ $fullname }}-tool-generator:5010"
@@ -117,10 +131,10 @@ spec:
             # quietly rather than failing the pod, so nothing turns red.
             - name: LLM_SERVICE_URL
               value: "http://{{ $fullname }}-llm-service:5000"
-            # llmServiceTimeout() (chat_nl_pipeline.go) falls back to 10s when
-            # this is empty, and a 10s deadline against CPU inference is what
-            # made every plain-English chat message return a canned reply with
-            # HTTP 200. docker-compose.quickstart.yml ships 240; match it, and
+            # llmServiceTimeout() (chat_nl_pipeline.go) falls back to 60s when
+            # this is empty, sized for a hosted API; its old 10s against CPU
+            # inference made every plain-English chat message return a canned
+            # reply with HTTP 200. docker-compose.quickstart.yml ships 240; match it, and
             # let operators on slower hardware raise it. It must also stay under
             # the api-gateway's own 300s WriteTimeout (main.go), which caps the
             # whole response: a deadline above that ceiling just moves the cut

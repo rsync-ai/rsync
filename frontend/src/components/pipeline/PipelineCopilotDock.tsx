@@ -12,7 +12,7 @@ import {
   HelpCircle,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
-import type { ExecutionPlanStage } from "./DAGVisualization"
+import type { ExecutionPlanStage } from "./dagTypes"
 import { detectDurationAnomaly } from "./dagHelpers"
 
 interface PipelineCopilotDockProps {

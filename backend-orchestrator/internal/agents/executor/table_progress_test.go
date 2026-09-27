@@ -1,6 +1,10 @@
 package executor
 
-import "testing"
+import (
+	"strings"
+	"testing"
+	"time"
+)
 
 // OBS1: the executor stage used to sit at a static 80% "Executor working…" for the
 // entire transfer, so long multi-table runs looked hung. The fix emits a
@@ -60,5 +64,50 @@ func TestBuildExecutorTableProgressEvent_ProjectorSchema(t *testing.T) {
 	}
 	if prog["stage"] != "executor" {
 		t.Fatalf("progress.stage must be executor: %v", prog)
+	}
+}
+
+// The per-table count is bumped once a table is queued for the sink, not once the
+// destination has written it. On prod (2026-09-26) "Transferred 6 of 6 tables" showed
+// while the last table was still landing rows, so the message must not claim landing.
+func TestExecutorTableProgressSaysQueuedNotTransferred(t *testing.T) {
+	evt := buildExecutorTableProgressEvent("pipe-1", "exec-1", "trace-1", 6, 6)
+	msg, _ := evt["message"].(string)
+	if msg != "Queued 6 of 6 tables for writing" {
+		t.Fatalf("message = %q; it counts tables queued for the sink, and must say so", msg)
+	}
+	if strings.Contains(strings.ToLower(msg), "transferred") {
+		t.Fatalf("message %q claims a transfer the destination has not confirmed", msg)
+	}
+}
+
+// While reconcileLandedRows waits on the sink's acks the run must say it is waiting,
+// at the band's ceiling — never at 100, which only the worker's STAGE_COMPLETED emits.
+func TestExecutorAwaitingLandingEvent(t *testing.T) {
+	evt := buildExecutorAwaitingLandingEvent("pipe-1", "exec-1", "trace-1", 6)
+	if evt["event_type"] != "STAGE_PROGRESS" || evt["stage"] != "executor" {
+		t.Fatalf("must be an executor STAGE_PROGRESS: %v", evt)
+	}
+	if evt["message"] != executorAwaitingLandingMessage {
+		t.Fatalf("message = %v", evt["message"])
+	}
+	prog, _ := evt["progress"].(map[string]interface{})
+	if prog["percent"] != 99 {
+		t.Fatalf("awaiting landing sits at the band's ceiling (99), got %v", prog["percent"])
+	}
+}
+
+// Left without seq, the projector must invent one; the builder stamps it the way every
+// producer of the topic does.
+func TestExecutorProgressEventsCarrySeq(t *testing.T) {
+	before := time.Now().UnixNano()
+	for _, evt := range []map[string]interface{}{
+		buildExecutorTableProgressEvent("pipe-1", "exec-1", "trace-1", 1, 3),
+		buildExecutorAwaitingLandingEvent("pipe-1", "exec-1", "trace-1", 3),
+	} {
+		seq, ok := evt["seq"].(int64)
+		if !ok || seq < before {
+			t.Fatalf("seq = %v (%T); want a producer-stamped UnixNano ≥ %d", evt["seq"], evt["seq"], before)
+		}
 	}
 }

@@ -5,12 +5,13 @@
 // This is Phase 3 of removing Kafka/Redis from the agent-orchestration dispatch
 // path: Temporal task queues natively provide load-balanced dispatch, retries,
 // worker redundancy and durable request/reply — the exact job the Kafka+Redis
-// layer reimplemented. Only the executor agent is migrated here; the other
-// agents stay on Redis correlation for now.
+// layer reimplemented. The Kafka agent command bus is gone entirely; only the
+// executor agent is migrated here, and the other agents stay on Redis
+// correlation for now.
 //
 // The activity reuses the EXISTING ExecutorWorker.Execute unchanged, so the MCP
-// registry, progress emitter, agent.executor.responses UI stream and all
-// data-plane behavior are identical to the correlation path.
+// registry, progress emitter and all data-plane behavior are identical to the
+// correlation path.
 package temporalworker
 
 import (

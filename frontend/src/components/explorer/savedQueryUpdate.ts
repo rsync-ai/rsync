@@ -25,7 +25,16 @@ export type SavedQueryUpdateResult =
       /** The server's own explanation of why this is pending. Shown as-is. */
       reason: string
     }
-  | { kind: "error"; message: string }
+  | {
+      kind: "error"
+      message: string
+      /**
+       * The server refused because the query changed after the caller read it (409
+       * stale_write). Still an error — a caller that ignores this reports a failure,
+       * never a save — but one whose fix is to reload, not to retry.
+       */
+      stale?: true
+    }
 
 /** The subset of fields PATCH accepts. Omitted keys are left alone server-side. */
 export interface SavedQueryPatch {
@@ -35,6 +44,12 @@ export interface SavedQueryPatch {
   visibility?: string
   /** Why the SQL should change. Only read when the edit becomes a proposal. */
   note?: string
+  /**
+   * The `updated_at` the caller's copy was read at, sent back verbatim. The server
+   * refuses the write with 409 stale_write if the query has changed since, which is
+   * the only thing that stops an edit left open from overwriting a teammate's save.
+   */
+  expected_updated_at?: string
 }
 
 const FALLBACK_REASON =
@@ -63,11 +78,15 @@ export async function updateSavedQuery(
 
   const data = (await res.json().catch(() => ({}))) as {
     error?: string
+    code?: string
     pending_approval?: { statement_class?: string; reason?: string }
   }
 
   if (!res.ok) {
-    return { kind: "error", message: data?.error || "Could not save your changes." }
+    const message = data?.error || "Could not save your changes."
+    return res.status === 409 && data?.code === "stale_write"
+      ? { kind: "error", message, stale: true }
+      : { kind: "error", message }
   }
 
   // Presence of the object is the signal, not its contents: an approval gate that

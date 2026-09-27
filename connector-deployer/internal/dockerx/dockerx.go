@@ -116,12 +116,28 @@ type Deployer struct {
 	backend   Backend
 	toolsDir  string
 	buildSpec buildSpecFn
+	// stackPrefix is the first segment of a runtime container name
+	// ("<stackPrefix>-<id>-vX-Y-Z-mcp"): "rsync-ai" by default, "rsync-ci" on the
+	// isolated CI stack.
+	stackPrefix string
 }
+
+// defaultStackPrefix matches the orchestrator's StackPrefix() default.
+const defaultStackPrefix = "rsync-ai"
 
 // NewDeployer wraps a Backend. toolsDir is the connector-artifacts root used to
 // resolve a compose-managed connector's current version (protected-compose check).
 func NewDeployer(backend Backend, toolsDir string) *Deployer {
-	return &Deployer{backend: backend, toolsDir: toolsDir, buildSpec: spec.BuildContainerSpec}
+	return &Deployer{backend: backend, toolsDir: toolsDir, buildSpec: spec.BuildContainerSpec, stackPrefix: defaultStackPrefix}
+}
+
+// WithStackPrefix sets the container-name prefix (STACK_PREFIX). Blank keeps the
+// default, so an unset env var behaves exactly as before.
+func (d *Deployer) WithStackPrefix(prefix string) *Deployer {
+	if p := strings.TrimSpace(prefix); p != "" {
+		d.stackPrefix = p
+	}
+	return d
 }
 
 // Ping reports daemon reachability.

@@ -45,9 +45,12 @@ var workspaceRoleRank = map[string]int{
 	"owner":  4,
 }
 
-// minMutatingRole is the floor for every caller of these gates: all six call
-// sites (provision, cleanup, update-tables, backfill, recover, sink restart)
-// mutate CDC infrastructure, so a viewer must not pass.
+// minMutatingRole is the floor for every caller of these gates. The CDC call
+// sites (provision, cleanup, update-tables, backfill, recover, sink restart,
+// pause/resume) mutate CDC infrastructure, so a viewer must not pass. The
+// pre-flight assessment routes use the same floor: running an assessment opens a
+// connection to the source database with that tenant's decrypted credentials,
+// which is not a viewer-level action either.
 const minMutatingRole = "member"
 
 // resourceAccess is what the DB says about one resource and one caller.
@@ -185,4 +188,20 @@ func assertConnectionOwner(c *gin.Context, db *sql.DB, connectionID string) bool
 // the pipeline's source_connection_id. Trusted internal callers pass through.
 func assertPipelineOwnerForHandlers(c *gin.Context, db *sql.DB, pipelineID string) bool {
 	return assertResourceWorkspaceRole(c, db, pipelineAccessQuery, pipelineID, "pipeline")
+}
+
+// AssertPipelineWorkspaceRole is the exported entry point for the CDC control
+// routes that cmd/orchestrator registers inline (pause / resume / status /
+// sink-restart) rather than through a handler struct.
+//
+// It exists so the CDC control plane has ONE authorization rule. The inline
+// routes carried their own copy that compared the caller against
+// `pipelines.created_by`, which is workspace-blind in both directions: a user
+// removed from the workspace kept the ability to pause and resume its CDC, and
+// a teammate holding a real role on a pipeline the workspace collectively owns
+// was refused. Every handler-side CDC route already used the workspace gate;
+// these four were the omission. Delegating instead of duplicating is what stops
+// them drifting apart a second time.
+func AssertPipelineWorkspaceRole(c *gin.Context, db *sql.DB, pipelineID string) bool {
+	return assertPipelineOwnerForHandlers(c, db, pipelineID)
 }

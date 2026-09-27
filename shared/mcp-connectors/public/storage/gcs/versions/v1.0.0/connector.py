@@ -35,6 +35,7 @@ from base_connector import (
     ExportResult,
 )
 from rsync_protocol.object_storage_source import ObjectStorageSourceMixin
+from rsync_protocol.file_formats import normalize_rows_for_columnar
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -306,6 +307,9 @@ class GcsMCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
                 else:
                     body = str(payload).encode("utf-8")
             else:
+                # One type per column for parquet/orc/arrow: a mixed column (Mongo int +
+                # ObjectId _id) would otherwise fail the whole batch into the DLQ.
+                payload = normalize_rows_for_columnar(payload, fmt, params.get("column_types"))
                 body = self.convert_data_to_format(payload, fmt, compression)
 
             # CDC provenance (Tier C): the kafka-mcp-sink stamps each CDC object with its

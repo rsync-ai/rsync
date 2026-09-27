@@ -43,6 +43,5 @@ These are documented as configured in this repo (ports/env/volumes), not as full
 - `docs/services/infra/redis/HLD.md` + `LLD.md`
 - `docs/services/infra/temporal/HLD.md` + `LLD.md` (includes Temporal UI + admin tools)
 - `docs/services/infra/schema-registry/HLD.md` + `LLD.md`
-- `docs/services/infra/observability/HLD.md` + `LLD.md` (Fluent Bit + OTel Collector)
 
 

@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Play, Pause, Loader2, Square, RefreshCw, AlertTriangle } from "lucide-react"
@@ -29,6 +29,7 @@ import { UpgradeModal } from "@/components/plan/UpgradeModal"
 import { toast } from "sonner"
 import { normalizePipelineStatus, type NormalizedPipelineStatus } from "@/lib/pipeline/statusNormalization"
 import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
+import { usePipelineStatePoll } from "@/lib/hooks/usePipelineStatePoll"
 import { classifyError } from "@/lib/utils/error-handling"
 import type { ApiErrorBody } from "@/lib/api/types"
 
@@ -45,7 +46,6 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
   const [isActing, setIsActing] = useState(false)
   const inFlightRef = useRef(false)
   const [defaultRunMode, setDefaultRunMode] = useState<"resume" | "reload">("resume")
-  const [liveStatus, setLiveStatus] = useState<NormalizedPipelineStatus>(() => normalizePipelineStatus(status))
   // Destination namespace, surfaced in the Reload confirm dialog so the user sees
   // exactly what gets dropped + rebuilt.
   const [destinationNamespace, setDestinationNamespace] = useState<string | null>(null)
@@ -61,16 +61,11 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
   // Plan limit modal state
   const [planLimitPayload, setPlanLimitPayload] = useState<PlanLimitPayload | null>(null)
 
-  const fetchLiveStatus = useCallback(async () => {
-    try {
-      const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, { cache: "no-store" })
-      if (!res.ok) return
-      const data = (await res.json()) as { status?: string }
-      setLiveStatus(normalizePipelineStatus(data?.status))
-    } catch {
-      // ignore; keep last known status
-    }
-  }, [pipelineId])
+  // The header's one shared /state poll (usePipelineStatePoll); the server-rendered
+  // status stands in until its first answer. Run, Pause, Resume and Stop below
+  // emit a refresh, which makes it read at once.
+  const live = usePipelineStatePoll(pipelineId)
+  const liveStatus: NormalizedPipelineStatus = live.status ?? normalizePipelineStatus(status)
 
   useEffect(() => {
     let cancelled = false
@@ -91,24 +86,6 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
       cancelled = true
     }
   }, [pipelineId])
-
-  // Keep the header actions consistent with the authoritative pipeline state.
-  // This avoids cases where the server-rendered pipeline.status lags behind /state (e.g. execution completes).
-  useEffect(() => {
-    let cancelled = false
-    const run = async () => {
-      await fetchLiveStatus()
-      if (cancelled) return
-      // Poll lightly; the live panel uses WS/polling too, but actions need to flip promptly.
-      const t = window.setInterval(() => void fetchLiveStatus(), 4000)
-      return () => window.clearInterval(t)
-    }
-    const cleanupPromise = run()
-    return () => {
-      cancelled = true
-      void cleanupPromise.then((cleanup) => cleanup?.())
-    }
-  }, [fetchLiveStatus])
 
   const primaryMode: "resume" | "reload" = useMemo(() => defaultRunMode, [defaultRunMode])
   const secondaryMode: "resume" | "reload" = useMemo(
@@ -134,7 +111,6 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
       await executePipelineWithRunMode(pipelineId, mode, { ackWarnings, nominatedKeys })
       toast.success(mode === "reload" ? "Pipeline reload started" : "Pipeline run started")
       router.refresh()
-      void fetchLiveStatus()
       emitPipelineRefresh(pipelineId)
       return { ok: true as const }
     } catch (error) {
@@ -188,7 +164,6 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
       if (response.ok) {
         toast.success("Pipeline paused")
         router.refresh()
-        void fetchLiveStatus()
         emitPipelineRefresh(pipelineId)
       } else {
         const body = await response.json().catch(() => ({}))
@@ -217,7 +192,6 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
       if (response.ok) {
         toast.success("Pipeline resumed")
         router.refresh()
-        void fetchLiveStatus()
         emitPipelineRefresh(pipelineId)
       } else {
         const body = await response.json().catch(() => ({}))
@@ -243,7 +217,6 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
       if (response.ok) {
         toast.success("Pipeline stopped")
         router.refresh()
-        void fetchLiveStatus()
         emitPipelineRefresh(pipelineId)
       } else {
         const body = await response.json().catch(() => ({}))

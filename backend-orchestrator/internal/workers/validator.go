@@ -3,12 +3,10 @@ package workers
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -71,10 +69,6 @@ func NewValidatorWorker(kafkaManager *kafka.Manager, db *sql.DB) *ValidatorWorke
 		correlationClient: correlationClient,
 		workerID:          fmt.Sprintf("validator-worker-%s", uuid.New().String()[:8]),
 	}
-}
-
-func (w *ValidatorWorker) GetWorkerType() string {
-	return "validator"
 }
 
 func (w *ValidatorWorker) Execute(ctx context.Context, task Task) TaskResult {
@@ -159,37 +153,17 @@ func (w *ValidatorWorker) Execute(ctx context.Context, task Task) TaskResult {
 	}
 }
 
+// Start launches the Redis correlation poller, the only way validator requests
+// reach this worker (the Temporal adapter writes them to the correlation store).
 func (w *ValidatorWorker) Start() error {
 	log.Info("🚀 Starting Validator Worker")
-	
-	// Start Redis poller for V2 workflows (correlation pattern)
-	if w.correlationClient != nil {
-		go w.startRedisPoller()
-		log.Info("✅ ValidatorWorker: Redis poller started for V2 correlation requests")
-	} else {
+	if w.correlationClient == nil {
 		log.Warn("⚠️  ValidatorWorker: Correlation client not initialized - V2 workflows will not work")
-	}
-	
-	// Consume from dedicated topic (no consumer group = no rebalancing)
-	return w.kafkaManager.ConsumeWithContext("agent.control.commands.validator", w.handleTask)
-}
-
-func (w *ValidatorWorker) handleTask(ctx context.Context, msg *sarama.ConsumerMessage) error {
-	var task Task
-	if err := json.Unmarshal(msg.Value, &task); err != nil {
-		return err
-	}
-	// V2 tasks are handled by the Redis correlation poller; the Kafka path is V1-only.
-	// Skipping here prevents double-execution (see KI-HYBRID-1).
-	if task.CorrelationID != "" {
 		return nil
 	}
-	if task.TaskType != "validate_policy" && task.TaskType != "validate_schema" {
-		return nil
-	}
-	result := w.Execute(context.Background(), task)
-	// Route result to correlation store (V2) or Kafka (V1)
-	return RouteResult(context.Background(), task, result, w.kafkaManager)
+	go w.startRedisPoller()
+	log.Info("✅ ValidatorWorker: Redis poller started for V2 correlation requests")
+	return nil
 }
 
 func (w *ValidatorWorker) Stop() error {

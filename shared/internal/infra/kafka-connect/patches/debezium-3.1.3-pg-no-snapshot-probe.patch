@@ -1,0 +1,35 @@
+Debezium 3.1.3.Final, PostgreSQL connector: stop probing the SNAPSHOT connection
+while streaming waits for a blocking snapshot. This is upstream's own revert
+(debezium/debezium cd2b1b3013, "DBZ-8680 Revert ...", first shipped in 3.2.0),
+reduced to its one-line production change. There is no 3.1.4.
+
+Why: in 3.1.0-3.1.3, streaming paused for a blocking snapshot runs `SELECT 1` +
+`commit()` every status.update.interval.ms (10 s) on the JDBC connection the
+snapshot is reading through. The commit closes the snapshot's server-side
+cursor, the next fetch fails with `portal "C_n" does not exist`, the snapshot
+aborts, streaming resumes, and the connector stays RUNNING -- so every CDC
+Reload of a PostgreSQL table whose export outlives one probe tick silently
+loses rows. Applied by the kafka-connect Dockerfile (stage dbz-pg-patch).
+
+Modified from the Apache-2.0 licensed Debezium source (Copyright Debezium
+Authors); the change is the hunk below.
+
+diff --git a/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresStreamingChangeEventSource.java b/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresStreamingChangeEventSource.java
+--- a/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresStreamingChangeEventSource.java
++++ b/debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresStreamingChangeEventSource.java
+@@ -260,14 +260,7 @@ && haveNotReceivedStreamingStoppingLsn(offsetContext, lastCompletelyProcessedLsn
+             if (context.isPaused()) {
+                 LOGGER.info("Streaming will now pause");
+                 context.streamingPaused();
+-                context.waitSnapshotCompletion(() -> {
+-                    try {
+-                        probeConnectionIfNeeded();
+-                    }
+-                    catch (SQLException e) {
+-                        throw new DebeziumException(e);
+-                    }
+-                });
++                context.waitSnapshotCompletion();
+                 LOGGER.info("Streaming resumed");
+             }
+         }

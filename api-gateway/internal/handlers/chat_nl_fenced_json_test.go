@@ -136,13 +136,19 @@ func TestParseIntentStillErrorsOnNonJSON(t *testing.T) {
 	}
 }
 
-// llmServiceTimeout replaces four hard-coded 10s literals. The default must stay
-// 10s (the cloud behaviour); only docker-compose.quickstart.yml raises it, where
-// inference runs on CPU Ollama.
-func TestLLMServiceTimeoutDefaultsToTenSecondsAndIsOverridable(t *testing.T) {
+// llmServiceTimeout replaces four hard-coded 10s literals. The default is 60s:
+// 10s was shorter than prod's Gemini takes to classify a question. It must stay
+// under Cloudflare's 100s proxy timeout on app.rsync.ai, or the browser gets a
+// 524 before the gateway can say the model did not answer.
+// docker-compose.quickstart.yml raises it for CPU Ollama.
+func TestLLMServiceTimeoutDefaultsToSixtySecondsAndIsOverridable(t *testing.T) {
+	const cloudflareProxyTimeout = 100 * time.Second
 	t.Setenv("LLM_SERVICE_TIMEOUT_SECONDS", "")
-	if got := llmServiceTimeout(); got != 10*time.Second {
-		t.Errorf("default timeout = %v, want 10s", got)
+	if got := llmServiceTimeout(); got != 60*time.Second {
+		t.Errorf("default timeout = %v, want 60s", got)
+	}
+	if got := llmServiceTimeout(); got >= cloudflareProxyTimeout {
+		t.Errorf("default timeout %v is not under Cloudflare's %v proxy timeout", got, cloudflareProxyTimeout)
 	}
 
 	t.Setenv("LLM_SERVICE_TIMEOUT_SECONDS", "180")

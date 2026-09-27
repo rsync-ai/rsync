@@ -168,7 +168,9 @@ func GetWorkspaceUsage(c *gin.Context) {
 				COALESCE(s.inserted_rows, 0),
 				COALESCE(s.applied_inserts, 0) + COALESCE(s.applied_updates, 0) + COALESCE(s.applied_deletes, 0)
 			)), 0) AS records_processed,
-			COALESCE(SUM(COALESCE(s.inserts, 0)), 0) AS cdc_inserts,
+			-- Snapshot reads a pre-114 row counted as inserts are not inserts
+			-- (capturedInsertsSQL, table_stats.go).
+			COALESCE(SUM(COALESCE(s.inserts - COALESCE(s.legacy_snapshot_reads, 0), 0)), 0) AS cdc_inserts,
 			COALESCE(SUM(COALESCE(s.updates, 0)), 0) AS cdc_updates,
 			COALESCE(SUM(COALESCE(s.deletes, 0)), 0) AS cdc_deletes,
 			COALESCE(SUM(

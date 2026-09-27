@@ -3870,6 +3870,21 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     if _k not in _seen_cols:
                         _seen_cols.add(_k)
                         columns.append(_k)
+            # A row whose key set is SMALLER than that union is NOT "the same row
+            # with NULLs in the gaps" — it is a row the producer deliberately said
+            # nothing about for those columns. The kafka sink relies on exactly that:
+            # filterDebeziumUnavailable (kafka-sink-worker main.go) DROPS the key of
+            # a TOAST-able column Debezium marked unchanged
+            # (__debezium_unavailable_value), on the contract that an absent key means
+            # "leave this column alone". Binding the union for every row broke the
+            # contract — row.get(col) -> None -> `SET "col" = EXCLUDED."col"` wrote
+            # NULL over the destination's good value. It only misfired when a batch
+            # MIXED shapes (one row carrying the column, one not), which is the normal
+            # shape of a CDC batch. Every statement below is now built from the row's
+            # OWN columns; this flag only decides whether the bulk path is eligible.
+            ragged_batch = any(
+                isinstance(_row, dict) and len(_row) != len(columns) for _row in data
+            )
             rows_upserted = 0
             driver_module = pattern.get("module", "")
 
@@ -3887,8 +3902,14 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             # table on a CDC first-write — we roll back and fall through to the
             # per-row loop, which auto-creates the table and binds each row
             # individually, so behavior is never regressed.
+            #
+            # A ragged batch is excluded: staged_upsert creates the staging table from
+            # ONE column list and bulk-loads every row against it, so a row that omits
+            # a column loads NULL there and the merge writes that NULL to the target.
+            # Only the per-row loop can honour an absent key, so raggedness costs the
+            # bulk path — correctness over throughput.
             is_pg = "psycopg2" in driver_module or "asyncpg" in driver_module
-            if is_pg and self.supports_staged_load() and len(data) > 1:
+            if is_pg and self.supports_staged_load() and len(data) > 1 and not ragged_batch:
                 try:
                     written = self.staged_upsert(cursor, table, columns, data, key_fields, col_types)
                     # Record the Kafka high-water offset in the SAME transaction as
@@ -3916,17 +3937,28 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             # catalog round-trip per row.
             perrow_conflict_keys = self._merge_conflict_keys(cursor, table, columns, key_fields)
             for row in data:
+                # Bind this row's OWN columns, never the batch union (see
+                # ragged_batch above). Order is inherited from the union so rows of
+                # the same shape still produce one identical statement string, and a
+                # key present with an explicit None stays in row_cols and correctly
+                # writes NULL — only a key the row never carried is omitted.
+                row_cols = [c for c in columns if c in row]
+                if not row_cols:
+                    raise ValueError(
+                        f"upsert_data: a row in the batch for {table} carries no columns; "
+                        "refusing to write an all-NULL row"
+                    )
                 if "psycopg2" in driver_module or "asyncpg" in driver_module:
                     # PostgreSQL: INSERT ... ON CONFLICT DO UPDATE.
                     # Quote identifiers (cols, conflict targets, EXCLUDED
                     # references) so case-sensitive column names like
                     # createdAt match what ensure_table() created — postgres
                     # folds unquoted idents to lowercase otherwise.
-                    col_str = ", ".join([f'"{c}"' for c in columns])
-                    placeholders = ", ".join(["%s"] * len(columns))
+                    col_str = ", ".join([f'"{c}"' for c in row_cols])
+                    placeholders = ", ".join(["%s"] * len(row_cols))
                     conflict_cols_list = perrow_conflict_keys
                     conflict_cols = ", ".join([f'"{c}"' for c in conflict_cols_list])
-                    update_cols = [c for c in columns if c not in conflict_cols_list]
+                    update_cols = [c for c in row_cols if c not in conflict_cols_list]
 
                     qualified = self._qualified_quoted_table(table)
                     if update_cols:
@@ -3935,7 +3967,7 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     else:
                         query = f"INSERT INTO {qualified} ({col_str}) VALUES ({placeholders}) ON CONFLICT ({conflict_cols}) DO NOTHING"
                     
-                    values = tuple(_pg_bind_value(row.get(col), col_types.get(col)) for col in columns)
+                    values = tuple(_pg_bind_value(row.get(col), col_types.get(col)) for col in row_cols)
                     try:
                         cursor.execute(query, values)
                     except Exception as e:
@@ -3957,9 +3989,9 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                 
                 elif "mysql" in driver_module or "pymysql" in driver_module:
                     # MySQL: INSERT ... ON DUPLICATE KEY UPDATE
-                    col_str = ", ".join(columns)
-                    placeholders = ", ".join(["%s"] * len(columns))
-                    update_cols = [c for c in columns if c not in key_fields]
+                    col_str = ", ".join(row_cols)
+                    placeholders = ", ".join(["%s"] * len(row_cols))
+                    update_cols = [c for c in row_cols if c not in key_fields]
                     
                     if update_cols:
                         update_str = ", ".join([f"{c} = VALUES({c})" for c in update_cols])
@@ -3967,19 +3999,19 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     else:
                         query = f"INSERT IGNORE INTO {table} ({col_str}) VALUES ({placeholders})"
                     
-                    values = tuple(row.get(col) for col in columns)
+                    values = tuple(row.get(col) for col in row_cols)
                     cursor.execute(query, values)
                 
                 elif "oracledb" in driver_module or "cx_Oracle" in driver_module:
                     # Oracle: MERGE statement
-                    col_str = ", ".join(columns)
-                    src_cols = ", ".join([f":{i+1} AS {c}" for i, c in enumerate(columns)])
+                    col_str = ", ".join(row_cols)
+                    src_cols = ", ".join([f":{i+1} AS {c}" for i, c in enumerate(row_cols)])
                     match_cond = " AND ".join([f"t.{k} = s.{k}" for k in key_fields])
-                    update_cols = [c for c in columns if c not in key_fields]
+                    update_cols = [c for c in row_cols if c not in key_fields]
                     
                     if update_cols:
                         update_str = ", ".join([f"t.{c} = s.{c}" for c in update_cols])
-                        insert_cols = ", ".join([f"s.{c}" for c in columns])
+                        insert_cols = ", ".join([f"s.{c}" for c in row_cols])
                         query = f"""
                             MERGE INTO {table} t
                             USING (SELECT {src_cols} FROM dual) s
@@ -3988,7 +4020,7 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                             WHEN NOT MATCHED THEN INSERT ({col_str}) VALUES ({insert_cols})
                         """
                     else:
-                        insert_cols = ", ".join([f"s.{c}" for c in columns])
+                        insert_cols = ", ".join([f"s.{c}" for c in row_cols])
                         query = f"""
                             MERGE INTO {table} t
                             USING (SELECT {src_cols} FROM dual) s
@@ -3996,19 +4028,24 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                             WHEN NOT MATCHED THEN INSERT ({col_str}) VALUES ({insert_cols})
                         """
                     
-                    values = tuple(row.get(col) for col in columns)
+                    values = tuple(row.get(col) for col in row_cols)
                     cursor.execute(query, values)
                 
                 else:
                     # Generic fallback: DELETE + INSERT
                     # Cast both sides to text to handle type mismatches (e.g. INT PK in a TEXT column).
+                    # NOTE: this branch cannot honour an absent key the way the upsert
+                    # branches above do — it removes the destination row first, so a
+                    # column this row does not carry is gone either way. Binding
+                    # row_cols at least stops it from writing an explicit NULL where
+                    # the column has a DEFAULT.
                     where_clause = " AND ".join([f"{k}::text = %s::text" for k in key_fields])
                     key_values = tuple(str(row.get(k)) if row.get(k) is not None else None for k in key_fields)
                     cursor.execute(f"DELETE FROM {table} WHERE {where_clause}", key_values)
                     
-                    col_str = ", ".join(columns)
-                    placeholders = ", ".join(["%s"] * len(columns))
-                    values = tuple(row.get(col) for col in columns)
+                    col_str = ", ".join(row_cols)
+                    placeholders = ", ".join(["%s"] * len(row_cols))
+                    values = tuple(row.get(col) for col in row_cols)
                     cursor.execute(f"INSERT INTO {table} ({col_str}) VALUES ({placeholders})", values)
                 
                 rows_upserted += 1

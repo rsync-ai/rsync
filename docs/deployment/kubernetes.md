@@ -158,12 +158,24 @@ No registry login is needed: the chart itself and every `ghcr.io/rsync-ai` image
 it names answer an anonymous pull.
 
 > [!NOTE]
-> **No image overrides are needed on this path.** An earlier 0.1.2 artifact was
-> packaged before MinIO withdrew `docker.io/minio/*`, so it named two images that
-> no longer exist and needed `objectStorage.minio.{image,mcImage}` overrides.
-> `0.1.2` has since been repackaged: its `values.yaml` names `quay.io/minio/*`,
-> the same images a checkout uses. If you pinned those two overrides in a values
-> file, they are now redundant.
+> **Chart 0.1.5 and older need two MinIO image overrides.** MinIO withdrew
+> anonymous pulls from `docker.io/minio/*` and then from `quay.io/minio/*`, the
+> images those charts name, so the MinIO pod and the bucket job fail to pull.
+> Point both at Chainguard's build, which carries the server and `mc` in one image:
+>
+> ```yaml
+> objectStorage:
+>   minio:
+>     image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+>     mcImage: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+> ```
+>
+> Put that in the file you pass with `-f` (or in `RSYNC_EXTRA_VALUES` on the
+> one-command path). From chart 0.1.6 the chart names this image itself, and a
+> checkout's `values.yaml` already does. The pod's uid comes from
+> `global.podSecurityContext`, not the image, so an existing MinIO volume keeps
+> working; if you have emptied that setting, the pod runs as the image's own uid
+> 65532 and cannot write a volume an earlier chart created.
 
 **Reaching a cloud overlay from here.** The `values-gke.yaml` / `values-eks.yaml`
 / `values-aks.yaml` overlays *are* packaged inside the published chart, but `-f`

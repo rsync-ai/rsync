@@ -9,6 +9,8 @@
  */
 
 import { modelHref } from "@/components/explorer/modelLineage"
+import { layoutGraph, type GraphLayout } from "@/lib/elk-layout"
+import type { SchemaTableLike } from "@/lib/explorer/schemaTree"
 
 export interface AssetNode {
   id: string
@@ -124,6 +126,19 @@ export function triggerLabel(trigger: string): string {
   return TRIGGER_LABELS[trigger] ?? trigger
 }
 
+/**
+ * The warehouses the graph's assets live in, as connection ids. A pipeline counts under
+ * the warehouse it writes to, which is also what `?connection_id=` filters it by.
+ */
+export function warehouseIds(graph: AssetGraph): string[] {
+  return [...new Set(graph.nodes.flatMap((n) => (n.connection_id ? [n.connection_id] : [])))].sort()
+}
+
+/** A warehouse's connection name, or a short id when the connection list has no name for it. */
+export function warehouseLabel(id: string, names: ReadonlyMap<string, string>): string {
+  return names.get(id) ?? `Warehouse ${id.slice(0, 8)}`
+}
+
 /** Where a node's own page is. Tables have none: a table is not a row the product owns. */
 export function assetHref(node: AssetNode): string | null {
   if (!node.ref_id) return null
@@ -142,18 +157,39 @@ export interface AssetView {
   focus: string | null
   role: Map<string, AssetRole>
   distance: Map<string, number>
+  /** Everything upstream of the focus, however far. */
   upstreamFound: number
+  /** Everything downstream of the focus, however far. */
   downstreamFound: number
-  /** Found but not drawn, because of the cap. */
+  upstreamShown: number
+  downstreamShown: number
+  /** Per drawn node, its next hop away from the focus that is not drawn. */
+  hiddenBeyond: Map<string, number>
+  /** Within the depth but not drawn, because of the cap. */
   omitted: number
 }
 
-function walk(start: string, next: Map<string, string[]>): Map<string, number> {
+export interface NeighbourhoodOptions {
+  /** Hops drawn on each side of the focus; Infinity draws them all. */
+  depth?: number
+  /** Nodes whose next hop is drawn whatever the depth. */
+  expanded?: ReadonlySet<string>
+  cap?: number
+}
+
+/** Hops from `start`, following a node's `next` only while it is within `depth` or expanded. */
+function walk(
+  start: string,
+  next: Map<string, string[]>,
+  depth = Infinity,
+  expanded: ReadonlySet<string> = new Set(),
+): Map<string, number> {
   const dist = new Map<string, number>([[start, 0]])
   let frontier = [start]
   for (let d = 1; frontier.length > 0; d++) {
     const following: string[] = []
     for (const id of frontier) {
+      if (d > depth && !expanded.has(id)) continue
       for (const n of next.get(id) ?? []) {
         if (dist.has(n)) continue
         dist.set(n, d)
@@ -167,18 +203,27 @@ function walk(start: string, next: Map<string, string[]>): Map<string, number> {
 }
 
 /**
- * Everything upstream of the focus and everything downstream of it, transitively, capped
- * at `cap` nodes with the nearest kept. A node that is both (a cycle) counts as upstream.
+ * What feeds the focus and what it feeds, `depth` hops out on each side plus the next
+ * hop of every expanded node, capped at `cap` nodes with the nearest kept. The totals
+ * count every hop, drawn or not. A node that is both (a cycle) counts as upstream.
  */
-export function neighbourhood(graph: AssetGraph, focus: string, cap = MAX_DRAWN_ASSETS): AssetView {
+export function neighbourhood(
+  graph: AssetGraph,
+  focus: string,
+  { depth = Infinity, expanded, cap = MAX_DRAWN_ASSETS }: NeighbourhoodOptions = {},
+): AssetView {
   const out = new Map<string, string[]>()
   const into = new Map<string, string[]>()
   for (const e of graph.edges) {
     out.set(e.from, [...(out.get(e.from) ?? []), e.to])
     into.set(e.to, [...(into.get(e.to) ?? []), e.from])
   }
-  const ups = walk(focus, into)
-  const downs = walk(focus, out)
+  const allUps = walk(focus, into)
+  const allDowns = walk(focus, out)
+  for (const id of allUps.keys()) allDowns.delete(id)
+
+  const ups = walk(focus, into, depth, expanded)
+  const downs = walk(focus, out, depth, expanded)
   for (const id of ups.keys()) downs.delete(id)
 
   const found = [
@@ -195,14 +240,23 @@ export function neighbourhood(graph: AssetGraph, focus: string, cap = MAX_DRAWN_
   }
   const nodeIds = [focus, ...kept.map((k) => k.id)]
   const drawn = new Set(nodeIds)
+  const hiddenBeyond = new Map<string, number>()
+  for (const k of kept) {
+    const onward = (k.role === "upstream" ? into : out).get(k.id) ?? []
+    const hidden = new Set(onward.filter((id) => !drawn.has(id))).size
+    if (hidden > 0) hiddenBeyond.set(k.id, hidden)
+  }
   return {
     nodeIds,
     edges: graph.edges.filter((e) => drawn.has(e.from) && drawn.has(e.to)),
     focus,
     role,
     distance,
-    upstreamFound: ups.size,
-    downstreamFound: downs.size,
+    upstreamFound: allUps.size,
+    downstreamFound: allDowns.size,
+    upstreamShown: kept.filter((k) => k.role === "upstream").length,
+    downstreamShown: kept.filter((k) => k.role === "downstream").length,
+    hiddenBeyond,
     omitted: found.length - kept.length,
   }
 }
@@ -216,8 +270,172 @@ export function wholeGraph(graph: AssetGraph): AssetView {
     distance: new Map(),
     upstreamFound: 0,
     downstreamFound: 0,
+    upstreamShown: 0,
+    downstreamShown: 0,
+    hiddenBeyond: new Map(),
     omitted: 0,
   }
+}
+
+/** Fewer unread tables than this stay drawn: a box would hide almost nothing. */
+export const FOLD_MIN = 3
+
+/** A pipeline's tables that nothing drawn reads, drawn as one box. */
+export interface FoldGroup {
+  id: string
+  pipeline: string
+  tables: string[]
+}
+
+export interface FoldedView {
+  nodeIds: string[]
+  edges: AssetEdge[]
+  /** Boxes still folded, keyed by their node id. */
+  groups: Map<string, FoldGroup>
+  /** Boxes that would fold but are drawn open. */
+  opened: number
+}
+
+/** The node id of a pipeline's box of unread tables. */
+export function foldId(pipeline: string): string {
+  return `fold:${pipeline}`
+}
+
+const EVIDENCE_STRENGTH = ["inferred", "declared", "observed"]
+
+/**
+ * A pipeline that writes many tables no model reads stacks them in one column as tall as
+ * the page, and the drawing can then only be read by zooming until the words vanish. So
+ * the tables only one pipeline writes, and nothing drawn reads, fold into one box per
+ * pipeline. The focused asset is never folded away, nor is the focused pipeline's output:
+ * that is what was asked to see. `open` names the boxes drawn open, or "all".
+ */
+export function foldUnreadTables(
+  view: AssetView,
+  graph: AssetGraph,
+  open: ReadonlySet<string> | "all" = new Set(),
+): FoldedView {
+  const kinds = new Map(graph.nodes.map((n) => [n.id, n.kind]))
+  const into = new Map<string, AssetEdge[]>()
+  const readers = new Set<string>()
+  for (const e of view.edges) {
+    into.set(e.to, [...(into.get(e.to) ?? []), e])
+    readers.add(e.from)
+  }
+  const unread = new Map<string, string[]>()
+  for (const id of view.nodeIds) {
+    if (id === view.focus || kinds.get(id) !== "table" || readers.has(id)) continue
+    const writes = into.get(id) ?? []
+    const writer = writes[0]?.from
+    if (!writer || writer === view.focus || kinds.get(writer) !== "pipeline") continue
+    if (!writes.every((e) => e.from === writer && e.kind === "writes")) continue
+    unread.set(writer, [...(unread.get(writer) ?? []), id])
+  }
+
+  const groups = new Map<string, FoldGroup>()
+  const folded = new Map<string, string>()
+  let opened = 0
+  for (const [pipeline, tables] of unread) {
+    if (tables.length < FOLD_MIN) continue
+    const id = foldId(pipeline)
+    if (open === "all" || open.has(id)) {
+      opened++
+      continue
+    }
+    groups.set(id, { id, pipeline, tables })
+    for (const t of tables) folded.set(t, id)
+  }
+  if (groups.size === 0) return { nodeIds: view.nodeIds, edges: view.edges, groups, opened }
+
+  const nodeIds: string[] = []
+  for (const id of view.nodeIds) {
+    const group = folded.get(id)
+    if (!group) nodeIds.push(id)
+    else if (groups.get(group)!.tables[0] === id) nodeIds.push(group)
+  }
+  const edges = view.edges.filter((e) => !folded.has(e.to))
+  for (const g of groups.values()) {
+    // The box's link is only as sure as the least sure write in it.
+    const evidence = EVIDENCE_STRENGTH.find((grade) =>
+      g.tables.some((t) => into.get(t)!.some((e) => e.evidence === grade)),
+    )
+    edges.push({ from: g.pipeline, to: g.id, kind: "writes", evidence: evidence ?? "observed" })
+  }
+  return { nodeIds, edges, groups, opened }
+}
+
+/** An asset's card on the canvas. */
+export const ASSET_NODE_WIDTH = 256
+export const ASSET_NODE_HEIGHT = 88
+
+/** Space between assets linked to nothing, and between them and the drawing above. */
+const LOOSE_GAP = 20
+const LOOSE_TOP_GAP = 56
+
+/**
+ * Where each asset goes: linked ones in columns, upstreams on the left. Assets linked to
+ * nothing are set in rows under that drawing, as wide as it is; left to the layout they
+ * would share its first column and make it as tall as there are of them.
+ */
+export async function layoutAssets(
+  nodeIds: string[],
+  edges: { from: string; to: string }[],
+  sizeOf: (id: string) => { width: number; height: number } = () => ({
+    width: ASSET_NODE_WIDTH,
+    height: ASSET_NODE_HEIGHT,
+  }),
+): Promise<GraphLayout> {
+  const linked = new Set(edges.flatMap((e) => [e.from, e.to]))
+  const { positions, bounds } = await layoutGraph(
+    nodeIds.filter((id) => linked.has(id)).map((id) => ({ id, ...sizeOf(id) })),
+    edges,
+  )
+  const loose = nodeIds.filter((id) => !linked.has(id))
+  if (loose.length === 0) return { positions, bounds }
+
+  const sizes = loose.map(sizeOf)
+  const step = Math.max(...sizes.map((s) => s.width)) + LOOSE_GAP
+  const columns = Math.max(Math.floor((bounds.width + LOOSE_GAP) / step), Math.min(loose.length, 4))
+  const drewLinked = positions.size > 0
+  let top = drewLinked ? bounds.y + bounds.height + LOOSE_TOP_GAP : 0
+  const left = drewLinked ? bounds.x : 0
+  for (let row = 0; row * columns < loose.length; row++) {
+    const inRow = loose.slice(row * columns, (row + 1) * columns)
+    inRow.forEach((id, i) => positions.set(id, { x: left + i * step, y: top }))
+    top += Math.max(...sizes.slice(row * columns, (row + 1) * columns).map((s) => s.height)) + LOOSE_GAP
+  }
+  const looseWidth = Math.min(loose.length, columns) * step - LOOSE_GAP
+  const y = drewLinked ? bounds.y : 0
+  return {
+    positions,
+    bounds: {
+      x: left,
+      y,
+      width: Math.max(drewLinked ? bounds.width : 0, looseWidth),
+      height: top - LOOSE_GAP - y,
+    },
+  }
+}
+
+export type ColumnsLookup =
+  | { found: "one"; table: SchemaTableLike }
+  | { found: "none" }
+  | { found: "many"; count: number }
+
+/**
+ * The warehouse table an asset table node names. The graph names a table
+ * `schema.table`, or bare when its producer gave no schema (asset_graph.go
+ * splitModelTarget), so a bare name matches in any schema, and can match more than one.
+ */
+export function findWarehouseTable(assetName: string, tables: SchemaTableLike[]): ColumnsLookup {
+  const dot = assetName.lastIndexOf(".")
+  const table = assetName.slice(dot + 1).toLowerCase()
+  const schema = dot > 0 ? assetName.slice(0, dot).toLowerCase() : null
+  const hits = tables.filter(
+    (t) => t.name.toLowerCase() === table && (schema === null || (t.schema ?? "").toLowerCase() === schema),
+  )
+  if (hits.length === 1) return { found: "one", table: hits[0] }
+  return hits.length === 0 ? { found: "none" } : { found: "many", count: hits.length }
 }
 
 function plural(n: number, one: string, many: string): string {

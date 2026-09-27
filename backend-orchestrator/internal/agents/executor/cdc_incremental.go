@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/rsync-ai/backend-orchestrator/internal/cdcsnapshot"
+	"github.com/rsync-ai/backend-orchestrator/internal/utils"
+	"github.com/rsync-ai/shared/kafkaclient"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -81,6 +84,36 @@ func computeCDCSnapshotStrategy(sourceType string, totalRowEstimate, thresholdRo
 	return snapshotStrategyBlocking
 }
 
+// cdcSignalTopicFor names the Kafka signal topic a CDC connector listens on, or ""
+// when the source gets none. Every PostgreSQL-family source gets one, whatever its
+// snapshot strategy: the channel is how Re-snapshot and "backfill newly added
+// tables" reach the connector after it starts (BackfillCDCTables), so it cannot be
+// reserved for the incremental initial load. MongoDB gets one too, but it only
+// ever carries BLOCKING snapshot signals — an incremental MongoDB snapshot writes
+// watermark documents into the source, so BackfillCDCTables refuses that mode for
+// it. MySQL keeps its source signal table.
+func cdcSignalTopicFor(sourceType, pipelineID string) string {
+	if !isPostgresFamily(sourceType) && normalizeDBType(sourceType) != "mongodb" {
+		return ""
+	}
+	return kafkaclient.Topic(fmt.Sprintf("signals.%s", utils.SafeID8(pipelineID)))
+}
+
+// applyCDCSignalParams adds the Debezium MCP start_sync params for the signal
+// channel and the snapshot strategy. They are separate on purpose:
+// signal_kafka_topic alone wires the channel and leaves snapshot.mode alone;
+// snapshot_strategy=incremental additionally swaps the blocking initial snapshot
+// for snapshot.mode=no_data plus an execute-snapshot signal the executor sends
+// once the connector is RUNNING.
+func applyCDCSignalParams(params map[string]interface{}, snapshotStrategy, signalTopic string) {
+	if signalTopic != "" {
+		params["signal_kafka_topic"] = signalTopic
+	}
+	if snapshotStrategy == snapshotStrategyIncremental {
+		params["snapshot_strategy"] = snapshotStrategyIncremental
+	}
+}
+
 // cdcAutoBatchInitialLoadEnabled reports whether the orchestrator may auto-select the
 // resumable hybrid batch initial load for a large CDC pipeline that would otherwise use
 // Debezium's non-resumable blocking snapshot. Defaults ON; set CDC_AUTO_BATCH_INITIAL_LOAD
@@ -138,7 +171,9 @@ func (a *Agent) shouldAutoUseBatchInitialLoad(ctx context.Context, task Executor
 
 // buildIncrementalSnapshotSignal builds the Kafka signal-channel message that triggers a
 // Debezium incremental snapshot. Per the Debezium signalling contract the message KEY must
-// be the connector's topic.prefix (== the connector name here) and the VALUE is the
+// be the connector's topic.prefix -- which is NOT the connector name: the connector is
+// registered as the bare cdc-<id8>, while its topic.prefix is the namespace-qualified
+// rsync.cdc-<id8> (see incrementalSnapshotSignalKey) -- and the VALUE is the
 // execute-snapshot signal JSON. dataCollections are the fully-qualified table identifiers
 // as Debezium emits them (e.g. "public.orders").
 func buildIncrementalSnapshotSignal(topicPrefix string, dataCollections []string) (key, value []byte, err error) {
@@ -307,7 +342,7 @@ func (a *Agent) triggerIncrementalSnapshot(ctx context.Context, task ExecutorTas
 	if a.kafkaManager == nil {
 		return fmt.Errorf("CDC incremental snapshot: no Kafka manager; history will NOT backfill (connector started with snapshot.mode=no_data)")
 	}
-	key, value, err := buildIncrementalSnapshotSignal(connectorName, dataCollections)
+	key, value, err := buildIncrementalSnapshotSignal(a.resolveSignalKey(ctx, connectorName), dataCollections)
 	if err != nil {
 		return fmt.Errorf("CDC incremental snapshot: could not build signal (history will NOT backfill): %w", err)
 	}
@@ -333,6 +368,38 @@ func (a *Agent) triggerIncrementalSnapshot(ctx context.Context, task ExecutorTas
 		"tables":       len(dataCollections),
 	}).Info("📸 CDC incremental snapshot triggered via Kafka signal (backfill runs concurrently with streaming)")
 	return nil
+}
+
+// incrementalSnapshotSignalKey is the key Debezium's Kafka signal channel accepts for
+// this connector: its topic.prefix. A signal under any other key is skipped by the
+// connector without an error, so the historical backfill of an incremental snapshot
+// would never start while the pipeline reports running.
+//
+// cfg is the connector's live config from Kafka Connect; its topic.prefix wins
+// (cdcsnapshot.SignalKey). Without one, the key is the prefix connector.py sets,
+// _qualify_topic(connector_name), predicted by debeziumTopicPrefixFor -- never the bare
+// connector name, which is what cdcsnapshot.SignalKey itself falls back to.
+func incrementalSnapshotSignalKey(cfg map[string]interface{}, connectorName string) string {
+	predicted := debeziumTopicPrefixFor(map[string]interface{}{"connector_name": connectorName})
+	if k := strings.TrimSpace(cdcsnapshot.SignalKey(cfg, predicted)); k != "" {
+		return k
+	}
+	return predicted
+}
+
+// resolveSignalKey reads the connector's config from Kafka Connect and returns
+// incrementalSnapshotSignalKey for it. A failed read falls back to the predicted prefix.
+func (a *Agent) resolveSignalKey(ctx context.Context, connectorName string) string {
+	base := strings.TrimRight(os.Getenv("KAFKA_CONNECT_URL"), "/")
+	if base == "" {
+		base = "http://kafka-connect:8083"
+	}
+	cfg, err := cdcsnapshot.NewConnectClient(base).Config(ctx, connectorName)
+	if err != nil {
+		log.WithError(err).WithField("connector", connectorName).
+			Warn("⚠️  CDC incremental snapshot: could not read the connector config; keying the signal with the predicted topic.prefix")
+	}
+	return incrementalSnapshotSignalKey(cfg, connectorName)
 }
 
 // waitConnectorRunning polls the Kafka Connect REST status for the connector until both

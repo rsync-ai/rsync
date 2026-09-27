@@ -253,7 +253,7 @@ The replication factor every topic this chart creates is born with.
 There is ONE definition because there used to be two, and on a BYO cluster with
 kafka.replicationFactor unset they disagreed: connectors/cdc.yaml derived 3 for
 Kafka Connect's three internal topics while jobs/kafka-init.yaml's shell derived
-1 for the 14 static topics. Same chart, same cluster, same install. Neither can
+1 for the platform topics it creates. Same chart, same cluster, same install. Neither can
 see the cluster, so neither was more right than the other.
 
 The 3 was the dangerous half, because Connect creates its internal topics itself
@@ -281,7 +281,7 @@ already sets the value explicitly, and the in-chart broker below is knowable.
 {{- else if .Values.kafka.enabled -}}
 1
 {{- else -}}
-{{- fail "kafka.enabled=false requires an explicit kafka.replicationFactor.\n\nThe chart cannot see your cluster, so it cannot derive one. It used to assume 3,\nwhich is wrong for every cluster with fewer than three brokers -- and it does not\nfail at render time. Kafka Connect starts, asks for 3 replicas for its internal\ntopics, and crash-loops with\n\n    TimeoutException: Timeout expired while trying to create topic(s)\n\na message that names neither the replication factor nor the broker count.\n\nSet it to your broker count, capped at 3:\n\n    1 broker  -> kafka.replicationFactor: \"1\"\n    2 brokers -> kafka.replicationFactor: \"2\"\n    3 or more -> kafka.replicationFactor: \"3\"  (with kafka.minInsyncReplicas: \"2\")\n\nState your REAL broker count. Overstating it is not harmless: kafka-init clamps\ndown to the live broker count so the platform's own 14 topics degrade with a\nwarning rather than failing to create, but Kafka Connect's three internal topics\ncannot be clamped by anything -- Connect creates them itself, before any of this\nplatform's code runs -- so too large a value still crash-loops Connect exactly as\ndescribed above. That is precisely why the chart will not pick a value for you." -}}
+{{- fail "kafka.enabled=false requires an explicit kafka.replicationFactor.\n\nThe chart cannot see your cluster, so it cannot derive one. It used to assume 3,\nwhich is wrong for every cluster with fewer than three brokers -- and it does not\nfail at render time. Kafka Connect starts, asks for 3 replicas for its internal\ntopics, and crash-loops with\n\n    TimeoutException: Timeout expired while trying to create topic(s)\n\na message that names neither the replication factor nor the broker count.\n\nSet it to your broker count, capped at 3:\n\n    1 broker  -> kafka.replicationFactor: \"1\"\n    2 brokers -> kafka.replicationFactor: \"2\"\n    3 or more -> kafka.replicationFactor: \"3\"  (with kafka.minInsyncReplicas: \"2\")\n\nState your REAL broker count. Overstating it is not harmless: kafka-init clamps\ndown to the live broker count so the platform's own topics degrade with a\nwarning rather than failing to create, but Kafka Connect's three internal topics\ncannot be clamped by anything -- Connect creates them itself, before any of this\nplatform's code runs -- so too large a value still crash-loops Connect exactly as\ndescribed above. That is precisely why the chart will not pick a value for you." -}}
 {{- end -}}
 {{- end -}}
 
@@ -318,6 +318,15 @@ rather than inherited.
   value: "json"
 - name: LOG_LEVEL
   value: {{ .Values.logLevel | default "info" | quote }}
+{{- /* The chart ships no OTLP collector, and the services default OTEL_ENABLED to
+true with a localhost:4317 exporter, so every pod retried a dead endpoint and
+logged each failure. Off here unless `extraEnv` sets it, which is how you turn it
+back on (with an OTEL_EXPORTER_OTLP_ENDPOINT for a collector you run). Emitted
+only then, never twice: a duplicate env name is rejected by server-side apply. */}}
+{{- if not (hasKey (.Values.extraEnv | default dict) "OTEL_ENABLED") }}
+- name: OTEL_ENABLED
+  value: "false"
+{{- end }}
 {{- range $k, $v := .Values.extraEnv }}
 - name: {{ $k }}
   value: {{ $v | quote }}

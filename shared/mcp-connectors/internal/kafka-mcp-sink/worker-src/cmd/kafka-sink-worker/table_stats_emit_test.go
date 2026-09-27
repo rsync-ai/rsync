@@ -117,7 +117,7 @@ func TestNoteTableStatsEmit_RealWriterFailureIsCounted(t *testing.T) {
 	sm := statsEmitTestMessage()
 	var cdcErr, batchErr error
 	captureLogLines(t, func() {
-		cdcErr = emitCDCTableStats(ctx, w, sm, 1, 2, 3, 4, 0)
+		cdcErr = emitCDCTableStats(ctx, w, sm, 1, 2, 3, 4, 0, 0)
 		noteTableStatsEmit(metrics, sm, "cdc", cdcErr)
 		batchErr = emitTableStats(ctx, w, sm, "batch", "running", 10, 10, 100)
 		noteTableStatsEmit(metrics, sm, "batch", batchErr)

@@ -484,14 +484,21 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 
 	serverKey := makeServerKey(config.Name, config.Version)
 
-	// Fast path: if a healthy HTTP server is already cached, return it immediately.
+	// Fast path: a cached HTTP server is returned while it still answers. One that was
+	// stopped or removed is dropped here, so the search and deploy below bring it back;
+	// otherwise every restart path (preflight, the infra sweep, dependency_probe's
+	// recovery) got the dead entry back until the orchestrator restarted.
 	sm.mu.RLock()
-	if server, exists := sm.servers[serverKey]; exists && server != nil && server.Status == "running" && server.ConnType == "http" {
-		sm.mu.RUnlock()
-		log.Infof("MCP server %s@%s already running via HTTP at %s:%d", config.Name, config.Version, server.Host, server.Port)
-		return server, nil
-	}
+	cached := sm.servers[serverKey]
 	sm.mu.RUnlock()
+	if cached != nil && cached.Status == "running" && cached.ConnType == "http" {
+		if sm.cachedHTTPServerAnswers(cached) {
+			log.Infof("MCP server %s@%s already running via HTTP at %s:%d", config.Name, config.Version, cached.Host, cached.Port)
+			return cached, nil
+		}
+		log.Warnf("⚠️  Cached MCP server %s@%s at %s:%d no longer answers /health — dropping it and looking for or deploying a container", config.Name, config.Version, cached.Host, cached.Port)
+		sm.forgetServer(cached)
+	}
 
 	// Deduplicate concurrent starts without holding sm.mu during blocking ops.
 	sm.mu.Lock()
@@ -591,7 +598,14 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 	//   - Fresh installs: connector images exist but containers were never started.
 	// Max wait is gated by config.DeployWaitTimeout (default 60s). Batch callers that don't
 	// need HTTP transport will reach the stdio fallback below if the container never appears.
-	deployed, building := sm.tryDeployConnectorContainer(config.Name, config.Version)
+	deployed, building, deployErr := sm.tryDeployConnectorContainer(config.Name, config.Version)
+	if deployErr != nil && (config.RequireHTTP || config.NoStdioWhileDeploying) {
+		// tool-generator said the deploy failed, so no container is coming: waiting out
+		// DeployWaitTimeout would only delay the error, and the guards below would replace
+		// the reason with "no container is reachable" or "still being set up". Callers
+		// that can use stdio fall through to it, as they do when no deploy was possible.
+		return finish(nil, fmt.Errorf("connector %s@%s could not be deployed: %w", config.Name, config.Version, deployErr))
+	}
 	if deployed {
 		waitTimeout := config.DeployWaitTimeout
 		if waitTimeout <= 0 {
@@ -802,15 +816,21 @@ func (sm *ServerManager) StartServer(config ServerConfig) (*ServerInfo, error) {
 // lets a pipeline pinned to an OLD connector version get its container built just-in-time
 // when the image was pruned after a newer version was promoted.
 //
-// Returns (deployed, building):
+// Returns (deployed, building, deployErr):
 //   - deployed: the deploy request was accepted (does not guarantee the container is up yet).
 //   - building: tool-generator kicked off a background image build; the caller should
 //     extend its poll deadline because a cold build can take minutes.
-func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version string) (bool, bool) {
+//   - deployErr: tool-generator answered and said the deploy FAILED. /v1/deploy reports
+//     a failure as HTTP 200 with "success": false and the reason in "error_message", so
+//     the status code alone reads a failed deploy as accepted and the caller polls for a
+//     container that is never coming
+//     (KI-MCP-REDEPLOY-IGNORES-STACK-PREFIX-AND-FAILED-DEPLOY-READS-AS-SUCCESS). A body
+//     without a "success" field (older tool-generator) keeps the accepted reading.
+func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version string) (deployed, building bool, deployErr error) {
 	toolGenURL := strings.TrimSpace(os.Getenv("TOOL_GENERATOR_URL"))
 	if toolGenURL == "" {
 		// No tool-generator configured; skip
-		return false, false
+		return false, false, nil
 	}
 	if version == "" {
 		version = "latest"
@@ -832,7 +852,7 @@ func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version stri
 	client := &http.Client{Timeout: deployCallTimeout}
 	req, err := http.NewRequest("POST", url, bytes.NewBuffer(body))
 	if err != nil {
-		return false, false
+		return false, false, nil
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if secret := strings.TrimSpace(os.Getenv("INTERNAL_SERVICE_SECRET")); secret != "" {
@@ -852,35 +872,96 @@ func (sm *ServerManager) tryDeployConnectorContainer(connectorName, version stri
 			// than they asked for.
 			log.Warnf("Tool-generator deploy call for %s@%s did not answer within %s — treating the deploy as in progress: %v",
 				connectorName, version, deployCallTimeout, err)
-			return true, false
+			return true, false, nil
 		}
 		log.Warnf("Tool-generator deploy call failed: %v", err)
-		return false, false
+		return false, false, nil
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		log.Warnf("Tool-generator deploy returned HTTP %d for %s@%s", resp.StatusCode, connectorName, version)
-		return false, false
+		return false, false, nil
 	}
 
-	// Detect whether a background build was kicked off so the caller can extend its poll.
-	building := false
+	// Read the outcome: a reported failure, or a background build the caller should
+	// extend its poll for.
 	if respBody, rerr := io.ReadAll(resp.Body); rerr == nil && len(respBody) > 0 {
 		var dr struct {
-			Building bool `json:"building"`
+			Success      *bool  `json:"success"`
+			Building     bool   `json:"building"`
+			ErrorMessage string `json:"error_message"`
 		}
 		if json.Unmarshal(respBody, &dr) == nil {
+			if dr.Success != nil && !*dr.Success {
+				reason := strings.TrimSpace(dr.ErrorMessage)
+				if reason == "" {
+					reason = "tool-generator reported the deploy failed without a reason"
+				}
+				log.Warnf("Tool-generator reported the deploy of %s@%s failed: %s", connectorName, version, reason)
+				return false, false, errors.New(reason)
+			}
 			building = dr.Building
 		}
 	}
 
-	return true, building
+	return true, building, nil
 }
 
 // deployCallTimeout bounds the tool-generator /v1/deploy request. A var so tests can
 // shorten it.
 var deployCallTimeout = 15 * time.Second
+
+// cachedHTTPVerifyInterval is how long StartServer trusts a cached HTTP server's last
+// good /health answer. Every tool call passes through StartServer, so asking on each
+// one would double the requests to the connector.
+var cachedHTTPVerifyInterval = 15 * time.Second
+
+// cachedHTTPProbeTimeout bounds that /health check. It is shorter than
+// checkDockerContainer's 5s: a busy connector that misses it is only dropped from the
+// cache, and the container search that follows, with the longer timeout, finds it again.
+var cachedHTTPProbeTimeout = 2 * time.Second
+
+// cachedHTTPServerAnswers reports whether a cached HTTP server answered /health with 200
+// within cachedHTTPVerifyInterval, asking it again when the last answer is older.
+func (sm *ServerManager) cachedHTTPServerAnswers(server *ServerInfo) bool {
+	server.mu.RLock()
+	verifiedAt := server.verifiedAt
+	server.mu.RUnlock()
+	if !verifiedAt.IsZero() && time.Since(verifiedAt) < cachedHTTPVerifyInterval {
+		return true
+	}
+
+	client := &http.Client{Timeout: cachedHTTPProbeTimeout}
+	resp, err := client.Get(fmt.Sprintf("http://%s:%d/health", server.Host, server.Port))
+	if err != nil {
+		log.Debugf("Cached MCP server %s:%d not reachable: %v", server.Host, server.Port, err)
+		return false
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		log.Debugf("Cached MCP server %s:%d returned status %d", server.Host, server.Port, resp.StatusCode)
+		return false
+	}
+
+	server.mu.Lock()
+	server.verifiedAt = time.Now()
+	server.mu.Unlock()
+	return true
+}
+
+// forgetServer drops server from the cache while it is still the entry registered for
+// its key. It matches the pointer, so a caller holding a stale entry cannot evict the
+// fresh one another caller has registered since.
+func (sm *ServerManager) forgetServer(server *ServerInfo) {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	for key, cur := range sm.servers {
+		if cur == server {
+			delete(sm.servers, key)
+		}
+	}
+}
 
 // isTimeoutError reports whether an HTTP client error is a timeout (the server accepted
 // the request but did not answer in time) rather than a refusal or DNS failure.
@@ -1075,6 +1156,15 @@ func (sm *ServerManager) StopServer(connectorType string, version string) error 
 		return fmt.Errorf("server not running: %s@%s", connectorType, version)
 	}
 
+	// An http entry is a Docker container checkDockerContainer found, not a process
+	// this manager started: Process is nil and the container's lifecycle is not ours.
+	// Forget it and leave the container running.
+	if server.Process == nil || server.Process.Process == nil {
+		delete(sm.servers, key)
+		log.Infof("Released MCP server %s@%s (%s; container left running)", connectorType, version, server.ConnType)
+		return nil
+	}
+
 	// Kill process
 	if err := server.Process.Process.Kill(); err != nil {
 		return fmt.Errorf("failed to kill process: %w", err)
@@ -1187,6 +1277,7 @@ func (sm *ServerManager) checkDockerContainer(containerName, connectorName strin
 		Port:        8000,          // MCP connectors use internal port 8000
 		ContainerID: containerName,
 		StartedAt:   time.Now(),
+		verifiedAt:  time.Now(),
 	}
 }
 
@@ -1212,7 +1303,9 @@ func (sm *ServerManager) StopAll() error {
 
 	var errors []string
 	for name, server := range sm.servers {
-		if server.Status == "running" {
+		// http entries have no process to kill (see StopServer); resetting the map
+		// below is all there is to do for them.
+		if server.Status == "running" && server.Process != nil && server.Process.Process != nil {
 			if err := server.Process.Process.Kill(); err != nil {
 				errors = append(errors, fmt.Sprintf("%s: %v", name, err))
 			} else {

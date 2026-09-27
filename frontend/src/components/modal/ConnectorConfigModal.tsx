@@ -5,6 +5,7 @@ import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } f
 import { GenericConnectorForm } from "@/components/connectors/GenericConnectorForm"
 import { fetchMCPConnector } from "@/lib/api/mcp-connectors"
 import { Loader2 } from "lucide-react"
+import { Button } from "@/components/ui/button"
 import { toast } from "sonner"
 import { saveConnection } from "@/lib/api/mcp-connectors"
 
@@ -17,6 +18,24 @@ interface ConnectorConfigModalProps {
   pipelineId?: string
 }
 
+/**
+ * The id the server gave this connection, or an error.
+ *
+ * The call site read `result.id || crypto.randomUUID()`: when the server
+ * returned no id, the client MINTED one, toasted "configured successfully", and
+ * handed that id to onSave, which wires it into the pipeline. The pipeline then
+ * pointed at a connection that exists in no database, and the failure surfaced
+ * much later, far from its cause, as an unresolvable connection id. A create
+ * response with no id is a failed create, whatever status code carried it.
+ */
+export function requireConnectionId(result: { id?: unknown } | null | undefined): string {
+  const id = typeof result?.id === "string" ? result.id.trim() : ""
+  if (!id) {
+    throw new Error("The server accepted the request but returned no connection id")
+  }
+  return id
+}
+
 export function ConnectorConfigModal({
   open,
   onClose,
@@ -27,6 +46,7 @@ export function ConnectorConfigModal({
 }: ConnectorConfigModalProps) {
   const [loading, setLoading] = useState(false)
   const [connector, setConnector] = useState<any>(null)
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
   
   // Load connector metadata when modal opens
@@ -38,11 +58,13 @@ export function ConnectorConfigModal({
   
   const loadConnector = async () => {
     setLoading(true)
+    setLoadError(null)
     try {
       const data = await fetchMCPConnector(connectorType)
       setConnector(data)
     } catch (error) {
       console.error("Failed to load connector:", error)
+      setLoadError(error instanceof Error ? error.message : `Failed to load connector: ${connectorType}`)
       toast.error(`Failed to load connector: ${connectorType}`)
     } finally {
       setLoading(false)
@@ -63,14 +85,19 @@ export function ConnectorConfigModal({
       }
 
       const result = await saveConnection(payload)
-      const connectionId = result.id || crypto.randomUUID()
+
+      const connectionId = requireConnectionId(result)
 
       toast.success(`${direction === "source" ? "Source" : "Destination"} connection configured successfully`)
       onSave(connectionId, (payload.config as Record<string, unknown>) || {})
       onClose()
     } catch (error) {
       console.error("Failed to save connection:", error)
-      toast.error("Failed to save connection")
+      // The server says WHY (duplicate name, unreachable host, bad credentials).
+      // A flat "Failed to save connection" threw all of that away and left the
+      // user to guess which field to change.
+      const detail = error instanceof Error ? error.message.trim() : ""
+      toast.error(detail ? `Failed to save connection: ${detail}` : "Failed to save connection")
     } finally {
       setSaving(false)
     }
@@ -103,8 +130,22 @@ export function ConnectorConfigModal({
             }}
           />
         ) : (
-          <div className="py-8 text-center text-zinc-500 dark:text-zinc-400">
-            Connector not found: {connectorType}
+          // fetchMCPConnector THROWS on every failure (mcp-connectors.ts:56) and
+          // only returns on success, so a null connector here always means the
+          // lookup failed -- never that the catalog lacks this connector. The old
+          // copy, "Connector not found: postgresql", told the user their setup was
+          // wrong when the truth was that the request never landed.
+          <div className="py-8 text-center space-y-3">
+            <p className="text-sm text-zinc-700 dark:text-zinc-300">
+              Could not load the {connectorType} connector
+            </p>
+            <p className="text-xs text-zinc-500 dark:text-zinc-400">
+              {loadError || "The request to the connector catalog did not complete."} This does not
+              mean the connector is unavailable.
+            </p>
+            <Button variant="outline" size="sm" onClick={loadConnector} disabled={loading}>
+              Retry
+            </Button>
           </div>
         )}
       </DialogContent>

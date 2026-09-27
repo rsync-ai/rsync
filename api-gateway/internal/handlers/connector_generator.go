@@ -489,6 +489,17 @@ func GenerateConnector(c *gin.Context) {
 				payload["error_message"] = e
 			} else if m, ok := payload["message"].(string); ok && m != "" {
 				payload["error_message"] = m
+			} else if d := fastAPIDetail(payload["detail"]); d != "" {
+				// llm-service signals failure by raising HTTPException, whose body
+				// is {"detail": ...} and carries NEITHER "error" NOR "message"
+				// (tool_generator/deployment/routes.go:62, service.py, and every
+				// discovery route). The chain above therefore never matched a
+				// single one of them, and they all reached the wizard as the flat
+				// string "Generation failed" -- so an operator whose
+				// INTERNAL_API_SECRET was unset was told their connector had
+				// failed to generate, rather than that the service was not
+				// configured to generate it.
+				payload["error_message"] = d
 			} else {
 				payload["error_message"] = "Generation failed"
 			}
@@ -499,6 +510,26 @@ func GenerateConnector(c *gin.Context) {
 	}
 
 	c.JSON(resp.StatusCode, payload)
+}
+
+// fastAPIDetail flattens a FastAPI error body's `detail` into a single line.
+//
+// `raise HTTPException(status_code=503, detail="internal_secret_not_configured")`
+// serializes as {"detail": "<string>"}; the structured form passes a dict and
+// serializes as {"detail": {...}}. Both shapes are handled; anything else
+// yields "" so the caller falls through to its own default.
+func fastAPIDetail(v any) string {
+	switch d := v.(type) {
+	case string:
+		return strings.TrimSpace(d)
+	case map[string]any:
+		for _, k := range []string{"message", "error", "detail", "msg"} {
+			if sv, ok := d[k].(string); ok && strings.TrimSpace(sv) != "" {
+				return strings.TrimSpace(sv)
+			}
+		}
+	}
+	return ""
 }
 
 // Note: Legacy V1 endpoint and separate V2 function have been removed.

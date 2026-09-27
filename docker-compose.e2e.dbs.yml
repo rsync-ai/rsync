@@ -94,7 +94,14 @@ services:
     # different MinIO instances → NoSuchKey → DLQ → silent data drop. Only start
     # it when the main stack is absent — `make e2e-start` guards on exactly that.
     profiles: ["standalone-minio"]
-    image: quay.io/minio/minio:latest
+    # Chainguard's build: MinIO withdrew anonymous pulls from docker.io/minio/* and
+    # then quay.io/minio/*. Floating on purpose (a torn-down fixture; see the
+    # ALLOWLIST in llm-service/tests/test_shipped_images_are_pinned.py).
+    image: cgr.dev/chainguard/minio:latest
+    # Root, like the image this replaces: `minio_data` persists across runs, and a
+    # volume the old image wrote is root-owned, which this image's default user
+    # (65532) cannot write.
+    user: "0:0"
     command: ["server", "/data", "--console-address", ":9001"]
     environment:
       - MINIO_ROOT_USER=minioadmin
@@ -105,7 +112,8 @@ services:
     volumes:
       - minio_data:/data
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      # The image has no curl; mc ships in it with a default `local` alias.
+      test: ["CMD", "mc", "ready", "local"]
       interval: 5s
       timeout: 5s
       retries: 20
@@ -120,7 +128,8 @@ services:
     # its profile is inactive) and points it at the MAIN stack's minio; a plain
     # profile-less `up` must NOT pull it in.
     profiles: ["standalone-minio"]
-    image: quay.io/minio/mc:latest
+    # The server image: it ships `mc` and the shell the entrypoint below needs.
+    image: cgr.dev/chainguard/minio:latest
     container_name: rsync-ai-minio-init
     depends_on:
       minio:

@@ -581,12 +581,12 @@ Full sizing and deployment options → [docs/deployment/ollama.md](../deployment
 | Agent | Endpoint | Description |
 |-------|----------|-------------|
 | ~~Intent~~ | ~~`/agents/intent/parse`~~ | **removed (PR #167)** — intent parsing is now the Go `IntentWorker`, not an llm-service endpoint |
-| Resolver | `/agents/resolver/resolve` | Resolve connector name |
-| Explorer | `/agents/explorer/nl2sql` | Convert NL to SQL |
-| Explorer | `/agents/explorer/tables` | Resolve tables |
-| Explorer | `/agents/explorer/columns` | Resolve columns |
-| PII | `/agents/pii/scan` | Scan for PII |
-| Suggestions | `/agents/suggestions/next` | Get suggestions |
+| Explorer | `/api/v1/sql/generate` | Convert NL to SQL |
+| Explorer | `/api/v1/explorer/nl/resolve-tables` | Resolve tables |
+| Explorer | `/api/v1/explorer/nl/resolve-columns` | Resolve columns |
+| Explorer | `/api/v1/explorer/nl/next-steps` | Suggest next queries |
+| Explorer | `/agents/rank-tables` | Rank candidate tables |
+| Suggestions | `/api/v1/agents/suggestions/generate` | Get suggestions |
 
 ---
 

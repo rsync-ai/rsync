@@ -64,6 +64,8 @@ func stubEmail(email string) func(context.Context, string) (string, error) {
 }
 
 func TestSlackInteractions_HappyApprove(t *testing.T) {
+	// The healer that applies approved DDL runs only with schema drift on.
+	t.Setenv("RSYNC_SCHEMA_DRIFT_ENABLED", "true")
 	mockDB, mock, err := sqlmock.New()
 	if err != nil {
 		t.Fatalf("sqlmock.New: %v", err)

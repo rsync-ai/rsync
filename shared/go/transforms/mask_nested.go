@@ -179,8 +179,13 @@ func parseMaskSpec(config map[string]interface{}) (*maskSpec, error) {
 		spec.pathNames = append(spec.pathNames, name)
 	}
 
+	// An empty mask_type is not a choice, it is an unset field - the UI sends one
+	// for every rule the user never opened. Taking it literally fell through
+	// applyMask's default branch to "***", silently turning the documented
+	// reversible-lookup default (hash) into irreversible redaction. Guarded the
+	// same way hash_function directly below always was.
 	spec.maskType = "hash"
-	if mt, ok := config["mask_type"].(string); ok {
+	if mt, ok := config["mask_type"].(string); ok && strings.TrimSpace(mt) != "" {
 		spec.maskType = mt
 	}
 

@@ -317,6 +317,30 @@ func TestSourceHeartbeatEnabled(t *testing.T) {
 	}
 }
 
+// #12 gave PostgreSQL sources a heartbeat. It acknowledges filtered WAL, but on a
+// database with no writes it repeats the same LSN, so it is not a liveness beacon and
+// must not arm the stall alarm. Only MongoDB's heartbeat moves an idle position.
+func TestHeartbeatAdvancesAnIdlePosition(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		config map[string]interface{}
+		want   bool
+	}{
+		{"mongodb", map[string]interface{}{"connector.class": "io.debezium.connector.mongodb.MongoDbConnector", "heartbeat.interval.ms": "300000"}, true},
+		{"postgresql", map[string]interface{}{"connector.class": "io.debezium.connector.postgresql.PostgresConnector", "heartbeat.interval.ms": "300000"}, false},
+		{"mysql", map[string]interface{}{"connector.class": "io.debezium.connector.mysql.MySqlConnector"}, false},
+		{"class absent", map[string]interface{}{"heartbeat.interval.ms": "300000"}, false},
+		{"class not a string", map[string]interface{}{"connector.class": 7}, false},
+		{"nil config", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := heartbeatAdvancesAnIdlePosition(tc.config); got != tc.want {
+				t.Fatalf("heartbeatAdvancesAnIdlePosition(%v) = %v, want %v", tc.config, got, tc.want)
+			}
+		})
+	}
+}
+
 // The issue id must be its own class. Colliding with cdc-connector-down-* would let the
 // connector-down resolver clear a stall that Connect never admitted to, which is exactly
 // the blindness this alarm exists to fix.

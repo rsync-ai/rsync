@@ -12,6 +12,8 @@ import (
 	log "github.com/sirupsen/logrus"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/healer"
+	"github.com/rsync-ai/backend-orchestrator/internal/cdc"
+	"github.com/rsync-ai/backend-orchestrator/internal/config"
 )
 
 // Source DDL that CDC will never mirror to the destination.
@@ -383,10 +385,44 @@ func buildUnappliedChangeEvent(pipelineID string, c unappliedChange, schemaName 
 	}
 }
 
+// schemaChangeConsumerWanted reports whether a connector publishes source DDL to its
+// bare topic.prefix topic, from the connector config Kafka Connect returns.
+//
+// Only the historized Debezium connectors do (cdc.HistorizedConnectorClass: MySQL,
+// MariaDB, SQL Server, Oracle, Db2), and only while include.schema.changes is not
+// "false" (Debezium's default is true). The PostgreSQL-family and MongoDB connectors
+// have no schema-change topic, so a consumer there would read nothing and its
+// subscription would create an empty rsync.cdc-<id8> per pipeline.
+func schemaChangeConsumerWanted(cfg map[string]interface{}) bool {
+	class, _ := cfg["connector.class"].(string)
+	if !cdc.HistorizedConnectorClass(class) {
+		return false
+	}
+	if v, ok := cfg["include.schema.changes"].(string); ok && strings.EqualFold(strings.TrimSpace(v), "false") {
+		return false
+	}
+	return true
+}
+
+// ensureSchemaChangeTopic creates the connector's bare topic.prefix topic through the
+// Kafka manager's ensure choke point (kafka.Manager.EnsureDDLTopic: 1 partition, seven
+// days of delete retention) when it does not exist yet. An existing topic, whether the
+// executor pre-created it or Debezium already wrote to it, is left as it is.
+func (a *Agent) ensureSchemaChangeTopic(topic string) error {
+	if a.ensureDDLTopic != nil {
+		return a.ensureDDLTopic(topic)
+	}
+	if a.kafka == nil {
+		return fmt.Errorf("no Kafka manager to create %s", topic)
+	}
+	return a.kafka.EnsureDDLTopic(topic)
+}
+
 // runSchemaChangeWorker consumes the connector's schema-change topic for the lifetime
 // of the pipeline worker.
 func (a *Agent) runSchemaChangeWorker(w *pipelineWorker) {
 	handler := &schemaChangeHandler{agent: a, worker: w}
+	ensured := false
 	for {
 		select {
 		case <-w.ctx.Done():
@@ -394,9 +430,21 @@ func (a *Agent) runSchemaChangeWorker(w *pipelineWorker) {
 		default:
 		}
 
-		// The bare topic.prefix topic. Debezium creates it on the first DDL, which for
-		// a snapshotting connector is immediate — but a Consume against a topic that
-		// does not exist yet fails, so this loop is the retry.
+		// The bare topic.prefix topic. The executor pre-creates it before start_sync
+		// for historized engines; this ensure covers a connector that predates that,
+		// and must run before the subscription, because the subscribing consumer does
+		// not create topics (newSchemaChangeConsumerConfig) and a Consume against a
+		// missing topic fails. A failed ensure is retried on the next pass.
+		if !ensured {
+			if err := a.ensureSchemaChangeTopic(w.topicPrefix); err != nil {
+				log.WithError(err).WithFields(log.Fields{
+					"pipeline_id": w.pipelineID,
+					"topic":       w.topicPrefix,
+				}).Warn("cdc schema changes: could not ensure the schema-change topic; will retry")
+			} else {
+				ensured = true
+			}
+		}
 		err := w.ddlConsumer.Consume(w.ctx, []string{w.topicPrefix}, handler)
 		if w.ctx.Err() != nil {
 			return
@@ -448,6 +496,14 @@ func (a *Agent) handleSchemaChangeRecord(ctx context.Context, w *pipelineWorker,
 	// classifySchemaChange files nothing — a CREATE is never drift worth approving,
 	// but it is exactly what closes an open drop.
 	a.trackSelectedTableDrops(ctx, w, &msg)
+
+	// The report onto healer.HealerTopic belongs to the schema-drift path. With
+	// RSYNC_SCHEMA_DRIFT_ENABLED off nothing consumes that topic and
+	// kafka.EnsurePlatformTopics does not provision it, so a produce here would only
+	// auto-create it. The drop tracking above is a health fact and stays ungated.
+	if !config.SchemaDriftEnabled() {
+		return
+	}
 
 	changes := classifySchemaChange(&msg, w.destNamespace)
 	if len(changes) == 0 {
@@ -501,5 +557,10 @@ func newSchemaChangeConsumerConfig() *sarama.Config {
 	cfg.Consumer.Offsets.AutoCommit.Enable = true
 	cfg.Consumer.Offsets.AutoCommit.Interval = 5 * time.Second
 	cfg.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{sarama.NewBalanceStrategySticky()}
+	// This consumer's metadata requests must not create the topic it subscribes to:
+	// the topic is created by ensureSchemaChangeTopic at its own partition count and
+	// retention, and a broker auto-create would use the broker's defaults instead.
+	// Scoped to this consumer only; no shared client config is touched.
+	cfg.Metadata.AllowAutoTopicCreation = false
 	return cfg
 }

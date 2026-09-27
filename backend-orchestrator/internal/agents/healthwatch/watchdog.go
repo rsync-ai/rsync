@@ -10,13 +10,13 @@
 // — typically before users notice.
 //
 // The watchdog runs as a goroutine started by the orchestrator. It:
-//   1. Wakes every hour
-//   2. Computes a fresh rollup from `executions` → `connector_version_health`
-//   3. Flags any (type, version) whose success_rate is >RegressionThreshold
-//      below the previous version (with at least MinSampleSize executions)
-//   4. Emits a notification via the existing rsync.notifications topic
-//      (consumed by api-gateway's notifier service) when a NEW regression
-//      is detected (dedup'd by the notifier so flapping versions don't spam)
+//  1. Wakes every hour
+//  2. Computes a fresh rollup from `executions` → `connector_version_health`
+//  3. Flags any (type, version) whose success_rate is >RegressionThreshold
+//     below the previous version (with at least MinSampleSize executions)
+//  4. Emits a notification via the existing rsync.notifications topic
+//     (consumed by api-gateway's notifier service) when a NEW regression
+//     is detected (dedup'd by the notifier so flapping versions don't spam)
 package healthwatch
 
 import (
@@ -138,13 +138,13 @@ func (w *Watchdog) Run(ctx context.Context) error {
 			if total >= w.MinSampleSize && drop > w.RegressionThreshold {
 				cur.Regressed = true
 				newReg := regression{
-					ConnectorType:     connType,
-					Version:           cur.Version,
-					PrevVersion:       prev.Version,
-					SuccessRate:       cur.SuccessRate,
-					PrevSuccessRate:   prev.SuccessRate,
-					DropPP:            drop * 100,
-					SampleSize:        total,
+					ConnectorType:   connType,
+					Version:         cur.Version,
+					PrevVersion:     prev.Version,
+					SuccessRate:     cur.SuccessRate,
+					PrevSuccessRate: prev.SuccessRate,
+					DropPP:          drop * 100,
+					SampleSize:      total,
 				}
 				newRegressions = append(newRegressions, newReg)
 			}
@@ -173,14 +173,14 @@ func (w *Watchdog) Run(ctx context.Context) error {
 
 // healthRow mirrors one row in the rollup result.
 type healthRow struct {
-	ConnectorType     string
-	Version           string
-	SuccessCount      int
-	FailureCount      int
-	SuccessRate       float64
-	PrevVersion       string
-	PrevSuccessRate   float64
-	Regressed         bool
+	ConnectorType   string
+	Version         string
+	SuccessCount    int
+	FailureCount    int
+	SuccessRate     float64
+	PrevVersion     string
+	PrevSuccessRate float64
+	Regressed       bool
 }
 
 type regression struct {
@@ -324,9 +324,11 @@ func (w *Watchdog) emitRegressionAlert(r regression) {
 		"type":        "structured_error_notification",
 		"pipeline_id": "system", // synthetic — this is an ops-level alert
 		"timestamp":   time.Now().UTC().Format(time.RFC3339),
-		"action_url":  fmt.Sprintf("/admin/health/connector-versions/%s/%s", r.ConnectorType, r.Version),
-		"error":       se,
-		"message":     se.UserMessage,
+		// /admin/health, not a per-version drill-down: that route was never
+		// built, so the bell deep-linked every one of these alerts into a 404.
+		"action_url": "/admin/health",
+		"error":      se,
+		"message":    se.UserMessage,
 	}
 	body, err := json.Marshal(notification)
 	if err != nil {

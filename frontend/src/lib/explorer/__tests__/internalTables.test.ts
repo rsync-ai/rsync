@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest"
-import { isInternalExplorerTable, excludeInternalTables } from "../internalTables"
+import { isInternalExplorerTable } from "../internalTables"
 
 describe("isInternalExplorerTable", () => {
   it("flags rsync internal bookkeeping tables (bare names)", () => {
@@ -24,22 +24,5 @@ describe("isInternalExplorerTable", () => {
     expect(isInternalExplorerTable(undefined)).toBe(false)
     expect(isInternalExplorerTable(null)).toBe(false)
     expect(isInternalExplorerTable("")).toBe(false)
-  })
-})
-
-describe("excludeInternalTables", () => {
-  it("drops internal tables, keeps the rest in order", () => {
-    const tables = [
-      { name: "_rsync_cdc_offsets" },
-      { name: "orders" },
-      { name: "_rsync_pipelines" },
-      { name: "customers" },
-    ]
-    expect(excludeInternalTables(tables).map((t) => t.name)).toEqual(["orders", "customers"])
-  })
-
-  it("returns all tables when none are internal", () => {
-    const tables = [{ name: "orders" }, { name: "users" }]
-    expect(excludeInternalTables(tables)).toHaveLength(2)
   })
 })

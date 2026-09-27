@@ -610,3 +610,38 @@ func TestGetPipelineState_BatchSameHeartbeat_StaleWithCancel(t *testing.T) {
 		t.Fatalf("streaming must be absent for a batch pipeline, got %v", body["streaming"])
 	}
 }
+
+func TestGetPipelineState_PausedCDC_KeepsPausedOverTableSummary(t *testing.T) {
+	// BUG #14: pause writes pipelines.status only, so the progress row still carries the
+	// streaming tick's stage_summary/stage_state. While paused, /state must read paused.
+	body := serveState(t, stateFixture{
+		progressStatus: "running", pipelineStatus: "paused", syncMode: "cdc",
+	})
+	requireStatus(t, body, "paused")
+	if body["summary"] != "Paused" {
+		t.Fatalf("summary = %v, want Paused (the pre-pause stage_summary must not win)", body["summary"])
+	}
+	if body["state"] != "paused" {
+		t.Fatalf("state = %v, want paused", body["state"])
+	}
+	if body["message"] != "Pipeline paused" {
+		t.Fatalf("message = %v, want Pipeline paused", body["message"])
+	}
+	if _, ok := body["streaming"]; ok {
+		t.Fatalf("streaming must be absent for a paused pipeline, got %v", body["streaming"])
+	}
+}
+
+func TestGetPipelineState_RunningCDC_StageSummaryStillShown(t *testing.T) {
+	// Control for the test above: an unpaused row keeps its stage_summary.
+	body := serveState(t, stateFixture{
+		progressStatus: "running", pipelineStatus: "running", syncMode: "cdc",
+		extra: func(m sqlmock.Sqlmock) {
+			expectLiveness(m, ago(time.Minute), 0)
+			expectDeps(m, "healthy")
+		},
+	})
+	if body["summary"] != "executor completed" {
+		t.Fatalf("summary = %v, want the stage_summary", body["summary"])
+	}
+}

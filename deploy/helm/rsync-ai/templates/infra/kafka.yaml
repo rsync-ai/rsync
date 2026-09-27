@@ -136,8 +136,13 @@ spec:
               value: "6000"
             - name: KAFKA_GROUP_MAX_SESSION_TIMEOUT_MS
               value: "180000"
+            {{- /*
+              -XX:+ExitOnOutOfMemoryError is appended here, not in values.yaml, so a
+              heapOpts override cannot drop it: a JVM whose heap fills exits and the pod
+              restarts from its committed offsets, instead of lingering half-alive.
+            */}}
             - name: KAFKA_HEAP_OPTS
-              value: {{ .Values.kafka.heapOpts | quote }}
+              value: {{ printf "%s -XX:+ExitOnOutOfMemoryError" (trim .Values.kafka.heapOpts) | quote }}
             {{/*
               Broker cap on a single record. Kafka's 1 MiB default rejects CDC change
               events for rows with large JSON/text/blob columns, which surfaces as a

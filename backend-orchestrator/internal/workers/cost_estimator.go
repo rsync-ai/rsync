@@ -2,12 +2,10 @@ package workers
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -71,12 +69,7 @@ func NewCostEstimatorWorker(kafkaManager *kafka.Manager) *CostEstimatorWorker {
 	}
 }
 
-// AgentName returns the worker name
-func (w *CostEstimatorWorker) AgentName() string {
-	return "cost_estimator"
-}
-
-// Start begins consuming tasks
+// Start begins claiming "cost_estimator" requests from the Redis correlation store.
 func (w *CostEstimatorWorker) Start() error {
 	log.Info("🚀 Starting Cost Estimator Worker")
 
@@ -90,12 +83,6 @@ func (w *CostEstimatorWorker) Start() error {
 		log.Warn("⚠️  CostEstimatorWorker: Correlation client not initialized - V2 workflows will not work")
 	}
 
-	// Consume from dedicated topic (no consumer group = no rebalancing)
-	err := w.kafkaManager.ConsumeWithContext("agent.control.commands.cost_estimator", w.handleTask)
-	if err != nil {
-		return fmt.Errorf("failed to consume agent.control.commands: %w", err)
-	}
-
 	log.Info("✅ Cost Estimator Worker started")
 	return nil
 }
@@ -104,36 +91,6 @@ func (w *CostEstimatorWorker) Start() error {
 func (w *CostEstimatorWorker) Stop() {
 	log.Info("🛑 Stopping Cost Estimator Worker")
 	w.cancel()
-	// Kafka consumer will be stopped via context cancellation
-}
-
-// handleTask processes incoming task assignments
-func (w *CostEstimatorWorker) handleTask(ctx context.Context, msg *sarama.ConsumerMessage) error {
-	var assignment Task
-	if err := json.Unmarshal(msg.Value, &assignment); err != nil {
-		log.WithError(err).Error("Failed to unmarshal task assignment")
-		return err
-	}
-
-	// Filter: only process cost estimation tasks
-	if assignment.TaskType != "estimate_cost" {
-		return nil // Not for us
-	}
-
-	log.WithFields(log.Fields{
-		"pipeline_id": assignment.PipelineID,
-		"task_id":     assignment.TaskID,
-	}).Info("📊 Processing cost estimation task")
-
-	result, err := w.ProcessTask(ctx, assignment)
-	if err != nil {
-		log.WithError(err).Error("Cost estimation failed")
-		result.Status = "failed"
-		result.Error = err.Error()
-	}
-
-	// Route result to correlation store (V2) or Kafka (V1)
-	return RouteResult(ctx, assignment, result, w.kafkaManager)
 }
 
 // ProcessTask implements the cost estimation logic

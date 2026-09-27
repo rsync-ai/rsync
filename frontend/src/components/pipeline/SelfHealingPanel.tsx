@@ -24,6 +24,7 @@
  */
 
 import { useCallback, useEffect, useState } from "react"
+import Link from "next/link"
 import {
   Activity,
   AlertTriangle,
@@ -46,6 +47,7 @@ import {
   extractHealerActivity,
   healSucceeded,
   HEALER_EVENT_TYPES,
+  openEscalations,
   type HealerActivity,
   type PipelineRunEvent,
 } from "@/lib/pipeline/eventNormalizer"
@@ -96,6 +98,7 @@ export const CATEGORY_TOKENS = Object.keys(CATEGORY_LABELS)
 
 const VERDICT_LABELS: Record<string, string> = {
   healed: "Healed",
+  self_resolved: "Recovered on its own",
   failed_again: "Failed again",
   inconclusive: "Inconclusive",
   superseded: "Superseded",
@@ -132,7 +135,7 @@ function confidenceBand(c?: number): { text: string; cls: string } {
 
 function OutcomeBadge({ a }: { a: HealerActivity }) {
   if (a.kind === "verdict") {
-    const good = a.verdict === "healed"
+    const good = a.verdict === "healed" || a.verdict === "self_resolved"
     const bad = a.verdict === "failed_again"
     return (
       <Badge
@@ -187,7 +190,7 @@ function OutcomeBadge({ a }: { a: HealerActivity }) {
 function KindIcon({ a }: { a: HealerActivity }) {
   const cls = "h-4 w-4 shrink-0 mt-0.5"
   if (a.kind === "verdict") {
-    if (a.verdict === "healed") return <CheckCircle2 className={`${cls} text-green-600 dark:text-green-400`} />
+    if (a.verdict === "healed" || a.verdict === "self_resolved") return <CheckCircle2 className={`${cls} text-green-600 dark:text-green-400`} />
     if (a.verdict === "failed_again") return <XCircle className={`${cls} text-red-600 dark:text-red-400`} />
     return <HelpCircle className={`${cls} text-gray-400`} />
   }
@@ -264,19 +267,28 @@ function ActivityRow({ a }: { a: HealerActivity }) {
 
           {open && (
             <dl className="mt-1.5 space-y-1.5 rounded bg-gray-50 p-2 text-xs dark:bg-gray-900/50">
-              {a.failureSignature && (
-                <div>
-                  <dt className="font-medium text-gray-700 dark:text-gray-300">Failure signature</dt>
-                  <dd className="break-words font-mono text-[11px] text-gray-600 dark:text-gray-400">
-                    {a.failureSignature}
-                  </dd>
-                </div>
-              )}
               {a.errorMessage && (
                 <div>
                   <dt className="font-medium text-gray-700 dark:text-gray-300">Error it diagnosed</dt>
                   <dd className="break-words font-mono text-[11px] text-gray-600 dark:text-gray-400">
                     {a.errorMessage}
+                  </dd>
+                </div>
+              )}
+              {/* signature.go FailureSignature: category|status|source->dest|error,
+                  with ids, times and numbers replaced and the error part cut at 160
+                  characters. It groups repeats; it does not quote the error, which
+                  is the row above. */}
+              {a.failureSignature && (
+                <div>
+                  <dt className="font-medium text-gray-700 dark:text-gray-300">
+                    Grouped as{" "}
+                    <span className="font-normal text-gray-500 dark:text-gray-400">
+                      (ids and numbers replaced, error cut at 160 characters)
+                    </span>
+                  </dt>
+                  <dd className="break-words font-mono text-[11px] text-gray-600 dark:text-gray-400">
+                    {a.failureSignature}
                   </dd>
                 </div>
               )}
@@ -308,11 +320,87 @@ function ActivityRow({ a }: { a: HealerActivity }) {
   )
 }
 
-export function SelfHealingPanel({ pipelineId }: { pipelineId: string }) {
+/**
+ * What watches this pipeline, in one sentence per watcher. Both are on unless an
+ * operator turned them off (cmd/orchestrator/main.go: ENABLE_HEAL_WORKER,
+ * ENABLE_CDC_SENTINEL), and neither says so to the UI, so this states the
+ * default rather than a live flag.
+ *
+ * - The heal agent (heal/worker.go) reads every run that ended in failure, in
+ *   either mode, and acts or asks depending on its confidence.
+ * - The CDC Sentinel (sentinel/cdc_sentinel.go) polls a running stream: it
+ *   restarts a FAILED change-capture connector a bounded number of times, then
+ *   stops the pipeline and escalates, and it raises alerts for source lag, sink
+ *   lag and replication-slot WAL growth.
+ */
+function Watchers({ pipelineType }: { pipelineType?: "etl" | "cdc" }) {
+  return (
+    <ul className="space-y-0.5 text-xs text-gray-600 dark:text-gray-400">
+      <li>
+        The heal agent reads every failed run, fixes it when it is confident, and asks you when it is not.
+      </li>
+      {pipelineType === "cdc" && (
+        <li>
+          The Sentinel watches the running stream: it restarts a failed change-capture connector a few times
+          before stopping the pipeline and asking you, and raises an alert when capture or delivery falls
+          behind, or a Postgres replication slot holds too much WAL.
+        </li>
+      )}
+    </ul>
+  )
+}
+
+/** The alerts endpoint caps a page at 100 (pipeline_alerts.go pipelineAlertsMaxLimit). */
+const ALERTS_PAGE = 100
+
+/**
+ * Open Sentinel alerts for a CDC pipeline, read from the same endpoint the Data
+ * flow tab lists them from. null = not asked, or the read failed: the line is
+ * left out rather than claiming "no open alerts" on a failed read.
+ */
+async function fetchOpenAlertCount(pipelineId: string): Promise<number | null> {
+  try {
+    const res = await authFetch(
+      `${API_ENDPOINTS.PIPELINES.ALERTS(pipelineId)}?resolved=false&limit=${ALERTS_PAGE}`,
+      { cache: "no-store" }
+    )
+    if (!res.ok) return null
+    const data = await res.json()
+    return Array.isArray(data?.alerts) ? data.alerts.length : null
+  } catch {
+    return null
+  }
+}
+
+function OpenAlertsLine({ pipelineId, count }: { pipelineId: string; count: number }) {
+  if (count === 0) {
+    return <p className="text-xs text-gray-500 dark:text-gray-400">No open Sentinel alerts.</p>
+  }
+  const n = count >= ALERTS_PAGE ? `${ALERTS_PAGE}+` : String(count)
+  return (
+    <p className="text-xs text-amber-700 dark:text-amber-300">
+      {n} open Sentinel alert{count === 1 ? "" : "s"}.{" "}
+      <Link href={`/pipelines/${pipelineId}?tab=monitor`} className="text-blue-600 hover:underline dark:text-blue-400">
+        See them in Data flow
+      </Link>
+    </p>
+  )
+}
+
+export function SelfHealingPanel({
+  pipelineId,
+  pipelineType,
+}: {
+  pipelineId: string
+  /** "cdc" adds the Sentinel and its open alerts. Omitted reads as batch. */
+  pipelineType?: "etl" | "cdc"
+}) {
   const [activity, setActivity] = useState<HealerActivity[]>([])
+  const [openAlerts, setOpenAlerts] = useState<number | null>(null)
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [forbidden, setForbidden] = useState(false)
   const [showAll, setShowAll] = useState(false)
 
   const fetchActivity = useCallback(
@@ -323,13 +411,18 @@ export function SelfHealingPanel({ pipelineId }: { pipelineId: string }) {
         // fetch: healer rows have a NULL seq and sort last, so a limit=200
         // unfiltered page can contain none of them on a busy pipeline.
         const url =
-          `${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/events` +
+          `${API_ENDPOINTS.PIPELINES.EVENTS(pipelineId)}` +
           `?limit=200&event_types=${HEALER_EVENT_TYPES.join(",")}`
-        const res = await authFetch(url, { cache: "no-store" })
+        const [res, alerts] = await Promise.all([
+          authFetch(url, { cache: "no-store" }),
+          pipelineType === "cdc" ? fetchOpenAlertCount(pipelineId) : Promise.resolve(null),
+        ])
+        setOpenAlerts(alerts)
         if (!res.ok) {
           // 403 is a viewer without access to this pipeline's events; there is
           // nothing for them to do about it, so say nothing rather than showing
           // an error they cannot act on.
+          setForbidden(res.status === 403)
           setError(res.status === 403 ? null : `Could not load self-healing activity (${res.status})`)
           setActivity([])
           return
@@ -337,6 +430,7 @@ export function SelfHealingPanel({ pipelineId }: { pipelineId: string }) {
         const data = await res.json()
         const events: PipelineRunEvent[] = data.events ?? []
         setActivity(extractHealerActivity(events))
+        setForbidden(false)
         setError(null)
       } catch {
         setError("Could not load self-healing activity")
@@ -345,7 +439,7 @@ export function SelfHealingPanel({ pipelineId }: { pipelineId: string }) {
         setRefreshing(false)
       }
     },
-    [pipelineId]
+    [pipelineId, pipelineType]
   )
 
   useEffect(() => {
@@ -354,10 +448,10 @@ export function SelfHealingPanel({ pipelineId }: { pipelineId: string }) {
     return () => clearInterval(timer)
   }, [fetchActivity])
 
-  // Nothing to say before the first response lands, and nothing to say about a
-  // pipeline the healer has never had reason to look at. An empty "no healing
-  // activity" card on every healthy pipeline is noise.
-  if (loading) return null
+  // Nothing to say before the first response lands, or to a viewer who may not
+  // read this pipeline's events. Otherwise the card always shows: a healthy
+  // pipeline still has watchers, and "nothing needed healing" is itself news.
+  if (loading || forbidden) return null
   if (error) {
     return (
       <Card>
@@ -365,24 +459,23 @@ export function SelfHealingPanel({ pipelineId }: { pipelineId: string }) {
       </Card>
     )
   }
-  if (activity.length === 0) return null
 
   const healed = activity.filter((a) => a.kind === "verdict" && healSucceeded(a)).length
-  const needsAttention = activity.filter(
-    (a) => a.kind === "decision" && (a.outcome === "escalated" || a.outcome === "hitl_requested")
-  ).length
+  const needsAttention = openEscalations(activity).length
   const visible = showAll ? activity : activity.slice(0, 5)
 
   return (
-    <Card>
+    <Card data-testid="self-healing-card">
       <CardHeader className="py-3 px-4 pb-2">
         <div className="flex items-center justify-between gap-2">
           <CardTitle className="flex items-center gap-2 text-sm font-semibold">
             <Activity className="h-4 w-4 text-blue-600 dark:text-blue-400" />
-            Self-healing activity
-            <Badge variant="outline" className="text-xs">
-              {activity.length}
-            </Badge>
+            Self-healing
+            {activity.length > 0 && (
+              <Badge variant="outline" className="text-xs">
+                {activity.length}
+              </Badge>
+            )}
             {healed > 0 && (
               <Badge variant="outline" className="border-green-400 text-xs text-green-700 dark:text-green-300">
                 {healed} healed
@@ -405,17 +498,27 @@ export function SelfHealingPanel({ pipelineId }: { pipelineId: string }) {
           </Button>
         </div>
       </CardHeader>
-      <CardContent className="px-4 pb-3 pt-0">
-        <div>
-          {visible.map((a) => (
-            <ActivityRow key={a.id} a={a} />
-          ))}
-        </div>
+      <CardContent className="space-y-2 px-4 pb-3 pt-0">
+        <Watchers pipelineType={pipelineType} />
+        {pipelineType === "cdc" && openAlerts !== null && (
+          <OpenAlertsLine pipelineId={pipelineId} count={openAlerts} />
+        )}
+        {activity.length === 0 ? (
+          <p className="text-xs text-gray-500 dark:text-gray-400">
+            The heal agent has not had to act on this pipeline.
+          </p>
+        ) : (
+          <div>
+            {visible.map((a) => (
+              <ActivityRow key={a.id} a={a} />
+            ))}
+          </div>
+        )}
         {activity.length > 5 && (
           <button
             type="button"
             onClick={() => setShowAll((v) => !v)}
-            className="mt-2 text-xs text-blue-600 hover:underline dark:text-blue-400"
+            className="text-xs text-blue-600 hover:underline dark:text-blue-400"
           >
             {showAll ? "Show less" : `Show all ${activity.length}`}
           </button>

@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	log "github.com/sirupsen/logrus"
@@ -173,7 +174,12 @@ func SeedDemoConnections(c *gin.Context) {
 		return
 	}
 
-	source, err := ensureDemoConnection(c, workspaceID, CreateConnectionRequest{
+	// One window for both halves, so the two together stay inside the frontend's
+	// request timeout (FirstRunOnboarding.tsx startDemo) and the server's 300s
+	// WriteTimeout.
+	retryUntil := time.Now().Add(demoDeployRetryWindow)
+
+	source, err := ensureDemoConnection(c, workspaceID, retryUntil, CreateConnectionRequest{
 		Name:          demoSourceName,
 		Type:          "source",
 		ConnectorType: demoSourceConnector,
@@ -186,7 +192,7 @@ func SeedDemoConnections(c *gin.Context) {
 		return
 	}
 
-	destination, err := ensureDemoConnection(c, workspaceID, CreateConnectionRequest{
+	destination, err := ensureDemoConnection(c, workspaceID, retryUntil, CreateConnectionRequest{
 		Name:          demoDestinationName,
 		Type:          "destination",
 		ConnectorType: demoDestinationConnector,
@@ -219,9 +225,37 @@ func SeedDemoConnections(c *gin.Context) {
 	})
 }
 
+// A fresh install starts no connector containers: sample-data and the postgresql
+// destination are both deployed on demand by the first connection create that
+// needs them. That create answers 503 connector_deploying when the container is not
+// up within the connection test's 45s wait (executor.go testConnectionDeployWait),
+// and nothing is saved. A person clicking "Try the demo" should not be told to click
+// again, so the seed retries that one answer, and only that one, until
+// demoDeployRetryWindow has passed.
+//
+// Worst case: the last retry starts just before the window closes and takes the
+// full 45s, then the destination's first attempt takes another 45s, so
+// 150 + 45 + 45 = 240s. That stays under the frontend's 270s timeout and the
+// server's 300s WriteTimeout. Vars so tests can shrink them.
+var (
+	demoDeployRetryWindow   = 150 * time.Second
+	demoDeployRetryInterval = 10 * time.Second
+	demoReplayCreate        = replayCreateConnection
+)
+
+// isConnectorDeployingSave reports whether a CreateConnection answer is
+// respondConnectorDeployingOnSave's: retryable, and nothing was saved.
+func isConnectorDeployingSave(status int, body map[string]interface{}) bool {
+	if status != http.StatusServiceUnavailable {
+		return false
+	}
+	code, _ := body["error"].(string)
+	return code == "connector_deploying"
+}
+
 // ensureDemoConnection returns the id of the workspace's demo connection with
 // this name, creating it if absent.
-func ensureDemoConnection(c *gin.Context, workspaceID string, payload CreateConnectionRequest) (string, error) {
+func ensureDemoConnection(c *gin.Context, workspaceID string, retryUntil time.Time, payload CreateConnectionRequest) (string, error) {
 	if database := db.GetDB(); database != nil {
 		var existing string
 		err := database.QueryRow(
@@ -238,9 +272,28 @@ func ensureDemoConnection(c *gin.Context, workspaceID string, payload CreateConn
 		}
 	}
 
-	status, body, err := replayCreateConnection(c, payload)
-	if err != nil {
-		return "", err
+	var (
+		status int
+		body   map[string]interface{}
+		err    error
+	)
+	for attempt := 1; ; attempt++ {
+		status, body, err = demoReplayCreate(c, payload)
+		if err != nil {
+			return "", err
+		}
+		if !isConnectorDeployingSave(status, body) || !time.Now().Add(demoDeployRetryInterval).Before(retryUntil) {
+			break
+		}
+		log.WithFields(log.Fields{
+			"connector": payload.ConnectorType,
+			"attempt":   attempt,
+		}).Info("Demo seed: connector is still being deployed, retrying")
+		select {
+		case <-c.Request.Context().Done():
+			return "", demoSeedError{status: status, body: body}
+		case <-time.After(demoDeployRetryInterval):
+		}
 	}
 	if status < 200 || status >= 300 {
 		return "", demoSeedError{status: status, body: body}

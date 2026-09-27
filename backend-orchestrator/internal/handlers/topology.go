@@ -40,14 +40,6 @@ type CreateTopicRequest struct {
 	Config            map[string]string `json:"config,omitempty"`
 }
 
-// CreateTopicForPipelineRequest is the request for pipeline-based topic creation
-type CreateTopicForPipelineRequest struct {
-	PipelineID      string  `json:"pipeline_id" binding:"required"`
-	SyncMode        string  `json:"sync_mode" binding:"required"`
-	TableCount      int     `json:"table_count"`
-	EstimatedSizeGB float64 `json:"estimated_size_gb"`
-}
-
 // TopicResponse is the response for topic operations
 type TopicResponse struct {
 	Success           bool              `json:"success"`
@@ -72,9 +64,8 @@ type TopicResponse struct {
 // kafkaclient.Topic(), so it carries the deployment's KAFKA_TOPIC_PREFIX
 // ("rsync." by default) on the wire:
 //
-//	rsync.agent.…                control-plane topics    kafka/topology.go CreateStandardTopics
-//	rsync.pipeline.<id8>.data    batch data + .dlq       kafka/topology.go generateTopicName
-//	rsync.cdc.<id8>              provisioned CDC topic   kafka/topology.go generateTopicName
+//	rsync.pipeline.domain.events platform event log      kafka/topology.go
+//	rsync.pipeline.<id8>.data    batch data + .dlq       executor.go resolvePipelineTopic
 //	rsync.cdc-<id8>[.db.table]   Debezium topic.prefix   executor.go
 //	rsync.schemahistory.cdc-…    Debezium schema history debezium connector.py
 //	rsync.signals.<id8>          incremental signals     executor.go:2916
@@ -219,13 +210,14 @@ func rejectForeignTopic(c *gin.Context, name string) bool {
 // "is this THIS CALLER's topic", and requirePrincipal — the middleware that
 // gates this group in cmd/orchestrator/main.go — only authenticates. Between
 // them, any user holding a valid session in ANY workspace could DELETE or
-// repartition another tenant's rsync.pipeline.<id8>.data / rsync.cdc.<id8>.
+// repartition another tenant's rsync.pipeline.<id8>.data / rsync.cdc-<id8>.….
 // That is not recoverable: Kafka topic deletion is irreversible, and
-// rsync.cdc.<id8> is created cleanup.policy=compact retention.ms=-1 — the
-// durable store of that pipeline's change stream.
+// rsync.cdc-<id8>.<db>.<table> carries that pipeline's change stream for
+// whatever part of the retention window the sink has not yet consumed.
+// Deleting it drops every unconsumed change in it.
 //
 // The join key is the 8-char pipeline id every producer embeds in the name (see
-// kafka/topology.go generateTopicName and executor.go), so the gates below
+// executor.go resolvePipelineTopic and the Debezium topic.prefix), so the gates below
 // resolve it back to pipelines.id and reuse the workspace-role policy the CDC
 // routes already run — decideResourceAccess in cdc_authz.go, same ladder, same
 // legacy-row fallback, same internal-caller passthrough.
@@ -237,7 +229,7 @@ var pipelineID8Pattern = regexp.MustCompile(`^[0-9a-fA-F]{8}$`)
 // topicPipelineID8 returns the pipeline id8 a topic name is scoped to.
 //
 // ok=false means the name is not pipeline-scoped: a shared control topic
-// (agent./pii./task.), a Kafka Connect internal (_rsync-connect-offsets), or
+// (pii.scan.*, rsync.notifications), a Kafka Connect internal (_rsync-connect-offsets), or
 // the planner's per-CONNECTION CDC topic ("cdc.<connection-name>",
 // llm-service/src/agents/planner/strategies.py:650), which carries no pipeline
 // id at all. Those are platform infrastructure rather than one tenant's data,
@@ -282,7 +274,7 @@ func topicPipelineID8(name string) (string, bool) {
 // topicPipelineAccessQuery resolves the id8 embedded in a topic name back to
 // every pipeline that could have produced it, plus the caller's role in each
 // one's workspace. Keyed on LEFT(id::text, 8) because that is exactly what
-// SafeID8 / generateTopicName put into the name.
+// SafeID8 puts into the name.
 const topicPipelineAccessQuery = `
 	SELECT p.workspace_id::text, p.created_by::text, wm.role
 	  FROM pipelines p
@@ -479,7 +471,6 @@ func topicReadAllowed(rows []resourceAccess, authUser string) bool {
 // RegisterRoutes registers the topology API routes
 func (h *TopologyHandler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.POST("/topics", h.CreateTopic)
-	rg.POST("/topics/pipeline", h.CreateTopicForPipeline)
 	rg.GET("/topics", h.ListTopics)
 	rg.GET("/topics/:name", h.GetTopic)
 	rg.DELETE("/topics/:name", h.DeleteTopic)
@@ -531,57 +522,6 @@ func (h *TopologyHandler) CreateTopic(c *gin.Context) {
 		Partitions:        int(req.Partitions),
 		ReplicationFactor: int(req.ReplicationFactor),
 		Config:            req.Config,
-		CreatedAt:         &now,
-	})
-}
-
-// CreateTopicForPipeline creates an optimally configured topic for a pipeline
-// POST /api/v1/topology/topics/pipeline
-// This is the main entry point for plan-time topic provisioning
-func (h *TopologyHandler) CreateTopicForPipeline(c *gin.Context) {
-	var req CreateTopicForPipelineRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, TopicResponse{
-			Success: false,
-			Error:   err.Error(),
-		})
-		return
-	}
-
-	// The topic name is constructed from req.PipelineID rather than supplied, so
-	// the namespace guard has nothing to catch here — the whole boundary is
-	// whether the caller may act on THAT pipeline. Same workspace-role gate the
-	// six CDC control routes run.
-	if !assertPipelineOwnerForHandlers(c, h.db, req.PipelineID) {
-		return
-	}
-
-	log.Infof("📦 Creating pipeline topic: pipeline=%s, mode=%s, tables=%d, size=%.1fGB",
-		req.PipelineID, req.SyncMode, req.TableCount, req.EstimatedSizeGB)
-
-	topicInfo, err := h.manager.CreateTopicForPipeline(
-		c.Request.Context(),
-		req.PipelineID,
-		req.SyncMode,
-		req.TableCount,
-		req.EstimatedSizeGB,
-	)
-	if err != nil {
-		log.Errorf("Failed to create pipeline topic: %v", err)
-		c.JSON(http.StatusInternalServerError, TopicResponse{
-			Success: false,
-			Error:   err.Error(),
-		})
-		return
-	}
-
-	now := time.Now()
-	c.JSON(http.StatusCreated, TopicResponse{
-		Success:           true,
-		TopicName:         topicInfo.Name,
-		Partitions:        topicInfo.Partitions,
-		ReplicationFactor: topicInfo.ReplicationFactor,
-		Config:            topicInfo.Config,
 		CreatedAt:         &now,
 	})
 }
@@ -812,9 +752,8 @@ func (h *TopologyHandler) CalculatePartitions(c *gin.Context) {
 	})
 }
 
-// calculateOptimalPartitions calculates optimal partition count for dry-run endpoint.
-// Note: Duplicates logic from TopologyManager.calculateOptimalPartitions intentionally
-// to allow partition calculation without creating topics (preview/dry-run mode).
+// calculateOptimalPartitions calculates optimal partition count for the dry-run
+// endpoint (preview only — it creates nothing).
 func (h *TopologyHandler) calculateOptimalPartitions(syncMode string, tableCount int, sizeGB float64) int {
 	const (
 		MinPartitions  = 3

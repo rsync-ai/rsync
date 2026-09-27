@@ -29,7 +29,8 @@ What this suite asserts, and why each part is here rather than folded into one t
   mismatch for the six connectors whose id and name differ.
 
 Subject: connector metadata (`shared/mcp-connectors/**`) and `tools.go`. Both are
-listed in ci.yml's `llm` paths-filter, so editing either runs this file.
+listed in the `llm` filter in .github/paths-filters.yml, so editing either runs
+this file.
 """
 
 from __future__ import annotations

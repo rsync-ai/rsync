@@ -76,9 +76,9 @@ func TestStopPipeline_MemberCanStopSharedPipeline(t *testing.T) {
 		WillReturnRows(gateRoleRows("member"))
 
 	// Status read is workspace-scoped, not created_by-scoped.
-	mock.ExpectQuery(`SELECT status FROM pipelines WHERE id = \$1 AND workspace_id = \$2`).
+	mock.ExpectQuery(`SELECT p\.status, .* FROM pipelines p WHERE p\.id = \$1 AND p\.workspace_id = \$2`).
 		WithArgs(wsScopePipeline, wsScopeWS).
-		WillReturnRows(sqlmock.NewRows([]string{"status"}).AddRow("running"))
+		WillReturnRows(sqlmock.NewRows([]string{"status", "is_cdc"}).AddRow("running", false))
 
 	// Stop write is workspace-scoped.
 	mock.ExpectExec(`UPDATE pipelines SET status = 'stopped', updated_at = NOW\(\) WHERE id = \$1 AND workspace_id = \$2`).

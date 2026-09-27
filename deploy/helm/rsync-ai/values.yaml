@@ -482,16 +482,20 @@ objectStorage:
 
   minio:
     # Pinned, per this file's own rule at the `tag:` key above: an unpinned tag
-    # silently changes what a re-pulled pod runs. Digest-identical to `latest`
-    # at the time of pinning, so this froze the image rather than changing it.
-    # quay.io, not Docker Hub: docker.io/minio/* stopped serving anonymous pulls
-    # (2026-09-12), so a cluster with no registry credentials could not pull it.
-    # Same release tags, byte-identical manifest digest.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # silently changes what a re-pulled pod runs. Pinned by digest because
+    # cgr.dev/chainguard serves only `latest` (and `latest-dev`) anonymously, so a
+    # digest is the only pin there is.
+    # Chainguard's build, not MinIO's: MinIO withdrew anonymous pulls from
+    # docker.io/minio/* (2026-09-12) and then from quay.io/minio/* (401), so a
+    # cluster with no registry credentials could pull neither. The pod's uid comes
+    # from global.podSecurityContext, not the image, so a volume written by an
+    # earlier chart keeps its owner. The image has no curl; the probes are httpGet.
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
     # The `mc` client, used once per install/upgrade to create the bucket and
     # apply the lifecycle rule above.
-    # Pinned for the same reason as the server image above.
-    mcImage: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    # The server image, same digest: it ships `mc` and `sh`, which the hook Job's
+    # `sh -c` needs. Chainguard's mc-only image is distroless (no shell).
+    mcImage: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
     persistence:
       size: 50Gi
       # Overrides global.storageClass for this volume only. Empty = inherit it.
@@ -514,7 +518,7 @@ temporal:
   # its schemas on first boot; it is an evaluation image, not a production one.
   # Set enabled=false to use Temporal Cloud or a separately-operated cluster.
   enabled: true
-  image: temporalio/auto-setup:1.22.4
+  image: temporalio/auto-setup:1.22.7
   # auto-setup's own defaults, stated here rather than left implicit because
   # db-init has to create these two on an external database and a second
   # hardcoded copy of a name is how the two drift apart. Changing them changes
@@ -586,6 +590,11 @@ orchestrator:
   correlationClaimTtl: 1h
   enableScheduler: false
   enableCdcTableStats: true
+  # Seconds between SIGTERM and SIGKILL. Shutdown drains HTTP for up to 10 s,
+  # then gives the Kafka consumer groups up to 15 s to leave, on top of the
+  # agents' own Stop calls; a SIGKILL skips all of it. Same value as
+  # stop_grace_period in docker-compose.yml, which gives the detail.
+  terminationGracePeriodSeconds: 45
 
 temporalAdapter:
   enabled: true
@@ -680,11 +689,12 @@ ollama:
 # disabling this never breaks an already-created pipeline.
 generation:
   enabled: true
-  # Deadline api-gateway puts on every llm-service call. The code falls back to
-  # 10s when unset, which is far below CPU inference latency -- at 10s the chat
-  # intent classifier times out and the reply comes back canned, with HTTP 200
-  # and one warning line. 90 matches docker-compose.quickstart.yml. Raise it on
-  # slower hardware; lower it only if you front this with a fast hosted model.
+  # Deadline api-gateway puts on the llm-service calls in one chat turn. The
+  # code falls back to 60s when unset, sized for a hosted API and below CPU
+  # inference latency -- then the chat intent classifier times out and the reply
+  # says the model did not answer. 240 matches docker-compose.quickstart.yml.
+  # Raise it on slower hardware; lower it only if you front this with a fast
+  # hosted model.
   llmServiceTimeoutSeconds: 240
   # llm-service + planner. tool-generator runs a different image — see below.
   image: { repository: llm-service-oss, tag: "" }

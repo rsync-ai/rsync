@@ -14,13 +14,13 @@ import (
 	"github.com/IBM/sarama"
 	kafkaclient "github.com/rsync-ai/shared/kafkaclient"
 	"github.com/rsync-ai/shared/kafkaclient/saramaauth"
+	"github.com/rsync-ai/shared/memlimit"
 	log "github.com/sirupsen/logrus"
 	enumspb "go.temporal.io/api/enums/v1"
 	"go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/interceptor"
 	"go.temporal.io/sdk/worker"
 
-	"github.com/rsync-ai/backend-temporal-adapter/internal/adapter"
 	"github.com/rsync-ai/backend-temporal-adapter/internal/db"
 	"github.com/rsync-ai/backend-temporal-adapter/internal/metrics"
 	"github.com/rsync-ai/backend-temporal-adapter/internal/telemetry"
@@ -34,6 +34,14 @@ import (
 // workflow that starts successfully and is never picked up by anything — which presents
 // as a monitor that simply never reports, the failure mode hardest to notice.
 const adapterTaskQueue = "pipeline-workflows"
+
+// kafkaServiceName is the identity this process presents to the broker.
+//
+// It becomes the default client.id, which is what a customer-managed cluster keys its
+// logs, throttling and quota metrics off. Without it every rsync process shares one
+// anonymous default, so a throttled cluster can tell neither our services apart nor ours
+// from another tenant's. KAFKA_CLIENT_ID still overrides it.
+const kafkaServiceName = "temporal-adapter"
 
 // localDatabaseHosts are hostnames that only ever point at an in-cluster dev
 // Postgres. A staging or production deployment must use a real managed database
@@ -188,6 +196,11 @@ func reportStartupSettingProblems(logger *log.Logger, getenv func(string) string
 func main() {
 	// Structured JSON logging + trace-context hook (log-trace correlation)
 	telemetry.InitLogging("temporal-adapter")
+
+	// Soft memory limit from the container cgroup (GOMEMLIMIT, when set, wins).
+	if ml := memlimit.Apply(); ml.Source != "none" {
+		log.Infof("memory soft limit: %d MiB (source=%s, cgroup=%d MiB)", ml.LimitBytes>>20, ml.Source, ml.CgroupBytes>>20)
+	}
 
 	// OTel tracer → OTel Collector → your OTLP backend
 	shutdownTracer, err := telemetry.InitTracer("temporal-adapter")
@@ -350,26 +363,13 @@ func main() {
 	// to catch are the ones nothing else is firing for.
 	startModelFreshnessSweep(temporalClient)
 
-	// Create Kafka adapter (consumes agent.results, signals workflows)
-	kafkaAdapter, err := adapter.NewKafkaAdapter(kafkaBrokers, temporalClient)
-	if err != nil {
-		log.Fatalf("Failed to create Kafka adapter: %v", err)
-	}
-
-	// Start the adapter
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	if err := kafkaAdapter.Start(ctx); err != nil {
-		log.Fatalf("Failed to start Kafka adapter: %v", err)
-	}
-
+	// No Kafka consumer here. Workflows are driven by Temporal signals sent over the
+	// Temporal API (see the Signal* constants in internal/workflows); Kafka is
+	// produce-only, and the topic set is pinned by TestAdapterProducesOnlyToPlatformTopics.
 	log.Info("================================================================================")
 	log.Info("✅ Temporal Adapter Service is running")
 	log.Info("   - Temporal Worker: Executing workflows and activities")
-	log.Info("   - Kafka Consumer: agent.control.results (signals workflows)")
-	log.Info("   - Kafka Producer: agent.control.commands (via activities)")
-	log.Info("   - Pattern: Temporal thinks, Kafka talks, Agents act")
+	log.Info("   - Kafka Producer: pipeline.domain.events, notifications (via activities)")
 	log.Info("Press Ctrl+C to stop")
 	log.Info("================================================================================")
 
@@ -379,10 +379,8 @@ func main() {
 	<-sigCh
 
 	log.Info("🛑 Shutting down Temporal Adapter Service...")
-	cancel()
 
 	// Graceful shutdown
-	kafkaAdapter.Stop()
 	w.Stop()
 	log.Info("✅ Temporal Adapter Service stopped")
 }
@@ -443,10 +441,8 @@ func newProducerConfig(brokers string) (*sarama.Config, kafkaclient.Config, erro
 	// Security (TLS/SASL) comes from the environment; the address stays whatever
 	// the caller was already given, so this changes only HOW we connect.
 	//
-	// adapter.ServiceName rather than a literal: the consumer in internal/adapter
-	// resolves its own config, and the two are one process. Sharing the constant
-	// is what stops them presenting two identities to the same cluster.
-	security, err := kafkaclient.FromEnvForService(adapter.ServiceName, brokers)
+	// kafkaServiceName names this process to the broker (its default client.id).
+	security, err := kafkaclient.FromEnvForService(kafkaServiceName, brokers)
 	if err != nil {
 		return nil, kafkaclient.Config{}, fmt.Errorf("invalid Kafka security configuration: %w", err)
 	}
@@ -491,8 +487,6 @@ func registerWorkflowsAndActivities(r worker.Registry) {
 
 	// Register shared activities (used by all workflows)
 	r.RegisterActivity(workflows.EmitDomainEventActivity)
-	r.RegisterActivity(workflows.SendToPipelineDLQ)
-	r.RegisterActivity(workflows.SendToAgentDLQ)
 	r.RegisterActivity(workflows.StateUpdateActivity)          // Architecture Phase 1: Authoritative state writer
 	r.RegisterActivity(workflows.UpdatePipelineStatusActivity) // Keeps pipelines.status in sync with workflow outcome
 

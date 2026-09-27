@@ -103,8 +103,10 @@ func NewCDCTableWatcher(database *sql.DB) *CDCTableWatcher {
 		connectorFor: findDebeziumConnectorName,
 		discover:     discoverConnectionTables,
 		push:         pushCDCTableList,
-		backfill:     requestCDCBackfill,
-		restartSink:  restartCDCSink,
+		backfill: func(ctx context.Context, pipelineID string, tables []string, mode string) gin.H {
+			return requestCDCBackfill(ctx, pipelineID, tables, mode, cdcSnapshotSourceAutoPickup)
+		},
+		restartSink: restartCDCSink,
 	}
 	w.persistSelection = func(pipelineID string, tables []string) error {
 		return persistSelectedTables(database, pipelineID, tables)
@@ -348,17 +350,47 @@ func (w *CDCTableWatcher) applyNewTables(ctx context.Context, p autoPickupPipeli
 	}
 
 	// Newly added tables need their existing rows loaded, not just their future
-	// changes streamed — the same "backfill_newly_added" the editor offers.
-	bf := w.backfill(ctx, p.ID, added, "incremental")
+	// changes streamed — the same "backfill_newly_added" the editor offers. No
+	// mode: the orchestrator picks the engine's default (blocking on MongoDB).
+	bf := w.backfill(ctx, p.ID, added, "")
 	sr := w.restartSink(ctx, p.ID)
 
-	log.WithFields(log.Fields{
+	fields := log.Fields{
 		"pipeline_id":  p.ID,
 		"added":        added,
 		"backfill_ok":  bf["success"],
 		"sink_restart": sr["success"],
-	}).Info("📥 cdc auto-pickup: new source tables added to the running pipeline")
+	}
+	if ok, _ := bf["success"].(bool); !ok {
+		// The tables ARE added and their new changes stream, but none of their
+		// existing rows arrive — and nobody is watching this sweep. At Info this
+		// read exactly like a success line (KI-CDC-EDIT-TABLES-BACKFILL-SILENT).
+		fields["backfill_status"] = bf["status_code"]
+		fields["backfill_error"] = backfillRefusalReason(bf)
+		log.WithFields(fields).Warn("⚠️  cdc auto-pickup: new source tables added and streaming, but their existing rows were NOT loaded — the backfill was refused; see backfill_error")
+		return nil
+	}
+	log.WithFields(fields).Info("📥 cdc auto-pickup: new source tables added to the running pipeline")
 	return nil
+}
+
+// backfillRefusalReason names why requestCDCBackfill did not succeed: the
+// orchestrator's machine-readable error code (cdc_backfill_not_supported,
+// missing_primary_key, …) when its body carried one, else the gateway's own
+// error (transport failure, bare status).
+func backfillRefusalReason(bf gin.H) string {
+	if raw, ok := bf["response"].(json.RawMessage); ok && len(raw) > 0 {
+		var body struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(raw, &body) == nil && strings.TrimSpace(body.Error) != "" {
+			return strings.TrimSpace(body.Error)
+		}
+	}
+	if e, ok := bf["error"].(string); ok && strings.TrimSpace(e) != "" {
+		return strings.TrimSpace(e)
+	}
+	return "unknown"
 }
 
 // splitByMissingPK partitions `added` into the tables to keep and the tables

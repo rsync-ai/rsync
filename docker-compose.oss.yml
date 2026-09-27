@@ -26,7 +26,7 @@
 #
 #     docker compose -f docker-compose.quickstart.yml -f docker-compose.oss.yml up -d
 #
-# Validate the merge before starting anything (rc=0 and 18 services today):
+# Validate the merge before starting anything (rc=0 and 17 services today):
 #
 #     docker compose -f docker-compose.quickstart.yml -f docker-compose.oss.yml \
 #         config --services
@@ -131,6 +131,10 @@ services:
       ENVIRONMENT: production
       LOG_FORMAT: json
       LOG_LEVEL: info
+      # Rotation for the connector containers THIS service creates -- compose's
+      # `logging:` blocks only reach the services compose itself starts.
+      RSYNC_LOG_MAX_SIZE: ${RSYNC_LOG_MAX_SIZE:-10m}
+      RSYNC_LOG_MAX_FILE: ${RSYNC_LOG_MAX_FILE:-3}
       INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
       DEPLOYER_DOCKER_NETWORK: rsync-ai-mcp
       MCP_SHARED_NETWORK: rsync-ai-mcp

@@ -9,14 +9,11 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/smtp"
 	"net/url"
 	"os"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"api-gateway/internal/cache"
@@ -1670,29 +1667,6 @@ func executeDatabricksQueryWithRedact(ctx context.Context, config map[string]int
 		Truncated:       truncated,
 		Warnings:        warnings,
 	}, nil
-}
-
-// ensureLimit wraps query with LIMIT if not already present
-func ensureLimit(sql string, limit int) string {
-	normalized := strings.ToUpper(strings.TrimSpace(sql))
-
-	// Check if LIMIT already present
-	if regexp.MustCompile(`\bLIMIT\s+\d+`).MatchString(normalized) {
-		// Replace with our limit if it's higher
-		re := regexp.MustCompile(`(?i)\bLIMIT\s+(\d+)`)
-		matches := re.FindStringSubmatch(sql)
-		if len(matches) > 1 {
-			existingLimit, _ := strconv.Atoi(matches[1])
-			if existingLimit > limit {
-				sql = re.ReplaceAllString(sql, fmt.Sprintf("LIMIT %d", limit))
-			}
-		}
-		return sql
-	}
-
-	// Add LIMIT
-	sql = strings.TrimSuffix(strings.TrimSpace(sql), ";")
-	return sql + fmt.Sprintf(" LIMIT %d", limit)
 }
 
 // =============================================================================
@@ -3552,8 +3526,15 @@ func GetExplorerNextSteps(c *gin.Context) {
 	httpClient := &http.Client{Timeout: 25 * time.Second}
 	resp, err := httpClient.Do(httpReq)
 	if err != nil {
+		// DELIBERATE, and pinned by TestNextStepsKeepsDefaultSuggestionsWhenTheAnswerIsUnusable:
+		// unlike the upstream-status branch below, this answers 200 with two
+		// generic actions. They are not a claim about the user's data and not an
+		// LLM answer -- they are the two things that are true of any result set,
+		// and the client keeps only their titles (frontend/src/lib/explorer/nextSteps.ts
+		// drops action_type/confidence/cta), so nothing fabricated reaches the screen.
+		// A self-host with no llm-service reachable still gets a usable explorer.
+		// Do not "fix" this into a 502 -- that was tried and reverted.
 		log.Errorf("[GetExplorerNextSteps] LLM request failed: %v", err)
-		// Return default suggestions on LLM failure
 		c.JSON(http.StatusOK, GetNextStepsResponse{
 			Suggestions: []NextStepSuggestion{
 				{ActionType: "metabase", Title: "Create Dashboard", Description: "Visualize results", Confidence: 0.8, RequiredInputs: []string{"dashboard_name"}, CTA: "Create"},
@@ -3592,7 +3573,12 @@ func GetExplorerNextSteps(c *gin.Context) {
 		Suggestions []NextStepSuggestion `json:"suggestions"`
 	}
 	if err := json.Unmarshal(body, &llmResp); err != nil {
-		// Return default on parse failure
+		// Same deliberate fallback as the transport branch above, same test pins it.
+		// The one thing that WAS missing here: this branch used to return in total
+		// silence, so a proxy page served in place of llm-service left no trace at
+		// all. Log the parse error -- never the body, which can echo the result
+		// profile back (the upstream-status branch above is pinned against that leak).
+		log.Errorf("[GetExplorerNextSteps] could not parse llm-service response: %v", err)
 		c.JSON(http.StatusOK, GetNextStepsResponse{
 			Suggestions: []NextStepSuggestion{
 				{ActionType: "metabase", Title: "Create Dashboard", Description: "Visualize results", Confidence: 0.8, RequiredInputs: []string{"dashboard_name"}, CTA: "Create"},
@@ -4031,223 +4017,4 @@ func ShareToSlack(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Sent to Slack"})
-}
-
-// ShareViaEmailRequest represents an email share request
-type ShareViaEmailRequest struct {
-	To         []string         `json:"to" binding:"required"`
-	Subject    string           `json:"subject" binding:"required"`
-	Body       string           `json:"body"`
-	HTMLBody   string           `json:"html_body,omitempty"`
-	Attachment *EmailAttachment `json:"attachment,omitempty"`
-}
-
-// EmailAttachment represents an email attachment
-type EmailAttachment struct {
-	Filename string `json:"filename"`
-	Content  string `json:"content"` // Base64 encoded
-	MimeType string `json:"mime_type"`
-}
-
-// ShareViaEmail handles POST /api/v1/explorer/share/email
-// Sends query results via SMTP email
-// shareViaEmailLimiter rate-limits ShareViaEmail per user (in-memory).
-// In-process limiter is sufficient for first-pilot scale; for HA the
-// state needs to move to Redis.
-var (
-	shareViaEmailLimiter   = make(map[string][]time.Time)
-	shareViaEmailLimiterMu sync.Mutex
-)
-
-const (
-	shareEmailMaxPerHour = 10 // max emails per user per hour
-	shareEmailMaxToCount = 5  // max recipients per single send
-)
-
-// shareViaEmailRateLimit returns true when the caller has exceeded
-// shareEmailMaxPerHour sends in the last hour. Sliding window.
-func shareViaEmailRateLimit(userID string) (allowed bool, retryAfter time.Duration) {
-	shareViaEmailLimiterMu.Lock()
-	defer shareViaEmailLimiterMu.Unlock()
-	now := time.Now()
-	cutoff := now.Add(-time.Hour)
-	hist := shareViaEmailLimiter[userID]
-	kept := hist[:0]
-	for _, t := range hist {
-		if t.After(cutoff) {
-			kept = append(kept, t)
-		}
-	}
-	if len(kept) >= shareEmailMaxPerHour {
-		oldest := kept[0]
-		return false, time.Until(oldest.Add(time.Hour))
-	}
-	kept = append(kept, now)
-	shareViaEmailLimiter[userID] = kept
-	return true, 0
-}
-
-func ShareViaEmail(c *gin.Context) {
-	userID, ok := resolveUserID(c)
-	if !ok {
-		return
-	}
-
-	var req ShareViaEmailRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request: " + err.Error()})
-		return
-	}
-
-	// T1-9 security gate: recipient cap + per-user-hour rate limit +
-	// optional domain allowlist. Pre-fix this endpoint accepted
-	// arbitrary `to[]` and sent via platform SMTP creds — an open
-	// phishing relay that would burn the platform's SPF/DKIM
-	// reputation within hours.
-	if len(req.To) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "to[] is required"})
-		return
-	}
-	if len(req.To) > shareEmailMaxToCount {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error": fmt.Sprintf("at most %d recipients per email", shareEmailMaxToCount),
-		})
-		return
-	}
-
-	// Domain allowlist gate. SHARE_EMAIL_ALLOWED_DOMAINS is a comma-
-	// separated list (e.g. "rsync-ai.local,example.com"); when set,
-	// every recipient must be on the list. When unset, only the
-	// caller's own email address is accepted (read from session) to
-	// keep the default safe. Operator opts into broader use by
-	// setting the env var explicitly.
-	allowedDomainsRaw := strings.TrimSpace(os.Getenv("SHARE_EMAIL_ALLOWED_DOMAINS"))
-	var allowedDomains []string
-	if allowedDomainsRaw != "" {
-		for _, d := range strings.Split(allowedDomainsRaw, ",") {
-			d = strings.ToLower(strings.TrimSpace(d))
-			if d != "" {
-				allowedDomains = append(allowedDomains, d)
-			}
-		}
-	}
-	callerEmail := strings.ToLower(strings.TrimSpace(c.GetString("user_email")))
-	for _, addr := range req.To {
-		a := strings.ToLower(strings.TrimSpace(addr))
-		if a == "" || !strings.Contains(a, "@") {
-			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("invalid email address: %q", addr)})
-			return
-		}
-		// Allow caller's own address unconditionally (self-send is harmless).
-		if callerEmail != "" && a == callerEmail {
-			continue
-		}
-		if len(allowedDomains) == 0 {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":   "recipient_not_allowed",
-				"message": fmt.Sprintf("Sending to %q is not allowed. By default this endpoint only sends to your own email. Set SHARE_EMAIL_ALLOWED_DOMAINS to permit additional domains.", addr),
-			})
-			return
-		}
-		dom := a[strings.LastIndex(a, "@")+1:]
-		matched := false
-		for _, allowed := range allowedDomains {
-			if dom == allowed {
-				matched = true
-				break
-			}
-		}
-		if !matched {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error":   "recipient_domain_not_allowed",
-				"message": fmt.Sprintf("Domain %q is not in SHARE_EMAIL_ALLOWED_DOMAINS.", dom),
-			})
-			return
-		}
-	}
-
-	// Per-user rate limit.
-	if allowed, retry := shareViaEmailRateLimit(userID); !allowed {
-		retrySec := int(retry.Seconds())
-		if retrySec < 1 {
-			retrySec = 1
-		}
-		c.Header("Retry-After", strconv.Itoa(retrySec))
-		c.JSON(http.StatusTooManyRequests, gin.H{
-			"error":       "rate_limit_exceeded",
-			"message":     fmt.Sprintf("max %d emails/hour per user; try again in %ds", shareEmailMaxPerHour, retrySec),
-			"retry_after": retrySec,
-		})
-		return
-	}
-
-	// Get SMTP config from environment
-	smtpHost := os.Getenv("SMTP_HOST")
-	smtpPort := os.Getenv("SMTP_PORT")
-	smtpUser := os.Getenv("SMTP_USER")
-	smtpPass := os.Getenv("SMTP_PASSWORD")
-	smtpFrom := os.Getenv("SMTP_FROM")
-
-	if smtpHost == "" {
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "Email service not configured",
-			"hint":  "Set SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASSWORD, SMTP_FROM environment variables",
-		})
-		return
-	}
-
-	if smtpPort == "" {
-		smtpPort = "587"
-	}
-	if smtpFrom == "" {
-		smtpFrom = smtpUser
-	}
-
-	// Build email message. Subject and Body are inserted directly
-	// after CRLF-strip to prevent header-injection — a CRLF in either
-	// could let an attacker append extra headers (Bcc, Reply-To,
-	// alternative From) and turn this into a relay anyway.
-	sanitizedSubject := strings.ReplaceAll(strings.ReplaceAll(req.Subject, "\r", " "), "\n", " ")
-	sanitizedBody := strings.ReplaceAll(req.Body, "\r\n.\r\n", "\r\n. \r\n") // defang SMTP end-of-message
-	var msg strings.Builder
-	msg.WriteString(fmt.Sprintf("From: %s\r\n", smtpFrom))
-	msg.WriteString(fmt.Sprintf("To: %s\r\n", strings.Join(req.To, ", ")))
-	msg.WriteString(fmt.Sprintf("Reply-To: %s\r\n", callerEmail))
-	msg.WriteString(fmt.Sprintf("Subject: %s\r\n", sanitizedSubject))
-	msg.WriteString(fmt.Sprintf("X-Sent-By-rsync-ai-User: %s\r\n", userID))
-	msg.WriteString("MIME-Version: 1.0\r\n")
-	msg.WriteString("Content-Type: text/plain; charset=UTF-8\r\n")
-	msg.WriteString("\r\n")
-	msg.WriteString(sanitizedBody)
-	msg.WriteString("\r\n\r\n--\r\nSent via rsync-ai on behalf of ")
-	msg.WriteString(callerEmail)
-
-	// Send via SMTP
-	addr := fmt.Sprintf("%s:%s", smtpHost, smtpPort)
-
-	var auth smtp.Auth
-	if smtpUser != "" && smtpPass != "" {
-		auth = smtp.PlainAuth("", smtpUser, smtpPass, smtpHost)
-	}
-
-	err := smtp.SendMail(addr, auth, smtpFrom, req.To, []byte(msg.String()))
-	if err != nil {
-		log.WithError(err).WithField("user_id", userID).Error("[ShareViaEmail] SMTP send failed")
-		// Audit: log the failure server-side, but DON'T return SMTP
-		// internals to the client (T1-9-extra: previously leaked
-		// SMTP hostname / auth-mode hints to anyone who could
-		// trigger an error).
-		c.JSON(http.StatusServiceUnavailable, gin.H{
-			"error": "Failed to send email",
-		})
-		return
-	}
-
-	logAudit(c, "share_email_sent", "explorer", "", map[string]interface{}{
-		"recipients":      req.To,
-		"recipient_count": len(req.To),
-		"subject_len":     len(sanitizedSubject),
-	})
-
-	c.JSON(http.StatusOK, gin.H{"success": true, "message": "Email sent", "recipients": req.To})
 }

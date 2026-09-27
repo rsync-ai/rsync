@@ -21,6 +21,38 @@ RUN --mount=type=cache,target=/root/.m2 \
     cd smt && mvn -q -DskipTests package
 
 
+# Debezium 3.1.3's PostgreSQL connector, with upstream's own 3.2.0 revert of the
+# DBZ-8680 snapshot-connection probe (patches/debezium-3.1.3-pg-no-snapshot-probe.patch
+# says why: every blocking snapshot -- every CDC Reload -- whose table export outlives
+# one 10 s probe tick dies with `portal "C_n" does not exist` and silently loses rows).
+# The one patched class is compiled against the base image's own jars and swapped
+# into the connector jar; the source is fetched at the pinned tag and sha256-verified,
+# and `git apply` fails the build if the hunk no longer matches.
+FROM --platform=$BUILDPLATFORM quay.io/debezium/connect:3.1.3.Final AS dbz-base
+
+FROM --platform=$BUILDPLATFORM maven:3.9.9-eclipse-temurin-21 AS dbz-pg-patch
+ARG DBZ_VERSION=3.1.3.Final
+ARG DBZ_PG_STREAMING_SRC_SHA256=63f7ae07104901ec588833a80d8d35488ea93ae9826ed6cb64dac7c174f1ae9e
+WORKDIR /patch
+COPY --from=dbz-base /kafka/libs/ /cp/libs/
+COPY --from=dbz-base /kafka/connect/debezium-connector-postgres/ /cp/pg/
+COPY patches/debezium-3.1.3-pg-no-snapshot-probe.patch /patch/
+RUN set -eu; \
+    src=debezium-connector-postgres/src/main/java/io/debezium/connector/postgresql/PostgresStreamingChangeEventSource.java; \
+    mkdir -p "$(dirname "$src")"; \
+    curl -sSfL -o "$src" "https://raw.githubusercontent.com/debezium/debezium/v${DBZ_VERSION}/$src"; \
+    echo "${DBZ_PG_STREAMING_SRC_SHA256}  $src" | sha256sum -c -; \
+    git apply -v debezium-3.1.3-pg-no-snapshot-probe.patch; \
+    ! grep -q 'waitSnapshotCompletion(() ->' "$src"; \
+    grep -q 'context.waitSnapshotCompletion();' "$src"; \
+    mkdir -p out; \
+    javac -nowarn --release 17 -proc:none -cp '/cp/pg/*:/cp/libs/*' -d out "$src"; \
+    jar="/cp/pg/debezium-connector-postgres-${DBZ_VERSION}.jar"; \
+    [ -f "$jar" ]; \
+    (cd out && jar uf "$jar" io/debezium/connector/postgresql/PostgresStreamingChangeEventSource*.class); \
+    mv "$jar" /patch/
+
+
 # debezium/connect is Apache 2.0 licensed (Red Hat / Debezium project).
 # It includes: Kafka Connect worker + Debezium connectors (MySQL, PostgreSQL,
 # MongoDB, SQL Server, Oracle) pre-installed. Java 21, runs as user kafka (1001).
@@ -53,6 +85,10 @@ RUN mkdir -p /opt/kafka/plugins
 COPY --from=smt-builder /build/smt/target/rsync-kafka-smt-1.0.0.jar /opt/kafka/plugins/
 
 RUN chmod -R 755 /opt/kafka/plugins
+
+# The patched PostgreSQL connector jar (stage dbz-pg-patch above) replaces the
+# base's copy under the same name, so the plugin path still holds exactly one.
+COPY --from=dbz-pg-patch /patch/debezium-connector-postgres-3.1.3.Final.jar /kafka/connect/debezium-connector-postgres/
 
 # --- Supply-chain hardening: replace known-vulnerable jars that ship in the
 # debezium/connect:3.1.3.Final base image (flagged by Trivy). Each jar is
@@ -133,10 +169,17 @@ RUN set -eu; \
       echo "$left"; \
       exit 1; }
 
+# rsync's log4j logger levels (log4j-loggers.properties -- today, quieting the
+# pgoutput decoder's WARNs for tables outside every pipeline). They are applied at
+# container start by sync-log4j-loggers.sh, not baked into /kafka/config here:
+# /kafka/config is a volume, a kept volume never receives a later image's file, and
+# the #1198 bake reached no host that upgraded in place. See the script's header.
+
 # Kafka client security from rsync's KAFKA_* contract (SASL JAAS line, OAuth,
 # combined mTLS keystore), then the base /docker-entrypoint.sh. Compose and Helm
 # both rely on it -- neither overrides the entrypoint. See the script's header.
-COPY --chmod=0755 connect-entrypoint.sh /opt/rsync/connect-entrypoint.sh
+COPY --chmod=0755 connect-entrypoint.sh sync-log4j-loggers.sh /opt/rsync/
+COPY --chmod=0644 log4j-loggers.properties /opt/rsync/
 ENTRYPOINT ["/opt/rsync/connect-entrypoint.sh"]
 CMD ["start"]
 

@@ -179,6 +179,14 @@ func TestPipelineDerivedStatusCase_Precedence(t *testing.T) {
 		}
 	}
 
+	// A late PIPELINE_COMPLETED projection leaves pp at 'completed' after the
+	// postflight failed the run: the failed executions row for the same run must
+	// be checked before pp 'completed' reads as passed.
+	ppCompletedFailed := mustIndexOnce(t, sql, "AND le.execution_status IN ('failed', 'error', 'silent_drop_detected',")
+	if ppCompletedFailed > mustIndexOnce(t, sql, "WHEN pp.status = 'completed' THEN 'passed'") {
+		t.Errorf("the postflight-failed check must precede `pp.status = 'completed' THEN 'passed'`")
+	}
+
 	// pipelines has no `mode` column; PostgreSQL resolves p.mode to the mode()
 	// aggregate instead of failing.
 	if regexp.MustCompile(`\bp\.mode\b`).MatchString(sql) {

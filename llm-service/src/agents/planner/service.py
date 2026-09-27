@@ -1106,47 +1106,26 @@ async def create_plan(request: PlanRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 def main():
-    """Run the service"""
+    """Run the service.
+
+    HTTP only. The planner used to also run a Kafka request loop on
+    agent.planner.requests/responses behind ENABLE_KAFKA_CONSUMER; every
+    deployment set that flag false, so the loop, its module and its topics were
+    removed. Planning requests reach this service over POST /plan.
+    """
     port = int(os.getenv("PORT", "5011"))
     host = os.getenv("HOST", "0.0.0.0")
-    enable_kafka = os.getenv("ENABLE_KAFKA_CONSUMER", "true").lower() == "true"
-    
+
     logger.info("=" * 60)
     logger.info("🚀 Planner Service Starting")
     logger.info("=" * 60)
     logger.info(f"Host: {host}")
     logger.info(f"Port: {port}")
-    logger.info(f"Kafka Consumer: {'Enabled' if enable_kafka else 'Disabled'}")
     logger.info(f"Endpoints:")
     logger.info(f"  - GET  http://localhost:{port}/health")
     logger.info(f"  - POST http://localhost:{port}/plan")
-    if enable_kafka:
-        logger.info(f"  - Kafka Topic: agent.planner.requests (consuming)")
-        logger.info(f"  - Kafka Topic: agent.planner.responses (producing)")
     logger.info("=" * 60)
-    
-    # Start Kafka consumer if enabled
-    if enable_kafka:
-        try:
-            import sys
-            from pathlib import Path
-            # Add current directory to path for kafka_consumer import
-            current_dir = Path(__file__).parent
-            if str(current_dir) not in sys.path:
-                sys.path.insert(0, str(current_dir))
-            
-            from kafka_consumer import PlannerKafkaConsumer
-            consumer = PlannerKafkaConsumer()
-            if consumer.start():
-                logger.info("✅ Kafka consumer started successfully")
-            else:
-                logger.warning("⚠️  Kafka consumer failed to start, continuing with HTTP only")
-        except ImportError as e:
-            logger.warning(f"⚠️  kafka_consumer module not found: {e}, skipping Kafka consumer")
-        except Exception as e:
-            logger.warning(f"⚠️  Failed to start Kafka consumer: {e}")
-            logger.warning("⚠️  Continuing with HTTP only")
-    
+
     # Start HTTP server
     uvicorn.run(
         app,

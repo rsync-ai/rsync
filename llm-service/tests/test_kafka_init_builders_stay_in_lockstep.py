@@ -260,11 +260,21 @@ def test_ci_runs_this_guard_when_any_site_it_watches_changes():
     """
     import yaml
 
+    # The filters left ci.yml with the `changes` job -- see "Why there is no
+    # `changes` job" in ci.yml. Assert the gated job still reads THIS file,
+    # otherwise the globs below are a list CI does not consult.
     ci = yaml.safe_load((REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8"))
-    step = next(
-        s for s in ci["jobs"]["changes"]["steps"] if "filters" in (s.get("with") or {})
+    job = ci["jobs"]["llm-service-unit"]
+    assert any(
+        (st.get("with") or {}).get("filters") == ".github/paths-filters.yml"
+        for st in job["steps"]
+    ), "llm-service-unit no longer filters on .github/paths-filters.yml"
+    assert "steps.filter.outputs.llm == 'true'" in yaml.safe_dump(job), (
+        "llm-service-unit is no longer gated on the `llm` filter"
     )
-    globs = yaml.safe_load(step["with"]["filters"])["llm"]
+    globs = yaml.safe_load(
+        (REPO / ".github" / "paths-filters.yml").read_text(encoding="utf-8")
+    )["llm"]
     assert globs, "the llm path filter parsed empty -- this check would pass vacuously"
 
     def covered(rel: str) -> bool:

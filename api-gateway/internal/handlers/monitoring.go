@@ -198,10 +198,18 @@ func GetSentinelIssues(c *gin.Context) {
 		return
 	}
 
-	// RBAC: power_user or admin required
+	// RBAC: power_user or admin required.
 	userRole := security.GetUserRole(c)
 	if userRole != security.RolePowerUser && userRole != security.RoleAdmin {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Insufficient permissions"})
+		return
+	}
+
+	// …and that is a PLATFORM role, which says nothing about which tenant's rows
+	// the caller may read. The workspace predicate is applied to the query below.
+	callerID := c.GetString("user_id")
+	if userRole != security.RoleAdmin && callerID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication required"})
 		return
 	}
 
@@ -260,6 +268,13 @@ func GetSentinelIssues(c *gin.Context) {
 		query += fmt.Sprintf(" AND component_id = $%d", argIdx)
 		args = append(args, componentID)
 		argIdx++
+	}
+
+	// Tenant scope — see sentinelIssueTenantPredicate.
+	if frag, arg := sentinelIssueTenantPredicate(userRole, callerID, argIdx); frag != "" {
+		query += frag
+		args = append(args, arg...)
+		argIdx += len(arg)
 	}
 
 	if resolved == "true" {
@@ -730,4 +745,44 @@ func numberField(meta, payload map[string]interface{}, key string) (float64, boo
 	}
 	v, ok := payload[key].(float64)
 	return v, ok
+}
+
+// sentinelIssueTenantPredicate returns the SQL fragment (and its arguments) that
+// scope sentinel_active_issues rows to what `role`/`callerID` may read, or an
+// empty fragment when no scoping applies.
+//
+// sentinel_active_issues has no workspace_id column (migration 011), but it is not
+// tenant-neutral: for component_type 'cdc_pipeline' and 'batch_pipeline' the
+// component_id IS a pipeline id and metadata.pipeline_name is that pipeline's
+// name. GetSentinelIssues gated only on the PLATFORM role axis (power_user or
+// admin), which says nothing about which tenant's rows the caller may read, so a
+// power_user in any one workspace could enumerate every other tenant's pipeline
+// ids, names and failure descriptions. The sibling route
+// /monitoring/sentinel/health was gated for exactly this; this one was left on the
+// role check alone.
+//
+// Admin-gating would have been the wrong fix: this is not only an admin surface —
+// CDCLagAlertsPanel queries it per pipeline from the ordinary pipeline page, so an
+// admin middleware would blank that panel for every non-admin. The scope is by row
+// kind instead:
+//
+//   - pipeline-scoped rows: the caller must hold a role in the workspace that owns
+//     that pipeline;
+//   - infrastructure rows (agent, mcp_connector, kafka_consumer, infrastructure):
+//     deployment-wide, and stay admin-only.
+//
+// Platform admins keep the unscoped view they already had.
+func sentinelIssueTenantPredicate(role security.UserRole, callerID string, argIdx int) (string, []interface{}) {
+	if role == security.RoleAdmin {
+		return "", nil
+	}
+	return fmt.Sprintf(`
+		AND component_type IN ('cdc_pipeline', 'batch_pipeline')
+		AND EXISTS (
+			SELECT 1
+			  FROM pipelines p
+			  JOIN workspace_members wm ON wm.workspace_id = p.workspace_id
+			 WHERE p.id::text = sentinel_active_issues.component_id
+			   AND wm.user_id::text = $%d
+		)`, argIdx), []interface{}{callerID}
 }

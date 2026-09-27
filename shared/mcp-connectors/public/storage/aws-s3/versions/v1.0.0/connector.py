@@ -42,6 +42,7 @@ from base_connector import (
     ErrorItem,
 )
 from rsync_protocol.object_storage_source import ObjectStorageSourceMixin
+from rsync_protocol.file_formats import normalize_rows_for_columnar
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -743,7 +744,7 @@ class AwsS3MCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
 
         if file_format == "parquet":
             with tempfile.NamedTemporaryFile(suffix=".parquet", delete=True) as tf:
-                bytes_written = try_write_parquet_to_file(tf.name, data)
+                bytes_written = try_write_parquet_to_file(tf.name, data, params.get("column_types"))
                 if bytes_written is None:
                     file_format = "jsonl"
                 else:
@@ -1005,6 +1006,9 @@ class AwsS3MCPServer(ObjectStorageSourceMixin, BaseMCPConnector):
                 else:
                     body = str(payload).encode("utf-8")
             else:
+                # One type per column for parquet/orc/arrow: a mixed column (Mongo int +
+                # ObjectId _id) would otherwise fail the whole batch into the DLQ.
+                payload = normalize_rows_for_columnar(payload, fmt, params.get("column_types"))
                 body = self.convert_data_to_format(payload, fmt, compression)
             put_args = {"Bucket": bucket, "Key": key, "Body": body, "ContentType": content_type}
             # CDC provenance (Tier C): the kafka-mcp-sink stamps each CDC object with its

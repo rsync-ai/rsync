@@ -8,7 +8,8 @@ import { Progress } from "@/components/ui/progress"
 import { ConnectorLogo } from "@/components/connectors/ConnectorLogo"
 import { getConnectorLogoUrl } from "@/lib/api/mcp-connectors"
 import { formatDateTime, cn } from "@/lib/utils"
-import { formatDuration, type ExecutionPlanStage } from "./DAGVisualization"
+import { formatDuration } from "./dagHelpers"
+import type { ExecutionPlanStage } from "./dagTypes"
 import { detectDurationAnomaly, stageDurationMs } from "./dagHelpers"
 
 const KIND_ICON: Record<string, React.ElementType> = {

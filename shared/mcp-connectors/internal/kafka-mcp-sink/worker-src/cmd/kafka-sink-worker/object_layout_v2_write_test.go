@@ -19,18 +19,44 @@ import (
 // one: a bump starts a new generation (numbering restarts at 1), a clean failure leaves
 // the generation uncleaned, and no LOAD number is handed out for an uncleaned
 // generation. A reservation key always maps to the same number within a generation.
+// reloads holds the orchestrator's reload requests (pipeline|topic → requested_at ms).
 type fakeLoadStore struct {
-	mu      sync.Mutex
-	gen     map[string]int64
-	cleaned map[string]int64
-	next    map[string]int64
-	res     map[string]string
-	cleans  int
-	calls   int
+	mu            sync.Mutex
+	gen           map[string]int64
+	cleaned       map[string]int64
+	next          map[string]int64
+	res           map[string]string
+	reloads       map[string]int64
+	cleans        int
+	calls         int
+	reloadQueries int
 }
 
 func newFakeLoadStore() *fakeLoadStore {
-	return &fakeLoadStore{gen: map[string]int64{}, cleaned: map[string]int64{}, next: map[string]int64{}, res: map[string]string{}}
+	return &fakeLoadStore{gen: map[string]int64{}, cleaned: map[string]int64{}, next: map[string]int64{},
+		res: map[string]string{}, reloads: map[string]int64{}}
+}
+
+func (f *fakeLoadStore) consumeReload(ctx context.Context, pipelineID, tableKey, topic string, firstEventTS int64, clean func(context.Context) error) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reloadQueries++
+	requested, ok := f.reloads[pipelineID+"|"+topic]
+	if !ok || !objectLayoutV2ReloadDue(firstEventTS, requested) {
+		return false, nil
+	}
+	k := pipelineID + "|" + tableKey
+	if _, ok := f.gen[k]; !ok {
+		f.gen[k], f.cleaned[k], f.next[k] = 0, -1, 1
+	}
+	if err := clean(ctx); err != nil {
+		return false, err // the transaction rolls back: no bump, the request stays
+	}
+	f.cleans++
+	f.gen[k]++
+	f.cleaned[k], f.next[k] = f.gen[k], 1
+	delete(f.reloads, pipelineID+"|"+topic)
+	return true, nil
 }
 
 func (f *fakeLoadStore) ensureClean(ctx context.Context, pipelineID, tableKey string, bump bool, clean func(context.Context) error) (int64, error) {

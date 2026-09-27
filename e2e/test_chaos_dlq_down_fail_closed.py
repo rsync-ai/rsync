@@ -36,10 +36,12 @@ DEADLINE (HALT_DEADLINE_S)
     S0 debezium + flush        ~3s + 5.00s  (main.go:1259 relational override)
     S1 batch retry ladder            7.75s  (main.go:957,958,1828-1841)
     S2 per-row isolation             7.75s  (main.go:1711-1721,1781)
-    S3 sendToDLQ exhaustion         12.70s  (main.go:3288 WriteTimeout=3s x4)
+    S3 DLQ topic pre-create          3.00s  (ensureDLQTopic, dlqTopicCreateTimeout;
+                                            once per DLQ topic per process)
+       sendToDLQ exhaustion         12.70s  (main.go:3288 WriteTimeout=3s x4)
     S4 exit -> supervisor -> status  ~5s    (connector.py:745-765,540-553)
-    total                          ~41.3s
-  120s is ~2.9x that, and is deliberately BELOW the 300s infra budget so a
+    total                          ~44.3s
+  120s is ~2.7x that, and is deliberately BELOW the 300s infra budget so a
   misclassified fault fails this test instead of quietly passing it.
 
 ENV KNOBS (used by the red-proof mutations; defaults are the real test)

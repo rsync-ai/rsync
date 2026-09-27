@@ -860,17 +860,14 @@ func CreateConnection(c *gin.Context) {
 
 	database := db.GetDB()
 	if database == nil {
-		log.WithField("trace_id", traceID).Warn("CreateConnection database unavailable; returning mock response")
-		// Mock response if DB not available
-		c.JSON(http.StatusCreated, gin.H{
-			"id":             uuid.New().String(),
-			"name":           req.Name,
-			"type":           req.Type,
-			"connector_type": req.ConnectorType,
-			"status":         "active",
-			"created_at":     time.Now(),
-			"note":           "Database not connected (mock response)",
-		})
+		// A 201 with a freshly minted uuid told the caller the connection was
+		// created and handed them an id that exists nowhere. Everything built on
+		// that id -- a pipeline, a discovery run, a retry -- then failed against a
+		// connection the server had never stored, with the original outage long
+		// out of the logs. An unavailable database is a 503; the client can retry.
+		log.WithField("trace_id", traceID).Error("CreateConnection: database unavailable")
+		respondError(c, http.StatusServiceUnavailable, "database_unavailable",
+			"Database is unavailable; the connection was not created", nil)
 		return
 	}
 
@@ -1484,7 +1481,14 @@ func UpdateConnection(c *gin.Context) {
 
 	result, err := database.Exec(query, args...)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update connection"})
+		// Same mapping as CreateConnection: a rename onto a name the workspace
+		// already uses (uq_connections_ws_name) is a 409 that says which name,
+		// not a 500 the form can only call "a server error".
+		log.WithError(err).WithFields(log.Fields{
+			"trace_id":      getTraceID(c),
+			"connection_id": connectionID,
+		}).Error("UpdateConnection database update failed")
+		SendDBError(c, err, "connection", req.Name)
 		return
 	}
 

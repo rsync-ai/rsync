@@ -76,8 +76,10 @@ func (w *ValidatorWorker) pollAndProcessRequests() error {
 }
 
 func (w *ValidatorWorker) processCorrelationRequest(req *correlation.PendingRequest) {
-	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+	ctx, cancel := correlationWorkContext(w.ctx, "validator")
 	defer cancel()
+	deliverCtx, cancelDeliver := correlationDeliveryContext()
+	defer cancelDeliver()
 
 	logger := log.WithFields(log.Fields{
 		"correlation_id": req.CorrelationID,
@@ -112,57 +114,14 @@ func (w *ValidatorWorker) processCorrelationRequest(req *correlation.PendingRequ
 	logger.Info("✅ Task processing completed")
 
 	// Write response to Redis
-	if routeErr := RouteResult(ctx, task, result, w.kafkaManager); routeErr != nil {
+	if routeErr := RouteResult(deliverCtx, task, result); routeErr != nil {
 		logger.WithError(routeErr).Error("Failed to route response")
 	}
 
 	// Delete request from Redis after processing
-	if delErr := w.correlationClient.DeleteRequest(ctx, req.CorrelationID, "validator"); delErr != nil {
+	if delErr := w.correlationClient.DeleteRequest(deliverCtx, req.CorrelationID, "validator"); delErr != nil {
 		logger.WithError(delErr).Warn("Failed to delete request from Redis")
 	}
 
 	logger.Info("📤 Validator request processed and response sent to Redis")
-}
-
-// processValidatorTask is the core validator processing logic extracted for reuse
-func (w *ValidatorWorker) processValidatorTask(ctx context.Context, task *Task) (TaskResult, error) {
-	// Extract request from payload
-	request, ok := task.Payload["request"].(string)
-	if !ok {
-		return TaskResult{}, fmt.Errorf("missing 'request' in payload")
-	}
-
-	// Call existing validator analysis logic
-	// This calls the LLM service to parse natural language into structured validator
-	validatorResult, err := w.callLLMForValidator(ctx, request, task.PipelineID)
-	if err != nil {
-		return TaskResult{}, fmt.Errorf("LLM service error: %w", err)
-	}
-
-	// Build result
-	result := TaskResult{
-		TaskID:      task.TaskID,
-		WorkflowID:  task.WorkflowID,
-		StepID:      task.StepID,
-		Status:      "success",
-		Output:      validatorResult,
-		CompletedAt: time.Now(),
-		TraceID:     task.TraceID,
-	}
-
-	return result, nil
-}
-
-// callLLMForValidator calls the LLM service for validator analysis
-// This method should already exist in validator.go - this is just a reference
-func (w *ValidatorWorker) callLLMForValidator(ctx context.Context, request string, pipelineID string) (map[string]interface{}, error) {
-	// This delegates to the existing LLM call logic in the worker
-	// The actual implementation should call w.llmServiceURL
-	// For now, we'll return a placeholder that needs to be replaced with actual logic
-	return map[string]interface{}{
-		"validator":   "data_transfer",
-		"source":      "auto",
-		"destination": "auto",
-		"query":       request,
-	}, nil
 }

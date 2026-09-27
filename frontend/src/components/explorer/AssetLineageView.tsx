@@ -4,66 +4,76 @@
 // and which models are refreshed out of step with what they read. The graph comes whole
 // from GET /api/v1/explorer/asset-graph; assetLineage.ts holds the logic, this file draws.
 
-import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react"
+import { createContext, useCallback, useContext, useEffect, useId, useMemo, useRef, useState } from "react"
 import Link from "next/link"
-import { useTheme } from "next-themes"
 import {
-  Handle,
+  BaseEdge,
+  EdgeLabelRenderer,
   MarkerType,
-  Position,
-  ReactFlow,
-  ReactFlowProvider,
-  useReactFlow,
+  getBezierPath,
   type Edge,
+  type EdgeProps,
   type Node,
   type NodeProps,
-  type ReactFlowInstance,
 } from "@xyflow/react"
-import { AlertTriangle, Loader2, Maximize, Minus, Plus, Search } from "lucide-react"
+import { AlertTriangle, Columns3, Loader2, Search } from "lucide-react"
 
 import { cn } from "@/lib/utils"
 import { authFetch } from "@/lib/api/auth-fetch"
+import { listConnections } from "@/lib/api/connections"
+import { useGraphLayout } from "@/lib/hooks/useGraphLayout"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
-import { LINEAGE_NODE_HEIGHT, LINEAGE_NODE_WIDTH, initialViewport, layoutLineage, modelHref } from "@/components/explorer/modelLineage"
+import { modelHref } from "@/components/explorer/modelLineage"
 import {
+  ColumnsPanel,
+  columnsPanelHeight,
+  tablesFor,
+  useWarehouseTables,
+  type WarehouseTablesCache,
+} from "@/components/explorer/AssetColumns"
+import {
+  CanvasStatus,
+  CardHandles,
+  GraphListToggle,
+  LegendLine,
+  LineageFlowCanvas,
+  nodeHandles,
+  useCanvasCapable,
+  useEdgeColors,
+} from "@/components/explorer/LineageFlowCanvas"
+import {
+  ASSET_NODE_HEIGHT,
+  ASSET_NODE_WIDTH,
   MAX_DRAWN_ASSETS,
   assetHref,
   describeAsset,
+  foldUnreadTables,
   kindLabel,
+  layoutAssets,
   needsAttention,
   neighbourhood,
   parseAssetGraph,
   searchAssets,
   triggerLabel,
+  warehouseIds,
+  warehouseLabel,
   wholeGraph,
+  type AssetEdge,
   type AssetGraph,
   type AssetNode,
   type AssetView,
   type AttentionItem,
+  type FoldedView,
   type ModelRefresh,
 } from "@/components/explorer/assetLineage"
 
 const ASSET_GRAPH_URL = "/api/v1/explorer/asset-graph"
 
-/** A canvas needs a pointer to pan and room to show more than one node; anything else gets the list. */
-const CANVAS_MEDIA_QUERY = "(min-width: 640px) and (pointer: fine)"
-
 /** Attention items shown before "Show all". */
 const ATTENTION_PREVIEW = 5
-
-function subscribeCanvasMedia(onChange: () => void): () => void {
-  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return () => {}
-  const mq = window.matchMedia(CANVAS_MEDIA_QUERY)
-  mq.addEventListener?.("change", onChange)
-  return () => mq.removeEventListener?.("change", onChange)
-}
-
-function canvasMediaMatches(): boolean {
-  return typeof window !== "undefined" && typeof window.matchMedia === "function" && window.matchMedia(CANVAS_MEDIA_QUERY).matches
-}
 
 const KIND_BORDER: Record<string, string> = {
   pipeline: "border-l-violet-500",
@@ -71,7 +81,14 @@ const KIND_BORDER: Record<string, string> = {
   model: "border-l-sky-500",
 }
 
-type LoadResult = { key: string; graph: AssetGraph } | { key: string; error: string }
+type LoadResult = { key: string; warehouse: string | null; graph: AssetGraph } | { key: string; error: string }
+
+const NO_NAMES: ReadonlyMap<string, string> = new Map()
+
+const NOTHING_OPEN: ReadonlySet<string> = new Set()
+
+/** Hops the reader can draw on each side of a focused asset. */
+const DEPTHS = [1, 2, 3, Infinity]
 
 export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
   const [retryTick, setRetryTick] = useState(0)
@@ -79,24 +96,31 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
   const [focusId, setFocusId] = useState<string | null>(null)
   const [query, setQuery] = useState("")
   const [view, setView] = useState<"graph" | "list">("graph")
+  // The warehouse (connection id) the backend narrows the graph to; null is all of them.
+  const [warehouse, setWarehouse] = useState<string | null>(null)
+  const [depth, setDepth] = useState(1)
+  // The assets whose next hop the reader opened, for one focus at one depth.
+  const [expansion, setExpansion] = useState<{ key: string; ids: ReadonlySet<string> }>({ key: "", ids: NOTHING_OPEN })
+  const tables = useWarehouseTables()
   const graphRef = useRef<HTMLDivElement>(null)
-  const canvasCapable = useSyncExternalStore(subscribeCanvasMedia, canvasMediaMatches, () => false)
+  const canvasCapable = useCanvasCapable()
 
-  const loadKey = `${reloadTick}|${retryTick}`
+  const loadKey = `${reloadTick}|${retryTick}|${warehouse ?? ""}`
   const loading = result?.key !== loadKey
 
   useEffect(() => {
     let cancelled = false
+    const url = warehouse ? `${ASSET_GRAPH_URL}?connection_id=${encodeURIComponent(warehouse)}` : ASSET_GRAPH_URL
     ;(async () => {
       try {
-        const res = await authFetch(ASSET_GRAPH_URL, { method: "GET" })
+        const res = await authFetch(url, { method: "GET" })
         if (cancelled) return
         if (!res.ok) {
           setResult({ key: loadKey, error: `Could not load the lineage graph (HTTP ${res.status}).` })
           return
         }
         const graph = parseAssetGraph(await res.json())
-        if (!cancelled) setResult({ key: loadKey, graph })
+        if (!cancelled) setResult({ key: loadKey, warehouse, graph })
       } catch {
         if (!cancelled) setResult({ key: loadKey, error: "Could not reach the server to load the lineage graph." })
       }
@@ -104,13 +128,46 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
     return () => {
       cancelled = true
     }
-  }, [loadKey])
+  }, [loadKey, warehouse])
 
   // A failed reload keeps the graph it had: the error is said above it, not instead of it.
   const [lastGraph, setLastGraph] = useState<AssetGraph | null>(null)
   if (result && "graph" in result && result.graph !== lastGraph) setLastGraph(result.graph)
   const graph = result && "graph" in result ? result.graph : lastGraph
   const error = !loading && result && "error" in result ? result.error : null
+
+  // The filter offers every warehouse the last unfiltered load had, so picking one does not
+  // take the others off the list.
+  const [unfiltered, setUnfiltered] = useState<AssetGraph | null>(null)
+  if (result && "graph" in result && result.warehouse === null && result.graph !== unfiltered) setUnfiltered(result.graph)
+  const warehouses = useMemo(() => (unfiltered ? warehouseIds(unfiltered) : []), [unfiltered])
+  const multiWarehouse = warehouses.length >= 2
+
+  // Warehouse names come from the connection list, asked for only when there is a choice to
+  // make. If it fails, each warehouse is shown by a short id instead: the filter still works.
+  const [names, setNames] = useState<ReadonlyMap<string, string>>(NO_NAMES)
+  useEffect(() => {
+    if (!multiWarehouse) return
+    let cancelled = false
+    listConnections()
+      .then(({ connections }) => {
+        if (!cancelled) setNames(new Map((connections ?? []).map((c) => [c.id, c.name])))
+      })
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [multiWarehouse, reloadTick])
+
+  // Each asset is labelled with its warehouse only while more than one is drawn.
+  const warehouseNames = useMemo(
+    () => (multiWarehouse && warehouse === null ? new Map(warehouses.map((id) => [id, warehouseLabel(id, names)])) : null),
+    [multiWarehouse, warehouse, warehouses, names],
+  )
+  const scopeName = warehouse ? `Everything in ${warehouseLabel(warehouse, names)}` : "Whole workspace"
+  const warehouseFilter = (multiWarehouse || warehouse !== null) && (
+    <WarehouseFilter warehouses={warehouses} names={names} value={warehouse} onChange={setWarehouse} />
+  )
 
   const byId = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.id, n])), [graph])
   const modelByNode = useMemo(() => new Map((graph?.models ?? []).map((m) => [m.node_id, m])), [graph])
@@ -119,11 +176,19 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
 
   // A focus the reloaded graph no longer has falls back to the workspace view.
   const focus = focusId && byId.has(focusId) ? focusId : null
+  // What is drawn: a new one starts from its own first view.
+  const signature = `${warehouse ?? ""}|${focus ?? ""}|${focus ? depth : ""}`
+  const expanded = expansion.key === signature ? expansion.ids : NOTHING_OPEN
+  const expand = useCallback(
+    (id: string) =>
+      setExpansion((prev) => ({ key: signature, ids: new Set([...(prev.key === signature ? prev.ids : NOTHING_OPEN), id]) })),
+    [signature],
+  )
   const assetView: AssetView | null = useMemo(() => {
     if (!graph) return null
-    if (focus) return neighbourhood(graph, focus)
+    if (focus) return neighbourhood(graph, focus, { depth, expanded })
     return graph.nodes.length <= MAX_DRAWN_ASSETS ? wholeGraph(graph) : null
-  }, [graph, focus])
+  }, [graph, focus, depth, expanded])
 
   const showInGraph = (id: string) => {
     setFocusId(id)
@@ -157,12 +222,17 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
 
   if (graph.nodes.length === 0) {
     return (
-      <Card className="px-4 py-10 text-center">
-        <p className="text-sm text-zinc-600 dark:text-zinc-300">Nothing to draw yet.</p>
-        <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
-          Lineage appears once a pipeline has written a table, or a saved query is scheduled as a model.
-        </p>
-      </Card>
+      <div className="space-y-4">
+        {warehouseFilter}
+        <Card className="px-4 py-10 text-center">
+          <p className="text-sm text-zinc-600 dark:text-zinc-300">
+            {warehouse ? "Nothing in this warehouse to draw." : "Nothing to draw yet."}
+          </p>
+          <p className="mt-1 text-xs text-zinc-500 dark:text-zinc-400">
+            Lineage appears once a pipeline has written a table, or a saved query is scheduled as a model.
+          </p>
+        </Card>
+      </div>
     )
   }
 
@@ -181,6 +251,8 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
         </div>
       )}
 
+      {warehouseFilter}
+
       <LineageSummary graph={graph} />
 
       {attention.length > 0 && <AttentionCard items={attention} byId={byId} onShow={showInGraph} />}
@@ -194,12 +266,12 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
                   What feeds <span className="font-mono">{focusNode.name}</span>, and what it feeds
                 </>
               ) : (
-                "Whole workspace"
+                scopeName
               )}
             </h2>
             <p className="text-xs text-zinc-500 dark:text-zinc-400">
               {assetView && focusNode
-                ? `${assetView.upstreamFound} upstream · ${assetView.downstreamFound} downstream`
+                ? `${shownOf(assetView.upstreamShown, assetView.upstreamFound)} upstream · ${shownOf(assetView.downstreamShown, assetView.downstreamFound)} downstream`
                 : `${graph.nodes.length} ${graph.nodes.length === 1 ? "asset" : "assets"} · ${graph.edges.length} ${graph.edges.length === 1 ? "link" : "links"}`}
             </p>
             {focusNode && (
@@ -214,28 +286,18 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
                   className="text-xs font-medium text-zinc-600 hover:underline dark:text-zinc-300"
                   onClick={() => setFocusId(null)}
                 >
-                  {graph.nodes.length <= MAX_DRAWN_ASSETS ? "Show the whole workspace" : "Clear"}
+                  {graph.nodes.length <= MAX_DRAWN_ASSETS ? (warehouse ? "Show the whole warehouse" : "Show the whole workspace") : "Clear"}
                 </button>
               </div>
             )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <AssetSearch graph={graph} query={query} onQuery={setQuery} onPick={showInGraph} />
+            <AssetSearch graph={graph} warehouseNames={warehouseNames} query={query} onQuery={setQuery} onPick={showInGraph} />
+            {focusNode && assetView && assetView.upstreamFound + assetView.downstreamFound > 0 && (
+              <DepthPicker value={depth} onChange={setDepth} />
+            )}
             {canvasCapable && assetView && assetView.nodeIds.length > 1 && (
-              <div role="group" aria-label="Show lineage as" className="flex gap-1">
-                {(["graph", "list"] as const).map((v) => (
-                  <Button
-                    key={v}
-                    size="sm"
-                    variant={view === v ? "secondary" : "ghost"}
-                    className="h-7 px-2 text-xs"
-                    aria-pressed={view === v}
-                    onClick={() => setView(v)}
-                  >
-                    {v === "graph" ? "Graph" : "List"}
-                  </Button>
-                ))}
-              </div>
+              <GraphListToggle label="Show lineage as" value={view} onChange={setView} />
             )}
           </div>
         </div>
@@ -249,16 +311,19 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
               Nothing in this workspace feeds it or reads from it.
             </p>
           ) : effectiveView === "graph" ? (
-            <ReactFlowProvider>
-              <AssetCanvas
-                graph={graph}
-                view={assetView}
-                byId={byId}
-                modelByNode={modelByNode}
-                attentionIds={attentionIds}
-                onFocus={setFocusId}
-              />
-            </ReactFlowProvider>
+            <AssetCanvas
+              graph={graph}
+              view={assetView}
+              byId={byId}
+              modelByNode={modelByNode}
+              attentionIds={attentionIds}
+              warehouseNames={warehouseNames}
+              scopeName={scopeName}
+              signature={signature}
+              tables={tables}
+              onFocus={setFocusId}
+              onExpand={expand}
+            />
           ) : (
             <AssetList
               graph={graph}
@@ -266,13 +331,86 @@ export function AssetLineageView({ reloadTick }: { reloadTick: number }) {
               byId={byId}
               modelByNode={modelByNode}
               attentionIds={attentionIds}
+              warehouseNames={warehouseNames}
+              tables={tables}
               onFocus={showInGraph}
+              onExpand={expand}
             />
           )}
         </div>
       </Card>
     </div>
   )
+}
+
+/** "3" when every one is drawn, "2 of 3" when some are not. */
+function shownOf(shown: number, found: number): string {
+  return shown === found ? `${found}` : `${shown} of ${found}`
+}
+
+function DepthPicker({ value, onChange }: { value: number; onChange: (depth: number) => void }) {
+  return (
+    <div role="group" aria-label="Hops drawn on each side" className="flex items-center gap-1">
+      <span className="text-xs text-zinc-500 dark:text-zinc-400" aria-hidden>
+        Hops
+      </span>
+      {DEPTHS.map((d) => (
+        <Button
+          key={d}
+          size="sm"
+          variant={value === d ? "secondary" : "ghost"}
+          className="h-7 min-w-7 px-2 text-xs"
+          aria-pressed={value === d}
+          aria-label={d === Infinity ? "Every hop" : `${d} ${d === 1 ? "hop" : "hops"}`}
+          onClick={() => onChange(d)}
+        >
+          {d === Infinity ? "All" : d}
+        </Button>
+      ))}
+    </div>
+  )
+}
+
+function WarehouseFilter({
+  warehouses,
+  names,
+  value,
+  onChange,
+}: {
+  warehouses: string[]
+  names: ReadonlyMap<string, string>
+  value: string | null
+  onChange: (id: string | null) => void
+}) {
+  const id = useId()
+  const options = warehouses
+    .map((w) => ({ id: w, label: warehouseLabel(w, names) }))
+    .sort((a, b) => a.label.localeCompare(b.label))
+  return (
+    <div className="flex items-center gap-2">
+      <label htmlFor={id} className="text-xs font-medium text-zinc-600 dark:text-zinc-300">
+        Warehouse
+      </label>
+      <select
+        id={id}
+        className="h-7 max-w-64 rounded-md border border-zinc-300 bg-white px-2 text-xs focus:outline-none focus:ring-2 focus:ring-blue-500 dark:border-zinc-700 dark:bg-zinc-900"
+        value={value ?? ""}
+        onChange={(e) => onChange(e.target.value || null)}
+      >
+        <option value="">All warehouses</option>
+        {options.map((o) => (
+          <option key={o.id} value={o.id}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </div>
+  )
+}
+
+/** The warehouse an asset is in, when more than one is drawn; null otherwise. */
+function warehouseOf(node: AssetNode, names: ReadonlyMap<string, string> | null): string | null {
+  return (names && node.connection_id && names.get(node.connection_id)) || null
 }
 
 function LineageSummary({ graph }: { graph: AssetGraph }) {
@@ -382,47 +520,99 @@ function AttentionCard({
 
 function AssetSearch({
   graph,
+  warehouseNames,
   query,
   onQuery,
   onPick,
 }: {
   graph: AssetGraph
+  warehouseNames: ReadonlyMap<string, string> | null
   query: string
   onQuery: (q: string) => void
   onPick: (id: string) => void
 }) {
-  const matches = searchAssets(graph, query)
+  const matches = useMemo(() => searchAssets(graph, query), [graph, query])
+  const listId = useId()
+  // The highlighted match belongs to the query it was chosen for: typing starts at the top.
+  const [active, setActive] = useState({ query, index: 0 })
+  const index = active.query === query ? Math.min(active.index, matches.length - 1) : 0
+  const [open, setOpen] = useState(true)
+  const shown = open && query.trim() !== ""
+  const optionId = (i: number) => `${listId}-${i}`
+
+  const move = (by: number) => {
+    if (matches.length === 0) return
+    setOpen(true)
+    setActive({ query, index: (index + by + matches.length) % matches.length })
+  }
+
   return (
     <div className="relative w-64 max-w-full">
       <Search className="pointer-events-none absolute left-2 top-2 h-3.5 w-3.5 text-zinc-400" aria-hidden />
       <Input
         type="search"
+        role="combobox"
+        aria-expanded={shown}
+        aria-controls={listId}
+        aria-autocomplete="list"
+        aria-activedescendant={shown && matches.length > 0 ? optionId(index) : undefined}
         value={query}
-        onChange={(e) => onQuery(e.target.value)}
+        onChange={(e) => {
+          setOpen(true)
+          onQuery(e.target.value)
+        }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setOpen(false)}
         onKeyDown={(e) => {
-          if (e.key === "Escape") onQuery("")
-          if (e.key === "Enter" && matches.length > 0) onPick(matches[0].id)
+          if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+            e.preventDefault()
+            move(e.key === "ArrowDown" ? 1 : -1)
+          } else if (e.key === "Escape") {
+            onQuery("")
+          } else if (e.key === "Enter" && shown && matches.length > 0) {
+            e.preventDefault()
+            onPick(matches[index].id)
+          }
         }}
         placeholder="Find a pipeline, table or model"
         aria-label="Find a pipeline, table or model"
         className="h-7 pl-7 text-xs"
       />
-      {query.trim() && (
+      <p role="status" className="sr-only">
+        {shown ? `${matches.length} ${matches.length === 1 ? "match" : "matches"}` : ""}
+      </p>
+      {shown && (
         <div className="absolute right-0 top-8 z-20 w-72 max-w-[calc(100vw-2rem)] rounded-md border bg-white p-1 shadow-lg dark:border-zinc-700 dark:bg-zinc-900">
           {matches.length === 0 ? (
             <p className="px-2 py-1.5 text-xs text-zinc-500 dark:text-zinc-400">No pipeline, table or model matches.</p>
           ) : (
-            <ul aria-label="Matches">
-              {matches.map((n) => (
-                <li key={n.id}>
-                  <button
-                    type="button"
-                    className="flex w-full items-baseline gap-2 rounded px-2 py-1.5 text-left hover:bg-zinc-100 dark:hover:bg-zinc-800"
-                    onClick={() => onPick(n.id)}
-                  >
-                    <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-400">{kindLabel(n.kind)}</span>
-                    <span className="truncate font-mono text-xs text-zinc-900 dark:text-white">{n.name}</span>
-                  </button>
+            <ul id={listId} role="listbox" aria-label="Matches">
+              {matches.map((n, i) => (
+                <li
+                  key={n.id}
+                  id={optionId(i)}
+                  role="option"
+                  aria-selected={i === index}
+                  className={cn(
+                    "flex cursor-pointer items-baseline gap-2 rounded px-2 py-1.5",
+                    i === index ? "bg-zinc-100 dark:bg-zinc-800" : "hover:bg-zinc-50 dark:hover:bg-zinc-800/60",
+                  )}
+                  // Keeps focus in the box, so the list is not closed by the blur before the click lands.
+                  onMouseDown={(e) => e.preventDefault()}
+                  onMouseMove={() => i !== index && setActive({ query, index: i })}
+                  onClick={() => onPick(n.id)}
+                >
+                  {/* The spaces are for screen readers, which read the option as one string. */}
+                  <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-400">{kindLabel(n.kind)}</span>{" "}
+                  <span className="truncate font-mono text-xs text-zinc-900 dark:text-white">{n.name}</span>
+                  {warehouseOf(n, warehouseNames) && (
+                    <>
+                      {" "}
+                      <span className="ml-auto shrink-0 truncate text-[11px] text-zinc-500 dark:text-zinc-400">
+                        {warehouseOf(n, warehouseNames)}
+                      </span>
+                    </>
+                  )}
                 </li>
               ))}
             </ul>
@@ -442,7 +632,7 @@ function GraphNotices({ graph, view }: { graph: AssetGraph; view: AssetView | nu
   ].filter(Boolean) as string[]
   const omitted = view?.omitted ?? 0
   if (cut.length === 0 && omitted === 0) return null
-  const found = view ? view.upstreamFound + view.downstreamFound : 0
+  const shown = view ? view.upstreamShown + view.downstreamShown : 0
   return (
     <div className="space-y-2 border-b px-4 py-3 text-xs text-amber-800 dark:border-zinc-800 dark:text-amber-300">
       {cut.length > 0 && (
@@ -455,7 +645,7 @@ function GraphNotices({ graph, view }: { graph: AssetGraph; view: AssetView | nu
       {omitted > 0 && (
         <p className="flex items-start gap-1.5">
           <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden />
-          Showing {found - omitted} of {found} linked assets, nearest first. {omitted} more{" "}
+          Drawing the nearest {shown} of the {shown + omitted} assets in reach, to keep it readable. {omitted} more{" "}
           {omitted === 1 ? "is" : "are"} not drawn.
         </p>
       )}
@@ -497,56 +687,161 @@ function PickPrompt({
   )
 }
 
+/** What a card on the canvas can ask of the page: the drawing is out of reach of its props. */
+interface CardActions {
+  /** Draws the next hop beyond an asset. `flowId` is its card, which the view keeps still. */
+  expand: (id: string, flowId: string) => void
+  toggleColumns: (node: AssetNode, flowId: string) => void
+  tables: WarehouseTablesCache
+}
+
+const CardActionsContext = createContext<CardActions | null>(null)
+
 interface AssetNodeData extends Record<string, unknown> {
   node: AssetNode
   line: string
+  warehouse: string | null
   focused: boolean
   flagged: boolean
+  /** The side of the focus it is on; null for the focus, or with no focus. */
+  side: "upstream" | "downstream" | null
+  /** Its next hop away from the focus that is not drawn. */
+  hidden: number
+  /** The height of its open column list; 0 when the list is shut. */
+  panel: number
 }
 
 type AssetFlowNode = Node<AssetNodeData, "asset">
 
-const HIDDEN_HANDLE_STYLE = { opacity: 0, pointerEvents: "none" as const }
+/** The border-t and py-2 around a card's column list. */
+const COLUMNS_FRAME_HEIGHT = 17
 
-function AssetNodeCard({ data }: NodeProps<AssetFlowNode>) {
-  const { node, line, focused, flagged } = data
+/** Card controls: out of the tab order (the canvas is hidden from screen readers; the List has them) and not a drag. */
+const IN_CARD = { tabIndex: -1 }
+
+function AssetNodeCard({ id, data }: NodeProps<AssetFlowNode>) {
+  const { node, line, warehouse, focused, flagged, side, hidden, panel } = data
+  const columnsOpen = panel > 0
+  const actions = useContext(CardActionsContext)
+  const stop = (act: () => void) => (e: { stopPropagation: () => void }) => {
+    e.stopPropagation()
+    act()
+  }
   return (
     <div
       title={focused ? undefined : "Show what feeds it and what it feeds"}
       className={cn(
-        "relative flex flex-col justify-center rounded-md border border-l-4 bg-white px-3 py-2 shadow-sm dark:border-zinc-700 dark:bg-zinc-900",
+        "relative flex flex-col rounded-md border border-l-4 bg-white shadow-sm dark:border-zinc-700 dark:bg-zinc-900",
         KIND_BORDER[node.kind] ?? KIND_BORDER.table,
-        focused ? "cursor-default ring-2 ring-zinc-900/70 dark:ring-white/70" : "cursor-pointer hover:bg-zinc-50 hover:shadow-md dark:hover:bg-zinc-800",
+        focused ? "cursor-default ring-2 ring-zinc-900/70 dark:ring-white/70" : "cursor-pointer hover:shadow-md",
       )}
-      style={{ width: LINEAGE_NODE_WIDTH, height: LINEAGE_NODE_HEIGHT }}
+      style={{ width: ASSET_NODE_WIDTH, height: ASSET_NODE_HEIGHT + panel }}
     >
-      <Handle type="target" position={Position.Left} isConnectable={false} style={HIDDEN_HANDLE_STYLE} />
+      <CardHandles top={ASSET_NODE_HEIGHT / 2} />
       {focused && (
         <span className="absolute -top-2 left-2 rounded bg-zinc-900 px-1 text-[10px] font-medium leading-4 text-white dark:bg-white dark:text-zinc-900">
           Selected
         </span>
       )}
-      <div className="flex items-center gap-1.5">
-        <span className="text-[10px] uppercase tracking-wide text-zinc-400">{kindLabel(node.kind)}</span>
-        {flagged && <AlertTriangle className="h-3 w-3 text-amber-500" aria-label="Needs attention" />}
+      <div
+        className={cn("flex shrink-0 flex-col justify-center px-3 py-2", !focused && "hover:bg-zinc-50 dark:hover:bg-zinc-800")}
+        style={{ height: ASSET_NODE_HEIGHT - 2 }}
+      >
+        <div className="flex min-w-0 items-center gap-1.5">
+          <span className="shrink-0 text-[10px] uppercase tracking-wide text-zinc-400">{kindLabel(node.kind)}</span>
+          {warehouse && (
+            <span className="truncate text-[10px] text-zinc-400" title={warehouse}>
+              · {warehouse}
+            </span>
+          )}
+          {flagged && <AlertTriangle className="h-3 w-3 shrink-0 text-amber-500" aria-label="Needs attention" />}
+          {node.kind === "table" && actions && (
+            <button
+              type="button"
+              {...IN_CARD}
+              aria-expanded={columnsOpen}
+              title={columnsOpen ? "Hide its columns" : "Show its columns"}
+              className="nodrag nopan ml-auto inline-flex shrink-0 items-center gap-1 rounded px-1 text-[10px] text-zinc-500 hover:bg-zinc-100 hover:text-zinc-900 dark:text-zinc-400 dark:hover:bg-zinc-800 dark:hover:text-white"
+              onClick={stop(() => actions.toggleColumns(node, id))}
+            >
+              <Columns3 className="h-3 w-3" aria-hidden />
+              {columnsOpen ? "Hide columns" : "Columns"}
+            </button>
+          )}
+        </div>
+        <span className="truncate font-mono text-sm font-medium text-zinc-900 dark:text-white" title={node.name}>
+          {node.name}
+        </span>
+        <span className="truncate text-[11px] text-zinc-500 dark:text-zinc-400" title={line}>
+          {line}
+        </span>
       </div>
-      <span className="truncate font-mono text-sm font-medium text-zinc-900 dark:text-white" title={node.name}>
-        {node.name}
-      </span>
-      <span className="truncate text-[11px] text-zinc-500 dark:text-zinc-400" title={line}>
-        {line}
-      </span>
-      <Handle type="source" position={Position.Right} isConnectable={false} style={HIDDEN_HANDLE_STYLE} />
+      {columnsOpen && actions && (
+        // Reading columns is not asking to focus the table.
+        <div
+          className="nodrag nopan min-h-0 flex-1 cursor-default overflow-hidden border-t px-3 py-2 dark:border-zinc-800"
+          onClick={(e) => e.stopPropagation()}
+        >
+          <ColumnsPanel
+            node={node}
+            tables={tablesFor(node, actions.tables)}
+            onRetry={() => node.connection_id && actions.tables.load(node.connection_id)}
+            inCanvas
+            className="h-full"
+          />
+        </div>
+      )}
+      {hidden > 0 && side && actions && (
+        <button
+          type="button"
+          {...IN_CARD}
+          title={`Show ${hidden} more ${side}`}
+          className={cn(
+            "nodrag nopan absolute z-10 -translate-y-1/2 rounded-full border bg-white px-1.5 text-[10px] font-medium leading-4 text-zinc-700 shadow-sm hover:bg-zinc-100 dark:border-zinc-600 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800",
+            side === "upstream" ? "-left-3 -translate-x-1/2" : "-right-3 translate-x-1/2",
+          )}
+          style={{ top: ASSET_NODE_HEIGHT / 2 }}
+          onClick={stop(() => actions.expand(node.id, id))}
+        >
+          +{hidden}
+        </button>
+      )}
     </div>
   )
 }
 
-const nodeTypes = { asset: AssetNodeCard }
+interface FoldNodeData extends Record<string, unknown> {
+  count: number
+}
 
-const NODE_HANDLES = [
-  { type: "target" as const, position: Position.Left, x: 0, y: LINEAGE_NODE_HEIGHT / 2, width: 1, height: 1 },
-  { type: "source" as const, position: Position.Right, x: LINEAGE_NODE_WIDTH - 1, y: LINEAGE_NODE_HEIGHT / 2, width: 1, height: 1 },
-]
+type FoldFlowNode = Node<FoldNodeData, "fold">
+
+type DrawnNode = AssetFlowNode | FoldFlowNode
+
+/** A pipeline's tables that nothing drawn reads, as one card that opens in place. */
+function FoldCard({ data }: NodeProps<FoldFlowNode>) {
+  return (
+    <div
+      title="Show these tables"
+      className={cn(
+        "relative flex cursor-pointer flex-col justify-center rounded-md border border-l-4 border-dashed bg-white px-3 py-2 shadow-sm hover:bg-zinc-50 hover:shadow-md dark:border-zinc-700 dark:bg-zinc-900 dark:hover:bg-zinc-800",
+        KIND_BORDER.table,
+      )}
+      style={{ width: ASSET_NODE_WIDTH, height: ASSET_NODE_HEIGHT }}
+    >
+      <CardHandles top={ASSET_NODE_HEIGHT / 2} />
+      <span className="text-[10px] uppercase tracking-wide text-zinc-400">Tables</span>
+      <span className="truncate text-sm font-medium text-zinc-900 dark:text-white">{data.count} tables no model reads</span>
+      <span className="truncate text-[11px] text-zinc-500 dark:text-zinc-400">Click to show them</span>
+    </div>
+  )
+}
+
+const nodeTypes = { asset: AssetNodeCard, fold: FoldCard }
+
+const ASSET_HANDLES = nodeHandles(ASSET_NODE_WIDTH, ASSET_NODE_HEIGHT / 2)
+
+const KIND_MAP_FILL: Record<string, string> = { pipeline: "#8b5cf6", table: "#a1a1aa", model: "#0ea5e9" }
 
 /** How an edge is drawn says how the backend knows it. */
 const EVIDENCE_DASH: Record<string, string | undefined> = {
@@ -555,175 +850,367 @@ const EVIDENCE_DASH: Record<string, string | undefined> = {
   inferred: "2 4",
 }
 
+const EDGE_KIND_TEXT: Record<string, string> = {
+  writes: "Writes",
+  materializes: "Builds",
+  reads: "Read by",
+  triggers: "Wakes when it finishes",
+}
+
+const EVIDENCE_TEXT: Record<string, string> = {
+  observed: "seen in a run",
+  declared: "configured",
+  inferred: "read from a model's SQL",
+}
+
+/** What an edge says when the pointer rests on it. */
+export function edgeLabel(e: Pick<AssetEdge, "kind" | "evidence">): string {
+  const kind = EDGE_KIND_TEXT[e.kind] ?? e.kind
+  const evidence = EVIDENCE_TEXT[e.evidence]
+  return evidence ? `${kind} · ${evidence}` : kind
+}
+
+interface EvidenceEdgeData extends Record<string, unknown> {
+  label: string
+  color: string
+}
+
+type EvidenceFlowEdge = Edge<EvidenceEdgeData, "evidence">
+
+/** A curved edge with a dot at its middle that names the link and how it is known. */
+function EvidenceEdge({
+  id,
+  sourceX,
+  sourceY,
+  targetX,
+  targetY,
+  sourcePosition,
+  targetPosition,
+  style,
+  markerEnd,
+  data,
+}: EdgeProps<EvidenceFlowEdge>) {
+  const [path, labelX, labelY] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition })
+  return (
+    <>
+      <BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} />
+      {data && (
+        <EdgeLabelRenderer>
+          <div
+            className="nodrag nopan group absolute flex h-4 w-4 items-center justify-center"
+            style={{ transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`, pointerEvents: "all" }}
+          >
+            <span
+              className="block h-2 w-2 rounded-full border-[1.5px] bg-zinc-50 dark:bg-zinc-950"
+              style={{ borderColor: data.color }}
+            />
+            <span className="pointer-events-none absolute left-1/2 top-4 z-10 hidden -translate-x-1/2 whitespace-nowrap rounded border bg-white px-1.5 py-0.5 text-[10px] text-zinc-700 shadow-sm group-hover:block dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200">
+              {data.label}
+            </span>
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  )
+}
+
+const edgeTypes = { evidence: EvidenceEdge }
+
+/** What one layout is of; the drawing is made from it, so cards and positions always agree. */
+interface AssetDrawingInput {
+  /** The canvas this drawing belongs to (see AssetLineageView's signature). */
+  signature: string
+  view: AssetView
+  folded: FoldedView
+  /** Tables whose columns are open → the height their list adds under the card. */
+  panels: ReadonlyMap<string, number>
+  /** Asset id → card id. Card ids are graph positions, so no asset id is written into the DOM. */
+  flowId: Map<string, string>
+}
+
+function layoutDrawing(input: AssetDrawingInput) {
+  return layoutAssets(input.folded.nodeIds, input.folded.edges, (id) => ({
+    width: ASSET_NODE_WIDTH,
+    height: ASSET_NODE_HEIGHT + (input.panels.get(id) ?? 0),
+  }))
+}
+
 function AssetCanvas({
   graph,
   view,
   byId,
   modelByNode,
   attentionIds,
+  warehouseNames,
+  scopeName,
+  signature,
+  tables,
   onFocus,
+  onExpand,
 }: {
   graph: AssetGraph
   view: AssetView
   byId: Map<string, AssetNode>
   modelByNode: Map<string, ModelRefresh>
   attentionIds: Set<string>
+  warehouseNames: ReadonlyMap<string, string> | null
+  /** What the unfocused drawing is of: the workspace, or one warehouse of it. */
+  scopeName: string
+  /** Names what is drawn; the reader's opened boxes and columns last as long as it does. */
+  signature: string
+  tables: WarehouseTablesCache
   onFocus: (id: string) => void
+  onExpand: (id: string) => void
 }) {
-  const { resolvedTheme } = useTheme()
-  const dark = resolvedTheme === "dark"
-  const { zoomIn, zoomOut, fitView } = useReactFlow()
-  const wrapperRef = useRef<HTMLDivElement>(null)
+  const { stroke, accent } = useEdgeColors()
+  // The boxes of unread tables the reader opened, or all of them.
+  const [opened, setOpened] = useState<{ signature: string; open: ReadonlySet<string> | "all" }>({
+    signature,
+    open: NOTHING_OPEN,
+  })
+  const open = opened.signature === signature ? opened.open : NOTHING_OPEN
+  const setOpen = (next: ReadonlySet<string> | "all") => setOpened({ signature, open: next })
+  // The tables whose columns are shown on their cards.
+  const [columns, setColumns] = useState<{ signature: string; open: ReadonlySet<string> }>({ signature, open: NOTHING_OPEN })
+  const columnsOpen = columns.signature === signature ? columns.open : NOTHING_OPEN
+  // The card the reader last acted on, kept still while the drawing moves around it.
+  const [anchor, setAnchor] = useState<{ signature: string; flowId: string } | null>(null)
 
-  const layout = useMemo(() => {
-    // Flow ids are positions in the list, so no asset id is written into the DOM.
-    const flowId = new Map(view.nodeIds.map((id, i) => [id, `n${i}`]))
-    const idByFlowId = new Map([...flowId].map(([id, f]) => [f, id]))
-    const { positions, bounds } = layoutLineage(view.nodeIds, view.edges)
-    // The first view centres on the selected asset, or on the start of the flow.
-    let anchor = view.focus ? positions.get(view.focus) : undefined
-    if (!anchor) {
-      for (const p of positions.values()) if (!anchor || p.x < anchor.x || (p.x === anchor.x && p.y < anchor.y)) anchor = p
+  const folded = useMemo(() => foldUnreadTables(view, graph, open), [view, graph, open])
+  // Each open column list as tall as what it shows, so one column does not get ten rows' room.
+  const panels = useMemo(() => {
+    const heights = new Map<string, number>()
+    for (const id of columnsOpen) {
+      const node = byId.get(id)
+      if (node) heights.set(id, COLUMNS_FRAME_HEIGHT + columnsPanelHeight(node, tablesFor(node, tables)))
     }
-    return {
-      flowId,
-      idByFlowId,
-      positions,
-      bounds,
-      root: { ...(anchor ?? { x: 0, y: 0 }), width: LINEAGE_NODE_WIDTH, height: LINEAGE_NODE_HEIGHT },
-      signature: `${view.nodeIds.join(",")}|${view.edges.map((e) => `${e.from}>${e.to}`).join(",")}`,
-    }
-  }, [view])
+    return heights
+  }, [columnsOpen, byId, tables])
+  const indexOf = useMemo(() => new Map(graph.nodes.map((n, i) => [n.id, i])), [graph])
 
-  const nodes: AssetFlowNode[] = useMemo(
+  const input: AssetDrawingInput = useMemo(() => {
+    const flowId = new Map<string, string>()
+    for (const id of folded.nodeIds) {
+      const group = folded.groups.get(id)
+      const at = indexOf.get(group ? group.pipeline : id)
+      if (at !== undefined) flowId.set(id, `${group ? "f" : "n"}${at}`)
+    }
+    return { signature, view, folded, panels, flowId }
+  }, [signature, view, folded, panels, indexOf])
+
+  const layoutKey = [
+    signature,
+    folded.nodeIds.join(","),
+    folded.edges.map((e) => `${e.from}>${e.to}:${e.kind}:${e.evidence}`).join(","),
+    [...panels].map(([id, height]) => `${id}:${height}`).join(","),
+  ].join("|")
+  const { settled, pending, error } = useGraphLayout(layoutKey, input, layoutDrawing)
+
+  const drawing = useMemo(() => {
+    if (!settled) return null
+    const { input: laidOut, layout } = settled
+    const idByFlowId = new Map([...laidOut.flowId].map(([id, f]) => [f, id]))
+    const focusAt = laidOut.view.focus ? layout.positions.get(laidOut.view.focus) : undefined
+    const root = focusAt
+      ? {
+          ...focusAt,
+          width: ASSET_NODE_WIDTH,
+          height: ASSET_NODE_HEIGHT + (laidOut.panels.get(laidOut.view.focus!) ?? 0),
+        }
+      : null
+    return { ...laidOut, layoutKey: settled.key, idByFlowId, positions: layout.positions, bounds: layout.bounds, root }
+  }, [settled])
+
+  const nodes: DrawnNode[] = useMemo(
     () =>
-      view.nodeIds.flatMap((id) => {
+      (drawing?.folded.nodeIds ?? []).flatMap((id): DrawnNode[] => {
+        const flowId = drawing!.flowId.get(id)
+        const position = drawing!.positions.get(id)
+        if (!flowId || !position) return []
+        const panel = drawing!.panels.get(id) ?? 0
+        const card = {
+          id: flowId,
+          position,
+          width: ASSET_NODE_WIDTH,
+          height: ASSET_NODE_HEIGHT + panel,
+          selectable: false,
+          connectable: false,
+          focusable: false,
+          handles: ASSET_HANDLES,
+        }
+        const group = drawing!.folded.groups.get(id)
+        if (group) return [{ ...card, type: "fold", data: { count: group.tables.length } }]
         const node = byId.get(id)
         if (!node) return []
+        const role = drawing!.view.role.get(id)
         return [
           {
-            id: layout.flowId.get(id)!,
-            type: "asset" as const,
-            position: layout.positions.get(id) ?? { x: 0, y: 0 },
+            ...card,
+            type: "asset",
             data: {
               node,
               line: describeAsset(node, graph, modelByNode.get(id)),
-              focused: id === view.focus,
+              warehouse: warehouseOf(node, warehouseNames),
+              focused: id === drawing!.view.focus,
               flagged: attentionIds.has(id),
+              side: role === "upstream" || role === "downstream" ? role : null,
+              hidden: drawing!.view.hiddenBeyond.get(id) ?? 0,
+              panel,
             },
-            width: LINEAGE_NODE_WIDTH,
-            height: LINEAGE_NODE_HEIGHT,
-            draggable: false,
-            selectable: false,
-            connectable: false,
-            focusable: false,
-            handles: NODE_HANDLES,
           },
         ]
       }),
-    [view, layout, byId, graph, modelByNode, attentionIds],
+    [drawing, byId, graph, modelByNode, attentionIds, warehouseNames],
   )
 
-  const stroke = dark ? "#a1a1aa" : "#71717a"
-  const wake = dark ? "#60a5fa" : "#2563eb"
-  const edges: Edge[] = useMemo(
+  const edges: EvidenceFlowEdge[] = useMemo(
     () =>
-      view.edges.map((e, i) => {
-        const color = e.kind === "triggers" ? wake : stroke
+      (drawing?.folded.edges ?? []).flatMap((e, i): EvidenceFlowEdge[] => {
+        const source = drawing!.flowId.get(e.from)
+        const target = drawing!.flowId.get(e.to)
+        if (!source || !target) return []
+        const color = e.kind === "triggers" ? accent : stroke
         const dash = EVIDENCE_DASH[e.evidence]
-        return {
-          id: `e${i}`,
-          source: layout.flowId.get(e.from)!,
-          target: layout.flowId.get(e.to)!,
-          type: "smoothstep",
-          focusable: false,
-          selectable: false,
-          // null stops React Flow writing "Edge from n0 to n1" as a label; the type says string.
-          ariaLabel: null as unknown as string,
-          style: { stroke: color, strokeWidth: 1.5, ...(dash ? { strokeDasharray: dash } : {}) },
-          markerEnd: { type: MarkerType.ArrowClosed, color },
-        }
+        return [
+          {
+            id: `e${i}`,
+            source,
+            target,
+            type: "evidence",
+            focusable: false,
+            selectable: false,
+            // null stops React Flow writing "Edge from n0 to n1" as a label; the type says string.
+            ariaLabel: null as unknown as string,
+            style: { stroke: color, strokeWidth: 1.5, ...(dash ? { strokeDasharray: dash } : {}) },
+            markerEnd: { type: MarkerType.ArrowClosed, color },
+            data: { label: edgeLabel(e), color },
+          },
+        ]
       }),
-    [view, layout, stroke, wake],
+    [drawing, stroke, accent],
   )
 
-  const onInit = (instance: ReactFlowInstance<AssetFlowNode, Edge>) => {
-    const el = wrapperRef.current
-    const size = { width: el?.clientWidth ?? 0, height: el?.clientHeight ?? 0 }
-    void instance.setViewport(initialViewport(layout.bounds, layout.root, size))
+  const actions: CardActions = useMemo(
+    () => ({
+      expand: (id, flowId) => {
+        setAnchor({ signature, flowId })
+        onExpand(id)
+      },
+      toggleColumns: (node, flowId) => {
+        const next = new Set(columnsOpen)
+        if (next.has(node.id)) next.delete(node.id)
+        else {
+          next.add(node.id)
+          if (node.connection_id) tables.load(node.connection_id)
+        }
+        setAnchor({ signature, flowId })
+        setColumns({ signature, open: next })
+      },
+      tables,
+    }),
+    [signature, columnsOpen, tables, onExpand],
+  )
+
+  if (!drawing) {
+    return (
+      <CanvasStatus>
+        {error ? (
+          <span role="alert">Could not lay out the graph. The List view has the same pipelines, tables and models.</span>
+        ) : (
+          <>
+            <Loader2 className="h-4 w-4 animate-spin" aria-hidden />
+            Laying out the graph…
+          </>
+        )}
+      </CanvasStatus>
+    )
   }
 
-  const evidence = new Set(view.edges.map((e) => e.evidence))
-  const anyWake = view.edges.some((e) => e.kind === "triggers")
+  const onNodeClick = (flowId: string) => {
+    const id = drawing.idByFlowId.get(flowId)
+    if (!id) return
+    if (drawing.folded.groups.has(id)) {
+      setAnchor({ signature, flowId })
+      setOpen(open === "all" ? open : new Set([...open, id]))
+    } else if (id !== drawing.view.focus) onFocus(id)
+  }
+
+  const evidence = new Set(drawing.folded.edges.map((e) => e.evidence))
+  const anyWake = drawing.folded.edges.some((e) => e.kind === "triggers")
+  const foldedTables = [...folded.groups.values()].reduce((n, g) => n + g.tables.length, 0)
+  const focusName = view.focus ? byId.get(view.focus)?.name : undefined
+  const focusFlowId = view.focus ? input.flowId.get(view.focus) : undefined
+  const keepFocusStill = () => setAnchor(focusFlowId ? { signature, flowId: focusFlowId } : null)
 
   return (
-    <div>
-      <p className="sr-only">
-        A drawing of the lineage. The List view has the same pipelines, tables and models, with links and a button that
-        centres the graph on each one.
-      </p>
-      <div className="relative">
-        <div ref={wrapperRef} aria-hidden="true" className="h-[480px] w-full bg-zinc-50 dark:bg-zinc-950">
-          <ReactFlow<AssetFlowNode, Edge>
-            key={layout.signature}
-            nodes={nodes}
-            edges={edges}
-            nodeTypes={nodeTypes}
-            onInit={onInit}
-            onNodeClick={(_, n) => {
-              const id = layout.idByFlowId.get(n.id)
-              if (id && id !== view.focus) onFocus(id)
-            }}
-            colorMode={dark ? "dark" : "light"}
-            nodesDraggable={false}
-            nodesConnectable={false}
-            nodesFocusable={false}
-            edgesFocusable={false}
-            elementsSelectable={false}
-            disableKeyboardA11y
-            zoomOnScroll={false}
-            zoomOnDoubleClick={false}
-            preventScrolling={false}
-            minZoom={0.2}
-            maxZoom={1.5}
-            proOptions={{ hideAttribution: true }}
-          />
+    <>
+      {(folded.groups.size > 0 || folded.opened > 0) && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2 text-xs text-zinc-600 dark:border-zinc-800 dark:text-zinc-300">
+          <p>
+            {folded.groups.size > 0
+              ? `${foldedTables} tables no model reads are folded into one box per pipeline. Click a box to open it.`
+              : "Every table is drawn."}
+          </p>
+          {folded.groups.size > 0 && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 text-xs"
+              onClick={() => {
+                keepFocusStill()
+                setOpen("all")
+              }}
+            >
+              Show every table
+            </Button>
+          )}
+          {folded.opened > 0 && (
+            <Button
+              size="sm"
+              variant="outline"
+              className="h-6 px-2 text-xs"
+              onClick={() => {
+                keepFocusStill()
+                setOpen(NOTHING_OPEN)
+              }}
+            >
+              Fold unread tables again
+            </Button>
+          )}
         </div>
-        <div className="absolute right-2 top-2 flex flex-col gap-1">
-          <Button size="icon" variant="outline" className="h-7 w-7 bg-white dark:bg-zinc-900" aria-label="Zoom in" onClick={() => void zoomIn()}>
-            <Plus className="h-3.5 w-3.5" aria-hidden />
-          </Button>
-          <Button size="icon" variant="outline" className="h-7 w-7 bg-white dark:bg-zinc-900" aria-label="Zoom out" onClick={() => void zoomOut()}>
-            <Minus className="h-3.5 w-3.5" aria-hidden />
-          </Button>
-          <Button
-            size="icon"
-            variant="outline"
-            className="h-7 w-7 bg-white dark:bg-zinc-900"
-            aria-label="Fit everything drawn"
-            onClick={() => void fitView({ padding: 0.1, maxZoom: 1 })}
-          >
-            <Maximize className="h-3.5 w-3.5" aria-hidden />
-          </Button>
-        </div>
-      </div>
-      <AssetLegend evidence={evidence} wakeColor={anyWake ? wake : null} />
-    </div>
+      )}
+      <CardActionsContext.Provider value={actions}>
+        <LineageFlowCanvas<DrawnNode>
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
+          bounds={drawing.bounds}
+          root={drawing.root}
+          signature={drawing.signature}
+          layoutKey={drawing.layoutKey}
+          onNodeClick={onNodeClick}
+          description="A drawing of the lineage. The List view has the same pipelines, tables and models, with links, their columns, and a button that centres the graph on each one."
+          title={focusName ? `What feeds ${focusName}, and what it feeds` : scopeName}
+          legend={<AssetLegend evidence={evidence} wakeColor={anyWake ? accent : null} expandable={view.hiddenBeyond.size > 0} />}
+          minimapColor={(n) => (n.type === "asset" ? KIND_MAP_FILL[n.data.node.kind] : undefined) ?? KIND_MAP_FILL.table}
+          pending={pending}
+          anchor={anchor?.signature === signature ? anchor.flowId : null}
+        />
+      </CardActionsContext.Provider>
+    </>
   )
 }
 
-function LegendLine({ dash, color = "currentColor", label }: { dash?: string; color?: string; label: string }) {
-  return (
-    <span className="inline-flex items-center gap-1.5">
-      <svg width="20" height="6" aria-hidden>
-        <line x1="0" y1="3" x2="20" y2="3" stroke={color} strokeWidth="1.5" strokeDasharray={dash} />
-      </svg>
-      {label}
-    </span>
-  )
-}
-
-function AssetLegend({ evidence, wakeColor }: { evidence: Set<string>; wakeColor: string | null }) {
+function AssetLegend({
+  evidence,
+  wakeColor,
+  expandable,
+}: {
+  evidence: Set<string>
+  wakeColor: string | null
+  expandable: boolean
+}) {
   return (
     <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t px-4 py-2 text-xs text-zinc-500 dark:text-zinc-400 dark:border-zinc-800">
       {(["pipeline", "table", "model"] as const).map((k) => (
@@ -732,10 +1219,11 @@ function AssetLegend({ evidence, wakeColor }: { evidence: Set<string>; wakeColor
           {kindLabel(k)}
         </span>
       ))}
-      {evidence.has("observed") && <LegendLine label="seen in a run" />}
-      {evidence.has("declared") && <LegendLine dash={EVIDENCE_DASH.declared} label="configured" />}
-      {evidence.has("inferred") && <LegendLine dash={EVIDENCE_DASH.inferred} label="read from a model's SQL" />}
+      {evidence.has("observed") && <LegendLine label={EVIDENCE_TEXT.observed} />}
+      {evidence.has("declared") && <LegendLine dash={EVIDENCE_DASH.declared} label={EVIDENCE_TEXT.declared} />}
+      {evidence.has("inferred") && <LegendLine dash={EVIDENCE_DASH.inferred} label={EVIDENCE_TEXT.inferred} />}
       {wakeColor && <LegendLine color={wakeColor} label="wakes the model when it finishes" />}
+      {expandable && <span>+N on a card draws its next hop</span>}
     </div>
   )
 }
@@ -754,27 +1242,43 @@ function AssetList({
   byId,
   modelByNode,
   attentionIds,
+  warehouseNames,
+  tables,
   onFocus,
+  onExpand,
 }: {
   graph: AssetGraph
   view: AssetView
   byId: Map<string, AssetNode>
   modelByNode: Map<string, ModelRefresh>
   attentionIds: Set<string>
+  warehouseNames: ReadonlyMap<string, string> | null
+  tables: WarehouseTablesCache
   onFocus: (id: string) => void
+  onExpand: (id: string) => void
 }) {
+  const [columnsOpen, setColumnsOpen] = useState<ReadonlySet<string>>(NOTHING_OPEN)
+  const panelIds = useId()
+  const toggleColumns = (n: AssetNode) => {
+    const next = new Set(columnsOpen)
+    if (next.has(n.id)) next.delete(n.id)
+    else {
+      next.add(n.id)
+      if (n.connection_id) tables.load(n.connection_id)
+    }
+    setColumnsOpen(next)
+  }
+
   const drawn = view.nodeIds.map((id) => byId.get(id)).filter((n): n is AssetNode => !!n)
   let sections: [string, AssetNode[]][]
   if (view.focus) {
     const byDistance = (a: AssetNode, b: AssetNode) => (view.distance.get(a.id) ?? 0) - (view.distance.get(b.id) ?? 0)
     const ups = drawn.filter((n) => view.role.get(n.id) === "upstream").sort(byDistance)
     const downs = drawn.filter((n) => view.role.get(n.id) === "downstream").sort(byDistance)
-    const counted = (label: string, shown: number, found: number) =>
-      found > shown ? `${label} (${shown} of ${found})` : `${label} (${shown})`
     sections = [
-      [counted("Upstream", ups.length, view.upstreamFound), ups],
+      [`Upstream (${shownOf(ups.length, view.upstreamFound)})`, ups],
       ["Selected", drawn.filter((n) => n.id === view.focus)],
-      [counted("Downstream", downs.length, view.downstreamFound), downs],
+      [`Downstream (${shownOf(downs.length, view.downstreamFound)})`, downs],
     ]
   } else {
     const ofKind = (k: string) => drawn.filter((n) => n.kind === k).sort((a, b) => a.name.localeCompare(b.name))
@@ -795,6 +1299,11 @@ function AssetList({
             <ul className="space-y-2">
               {rows.map((n) => {
                 const href = assetHref(n)
+                const warehouse = warehouseOf(n, warehouseNames)
+                const hidden = view.hiddenBeyond.get(n.id) ?? 0
+                const side = view.role.get(n.id)
+                const showsColumns = columnsOpen.has(n.id)
+                const panelId = `${panelIds}-${view.nodeIds.indexOf(n.id)}`
                 return (
                   <li
                     key={n.id}
@@ -804,6 +1313,7 @@ function AssetList({
                   >
                     <div className="flex min-w-0 flex-wrap items-baseline gap-x-2">
                       <span className="text-[10px] uppercase tracking-wide text-zinc-400">{kindLabel(n.kind)}</span>
+                      {warehouse && <span className="text-[11px] text-zinc-500 dark:text-zinc-400">{warehouse}</span>}
                       {href ? (
                         <Link href={href} className="font-mono text-sm font-medium text-zinc-900 hover:underline dark:text-white">
                           {n.name}
@@ -829,10 +1339,44 @@ function AssetList({
                           Focus
                         </Button>
                       )}
+                      {hidden > 0 && (side === "upstream" || side === "downstream") && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 px-2 text-xs"
+                          aria-label={`Show ${hidden} more ${side} of ${n.name}`}
+                          onClick={() => onExpand(n.id)}
+                        >
+                          +{hidden} {side}
+                        </Button>
+                      )}
+                      {n.kind === "table" && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          className="h-6 px-2 text-xs"
+                          aria-expanded={showsColumns}
+                          aria-controls={showsColumns ? panelId : undefined}
+                          aria-label={`Columns of ${n.name}`}
+                          onClick={() => toggleColumns(n)}
+                        >
+                          <Columns3 className="mr-1 h-3 w-3" aria-hidden />
+                          Columns
+                        </Button>
+                      )}
                     </div>
                     <div className="text-[11px] text-zinc-500 dark:text-zinc-400">
                       {describeAsset(n, graph, modelByNode.get(n.id))}
                     </div>
+                    {showsColumns && (
+                      <div id={panelId} className="mt-2 max-w-md rounded-md border p-2 dark:border-zinc-800">
+                        <ColumnsPanel
+                          node={n}
+                          tables={tablesFor(n, tables)}
+                          onRetry={() => n.connection_id && tables.load(n.connection_id)}
+                        />
+                      </div>
+                    )}
                   </li>
                 )
               })}

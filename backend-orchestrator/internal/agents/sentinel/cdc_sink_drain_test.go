@@ -21,7 +21,7 @@ func runDrainTicks(t *testing.T, ticks []tick) []bool {
 	start := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
 	got := make([]bool, len(ticks))
 	for i, tk := range ticks {
-		got[i], _ = s.observeSinkDrain("p1", tk.committed, tk.lag, start.Add(tk.at))
+		got[i], _, _ = s.observeSinkDrain("p1", tk.committed, tk.lag, start.Add(tk.at))
 	}
 	return got
 }
@@ -102,10 +102,10 @@ func TestSinkDrain_PipelinesAreTrackedSeparately(t *testing.T) {
 	start := time.Date(2026, 9, 17, 10, 0, 0, 0, time.UTC)
 	s.observeSinkDrain("stuck", 1, true, start)
 	s.observeSinkDrain("busy", 1, true, start)
-	if stuck, _ := s.observeSinkDrain("stuck", 1, true, start.Add(6*time.Minute)); !stuck {
+	if stuck, _, _ := s.observeSinkDrain("stuck", 1, true, start.Add(6*time.Minute)); !stuck {
 		t.Fatal("stuck pipeline did not alarm after 6m without committing")
 	}
-	if busy, _ := s.observeSinkDrain("busy", 2000, true, start.Add(6*time.Minute)); busy {
+	if busy, _, _ := s.observeSinkDrain("busy", 2000, true, start.Add(6*time.Minute)); busy {
 		t.Fatal("a pipeline that committed alarmed because another pipeline was stuck")
 	}
 }

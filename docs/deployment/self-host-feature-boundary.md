@@ -59,9 +59,9 @@ service's own operational plumbing.
 | Absent | Why | Decided at |
 |---|---|---|
 | **Connector *generation*** (build a new connector from an OpenAPI/GraphQL spec) | the generator package is stripped from the image | `llm-service/oss-strip-list.txt` |
-| Monitoring UI (overview, infra, traces) | needs an observability backend, and this repo ships none | `features.go:35-42` — overview and infra default `false`; traces defaults to `isDevelopment()`, which quickstart makes false by pinning `ENVIRONMENT=production` |
-| OpenTelemetry export | no `otel-collector` container in quickstart | `docker-compose.quickstart.yml` |
-| Log shipping (`fluent-bit`), Avro `schema-registry`, Temporal web UI + admin tools, MinIO lifecycle init, Docker socket proxy, connector FS init | hosted-only plumbing | 8 services quickstart omits, `otel-collector` included |
+| Monitoring UI (overview, infra, traces) | needs an observability backend, and this repo ships none | `features.go:41-47` — overview and infra default `false`; traces defaults to `isDevelopment()`, which quickstart makes false by pinning `ENVIRONMENT=production` |
+| OpenTelemetry export and log shipping (`fluent-bit`) | neither default stack runs a collector or a log shipper, so `OTEL_ENABLED` defaults to `false` and `docker logs` is the log path; point `OTEL_EXPORTER_OTLP_ENDPOINT` at your own collector and set `OTEL_ENABLED=true` to export | `docker-compose.yml`, `docker-compose.quickstart.yml` |
+| Avro `schema-registry`, Temporal web UI + admin tools, MinIO lifecycle init, Docker socket proxy, connector FS init | hosted-only plumbing | services quickstart omits |
 | Internal connectors as pipeline endpoints (MinIO, Debezium, Kafka sink) | blocked by default in **both** editions; the hosted compose opts in with `RSYNC_ALLOW_INTERNAL_CONNECTORS=true` | `connections.go:56-60` |
 | Billing and plan quotas | `RSYNC_BILLING_ENFORCED=false` | `docker-compose.quickstart.yml:1148` |
 | The Usage panel (`/usage`, `/admin/usage`) | it reports plan, quota and trial numbers that a deployment enforcing no plans does not have; the flag defaults to whatever billing does, so it switches itself off | `features.go` → `resolveUsagePanel()`; set `FEATURE_USAGE_PANEL=true` to show it anyway |

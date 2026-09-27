@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"github.com/rsync-ai/shared/kafkaclient"
 	"io"
 	"net/http"
 	"os"
@@ -17,6 +16,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/rsync-ai/shared/memlimit"
 	_ "github.com/rsync-ai/shared/pgdriver"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
@@ -29,6 +29,7 @@ import (
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/retention"
 	"github.com/rsync-ai/backend-orchestrator/internal/agents/sentinel"
 	"github.com/rsync-ai/backend-orchestrator/internal/assessor"
+	"github.com/rsync-ai/backend-orchestrator/internal/cdcsnapshot"
 	"github.com/rsync-ai/backend-orchestrator/internal/config"
 	"github.com/rsync-ai/backend-orchestrator/internal/connections"
 	"github.com/rsync-ai/backend-orchestrator/internal/connectorpaths"
@@ -404,6 +405,11 @@ func main() {
 	log.Infof("Port: %s", cfg.Server.Port)
 	log.Infof("Environment: %s", cfg.Server.Environment)
 
+	// Soft memory limit from the container cgroup (GOMEMLIMIT, when set, wins).
+	if ml := memlimit.Apply(); ml.Source != "none" {
+		log.Infof("memory soft limit: %d MiB (source=%s, cgroup=%d MiB)", ml.LimitBytes>>20, ml.Source, ml.CgroupBytes>>20)
+	}
+
 	// Setup signal handling
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
@@ -509,31 +515,15 @@ func main() {
 		defer topologyManager.Close()
 		log.Info("✅ Kafka TopologyManager initialized (plan-time topic provisioning)")
 
-		// Provision agent control topics up front (required for horizontal scaling).
-		// If these topics are auto-created with 1 partition, only one replica will get work.
-		partitions := int32(0)
-		const maxAgentTopicPartitions int32 = 64
-		if v := strings.TrimSpace(os.Getenv("KAFKA_AGENT_TOPIC_PARTITIONS")); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				partitions = int32(n)
-			} else {
-				log.WithField("value", v).Warn("⚠️  Invalid KAFKA_AGENT_TOPIC_PARTITIONS; using default")
-			}
-		}
-		if partitions <= 0 {
-			partitions = 3
-		}
-		if partitions > maxAgentTopicPartitions {
-			log.WithFields(log.Fields{
-				"value": partitions,
-				"max":   maxAgentTopicPartitions,
-			}).Warn("⚠️  KAFKA_AGENT_TOPIC_PARTITIONS too large; clamping to max")
-			partitions = maxAgentTopicPartitions
-		}
-		if err := topologyManager.EnsureAgentControlTopics(context.Background(), partitions); err != nil {
-			log.WithError(err).Warn("⚠️  Failed to ensure agent control topics (scaling may be limited)")
+		// Provision the steady-state platform topics before any consumer of them
+		// starts (see ensurePlatformTopicsWithRetry for why the order matters), so
+		// no producer or consumer depends on the broker auto-creating them.
+		if err := ensurePlatformTopicsWithRetry(context.Background(),
+			topologyManager.EnsurePlatformTopics,
+			platformTopicAttempts, platformTopicBackoff, time.Sleep); err != nil {
+			log.WithError(err).Warn("⚠️  Failed to ensure platform topics")
 		} else {
-			log.WithField("partitions", partitions).Info("✅ Ensured agent control topics for scaling")
+			log.Info("✅ Ensured platform topics")
 		}
 	}
 
@@ -598,85 +588,45 @@ func main() {
 	// - API Gateway: Starts workflows via Temporal client
 	// ============================================================================
 	log.Info("✅ Using Temporal for workflow orchestration (temporal:7233)")
-	log.Info("   Pattern: Temporal thinks, Kafka talks, Agents act")
+	log.Info("   Pattern: Temporal thinks, the Redis correlation store carries requests, Agents act")
 
 	// ============================================================================
 	// CORRELATION STORE (V2 Request/Reply Pattern)
 	// ============================================================================
 	// Initialize correlation client for V2 workflows
-	// V2 Activities wait on Redis, workers write responses to Redis
-	// V1 workflows continue to use Kafka (backward compatible)
+	// V2 Activities wait on Redis, workers write responses to Redis.
+	// This is the workers' only request channel — there is no Kafka command bus.
 	if err := workers.InitCorrelationClient(); err != nil {
 		log.Fatalf("❌ Failed to initialize correlation client: %v", err)
 	}
 	log.Info("✅ Correlation client initialized for V2 workflows (Redis-based request/reply)")
 
 	// ============================================================================
-	// STARTUP GATING: Stagger worker initialization to prevent rebalance thrashing
+	// WORKERS: each one polls the Redis correlation store for its AgentType
+	// (see the *_redis_polling.go files in internal/workers). No Kafka consumer
+	// group is joined here, so there is no rebalance to stagger around, and
+	// replicas scale by polling the same store rather than by partition count.
 	// ============================================================================
-	// With 9 workers joining the same consumer group simultaneously, Kafka's
-	// rebalance coordinator gets overwhelmed. We stagger startups to allow
-	// each worker to join cleanly.
-	//
-	// Timing: 3s initial delay + 0.5s between workers = ~7.5s total startup
-	// This is well within Kafka's group.initial.rebalance.delay.ms=3000
-	//
-	// SCALING:
-	//   This orchestrator scales horizontally up to N replicas where N equals
-	//   the partition count of the agent.control.commands.<type> topics
-	//   (currently 3). Each replica joins the same per-topic consumer group
-	//   ("orchestrator-agent.control.commands.<type>") and Kafka splits
-	//   partitions across them via the cooperative-sticky strategy.
-	//   Producer-side keys by pipeline_id, so per-pipeline ordering is
-	//   preserved when replicas split partitions. To go beyond N=3, increase
-	//   partition count on the agent topics (kafka-topics --alter).
-	//   Replication factor (broker durability) is independent of this and
-	//   does not affect consumer parallelism.
-	// ============================================================================
-
-	log.Info("🚦 STARTUP GATING: Staggering worker initialization (prevents rebalance thrashing)")
-	time.Sleep(3 * time.Second) // Initial delay for Kafka to stabilize
-
-	// Start workers with staggered delays (500ms between each)
 	intentWorker := workers.NewIntentWorker(kafkaManager, db)
 	if err := intentWorker.Start(); err != nil {
 		log.Fatalf("Failed to start Intent Worker: %v", err)
 	}
-	log.Info("✅ Intent Worker started (stateless) [1/9]")
+	log.Info("✅ Intent Worker started (stateless) [1/7]")
 	defer intentWorker.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	resolverWorker := workers.NewResolverWorker(kafkaManager, db)
-	if err := resolverWorker.Start(); err != nil {
-		log.Fatalf("Failed to start Resolver Worker: %v", err)
-	}
-	log.Info("✅ Resolver Worker started (stateless) [2/9]")
-	defer resolverWorker.Stop()
-	time.Sleep(500 * time.Millisecond)
-
-	discoveryWorker := workers.NewDiscoveryWorker(kafkaManager, db, toolsDir)
-	if err := discoveryWorker.Start(); err != nil {
-		log.Fatalf("Failed to start Discovery Worker: %v", err)
-	}
-	log.Info("✅ Discovery Worker started (stateless) [3/9]")
-	defer discoveryWorker.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	plannerWorker := workers.NewPlannerWorker(kafkaManager, db)
 	if err := plannerWorker.Start(); err != nil {
 		log.Fatalf("Failed to start Planner Worker: %v", err)
 	}
-	log.Info("✅ Planner Worker started (stateless) [4/9]")
+	log.Info("✅ Planner Worker started (stateless) [2/7]")
 	defer plannerWorker.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	validatorWorker := workers.NewValidatorWorker(kafkaManager, db)
 	if err := validatorWorker.Start(); err != nil {
 		log.Fatalf("Failed to start Validator Worker: %v", err)
 	}
-	log.Info("✅ Validator Worker started (stateless) [5/9]")
+	log.Info("✅ Validator Worker started (stateless) [3/7]")
 	defer validatorWorker.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	// Share the legacy executorAgent's MCP server registry with the worker
 	// so HTTP discover-schema, the worker's pipeline runs, and the dependency
@@ -688,31 +638,28 @@ func main() {
 	if err := executorWorker.Start(); err != nil {
 		log.Fatalf("Failed to start Executor Worker: %v", err)
 	}
-	log.Info("✅ Executor Worker started (stateless) [6/9]")
+	log.Info("✅ Executor Worker started (stateless) [4/7]")
 	defer executorWorker.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	costEstimatorWorker := workers.NewCostEstimatorWorker(kafkaManager)
 	if err := costEstimatorWorker.Start(); err != nil {
 		log.Fatalf("Failed to start Cost Estimator Worker: %v", err)
 	}
-	log.Info("✅ Cost Estimator Worker started (stateless) [7/9]")
+	log.Info("✅ Cost Estimator Worker started (stateless) [5/7]")
 	defer costEstimatorWorker.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	capabilityResolverWorker := workers.NewCapabilityResolverWorker(kafkaManager, db)
 	if err := capabilityResolverWorker.Start(); err != nil {
 		log.Fatalf("Failed to start Capability Resolver Worker: %v", err)
 	}
-	log.Info("✅ Capability Resolver Worker started (stateless) [8/9]")
+	log.Info("✅ Capability Resolver Worker started (stateless) [6/7]")
 	defer capabilityResolverWorker.Stop()
-	time.Sleep(500 * time.Millisecond)
 
 	connectionValidatorWorker := workers.NewConnectionValidatorWorker(kafkaManager, db, toolsDir)
 	if err := connectionValidatorWorker.Start(); err != nil {
 		log.Fatalf("Failed to start Connection Validator Worker: %v", err)
 	}
-	log.Info("✅ Connection Validator Worker started (stateless) [9/9]")
+	log.Info("✅ Connection Validator Worker started (stateless) [7/7]")
 	defer connectionValidatorWorker.Stop()
 
 	// [10/10] Native executor Temporal worker (Phase 3) — ⛔ PARKED, dead scaffolding.
@@ -740,10 +687,9 @@ func main() {
 		}
 	}
 
-	log.Info("📊 TEMPORAL ARCHITECTURE: 9 stateless workers consuming from agent.control.commands")
-	log.Info("   ✅ All workers joined consumer group successfully with staggered startup (7.5s total)")
-	log.Info("   Workers: Intent, Resolver, Capability Resolver, Connection Validator,")
-	log.Info("            Discovery, Planner, Validator, Cost Estimator, Executor")
+	log.Info("📊 TEMPORAL ARCHITECTURE: 7 stateless workers polling the Redis correlation store")
+	log.Info("   Workers: Intent, Capability Resolver, Connection Validator,")
+	log.Info("            Planner, Validator, Cost Estimator, Executor")
 	// ============================================================================
 
 	// Initialize Pipeline Scheduler for automated/scheduled runs
@@ -871,6 +817,23 @@ func main() {
 	// CDC Table Stats: consumes Debezium topics and emits TABLE_STATS (feature-flagged).
 	// Enable with ENABLE_CDC_TABLE_STATS=true
 	cdcStatsAgent := cdcstats.New(db, kafkaManager)
+
+	// CDC snapshot requests: a re-snapshot / new-table backfill is queued and
+	// sent once the connector's running task captures the tables (a signal sent
+	// straight after Edit tables reached the old task and was dropped). The
+	// stats agent reports snapshot progress back; without it (stats disabled) a
+	// sent request closes as unconfirmed instead of completed.
+	snapshotRequests := cdcsnapshot.NewStore(db)
+	snapshotConnectURL := strings.TrimSpace(os.Getenv("KAFKA_CONNECT_URL"))
+	if snapshotConnectURL == "" {
+		snapshotConnectURL = "http://kafka-connect:8083"
+	}
+	snapshotDispatcher := cdcsnapshot.NewDispatcher(snapshotRequests, kafkaManager,
+		cdcsnapshot.NewConnectClient(snapshotConnectURL), os.Getenv("ENABLE_CDC_TABLE_STATS") == "true")
+	cdcStatsAgent.SetSnapshotObserver(snapshotDispatcher.Observe)
+	snapshotDispatcher.Start()
+	defer snapshotDispatcher.Stop()
+
 	if err := cdcStatsAgent.Start(); err != nil {
 		log.Warnf("⚠️  Failed to start CDC Table Stats agent: %v", err)
 	} else {
@@ -1095,31 +1058,25 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			"architecture": "Temporal Workflows + Stateless Agent Workers",
 			"orchestration": gin.H{
 				"type":        "temporal",
-				"description": "Temporal handles workflow orchestration, Kafka for agent communication",
-				"pattern":     "Temporal thinks, Kafka talks, Agents act",
+				"description": "Temporal handles workflow orchestration; workers take requests from the Redis correlation store",
+				"pattern":     "Temporal thinks, the Redis correlation store carries requests, Agents act",
 			},
 			"workers": []string{
 				"intent-worker",
-				"resolver-worker",
 				"capability-resolver-worker",
 				"connection-validator-worker",
-				"discovery-worker",
 				"planner-worker",
 				"validator-worker",
 				"cost-estimator-worker",
 				"executor-worker",
 			},
-			"workflow": "Intent → Resolver → Discovery → Planner → Validator → Executor",
+			"workflow": "Intent → Capability Resolver → Connection Validator → Planner → Cost Estimator → Validator → Executor",
 			// "scheduler":         schedulerInfo, // Deprecated
 			"consumer_registry": consumerRegistryInfo,
 			"retention_agent":   retentionAgentInfo,
 			"kafka": gin.H{
 				"connected": kafkaConnected,
 				"brokers":   brokers,
-				"topics": kafkaclient.Topics(
-					"agent.control.commands",
-					"agent.control.results",
-				),
 			},
 		})
 	})
@@ -1184,76 +1141,58 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 					"name":           "intent-worker",
 					"status":         "running",
 					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
+					"request_source": "redis-correlation",
 					"description":    "Parses natural language to understand user intent",
-				},
-				{
-					"name":           "resolver-worker",
-					"status":         "running",
-					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
-					"description":    "Finds matching connections based on parsed intent",
 				},
 				{
 					"name":           "capability-resolver-worker",
 					"status":         "running",
 					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
+					"request_source": "redis-correlation",
 					"description":    "Resolves connector capabilities for the pipeline",
 				},
 				{
 					"name":           "connection-validator-worker",
 					"status":         "running",
 					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
+					"request_source": "redis-correlation",
 					"description":    "Validates connection configurations",
-				},
-				{
-					"name":           "discovery-worker",
-					"status":         "running",
-					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
-					"description":    "Discovers schemas from data sources",
 				},
 				{
 					"name":           "planner-worker",
 					"status":         "running",
 					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
+					"request_source": "redis-correlation",
 					"description":    "Builds intelligent execution plans",
 				},
 				{
 					"name":           "validator-worker",
 					"status":         "running",
 					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
+					"request_source": "redis-correlation",
 					"description":    "Validates plans for security and feasibility",
 				},
 				{
 					"name":           "cost-estimator-worker",
 					"status":         "running",
 					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
+					"request_source": "redis-correlation",
 					"description":    "Estimates cost and resource usage",
 				},
 				{
 					"name":           "executor-worker",
 					"status":         "running",
 					"architecture":   "stateless",
-					"consumer_group": "agent-workers",
+					"request_source": "redis-correlation",
 					"description":    "Executes validated plans with streaming support",
 				},
 			},
 			"orchestration": gin.H{
 				"type":        "temporal",
-				"description": "Temporal workflows coordinate agents via Kafka",
+				"description": "Temporal workflows coordinate agents through the Redis correlation store",
 			},
-			"total":        9,
-			"architecture": "Temporal Workflows + Event-Driven Stateless Workers",
-			"kafka_topics": gin.H{
-				"agent_control_commands": "Temporal adapter sends commands to workers",
-				"agent_control_results":  "Workers send results to Temporal adapter",
-			},
+			"total":        7,
+			"architecture": "Temporal Workflows + Stateless Workers",
 		})
 	})
 
@@ -1678,15 +1617,35 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 		{
 			// GET /api/v1/cdc/data-pipelines — list CDC pipelines for dashboard count.
 			cdcGrp.GET("/cdc/data-pipelines", func(c *gin.Context) {
-				// Scope to the authenticated principal. A logged-in user sees only
-				// their own CDC pipelines; a trusted internal caller (the Next.js
-				// dashboard) may pass an explicit X-User-ID filter or omit it for an
-				// unscoped count. The old spoofable X-User-ID-only path let an
-				// anonymous caller list every tenant's pipelines.
+				// Scope to a USER, then to that user's workspaces.
+				//
+				// Two bugs lived in the predicate this replaces,
+				// `($1 = '' OR created_by::text = $1)`:
+				//
+				//  1. It collapsed to no predicate at all whenever $1 was empty,
+				//     which is exactly what an internal principal that sent no
+				//     X-User-ID produced — every CDC pipeline on the deployment, for
+				//     every tenant. That is not theoretical: the Home dashboard hit
+				//     this path with the internal secret and no user, counted other
+				//     workspaces' pipelines and listed them under "Recent" (see the
+				//     comment in frontend/src/app/(dashboard)/page.tsx). Home was
+				//     moved off this endpoint; the hole it fell into was left open.
+				//     It now fails closed — an internal caller must say who it is
+				//     asking for.
+				//  2. created_by is workspace-blind, the same defect fixed in
+				//     assertPipelineOwner: it hides a teammate's pipelines from a
+				//     workspace member and keeps showing them to someone who has been
+				//     removed. The boundary is workspace membership.
 				authUser, internal := principalUserID(c)
 				userID := authUser
 				if internal {
 					userID = strings.TrimSpace(c.GetHeader("X-User-ID"))
+				}
+				if userID == "" {
+					c.JSON(http.StatusBadRequest, gin.H{
+						"error": "X-User-ID is required: this endpoint is workspace-scoped and has no unscoped mode",
+					})
+					return
 				}
 				rows, err := db.Query(
 					// NOTE: source_type / destination_type are intentionally NOT selected — those
@@ -1694,15 +1653,26 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 					// Selecting them caused this endpoint to 500 with `column "source_type" does
 					// not exist`. The dashboard derives source/destination from the connection
 					// objects, so the empty struct fields below are harmless.
-					`SELECT id, name, status, sync_mode, created_at, updated_at
-					 FROM pipelines
-					 WHERE sync_mode = 'cdc'
-					 AND ($1 = '' OR created_by::text = $1)
-					 ORDER BY created_at DESC`,
+					//
+					// Rows that predate workspaces (workspace_id IS NULL) keep the legacy
+					// creator comparison so they do not vanish from their creator's list.
+					`SELECT p.id, p.name, p.status, p.sync_mode, p.created_at, p.updated_at
+					 FROM pipelines p
+					 WHERE p.sync_mode = 'cdc'
+					   AND (
+					         EXISTS (
+					           SELECT 1 FROM workspace_members wm
+					            WHERE wm.workspace_id = p.workspace_id
+					              AND wm.user_id::text = $1
+					         )
+					      OR (p.workspace_id IS NULL AND p.created_by::text = $1)
+					       )
+					 ORDER BY p.created_at DESC`,
 					userID,
 				)
 				if err != nil {
-					c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+					log.WithError(err).Error("cdc/data-pipelines: list query failed")
+					c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to list CDC pipelines"})
 					return
 				}
 				defer rows.Close()
@@ -2124,8 +2094,15 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 				})
 			})
 
-			// DMS-like "reload/backfill" for newly added tables (Debezium ad-hoc snapshot).
-			cdcGrp.POST("/cdc/pipelines/:pipeline_id/backfill", handlers.BackfillCDCTables(db, kafkaManager))
+			// Stop keeps the position: connector parked in STOPPED with its offsets,
+			// sink workers stopped, slot and publication kept (handlers/cdc_stop.go).
+			cdcGrp.PUT("/cdc/pipelines/:pipeline_id/stop", handlers.StopCDCPipeline(db, mcpServerManager, topologyManager))
+
+			// DMS-like "reload/backfill" for newly added tables (Debezium ad-hoc snapshot),
+			// queued in cdc_snapshot_requests for the snapshot dispatcher started in main.
+			cdcGrp.POST("/cdc/pipelines/:pipeline_id/backfill", handlers.BackfillCDCTables(db, kafkaManager, cdcsnapshot.NewStore(db)))
+			// Read-only: would a backfill be accepted? (signal channel present or not)
+			cdcGrp.GET("/cdc/pipelines/:pipeline_id/backfill", handlers.GetCDCBackfillCapability(db))
 			// Guarded operator-initiated recovery (FAILED → resnapshot / resume).
 			cdcGrp.POST("/cdc/pipelines/:pipeline_id/recover", handlers.RecoverCDCPipeline(db))
 			// Restart sink worker to pick up newly-added CDC topics.
@@ -2138,23 +2115,36 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			// groups. Must run AFTER the pipelines row is gone (see the handler
 			// doc) — api-gateway calls it once the delete transaction commits.
 			cdcGrp.POST("/cdc/kafka-teardown", handlers.TeardownPipelineKafka(db, mcpServerManager, topologyManager, cdcStatsAgent))
-			cdcGrp.PUT("/cdc/tables", handlers.UpdateCDCTables(db))
+			// Topics of tables removed from the include list are deleted once the
+			// sink has applied them (nil without a Kafka admin: they stay).
+			cdcGrp.PUT("/cdc/tables", handlers.UpdateCDCTables(db,
+				handlers.NewRemovedTopicReaper(db, topologyManager, kafkaManager, cdcStatsAgent)))
 		}
 
 		// Transform Preview (for UI)
 		api.POST("/transforms/preview", handlers.PreviewTransforms(executorAgent))
 
-		// Consumer Registry API (dynamic consumer management)
+		// Consumer Registry API (dynamic consumer management).
+		//
+		// requirePrincipal is mandatory here for the same reason it is on
+		// /topology: /api/v1 has no global auth and this group is publicly
+		// reachable through the Traefik /orchestrator route. Unauthenticated it
+		// exposed POST /consumers/stop and /consumers/consumers/terminate — verbs
+		// that halt another tenant's data plane — to the internet, while the agent
+		// was on by default. It is opt-in now (ENABLE_CONSUMER_AGENT); the gate
+		// stays for every deployment that turns it on.
 		if consumerRegistry != nil {
 			consumerHandlers := consumer.NewHandlers(consumerRegistry)
-			consumerAPI := api.Group("/consumers")
+			consumerAPI := api.Group("/consumers", requirePrincipal(db))
 			consumerHandlers.RegisterRoutes(consumerAPI)
 		}
 
-		// Retention Manager API (data lifecycle management)
+		// Retention Manager API (data lifecycle management).
+		// Same gate, same reason: these routes drive topic retention and deletion.
+		// Latent rather than live only because ENABLE_RETENTION_AGENT defaults off.
 		if retentionAgent != nil {
 			retentionHandlers := retention.NewHandlers(retentionAgent)
-			retentionAPI := api.Group("/retention")
+			retentionAPI := api.Group("/retention", requirePrincipal(db))
 			retentionHandlers.RegisterRoutes(retentionAPI)
 		}
 
@@ -2195,7 +2185,14 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 		assessmentRegistry.SetDefault(assessor.NewConnectorAssessor(assessmentMCP))
 		connMgr := connections.NewManager(db)
 		assessmentHandler := handlers.NewAssessmentHandler(db, connMgr, assessmentRegistry)
-		assessmentHandler.RegisterRoutes(api)
+		// Mounted on a gated view of the SAME base path (no path change) because
+		// the assessment routes take an arbitrary pipeline id and an optional
+		// caller-supplied source_connection_id, then decrypt that connection and
+		// dial it from inside rsync's network. Anonymous, that was a credential
+		// oracle against any tenant. The per-resource workspace check lives in the
+		// handler (RunAssessment); this only authenticates.
+		assessmentAPI := api.Group("", requirePrincipal(db))
+		assessmentHandler.RegisterRoutes(assessmentAPI)
 		log.WithField("supported_types", assessmentRegistry.SupportedTypes()).
 			Info("✅ Pre-flight Assessment API registered at /api/v1/pipelines/:id/assess")
 
@@ -2209,7 +2206,12 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 		watchdog := healthwatch.New(db, kafkaManager)
 		go watchdog.Start(context.Background())
 		healthVersionsHandler := handlers.NewHealthVersionsHandler(watchdog)
-		healthVersionsHandler.RegisterRoutes(api)
+		// Admin rollup: per-connector success rates and version history across the
+		// whole deployment. Anonymous it told the internet which connectors this
+		// host runs and which of them are failing. POST .../refresh also forces
+		// work on demand.
+		healthVersionsAPI := api.Group("", requirePrincipal(db))
+		healthVersionsHandler.RegisterRoutes(healthVersionsAPI)
 		log.Info("✅ Connector Health Watchdog started; admin API at /api/v1/health/connector-versions")
 
 		// NOTE: Workflow-driving agent endpoints are not exposed here.

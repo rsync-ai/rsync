@@ -17,9 +17,31 @@ package llmscrub
 
 import (
 	"regexp"
+	"strings"
 )
 
 const redacted = "[redacted]"
+
+// redactionMarkers are every token Scrub can leave behind. Kept next to the
+// substitutions that emit them so ContainsRedaction cannot fall out of step.
+var redactionMarkers = []string{redacted, "[num-redacted]", "[email-redacted]", "[ip-redacted]"}
+
+// ContainsRedaction reports whether s carries a marker this package writes.
+//
+// Scrubbed text is for a human or an LLM to READ. When some caller then feeds
+// an LLM's answer back into something EXECUTED -- the schema healer applies the
+// DDL the model suggests -- a marker in that answer means the model was echoing
+// redacted input, and running it would write "[redacted]" into the customer's
+// schema. Callers in that position check here and fall back to the unscrubbed
+// source they already hold.
+func ContainsRedaction(s string) bool {
+	for _, m := range redactionMarkers {
+		if strings.Contains(s, m) {
+			return true
+		}
+	}
+	return false
+}
 
 var (
 	// Postgres not-null/check-constraint DETAIL dumps the ENTIRE row:

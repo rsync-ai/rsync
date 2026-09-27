@@ -12,7 +12,7 @@
 # which is doing two jobs: it stops one runaway container from taking the host
 # down via the OOM killer (which picks the largest RSS on the box — Kafka or
 # Postgres — not the container at fault), and it is what makes the orchestrator's
-# own memory-aware sizing engage at all. resolveTableConcurrency() reads the
+# own memory-aware sizing engage at all. resolveTableConcurrencyWithReason() reads the
 # CGROUP limit (backend-orchestrator/internal/agents/executor/table_concurrency.go
 # detectMemoryLimitBytes); with no limit set, that read returns "unlimited" and
 # the memory guard is dead code, so a 4-core box fans out to 8 concurrent table
@@ -36,6 +36,11 @@
 #                       pipeline fails preflight rather than degrading.
 #   --profile generate  context7-mcp, API-doc research used only while GENERATING
 #                       a new connector. Existing connectors run without it.
+#   --profile connectors  sample-data-mcp pre-started. Off by default: the first
+#                       connection that needs it (or the first "Try the demo")
+#                       deploys it on demand through connector-deployer, as it
+#                       already does postgresql/mysql/aws-s3 and every other
+#                       catalog connector. Turn it on only to skip that first wait.
 #
 #   docker compose -f docker-compose.quickstart.yml --profile cdc up -d
 #
@@ -248,10 +253,17 @@ services:
         max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     restart: unless-stopped
-    # KAFKA_HEAP_OPTS below pins Xmx at 512m; the rest is direct buffers plus
-    # log-segment page cache, which is reclaimable and so shrinks under
-    # pressure rather than triggering the OOM killer.
-    mem_limit: 1g
+    # KAFKA_HEAP_OPTS below pins Xmx at 512m. Only PART of the rest is reclaimable:
+    # log-segment page cache does shrink under pressure, but direct/network buffers
+    # and metaspace are anonymous memory and count against the cap permanently.
+    #
+    # 1g gave that anonymous remainder ~512 MiB. The same broker config on the GCP
+    # host, capped at 1536M, measures 644.7 MiB resident at REST (2026-09-23) — i.e.
+    # already over what 1g would leave once heap is fully used, before any load. The
+    # cap here now matches docker-compose.prod.yml rather than sitting 512 MiB under
+    # it for an identical JVM; self-host is the deployment most likely to meet a
+    # large first sync with no operator watching.
+    mem_limit: 1536m
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
@@ -275,8 +287,17 @@ services:
       # exceed it. docker-compose.yml has carried this since the bug was first hit; the
       # quickstart shipped the producer half alone.
       KAFKA_MESSAGE_MAX_BYTES: 15728640
+      # Retention for topics rsync does not create itself — Debezium auto-creates
+      # rsync.cdc-* and those inherit the BROKER default, not kafka/topology.go.
+      # 168h/delete matches Apache's own defaults, so nothing changes today; it
+      # pins the 7-day policy so a future image default cannot silently restore
+      # unbounded growth. See docker-compose.yml for the full note. Per-topic
+      # retention.ms=-1 on the Debezium schema-history topic wins over this,
+      # which is what that one exception relies on.
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_LOG_CLEANUP_POLICY: delete
       CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
-      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m"
+      KAFKA_HEAP_OPTS: "-Xms256m -Xmx512m -XX:+ExitOnOutOfMemoryError"
       # Kafka's two internal topics default to 50 partitions EACH. On a single
       # broker that is 100 partition directories, 100 index/timeindex file pairs
       # and 100 sets of in-memory metadata, bought for a stack whose real traffic
@@ -548,28 +569,38 @@ services:
           echo "  connected ANONYMOUSLY and the broker rejected it: set KAFKA_SECURITY_PROTOCOL." >&2;
           exit 1;
         fi;
-        for agent in intent planner validator executor discovery resolver capability_resolver connection_validator cost_estimator; do
-          kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}agent.control.commands.$$agent" --partitions 3 --replication-factor "$$RF" $$MISR_ARG || exit 1
+        # One config for all three, the one the orchestrator's topology
+        # provisioner (backend-orchestrator/internal/kafka/topology.go) gives the
+        # same names. No creator alters a topic that already exists, so whichever
+        # runs first fixes the config for good; they must agree. Retention is
+        # bounded at 7 days, pipeline.domain.events included. Same list as
+        # deploy/helm/rsync-ai/templates/jobs/kafka-init.yaml.
+        TC="--config cleanup.policy=delete --config retention.ms=604800000 --config compression.type=snappy";
+        for t in pipeline.domain.events pii.scan.request pii.scan.response; do
+          kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}$$t" --partitions 3 --replication-factor "$$RF" $$MISR_ARG $$TC || exit 1;
         done &&
-        kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}agent.planner.responses" --partitions 3 --replication-factor "$$RF" $$MISR_ARG &&
-        kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}pipeline.domain.events" --partitions 3 --replication-factor "$$RF" $$MISR_ARG &&
-        kafka-topics.sh --create --if-not-exists --bootstrap-server "$$B" $$CC --topic "$${P}pii.scan.response" --partitions 3 --replication-factor "$$RF" $$MISR_ARG &&
         echo "✅ Kafka topics ready"
     restart: "no"
 
   minio:
     # Pinned: this is the one-command install. An unpinned tag means two operators running
-    # the same install command on different days get different object stores.
-    # quay.io, not Docker Hub. MinIO revoked anonymous pulls on docker.io/minio/*
-    # on 2026-09-12 -- every tag, server and `mc` client alike, 401 to an
-    # unauthenticated client. This file is the one-command install: `docker
-    # compose pull` died here before a single container started, and the error
-    # Docker reports for a walled repository is "repository does not exist or may
-    # require 'docker login'", which reads like a typo rather than a vendor
-    # policy change. quay.io/minio carries the same RELEASE tags and this one's
-    # manifest digest is byte-identical (sha256:14cea493...) to what Docker Hub
-    # served, so the source moved and the bits did not.
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # the same install command on different days get different object stores. Pinned by
+    # digest because cgr.dev/chainguard serves only `latest` (and `latest-dev`)
+    # anonymously, so a digest is the only pin there is.
+    # Chainguard's build, not MinIO's. MinIO revoked anonymous pulls on
+    # docker.io/minio/* on 2026-09-12 and then on quay.io/minio/* -- every tag, server
+    # and `mc` client alike, 401 to an unauthenticated client. This file is the
+    # one-command install: `docker compose pull` died here before a single container
+    # started, and the error Docker reports for a walled repository is "repository
+    # does not exist or may require 'docker login'", which reads like a typo rather
+    # than a vendor policy change. This image carries both `minio` (its entrypoint)
+    # and `mc`, which the healthcheck below uses; it has no curl.
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    # Root, like the image this replaces. A volume written by v0.1.5 is root-owned
+    # 0755, and this image's default user (65532) cannot write it: the server exits
+    # "Unable to write to the backend". Nothing here waits on MinIO's health, so
+    # without this the upgrade would report success with a dead object store.
+    user: "0:0"
     container_name: rsync-minio
     logging:
       driver: json-file
@@ -590,10 +621,46 @@ services:
       timeout: 5s
       retries: 5
 
+  # One-shot: create the `pipeline-data` bucket every batch stage and claim-check
+  # writes into, and put the staging-prefix expiry backstop on it. Nothing else on
+  # this install creates it: the minio connector only head_bucket()s and
+  # put_object()s, and the orchestrator has no MakeBucket. docker-compose.yml and
+  # the Helm chart each carry this step (minio-lifecycle-init / the `<release>-minio-mb` Job);
+  # this file, being standalone, has to repeat it or a fresh install stages into a
+  # bucket that does not exist. Same image and digest as `minio` above, which ships
+  # `mc` and a shell. The 7-day expiry must stay >= the batch-topic retention, for
+  # the reason spelled out on minio-lifecycle-init in docker-compose.yml.
+  minio-init:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    container_name: rsync-minio-init
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
+      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until mc alias set local http://minio:9000 "$$MINIO_ACCESS_KEY_ID" "$$MINIO_SECRET_ACCESS_KEY"; do
+          echo "waiting for minio..."; sleep 2;
+        done
+        mc mb --ignore-existing local/pipeline-data
+        mc ilm rule add local/pipeline-data --expire-days 7 --prefix staging/ \
+          || echo "WARN: could not set the staging expiry rule; the sink's own delete is the primary cleanup"
+        echo "minio-init: pipeline-data bucket ready"
+    restart: "no"
+
   # ─── TEMPORAL ────────────────────────────────────────────────────────────────
 
   temporal:
-    image: temporalio/auto-setup:1.22.4
+    image: temporalio/auto-setup:1.22.7
     container_name: rsync-temporal
     logging:
       driver: json-file
@@ -616,8 +683,9 @@ services:
       POSTGRES_SEEDS: ${POSTGRES_HOST:-postgres}
       # TLS to the database. Temporal does NOT read POSTGRES_SSLMODE -- it has
       # its own names, verified against the pinned image's
-      # /etc/temporal/config/config_template.yaml (1.22.4). SQL_TLS_ENABLED
-      # gates all four sql blocks (default store + visibility) at once.
+      # /etc/temporal/config/config_template.yaml (1.22.4; byte-identical in
+      # 1.22.7). SQL_TLS_ENABLED gates all four sql blocks (default store +
+      # visibility) at once.
       # Managed Postgres that mandates TLS (Azure Database, RDS with
       # rds.force_ssl=1) needs this true or auto-setup cannot create its
       # schemas -- and then no workflow engine starts and every pipeline fails.
@@ -735,6 +803,9 @@ services:
       # (openai_client.py get_default_model); gpt-4o is a name only OpenAI's catalog
       # has, so a Groq, Azure or Ollama stack with no LLM_MODEL got 404 on every call.
       LLM_MODEL: ${LLM_MODEL:-}
+      # Empty = 4096 (openai_client.py with_reasoning_headroom): room a thinking model
+      # reasons in before it answers. 0 for a model with a small output limit.
+      LLM_REASONING_TOKEN_HEADROOM: ${LLM_REASONING_TOKEN_HEADROOM:-}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       # OLLAMA_BASE_URL wins over OLLAMA_URL (openai_client.py _ollama_base_url).
       # docs/deployment/env-vars.md tells operators to set this one, so it needs a
@@ -767,9 +838,6 @@ services:
       # localhost:9092 and its startup failure is swallowed into a log warning.
       KAFKA_BROKERS: "${KAFKA_BROKERS:-kafka:29092}"
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX-rsync.}
-      # Avro requires a Schema Registry; this compose ships none. The code default is
-      # true, so leaving it unset points the producer at a host that does not exist here.
-      KAFKA_USE_AVRO: "false"
       USE_MOCK_LLM: "false"
       # The gateway's rate limiter (src/utils/ratelimit.py get_limiter) builds its
       # Redis URL from these four. With none of them delivered it still resolved
@@ -860,6 +928,10 @@ services:
       ENVIRONMENT: production
       LOG_FORMAT: json
       LOG_LEVEL: info
+      # Rotation for the connector containers THIS service creates -- compose's
+      # `logging:` blocks only reach the services compose itself starts.
+      RSYNC_LOG_MAX_SIZE: ${RSYNC_LOG_MAX_SIZE:-10m}
+      RSYNC_LOG_MAX_FILE: ${RSYNC_LOG_MAX_FILE:-3}
       INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
       DEPLOYER_DOCKER_NETWORK: rsync-ai-mcp
       MCP_SHARED_NETWORK: rsync-ai-mcp
@@ -968,6 +1040,7 @@ services:
       AZURE_OPENAI_DEPLOYMENT: ${AZURE_OPENAI_DEPLOYMENT:-}
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_MODEL: ${LLM_MODEL:-}
+      LLM_REASONING_TOKEN_HEADROOM: ${LLM_REASONING_TOKEN_HEADROOM:-}
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-}
@@ -983,10 +1056,6 @@ services:
       # an explicit empty value means "disable" (keep pre-prefix topic names) and
       # `:-` would silently turn that back into the default.
       KAFKA_TOPIC_PREFIX: ${KAFKA_TOPIC_PREFIX-rsync.}
-      # Avro requires a Schema Registry; this compose ships none. The code default is
-      # true, so leaving it unset points the producer at a host that does not exist here.
-      KAFKA_USE_AVRO: "false"
-      ENABLE_KAFKA_CONSUMER: "false"
       CONNECTORS_DIR: /app/shared/mcp-connectors
       # src/agents/planner/service.py imports the same get_limiter as the gateway,
       # so it needs the same four vars or its limits are per-replica too.
@@ -1015,6 +1084,8 @@ services:
         max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     restart: unless-stopped
+    # Repeated from docker-compose.yml, which says why: this file is standalone.
+    stop_grace_period: 45s
     mem_limit: 2g
     depends_on:
       postgres:
@@ -1088,6 +1159,15 @@ services:
       REDIS_DB: 0
       REDIS_PASSWORD: ${REDIS_PASSWORD}
       TOOL_GENERATOR_URL: http://tool-generator:5010
+      # Sentinel core-service probes (sentinel/service_probes.go). Each is probed only
+      # when its address is set; after 3 failed 30s checks the service is recorded
+      # unhealthy and every admin gets an INFRASTRUCTURE_DOWN alert. Redis is always
+      # probed, at the address the correlation client uses. TEMPORAL_ADDRESS is also the
+      # (parked) native Temporal worker's dial address, whose default is this same value.
+      TEMPORAL_ADDRESS: temporal:7233
+      SENTINEL_PROBE_TEMPORAL_ADAPTER_URL: http://temporal-adapter:8082
+      SENTINEL_PROBE_CONNECTOR_DEPLOYER_URL: http://connector-deployer:5011
+      SENTINEL_PROBE_LLM_SERVICE_URL: http://llm-service:5000
       # Object-storage-to-object-storage runs stage bytes in MinIO using these
       # (executor/blob_lane.go buildStagingConfig). Unset, the endpoint defaults
       # to rsync-ai-minio, a container that does not exist in this file (it is
@@ -1102,7 +1182,7 @@ services:
       ENABLE_CDC_TABLE_STATS: "true"
       # Batch data-plane sizing. Both empty by default = the code's own values,
       # which are now correct rather than merely default: with this container's
-      # mem_limit set above, resolveTableConcurrency() can finally read a real
+      # mem_limit set above, resolveTableConcurrencyWithReason() can finally read a real
       # cgroup limit and cap the pool at what the box can buffer (~384 MiB per
       # concurrent table load). Pin EXECUTOR_TABLE_CONCURRENCY only to override
       # that derivation; lower EXECUTOR_TABLE_BATCH_ROWS (default 10000) if a
@@ -1265,15 +1345,15 @@ services:
       ORCHESTRATOR_URL: http://orchestrator:8080
       AGENT_ORCHESTRATOR_URL: http://orchestrator:8080
       TOOL_GENERATOR_URL: http://tool-generator:5010
-      # Deadline for every chat call to llm-service (llmServiceTimeout() in
-      # internal/handlers/chat_nl_pipeline.go). The code default is 10s — right
-      # for a hosted API, hopeless for this bundle, which runs inference on CPU
-      # Ollama where a first token takes 60-100s. At 10s every plain-English
-      # message returned the canned fallback while the regex fast path kept
-      # answering canonical phrasings instantly, so the stack looked healthy.
+      # Deadline for the llm-service calls in one chat turn (llmServiceTimeout()
+      # in internal/handlers/chat_nl_pipeline.go). The code default is 60s, sized
+      # for a hosted API; this bundle runs inference on CPU Ollama, where a first
+      # token takes 60-100s. When it was 10s, every plain-English message
+      # returned the canned fallback while the regex fast path kept answering
+      # canonical phrasings instantly, so the stack looked healthy.
       #
-      # 90 and not more: cmd/server/main.go:1244 caps the whole response at a
-      # 120s WriteTimeout, so a longer upstream deadline would just move the cut
+      # Under 300 on purpose: cmd/server/main.go caps the whole response at a
+      # 300s WriteTimeout, so a longer upstream deadline would just move the cut
       # to a worse place. Raise both together if you ever need more.
       LLM_SERVICE_TIMEOUT_SECONDS: ${LLM_SERVICE_TIMEOUT_SECONDS:-240}
       JWT_SECRET: ${JWT_SECRET}
@@ -1424,6 +1504,12 @@ services:
   # quickstart box paid 120 seconds at preflight and then ran with a duplicate
   # minio-mcp resident, while the compose-started container sat unused forever.
   # Renaming is the whole fix; do not shorten these again.
+  #
+  # Pre-started, unlike sample-data-mcp below, because on-demand is not an
+  # option for it yet: the JIT deploy path (connector-deployer, tool-generator
+  # deployment, infra_preflight's last resort) passes no MINIO_* credentials, so
+  # a container it started would come up unable to reach the bucket. The env
+  # block below is the only place those credentials reach this connector.
 
   minio-mcp:
     image: ghcr.io/rsync-ai/mcp-minio:${RSYNC_VERSION:-latest}
@@ -1467,9 +1553,17 @@ services:
   # at http://<name>:8000/health. The minio-mcp note above is the record of what
   # shortening one of these costs: 120s of preflight per pipeline plus a
   # duplicate container. Do not shorten it.
+  #
+  # Behind the opt-in "connectors" profile: an install starts no catalog
+  # connector. Creating the sample-data connection deploys this same container
+  # name on demand (connector-deployer builds it from the seeded source), and
+  # POST /demo/seed retries its 503 connector_deploying while that runs
+  # (api-gateway demo.go demoDeployRetryWindow). minio-mcp above and the cdc
+  # pair stay pre-started for reasons given at each.
   sample-data-mcp:
     image: ghcr.io/rsync-ai/mcp-sample-data:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-sample-data-v1-0-0-mcp
+    profiles: ["connectors"]
     logging:
       driver: json-file
       options:
@@ -1492,6 +1586,11 @@ services:
   # unconditionally here while kafka-connect — the engine debezium-mcp is a bridge
   # to — had no service at all, so a CDC pipeline failed preflight on a box that
   # was already paying to run half of it.
+  #
+  # The two MCPs are not deployed on demand the way catalog connectors are:
+  # preflight's JIT last resort starts them without this file's Kafka client and
+  # security env (x-kafka-client-env), and only after polling 24 x 5s first. So
+  # the profile, not the first CDC pipeline, is what starts them.
   kafka-connect:
     image: ghcr.io/rsync-ai/kafka-connect:${RSYNC_VERSION:-latest}
     container_name: kafka-connect
@@ -1502,7 +1601,17 @@ services:
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     profiles: ["cdc"]
     restart: unless-stopped
-    mem_limit: 1536m
+    # Parity with docker-compose.prod.yml, which was raised to 2048M after this
+    # container was OOM-killed repeatedly on the GCP host. The overrun is NATIVE,
+    # not heap: Debezium's BufferingChangeStreamCursor allocates outside the JVM
+    # heap, so KAFKA_HEAP_OPTS (-Xmx768M, below) does not bound it and raising
+    # Xmx would make the kill arrive SOONER, since the cgroup counts total RSS.
+    # Kernel evidence, 2026-09-23 — three separate kills at the old 1024M cap:
+    #   Memory cgroup out of memory: Killed process (java) anon-rss:1042068kB
+    # 1536m left only 768 MiB of non-heap headroom; 2048m leaves 1280 MiB, which
+    # is what prod now runs. This file is the one-command self-host path, so it is
+    # where a first CDC snapshot of a large collection actually lands.
+    mem_limit: 2048m
     depends_on:
       kafka:
         condition: service_healthy
@@ -1540,7 +1649,7 @@ services:
       CONNECT_CONFIG_PROVIDERS: "file"
       CONNECT_CONFIG_PROVIDERS_FILE_CLASS: "org.apache.kafka.common.config.provider.FileConfigProvider"
       CONNECT_CONFIG_PROVIDERS_FILE_PARAM_ALLOWED_PATHS: "/connect-secrets"
-      KAFKA_HEAP_OPTS: "-Xms256M -Xmx768M"
+      KAFKA_HEAP_OPTS: "-Xms256M -Xmx768M -XX:+ExitOnOutOfMemoryError"
 
       # ── BYO-Kafka security ───────────────────────────────────────────────
       # The base image's entrypoint turns every ^CONNECT_ variable into one

@@ -11,8 +11,8 @@ The Backend Orchestrator is the **heart of RSYNC AI**, implementing a **Control 
 ### Key Components
 
 1. **Control Plane Orchestrator** - Manages pipeline state machines and task assignments
-2. **Stateless Workers** (6) - Execute tasks in parallel, horizontally scalable
-3. **Kafka Manager** - Handles Kafka consumer groups and load balancing
+2. **Stateless Workers** (7) - Poll the Redis correlation store for their stage's requests
+3. **Kafka Manager** - Produces domain events and data, pre-creates topics, runs the few remaining consumers
 4. **Sentinel Agent** - Monitors system health and triggers auto-healing
 5. **HTTP API** - Exposes endpoints for pipeline management
 
@@ -30,27 +30,31 @@ The Backend Orchestrator is the **heart of RSYNC AI**, implementing a **Control 
 └───────────────┬─────────────────────────┘
                 │
                 ▼
-   ┌────────────────────────┐
-   │   Kafka Message Bus    │
-   │   • task.assignments   │
-   │   • task.results       │
-   │   • domain.events      │
-   │   • telemetry          │
-   └────┬──────────────┬────┘
-        │              │
-        ▼              ▼
-┌───────────────┐ ┌──────────────┐
-│   Stateless   │ │  Control     │
-│   Workers     │ │  Plane       │
-│   (6 types)   │ │  (consumer)  │
-│   • Intent    │ └──────────────┘
-│   • Resolver  │
-│   • Discovery │
-│   • Planner   │
-│   • Validator │
-│   • Executor  │
-└───────────────┘
+   ┌──────────────────────────┐
+   │ Redis correlation store  │
+   │ (written by the Temporal │
+   │  adapter, one request    │
+   │  per agent stage)        │
+   └────────────┬─────────────┘
+                │ polled by
+                ▼
+┌──────────────────────────┐
+│   Stateless Workers (7)  │
+│   • Intent               │
+│   • Capability resolver  │
+│   • Connection validator │
+│   • Planner              │
+│   • Validator            │
+│   • Cost estimator       │
+│   • Executor             │
+└──────────────────────────┘
 ```
+
+Agent stages hand off through Redis, not Kafka — the agent Kafka bus
+(`task.assignments`, `task.results`, `pipeline.agent.telemetry`) was removed in
+[#1227](https://github.com/rsync-ai/rsync-ai/pull/1227). Kafka carries the
+`pipeline.domain.events` stream and the batch and CDC data; see
+[docs/architecture/kafka-topics.md](../docs/architecture/kafka-topics.md).
 
 ---
 
@@ -71,11 +75,13 @@ backend-orchestrator/
 │   ├── workers/                    # Stateless Workers
 │   │   ├── types.go                # Worker interface
 │   │   ├── intent.go               # Intent worker
-│   │   ├── resolver.go             # Resolver worker
-│   │   ├── discovery.go            # Discovery worker
+│   │   ├── capability_resolver.go  # Capability (connector) resolver worker
+│   │   ├── connection_validator.go # Connection validator worker
 │   │   ├── planner.go              # Planner worker
 │   │   ├── validator.go            # Validator worker
-│   │   └── executor.go             # Executor worker
+│   │   ├── cost_estimator.go       # Cost estimator worker
+│   │   ├── executor.go             # Executor worker
+│   │   └── *_redis_polling.go      # Each worker's Redis correlation poller
 │   │
 │   ├── kafka/                      # Kafka Management
 │   │   └── manager.go              # Consumer groups, load balancing
@@ -208,13 +214,14 @@ type IntentWorker struct {
     tracer        trace.Tracer
 }
 
+// Start launches the Redis correlation poller, the only way intent requests
+// reach this worker (the Temporal adapter writes them to the correlation store).
 func (w *IntentWorker) Start() error {
-    // Join shared consumer group
-    return w.kafkaManager.ConsumeWithSharedGroup(
-        "task.assignments",
-        w.AgentName(),
-        w.handleTask,
-    )
+    if w.correlationClient == nil {
+        return nil
+    }
+    go w.startRedisPoller()
+    return nil
 }
 
 func (w *IntentWorker) ProcessTask(ctx context.Context, task Task) (TaskResult, error) {
@@ -257,14 +264,22 @@ if err := myWorker.Start(); err != nil {
 
 ## 📊 Kafka Topics
 
-### Core Topics
+### Platform Topics
 
-| Topic | Partitions | Retention | Purpose |
-|-------|-----------|-----------|---------|
-| `task.assignments` | 3 | 7 days | Control plane → Workers |
-| `task.results` | 3 | 7 days | Workers → Control plane |
-| `pipeline.domain.events` | 3 | Infinite (compacted) | Canonical events |
-| `pipeline.agent.telemetry` | 3 | 7 days | Debug logs |
+Created at startup by `TopologyManager.EnsurePlatformTopics`
+([internal/kafka/topology.go](internal/kafka/topology.go)), each at 3 partitions,
+`cleanup.policy=delete`, 7 days' retention:
+
+| Topic | Purpose |
+|-------|---------|
+| `pipeline.domain.events` | Pipeline lifecycle events (WebSocket stream, read-model projection) |
+| `rsync.notifications` | Slack and email alerts |
+| `pii.scan.request` · `pii.scan.response` | api-gateway ↔ llm-service PII scan round trip |
+
+With `RSYNC_SCHEMA_DRIFT_ENABLED=true` it also creates `rsync.healer.schema-changes`,
+`rsync.healer.approved-changes` and `rsync.healer.results`. Per-pipeline data topics are
+created when a pipeline runs. Full catalogue:
+[docs/architecture/kafka-topics.md](../docs/architecture/kafka-topics.md).
 
 ### Consumer Groups
 
@@ -275,8 +290,7 @@ joins under the bare value.
 
 | Consumer | Group id it actually joins | Source |
 |---|---|---|
-| Per-topic consumers | `rsync.go-orchestrator-group-rsync.<topic>` | [manager.go:931](internal/kafka/manager.go#L931) |
-| Single-group consumer | `rsync.go-orchestrator-group` | [manager.go](internal/kafka/manager.go) |
+| Per-topic consumers (the schema-drift healer's, only with `RSYNC_SCHEMA_DRIFT_ENABLED=true`) | `rsync.go-orchestrator-group-rsync.<topic>` | [manager.go:1038](internal/kafka/manager.go#L1038) |
 | API Gateway, domain events | `rsync.api-gateway-domain-events` | `api-gateway/internal/handlers/domain_events.go` |
 
 Both halves are qualified — `KAFKA_GROUP_ID` once at the point it is read
@@ -294,8 +308,7 @@ bare names.
 
 The Sentinel agent monitors system health:
 
-- ✅ **Consumer Lag** - Monitors lag on all topics
-- ✅ **Worker Availability** - Verifies workers are consuming
+- ✅ **Consumer Lag** - Monitors CDC sink consumer lag and source replication lag ([cdc_sentinel.go](internal/agents/sentinel/cdc_sentinel.go))
 - ✅ **Kafka Rebalancing** - Observes (doesn't intervene, Kafka handles it)
 - ✅ **Infrastructure Issues** - Alerts and attempts remediation
 
@@ -308,9 +321,9 @@ docker logs rsync-ai-orchestrator 2>&1 | grep -i sentinel
 # List consumer groups
 docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 --list
 
-# Check consumer lag
+# Check consumer lag (pick a group id from the list above)
 docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --group rsync.go-orchestrator-group-rsync.task.assignments --describe
+  --group rsync.api-gateway-domain-events --describe
 ```
 
 ---
@@ -329,7 +342,8 @@ docker-compose up --scale orchestrator=1 intent-worker=3
 docker-compose up --scale executor-worker=5
 ```
 
-Kafka automatically load-balances tasks across instances.
+Workers poll the Redis correlation store and claim each request, so a request is
+handled by one poller; there is no Kafka consumer group to rebalance.
 
 ### Performance Metrics
 
@@ -424,26 +438,13 @@ curl http://localhost:8081/api/v1/pipelines/{pipeline_id}/events | jq .
 
 ## 🐛 Troubleshooting
 
-### "Worker not consuming tasks"
+### "Worker not picking up requests"
+
+Workers do not join a Kafka consumer group; each one polls the Redis correlation store.
 
 ```bash
-# Check worker logs
-docker logs rsync-ai-orchestrator 2>&1 | grep "Worker started"
-
-# Verify consumer group is active
-docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --group rsync.go-orchestrator-group-rsync.task.assignments --describe
-```
-
-### "High consumer lag"
-
-```bash
-# Scale up workers
-docker-compose up --scale orchestrator=1 resolver-worker=5
-
-# Check lag again
-docker exec kafka kafka-consumer-groups --bootstrap-server localhost:9092 \
-  --group rsync.go-orchestrator-group-rsync.task.assignments --describe
+# Check the pollers started
+docker logs rsync-ai-orchestrator 2>&1 | grep "Redis poller started"
 ```
 
 ### "Pipeline stuck"
@@ -455,9 +456,9 @@ curl http://localhost:8081/api/v1/pipelines/{pipeline_id} | jq .
 # Check telemetry for errors
 curl http://localhost:8081/api/v1/pipelines/{pipeline_id}/telemetry | jq .
 
-# Check Kafka topics
+# Check the pipeline's domain events
 docker exec kafka kafka-console-consumer --bootstrap-server localhost:9092 \
-  --topic task.results --from-beginning --max-messages 10
+  --topic rsync.pipeline.domain.events --from-beginning --max-messages 10
 ```
 
 ---

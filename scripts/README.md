@@ -123,13 +123,16 @@ Not wired into any compose file — only [setup.sh](setup.sh) calls it, so it do
 run on a deployed stack. The deployed equivalent is the `kafka-init` one-shot service in
 `docker-compose.yml`, which runs [kafka-init-new-topics.sh](kafka-init-new-topics.sh).
 
-**Topics created** (8, each prefixed with `$KAFKA_TOPIC_PREFIX`, default `rsync.`):
-- `agent.planner.requests` · `agent.executor.requests` — the two request topics a service actually consumes
-- `agent.{intent,resolver,discovery,planner,validator,executor}.responses` — consumed by the api-gateway WebSocket bridge
+**Topics created** (3, each prefixed with `$KAFKA_TOPIC_PREFIX`, default `rsync.`; 3 partitions, `cleanup.policy=delete`, 7 days, `snappy`):
+- `pipeline.domain.events` — pipeline lifecycle events
+- `pii.scan.request` · `pii.scan.response` — the api-gateway ↔ llm-service PII scan round trip
 
-Every name has a matching produce or subscribe call in a service. Fourteen names that
-had neither were removed in the `rsync.` cutover — a pre-created topic nobody reads is
-indistinguishable on the broker from a working one.
+The same list and config as `kafka-init`, the quickstart and Helm bootstrappers, and the
+orchestrator's startup provisioner (which also creates `rsync.notifications`). Every name
+has a matching produce or subscribe call in a service — a pre-created topic nobody reads is
+indistinguishable on the broker from a working one. The `agent.*` request and response
+topics this script used to create were removed with the agent Kafka bus in
+[#1227](https://github.com/rsync-ai/rsync-ai/pull/1227).
 
 Full catalogue of who produces, consumes and creates each topic:
 [docs/architecture/kafka-topics.md](../docs/architecture/kafka-topics.md).

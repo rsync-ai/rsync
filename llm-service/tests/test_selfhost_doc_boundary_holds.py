@@ -331,18 +331,23 @@ def test_cors_locked_is_attached_to_no_router():
 
 
 def test_capabilities_does_not_advertise_cors_locked_as_an_active_control():
-    if not (REPO / "CAPABILITIES.md").exists():
+    # The board is three files since 2026-09-24: the ✅ and 🔬 tables moved to docs/status/
+    # (see docs/status/README.md). The row this guards is a ✅ one, so looking only in
+    # CAPABILITIES.md would report it deleted the day it moved.
+    board = ["CAPABILITIES.md", "docs/status/verified.md", "docs/status/untested.md"]
+    present = [f for f in board if (REPO / f).exists()]
+    if not present:
         pytest.skip(
-            "CAPABILITIES.md is absent -- removed by scripts/flip/excludes.txt. "
+            "the status board is absent -- removed by scripts/flip/excludes.txt. "
             "The two tests above still hold the actual control: nothing attaches "
             "cors-locked. This one only guards how that is written down."
         )
     rows = [
-        l for l in _read("CAPABILITIES.md").splitlines()
+        l for f in present for l in _read(f).splitlines()
         if l.startswith("|") and "cors-locked" in l
     ]
     assert rows, (
-        "no CAPABILITIES.md row mentions cors-locked. It was corrected, not "
+        "no status-board row mentions cors-locked. It was corrected, not "
         "deleted -- a self-hoster reading the status board needs to know the "
         "middleware is an opt-in starting point, not a shipped control."
     )

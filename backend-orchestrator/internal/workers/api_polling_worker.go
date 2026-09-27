@@ -50,10 +50,6 @@ func NewAPIPollingWorker(kafkaManager *kafka.Manager, db *sql.DB, toolsDir strin
 	}
 }
 
-func (w *APIPollingWorker) GetWorkerType() string {
-	return "api_polling"
-}
-
 // Execute runs one polling cycle for the given pipeline task.
 func (w *APIPollingWorker) Execute(ctx context.Context, task Task) TaskResult {
 	ctx, span := w.tracer.Start(ctx, "api_polling.execute",

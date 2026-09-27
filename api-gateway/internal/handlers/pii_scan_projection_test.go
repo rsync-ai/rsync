@@ -8,28 +8,8 @@ import (
 	"unicode/utf8"
 )
 
-// The payload shape is the one llm-service actually publishes on
-// pii.scan.response: llm-service/src/agents/pii_scanner/kafka_consumer.py:185-209
-// builds result.tables[].columns[] with exactly these keys, and reports every
-// column it looked at, PII or not.
-const scannerPayload = `{
-  "scan_id": "s-1",
-  "connection_id": "c-1",
-  "tables_scanned": 2,
-  "total_pii_columns_found": 2,
-  "scan_method": "pattern",
-  "errors": [],
-  "tables": [
-    {"table_name": "customers", "columns": [
-      {"column_name": "email",    "is_pii": true,  "pii_type": "EMAIL_ADDRESS", "confidence": 0.95, "detection_method": "pattern", "suggested_masking": "hash"},
-      {"column_name": "id",       "is_pii": false, "pii_type": "", "confidence": 0, "detection_method": "pattern", "suggested_masking": ""},
-      {"column_name": "ssn",      "is_pii": true,  "pii_type": "US_SSN", "confidence": 0.88, "detection_method": "ml", "suggested_masking": "redact"}
-    ]},
-    {"table_name": "orders", "columns": [
-      {"column_name": "total", "is_pii": false, "pii_type": "", "confidence": 0, "detection_method": "pattern", "suggested_masking": ""}
-    ]}
-  ]
-}`
+// The real pii.scan.response is pinned in shared/pii_scan_contract_golden.json
+// and projected in pii_scan_contract_test.go. These cover the edges.
 
 func decodeScanPayload(t *testing.T, raw string) map[string]interface{} {
 	t.Helper()
@@ -38,28 +18,6 @@ func decodeScanPayload(t *testing.T, raw string) map[string]interface{} {
 		t.Fatalf("payload does not decode: %v", err)
 	}
 	return m
-}
-
-func TestPIIFindingsFromRealScannerPayload(t *testing.T) {
-	findings, scanned := piiFindingsFrom(decodeScanPayload(t, scannerPayload))
-
-	if len(findings) != 2 {
-		t.Fatalf("want 2 PII findings, got %d: %+v", len(findings), findings)
-	}
-	if findings[0].table != "customers" || findings[0].column != "email" ||
-		findings[0].piiType != "EMAIL_ADDRESS" || findings[0].confidence != 0.95 ||
-		findings[0].method != "pattern" || findings[0].masking != "hash" {
-		t.Errorf("first finding not carried through intact: %+v", findings[0])
-	}
-	if findings[1].column != "ssn" || findings[1].piiType != "US_SSN" {
-		t.Errorf("second finding wrong: %+v", findings[1])
-	}
-
-	// "orders" was scanned and clean. It must still be reported as scanned, or
-	// the prune would never clear a finding that a later scan cleared.
-	if len(scanned) != 2 || scanned[0] != "customers" || scanned[1] != "orders" {
-		t.Errorf("want both scanned tables including the clean one, got %v", scanned)
-	}
 }
 
 // A scan that reported on tables but flagged nothing has to be distinguishable

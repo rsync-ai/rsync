@@ -76,8 +76,10 @@ func (w *ConnectionValidatorWorker) pollAndProcessRequests() error {
 }
 
 func (w *ConnectionValidatorWorker) processCorrelationRequest(req *correlation.PendingRequest) {
-	ctx, cancel := context.WithTimeout(w.ctx, 30*time.Second)
+	ctx, cancel := correlationWorkContext(w.ctx, "connection_validator")
 	defer cancel()
+	deliverCtx, cancelDeliver := correlationDeliveryContext()
+	defer cancelDeliver()
 
 	logger := log.WithFields(log.Fields{
 		"correlation_id": req.CorrelationID,
@@ -117,12 +119,12 @@ func (w *ConnectionValidatorWorker) processCorrelationRequest(req *correlation.P
 	logger.Info("✅ Task processing completed")
 
 	// Write response to Redis
-	if routeErr := RouteResult(ctx, task, result, w.kafkaManager); routeErr != nil {
+	if routeErr := RouteResult(deliverCtx, task, result); routeErr != nil {
 		logger.WithError(routeErr).Error("Failed to route response")
 	}
 
 	// Delete request from Redis after processing
-	if delErr := w.correlationClient.DeleteRequest(ctx, req.CorrelationID, "connection_validator"); delErr != nil {
+	if delErr := w.correlationClient.DeleteRequest(deliverCtx, req.CorrelationID, "connection_validator"); delErr != nil {
 		logger.WithError(delErr).Warn("Failed to delete request from Redis")
 	}
 }

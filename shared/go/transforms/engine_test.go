@@ -95,6 +95,9 @@ func TestSimpleTransformEngine_NullHandle_DropRow(t *testing.T) {
 	e := NewSimpleTransformEngine()
 	ctx := context.Background()
 
+	// {"name": "no-age"} does not CARRY age, which is not the same as carrying a
+	// null age: drop_row drops the null and keeps the row the column is absent
+	// from (KI-NULL-HANDLE-MISSING-COLUMN-DROPS-EVERY-ROW).
 	data := []Row{{"age": nil}, {"age": 5}, {"name": "no-age"}}
 	out, err := e.Apply(ctx, data, Transform{
 		Type: "null_handle",
@@ -106,11 +109,14 @@ func TestSimpleTransformEngine_NullHandle_DropRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(out) != 1 {
-		t.Fatalf("expected 1 row after drop_row, got %d", len(out))
+	if len(out) != 2 {
+		t.Fatalf("expected 2 rows after drop_row, got %d: %v", len(out), out)
 	}
 	if got := out[0]["age"]; got != 5 {
-		t.Fatalf("expected remaining row age=5, got %#v", got)
+		t.Fatalf("expected the null row dropped and age=5 first, got %#v", got)
+	}
+	if got := out[1]["name"]; got != "no-age" {
+		t.Fatalf("expected the row without an age column kept, got %#v", out[1])
 	}
 }
 

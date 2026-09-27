@@ -13,12 +13,12 @@ const EnvTopicPrefix = "KAFKA_TOPIC_PREFIX"
 // not say otherwise.
 //
 // The platform grew up owning its broker, so it named topics after the thing
-// they carried: agent.planner.requests, pipeline.<id8>.data, cdc.<id8>,
+// they carried: pipeline.domain.events, pipeline.<id8>.data, cdc.<id8>,
 // pii.scan.request. On a dedicated cluster those read well. On a customer's
 // shared cluster — the BYO-Kafka shape the managed-Kubernetes deployment targets
 // — they are anonymous: an operator listing topics cannot tell which ones this
 // product created, which ones are safe to delete when they uninstall, or which
-// ones to size retention for. Worse, "pipeline." and "agent." are generic enough
+// ones to size retention for. Worse, "pipeline." and "cdc." are generic enough
 // to collide outright with another team's topics on the same cluster.
 //
 // A single owned prefix fixes all of that at once: every topic the product
@@ -35,8 +35,8 @@ const DefaultTopicPrefix = "rsync."
 // topic nobody writes and blocks forever with no error. Funnelling both sides
 // through one function makes that class of desync unrepresentable.
 //
-// The call sites keep spelling the logical name in full — Topic("agent.planner.
-// requests"), not Topic(AgentPlannerRequests) — so the code still says what it
+// The call sites keep spelling the logical name in full — Topic("pii.scan.
+// request"), not Topic(PIIScanRequest) — so the code still says what it
 // talks to and a grep for the old name still lands on the right line.
 //
 // Qualification is idempotent. Topic names are persisted (pipelines.kafka_topic,
@@ -77,7 +77,7 @@ func TopicPrefix() string {
 		return ""
 	}
 	// Without a trailing separator the prefix runs into the name it qualifies
-	// ("rsync" + "agent.x" = "rsyncagent.x"), which is a legal topic name and so
+	// ("rsync" + "pipeline.x" = "rsyncpipeline.x"), which is a legal topic name and so
 	// fails silently rather than loudly.
 	if !strings.HasSuffix(prefix, ".") && !strings.HasSuffix(prefix, "-") && !strings.HasSuffix(prefix, "_") {
 		prefix += "."

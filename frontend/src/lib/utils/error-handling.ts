@@ -182,6 +182,8 @@ export type ParsedApiError = {
   details?: string
   field?: string
   suggestion?: string
+  /** Why a connectivity test failed, when the server says (`test_error`). */
+  cause?: string
   statusCode?: number
   raw?: unknown
 }
@@ -311,9 +313,11 @@ export function parseApiError(err: unknown): ParsedApiError {
       }
     }
 
-    // Direct structured shape
+    // Direct structured shape. A caller that threw `{ statusCode, ... }` keeps
+    // its status, so a 409 or 500 is still one after this point.
     if (hasAnyKey(obj, ["error_message", "error", "message", "detail", "details", "code"])) {
-      return { ...normalizeErrorObject(obj), raw: obj }
+      const statusCode = typeof obj.statusCode === "number" ? obj.statusCode : undefined
+      return { ...normalizeErrorObject(obj), ...(statusCode ? { statusCode } : {}), raw: obj }
     }
   }
 
@@ -362,23 +366,33 @@ function parseFromHttpPrefixedError(input: string): ParsedApiError | null {
   }
 }
 
+// A machine code such as "connection_test_failed" or "DUPLICATE_NAME": one
+// token, no spaces. The gateway sends `{error: <code>, message: <sentence>}`.
+const MACHINE_CODE = /^[A-Za-z0-9_.:-]+$/
+
 function normalizeErrorObject(obj: Record<string, unknown>): Omit<ParsedApiError, "statusCode"> {
-  // Tool-generator v2 / API Gateway patterns
+  // Tool-generator v2 / API Gateway patterns. `error` is a sentence from some
+  // handlers and a code from others; when it is a code and a sentence sits in
+  // `message`, the sentence is what the user needs to read.
+  const error = asString(obj.error)
+  const errorIsCode = !!error && MACHINE_CODE.test(error)
   const msg =
     asString(obj.error_message) ||
-    asString(obj.error) ||
+    (errorIsCode ? asString(obj.message) : undefined) ||
+    error ||
     asString(obj.message) ||
     asString(obj.detail) ||
     // Some handlers return { errors: [...] }
     normalizeFastApiDetail(obj.detail) ||
     "An unexpected error occurred"
 
-  const code = asString(obj.code) || asString(obj.error_code)
+  const code = asString(obj.code) || asString(obj.error_code) || (errorIsCode ? error : undefined)
   const details = asString(obj.details) || asString(obj.hint)
   const field = asString(obj.field)
   const suggestion = asString(obj.suggestion)
+  const cause = asString(obj.test_error)
 
-  return { message: msg, code, details, field, suggestion }
+  return { message: msg, code, details, field, suggestion, ...(cause ? { cause } : {}) }
 }
 
 function normalizeFastApiDetail(detail: unknown): string | undefined {
@@ -424,6 +438,7 @@ function asApiRequestError(err: unknown): ParsedApiError | null {
     details: api["details"] ? String(api["details"]) : undefined,
     field: api["field"] ? String(api["field"]) : undefined,
     suggestion: api["suggestion"] ? String(api["suggestion"]) : undefined,
+    cause: api["cause"] ? String(api["cause"]) : undefined,
     raw: apiErr,
   }
 }

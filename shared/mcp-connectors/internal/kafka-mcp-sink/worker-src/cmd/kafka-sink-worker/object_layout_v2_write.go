@@ -201,6 +201,25 @@ type objectLoadStore interface {
 	// current generation, handing out the next number (and storing keyFn's key) the
 	// first time the reservation key is seen.
 	reserveLoadSeq(ctx context.Context, pipelineID, tableKey, reservationKey, executionID string, keyFn func(int64) (string, error)) (int64, string, error)
+	// consumeReload starts a new generation for a snapshot batch of topic when the
+	// orchestrator left a reload request for it (cdc_object_reload_requests) and the
+	// batch's first event is not older than the request (objectLayoutV2ReloadDue). The
+	// bump, the clean and the request's delete commit together; a clean error keeps
+	// the request. It reports whether it started a generation.
+	consumeReload(ctx context.Context, pipelineID, tableKey, topic string, firstEventTS int64, clean func(context.Context) error) (bool, error)
+}
+
+// objectLayoutV2ReloadSkew is how much older than a reload request a snapshot batch's
+// first event may be and still consume it: the request time comes from the
+// orchestrator's clock and the event time from the source database's.
+const objectLayoutV2ReloadSkew = 30 * time.Second
+
+// objectLayoutV2ReloadDue reports whether a snapshot batch whose first event is at
+// firstEventTS (ms) belongs to the snapshot requested at requestedMs. An unknown event
+// time never does: a missed clean leaves a second copy, a wrong one deletes rows that
+// nothing will reload.
+func objectLayoutV2ReloadDue(firstEventTS, requestedMs int64) bool {
+	return firstEventTS > 0 && firstEventTS >= requestedMs-objectLayoutV2ReloadSkew.Milliseconds()
 }
 
 var errObjectLoadStoreUnavailable = errors.New("object layout v2 needs the pipeline database for LOAD numbers, and the sink has none")
@@ -257,6 +276,68 @@ func (s *pgObjectLoadStore) ensureClean(ctx context.Context, pipelineID, tableKe
 		return 0, err
 	}
 	return gen, nil
+}
+
+func (s *pgObjectLoadStore) consumeReload(ctx context.Context, pipelineID, tableKey, topic string, firstEventTS int64, clean func(context.Context) error) (consumed bool, err error) {
+	if s == nil || s.db == nil {
+		return false, errObjectLoadStoreUnavailable
+	}
+	const markerSQL = `SELECT (EXTRACT(EPOCH FROM requested_at) * 1000)::bigint FROM cdc_object_reload_requests
+		WHERE pipeline_id = $1::uuid AND topic = $2`
+	// The one query every snapshot batch pays: no request, or one this batch predates.
+	var requestedMs int64
+	err = s.db.QueryRowContext(ctx, markerSQL, pipelineID, topic).Scan(&requestedMs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil || !objectLayoutV2ReloadDue(firstEventTS, requestedMs) {
+		return false, err
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if err != nil || !consumed {
+			_ = tx.Rollback()
+		}
+	}()
+	// Counter row first, like ensureClean: a sink for another partition of the topic
+	// waits here, then finds the request gone.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO object_load_counters (pipeline_id, table_key)
+		VALUES ($1::uuid, $2) ON CONFLICT (pipeline_id, table_key) DO NOTHING`, pipelineID, tableKey); err != nil {
+		return false, err
+	}
+	var gen int64
+	if err = tx.QueryRowContext(ctx, `SELECT generation FROM object_load_counters
+		WHERE pipeline_id = $1::uuid AND table_key = $2 FOR UPDATE`, pipelineID, tableKey).Scan(&gen); err != nil {
+		return false, err
+	}
+	err = tx.QueryRowContext(ctx, markerSQL+` FOR UPDATE`, pipelineID, topic).Scan(&requestedMs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil // consumed by another writer while this one waited
+	}
+	if err != nil || !objectLayoutV2ReloadDue(firstEventTS, requestedMs) {
+		return false, err // re-requested since the first read, for a later snapshot
+	}
+	gen++
+	// Both row locks are held across the delete; a clean error rolls back the bump
+	// and keeps the request, so the redelivered batch tries again.
+	if err = clean(ctx); err != nil {
+		return false, err
+	}
+	if _, err = tx.ExecContext(ctx, `UPDATE object_load_counters SET generation = $3, cleaned_generation = $3, next_seq = 1, updated_at = NOW()
+		WHERE pipeline_id = $1::uuid AND table_key = $2`, pipelineID, tableKey, gen); err != nil {
+		return false, err
+	}
+	if _, err = tx.ExecContext(ctx, `DELETE FROM cdc_object_reload_requests WHERE pipeline_id = $1::uuid AND topic = $2`,
+		pipelineID, topic); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *pgObjectLoadStore) reserveLoadSeq(ctx context.Context, pipelineID, tableKey, reservationKey, executionID string, keyFn func(int64) (string, error)) (seq int64, destKey string, err error) {
@@ -342,6 +423,17 @@ func (c objectLayoutV2Cleaned) ensure(ctx context.Context, store objectLoadStore
 	}
 	c[tableKey] = true
 	return nil
+}
+
+// reload consumes the orchestrator's reload request for a snapshot batch of topic
+// (store.consumeReload), recording the new generation as cleaned when it does.
+func (c objectLayoutV2Cleaned) reload(ctx context.Context, store objectLoadStore, pipelineID, tableKey, topic string, firstEventTS int64, clean func(context.Context) error) (bool, error) {
+	consumed, err := store.consumeReload(ctx, pipelineID, tableKey, topic, firstEventTS, clean)
+	if err != nil || !consumed {
+		return false, err
+	}
+	c[tableKey] = true
+	return true, nil
 }
 
 // objectLayoutV2BatchReservationKey is b|<execution_id>|<batch_offset>|<write_unit_index>.
@@ -477,8 +569,22 @@ func (b *cdcObjectBatcher) objectLayoutV2FlushKey(ctx context.Context, batch *cd
 }
 
 func (b *cdcObjectBatcher) objectLayoutV2FlushKeyOnce(ctx context.Context, batch *cdcObjectBatch, sm *SinkMessage, t objectLayoutV2Table, tableKey string, ts int64) (string, error) {
-	if err := b.v2Cleaned.ensure(ctx, b.store, b.cfg.PipelineID, tableKey, false, objectLayoutV2Clean(b.httpClient, b.cfg, b.destType, t)); err != nil {
-		return "", err
+	clean := objectLayoutV2Clean(b.httpClient, b.cfg, b.destType, t)
+	// A requested re-snapshot empties the folder before its first LOAD file, so the
+	// reloaded rows replace the old copy instead of joining it. Only a snapshot batch
+	// checks: a change batch, or a restart that redelivers an old snapshot, never cleans.
+	reloaded := false
+	if sm != nil && sm.IsSnapshot {
+		var err error
+		reloaded, err = b.v2Cleaned.reload(ctx, b.store, b.cfg.PipelineID, tableKey, batch.topic, batch.firstEventTS, clean)
+		if err != nil && !errors.Is(err, errObjectLoadStoreUnavailable) {
+			return "", err
+		}
+	}
+	if !reloaded {
+		if err := b.v2Cleaned.ensure(ctx, b.store, b.cfg.PipelineID, tableKey, false, clean); err != nil {
+			return "", err
+		}
 	}
 	if sm == nil || !sm.IsSnapshot {
 		return objectLayoutV2CDCKey(t, ts, batch.partition, batch.firstOffset)

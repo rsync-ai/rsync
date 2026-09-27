@@ -403,6 +403,26 @@ def grade(expect, reason, got, msg):
     return expect == "PASS" or reason is None or re.search(reason, msg) is not None
 
 
+# A starved host shows up as a TIMEOUT, never as the broker's verdict: on a busy
+# CI Mac, JVM metadata waits and kafka-go dials ran past their deadlines on cells
+# that pass on any idle machine, a different handful on every run. Such a cell is
+# re-run, a few at a time, up to RETRIES more times. A cell that reached a verdict
+# is NEVER re-run -- a PASS, or any rejection -- so a retry cannot turn a real
+# regression green: an accepted rogue cert is a PASS, a refused good password is
+# a rejection, and both stand as first reported.
+RETRIES = 2
+RETRY_WORKERS = 2
+R_TIMEOUT = r"(?i)timed? ?out|deadline exceeded"
+R_VERDICT = "(?i)" + "|".join(r.removeprefix("(?i)") for r in (
+    R_BAD_CERT, R_BAD_PW, R_BAD_CLIENT, R_UNKNOWN_CA, R_WRONG_HOST, R_BAD_TOKEN, R_INSECURE_ENDPOINT))
+
+
+def timed_out(expect, reason, got, msg):
+    """A mismatch that is only the clock: it timed out and names no verdict."""
+    return (not grade(expect, reason, got, msg) and got in ("FAIL", "ERROR")
+            and re.search(R_TIMEOUT, msg) is not None and re.search(R_VERDICT, msg) is None)
+
+
 # ---------------------------------------------------------------- client matrix
 
 def client_cell(row, runtime):
@@ -439,12 +459,23 @@ def _client_cell(row, runtime):
 def client_matrix(rows):
     for row in rows:
         write_env(os.path.join(W, "rows", row.name + ".env"), row.env)
-    results = {}
-    with concurrent.futures.ThreadPoolExecutor(8) as pool:
-        futs = {pool.submit(client_cell, row, rt): (row, rt) for row in rows for rt in RUNTIMES}
-        for fut in concurrent.futures.as_completed(futs):
-            results[futs[fut]] = fut.result()
-    return [(row.name, rt, *row.expectation(rt), *results[(row, rt)]) for row in rows for rt in RUNTIMES]
+    cells = [(row, rt) for row in rows for rt in RUNTIMES]
+    results = _run_cells(cells, 8)
+    for attempt in range(2, RETRIES + 2):
+        again = [c for c in cells if timed_out(*c[0].expectation(c[1]), *results[c])]
+        if not again:
+            break
+        print(f"[{PFX}] attempt {attempt}: re-running {len(again)} cell(s) that timed out before any verdict: "
+              + ", ".join(f"{row.name}/{rt}" for row, rt in again))
+        for cell, (got, msg) in _run_cells(again, RETRY_WORKERS).items():
+            results[cell] = (got, f"attempt {attempt}: {msg}")
+    return [(row.name, rt, *row.expectation(rt), *results[(row, rt)]) for row, rt in cells]
+
+
+def _run_cells(cells, workers):
+    with concurrent.futures.ThreadPoolExecutor(workers) as pool:
+        futs = {pool.submit(client_cell, row, rt): (row, rt) for row, rt in cells}
+        return {futs[fut]: fut.result() for fut in concurrent.futures.as_completed(futs)}
 
 
 # ---------------------------------------------------------------- connect matrix

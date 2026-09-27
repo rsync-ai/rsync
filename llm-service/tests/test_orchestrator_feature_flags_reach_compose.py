@@ -173,14 +173,55 @@ def test_exempted_flags_are_still_actually_unwired(flag):
     )
 
 
-# Flags the api-gateway reads only to REPORT what the orchestrator does. The
-# gateway never acts on them, so the only way to get it wrong is for the two
-# services to see different values: the UI would then say "detection is off"
-# while the orchestrator is detecting, or the reverse.
-#   RSYNC_SCHEMA_DRIFT_ENABLED — api-gateway/internal/handlers/schema_evolution.go
-#   schemaDriftDetectorEnabled(), surfaced as detector_enabled on the pipeline's
-#   schema-drift-policy endpoints for the "Schema change alerts" card.
+# Flags the api-gateway and the orchestrator must see with the same value. If
+# the two services disagree, the UI says "detection is off" while the
+# orchestrator is detecting, or the reverse; and since the flag also decides
+# whether the rsync.healer.* topics exist, a gateway that reads it as on
+# subscribes to (and so auto-creates) topics the orchestrator never provisioned.
+#   RSYNC_SCHEMA_DRIFT_ENABLED: read by the api-gateway's config
+#   SchemaDriftEnabled(). It gates the healer-topic subscriptions and producers,
+#   and it is surfaced as detector_enabled on the pipeline's schema-drift-policy
+#   endpoints for the "Schema change alerts" card.
 GATEWAY_MIRRORED_FLAGS = ("RSYNC_SCHEMA_DRIFT_ENABLED",)
+
+GATEWAY_SRC = os.path.join(REPO_ROOT, "api-gateway")
+
+# The api-gateway had well over 100 non-test Go files when this floor was set.
+# A walk that finds fewer has lost the tree, and would then report every flag
+# as "no longer read".
+MIN_GATEWAY_GO_FILES = 50
+
+
+def _gateway_go_sources():
+    """Path and text of every non-test Go file in the api-gateway."""
+    sources = []
+    for dirpath, dirnames, filenames in os.walk(GATEWAY_SRC):
+        dirnames[:] = [d for d in dirnames if d not in (".git", "vendor", "bin")]
+        for name in filenames:
+            if not name.endswith(".go") or name.endswith("_test.go"):
+                continue
+            path = os.path.join(dirpath, name)
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                sources.append((path, fh.read()))
+    return sources
+
+
+def _gateway_files_reading(flag, sources):
+    """The gateway files that call os.Getenv(flag). Any file counts: the read
+    has already moved once, from a handler into the config package."""
+    needle = re.compile(r'os\.Getenv\(\s*"' + re.escape(flag) + r'"\s*\)')
+    return [os.path.relpath(p, REPO_ROOT) for p, text in sources if needle.search(text)]
+
+
+def test_the_gateway_flag_scan_can_tell_a_read_from_no_read():
+    """Arms the check below. The scan has to cover the gateway, and it has to
+    come back empty for a flag nothing reads, or an empty result means
+    nothing."""
+    sources = _gateway_go_sources()
+    assert len(sources) >= MIN_GATEWAY_GO_FILES, (
+        f"scanned only {len(sources)} api-gateway Go files under {GATEWAY_SRC}"
+    )
+    assert _gateway_files_reading("RSYNC_NO_SUCH_FLAG_ENABLED", sources) == []
 
 
 def _service_environment(name):
@@ -195,11 +236,9 @@ def _service_environment(name):
 
 @pytest.mark.parametrize("flag", GATEWAY_MIRRORED_FLAGS)
 def test_gateway_mirrors_the_orchestrator_value_exactly(flag):
-    gateway_src = os.path.join(REPO_ROOT, "api-gateway", "internal", "handlers", "schema_evolution.go")
-    with open(gateway_src, encoding="utf-8") as fh:
-        assert f'os.Getenv("{flag}")' in fh.read(), (
-            f"the api-gateway no longer reads {flag}; drop it from GATEWAY_MIRRORED_FLAGS"
-        )
+    assert _gateway_files_reading(flag, _gateway_go_sources()), (
+        f"the api-gateway no longer reads {flag}; drop it from GATEWAY_MIRRORED_FLAGS"
+    )
     orch = _orchestrator_environment()
     gateway = _service_environment("api-gateway")
     assert flag in orch, f"{flag} is not passed to the orchestrator"

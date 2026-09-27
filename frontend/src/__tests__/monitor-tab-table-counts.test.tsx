@@ -1,5 +1,5 @@
 /**
- * Monitor tab, Throughput card: the table counts must add up to the total.
+ * Monitor tab: the table counts must add up to the total.
  *
  * api-gateway now reports a selected CDC table that has sent nothing yet as
  * `waiting_for_data` and counts it in `tables_waiting_for_data` — no longer in
@@ -7,6 +7,11 @@
  * completed / failed / running only, so a pipeline that had just been set up read
  * "Tables completed 1 / 5" plus "Tables running 1": three tables missing from the
  * screen. Degraded tables were missing the same way.
+ *
+ * A CDC pipeline's Flow card folds completed and running into one "Replicating"
+ * line — a stream's table is never done, so "Tables completed 0 / 3" read as
+ * stuck — and leads with the total. Every other status keeps its own line, so the
+ * lines under the total still add up to it. A batch run keeps "Tables completed".
  */
 
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -63,10 +68,12 @@ function cdcSummary(counts: {
   }
 }
 
-function serve(stats: unknown) {
+const RUNTIME_BATCH = { ...RUNTIME_CDC, mode: "batch", phase: "syncing" }
+
+function serve(stats: unknown, runtime: unknown = RUNTIME_CDC) {
   authFetch.mockImplementation(async (url: string) => {
     const u = String(url)
-    if (u.includes("/runtime")) return res(200, RUNTIME_CDC)
+    if (u.includes("/runtime")) return res(200, runtime)
     if (u.includes("/table-stats")) return res(200, stats)
     return res(200, { events: [] })
   })
@@ -75,14 +82,11 @@ function serve(stats: unknown) {
 type FooterRow = { label: string; value: number }
 
 /**
- * Every row of the Throughput card's table-count footer, in screen order.
- * An array, not a map: a row printed twice must count twice, or a duplicate
- * line would pass the "adds up" check while the screen shows more than the total.
+ * Every row of a table-count footer, in screen order. An array, not a map: a
+ * row printed twice must count twice, or a duplicate line would pass the "adds
+ * up" check while the screen shows more than the total.
  */
-async function footerRows(): Promise<FooterRow[]> {
-  const completed = await screen.findByText("Tables completed")
-  const footer = completed.closest("div.border-t") as HTMLElement
-  expect(footer).not.toBeNull()
+function readRows(footer: HTMLElement): FooterRow[] {
   const out: FooterRow[] = []
   for (const row of Array.from(footer.children)) {
     const [label, value] = Array.from(row.children).map((c) => (c.textContent || "").trim())
@@ -90,6 +94,13 @@ async function footerRows(): Promise<FooterRow[]> {
   }
   expect(out.length).toBeGreaterThan(0)
   return out
+}
+
+/** The Flow card's footer: "Tables <total>", then one line per status. */
+async function flowRows(): Promise<{ total: number; rows: FooterRow[] }> {
+  const all = readRows(await screen.findByTestId("flow-tables"))
+  expect(all[0].label).toBe("Tables")
+  return { total: all[0].value, rows: all.slice(1) }
 }
 
 function expectReconciles(rows: FooterRow[], total: number) {
@@ -111,29 +122,27 @@ describe("Monitor tab — table counts reconcile with the total", () => {
     render(<MonitorTab pipelineId="p1" />)
 
     await waitFor(() => expect(screen.getByText("Tables with no data yet")).toBeInTheDocument())
-    const rows = await footerRows()
-    const totalText = within(screen.getByText("Tables completed").parentElement as HTMLElement).getByText("1 / 5")
-    expect(totalText).toBeInTheDocument()
-
+    const { total, rows } = await flowRows()
+    expect(total).toBe(5)
     expect(rows.map((r) => r.label)).toEqual([
-      "Tables completed",
+      "Replicating",
       "Tables degraded",
-      "Tables running",
       "Tables with no data yet",
     ]) // zero rows (failed) stay hidden
+    expect(valueOf(rows, "Replicating")).toBe(2) // completed + running
     expect(valueOf(rows, "Tables with no data yet")).toBe(2)
     expect(valueOf(rows, "Tables degraded")).toBe(1)
-    expect(valueOf(rows, "Tables running")).toBe(1)
-    expectReconciles(rows, 5)
+    expectReconciles(rows, total)
   })
 
   it("control: with nothing waiting or degraded there is no extra row and it still adds up", async () => {
     serve(cdcSummary({ completed: 2, failed: 1, running: 1, degraded: 0, waiting: 0 }))
     render(<MonitorTab pipelineId="p1" />)
 
-    const rows = await footerRows()
-    expect(rows.map((r) => r.label)).toEqual(["Tables completed", "Tables failed", "Tables running"])
-    expectReconciles(rows, 4)
+    const { total, rows } = await flowRows()
+    expect(rows.map((r) => r.label)).toEqual(["Replicating", "Tables failed"])
+    expectReconciles(rows, total)
+    expect(total).toBe(4)
     expect(screen.queryByText("Tables with no data yet")).toBeNull()
   })
 
@@ -147,9 +156,35 @@ describe("Monitor tab — table counts reconcile with the total", () => {
     render(<MonitorTab pipelineId="p1" />)
 
     await waitFor(() => expect(screen.getByText("Tables in another state")).toBeInTheDocument())
-    const rows = await footerRows()
-    expect(rows.map((r) => r.label)).toEqual(["Tables completed", "Tables running", "Tables in another state"])
+    const { total, rows } = await flowRows()
+    expect(rows.map((r) => r.label)).toEqual(["Replicating", "Tables in another state"])
     expect(valueOf(rows, "Tables in another state")).toBe(2)
+    expectReconciles(rows, total)
+  })
+
+  it("a batch run keeps 'Tables completed n / total', and its rows add up too", async () => {
+    serve(
+      {
+        summary: {
+          mode: "batch",
+          total_tables: 4,
+          tables_completed: 2,
+          tables_failed: 1,
+          tables_running: 1,
+          total_read_rows: 10,
+          total_inserted_rows: 10,
+        },
+        tables: [],
+        total: 4,
+      },
+      RUNTIME_BATCH,
+    )
+    render(<MonitorTab pipelineId="p1" />)
+
+    const completed = await screen.findByText("Tables completed")
+    expect(within(completed.parentElement as HTMLElement).getByText("2 / 4")).toBeInTheDocument()
+    const rows = readRows(completed.closest("div.border-t") as HTMLElement)
+    expect(rows.map((r) => r.label)).toEqual(["Tables completed", "Tables failed", "Tables running"])
     expectReconciles(rows, 4)
   })
 })

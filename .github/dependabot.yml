@@ -1,6 +1,7 @@
 # Dependabot — standing dependency-update + vulnerability-alert automation.
 # Complements .github/workflows/security.yml (which SCANS); Dependabot PROPOSES
-# the fix PRs. Grouped + scheduled weekly to keep PR volume manageable.
+# the fix PRs. Grouped + scheduled monthly to keep PR volume manageable: weekly
+# produced 143 PRs in the 90 days to 2026-09-24, about half of them closed.
 #
 # Deliberate `ignore` rules below encode two coupling constraints this repo
 # guards by hand — auto-bumping either set breaks a runtime invariant:
@@ -24,7 +25,7 @@ updates:
       - "/shared/go/transforms"
       - "/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 10
     groups:
       go-minor-patch:
@@ -38,9 +39,17 @@ updates:
   - package-ecosystem: "npm"
     directory: "/frontend"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 10
     groups:
+      # vitest and @vitest/coverage-v8 must move together: coverage-v8 peers an
+      # EXACT vitest version, so a PR bumping either one alone fails `npm ci` with
+      # ERESOLVE. npm-minor-patch already pairs them for minor/patch, but majors
+      # fall outside it and arrived as two PRs that could never install (#1151,
+      # #1153). No `update-types` here, so majors group too. It must stay ABOVE
+      # npm-minor-patch: a dependency joins the first group it matches.
+      vitest:
+        patterns: ["vitest", "@vitest/*"]
       npm-minor-patch:
         patterns: ["*"]
         update-types: ["minor", "patch"]
@@ -65,7 +74,7 @@ updates:
       # already allow ^10; they are not the constraint.)
       #
       # Majors are not covered by the npm-minor-patch group above, so each one
-      # arrives as its own PR -- #901 was that, and it is a weekly recurrence
+      # arrives as its own PR -- #901 was that, and it recurs on every run
       # until this entry exists. Drop it when those three plugins ship ^10
       # peers, which in practice means when Next ships a config that requires
       # them to.
@@ -79,7 +88,7 @@ updates:
   - package-ecosystem: "pip"
     directory: "/llm-service"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 10
     groups:
       # No `update-types` filter here, unlike the gomod and npm groups above.
@@ -103,6 +112,9 @@ updates:
       - dependency-name: "opentelemetry-*"
       - dependency-name: "fastapi"
       - dependency-name: "starlette"
+      # presidio-anonymizer left llm-service/requirements.txt on 2026-09-26, so
+      # nothing installed may still need this cap; lifting it (and the ceiling in
+      # requirements.txt) is a separate change. Why it was set:
       # cryptography is capped by presidio-anonymizer, not by us: 2.2.364 -- the
       # newest release -- declares a floor of 48.0.1 and a ceiling below 49, so
       # anything from 49 up is ResolutionImpossible. Re-verified against the
@@ -263,7 +275,7 @@ updates:
       - "/shared/mcp-connectors/public/*/*/versions/*"
       - "/deploy/helm/rsync-ai/test/kind/oidc"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 5
     groups:
       # Ungrouped, this ecosystem opened one PR per image: #871 #872 #873 were
@@ -295,7 +307,7 @@ updates:
       # the Dockerfile asserts kafka-clients and connect-runtime agree to
       # major.minor, so a bump that skews them fails the BUILD instead of
       # shipping a worker that cannot boot. This entry is therefore no longer
-      # the only defense; it exists to stop the weekly re-proposal of a PR we
+      # the only defense; it exists to stop the every-run re-proposal of a PR we
       # already know needs a coordinated re-pin.
       #
       # The name has NO registry host. It used to carry one, copied straight
@@ -336,7 +348,7 @@ updates:
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
     open-pull-requests-limit: 5
     groups:
       actions:

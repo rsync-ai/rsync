@@ -65,7 +65,8 @@ from doclinks import repo_path_targets
 # eleven doc guards run. See _cut_collection.py for why conftest cannot do this.
 from _cut_collection import skip_if_cut
 
-skip_if_cut("CAPABILITIES.md", "CAPABILITIES-ARCHIVE.md")
+skip_if_cut("CAPABILITIES.md", "CAPABILITIES-ARCHIVE.md",
+            "docs/status/verified.md", "docs/status/untested.md")
 
 REPO = Path(__file__).resolve().parents[2]
 DOC = REPO / "CAPABILITIES.md"
@@ -79,11 +80,22 @@ ARCHIVE = REPO / "CAPABILITIES-ARCHIVE.md"
 # historical record the scope note below rules out, and stays out.
 MOVED_FROM = "## Active Known issues — full write-ups"
 
+# 2026-09-24: the ✅ and 🔬 tables moved out of CAPABILITIES.md to docs/status/, taking 423 of
+# the board's 480 rows with them. A row does not stop making a merge claim by changing file --
+# "Build-proven; the timing is not", "Render-tested only" and the rest are exactly the claims
+# this guard exists to catch going stale -- so they are scanned where they now live.
+SATELLITES = (REPO / "docs" / "status" / "verified.md", REPO / "docs" / "status" / "untested.md")
+
 
 def _scanned() -> list[tuple[str, int, str]]:
-    """(file, lineno, line) for CAPABILITIES.md plus the archive tail that left it."""
+    """(file, lineno, line) for the whole status board -- the index and both satellites --
+    plus the archive tail that left it."""
     rows = [("CAPABILITIES.md", n, line)
             for n, line in enumerate(DOC.read_text().split("\n"), start=1)]
+    for path in SATELLITES:
+        name = path.relative_to(REPO).as_posix()
+        rows += [(name, n, line)
+                 for n, line in enumerate(path.read_text().split("\n"), start=1)]
     arc = ARCHIVE.read_text().split("\n")
     start = arc.index(MOVED_FROM)
     rows += [("CAPABILITIES-ARCHIVE.md", n, line)
@@ -275,7 +287,14 @@ def test_the_doc_and_the_link_scanner_both_work():
     # Re-measured 2026-09-18, after the index was cut to present capabilities (fixed-bug
     # rows and resolved Known issues moved to the archive, the KIs above MOVED_FROM):
     # CAPABILITIES.md 824 lines, 2960 lines scanned.
-    assert len(DOC.read_text().split("\n")) > 600, "CAPABILITIES.md is far shorter than expected -- wrong file?"
+    # Re-measured 2026-09-24, after the ✅ and 🔬 tables moved to docs/status/: CAPABILITIES.md
+    # 577 lines, the two satellites 467 between them. The floor is on the three together --
+    # the board, wherever it is kept -- because a floor on the index alone would now be
+    # satisfied by a file that had lost every row it still holds.
+    board = len(DOC.read_text().split("\n")) + sum(
+        len(p.read_text().split("\n")) for p in SATELLITES
+    )
+    assert board > 600, f"the status board is {board} lines, far shorter than expected -- wrong file?"
     lines = [line for _, _, line in _scanned()]
     assert len(lines) > 2500, (
         f"only {len(lines)} lines scanned; the archive tail at {MOVED_FROM!r} has shrunk or moved"

@@ -20,9 +20,9 @@ func TestUnsetEnvYieldsRsyncPrefix(t *testing.T) {
 func TestTopicQualifiesEveryPlatformNamespace(t *testing.T) {
 	t.Setenv(EnvTopicPrefix, "rsync.")
 	for _, name := range []string{
-		"agent.planner.requests",
-		"agent.control.results",
 		"pipeline.domain.events",
+		"notifications",
+		"pii.scan.response",
 		"pipeline.abc12345.data",
 		"pipeline.abc12345.data.dlq",
 		"cdc.abc12345",
@@ -64,7 +64,7 @@ func TestQualificationIsIdempotent(t *testing.T) {
 // it blocks forever.
 func TestProducerAndConsumerResolveIdentically(t *testing.T) {
 	t.Setenv(EnvTopicPrefix, "rsync.")
-	const logical = "agent.planner.responses"
+	const logical = "pii.scan.response"
 	producerSide := Topic(logical)
 	consumerSide := Topics(logical)[0]
 	if producerSide != consumerSide {
@@ -77,20 +77,20 @@ func TestProducerAndConsumerResolveIdentically(t *testing.T) {
 // renaming them in the same deploy.
 func TestEmptyPrefixLeavesNamesUntouched(t *testing.T) {
 	t.Setenv(EnvTopicPrefix, "")
-	for _, name := range []string{"agent.planner.requests", "cdc.abc12345"} {
+	for _, name := range []string{"pii.scan.request", "cdc.abc12345"} {
 		if got := Topic(name); got != name {
 			t.Errorf("Topic(%q) with empty prefix = %q, want it unchanged", name, got)
 		}
 	}
 }
 
-// "rsync" + "agent.x" = "rsyncagent.x" is a legal Kafka topic name, so this
+// "rsync" + "pipeline.x" = "rsyncpipeline.x" is a legal Kafka topic name, so this
 // mistake would not surface as an error anywhere -- it would just be the wrong
 // topic.
 func TestPrefixWithoutSeparatorGainsOne(t *testing.T) {
 	t.Setenv(EnvTopicPrefix, "rsync")
-	if got := Topic("agent.x"); got != "rsync.agent.x" {
-		t.Fatalf("Topic(agent.x) = %q, want rsync.agent.x", got)
+	if got := Topic("pipeline.x"); got != "rsync.pipeline.x" {
+		t.Fatalf("Topic(pipeline.x) = %q, want rsync.pipeline.x", got)
 	}
 }
 
@@ -98,9 +98,9 @@ func TestExistingSeparatorIsNotDoubled(t *testing.T) {
 	for _, sep := range []string{".", "-", "_"} {
 		t.Run(sep, func(t *testing.T) {
 			t.Setenv(EnvTopicPrefix, "rsync"+sep)
-			want := "rsync" + sep + "agent.x"
-			if got := Topic("agent.x"); got != want {
-				t.Fatalf("Topic(agent.x) = %q, want %q", got, want)
+			want := "rsync" + sep + "pipeline.x"
+			if got := Topic("pipeline.x"); got != want {
+				t.Fatalf("Topic(pipeline.x) = %q, want %q", got, want)
 			}
 		})
 	}
@@ -141,8 +141,8 @@ func TestEmptyNameStaysEmpty(t *testing.T) {
 
 func TestTopicsQualifiesEveryElement(t *testing.T) {
 	t.Setenv(EnvTopicPrefix, "rsync.")
-	got := Topics("agent.a", "agent.b", "pipeline.c")
-	want := []string{"rsync.agent.a", "rsync.agent.b", "rsync.pipeline.c"}
+	got := Topics("pii.a", "pii.b", "pipeline.c")
+	want := []string{"rsync.pii.a", "rsync.pii.b", "rsync.pipeline.c"}
 	if len(got) != len(want) {
 		t.Fatalf("Topics returned %d names, want %d", len(got), len(want))
 	}

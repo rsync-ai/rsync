@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"encoding/json"
+	"strings"
+	"testing"
+)
 
 func TestSourceFamily(t *testing.T) {
 	mongo := map[string]interface{}{"source": map[string]interface{}{"connector": "mongodb", "db": "app"}}
@@ -111,5 +115,101 @@ func TestDecodeMongoDocument_FailLoud(t *testing.T) {
 	sm2 := &SinkMessage{PK: map[string]interface{}{"id": `{"$oid":"5f1a"}`}}
 	if err := decodeMongoDocument(cfg, sm2, map[string]interface{}{"after": `{not valid json`}, "c"); err == nil {
 		t.Error("create with corrupt after JSON should fail loud, got nil error")
+	}
+}
+
+// TestNormalizeMongoIDNumericKeysAreLiteral locks the primary-key contract for
+// NUMERIC MongoDB _id values. A key is an identity, not a measurement: it must be
+// the same characters the source holds, at every magnitude.
+//
+// TestNormalizeMongoID above already covers _id shapes, but every numeric case it
+// has arrives as {"$numberLong": "..."} — an Extended-JSON *string*, which takes
+// the correct branch. A bare JSON number does not, and that is the gap this fills:
+// a bare number decodes to float64, which reached fmt.Sprint's %g and flipped to
+// exponent form once the decimal exponent hit 6. An _id of 9000001 was written to
+// pk_json, and to the destination's _id primary-key column, as "9.000001e+06"
+// (observed in prod 2026-09-23), while 20931 was untouched — so the corruption
+// began at exactly 1e6 and nothing below it ever showed a symptom.
+func TestNormalizeMongoIDNumericKeysAreLiteral(t *testing.T) {
+	cases := []struct {
+		name string
+		in   interface{}
+		want string
+	}{
+		// The boundary: %g flips to exponent form at 1e6, so these two sat on
+		// opposite sides of the bug with nothing to distinguish them.
+		{"float below the 1e6 threshold", float64(999999), "999999"},
+		{"float at the 1e6 threshold", float64(1000000), "1000000"},
+		{"float above the threshold", float64(9000001), "9000001"},
+		{"float with many significant digits", float64(12345678), "12345678"},
+		{"small float unaffected", float64(20931), "20931"},
+
+		// json.Number is the exact decimal literal off the wire; never reformat it.
+		{"json.Number integer", json.Number("9000001"), "9000001"},
+		{"json.Number beyond 2^53", json.Number("9007199254740993"), "9007199254740993"},
+
+		// int64 is what normalizeJSONNumbers yields for an exact integer.
+		{"int64 stays exact", int64(9007199254740993), "9007199254740993"},
+
+		// A genuine non-integral value is a real double; keep it readable.
+		{"non-integral float", float64(1.5), "1.5"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := normalizeMongoID(tc.in); got != tc.want {
+				t.Errorf("normalizeMongoID(%v)=%q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecodeMongoDocumentKeepsNumericIDExact drives the whole decode path the way
+// a Debezium change event arrives, because the bug was not in the formatter alone:
+// decodeMongoDocument prefers the DOCUMENT's own _id over the message key, and
+// parsed that document with a plain json.Unmarshal, which forces every JSON number
+// through float64. The message key was always correct, so the sink shipped a wrong
+// key while holding the right one — which is why a key-only test could not see it.
+func TestDecodeMongoDocumentKeepsNumericIDExact(t *testing.T) {
+	cases := []struct {
+		name string
+		doc  string
+		want string
+	}{
+		{"numeric id above 1e6", `{"_id":9000001,"body":"probe"}`, "9000001"},
+		{"numeric id at the threshold", `{"_id":1000000,"body":"probe"}`, "1000000"},
+		{"numeric id below the threshold", `{"_id":20931,"body":"probe"}`, "20931"},
+		// float64 cannot hold this exactly; UseNumber parses the literal instead.
+		{"numeric id beyond 2^53", `{"_id":9007199254740993,"body":"probe"}`, "9007199254740993"},
+		{"objectid id still works", `{"_id":{"$oid":"6ab36853017b1d5358ac4512"},"body":"probe"}`, "6ab36853017b1d5358ac4512"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := &WorkerConfig{DestinationConnector: "postgresql"}
+			// A deliberately wrong message key: the document's _id must win, and
+			// must win in its exact form.
+			sm := &SinkMessage{PK: map[string]interface{}{"id": "key-not-used"}}
+			if err := decodeMongoDocument(cfg, sm, map[string]interface{}{"after": tc.doc}, "c"); err != nil {
+				t.Fatalf("decodeMongoDocument: %v", err)
+			}
+
+			// The key written to pk_json and to the destination _id column.
+			if got, _ := sm.PK["_id"].(string); got != tc.want {
+				t.Errorf("sm.PK[_id]=%q, want %q", got, tc.want)
+			}
+			if got, _ := sm.After["_id"].(string); got != tc.want {
+				t.Errorf("sm.After[_id]=%v, want %q", sm.After["_id"], tc.want)
+			}
+
+			// The packed document column must round-trip the _id too: float64
+			// silently rewrote 9007199254740993 as ...992 inside the payload,
+			// where no exponent notation made it visible.
+			b, err := json.Marshal(sm.After["document"])
+			if err != nil {
+				t.Fatalf("marshal document: %v", err)
+			}
+			if !strings.Contains(string(b), tc.want) {
+				t.Errorf("document column %s lost the exact _id %q", b, tc.want)
+			}
+		})
 	}
 }

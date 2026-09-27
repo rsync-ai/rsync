@@ -12,7 +12,7 @@ Deploy rsync-ai on your own infrastructure with production-grade security, TLS, 
 6. [Bring Your Own Kafka](#bring-your-own-kafka)
 7. [Bring Your Own PostgreSQL](#bring-your-own-postgresql)
 8. [Connector Setup](#connector-setup)
-9. [Monitoring (Optional)](#monitoring-optional)
+9. [Monitoring](#monitoring)
 10. [Admin Panel Setup](#admin-panel-setup)
 11. [Backup & Restore](#backup--restore)
 12. [Upgrading](#upgrading)
@@ -1068,70 +1068,64 @@ Notes:
 
 ---
 
-## Monitoring (Optional)
+## Monitoring
 
-rsync-ai ships OpenTelemetry instrumentation and an OTel Collector, but **no
-observability backend**. Out of the box, observability on a self-hosted stack is
-`docker compose logs`. If you want traces and metrics stored and searchable,
-bring your own OTLP-compatible backend and point the collector at it.
-
-### Reading the logs
-
-Every service logs structured JSON to stdout (`LOG_FORMAT=json` in
-`docker-compose.prod.yml`), so the container logs are the primary diagnostic
-surface:
+**Logs are `docker logs`.** The stack runs no log shipper and no log store. Every container
+writes Docker's json-file log with rotation: 10 MB per file, 3 files (`RSYNC_LOG_MAX_SIZE`,
+`RSYNC_LOG_MAX_FILE` in [env-vars.md](env-vars.md)). That covers the compose services and the
+connector containers `connector-deployer` starts on demand, which compose's `logging:` blocks
+cannot reach:
 
 ```bash
-P="-f docker-compose.yml -f docker-compose.prod.yml --env-file .env.prod"
-
-docker compose $P logs -f api-gateway              # follow one service
-docker compose $P logs --since 15m --tail 200      # recent activity, all services
-docker compose $P ps                               # what is up, and health state
+docker compose logs -f --tail=200 api-gateway   # one compose service
+docker logs -f --since 10m <container>          # any container, connectors included
 ```
 
-Each line is a JSON object carrying `level`, `message`, `service`, `trace_id` and
-`span_id`, so `jq` filters work directly:
+api-gateway, the orchestrator, temporal-adapter, connector-deployer, llm-service, the planner
+and the tool-generator honour `LOG_LEVEL` and `LOG_FORMAT`; the MCP connectors do not yet.
 
-```bash
-# errors only, across the whole stack, in the last hour
-docker compose $P logs --no-log-prefix --since 1h \
-  | jq -rc 'select(.level=="error") | [.service, .message] | @tsv'
+**Telemetry is off.** The services carry OpenTelemetry instrumentation, but `OTEL_ENABLED`
+defaults to `false` and the stack ships no collector, so nothing is exported.
 
-# every log line belonging to one request, once you have its trace_id
-docker compose $P logs --no-log-prefix --since 1h \
-  | jq -rc 'select(.trace_id=="<trace-id>")'
-```
+### Outage alerts, and the two outages that need an outside check
 
-Log volume is bounded — every service uses the `json-file` driver with
-`max-size` (default `10m`) and `max-file` (default `3`), tunable via
-`RSYNC_LOG_MAX_SIZE` and `RSYNC_LOG_MAX_FILE`. That caps worst-case disk at
-roughly `max-size × max-file` per container, so an unattended box cannot fill
-its disk with logs.
+rsync alerts every admin when a service it depends on stops answering. A service counts as down
+after three failed checks in a row, 30 seconds apart. The alert names the service and what stops
+while it is down. It never quotes the probe's error, because that error can carry an address or
+a credential.
 
-### Attaching your own OTLP backend
+| Service | Checked by | How |
+|---|---|---|
+| Redis · Temporal · temporal-adapter · connector-deployer · tool-generator · llm-service | orchestrator | Redis ping, a TCP dial to Temporal, HTTP health on the rest |
+| Kafka Connect | orchestrator | HTTP `GET /` on `KAFKA_CONNECT_URL`, while `KAFKA_CONNECT_URL` is set or any CDC pipeline exists |
+| The orchestrator itself · Kafka | api-gateway | `/health` on the orchestrator, a metadata request to Kafka. The gateway waits 2 minutes after it starts before counting a failure |
 
-The stack already runs an OTel Collector that receives traces and metrics over
-OTLP, receives logs from fluent-bit, correlates them, and forwards everything to
-a single OTLP endpoint. That endpoint is `OTLP_BACKEND_ENDPOINT`, and nothing
-listens on its default, so exports fail and are dropped until you set it:
+The orchestrator probes a service only when it has the service's address. The bundled compose
+files and the Helm chart set the addresses: `TEMPORAL_ADDRESS`,
+`SENTINEL_PROBE_TEMPORAL_ADAPTER_URL`, `SENTINEL_PROBE_CONNECTOR_DEPLOYER_URL`,
+`TOOL_GENERATOR_URL` and `SENTINEL_PROBE_LLM_SERVICE_URL`. Redis is always probed, at
+`REDIS_ADDRESS`. If you run one of these services somewhere else, point its variable there;
+leave a variable unset and that service goes unwatched.
 
-```bash
-# in .env.prod — your backend's OTLP gRPC endpoint
-OTLP_BACKEND_ENDPOINT=10.0.0.20:4317
-```
+Kafka Connect is optional. The quickstart runs it only in the `cdc` profile, and the Helm chart
+only with CDC enabled. The orchestrator therefore checks it only when `KAFKA_CONNECT_URL` is set
+(the chart sets it when CDC is enabled) or when a CDC pipeline exists, whatever that pipeline's
+state. An install with neither gets no Kafka Connect alert. Deleting the last CDC pipeline
+closes an open Kafka Connect alert. If you run your own Kafka Connect, set `KAFKA_CONNECT_URL`
+so it is watched before the first CDC pipeline exists. The Admin → Health page follows the
+same rule for Kafka Connect and for the CDC sink, `kafka-mcp-sink`. It lists each only when its
+address is set (`KAFKA_CONNECT_URL`, `KAFKA_SINK_URL`) or a CDC pipeline exists.
 
-```bash
-docker compose $P up -d otel-collector
-```
+**Two outages cannot be reported from inside the deployment**:
 
-If your backend runs as a container on the same host rather than on a separate
-box, attach the collector to that backend's network and target it by container
-name instead of an address — a `docker compose up` recreates the collector and
-drops any `docker network connect` made by hand, so declare the network in
-compose rather than attaching it manually.
-
-The collector's pipelines, processors and the exact trace↔log correlation
-behaviour are documented in [deploy/TELEMETRY.md](../../deploy/TELEMETRY.md).
+- **api-gateway down.** The gateway runs the watch above and delivers every alert. Point any
+  external uptime monitor at `https://<your-host>/api/health`, which returns `200
+  {"status":"ok"}` while the gateway is serving. The endpoint is static, so a 200 means the
+  gateway is up and nothing more.
+- **PostgreSQL down.** Every alert is stored in PostgreSQL, and its recipients are looked up
+  there, before it is sent. The bundled PostgreSQL container has a `pg_isready` healthcheck, so a
+  host monitor can read `docker inspect --format '{{.State.Health.Status}}' rsync-postgres`
+  (the quickstart's container name). With a managed database, use the provider's own monitoring.
 
 ---
 

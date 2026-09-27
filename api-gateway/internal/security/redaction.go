@@ -40,19 +40,6 @@ func RedactAny(v interface{}) interface{} {
 	}
 }
 
-// RedactMapWithVersion applies redaction and adds policy version metadata
-func RedactMapWithVersion(m map[string]interface{}) map[string]interface{} {
-	redacted := RedactMap(m)
-	if redacted == nil {
-		redacted = make(map[string]interface{})
-	}
-	
-	// Add redaction metadata (non-intrusive key)
-	redacted["_redaction_policy_version"] = RedactionPolicyVersion
-	
-	return redacted
-}
-
 // RedactMap masks sensitive keys and recursively redacts nested objects/arrays.
 func RedactMap(m map[string]interface{}) map[string]interface{} {
 	if m == nil {

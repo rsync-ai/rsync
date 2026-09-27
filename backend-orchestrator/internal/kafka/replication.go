@@ -112,15 +112,6 @@ func (p replicationPolicy) replicationFactorOr(def int16) int16 {
 	return def
 }
 
-// minInsyncReplicasOr returns the operator's requested durability floor, or def when
-// they did not state one.
-func (p replicationPolicy) minInsyncReplicasOr(def int) int {
-	if p.minInsyncReplicas > 0 {
-		return p.minInsyncReplicas
-	}
-	return def
-}
-
 // forCluster is the replication factor for a topic this package mints itself, as
 // opposed to one whose RF a caller stated.
 //

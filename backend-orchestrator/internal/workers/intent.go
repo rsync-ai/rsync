@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/IBM/sarama"
 	"github.com/google/uuid"
 	log "github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
@@ -30,25 +29,13 @@ import (
 // INTENT WORKER - PURELY AGENTIC & GENERIC
 // ==============================================================================
 // This worker follows the Temporal/Conductor pattern:
-// 1. Consumes tasks from agent.control.commands
+// 1. Claims "intent" requests from the Redis correlation store (startRedisPoller)
 // 2. Makes autonomous decisions (calls LLM to parse intent)
-// 3. Returns results to agent.control.results
+// 3. Writes the result back to the correlation store (RouteResult)
 // 4. NEVER emits domain events (only orchestrator does)
 // 5. Is STATELESS and horizontally scalable
 // 6. Is GENERIC (works with ANY natural language request)
-//
-// CRITICAL: Uses async worker pool to prevent blocking Kafka poll loop
-// - Phase 1 (Fast): Receive message, enqueue, return immediately (<10ms)
-// - Phase 2 (Slow): Worker goroutines process tasks and commit offsets
 // ==============================================================================
-
-// taskWithContext wraps a task with its Kafka message context for async processing
-type taskWithContext struct {
-	task    Task
-	message *sarama.ConsumerMessage
-	session sarama.ConsumerGroupSession
-	ctx     context.Context
-}
 
 // IntentWorker parses natural language requests into structured intent
 type IntentWorker struct {
@@ -61,13 +48,9 @@ type IntentWorker struct {
 	progressEmitter   *ProgressEmitter
 	correlationClient *correlation.Client
 	workerID          string
-
-	// Async worker pool to prevent blocking Kafka poll loop
-	taskQueue   chan taskWithContext
-	workerCount int
 }
 
-// NewIntentWorker creates a new intent worker with async worker pool
+// NewIntentWorker creates a new intent worker
 func NewIntentWorker(kafkaManager *kafka.Manager, db *sql.DB) *IntentWorker {
 	log.Info("🔧 IntentWorker: NewIntentWorker() called")
 	ctx, cancel := context.WithCancel(context.Background())
@@ -76,8 +59,6 @@ func NewIntentWorker(kafkaManager *kafka.Manager, db *sql.DB) *IntentWorker {
 	if llmServiceURL == "" {
 		llmServiceURL = "http://planner:5011"
 	}
-
-	workerCount := 5 // Number of concurrent workers for processing tasks
 
 	// Initialize correlation client for V2 workflows
 	redisAddr := os.Getenv("REDIS_ADDRESS")
@@ -102,25 +83,13 @@ func NewIntentWorker(kafkaManager *kafka.Manager, db *sql.DB) *IntentWorker {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		ctx:         ctx,
-		cancel:      cancel,
-		tracer:      otel.Tracer("intent-worker"),
-		taskQueue:   make(chan taskWithContext, 100), // Buffer for 100 pending tasks
-		workerCount: workerCount,
+		ctx:    ctx,
+		cancel: cancel,
+		tracer: otel.Tracer("intent-worker"),
 	}
 
-	// Start background worker pool (Phase 2 - slow path)
-	for i := 0; i < workerCount; i++ {
-		go w.processTasksAsync(i)
-	}
-
-	log.Infof("✅ IntentWorker: Initialized with %d async workers", workerCount)
+	log.Info("✅ IntentWorker: Initialized")
 	return w
-}
-
-// GetWorkerType returns the worker type
-func (w *IntentWorker) GetWorkerType() string {
-	return "intent"
 }
 
 // Execute processes a task and returns a result
@@ -188,19 +157,6 @@ func (w *IntentWorker) Execute(ctx context.Context, task Task) TaskResult {
 			TraceID:     task.TraceID,
 		}
 	}
-
-	// Optional: Emit telemetry (not domain events!)
-	w.emitTelemetry(ctx, TelemetryEvent{
-		TelemetryType: TelemetryProgressUpdate,
-		PipelineID:    task.PipelineID,
-		Agent:         "intent",
-		Timestamp:     time.Now(),
-		Data: map[string]interface{}{
-			"message": "Parsing natural language request",
-			"request": userRequest,
-		},
-		TraceID: task.TraceID,
-	})
 
 	// Call LLM to parse intent (AUTONOMOUS DECISION)
 	intent, err := w.parseIntent(ctx, userRequest, task.TraceID)
@@ -360,24 +316,12 @@ func (w *IntentWorker) parseIntent(ctx context.Context, userRequest string, trac
 		req.Header.Set(k, v)
 	}
 
-	// Optional: Emit telemetry for LLM call
 	startTime := time.Now()
 	resp, err := w.httpClient.Do(req)
-	latencyMs := time.Since(startTime).Milliseconds()
+	span.SetAttributes(attribute.Int64("llm.latency_ms", time.Since(startTime).Milliseconds()))
 
 	if err != nil {
 		span.RecordError(err)
-		w.emitTelemetry(ctx, TelemetryEvent{
-			TelemetryType: TelemetryLLMCall,
-			PipelineID:    "", // Will be set by caller
-			Agent:         "intent",
-			Timestamp:     time.Now(),
-			Data: map[string]interface{}{
-				"error":      err.Error(),
-				"latency_ms": latencyMs,
-			},
-			TraceID: traceID,
-		})
 		return nil, fmt.Errorf("LLM request failed: %w", err)
 	}
 	defer resp.Body.Close()
@@ -431,20 +375,6 @@ func (w *IntentWorker) parseIntent(ctx context.Context, userRequest string, trac
 		// Include original plan for downstream agents
 		"original_plan": plan,
 	}
-
-	// Emit telemetry for successful LLM call
-	w.emitTelemetry(ctx, TelemetryEvent{
-		TelemetryType: TelemetryLLMCall,
-		PipelineID:    "", // Will be set by caller
-		Agent:         "intent",
-		Timestamp:     time.Now(),
-		Data: map[string]interface{}{
-			"latency_ms":  latencyMs,
-			"tokens_used": llmResponse["tokens_used"],
-			"model":       llmResponse["model"],
-		},
-		TraceID: traceID,
-	})
 
 	span.SetStatus(codes.Ok, "Intent parsed successfully")
 	return intent, nil
@@ -601,237 +531,23 @@ func extractExplicitSourceDest(msg string) (string, string, bool) {
 	return "", "", false
 }
 
-// emitTelemetry sends telemetry to pipeline.agent.telemetry topic
-// This is OPTIONAL and does NOT affect the state machine
-func (w *IntentWorker) emitTelemetry(ctx context.Context, event TelemetryEvent) {
-	telemetryJSON, err := json.Marshal(event)
-	if err != nil {
-		log.WithError(err).Warn("Failed to marshal telemetry event")
-		return
-	}
-
-	// Fire and forget - telemetry should not block task processing
-	go func() {
-		err := w.kafkaManager.Produce("pipeline.agent.telemetry", []byte(event.PipelineID), telemetryJSON)
-		if err != nil {
-			log.WithError(err).Warn("Failed to emit telemetry")
-		}
-	}()
-}
-
-// Start begins consuming tasks from agent.control.commands topic
+// Start launches the Redis correlation poller, the only way intent requests
+// reach this worker (the Temporal adapter writes them to the correlation store).
 func (w *IntentWorker) Start() error {
-	log.Info("🚀 IntentWorker.Start() called - consuming from dedicated topic")
-
-	// Start Redis poller for V2 workflows (correlation pattern)
-	if w.correlationClient != nil {
-		go w.startRedisPoller()
-		log.Info("✅ IntentWorker: Redis poller started for V2 correlation requests")
-	} else {
+	if w.correlationClient == nil {
 		log.Warn("⚠️  IntentWorker: Correlation client not initialized - V2 workflows will not work")
-	}
-
-	// Consume from dedicated topic: agent.control.commands.intent
-	// This eliminates rebalancing - each worker has its own topic
-	err := w.kafkaManager.ConsumeWithContext("agent.control.commands.intent", w.handleTask)
-	if err != nil {
-		return fmt.Errorf("failed to consume agent.control.commands.intent: %w", err)
-	}
-
-	log.Info("✅ IntentWorker started - consuming from dedicated topic (NO rebalancing)")
-	return nil
-}
-
-// handleTask is the Kafka message handler (PHASE 1 - FAST PATH)
-// This MUST return quickly (<10ms) to avoid blocking the Kafka poll loop
-func (w *IntentWorker) handleTask(ctx context.Context, msg *sarama.ConsumerMessage) error {
-	// ============================================================================
-	// INSTRUMENTATION POINT 1: Handler Entry (MUST ALWAYS LOG)
-	// ============================================================================
-	log.WithFields(log.Fields{
-		"topic":     msg.Topic,
-		"partition": msg.Partition,
-		"offset":    msg.Offset,
-	}).Info("🔍 HANDLE_TASK_ENTERED - Intent Worker received message")
-
-	// ============================================================================
-	// INSTRUMENTATION POINT 2: Parse Task
-	// ============================================================================
-	var task Task
-	if err := json.Unmarshal(msg.Value, &task); err != nil {
-		log.WithError(err).Error("❌ HANDLE_TASK_EXIT - Failed to unmarshal task (reason: parse_error)")
-		return err // Will go to DLQ after retries
-	}
-
-	// V2 tasks are handled by the Redis correlation poller; the Kafka path is V1-only.
-	// Skipping here prevents double-execution (see KI-HYBRID-1).
-	if task.CorrelationID != "" {
-		log.WithField("correlation_id", task.CorrelationID).
-			Debug("⏭️  Skipping Kafka path for V2 task (handled by Redis correlation poller)")
 		return nil
 	}
-
-	log.WithFields(log.Fields{
-		"task_id":     task.TaskID,
-		"task_type":   task.TaskType,
-		"pipeline_id": task.PipelineID,
-	}).Info("✅ Task unmarshaled successfully")
-
-	// ============================================================================
-	// INSTRUMENTATION POINT 3: Task Type Filter (CRITICAL - Most Common Drop Point)
-	// ============================================================================
-	if task.TaskType != "parse_intent" {
-		log.WithFields(log.Fields{
-			"received_type": task.TaskType,
-			"expected_type": "parse_intent",
-			"task_id":       task.TaskID,
-		}).Warn("⏭️  HANDLE_TASK_EXIT - TASK_SKIPPED (reason: wrong_type)")
-		return nil // Return quickly, don't process
-	}
-
-	log.WithFields(log.Fields{
-		"task_id":     task.TaskID,
-		"pipeline_id": task.PipelineID,
-	}).Info("✅ [PHASE 1] Task type matched - proceeding to enqueue")
-
-	// ============================================================================
-	// INSTRUMENTATION POINT 4: Enqueue for Async Processing
-	// ============================================================================
-	select {
-	case w.taskQueue <- taskWithContext{
-		task:    task,
-		message: msg,
-		session: nil, // Session not needed for auto-commit
-		ctx:     ctx,
-	}:
-		log.WithFields(log.Fields{
-			"task_id":   task.TaskID,
-			"queue_len": len(w.taskQueue),
-			"queue_cap": cap(w.taskQueue),
-		}).Info("✅ HANDLE_TASK_EXIT - [PHASE 1] Task enqueued successfully (reason: enqueued)")
-		return nil // Return immediately - task will be processed by worker pool
-	case <-time.After(100 * time.Millisecond):
-		// Queue full - reject task (will be retried by Kafka)
-		log.WithFields(log.Fields{
-			"task_id":   task.TaskID,
-			"queue_len": len(w.taskQueue),
-			"queue_cap": cap(w.taskQueue),
-		}).Error("❌ HANDLE_TASK_EXIT - TASK_REJECTED (reason: queue_full)")
-		return fmt.Errorf("worker queue full, task will be retried")
-	}
+	go w.startRedisPoller()
+	log.Info("✅ IntentWorker: Redis poller started for V2 correlation requests")
+	return nil
 }
 
 // Stop gracefully shuts down the worker
 func (w *IntentWorker) Stop() error {
 	log.Info("🛑 Stopping Intent Worker")
 	w.cancel()
-	close(w.taskQueue) // Signal workers to stop
-	// Note: Kafka consumer will be stopped by the manager's Close() method
 	return nil
-}
-
-// processTasksAsync runs in background goroutines (PHASE 2 - SLOW PATH)
-// This can take as long as needed without blocking Kafka poll loop
-func (w *IntentWorker) processTasksAsync(workerID int) {
-	log.Infof("🔧 [PHASE 2] Worker #%d started - processing tasks async", workerID)
-
-	// Panic recovery to prevent silent task drops
-	defer func() {
-		if r := recover(); r != nil {
-			log.WithFields(log.Fields{
-				"worker_id": workerID,
-				"panic":     r,
-			}).Error("🚨 [PHASE 2] INTENT_HANDLER_PANIC - Worker crashed!")
-		}
-	}()
-
-	for taskCtx := range w.taskQueue {
-		// ========================================================================
-		// INSTRUMENTATION POINT 5: PHASE 2 Entry
-		// ========================================================================
-		log.WithFields(log.Fields{
-			"worker_id":   workerID,
-			"task_id":     taskCtx.task.TaskID,
-			"pipeline_id": taskCtx.task.PipelineID,
-		}).Info("🔄 [PHASE 2 - SLOW] PHASE_2_START - Dequeued task, calling Execute()")
-
-		// Wrap Execute in defer for panic recovery.
-		//
-		// F-Obs-3: pre-fix the panic only logged — the panicked task
-		// silently disappeared from the in-process queue, leaving the
-		// Temporal adapter waiting for an activity reply that would
-		// never come. The workflow appeared "running" for minutes-to-
-		// hours until the activity start-to-close timeout fired, at
-		// which point the user got an unhelpful "activity timed out"
-		// error with no signal in the orchestrator logs of WHAT
-		// panicked. Fix: synthesize a failed TaskResult inside the
-		// recover and call RouteResult so the failure reaches the
-		// correlation store / Temporal adapter immediately. The user
-		// sees a real error in seconds instead of hours.
-		func() {
-			defer func() {
-				if r := recover(); r != nil {
-					log.WithFields(log.Fields{
-						"worker_id": workerID,
-						"task_id":   taskCtx.task.TaskID,
-						"panic":     r,
-					}).Error("🚨 [PHASE 2] Execute() panicked!")
-
-					panicResult := TaskResult{
-						TaskID:      taskCtx.task.TaskID,
-						WorkflowID:  taskCtx.task.WorkflowID,
-						StepID:      taskCtx.task.StepID,
-						Status:      "failure",
-						Output:      map[string]interface{}{},
-						Error:       fmt.Sprintf("intent worker panic: %v", r),
-						CompletedAt: time.Now().UTC(),
-						TraceID:     taskCtx.task.TraceID,
-					}
-					if routeErr := RouteResult(taskCtx.ctx, taskCtx.task, panicResult, w.kafkaManager); routeErr != nil {
-						log.WithError(routeErr).WithFields(log.Fields{
-							"task_id":        taskCtx.task.TaskID,
-							"correlation_id": taskCtx.task.CorrelationID,
-						}).Error("🚨 [PHASE 2] Failed to route panic-failure result; workflow will time out")
-					} else {
-						log.WithFields(log.Fields{
-							"task_id":        taskCtx.task.TaskID,
-							"correlation_id": taskCtx.task.CorrelationID,
-						}).Info("📤 [PHASE 2] Routed panic-failure result (workflow will see immediate failure instead of activity timeout)")
-					}
-				}
-			}()
-
-			// Execute task (can take 30s+ for LLM call)
-			result := w.Execute(taskCtx.ctx, taskCtx.task)
-
-			log.WithFields(log.Fields{
-				"worker_id":   workerID,
-				"task_id":     taskCtx.task.TaskID,
-				"pipeline_id": taskCtx.task.PipelineID,
-				"status":      result.Status,
-			}).Info("✅ [PHASE 2] Execute() completed, sending result...")
-
-			// Route result to correlation store (V2) or Kafka (V1)
-			err := RouteResult(taskCtx.ctx, taskCtx.task, result, w.kafkaManager)
-			if err != nil {
-				log.WithError(err).WithFields(log.Fields{
-					"task_id":        taskCtx.task.TaskID,
-					"correlation_id": taskCtx.task.CorrelationID,
-				}).Error("❌ [PHASE 2] PHASE_2_EXIT - Failed to route result (reason: route_error)")
-				// TODO: Could implement retry logic or DLQ here
-				return
-			}
-
-			log.WithFields(log.Fields{
-				"worker_id":   workerID,
-				"task_id":     taskCtx.task.TaskID,
-				"pipeline_id": taskCtx.task.PipelineID,
-				"status":      result.Status,
-			}).Info("📤 [PHASE 2] PHASE_2_EXIT - Sent result to orchestrator (reason: success)")
-		}()
-	}
-
-	log.Infof("🛑 [PHASE 2] Worker #%d stopped", workerID)
 }
 
 // getExecutionID extracts execution_id from task context

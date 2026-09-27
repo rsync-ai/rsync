@@ -50,13 +50,17 @@ export function findConnectionNames(
   return { srcName: pick("source_connection_name"), dstName: pick("destination_connection_name") }
 }
 
+const EXECUTOR_TRANSFER_MESSAGE = /^(?:Queued|Transferred) \d+ of \d+ tables|^All tables queued/
+
 /**
  * Executor subtitle. "Syncing" needs evidence the transfer is past prep,
  * because table selection happens inside this stage and saying "Syncing"
  * before tables are picked is untrue. Evidence: stage progress or rows, or
- * the worker's per-table progress message ("Transferred N of M tables",
- * executor.go buildExecutorTableProgressEvent). Without it the label still
- * names the route when the connection-validation stage reported it.
+ * the executor's progress messages (executor.go buildExecutorTableProgressEvent
+ * and buildExecutorAwaitingLandingEvent: "Queued N of M tables for writing",
+ * "All tables queued — waiting for the destination to confirm…"; orchestrator
+ * images before that rename say "Transferred N of M tables"). Without it the
+ * label still names the route when the connection-validation stage reported it.
  */
 export function executorRunningMessage(args: {
   currentStage?: string
@@ -72,7 +76,7 @@ export function executorRunningMessage(args: {
   const transferring =
     (typeof stage.progress === "number" && stage.progress > 0 && stage.progress < 100) ||
     (Number.isFinite(rows) && rows > 0) ||
-    /^Transferred \d+ of \d+ tables/.test(stateMessage || "")
+    EXECUTOR_TRANSFER_MESSAGE.test(stateMessage || "")
   const route = srcName && dstName ? ` "${srcName}" → "${dstName}"` : ""
   if (transferring) return route ? `Syncing${route}…` : "Syncing data…"
   return route ? `Preparing${route}…` : "Preparing…"

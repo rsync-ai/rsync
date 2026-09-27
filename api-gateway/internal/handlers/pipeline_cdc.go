@@ -2,12 +2,14 @@ package handlers
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"time"
 
+	"api-gateway/internal/db"
 	"api-gateway/internal/security"
 
 	"github.com/gin-gonic/gin"
@@ -220,7 +222,60 @@ func BackfillPipelineCDCTables(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	// BUG #9: an accepted re-snapshot loads the tables' existing rows, so they are no
+	// longer streaming-only (UpdatePipelineCDCTables added them there). Best-effort:
+	// the snapshot is already requested and must be reported either way.
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		var sent struct {
+			Tables []string `json:"tables"`
+		}
+		if json.Unmarshal(raw, &sent) == nil && len(sent.Tables) > 0 {
+			if database := db.GetDB(); database != nil {
+				if err := updateCDCStreamingOnlyTables(database, pipelineID, nil, sent.Tables); err != nil {
+					log.WithError(err).WithField("pipeline_id", pipelineID).Warn("Failed to update cdc_streaming_only_tables after a re-snapshot (ignored)")
+				}
+			}
+		}
+	}
+
 	forwardOrchestratorJSON(c, resp, "Reload")
+}
+
+// GetPipelineCDCBackfillCapability reports whether a re-snapshot would be
+// accepted — i.e. whether the pipeline's connector has a signal channel —
+// without triggering one. Read-only, so Viewer is enough (the POST on the same
+// path needs Member). Proxies to backend-orchestrator.
+//
+// GET /api/v1/pipelines/:id/cdc/backfill
+func GetPipelineCDCBackfillCapability(c *gin.Context) {
+	pipelineID, ok := requireUUIDParam(c, "id", "invalid_pipeline_id", "Invalid pipeline ID format")
+	if !ok {
+		return
+	}
+	if _, ok := requirePipelineWorkspaceRole(c, pipelineID, security.WSViewer); !ok {
+		return
+	}
+
+	url := fmt.Sprintf("%s/api/v1/cdc/pipelines/%s/backfill", orchestratorBaseURL(), pipelineID)
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, url, nil)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to build request"})
+		return
+	}
+	if traceID := c.GetHeader("X-Trace-ID"); traceID != "" {
+		req.Header.Set("X-Trace-ID", traceID)
+	}
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	setInternalServiceSecret(req)
+	resp, err := client.Do(req)
+	if err != nil {
+		respondError(c, http.StatusBadGateway, "orchestrator_unreachable", "Orchestrator is unreachable", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	forwardOrchestratorJSON(c, resp, "Re-snapshot check")
 }
 
 // PausePipelineCDC pauses a CDC pipeline by pausing the Kafka Connect connector.

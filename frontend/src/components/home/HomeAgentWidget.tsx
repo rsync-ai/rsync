@@ -159,6 +159,10 @@ export function HomeAgentWidget() {
   // True until the first connections fetch for the active workspace settles, so
   // the "No connections configured" warning never flashes while loading (#2).
   const [connectionsLoading, setConnectionsLoading] = useState(true)
+  // A failed read used to leave `connections` at [] and land the user on the
+  // "No connections configured" warning with an Add button — an outage rendered
+  // as a measured fact about their account.
+  const [connectionsError, setConnectionsError] = useState<string | null>(null)
   const [messages, setMessages] = useState<AgentMessage[]>([])
   const [showFullChat, setShowFullChat] = useState(false)
   const inputRef = useRef<HTMLInputElement>(null)
@@ -185,9 +189,13 @@ export function HomeAgentWidget() {
         const data = await res.json()
         if (isStale()) return
         setConnections(data.connections || [])
+        setConnectionsError(null)
+      } else {
+        setConnectionsError(`The server answered ${res.status}`)
       }
     } catch (error) {
       console.error("Failed to fetch connections:", error)
+      if (!isStale()) setConnectionsError("Could not reach the server")
     }
     if (!isStale()) setConnectionsLoading(false)
   }
@@ -349,8 +357,26 @@ export function HomeAgentWidget() {
         </div>
       )}
 
+      {/* Read failed: unknown, not zero */}
+      {!connectionsLoading && connectionsError && (
+        <div className="flex items-center gap-3 p-4 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900">
+          <AlertCircle className="h-5 w-5 text-amber-600" />
+          <div className="flex-1">
+            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+              Could not load your connections
+            </p>
+            <p className="text-xs text-amber-600 dark:text-amber-500">
+              {connectionsError}. This does not mean you have none — retry before adding anything.
+            </p>
+          </div>
+          <Button variant="outline" size="sm" onClick={() => void fetchConnections()}>
+            Retry
+          </Button>
+        </div>
+      )}
+
       {/* No connections warning */}
-      {!connectionsLoading && connections.length === 0 && (
+      {!connectionsLoading && !connectionsError && connections.length === 0 && (
         <div className="flex items-center gap-3 p-4 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900">
           <AlertCircle className="h-5 w-5 text-amber-600" />
           <div className="flex-1">

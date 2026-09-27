@@ -78,26 +78,6 @@ func NewMetricsEmitter(cfg MetricsEmitterConfig, emitFn func(event []byte, heade
 	}
 }
 
-// SetExpectedFileCount dynamically adjusts maxFilesPerFlush.
-// This reduces event spam for huge runs while keeping UI responsive for small runs.
-func (m *MetricsEmitter) SetExpectedFileCount(expectedTotalFiles int) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	switch {
-	case expectedTotalFiles > 5000:
-		m.maxFilesPerFlush = 250
-	case expectedTotalFiles > 0 && expectedTotalFiles < 100:
-		m.maxFilesPerFlush = 50
-	default:
-		if m.cfg.DefaultMaxFilesPerFlush > 0 {
-			m.maxFilesPerFlush = m.cfg.DefaultMaxFilesPerFlush
-		} else {
-			m.maxFilesPerFlush = 100
-		}
-	}
-}
-
 func (m *MetricsEmitter) ObserveTotals(currentTable string, totalRows, totalBytes int64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

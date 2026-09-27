@@ -156,4 +156,23 @@ func TestDebeziumTaskProbeDroppedTable(t *testing.T) {
 			t.Errorf("unmet sqlmock expectations: %v", err)
 		}
 	})
+
+	t.Run("a connector parked by Stop is degraded, not unhealthy", func(t *testing.T) {
+		// Stop parks the connector in STOPPED and keeps its offsets. Graded
+		// unhealthy, a sweep racing Stop or Start froze a row that /runtime read
+		// as phase "failed" (U-18).
+		stopped := strings.Replace(connectStatusRunning, `"state": "RUNNING", "worker_id": "kafka-connect:8083"},`,
+			`"state": "STOPPED", "worker_id": "kafka-connect:8083"},`, 1)
+		p, mock := droppedTableProbe(t, stopped)
+
+		status, lastErr, _ := p.probeOne(context.Background(), droppedTablePipelineID,
+			"debezium_task", "cdc-abd8a64d", nil)
+
+		if status != "degraded" || lastErr != "debezium connector stopped" {
+			t.Fatalf("status = %q, last_error = %q; want degraded/stopped", status, lastErr)
+		}
+		if err := mock.ExpectationsWereMet(); err != nil {
+			t.Errorf("unmet sqlmock expectations: %v", err)
+		}
+	})
 }

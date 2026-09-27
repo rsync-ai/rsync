@@ -13,6 +13,7 @@ WORKDIR /build
 # less often than the adapter, so it stays cached across adapter edits.
 COPY shared/go/kafkaclient /build/shared/go/kafkaclient
 COPY shared/go/pgdriver /build/shared/go/pgdriver
+COPY shared/go/memlimit /build/shared/go/memlimit
 
 COPY backend-temporal-adapter/go.mod backend-temporal-adapter/go.sum* /build/backend-temporal-adapter/
 WORKDIR /build/backend-temporal-adapter
@@ -23,9 +24,11 @@ COPY backend-temporal-adapter/ /build/backend-temporal-adapter/
 
 ARG TARGETOS
 ARG TARGETARCH
+# -trimpath keeps build-host paths out of the binary; -s -w drops the symbol table and
+# DWARF. Panics still print file:line (that is pclntab, which stays), only a debugger loses.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o temporal-adapter ./cmd/adapter
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o temporal-adapter ./cmd/adapter
 
 # Runtime stage
 FROM alpine:3.24
@@ -38,9 +41,7 @@ WORKDIR /app
 RUN apk --no-cache add ca-certificates curl
 
 # Copy binary from builder
-COPY --from=builder /build/backend-temporal-adapter/temporal-adapter .
-
-RUN chown appuser:appgroup /app/temporal-adapter
+COPY --from=builder --chown=appuser:appgroup /build/backend-temporal-adapter/temporal-adapter .
 
 USER appuser
 

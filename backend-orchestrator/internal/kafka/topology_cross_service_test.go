@@ -30,7 +30,7 @@ import (
 //
 // So the check runs from the side that holds the answer. This test reads the sibling
 // services' produce sites out of their source and checks them against the set
-// EnsureAgentControlTopics actually creates.
+// EnsurePlatformTopics actually creates.
 //
 // CAPABILITIES.md recorded this gap in as many words — "Neither of those two services is
 // covered by the orchestrator's source-scanning guard test" — which is what this closes.
@@ -87,7 +87,7 @@ func TestSiblingServiceProduceTargetsAreProvisioned(t *testing.T) {
 					"exist only if the broker's auto.create.topics.enable is on — a setting this "+
 					"platform does not own on a customer-managed cluster, and one that leaves the "+
 					"topic carrying the broker's own min.insync.replicas when it is on:\n  %s\n\n"+
-					"Add them to EnsureAgentControlTopics (topology.go), or record why not in "+
+					"Add them to EnsurePlatformTopics (topology.go), or record why not in "+
 					"knownUncoveredSiblingProduceTargets.",
 					len(missing), svc.dir, strings.Join(missing, "\n  "))
 			}
@@ -104,10 +104,11 @@ func TestSiblingProduceScanSeesTheKnownSites(t *testing.T) {
 			"rsync.healer.approved-changes", // handlers/schema_evolution.go, SendPipelineRequest
 			"pii.scan.request",              // handlers/pii.go, SendAgentMessage
 		},
+		// The adapter's only literal produce target. It also writes rsync.notifications
+		// (workflows/pipeline_failure_notification.go), but through a named constant,
+		// which this literal-only scan does not read.
 		"backend-temporal-adapter": {
 			"pipeline.domain.events", // workflows/activities.go, sarama.ProducerMessage
-			"pipeline.failed.dlq",
-			"agent.failed.dlq",
 		},
 	}
 
@@ -124,7 +125,7 @@ func TestSiblingProduceScanSeesTheKnownSites(t *testing.T) {
 
 // A consumer subscription is not a produce. event_projector.go reads
 // pipeline.domain.events through a kafka.ReaderConfig whose field is also named Topic,
-// and main.go subscribes to the planner/PII response topics. Counting either as a
+// and main.go subscribes to the PII response topic. Counting either as a
 // produce target would turn TestSiblingServiceProduceTargetsAreProvisioned into a
 // standing false alarm, which is how a guard gets deleted.
 //
@@ -133,20 +134,19 @@ func TestSiblingProduceScanSeesTheKnownSites(t *testing.T) {
 // agent.orchestrator.progress and task.results — three literals the WebSocket bridge
 // carried until the producer-less subscriptions were pruned, after which this test
 // would have passed because the strings were GONE rather than because the scanner was
-// right. Hence the non-vacuity half below: every fixture name must still be present in
-// api-gateway's source as a kafkaclient.Topic/Topics argument before its absence from
-// the produce set means anything.
+// right. The agent command bus removal did the same to agent.planner.responses,
+// agent.executor.responses and pipeline.agent.telemetry. Hence the non-vacuity half
+// below: every fixture name must still be present in api-gateway's source as a
+// kafkaclient.Topic/Topics argument before its absence from the produce set means
+// anything.
 func TestSiblingProduceScanIgnoresConsumerSubscriptions(t *testing.T) {
 	root := siblingServiceRoot(t, "api-gateway")
 	produced := siblingProduceTargets(t, root, 80)
 	all := siblingTopicLiterals(t, root, 80)
 
 	consumeOnly := []string{
-		"pipeline.domain.events",   // projector/event_projector.go ReaderConfig, handlers/domain_events.go Consume, websocket/kafka_bridge.go
-		"agent.planner.responses",  // cmd/server/main.go, consumer subscription
-		"pii.scan.response",        // cmd/server/main.go, consumer subscription
-		"pipeline.agent.telemetry", // websocket/kafka_bridge.go subscription
-		"agent.executor.responses", // websocket/kafka_bridge.go subscription
+		"pipeline.domain.events", // projector/event_projector.go ReaderConfig, handlers/domain_events.go Consume, websocket/kafka_bridge.go
+		"pii.scan.response",      // cmd/server/main.go, consumer subscription
 	}
 
 	for _, name := range consumeOnly {

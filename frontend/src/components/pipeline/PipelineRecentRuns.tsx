@@ -83,6 +83,7 @@ export function summarizeRecentRuns(t: PipelineTrendsResponse): RecentRunsSummar
 function pillClass(status: string) {
   if (isSuccess(status)) return "bg-emerald-500 hover:bg-emerald-600"
   if (status === "failed") return "bg-red-500 hover:bg-red-600"
+  if (status === "cancelled") return "bg-slate-400 hover:bg-slate-500"
   return "bg-blue-500 animate-pulse"
 }
 
@@ -90,6 +91,7 @@ function statusLabel(status: string) {
   if (isSuccess(status)) return "Succeeded"
   if (status === "failed") return "Failed"
   if (status === "running") return "Running"
+  if (status === "cancelled") return "Cancelled"
   return status
 }
 

@@ -736,11 +736,11 @@ func (s *CDCSentinel) restartConnector(ctx context.Context, connectorName string
 // triggerHealer records the Sentinel's terminal verdict on a connector: it has
 // failed, and restarting it did not bring it back.
 //
-// This used to produce to HealerDLQ, and nothing consumed that topic — the
-// healer subscribes "agent.executor.requests" and deliberately does NOT take
-// the ".dlq" sibling, because a payload on it is a sentinel alert rather than an
-// executor task and re-running it as one would be wrong. That reasoning is
-// still right; the mistake was the destination, not the refusal. So the verdict
+// This used to produce to a HealerDLQ topic, and nothing consumed it — the
+// healer subscribes only the schema-drift topics and deliberately takes no DLQ,
+// because a payload on one is a sentinel alert rather than an executor task and
+// re-running it as one would be wrong. That reasoning is still right; the
+// mistake was the destination, not the refusal. So the verdict
 // now lands in sentinel_active_issues, which the heal sweep reads, the
 // monitoring API serves, and the self-healing panel renders.
 //
@@ -1288,7 +1288,23 @@ func (s *CDCSentinel) checkSinkConsumerLag(ctx context.Context, pipelineID, pipe
 	lagging := totalLag > walBytesFromEnv("CDC_SINK_KAFKA_LAG_ALERT", SinkKafkaLagAlert)
 	// A backlog alone is not a stuck sink: a first load puts one far above the threshold on
 	// a healthy sink. Alarm only when the sink has also stopped committing (cdc_sink_drain.go).
-	stalled, stalledFor := s.observeSinkDrain(pipelineID, drain.Committed, lagging, time.Now())
+	stalled, stalledFor, moving := s.observeSinkDrain(pipelineID, drain.Committed, lagging, time.Now())
+
+	// Persist the reading before deciding what to do with it. This tick is the only
+	// place in the product that reads the authoritative broker-side drain on a
+	// schedule; until now it computed all three numbers and kept none, so the
+	// pipeline page's lag came from a one-shot snapshot taken whenever somebody last
+	// opened it. Writing it here means the tile is at most one tick stale whether or
+	// not anyone is watching. Best-effort: a failed write must never stop the alarm
+	// below from firing, so the error is logged and swallowed.
+	s.recordSinkLag(ctx, pipelineID, consumerGroup, totalLag, drain.Committed, moving, stalled, stalledFor)
+
+	// Per-consumer, per-topic census for the pipeline page. Pure observation: it
+	// touches none of the alarm decision below, and it reuses this group's reading
+	// rather than taking its own (fetchConsumerGroupOffsets builds its request over
+	// every topic in the cluster, so a second read of the same group would double
+	// the tick's cost for no new information).
+	s.recordConsumerCensus(ctx, pipelineID, consumerGroup, drain)
 
 	log.WithFields(log.Fields{
 		"pipeline_id":    pipelineID,
@@ -1407,6 +1423,10 @@ func (s *CDCSentinel) emitCDCIssue(
 	_ = s.kafkaManager.ProduceWithHeaders("pipeline.domain.events", []byte(pipelineID), b, map[string]string{
 		"trace_id": pipelineID,
 	})
+
+	// ...and tell the pipeline's owner, if this is one they need to act on.
+	// The domain event above only reaches somebody already looking at the UI.
+	publishSentinelAlert(s.kafkaManager, issueType, severity, alertType, pipelineID, description, metadata)
 
 	log.WithFields(log.Fields{
 		"pipeline_id": pipelineID,

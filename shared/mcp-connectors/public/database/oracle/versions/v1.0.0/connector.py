@@ -381,6 +381,36 @@ def _oracle_bind_value(v: Any, canonical_type: Optional[str] = None) -> Any:
     return v
 
 
+
+def _group_rows_by_shape(data, columns):
+    """Split a batch into CONSECUTIVE runs of rows that carry the same columns.
+
+    A row whose key set is SMALLER than the batch union is not "the same row with
+    NULLs in the gaps" — it is a row the producer deliberately said nothing about
+    for those columns. The kafka sink depends on exactly that: its
+    filterDebeziumUnavailable DROPS the key of a TOAST-able column Debezium
+    reported unchanged (``__debezium_unavailable_value``), on the contract that an
+    absent key means "leave this column alone". Building one statement from the
+    union broke that contract — ``row.get(col)`` returned None and the UPDATE/SET
+    clause wrote NULL over the destination's good value. It only misfired when a
+    batch MIXED shapes (one row carrying the column, one not), which is the normal
+    shape of a CDC batch, so a single-row batch always looked correct.
+
+    Runs are CONSECUTIVE and never merged across the batch: two changes to the same
+    primary key must still be applied in arrival order, and regrouping by shape
+    would let the older change win. A uniform batch therefore yields exactly one
+    run — the previous single-statement, single-``executemany`` behaviour.
+    """
+    groups = []
+    for row in data:
+        sig = tuple(c for c in columns if isinstance(row, dict) and c in row)
+        if groups and groups[-1][0] == sig:
+            groups[-1][1].append(row)
+        else:
+            groups.append((sig, [row]))
+    return [(list(sig), rows) for sig, rows in groups]
+
+
 class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
     """MCP Server for Oracle Database"""
     
@@ -1544,51 +1574,61 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
             if not columns:
                 return {"success": False, "error": "No safe columns to upsert"}
 
-            conflict_cols = [k for k in key_fields if k in columns and self._is_safe_ident(k)]
-            if not conflict_cols:
-                conflict_cols = ["id"] if "id" in columns else [columns[0]]
-            update_cols = [c for c in columns if c not in conflict_cols]
+            def _build_merge(shape_cols):
+                """One MERGE for ONE row shape (see _group_rows_by_shape)."""
+                conflict_cols = [k for k in key_fields if k in shape_cols and self._is_safe_ident(k)]
+                if not conflict_cols:
+                    conflict_cols = ["id"] if "id" in shape_cols else [shape_cols[0]]
+                update_cols = [c for c in shape_cols if c not in conflict_cols]
 
-            using_cols = ", ".join(f":{i + 1} AS {self._ora_quote(c)}" for i, c in enumerate(columns))
-            on_clause = " AND ".join(f"t.{self._ora_quote(k)} = s.{self._ora_quote(k)}" for k in conflict_cols)
-            if update_cols:
-                set_clause = ", ".join(f"t.{self._ora_quote(c)} = s.{self._ora_quote(c)}" for c in update_cols)
-                matched = f"WHEN MATCHED THEN UPDATE SET {set_clause} "
-            else:
-                matched = ""  # all columns are keys -> insert-if-absent only
-            insert_cols = ", ".join(self._ora_quote(c) for c in columns)
-            insert_vals = ", ".join(f"s.{self._ora_quote(c)}" for c in columns)
-            merge_query = (
-                f"MERGE INTO {qname} t USING (SELECT {using_cols} FROM dual) s "
-                f"ON ({on_clause}) {matched}"
-                f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
-            )
-
-            def _rows(batch):
-                return [
-                    tuple(_oracle_bind_value(row.get(col), col_types.get(col)) for col in columns)
-                    for row in batch
-                ]
+                using_cols = ", ".join(f":{i + 1} AS {self._ora_quote(c)}" for i, c in enumerate(shape_cols))
+                on_clause = " AND ".join(f"t.{self._ora_quote(k)} = s.{self._ora_quote(k)}" for k in conflict_cols)
+                if update_cols:
+                    set_clause = ", ".join(f"t.{self._ora_quote(c)} = s.{self._ora_quote(c)}" for c in update_cols)
+                    matched = f"WHEN MATCHED THEN UPDATE SET {set_clause} "
+                else:
+                    matched = ""  # all columns are keys -> insert-if-absent only
+                insert_cols = ", ".join(self._ora_quote(c) for c in shape_cols)
+                insert_vals = ", ".join(f"s.{self._ora_quote(c)}" for c in shape_cols)
+                query = (
+                    f"MERGE INTO {qname} t USING (SELECT {using_cols} FROM dual) s "
+                    f"ON ({on_clause}) {matched}"
+                    f"WHEN NOT MATCHED THEN INSERT ({insert_cols}) VALUES ({insert_vals})"
+                )
+                return query, conflict_cols
 
             rows_upserted = 0
             batch_size = min(self.max_batch_size, 1000)
-            for i in range(0, len(data), batch_size):
-                batch = data[i:i + batch_size]
-                values = _rows(batch)
-                try:
-                    cursor.executemany(merge_query, values)
-                except Exception as e:
-                    if "ORA-00942" in str(e):  # table or view does not exist
-                        try:
-                            conn.rollback()
-                        except Exception:
-                            pass
-                        cursor = self._get_cursor(conn, as_dict=False)
-                        self._ora_ensure_table_ddl(cursor, config, table, columns, conflict_cols, col_types, params)
+            # One MERGE per SHAPE-RUN, not one per batch: a column this row does not
+            # carry must not appear in its SET clause. `columns` (the union) is still
+            # what the DDL retry below needs.
+            for shape_cols, shape_rows in _group_rows_by_shape(data, columns):
+                if not shape_cols:
+                    raise ValueError(
+                        f"upsert_data: a row in the batch for {table} carries no safe columns; "
+                        "refusing to write an all-NULL row"
+                    )
+                merge_query, conflict_cols = _build_merge(shape_cols)
+                for i in range(0, len(shape_rows), batch_size):
+                    batch = shape_rows[i:i + batch_size]
+                    values = [
+                        tuple(_oracle_bind_value(row.get(col), col_types.get(col)) for col in shape_cols)
+                        for row in batch
+                    ]
+                    try:
                         cursor.executemany(merge_query, values)
-                    else:
-                        raise
-                rows_upserted += len(batch)
+                    except Exception as e:
+                        if "ORA-00942" in str(e):  # table or view does not exist
+                            try:
+                                conn.rollback()
+                            except Exception:
+                                pass
+                            cursor = self._get_cursor(conn, as_dict=False)
+                            self._ora_ensure_table_ddl(cursor, config, table, columns, conflict_cols, col_types, params)
+                            cursor.executemany(merge_query, values)
+                        else:
+                            raise
+                    rows_upserted += len(batch)
 
             logger.info("upsert_data[oracle]: target=%s.%s submitted=%d",
                         owner or "", name, rows_upserted)

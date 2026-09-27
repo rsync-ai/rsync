@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/IBM/sarama"
@@ -44,9 +46,18 @@ type Manager struct {
 	client    sarama.Client
 	producer  sarama.SyncProducer
 	consumers map[string]sarama.ConsumerGroup
-	mu        sync.RWMutex
-	connected bool
-	tracer    trace.Tracer
+	// consumeStops cancels each topic's consume loop, keyed like consumers.
+	consumeStops map[string]context.CancelFunc
+	// handlers holds each topic's handler, keyed like consumers, so
+	// RestartConsumerGroup can start the same consumer again.
+	handlers map[string]ConsumeHandlerWithContext
+	// newConsumerGroup builds the group a topic's consumer joins. NewManager
+	// gives each group a client of its own; see startConsumerLocked. A field so
+	// tests can substitute a fake.
+	newConsumerGroup func(groupID string) (sarama.ConsumerGroup, error)
+	mu               sync.RWMutex
+	connected        bool
+	tracer           trace.Tracer
 
 	// topology is the admin view over the SAME broker connection, built on first
 	// use so a manager that never creates a topic never opens an admin client.
@@ -54,6 +65,10 @@ type Manager struct {
 	// topic creation must not queue behind it.
 	topology   *TopologyManager
 	topologyMu sync.Mutex
+
+	// signalTopicsTuned records the signal topics EnsureSignalTopic has brought
+	// to SignalTopicConfig in this process, so it alters each one once.
+	signalTopicsTuned sync.Map
 }
 
 // topologyFor returns the single TopologyManager layered over this manager's
@@ -237,11 +252,18 @@ func NewManager(config Config) (*Manager, error) {
 	}
 
 	manager := &Manager{
-		Config:    config,
-		security:  security,
-		client:    client,
-		producer:  producer,
-		consumers: make(map[string]sarama.ConsumerGroup),
+		Config:       config,
+		security:     security,
+		client:       client,
+		producer:     producer,
+		consumers:    make(map[string]sarama.ConsumerGroup),
+		consumeStops: make(map[string]context.CancelFunc),
+		handlers:     make(map[string]ConsumeHandlerWithContext),
+		// saramaConfig already carries the SASL/TLS settings:
+		// saramaauth.NewClient applied them to it above.
+		newConsumerGroup: func(groupID string) (sarama.ConsumerGroup, error) {
+			return sarama.NewConsumerGroup(security.Brokers, groupID, saramaConfig)
+		},
 		connected: true,
 		tracer:    otel.Tracer("kafka-manager"),
 	}
@@ -317,7 +339,7 @@ func (m *Manager) ProduceWithContext(ctx context.Context, topic string, key, val
 	// variant funnels through these three, so a topic named anywhere in the
 	// orchestrator -- including one added later -- lands in the platform
 	// namespace without the author having to remember. Idempotent, so an
-	// already-qualified name from generateTopicName passes through unchanged.
+	// already-qualified name (a stored pipelines.kafka_topic, say) passes through unchanged.
 	topic = kafkaclient.Topic(topic)
 	// Start a span for the produce operation
 	ctx, span := m.tracer.Start(ctx, fmt.Sprintf("kafka.produce.%s", topic),
@@ -381,6 +403,59 @@ func (m *Manager) ProduceWithContext(ctx context.Context, topic string, key, val
 	return nil
 }
 
+// ProduceToExactTopic sends a message to exactly the named topic, WITHOUT the
+// platform qualification every other Produce variant applies (kafkaclient.Topic).
+//
+// It exists for topics whose name is owned by something other than the orchestrator.
+// The Kafka Connect worker's offset-storage topic is the case in point: Connect reads
+// OFFSET_STORAGE_TOPIC verbatim (_rsync-connect-offsets by default), so a record
+// produced through ProduceWithContext lands in rsync._rsync-connect-offsets, a topic
+// nothing reads, and the seeded offset is silently ignored. The caller owns the name;
+// an empty one is refused rather than sent.
+func (m *Manager) ProduceToExactTopic(ctx context.Context, topic string, key, value []byte) error {
+	if strings.TrimSpace(topic) == "" {
+		return fmt.Errorf("topic name is required")
+	}
+	if m.producer == nil {
+		return fmt.Errorf("kafka producer not initialized")
+	}
+	ctx, span := m.tracer.Start(ctx, fmt.Sprintf("kafka.produce.%s", topic),
+		trace.WithSpanKind(trace.SpanKindProducer),
+		trace.WithAttributes(
+			attribute.String("messaging.system", "kafka"),
+			attribute.String("messaging.destination", topic),
+			attribute.String("messaging.destination_kind", "topic"),
+		),
+	)
+	defer span.End()
+
+	headers := m.injectTraceHeaders(ctx)
+	saramaHeaders := make([]sarama.RecordHeader, 0, len(headers))
+	for k, v := range headers {
+		saramaHeaders = append(saramaHeaders, sarama.RecordHeader{Key: []byte(k), Value: []byte(v)})
+	}
+
+	partition, offset, err := m.producer.SendMessage(&sarama.ProducerMessage{
+		Topic:   topic,
+		Key:     sarama.ByteEncoder(key),
+		Value:   sarama.ByteEncoder(value),
+		Headers: saramaHeaders,
+	})
+	if err != nil {
+		appmetrics.KafkaMessagesPublishedTotal.WithLabelValues(topic, "failure").Inc()
+		span.RecordError(err)
+		span.SetStatus(codes.Error, "Failed to produce message")
+		return fmt.Errorf("failed to produce message to %s: %w", topic, err)
+	}
+	appmetrics.KafkaMessagesPublishedTotal.WithLabelValues(topic, "success").Inc()
+	span.SetAttributes(
+		attribute.Int64("messaging.kafka.partition", int64(partition)),
+		attribute.Int64("messaging.kafka.offset", offset),
+	)
+	span.SetStatus(codes.Ok, "")
+	return nil
+}
+
 // ProduceWithHeaders sends a message to a Kafka topic with custom headers
 func (m *Manager) ProduceWithHeaders(topic string, key, value []byte, headers map[string]string) error {
 	return m.ProduceWithHeadersAndContext(context.Background(), topic, key, value, headers)
@@ -392,7 +467,7 @@ func (m *Manager) ProduceWithHeadersAndContext(ctx context.Context, topic string
 	// variant funnels through these three, so a topic named anywhere in the
 	// orchestrator -- including one added later -- lands in the platform
 	// namespace without the author having to remember. Idempotent, so an
-	// already-qualified name from generateTopicName passes through unchanged.
+	// already-qualified name (a stored pipelines.kafka_topic, say) passes through unchanged.
 	topic = kafkaclient.Topic(topic)
 	// Start a span for the produce operation
 	ctx, span := m.tracer.Start(ctx, fmt.Sprintf("kafka.produce.%s", topic),
@@ -610,8 +685,23 @@ func (h *ConsumerGroupHandler) ConsumeClaim(session sarama.ConsumerGroupSession,
 					shouldCommit = true
 					log.WithField("trace_id", traceID).Info("✅ Message sent to DLQ, committing offset")
 				} else {
-					shouldCommit = false
-					log.WithField("trace_id", traceID).Error("❌ DLQ send failed, NOT committing offset (message will be redelivered)")
+					// Fail closed: END THE CLAIM. Leaving this message unmarked and
+					// reading on is not enough -- the next message that succeeds is
+					// marked, and a MarkMessage commits every offset below it, this
+					// failed one included, so it would never be redelivered. Returning
+					// ends the session (sarama cancels it when any ConsumeClaim
+					// returns); consumeLoop joins again and the group resumes from the
+					// last committed offset, which is this message. The pause keeps a
+					// DLQ that stays unwritable from turning that into a hot loop.
+					span.End()
+					log.WithField("trace_id", traceID).Error("❌ DLQ send failed, NOT committing offset; ending the claim so the message is redelivered")
+					select {
+					case <-time.After(dlqFailureBackoff):
+					case <-session.Context().Done():
+					}
+					return fmt.Errorf("kafka consumer %s: message at partition %d offset %d failed (%v) "+
+						"and could not be sent to %s; ending the claim so it is redelivered",
+						h.topic, message.Partition, message.Offset, lastErr, dlqTopicFor(h.topic))
 				}
 			} else {
 				// Handler succeeded
@@ -852,7 +942,7 @@ func (h *ConsumerGroupHandler) sendToDLQ(ctx context.Context, message *sarama.Co
 	)
 	defer span.End()
 
-	dlqTopic := h.topic + ".dlq"
+	dlqTopic := dlqTopicFor(h.topic)
 
 	// Copy original headers and add error details
 	headers := make([]sarama.RecordHeader, 0, len(message.Headers)+4)
@@ -916,8 +1006,17 @@ func (m *Manager) ConsumeWithContext(topic string, handler ConsumeHandlerWithCon
 	// variant funnels through these three, so a topic named anywhere in the
 	// orchestrator -- including one added later -- lands in the platform
 	// namespace without the author having to remember. Idempotent, so an
-	// already-qualified name from generateTopicName passes through unchanged.
+	// already-qualified name (a stored pipelines.kafka_topic, say) passes through unchanged.
 	topic = kafkaclient.Topic(topic)
+
+	// The DLQ companion is created here, before the group joins, rather than left to
+	// the first sendToDLQ: that produce would auto-create it at the broker's defaults,
+	// and a broker with auto-creation off would refuse it, which (ConsumeClaim fails
+	// closed) stalls the partition. Best effort: a failure leaves the old behaviour.
+	if err := m.EnsureTopicExistsWithConfig(dlqTopicFor(topic), 1, DLQTopicConfig()); err != nil {
+		log.WithError(err).WithField("topic", dlqTopicFor(topic)).Warn("Could not pre-create the DLQ topic; the first DLQ send will have to create it")
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -926,49 +1025,127 @@ func (m *Manager) ConsumeWithContext(topic string, handler ConsumeHandlerWithCon
 		return fmt.Errorf("already consuming topic: %s", topic)
 	}
 
-	// Create topic-specific consumer group to avoid rebalancing conflicts
-	// Each topic gets its own consumer group for independent consumption
-	topicGroupID := fmt.Sprintf("%s-%s", m.Config.GroupID, topic)
+	if err := m.startConsumerLocked(topic, handler); err != nil {
+		return err
+	}
 
-	consumerGroup, err := sarama.NewConsumerGroupFromClient(topicGroupID, m.client)
+	log.Infof("✅ Started consuming from topic: %s", topic)
+	return nil
+}
+
+// consumerGroupID is the group a topic's consumer joins. Each topic gets its own
+// group, so a rebalance on one topic never pauses the others.
+func (m *Manager) consumerGroupID(topic string) string {
+	return fmt.Sprintf("%s-%s", m.Config.GroupID, topic)
+}
+
+// startConsumerLocked builds the topic's consumer group, records it with its
+// handler, and starts its consume loop. Callers hold m.mu.
+//
+// Each group has a client of its own rather than sharing m.client. A sarama
+// Broker holds one lock for a request's whole round trip (sendAndReceive,
+// broker.go:1212 in v1.60.2), and an idle Fetch keeps it for up to MaxWaitTime.
+// With all nine groups and the producer on one client, every request on a
+// single broker queued behind the groups' Fetches: on the dev broker a Produce
+// blocked for 4.5 s at p50, and a message took 7-9 s to reach its handler
+// (manager_delivery_probe_test.go). sarama's own doc on
+// NewConsumerGroupFromClient says consumer groups can re-use a client but must
+// not share one.
+func (m *Manager) startConsumerLocked(topic string, handler ConsumeHandlerWithContext) error {
+	groupID := m.consumerGroupID(topic)
+	consumerGroup, err := m.newConsumerGroup(groupID)
 	if err != nil {
 		return fmt.Errorf("failed to create consumer group: %w", err)
 	}
 
-	log.Infof("📡 Consumer group '%s' created for topic: %s", topicGroupID, topic)
+	log.Infof("📡 Consumer group '%s' created for topic: %s", groupID, topic)
 
 	m.consumers[topic] = consumerGroup
+	if m.handlers == nil {
+		m.handlers = make(map[string]ConsumeHandlerWithContext)
+	}
+	m.handlers[topic] = handler
 
-	// Start consuming in goroutine
-	go func() {
-		groupHandler := &ConsumerGroupHandler{
-			topic:          topic,
-			handlerWithCtx: handler,
-			producer:       m.producer, // Pass producer for DLQ support
-			maxRetries:     3,          // Default 3 retries before DLQ
-			tracer:         m.tracer,
-		}
+	ctx, stop := context.WithCancel(context.Background())
+	if m.consumeStops == nil {
+		m.consumeStops = make(map[string]context.CancelFunc)
+	}
+	m.consumeStops[topic] = stop
 
-		ctx := context.Background()
-		for {
-			// This will block until session ends
-			if err := consumerGroup.Consume(ctx, []string{topic}, groupHandler); err != nil {
-				log.Errorf("Error from consumer group for topic %s: %v", topic, err)
-				time.Sleep(5 * time.Second) // Wait before retrying
-			}
-
-			// Check if context is done (shutdown)
-			select {
-			case <-ctx.Done():
-				log.Infof("Consumer for topic %s shutting down", topic)
-				return
-			default:
-			}
-		}
-	}()
-
-	log.Infof("✅ Started consuming from topic: %s", topic)
+	groupHandler := &ConsumerGroupHandler{
+		topic:          topic,
+		handlerWithCtx: handler,
+		producer:       m.producer, // Pass producer for DLQ support
+		maxRetries:     3,          // Default 3 retries before DLQ
+		tracer:         m.tracer,
+	}
+	go consumeLoop(ctx, topic, consumerGroup, groupHandler)
 	return nil
+}
+
+// consumeRetryDelay is how long consumeLoop waits after a failed session
+// before joining the group again. A var so tests need not wait it out.
+var consumeRetryDelay = 5 * time.Second
+
+// dlqFailureBackoff is how long ConsumeClaim waits, after a message whose handler
+// and DLQ send both failed, before it ends the claim for redelivery. A variable so
+// tests need not wait.
+var dlqFailureBackoff = 5 * time.Second
+
+// dlqTopicFor is the dead-letter companion of a consumed topic, the name sendToDLQ
+// produces to and ConsumeWithContext pre-creates.
+func dlqTopicFor(topic string) string {
+	return topic + ".dlq"
+}
+
+// DLQTopicConfig is the per-topic configuration of a consumer's DLQ companion:
+// one partition (a DLQ is read by an operator, not a consumer group) and seven days
+// of retention, long enough to notice and replay a failure.
+func DLQTopicConfig() map[string]string {
+	return map[string]string{
+		"cleanup.policy": "delete",
+		"retention.ms":   "604800000",
+	}
+}
+
+// consumeLoop runs one consumer-group session after another until ctx is
+// cancelled or the group is closed.
+//
+// A closed group can never consume again: sarama's Consume returns
+// ErrClosedConsumerGroup before doing anything else (consumer_group.go:215 in
+// v1.60.2). The loop used to treat that like any other error and retry every
+// 5 s for the rest of the process, so a Close left each topic's goroutine
+// logging "tried to use a consumer group that was closed" until the process
+// died, and a StopConsuming leaked the goroutine for good.
+func consumeLoop(ctx context.Context, topic string, group sarama.ConsumerGroup, handler sarama.ConsumerGroupHandler) {
+	for {
+		// This will block until session ends
+		err := group.Consume(ctx, []string{topic}, handler)
+		if ctx.Err() != nil || errors.Is(err, sarama.ErrClosedConsumerGroup) {
+			log.Infof("Consumer for topic %s shutting down", topic)
+			return
+		}
+		if err == nil {
+			continue // a rebalance ended the session; join the next one
+		}
+		log.Errorf("Error from consumer group for topic %s: %v", topic, err)
+		select {
+		case <-ctx.Done():
+			log.Infof("Consumer for topic %s shutting down", topic)
+			return
+		case <-time.After(consumeRetryDelay):
+		}
+	}
+}
+
+// stopConsumeLoop cancels the topic's consume loop, if it has one, so its
+// current session starts releasing its claims before the group is closed.
+// Callers hold m.mu.
+func (m *Manager) stopConsumeLoop(topic string) {
+	if stop, ok := m.consumeStops[topic]; ok {
+		stop()
+		delete(m.consumeStops, topic)
+	}
 }
 
 // StopConsuming stops consuming from a specific topic
@@ -984,6 +1161,8 @@ func (m *Manager) StopConsuming(topic string) error {
 
 	log.Infof("🛑 Stopping consumer for topic: %s", topic)
 
+	m.stopConsumeLoop(topic)
+	delete(m.handlers, topic)
 	if err := consumer.Close(); err != nil {
 		log.Errorf("Error closing consumer for topic %s: %v", topic, err)
 		// Still remove from map even if close failed
@@ -1003,12 +1182,12 @@ func (m *Manager) Close() error {
 
 	log.Info("Closing Kafka connections...")
 
-	// Close all consumers
-	for topic, consumer := range m.consumers {
-		if err := consumer.Close(); err != nil {
-			log.Errorf("Error closing consumer for topic %s: %v", topic, err)
-		}
+	// Cancel every consume loop first, so all the sessions start releasing
+	// their claims now rather than each one waiting its turn below.
+	for topic := range m.consumeStops {
+		m.stopConsumeLoop(topic)
 	}
+	closeConsumerGroups(m.consumers, consumerCloseTimeout)
 
 	// Close producer
 	if err := m.producer.Close(); err != nil {
@@ -1023,6 +1202,56 @@ func (m *Manager) Close() error {
 	m.connected = false
 	log.Info("✅ Kafka connections closed")
 	return nil
+}
+
+// consumerCloseTimeout bounds how long Close waits for the consumer groups to
+// leave. A var so tests need not wait it out.
+var consumerCloseTimeout = 15 * time.Second
+
+// closeConsumerGroups closes every group at once and waits at most timeout.
+//
+// The groups used to share one sarama.Client, so on a single broker every
+// Fetch, heartbeat, offset commit and LeaveGroup they sent queued on the same
+// connection, and an idle Fetch held it for MaxWaitTime. Closed one after
+// another, the orchestrator's nine groups took 33 s to leave on the dev stack.
+// That is past a 30 s stop grace period, so Docker SIGKILLed the process before
+// main's remaining defers ran. Each group now has its own client
+// (startConsumerLocked), and closing one closes that client too. They are
+// still closed together, so the slowest group sets the wait rather than the
+// sum of them.
+//
+// A group still closing at the deadline is abandoned. The caller goes on to
+// close the producer and the client, and the broker drops the member after
+// Session.Timeout, as it would after a crash.
+func closeConsumerGroups(groups map[string]sarama.ConsumerGroup, timeout time.Duration) {
+	if len(groups) == 0 {
+		return
+	}
+	var wg sync.WaitGroup
+	var open atomic.Int32
+	open.Store(int32(len(groups)))
+	for topic, group := range groups {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer open.Add(-1)
+			if err := group.Close(); err != nil {
+				log.Errorf("Error closing consumer for topic %s: %v", topic, err)
+			}
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Warnf("⚠️ %d of %d Kafka consumer group(s) still closing after %s; closing the client anyway",
+			open.Load(), len(groups), timeout)
+	}
 }
 
 // TopicMetadata represents metadata about a Kafka topic
@@ -1060,6 +1289,9 @@ type ConsumerGroupDrain struct {
 	// Committed is the sum of the group's committed offsets over every partition it has
 	// committed to. Its absolute value means nothing; only a change between readings does.
 	Committed int64
+	// CommittedByTopic is the same position split by topic, for the per-topic rows of
+	// the consumer census. It has an entry for exactly the topics in LagByTopic.
+	CommittedByTopic map[string]int64
 }
 
 // GetConsumerGroupDrain reads the group's lag and committed position in one pass.
@@ -1069,8 +1301,9 @@ func (m *Manager) GetConsumerGroupDrain(groupID string) (ConsumerGroupDrain, err
 		return ConsumerGroupDrain{}, err
 	}
 	return ConsumerGroupDrain{
-		LagByTopic: computeConsumerGroupLag(committed, logEnd),
-		Committed:  sumCommittedOffsets(committed),
+		LagByTopic:       computeConsumerGroupLag(committed, logEnd),
+		Committed:        sumCommittedOffsets(committed),
+		CommittedByTopic: committedByTopic(committed),
 	}, nil
 }
 
@@ -1202,6 +1435,28 @@ func sumCommittedOffsets(committed map[string]map[int32]int64) int64 {
 	return total
 }
 
+// committedByTopic is sumCommittedOffsets per topic. A topic the group has never
+// committed on is omitted, as computeConsumerGroupLag omits it, so every lag reading has
+// exactly one committed position beside it.
+func committedByTopic(committed map[string]map[int32]int64) map[string]int64 {
+	out := make(map[string]int64)
+	for topic, partitions := range committed {
+		var total int64
+		hasCommitted := false
+		for _, offset := range partitions {
+			if offset < 0 {
+				continue
+			}
+			hasCommitted = true
+			total += offset
+		}
+		if hasCommitted {
+			out[topic] = total
+		}
+	}
+	return out
+}
+
 // consumerGroupLister is the slice of sarama.ClusterAdmin that ListConsumerGroups
 // needs, narrowed so the aggregation contract can be exercised without a cluster.
 type consumerGroupLister interface {
@@ -1255,6 +1510,86 @@ func listConsumerGroups(admin consumerGroupLister) ([]string, error) {
 	return names, nil
 }
 
+// ConsumerGroupDescription is the part of a group's broker-side description the
+// product needs: is anybody in it, and is it settled?
+//
+// State is the fact lag cannot supply. A group with lag 0 and state "Empty" has
+// no members at all — nothing is consuming, and the queue is drained only in the
+// sense that the producer also stopped. A group in "PreparingRebalance" is mid
+// re-assignment, so a lag reading taken from it is a snapshot of a moving target
+// rather than a backlog. Both used to be indistinguishable from "caught up".
+type ConsumerGroupDescription struct {
+	State   string
+	Members int
+}
+
+// consumerGroupDescriber is the slice of sarama.ClusterAdmin that
+// DescribeConsumerGroups needs, narrowed so the aggregation contract below can be
+// exercised without a cluster — the same treatment consumerGroupLister gets.
+type consumerGroupDescriber interface {
+	DescribeConsumerGroups(groups []string) ([]*sarama.GroupDescription, error)
+}
+
+// DescribeConsumerGroups returns the state and member count of each named group.
+//
+// Groups the broker does not know are simply ABSENT from the result rather than
+// reported as empty or dead. The caller asks about names it derived or read from a
+// manifest, and a group that has never been joined is a different thing from one
+// that exists and has lost its members: the first means "this consumer has not
+// started", the second means "this consumer has stopped". Collapsing them would
+// recreate, one level up, exactly the "zero is not health" confusion this whole
+// area exists to fix. Sarama reports an unknown group with state "Dead" and no
+// members, which is why the check below is on the state string and not on len().
+func (m *Manager) DescribeConsumerGroups(groupIDs []string) (map[string]ConsumerGroupDescription, error) {
+	if !m.connected || m.client == nil {
+		return nil, fmt.Errorf("kafka manager not connected")
+	}
+	if len(groupIDs) == 0 {
+		return map[string]ConsumerGroupDescription{}, nil
+	}
+
+	admin, err := sarama.NewClusterAdminFromClient(m.client)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cluster admin: %w", err)
+	}
+	// NewClusterAdminFromClient shares the underlying client; do NOT Close() it here
+	// (admin.Close() closes the shared client). Same rule as ListConsumerGroups.
+	return describeConsumerGroups(admin, groupIDs)
+}
+
+// describeConsumerGroups is the pure core, split out so the "an unknown group is
+// absent, not Dead" rule is unit-testable without a live broker.
+func describeConsumerGroups(admin consumerGroupDescriber, groupIDs []string) (map[string]ConsumerGroupDescription, error) {
+	described, err := admin.DescribeConsumerGroups(groupIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to describe consumer groups: %w", err)
+	}
+
+	out := make(map[string]ConsumerGroupDescription, len(described))
+	for _, g := range described {
+		if g == nil || g.GroupId == "" {
+			continue
+		}
+		// Kafka Connect workers ("connect") and other non-consumer protocols do not
+		// carry a consumer-group membership in the wire format this reads, so their
+		// member count would be meaningless. Same filter TopicConsumerGroups applies.
+		if g.ProtocolType != "" && g.ProtocolType != "consumer" {
+			continue
+		}
+		// "Dead" with no members is how the broker answers about a group id it has
+		// never seen. Reporting that as a state would tell the UI a consumer had died
+		// when it simply has not started yet.
+		if strings.EqualFold(g.State, "Dead") && len(g.Members) == 0 {
+			continue
+		}
+		out[g.GroupId] = ConsumerGroupDescription{
+			State:   g.State,
+			Members: len(g.Members),
+		}
+	}
+	return out, nil
+}
+
 // GetTopicMetadata retrieves metadata for a specific topic
 func (m *Manager) GetTopicMetadata(topic string) (*TopicMetadata, error) {
 	if !m.connected {
@@ -1283,6 +1618,35 @@ func (m *Manager) GetTopicMetadata(topic string) (*TopicMetadata, error) {
 	}
 
 	return metadata, nil
+}
+
+// TopicMessageCount is the number of messages topic still retains (log end minus
+// log start, summed over partitions). Call it only for a topic known to exist: a
+// metadata request for a missing topic auto-creates it on a broker with
+// auto.create.topics.enable.
+func (m *Manager) TopicMessageCount(topic string) (int64, error) {
+	if !m.connected {
+		return 0, fmt.Errorf("kafka manager not connected")
+	}
+	partitions, err := m.client.Partitions(topic)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get partitions for topic %s: %w", topic, err)
+	}
+	var total int64
+	for _, p := range partitions {
+		newest, err := m.client.GetOffset(topic, p, sarama.OffsetNewest)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read the end offset of %s/%d: %w", topic, p, err)
+		}
+		oldest, err := m.client.GetOffset(topic, p, sarama.OffsetOldest)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read the start offset of %s/%d: %w", topic, p, err)
+		}
+		if newest > oldest {
+			total += newest - oldest
+		}
+	}
+	return total, nil
 }
 
 // ListTopics returns all topic names known to the broker.
@@ -1341,6 +1705,70 @@ func (m *Manager) EnsureTopicExistsWithConfig(topic string, partitions int32, co
 		return err
 	}
 	return ensureAuthoritativeTopic(tm, topic, partitions, configEntries)
+}
+
+// SignalTopicConfig is the per-topic configuration of a Debezium Kafka signal
+// channel topic (#23). Signals are one-shot commands, not data: once the
+// connector has read one it must never run again. Debezium's signal consumer
+// commits its position to a consumer group, and the broker forgets an idle
+// group's offsets after offsets.retention.minutes (7 days by default); a
+// connector that restarts after a longer stop reads the topic from the start
+// and re-runs every snapshot signal still retained. With the broker default
+// retention (7 days, and a never-rolled segment kept until the next write) that
+// was every signal ever sent. One day of retention, in hourly segments, leaves
+// nothing that old to replay; the dispatcher only sends to a running task, so a
+// live signal is read within seconds.
+func SignalTopicConfig() map[string]string {
+	return map[string]string{
+		"cleanup.policy": "delete",
+		"retention.ms":   "86400000",
+		"segment.ms":     "3600000",
+	}
+}
+
+// EnsureSignalTopic creates a Debezium signal topic with SignalTopicConfig, and
+// brings an existing one (created with the broker defaults before #23) to it,
+// once per topic per process. The alter is best effort: a broker that refuses
+// it still has a usable topic, so the error is returned for a warning only.
+func (m *Manager) EnsureSignalTopic(topic string) error {
+	if err := m.EnsureTopicExistsWithConfig(topic, 1, SignalTopicConfig()); err != nil {
+		return err
+	}
+	if _, done := m.signalTopicsTuned.Load(topic); done {
+		return nil
+	}
+	tm, err := m.topologyFor()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := tm.SetTopicConfig(ctx, topic, SignalTopicConfig()); err != nil {
+		return fmt.Errorf("signal topic %s exists but its retention could not be set: %w", topic, err)
+	}
+	m.signalTopicsTuned.Store(topic, struct{}{})
+	return nil
+}
+
+// DDLTopicConfig is the per-topic configuration of a Debezium connector's bare
+// topic.prefix topic, where a historized connector (MySQL/MariaDB, SQL Server,
+// Oracle, Db2) publishes source DDL when include.schema.changes is on. cdcstats reads
+// it as a reporting side channel; Debezium itself never reads it back (its own
+// replay source is the schema-history topic), so seven days of delete retention is
+// enough, and one partition keeps the DDL in order.
+func DDLTopicConfig() map[string]string {
+	return map[string]string{
+		"cleanup.policy": "delete",
+		"retention.ms":   "604800000",
+	}
+}
+
+// EnsureDDLTopic pre-creates a historized connector's DDL topic (the bare
+// topic.prefix, e.g. rsync.cdc-<id8>) at 1 partition with DDLTopicConfig, so neither
+// Debezium's first DDL record nor the cdcstats consumer's subscription creates it at
+// the broker's defaults. The name is used exactly as given.
+func (m *Manager) EnsureDDLTopic(topic string) error {
+	return m.EnsureTopicExistsWithConfig(topic, 1, DDLTopicConfig())
 }
 
 // ensureAuthoritativeTopic is the TopicConfig that EnsureTopicExists asks for, split
@@ -1411,8 +1839,16 @@ func (m *Manager) GetAllConsumerGroupsLag() (map[string]map[string]int64, error)
 	return allLags, nil
 }
 
-// RestartConsumerGroup stops and restarts a consumer group for a specific topic
-// This is used by Sentinel agent for auto-healing closed consumer groups
+// RestartConsumerGroup closes a topic's consumer group and starts it again:
+// the same group ID, config and handler, so it resumes from the group's
+// committed offsets. Nothing calls it yet, and nothing watches this Manager's
+// consumer groups for it to act on: the sentinel's per-topic consumer check was
+// removed with the agent command bus, whose topics were the only ones it watched.
+//
+// It used to rebuild the group under the base group ID instead of the topic's
+// own, from a second, hand-written config that differed from NewManager's
+// (round-robin, OffsetNewest, other timeouts), and it never started a consume
+// loop, so the new group never joined and the topic went unread.
 func (m *Manager) RestartConsumerGroup(topic string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1424,8 +1860,15 @@ func (m *Manager) RestartConsumerGroup(topic string) error {
 	if !exists {
 		return fmt.Errorf("no consumer found for topic: %s", topic)
 	}
+	// Checked before anything is closed, so a restart that cannot finish leaves
+	// the running consumer alone.
+	handler, ok := m.handlers[topic]
+	if !ok {
+		return fmt.Errorf("no handler recorded for topic: %s", topic)
+	}
 
 	// Close the existing consumer
+	m.stopConsumeLoop(topic)
 	if err := consumer.Close(); err != nil {
 		log.WithError(err).WithField("topic", topic).Warn("Error closing consumer during restart")
 		// Continue anyway - we'll try to create a new one
@@ -1433,57 +1876,13 @@ func (m *Manager) RestartConsumerGroup(topic string) error {
 
 	// Remove from map
 	delete(m.consumers, topic)
+	delete(m.handlers, topic)
 	log.WithField("topic", topic).Info("✅ Closed old consumer group")
 
-	// Create new consumer group with same config
-	saramaConfig := sarama.NewConfig()
-	saramaConfig.Version = sarama.V3_3_0_0
-	saramaConfig.Consumer.Return.Errors = true
-	saramaConfig.Consumer.Offsets.Initial = sarama.OffsetNewest // Continue from where we left off
-	saramaConfig.Consumer.Group.Rebalance.GroupStrategies = []sarama.BalanceStrategy{
-		sarama.NewBalanceStrategyRoundRobin(),
-	}
-	saramaConfig.Consumer.Group.Rebalance.Timeout = 60 * time.Second
-	saramaConfig.Consumer.MaxProcessingTime = 120 * time.Second
-	saramaConfig.Consumer.Fetch.Min = 1
-	saramaConfig.Consumer.Fetch.Default = 1024 * 1024
-	saramaConfig.Consumer.MaxWaitTime = 500 * time.Millisecond
-
-	// Create new consumer group.
-	//
-	// This is a second, independent sarama.Config — it copies nothing from the
-	// one NewManager builds — so the security settings have to be applied here
-	// too, and the brokers come from the already-split list.
-	if err := saramaauth.Apply(saramaConfig, m.security); err != nil {
-		return fmt.Errorf("failed to apply Kafka security config for %s: %w", topic, err)
-	}
-	newConsumer, err := sarama.NewConsumerGroup(m.security.Brokers, m.Config.GroupID, saramaConfig)
-	if err != nil {
+	if err := m.startConsumerLocked(topic, handler); err != nil {
 		return fmt.Errorf("failed to create new consumer group for %s: %w", topic, err)
 	}
-
-	// Store new consumer
-	m.consumers[topic] = newConsumer
 	log.WithField("topic", topic).Info("✅ Created new consumer group - restart complete")
 
 	return nil
-}
-
-// IsConsumerActive checks if a consumer group is active and not closed
-func (m *Manager) IsConsumerActive(topic string) bool {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	consumer, exists := m.consumers[topic]
-	if !exists {
-		return false
-	}
-
-	// Check if consumer errors channel is closed (indicates consumer is dead)
-	select {
-	case _, ok := <-consumer.Errors():
-		return ok // If channel is closed, ok will be false
-	default:
-		return true // Channel is open and no error available
-	}
 }

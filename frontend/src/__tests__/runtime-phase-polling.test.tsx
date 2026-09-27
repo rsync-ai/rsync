@@ -57,6 +57,7 @@ const EVERY_PHASE: Record<RuntimePhase, true> = {
   completed: true,
   failed: true,
   paused: true,
+  stopped: true,
 }
 const ALL_PHASES = Object.keys(EVERY_PHASE) as RuntimePhase[]
 
@@ -114,7 +115,7 @@ describe("RuntimePhase type", () => {
     expect(sharedConstant).toBe(wirePhase)
     expect(invented).toBe("waiting_for_godot")
     expect(ALL_PHASES).toContain("waiting_for_data")
-    expect(ALL_PHASES).toHaveLength(10)
+    expect(ALL_PHASES).toHaveLength(11)
   })
 
   it("the hook's polling table has a rule for exactly the phases in the union", () => {

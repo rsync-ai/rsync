@@ -492,3 +492,18 @@ def test_suggestions_say_set_up_an_llm_for_transforms(client, monkeypatch):
     body = response.json()
     assert body["error_code"] == LLM_NOT_CONFIGURED
     assert body["error"].startswith("Set up an LLM first")
+
+
+@pytest.mark.parametrize("dest,want", [("gcs", 0), ("storage", 0), ("postgresql", 1)])
+def test_suggestions_give_index_advice_only_where_the_destination_has_indexes(client, dest, want):
+    # An intent with no transform keyword needs no LLM, so this runs as-is.
+    response = client.post(
+        "/api/v1/agents/suggestions/generate",
+        json={
+            "schema": {"columns": [{"name": "users.id", "type": "int"}]},
+            "intent": {"description": "Data pipeline sync", "destination_type": dest},
+        },
+    )
+    assert response.status_code == 200, response.text
+    indexing = [o for o in response.json()["optimizations"] if o["type"] == "indexing"]
+    assert len(indexing) == want

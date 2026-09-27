@@ -33,12 +33,19 @@ import (
 // pipelineKafkaNames matches the topics and consumer groups owned by one
 // pipeline. The names come from the producers:
 //
-//	topics  cdc-<id8>                      executor.go (Debezium topic.prefix == connector name)
+//	topics  cdc-<id8>                      source DDL topic (Debezium topic.prefix == connector name);
+//	                                       historized engines only (MySQL/MariaDB, SQL Server, Oracle,
+//	                                       Db2), pre-created by executor.go executeStreamingDataTransfer
 //	        cdc-<id8>.<db>.<table>         Debezium per-table topic
 //	        cdc-<id8>.<db>.<table>.dlq     kafka-sink-worker (srcTopic + ".dlq")
-//	        schemahistory.cdc-<id8>        debezium connector.py
-//	        signals.<id8>                  executor.go incremental-snapshot signal channel
-//	        signals.cdc-<id8>              debezium connector.py fallback for the same
+//	        schemahistory.cdc-<id8>        executor.go schemaHistoryTopicFor; historized engines only
+//	        heartbeat.cdc-<id8>            executor.go heartbeatTopicFor (MongoDB and PostgreSQL sources):
+//	                                       <Topic("heartbeat")>.<topic.prefix>, so both halves carry the
+//	                                       namespace -- rsync.heartbeat.rsync.cdc-<id8> by default --
+//	                                       and ownsTopic matches it exactly, not by either-spelling
+//	        signals.<id8>                  executor.go cdcSignalTopicFor, incremental-snapshot signal channel
+//	                                       (the only spelling: connector.py refuses an incremental
+//	                                       snapshot without a named signal topic)
 //	        pipeline.<id8>.data(+.dlq)     batch backfill
 //	groups  sink-<id8>                     CDC streaming sink
 //	        sink-<id8>-batch               batch backfill sink
@@ -72,8 +79,13 @@ func (n pipelineKafkaNames) ownsTopic(topic string) bool {
 		}
 	}
 	// Signal topics carry no suffix, so they match exactly.
-	for _, base := range []string{"signals." + n.id8, "signals.cdc-" + n.id8} {
-		if topic == base || topic == kafkaclient.Topic(base) {
+	if base := "signals." + n.id8; topic == base || topic == kafkaclient.Topic(base) {
+		return true
+	}
+	// The heartbeat topic is <heartbeat prefix>.<topic.prefix>, both qualified and the
+	// prefix FIRST (executor.go heartbeatTopicFor), so it also matches exactly.
+	for _, base := range []string{"cdc-" + n.id8, kafkaclient.Topic("cdc-" + n.id8)} {
+		if topic == kafkaclient.Topic("heartbeat")+"."+base {
 			return true
 		}
 	}

@@ -438,3 +438,77 @@ describe("PipelineTableSelector — server-level source (a connection naming no 
     })
   })
 })
+
+// Prod 2026-09-26 (pipeline 93e1e11d): "Sync N tables" sat disabled with no reason
+// in sight (the namespace error renders at the top of the scrolled body), and all
+// 9 tables carried "AI suggested" while the AI had ticked 6.
+describe("PipelineTableSelector — the confirm button says why it is disabled", () => {
+  beforeEach(() => vi.clearAllMocks())
+
+  function reasonFor(button: HTMLElement): string {
+    const id = button.getAttribute("aria-describedby")
+    return (id && document.getElementById(id)?.textContent) || ""
+  }
+
+  it("nothing selected: the reason sits by the button and clears once a table is ticked", async () => {
+    const { user } = setup()
+    const confirm = screen.getByRole("button", { name: /^Continue$/i })
+    expect(confirm).toBeDisabled()
+    expect(reasonFor(confirm)).toBe("Select at least one table to continue.")
+
+    const salesOrders = screen.getByText("sales.orders").closest("label") as HTMLElement
+    await user.click(within(salesOrders).getByRole("checkbox"))
+    const sync = screen.getByRole("button", { name: /Sync 1 table/i })
+    expect(sync).toBeEnabled()
+    expect(sync).not.toHaveAttribute("aria-describedby")
+    expect(screen.queryByTestId("table-selector-confirm-reason")).toBeNull()
+  })
+
+  it("a missing prefix: the footer repeats the field's error", async () => {
+    const { user } = setup({
+      destinationType: "gcs",
+      destinationConfig: { namespace: "", namespace_kind: "path", create_if_not_exists: false },
+    })
+    const salesOrders = screen.getByText("sales.orders").closest("label") as HTMLElement
+    await user.click(within(salesOrders).getByRole("checkbox"))
+
+    const sync = screen.getByRole("button", { name: /Sync 1 table/i })
+    expect(sync).toBeDisabled()
+    expect(reasonFor(sync)).toMatch(/^Enter a path prefix/)
+
+    await user.type(screen.getByLabelText(/Path prefix/i), "Sales")
+    expect(reasonFor(sync)).toMatch(/lowercase letters, digits and underscores/)
+
+    await user.clear(screen.getByLabelText(/Path prefix/i))
+    await user.type(screen.getByLabelText(/Path prefix/i), "sales")
+    expect(sync).toBeEnabled()
+    expect(screen.queryByTestId("table-selector-confirm-reason")).toBeNull()
+  })
+})
+
+describe("PipelineTableSelector — the AI badge marks the tables the AI ticked", () => {
+  it("badges the confident picks only, the same tables it pre-selects", async () => {
+    setup({
+      suggestedTables: [
+        { name: "orders", schema: "sales", confidence: 0.92, reason: "named in the request" },
+        { name: "employees", schema: "hr", confidence: 0.9 },
+        { name: "orders", schema: "procurement", confidence: 0.4 },
+      ],
+    })
+    await screen.findByRole("button", { name: /Sync 2 tables/i })
+    const badged = screen.getAllByText("AI suggested").map((b) => b.closest("label")?.textContent || "")
+    expect(badged).toHaveLength(2)
+    expect(badged.some((t) => t.includes("sales.orders"))).toBe(true)
+    expect(badged.some((t) => t.includes("hr.employees"))).toBe(true)
+    expect(badged.some((t) => t.includes("procurement.orders"))).toBe(false)
+  })
+
+  // Control: a "top N of N" ranking pre-selects nothing, so it badges nothing.
+  it("badges nothing when the ranking does not narrow the tables", () => {
+    setup({
+      suggestedTables: multiSchemaTables.map((t) => ({ name: t.name, schema: t.schema, confidence: 0.9 })),
+    })
+    expect(screen.queryByText("AI suggested")).toBeNull()
+    expect(screen.getByRole("button", { name: /^Continue$/i })).toBeDisabled()
+  })
+})

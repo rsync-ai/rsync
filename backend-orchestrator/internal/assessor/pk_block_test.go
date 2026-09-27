@@ -34,6 +34,10 @@ func TestInput_CDCBlocksWithoutPrimaryKey(t *testing.T) {
 		{"cdc to mysql", Input{SyncMode: "cdc", DestinationType: "mysql"}, true},
 		{"cdc to mariadb alias", Input{SyncMode: "cdc", DestinationType: "MariaDB"}, true},
 		{"case and space insensitive", Input{SyncMode: "cdc", DestinationType: "  PostgreSQL "}, true},
+		// MongoDB destinations upsert on the key as well; a keyless table there
+		// is blocked by product rule (no guessed or surrogate key for CDC).
+		{"cdc to mongodb", Input{SyncMode: "cdc", DestinationType: "mongodb"}, true},
+		{"batch to mongodb", Input{SyncMode: "batch", DestinationType: "mongodb"}, false},
 
 		// Unknown sync mode is treated as CDC everywhere else in this file
 		// (IsCDC), and must be here too — otherwise the strict path is the one
@@ -46,7 +50,7 @@ func TestInput_CDCBlocksWithoutPrimaryKey(t *testing.T) {
 		{"full refresh to mysql", Input{SyncMode: "full_refresh", DestinationType: "mysql"}, false},
 
 		// Deliberately outside the block — executor.go gates on
-		// normalizedDest == "postgresql" || "mysql" only, so these CDC runs do
+		// normalizedDest == "postgresql" || "mysql" || "mongodb" only, so these CDC runs do
 		// start and the existing warning remains the honest answer.
 		{"cdc to oracle is not blocked", Input{SyncMode: "cdc", DestinationType: "oracle"}, false},
 		{"cdc to sqlserver is not blocked", Input{SyncMode: "cdc", DestinationType: "sqlserver"}, false},

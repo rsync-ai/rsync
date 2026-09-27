@@ -109,12 +109,61 @@ def _get_path(doc: Any, path: str):
     return (True, cur)
 
 
+# BSON's cross-type order as the fakes model it — written out independently of
+# the connector's own table so a test compares two sources, not one with itself.
+# Sorting places whole type brackets in this order; a comparison operator only
+# matches within one bracket (an int is never $gt an ObjectId, or vice versa).
+_FAKE_BRACKETS = [
+    ("null",), ("int", "long", "double", "decimal"), ("string",), ("object",),
+    ("array",), ("binData",), ("objectId",), ("bool",), ("date",),
+]
+
+
+def _bson_alias(value: Any) -> str:
+    import datetime as _dt
+    from bson import ObjectId, Binary, Int64, Decimal128
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, Int64):
+        return "long"
+    if isinstance(value, int):
+        return "int" if -2 ** 31 <= value < 2 ** 31 else "long"
+    if isinstance(value, float):
+        return "double"
+    if isinstance(value, Decimal128):
+        return "decimal"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, (bytes, Binary)):
+        return "binData"
+    if isinstance(value, ObjectId):
+        return "objectId"
+    if isinstance(value, _dt.datetime):
+        return "date"
+    raise NotImplementedError(f"fake BSON order does not model {type(value).__name__}")
+
+
+def _bracket(value: Any) -> int:
+    alias = _bson_alias(value)
+    return next(i for i, b in enumerate(_FAKE_BRACKETS) if alias in b)
+
+
 def _sort_key(doc: Any, field: str):
     found, value = _get_path(doc, field)
-    return (1, value) if found and value is not None else (0, 0)
+    if not found or value is None:
+        return (0, 0)
+    return (_bracket(value), value)
 
 
 def _cmp(value, op, target) -> bool:
+    if _bracket(value) != _bracket(target):
+        return False  # MongoDB does not compare across BSON type brackets
     try:
         return {"$gt": value > target, "$gte": value >= target,
                 "$lt": value < target, "$lte": value <= target}[op]
@@ -140,6 +189,11 @@ def _match_condition(found: bool, value: Any, cond: Any) -> bool:
             ok = any(_match_condition(found, value, t) for t in target)
         elif op == "$nin":
             ok = not any(_match_condition(found, value, t) for t in target)
+        elif op == "$type":
+            aliases = target if isinstance(target, list) else [target]
+            alias = _bson_alias(value) if found else None
+            ok = found and (alias in aliases or (
+                "number" in aliases and alias in ("int", "long", "double", "decimal")))
         elif op == "$exists":
             ok = found == bool(target)
         elif op == "$not":
@@ -190,6 +244,35 @@ def _project(doc: Dict[str, Any], projection: Optional[Dict[str, Any]]) -> Dict[
         return out
     exclude = {k for k, v in projection.items() if not v}
     return {k: v for k, v in doc.items() if k not in exclude}
+
+
+def _is_update_doc(doc: Any) -> bool:
+    """True for an UPDATE document (``{"$set": ..., "$max": ...}``), False for a
+    whole-document REPLACE. pymongo stores both under the op's ``_doc``, so the
+    only way to tell ReplaceOne from UpdateOne here is the operator prefix."""
+    return isinstance(doc, dict) and bool(doc) and all(
+        isinstance(k, str) and k.startswith("$") for k in doc)
+
+
+def _apply_update(doc: Dict[str, Any], update: Dict[str, Any]) -> None:
+    """Apply the update operators the connector emits, in place.
+
+    ``$max`` is the CDC-offset monotonic merge: MongoDB SETS the field when it is
+    absent and otherwise keeps the larger value, so a redelivered (lower) offset
+    can never walk the high-water mark backwards. Modelling that faithfully is the
+    whole point of this fake — a `$max` that behaved like `$set` would let a
+    regression test pass on a connector that had lost its monotonicity.
+    """
+    for op, fields in update.items():
+        if op in ("$set", "$setOnInsert"):
+            for k, v in fields.items():
+                doc[k] = v
+        elif op == "$max":
+            for k, v in fields.items():
+                if k not in doc or doc[k] is None or v > doc[k]:
+                    doc[k] = v
+        else:
+            raise NotImplementedError(f"fake bulk_write does not model {op}")
 
 
 class _FakeInsertManyResult:
@@ -245,6 +328,7 @@ class FakeCollection:
         self.index_calls: List[Any] = []   # create_index keys, so tests assert indexing
         self.options_calls: List[Dict[str, Any]] = []  # with_options kwargs (read_preference)
         self.find_error: Optional[Exception] = None     # raised when a find cursor iterates
+        self.bulk_error: Optional[Exception] = None     # raised by bulk_write (offset-write failure)
         self.last_cursor: Optional[FakeCursor] = None
 
     def create_index(self, keys, **kw):
@@ -309,8 +393,18 @@ class FakeCollection:
         return None
 
     def bulk_write(self, ops, ordered=True, **kw):
-        """Apply a list of pymongo ReplaceOne ops (the only op the connector emits),
-        introspecting each op's _filter/_doc/_upsert."""
+        """Apply a list of pymongo ReplaceOne / UpdateOne ops (the two the connector
+        emits), introspecting each op's _filter/_doc/_upsert.
+
+        ReplaceOne carries a whole document; UpdateOne carries operators
+        (``$set``/``$max`` — the CDC-offset monotonic merge). On an upsert that
+        matches nothing, MongoDB seeds the new document from the filter's equality
+        fields and then applies the operators, which is what ``dict(flt)`` models.
+        ``bulk_error`` makes the call raise, so a test can prove the best-effort
+        offset write never fails the data write that preceded it.
+        """
+        if self.bulk_error is not None:
+            raise self.bulk_error
         self.bulk_ops.append({"ops": list(ops), "ordered": ordered})
         matched = upserted = modified = 0
         for op in ops:
@@ -318,7 +412,19 @@ class FakeCollection:
             doc = getattr(op, "_doc", None)
             upsert = bool(getattr(op, "_upsert", False))
             idx = self._find_index(flt)
-            if idx is not None:
+            if _is_update_doc(doc):
+                if idx is None and not upsert:
+                    continue
+                base = dict(self._docs[idx]) if idx is not None else dict(flt or {})
+                _apply_update(base, doc)
+                if idx is not None:
+                    self._docs[idx] = base
+                    matched += 1
+                    modified += 1
+                else:
+                    self._docs.append(base)
+                    upserted += 1
+            elif idx is not None:
                 self._docs[idx] = dict(doc)
                 matched += 1
                 modified += 1

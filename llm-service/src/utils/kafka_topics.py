@@ -12,7 +12,7 @@ consumer simply subscribes to a topic nobody writes and blocks forever. Change
 one, change the other.
 
 Why a prefix at all: the platform grew up owning its broker and named topics
-after their contents (``agent.planner.requests``, ``pipeline.<id8>.data``,
+after their contents (``pii.scan.request``, ``pipeline.<id8>.data``,
 ``cdc.<id8>``). On a customer's shared cluster -- the BYO-Kafka shape the
 managed-Kubernetes deployment targets -- those are anonymous, and generic enough
 to collide with another team's topics outright. One owned prefix makes every
@@ -47,7 +47,7 @@ def topic_prefix() -> str:
     if not prefix:
         return ""
     # Without a trailing separator the prefix runs into the name it qualifies
-    # ("rsync" + "agent.x" = "rsyncagent.x"), which is a legal topic name and so
+    # ("rsync" + "pii.x" = "rsyncpii.x"), which is a legal topic name and so
     # fails silently rather than loudly.
     if prefix[-1] not in "._-":
         prefix += "."

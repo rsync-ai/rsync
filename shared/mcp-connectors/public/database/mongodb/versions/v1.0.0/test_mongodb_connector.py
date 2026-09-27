@@ -302,7 +302,42 @@ def test_discover_schema_samples_fields_and_counts():
     assert cols["created"]["type"] == "timestamp", cols
 
 
+
+def test_discover_schema_widens_a_field_whose_sampled_types_conflict():
+    # B-MONGO-3: first-seen-wins declared _id an integer on a collection holding int
+    # AND ObjectId ids, and every ObjectId row then failed the destination write.
+    docs = [
+        {"_id": 1, "n": 1, "tag": None, "v": 5},
+        {"_id": ObjectId(), "n": 2.5, "tag": "x", "v": "five"},
+        {"_id": 2, "n": 3, "tag": None, "v": {"k": 1}, "only_null": None},
+    ]
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"messages": docs}})
+    out = s.discover_schema(CFG)
+    cols = {c["name"]: c["type"] for c in out["tables"][0]["columns"]}
+    assert list(cols)[0] == "_id", cols
+    assert cols["_id"] == "string", cols        # int + ObjectId
+    assert cols["n"] == "double", cols          # int + double stays numeric
+    assert cols["tag"] == "string", cols        # nulls never decide a type
+    assert cols["v"] == "string", cols          # int + string + object
+    assert cols["only_null"] == "string", cols  # null in every sample
+
+
+def test_widen_type_rules():
+    w = mg._widen_type
+    assert w(None, "integer") == "integer" and w("integer", None) == "integer"
+    assert w("integer", "integer") == "integer"
+    assert w("integer", "double") == "double" and w("double", "integer") == "double"
+    assert w("integer", "string") == "string" and w("object", "array") == "string"
+    assert w("boolean", "integer") == "string"
+
 # ============================ EXPORT: _id keyset paging =====================
+
+def _after(q, op="$gt"):
+    """The bound inside the connector's type-aware keyset predicate:
+    {"$or": [{"_id": {op: v}}, {"_id": {"$type": [later brackets]}}]}."""
+    assert set(q) == {"$or"} and len(q["$or"]) == 2, q
+    return q["$or"][0]["_id"][op]
+
 
 def test_export_first_page_keyset_by_id_serializes_bson():
     ids = [ObjectId() for _ in range(3)]
@@ -313,7 +348,7 @@ def test_export_first_page_keyset_by_id_serializes_bson():
     assert out["row_count"] == 2 and len(out["data"]) == 2, out
     assert out["has_more"] is True, out                    # len(2) >= limit(2)
     assert out["paging_mode"] == "keyset" and out["cursor_column"] == "_id", out
-    assert out["next_cursor"] == str(ids[1]), out          # str of last _id
+    assert mg._decode_export_cursor(out["next_cursor"]) == ids[1], out   # exact BSON type
     # BSON coerced JSON-safe: _id came back as a string, not an ObjectId.
     assert out["data"][0]["_id"] == str(ids[0]), out["data"][0]
     assert all(isinstance(r["_id"], str) for r in out["data"]), out["data"]
@@ -329,12 +364,14 @@ def test_export_continuation_24hex_cursor_uses_objectid_gt():
     out = s.export({**CFG, "table": "users", "cursor": str(ids[0]), "limit": 10})
     assert out["success"] is True, out
     q = client["appdb"]["users"].find_calls[-1]["query"]
-    assert isinstance(q.get("_id", {}).get("$gt"), ObjectId), q   # resumed as ObjectId
-    assert q["_id"]["$gt"] == ids[0], q
+    assert isinstance(_after(q), ObjectId), q             # legacy hex resumed as ObjectId
+    assert _after(q) == ids[0], q
     # only _ids strictly greater than the cursor come back
     assert [r["v"] for r in out["data"]] == [1, 2], out["data"]
     assert out["has_more"] is False, out                   # 2 < limit(10) → final page
-    assert "next_cursor" not in out, out
+    # The final page still reports where it ended: the executor folds it into the
+    # PK high-water, which the next Resume sends back as since_cursor.
+    assert mg._decode_export_cursor(out["next_cursor"]) == ids[2], out
 
 
 def test_export_non_hex_cursor_compared_raw():
@@ -345,7 +382,7 @@ def test_export_non_hex_cursor_compared_raw():
     out = s.export({**CFG, "table": "nums", "cursor": 1, "limit": 10})
     assert out["success"] is True, out
     q = client["appdb"]["nums"].find_calls[-1]["query"]
-    assert q == {"_id": {"$gt": 1}}, q                      # raw value, no ObjectId
+    assert _after(q) == 1 and type(_after(q)) is int, q    # raw value, no ObjectId
     assert [r["v"] for r in out["data"]] == [2, 3], out["data"]
 
 
@@ -378,16 +415,115 @@ def test_export_int_id_pages_past_first_page():
         assert pages < total, "export never finished"
     assert seen == list(range(1, total + 1)), seen
     q = client["appdb"]["msgs"].find_calls[1]["query"]
-    assert q == {"_id": {"$gt": 3}}, q
+    assert _after(q) == 3, q
 
 
-def test_export_cursor_keeps_objectid_and_string_ids_as_strings():
-    oid = ObjectId()
-    assert mg._export_cursor(oid) == str(oid)
-    assert mg._export_cursor("user-9") == "user-9"
+def test_export_cursor_round_trips_every_id_type_exactly():
+    """Numbers stay JSON numbers; every other _id type round-trips with its exact
+    BSON type. str() made a 24-hex STRING _id resume as an ObjectId, and a bool or
+    date _id resume as a string that matches nothing."""
+    import datetime as dt
+    from bson.int64 import Int64
     assert mg._export_cursor(7) == 7 and mg._export_cursor(2.5) == 2.5
-    assert mg._export_cursor(True) == "True"
     assert mg._export_cursor(None) is None
+    big = Int64(2 ** 60)                                   # beyond float64's exact range
+    hex_str = "a" * 24
+    for v in (ObjectId(), "user-9", hex_str, True, big,
+              dt.datetime(2026, 9, 26, 12, 0), {"k": 1}):   # naive UTC, as pymongo returns it
+        enc = mg._export_cursor(v)
+        assert isinstance(enc, str), (v, enc)
+        dec = mg._decode_export_cursor(enc)
+        assert dec == v and type(dec) is type(v), (v, enc, dec)
+    # Legacy checkpoint cursors (the old str() form) still resume.
+    oid = ObjectId()
+    assert mg._decode_export_cursor(str(oid)) == oid
+    assert mg._decode_export_cursor("user-9") == "user-9"
+    assert mg._decode_export_cursor(42) == 42
+
+
+def _export_all(s, table, limit, since_cursor=None):
+    """Drive export the way the executor does: JSON round-trip next_cursor into the
+    next call until a short page. Returns (values, last next_cursor)."""
+    import json
+    seen, cursor, last = [], None, None
+    for _ in range(100):
+        params = {**CFG, "table": table, "limit": limit}
+        if cursor is not None:
+            params["cursor"] = cursor
+        if since_cursor is not None:
+            params["since_cursor"] = since_cursor
+        out = s.export(params)
+        assert out["success"] is True, out
+        seen += [r["v"] for r in out["data"]]
+        last = out.get("next_cursor", last)
+        if not out.get("has_more"):
+            return seen, last
+        cursor = json.loads(json.dumps(out["next_cursor"]))
+    raise AssertionError("export never finished")
+
+
+def test_export_pages_across_mixed_int_and_objectid_ids():
+    """Regression (prod datingapp.messages): int _ids followed by ObjectIds.
+
+    BSON sorts every number before every ObjectId, but {"_id": {"$gt": 21085}}
+    matches only numbers, so the page after the last int came back EMPTY and the
+    run reported Completed with 1.1 M ObjectId documents never read.
+    """
+    ints = [{"_id": i, "v": i} for i in range(1, 6)]
+    oids = [{"_id": ObjectId(f"{i:024x}"), "v": 100 + i} for i in range(1, 6)]
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"msgs": oids + ints}})
+    seen, _ = _export_all(s, "msgs", limit=3)
+    assert seen == [1, 2, 3, 4, 5, 101, 102, 103, 104, 105], seen
+
+
+def test_export_honors_since_cursor_across_types():
+    """Resume after a completed sweep sends since_cursor = the PK high-water. The
+    connector used to ignore it and re-export every document (duplicates in an
+    object-store destination)."""
+    import json
+    ints = [{"_id": i, "v": i} for i in range(1, 6)]
+    oids = [{"_id": ObjectId(f"{i:024x}"), "v": 100 + i} for i in range(1, 6)]
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"msgs": ints + oids}})
+    _, high_water = _export_all(s, "msgs", limit=4)
+    high_water = json.loads(json.dumps(high_water))          # through the checkpoint
+    assert mg._decode_export_cursor(high_water) == ObjectId(f"{5:024x}"), high_water
+    # Nothing new: the delta sweep is empty.
+    assert _export_all(s, "msgs", limit=4, since_cursor=high_water)[0] == []
+    # New documents after the high-water come back, and only those.
+    client["appdb"]["msgs"]._docs += [{"_id": ObjectId(f"{i:024x}"), "v": 100 + i} for i in (6, 7)]
+    assert _export_all(s, "msgs", limit=4, since_cursor=high_water)[0] == [106, 107]
+    # A since_cursor inside the int range still crosses into the ObjectIds, and
+    # combines with the paging cursor (both bounds AND'ed).
+    seen, _ = _export_all(s, "msgs", limit=2, since_cursor=3)
+    assert seen == [4, 5, 101, 102, 103, 104, 105, 106, 107], seen
+    q = client["appdb"]["msgs"].find_calls[-1]["query"]
+    assert set(q) == {"$and"} and len(q["$and"]) == 2, q
+
+
+def test_id_after_brackets_follow_bson_order():
+    """The $type branch names exactly the brackets after (or, descending, before)
+    the value's own — derived from BSON's documented order, not the table."""
+    ascending = mg._id_after(5)["$or"][1]["_id"]["$type"]
+    assert ascending[:2] == ["symbol", "string"] and "objectId" in ascending, ascending
+    assert "int" not in ascending and "null" not in ascending, ascending
+    descending = mg._id_after(ObjectId(), -1)
+    assert descending["$or"][0] == {"_id": {"$lt": descending["$or"][0]["_id"]["$lt"]}}
+    before = descending["$or"][1]["_id"]["$type"]
+    assert "int" in before and "string" in before and "objectId" not in before, before
+    assert "bool" not in before and "date" not in before, before
+    from bson.max_key import MaxKey
+    assert mg._id_after(MaxKey()) == {"_id": {"$gt": MaxKey()}}   # nothing sorts after
+
+
+def test_find_keyset_pages_across_mixed_id_types():
+    docs = [{"_id": i, "v": i} for i in range(1, 4)] + \
+           [{"_id": f"s{i}", "v": 10 + i} for i in range(1, 3)] + \
+           [{"_id": ObjectId(f"{i:024x}"), "v": 20 + i} for i in range(1, 3)]
+    s, _ = _find_server(docs)
+    got, _ = _page_through(s, "cursor", limit=2)
+    assert [d["v"] for d in got] == [1, 2, 3, 11, 12, 21, 22], got
+    got, _ = _page_through(s, "cursor", limit=2, sort={"_id": -1})
+    assert [d["v"] for d in got] == [22, 21, 12, 11, 3, 2, 1], got
 
 
 def test_export_strips_db_qualifier_from_collection():
@@ -492,6 +628,53 @@ def test_upsert_data_skips_records_missing_key():
                          "data": [{"id": 1, "v": "ok"}, {"no_key": True}]})
     assert out["success"] is True, out
     assert out["rows_upserted"] == 1 and out.get("skipped") == 1, out
+
+
+def test_upsert_data_names_skipped_records_by_position():
+    """The CDC sink dead-letters exactly the rows named in skipped_indexes, so they
+    are positions in the data it sent — non-documents included — and never values."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"c": []}})
+    out = s.upsert_data({**CFG, "table": "c", "key_fields": ["id"],
+                         "data": [{"id": 1, "v": "ok"}, {"v": "secret-a"}, {"id": 2}, "not-a-doc"]})
+    assert out["success"] is True, out
+    assert out["rows_upserted"] == 2 and out["skipped"] == 2, out
+    assert out["skipped_indexes"] == [1, 3], out
+    assert "secret" not in repr(out), out
+    assert sorted(d["id"] for d in client["appdb"]["c"].docs()) == [1, 2], client["appdb"]["c"].docs()
+
+
+def test_upsert_data_names_a_batch_with_no_documents_at_all():
+    """A batch in which nothing is a document used to return early as a clean
+    no-op, so the sink never dead-lettered those records."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"c": []}})
+    out = s.upsert_data({**CFG, "table": "c", "key_fields": ["id"], "data": ["not-a-doc", 7]})
+    assert out["success"] is True and out["rows_upserted"] == 0, out
+    assert out["skipped"] == 2 and out["skipped_indexes"] == [0, 1], out
+    assert client["appdb"]["c"].docs() == [], client["appdb"]["c"].docs()
+    # The control: an empty batch skipped nothing.
+    out = s.upsert_data({**CFG, "table": "c", "key_fields": ["id"], "data": []})
+    assert "skipped_indexes" not in out, out
+
+
+def test_upsert_data_reports_no_skip_when_every_record_is_keyed():
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"c": []}})
+    out = s.upsert_data({**CFG, "table": "c", "key_fields": ["id"], "data": [{"id": 1}, {"id": 2}]})
+    assert out == {"success": True, "rows_upserted": 2}, out
+
+
+def test_delete_data_names_skipped_records_by_position():
+    docs = [{"id": 1}, {"id": 2}]
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"t": list(docs)}})
+    out = s.delete_data({**CFG, "table": "t", "key_fields": ["id"],
+                         "data": [{"other": "secret-a"}, {"before": {"id": 2}}]})
+    assert out["success"] is True and out["rows_deleted"] == 1, out
+    assert out["skipped"] == 1 and out["skipped_indexes"] == [0], out
+    assert "secret" not in repr(out), out
+    # Nothing deletable at all is still a no-op, and still names what it skipped.
+    out = s.delete_data({**CFG, "table": "t", "key_fields": ["id"], "data": [{"other": 1}]})
+    assert out["success"] is True and out["rows_deleted"] == 0, out
+    assert out["skipped_indexes"] == [0], out
+    assert [d["id"] for d in client["appdb"]["t"].docs()] == [1], client["appdb"]["t"].docs()
 
 
 def test_delete_data_by_id_uses_in_filter():
@@ -903,7 +1086,7 @@ def test_find_keyset_pages_cover_every_document_once():
     assert [d["n"] for d in docs] == list(range(1, 8)), docs
     assert pages == 3, pages
     q = client["appdb"]["orders"].find_calls[1]["query"]
-    assert set(q) == {"_id"} and isinstance(q["_id"]["$gt"], ObjectId), q
+    assert isinstance(_after(q), ObjectId), q
 
 
 def test_find_keyset_descending_combined_with_filter():
@@ -911,18 +1094,18 @@ def test_find_keyset_descending_combined_with_filter():
     docs, _ = _page_through(s, "cursor", limit=2, sort={"_id": -1}, filter={"status": "paid"})
     assert [d["n"] for d in docs] == [9, 7, 5, 3, 1], docs
     q = client["appdb"]["orders"].find_calls[1]["query"]
-    assert q["$and"][0] == {"status": "paid"} and "$lt" in q["$and"][1]["_id"], q
+    assert q["$and"][0] == {"status": "paid"} and isinstance(_after(q["$and"][1], "$lt"), ObjectId), q
 
 
 def test_find_cursor_keeps_a_string_id_a_string():
-    """export's str() cursor turns a 24-hex STRING _id into an ObjectId and skips
-    nothing but matches nothing; find's cursor carries the BSON type."""
+    """A 24-hex STRING _id must resume as a string, not an ObjectId (which would
+    match nothing); the cursor carries the BSON type."""
     hexes = [f"{i:024x}" for i in range(1, 4)]
     s, client = _find_server([{"_id": h, "v": i} for i, h in enumerate(hexes)])
     docs, _ = _page_through(s, "cursor", limit=1)
     assert [d["_id"] for d in docs] == hexes, docs
     q = client["appdb"]["orders"].find_calls[1]["query"]
-    assert type(q["_id"]["$gt"]) is str, q
+    assert type(_after(q)) is str, q
 
 
 def test_find_rejects_cursor_tampering():
@@ -1235,6 +1418,204 @@ def test_discover_schema_count_is_bounded_and_falls_back_to_estimate():
     big = out["tables"][0]
     assert big["row_count"] == 2 and big["is_exact_count"] is False, big
     assert coll.count_calls and coll.count_calls[0].get("maxTimeMS", 0) > 0, coll.count_calls
+
+
+# ==================== CDC exactly-once offsets (Tier B) =====================
+#
+# Contract: docs/connectors/cdc-exactly-once-offsets.md. The kafka-mcp-sink passes
+# the Kafka high-water offset it is about to apply as params["kafka_offset"] on
+# EVERY CDC write, and on startup calls get_cdc_offsets to seed the skip-map that
+# suppresses redelivered messages. MongoDB is Tier B (idempotent destination,
+# offsets written after the data write) — the model is the BigQuery adapter in
+# shared/mcp-connectors/public/warehouse_adapters.py.
+#
+# Without this, a sink restart (OOM kill, crash-loop respawn, container restart)
+# replays the whole uncommitted window and every KEYLESS row — the ones that reach
+# import_data's blind insert_many — is inserted a second time.
+# (KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES)
+
+_OFFSETS = "_rsync_cdc_offsets"
+_TOPIC = "rsync.cdc-p1.public.users"
+
+
+def _ko(offset, partition=0, pipeline_id="p1", topic=_TOPIC):
+    """The §2.1 kafka_offset shape the sink sends."""
+    return {"pipeline_id": pipeline_id, "topic": topic,
+            "partition": partition, "offset": offset}
+
+
+def _offset_docs(client, db="appdb"):
+    return client[db][_OFFSETS].docs()
+
+
+def test_get_capabilities_advertises_get_cdc_offsets():
+    """§2.4: the operation must be advertised, or nothing knows the sink can seed
+    from this connector."""
+    ops = mg.MongodbMCPServer().get_capabilities({})["operations"]
+    by_name = {o["name"]: o for o in ops}
+    assert "get_cdc_offsets" in by_name, sorted(by_name)
+    op = by_name["get_cdc_offsets"]
+    assert op["method"] == "mongodb_get_cdc_offsets", op
+    assert op["type"] == "destination", op
+
+
+def test_get_cdc_offsets_is_empty_on_a_fresh_pipeline():
+    """§2.3: a first run has no offsets collection — that is success with an empty
+    list, NEVER an error. An error here would be read by the sink as 'seed
+    unavailable' and logged, which is indistinguishable from a broken connection."""
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": []}})
+    out = s.get_cdc_offsets({**CFG, "pipeline_id": "p1"})
+    assert out["success"] is True, out
+    assert out["offsets"] == [], out
+
+
+def test_get_cdc_offsets_resolves_through_the_tool_dispatcher():
+    """The advertised method name must actually dispatch — get_capabilities can
+    advertise a tool the connector does not expose, and the sink calls by name."""
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": []}})
+    out = s._handle_tool_call({"name": "mongodb_get_cdc_offsets",
+                               "arguments": {**CFG, "pipeline_id": "p1"}})
+    assert out["success"] is True and out["offsets"] == [], out
+
+
+def test_import_data_records_the_kafka_high_water_offset():
+    """The blind-append path is the one that duplicates on replay, so it is the one
+    that most needs the high-water mark recorded."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": []}})
+    out = s.import_data({**CFG, "table": "users", "data": [{"name": "a"}],
+                         "kafka_offset": _ko(42)})
+    assert out["success"] is True and out["rows_inserted"] == 1, out
+    rows = _offset_docs(client)
+    assert len(rows) == 1, rows
+    # §2.2 field names: kafka_partition (not "partition" — reserved in several engines).
+    assert rows[0]["pipeline_id"] == "p1", rows[0]
+    assert rows[0]["topic"] == _TOPIC, rows[0]
+    assert rows[0]["kafka_partition"] == 0, rows[0]
+    assert rows[0]["last_offset"] == 42, rows[0]
+    # ... and it reads back in the §2.3 shape the sink seeds from.
+    seeded = s.get_cdc_offsets({**CFG, "pipeline_id": "p1"})
+    assert seeded == {"success": True,
+                      "offsets": [{"topic": _TOPIC, "partition": 0, "offset": 42}]}, seeded
+
+
+def test_upsert_data_records_the_kafka_high_water_offset():
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": []}})
+    out = s.upsert_data({**CFG, "table": "users", "data": [{"_id": 7, "v": 1}],
+                         "kafka_offset": _ko(99)})
+    assert out["success"] is True and out["rows_upserted"] == 1, out
+    assert [(r["topic"], r["last_offset"]) for r in _offset_docs(client)] == [(_TOPIC, 99)], \
+        _offset_docs(client)
+
+
+def test_delete_data_records_the_kafka_high_water_offset():
+    """A CDC delete advances the offset too — a tombstone-only window that recorded
+    nothing would be replayed in full on restart."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": [{"_id": 7}]}})
+    out = s.delete_data({**CFG, "table": "users", "data": [{"_id": 7}],
+                         "kafka_offset": _ko(120)})
+    assert out["success"] is True and out["rows_deleted"] == 1, out
+    assert [(r["topic"], r["last_offset"]) for r in _offset_docs(client)] == [(_TOPIC, 120)], \
+        _offset_docs(client)
+
+
+def test_a_skipped_record_withholds_the_high_water_offset():
+    """A skipped record did not land. Recording the batch's offset would claim it had,
+    and a restart would seed the sink's skip-map past it — so a redelivery could never
+    dead-letter it. The mark stays put; the control batch (every key present) moves it."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": [{"id": 7}]}})
+    out = s.upsert_data({**CFG, "table": "users", "key_fields": ["id"],
+                         "data": [{"id": 1}, {"v": "keyless"}], "kafka_offset": _ko(99)})
+    assert out["success"] is True and out["skipped_indexes"] == [1], out
+    out = s.delete_data({**CFG, "table": "users", "key_fields": ["id"],
+                         "data": [{"id": 7}, {"v": "keyless"}], "kafka_offset": _ko(100)})
+    assert out["success"] is True and out["skipped_indexes"] == [1], out
+    assert _offset_docs(client) == [], _offset_docs(client)
+
+    out = s.upsert_data({**CFG, "table": "users", "key_fields": ["id"],
+                         "data": [{"id": 1}, {"id": 2}], "kafka_offset": _ko(101)})
+    assert out["success"] is True and "skipped" not in out, out
+    assert [(r["topic"], r["last_offset"]) for r in _offset_docs(client)] == [(_TOPIC, 101)], \
+        _offset_docs(client)
+
+
+def test_cdc_offsets_never_regress():
+    """§2.2: last_offset is monotonic (GREATEST / $max). A redelivered batch carries
+    a LOWER high-water mark; overwriting with it would un-skip messages the sink had
+    already applied and re-duplicate them on the next restart."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": []}})
+    s.import_data({**CFG, "table": "users", "data": [{"n": 1}], "kafka_offset": _ko(500)})
+    s.import_data({**CFG, "table": "users", "data": [{"n": 2}], "kafka_offset": _ko(17)})
+    rows = _offset_docs(client)
+    assert len(rows) == 1, rows                    # same (pipeline, topic, partition)
+    assert rows[0]["last_offset"] == 500, rows[0]  # not walked backwards to 17
+
+
+def test_kafka_offset_list_records_every_partition():
+    """§2.1: kafka_offset may be a single object OR a list — a batch that spans
+    partitions sends one high-water mark per partition."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": []}})
+    s.import_data({**CFG, "table": "users", "data": [{"n": 1}],
+                   "kafka_offset": [_ko(10, partition=0), _ko(20, partition=1)]})
+    got = {(r["kafka_partition"], r["last_offset"]) for r in _offset_docs(client)}
+    assert got == {(0, 10), (1, 20)}, got
+    seeded = s.get_cdc_offsets({**CFG, "pipeline_id": "p1"})["offsets"]
+    assert sorted((o["partition"], o["offset"]) for o in seeded) == [(0, 10), (1, 20)], seeded
+
+
+def test_get_cdc_offsets_is_scoped_to_one_pipeline():
+    """Two pipelines can share a destination connection; seeding one with the
+    other's high-water mark would silently DROP its unapplied messages."""
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": []}})
+    s.import_data({**CFG, "table": "users", "data": [{"n": 1}],
+                   "kafka_offset": _ko(10, pipeline_id="p1")})
+    s.import_data({**CFG, "table": "users", "data": [{"n": 2}],
+                   "kafka_offset": _ko(77, pipeline_id="p2", topic="rsync.cdc-p2.public.t")})
+    p1 = s.get_cdc_offsets({**CFG, "pipeline_id": "p1"})["offsets"]
+    assert p1 == [{"topic": _TOPIC, "partition": 0, "offset": 10}], p1
+
+
+def test_cdc_offsets_live_in_the_connection_database_not_the_namespace():
+    """The offsets collection is per-CONNECTION control-plane state keyed by
+    pipeline_id, so it stays in the connection's database even when
+    destination_namespace routes the DATA elsewhere: the sink's seed call
+    (callGetCDCOffsets) forwards NO namespace, so offsets that followed the data
+    could never be read back and the restart seed would silently return empty."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {}, "tenant7": {"users": []}})
+    out = s.import_data({**CFG, "table": "users", "namespace": "tenant7",
+                         "data": [{"n": 1}], "kafka_offset": _ko(42)})
+    assert out["success"] is True, out
+    assert [d["n"] for d in client["tenant7"]["users"].docs()] == [1], "data follows the namespace"
+    assert _OFFSETS not in client["tenant7"].list_collection_names(), \
+        "offsets must NOT follow the namespace — the seed read cannot reach them there"
+    assert [r["last_offset"] for r in _offset_docs(client, "appdb")] == [42], _offset_docs(client)
+    # The namespace-less seed read (exactly what the sink sends) finds them.
+    seeded = s.get_cdc_offsets({**CFG, "pipeline_id": "p1"})["offsets"]
+    assert seeded == [{"topic": _TOPIC, "partition": 0, "offset": 42}], seeded
+
+
+def test_offset_write_failure_never_fails_the_data_write():
+    """Tier B: the offset write is best-effort and happens AFTER the data write.
+    Failing the batch on it would re-deliver data that already landed — strictly
+    worse than the reprocessing a lost offset costs."""
+    offsets = _mongo_fakes.FakeCollection([], name=_OFFSETS)
+    offsets.bulk_error = RuntimeError("not authorized on appdb to execute bulkWrite")
+    s, client = _mongo_fakes.make_connector(
+        mg, dbs={"appdb": {"users": [], _OFFSETS: offsets}})
+    out = s.import_data({**CFG, "table": "users", "data": [{"n": 1}],
+                         "kafka_offset": _ko(42)})
+    assert out["success"] is True and out["rows_inserted"] == 1, out
+    assert [d["n"] for d in client["appdb"]["users"].docs()] == [1], "data still landed"
+
+
+def test_no_offsets_collection_without_a_kafka_offset():
+    """A plain batch load sends no kafka_offset. It must not grow an offsets
+    collection in the customer's database."""
+    s, client = _mongo_fakes.make_connector(mg, dbs={"appdb": {"users": []}})
+    assert s.import_data({**CFG, "table": "users", "data": [{"n": 1}]})["success"] is True
+    assert s.upsert_data({**CFG, "table": "users", "data": [{"_id": 1}]})["success"] is True
+    assert s.delete_data({**CFG, "table": "users", "data": [{"_id": 1}]})["success"] is True
+    assert client["appdb"].list_collection_names() == ["users"], \
+        client["appdb"].list_collection_names()
 
 
 def _run():

@@ -98,6 +98,7 @@ export function SuggestTablesCard({
   tableKey,
   onToggleTable,
   onStartQuery,
+  embedded = false,
 }: {
   connectionId: string
   /** Tables picked for the AI prompt, by `tableKey`. */
@@ -106,6 +107,10 @@ export function SuggestTablesCard({
   onToggleTable: (key: string) => void
   /** Puts a statement in the empty SQL editor. */
   onStartQuery: (sql: string) => void
+  /** Drop the Card chrome and fill the parent: the workspace layout already
+   *  frames this as the results pane's empty state, so a second border and a
+   *  fixed-width column would just waste the pane. */
+  embedded?: boolean
 }) {
   const [intent, setIntent] = useState("")
   const [state, setState] = useState<State>({ phase: "idle" })
@@ -129,18 +134,8 @@ export function SuggestTablesCard({
 
   const loading = state.phase === "loading"
 
-  return (
-    <Card data-testid="suggest-tables">
-      <CardHeader className="px-4 pt-4 pb-3">
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Sparkles className="h-4 w-4 text-violet-500" aria-hidden />
-          Not sure which table to start with?
-        </CardTitle>
-        <CardDescription>
-          Say what you want to find out, and get the tables in this connection most likely to hold it.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4 px-4 pb-4">
+  const body = (
+    <>
         <form
           className="flex flex-col gap-2 sm:flex-row"
           onSubmit={(e) => {
@@ -188,7 +183,38 @@ export function SuggestTablesCard({
             onStartQuery={onStartQuery}
           />
         )}
-      </CardContent>
+    </>
+  )
+
+  if (embedded) {
+    return (
+      <div data-testid="suggest-tables" className="space-y-4">
+        <div className="space-y-1">
+          <h3 className="flex items-center gap-2 text-base font-semibold">
+            <Sparkles className="h-4 w-4 text-violet-500" aria-hidden />
+            Not sure which table to start with?
+          </h3>
+          <p className="text-sm text-muted-foreground">
+            Say what you want to find out, and get the tables in this connection most likely to hold it.
+          </p>
+        </div>
+        {body}
+      </div>
+    )
+  }
+
+  return (
+    <Card data-testid="suggest-tables">
+      <CardHeader className="px-4 pt-4 pb-3">
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Sparkles className="h-4 w-4 text-violet-500" aria-hidden />
+          Not sure which table to start with?
+        </CardTitle>
+        <CardDescription>
+          Say what you want to find out, and get the tables in this connection most likely to hold it.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4 px-4 pb-4">{body}</CardContent>
     </Card>
   )
 }
@@ -232,14 +258,21 @@ function SuggestionList({
           keywords and by size. Treat them as a rough start.
         </p>
       )}
-      <ul aria-label="Suggested tables" className="divide-y rounded-md border">
+      <ul
+        aria-label="Suggested tables"
+        className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3"
+      >
         {recs.map((t) => {
           const qualified = qualifiedName(t)
           const key = tableKey(t)
           const picked = selectedTables.includes(key)
           const category = categoryLabel(t.category)
           return (
-            <li key={qualified} data-suggestion={qualified} className="space-y-1.5 px-3 py-2.5">
+            <li
+              key={qualified}
+              data-suggestion={qualified}
+              className="flex flex-col gap-1.5 rounded-md border px-3 py-2.5"
+            >
               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
                 <span className="break-all font-mono text-sm font-medium">{qualified}</span>
                 {t.row_count > 0 && (
@@ -262,7 +295,7 @@ function SuggestionList({
                   Columns: <span className="font-mono">{t.key_columns.join(", ")}</span>
                 </p>
               )}
-              <div className="flex flex-wrap gap-2 pt-1">
+              <div className="mt-auto flex flex-wrap gap-2 pt-1">
                 <Button
                   variant="outline"
                   size="sm"

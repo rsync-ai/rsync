@@ -56,7 +56,7 @@ func TestUpdateConnectorTableList_MongoWritesCollectionIncludeList(t *testing.T)
 	}}
 	srv := fake.server(t)
 
-	if err := updateConnectorTableList(context.Background(), srv.URL, "cdc-conn", []string{"datingapp.matches", "messages"}); err != nil {
+	if _, err := updateConnectorTableList(context.Background(), srv.URL, "cdc-conn", []string{"datingapp.matches", "messages"}); err != nil {
 		t.Fatalf("updateConnectorTableList: %v", err)
 	}
 
@@ -90,7 +90,7 @@ func TestUpdateConnectorTableList_MongoDropsStaleTableIncludeList(t *testing.T) 
 	}}
 	srv := fake.server(t)
 
-	if err := updateConnectorTableList(context.Background(), srv.URL, "cdc-conn", []string{"datingapp.matches"}); err != nil {
+	if _, err := updateConnectorTableList(context.Background(), srv.URL, "cdc-conn", []string{"datingapp.matches"}); err != nil {
 		t.Fatalf("updateConnectorTableList: %v", err)
 	}
 	cfg, err := fetchKafkaConnectConfig(context.Background(), srv.URL, "cdc-conn")
@@ -114,7 +114,7 @@ func TestUpdateConnectorTableList_PostgresUnchanged(t *testing.T) {
 	}}
 	srv := fake.server(t)
 
-	if err := updateConnectorTableList(context.Background(), srv.URL, "cdc-conn", []string{"public.orders", "customers"}); err != nil {
+	if _, err := updateConnectorTableList(context.Background(), srv.URL, "cdc-conn", []string{"public.orders", "customers"}); err != nil {
 		t.Fatalf("updateConnectorTableList: %v", err)
 	}
 	cfg, err := fetchKafkaConnectConfig(context.Background(), srv.URL, "cdc-conn")

@@ -139,7 +139,7 @@ func (w *ExecutorWorker) processCorrelationRequest(req *correlation.PendingReque
 	ctxCleanup, cancelCleanup := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancelCleanup()
 
-	if routeErr := RouteResult(ctxCleanup, task, result, w.kafkaManager); routeErr != nil {
+	if routeErr := RouteResult(ctxCleanup, task, result); routeErr != nil {
 		logger.WithError(routeErr).Error("Failed to route response")
 	}
 

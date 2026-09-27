@@ -1,7 +1,7 @@
-// Package notifier consumes the rsync.notifications / rsync.healer.actions /
-// rsync.healer.results Kafka topics, persists each event into
-// pipeline_notifications, and delivers it via the configured channels
-// (Slack webhook + email) to the owning user.
+// Package notifier consumes the rsync.notifications Kafka topic (plus
+// rsync.healer.results when RSYNC_SCHEMA_DRIFT_ENABLED=true), persists each
+// event into pipeline_notifications, and delivers it via the configured
+// channels (Slack webhook + email) to the owning user.
 //
 // This closes G1 / F-Obs-1 — pre-fix the healer + sentinel + executor
 // agents emitted notifications into the void because no service
@@ -44,6 +44,7 @@ import (
 	"strings"
 	"time"
 
+	"api-gateway/internal/config"
 	rsynckafka "api-gateway/internal/kafka"
 	"api-gateway/internal/safehttp"
 	"api-gateway/internal/slack"
@@ -58,7 +59,6 @@ const (
 	// The canonical spellings. Nothing may hand these to sarama directly --
 	// notifierTopics below is the only thing that turns them into wire names.
 	notifyTopic   = "rsync.notifications"
-	healerActions = "rsync.healer.actions"
 	healerResults = "rsync.healer.results"
 
 	// Dedup window: same (pipeline_id, type, action_url) within this
@@ -67,15 +67,23 @@ const (
 	dedupWindowMinutes = 60
 )
 
-// notifierTopics holds the three subscriptions as they appear ON THE WIRE,
-// resolved once at wiring time.
+// notifierTopics holds the subscriptions as they appear ON THE WIRE, resolved
+// once at wiring time.
 //
-// Every producer of these topics -- the healer (healer.go:1318, :1383), the CDC
-// WAL watchdog (cdc_wal_watchdog.go:369) and healthwatch (watchdog.go:333) --
-// publishes through backend-orchestrator's kafka.Manager, and Manager qualifies
-// at its Produce/Consume chokepoints (manager.go:321, :396, :920). So the name
-// that actually reaches the broker carries KAFKA_TOPIC_PREFIX, including for
-// these three, whose literals already spell "rsync." themselves.
+// healerResults is set only when RSYNC_SCHEMA_DRIFT_ENABLED=true
+// (config.SchemaDriftEnabled). rsync.healer.results is one of the three
+// schema-drift topics the orchestrator creates and produces only with that flag
+// on, and a sarama consumer group auto-creates what it subscribes to, so
+// subscribing unconditionally would re-create the topic on every installation
+// that runs with drift off. With the flag off the field is empty, all() leaves
+// it out, and handleMessage never routes to it.
+//
+// Every producer of these topics -- the healer (notifyUser and its
+// healing-result publish), the CDC WAL watchdog and healthwatch -- publishes
+// through backend-orchestrator's kafka.Manager, and Manager qualifies at its
+// Produce/Consume chokepoints. So the name that actually reaches the broker
+// carries KAFKA_TOPIC_PREFIX, including for these, whose literals already spell
+// "rsync." themselves.
 //
 // At the default prefix that is a no-op -- Topic("rsync.notifications") matches
 // its own prefix and passes through unchanged -- which is exactly why
@@ -91,21 +99,24 @@ const (
 // fix to the subscription cannot leave the routing switch behind.
 type notifierTopics struct {
 	notify        string
-	healerActions string
-	healerResults string
+	healerResults string // "" unless schema drift is enabled
 }
 
 func resolveNotifierTopics() notifierTopics {
-	return notifierTopics{
-		notify:        kafkaclient.Topic(notifyTopic),
-		healerActions: kafkaclient.Topic(healerActions),
-		healerResults: kafkaclient.Topic(healerResults),
+	t := notifierTopics{notify: kafkaclient.Topic(notifyTopic)}
+	if config.SchemaDriftEnabled() {
+		t.healerResults = kafkaclient.Topic(healerResults)
 	}
+	return t
 }
 
 // all returns the subscription list in the order the consumer group receives it.
 func (t notifierTopics) all() []string {
-	return []string{t.notify, t.healerActions, t.healerResults}
+	out := []string{t.notify}
+	if t.healerResults != "" {
+		out = append(out, t.healerResults)
+	}
+	return out
 }
 
 // Notifier wraps the sarama ConsumerGroup that reads from the
@@ -198,6 +209,7 @@ func Start(ctx context.Context, db *sql.DB, kafkaBrokers []string) (*Notifier, e
 		"app_base_url":          n.appBaseURL,
 		"interactive_approvals": n.interactiveApprovals,
 		"topics":                strings.Join(n.topics.all(), ","),
+		"schema_drift_enabled":  n.topics.healerResults != "",
 		"consumer_group":        groupID,
 	}).Info("🔔 Starting notifier consumer")
 
@@ -275,20 +287,101 @@ func (n *Notifier) run(ctx context.Context) {
 func (n *Notifier) Setup(sarama.ConsumerGroupSession) error   { return nil }
 func (n *Notifier) Cleanup(sarama.ConsumerGroupSession) error { return nil }
 
+// permanentError marks a failure that re-reading the same message can never
+// fix: a payload that will not parse, or one naming a pipeline that is gone.
+// Those are dropped, offset committed, so one bad message cannot wedge a topic.
+//
+// Everything else is retryable BY DEFAULT — including error classes nobody
+// anticipated. That default is the point: see ConsumeClaim.
+type permanentError struct{ err error }
+
+func (e permanentError) Error() string { return e.err.Error() }
+func (e permanentError) Unwrap() error { return e.err }
+
+// permanent wraps a formatted error as unprocessable.
+func permanent(format string, args ...interface{}) error {
+	return permanentError{err: fmt.Errorf(format, args...)}
+}
+
+func isPermanent(err error) bool {
+	var p permanentError
+	return errors.As(err, &p)
+}
+
+// How long one message is retried in place before the claim is given up on.
+// Four attempts two seconds apart rides out a database restart without forcing
+// a consumer-group rebalance.
+const handleAttempts = 4
+
+// var, not const, so tests can exercise the retry loop without sleeping.
+var handleRetryDelay = 2 * time.Second
+
 func (n *Notifier) ConsumeClaim(session sarama.ConsumerGroupSession, claim sarama.ConsumerGroupClaim) error {
 	for msg := range claim.Messages() {
 		if msg == nil {
 			continue
 		}
-		if err := n.handleMessage(session.Context(), msg.Topic, msg.Value); err != nil {
-			// Don't abort the claim on a single bad message — log and
-			// keep going so one malformed payload doesn't poison the
-			// whole subscription.
-			log.WithError(err).WithField("topic", msg.Topic).Warn("notifier: handleMessage error")
+		err := n.handleWithRetry(session.Context(), msg)
+		if err != nil && !isPermanent(err) {
+			// Retries are spent and the failure is still one that re-processing
+			// could fix — the database is down, most likely. Return WITHOUT
+			// marking the offset: the session ends and the broker redelivers
+			// from the last commit, which is what makes this at-least-once.
+			//
+			// Committing here instead, as this loop used to do for every error
+			// alike, destroyed every alert that arrived during an outage.
+			// Nothing ever re-reads a Kafka message whose offset has moved on,
+			// so those alerts were not delayed, they were gone — and the only
+			// trace was one Warn line.
+			//
+			// The cost of the other choice is that a failure misclassified as
+			// retryable stalls this subscription. That is the deliberate trade:
+			// a stalled notifier is loud (this log, plus consumer lag that
+			// keeps growing), a silently dropped alert is not.
+			log.WithError(err).WithFields(log.Fields{
+				"topic":     msg.Topic,
+				"partition": msg.Partition,
+				"offset":    msg.Offset,
+			}).Error("notifier: giving up after retries; aborting claim so the message is redelivered")
+			return err
+		}
+		if err != nil {
+			// Permanent. Drop it and keep going so one malformed payload
+			// doesn't poison the whole subscription.
+			log.WithError(err).WithFields(log.Fields{
+				"topic":     msg.Topic,
+				"partition": msg.Partition,
+				"offset":    msg.Offset,
+			}).Warn("notifier: dropping unprocessable message")
 		}
 		session.MarkMessage(msg, "")
 	}
 	return nil
+}
+
+// handleWithRetry runs handleMessage, retrying in place while the failure looks
+// retryable. Returns nil once it succeeds, or the final error.
+func (n *Notifier) handleWithRetry(ctx context.Context, msg *sarama.ConsumerMessage) error {
+	var err error
+	for attempt := 1; attempt <= handleAttempts; attempt++ {
+		if err = n.handleMessage(ctx, msg.Topic, msg.Value); err == nil {
+			return nil
+		}
+		if isPermanent(err) || attempt == handleAttempts {
+			return err
+		}
+		log.WithError(err).WithFields(log.Fields{
+			"topic":   msg.Topic,
+			"offset":  msg.Offset,
+			"attempt": attempt,
+		}).Warn("notifier: retryable failure handling message, retrying")
+		select {
+		case <-ctx.Done():
+			return err
+		case <-time.After(handleRetryDelay):
+		}
+	}
+	return err
 }
 
 // notificationPayload mirrors the shape healer.go::notifyUser emits.
@@ -342,15 +435,6 @@ type healingResultPayload struct {
 	Reason     string `json:"reason"`
 }
 
-// healerActionPayload mirrors healer.HealerAction (rsync.healer.actions).
-// Same problem: no type, no message.
-type healerActionPayload struct {
-	PipelineID string `json:"pipeline_id"`
-	Action     string `json:"action"`
-	Reason     string `json:"reason"`
-	Details    string `json:"details"`
-}
-
 // normalizeHealingResult rewrites a rsync.healer.results event into the common
 // notification shape, and reports whether it belongs in a user's inbox at all.
 //
@@ -393,30 +477,6 @@ func normalizeHealingResult(raw []byte, p *notificationPayload) (code string, pa
 	return codeSchemaChangeApplied, map[string]string{"table": table}, true
 }
 
-// normalizeHealerAction rewrites a rsync.healer.actions event into the common
-// shape. The type is intentionally left empty so the copy resolves through
-// topicDefaults ("Automatic recovery in progress") rather than a machine-shaped
-// action name.
-func normalizeHealerAction(raw []byte, p *notificationPayload) bool {
-	var ha healerActionPayload
-	if err := json.Unmarshal(raw, &ha); err != nil {
-		return false
-	}
-	msg := strings.TrimSpace(ha.Reason)
-	if d := strings.TrimSpace(ha.Details); d != "" {
-		if msg != "" {
-			msg += " "
-		}
-		msg += d
-	}
-	p.Type = ""
-	p.Message = msg
-	if strings.TrimSpace(p.ActionURL) == "" && strings.TrimSpace(ha.PipelineID) != "" {
-		p.ActionURL = "/pipelines/" + ha.PipelineID
-	}
-	return true
-}
-
 // prettySourceType turns a stored connector type into something we can drop
 // into a sentence ("Reconnect your PostgreSQL account"). Unknown types fall
 // back to Title Case rather than being shown raw.
@@ -447,18 +507,19 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	}
 	var p notificationPayload
 	if err := json.Unmarshal(raw, &p); err != nil {
-		return fmt.Errorf("unmarshal: %w", err)
+		// Bytes that are not JSON will not become JSON on a redelivery.
+		return permanent("unmarshal: %v", err)
 	}
 
-	// The healer's result/action topics carry their own struct shapes with no
-	// type and no message. Normalize them into the common payload before any
-	// copy resolution, and drop the ones that are pure internal telemetry.
+	// The healer's result topic carries its own struct shape with no type and no
+	// message. Normalize it into the common payload before any copy resolution,
+	// and drop the events that are pure internal telemetry. healerResults is ""
+	// when schema drift is off, and nothing is subscribed to it then.
 	var (
 		normalizedCode string
 		extraParams    = map[string]string{}
 	)
-	switch topic {
-	case n.topics.healerResults:
+	if n.topics.healerResults != "" && topic == n.topics.healerResults {
 		code, params, keep := normalizeHealingResult(raw, &p)
 		if !keep {
 			return nil
@@ -467,35 +528,74 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 		for k, v := range params {
 			extraParams[k] = v
 		}
-	case n.topics.healerActions:
-		if !normalizeHealerAction(raw, &p) {
+	}
+
+	// Who is this alert for? Two shapes arrive on these topics:
+	//
+	//   - a PIPELINE alert, which routes to that pipeline's owner; and
+	//   - an INSTANCE alert, which is about no pipeline and belongs to whoever
+	//     operates the instance.
+	//
+	// The second used to have nowhere to go. healthwatch/watchdog.go sends its
+	// connector-version-regression alert with the synthetic pipeline_id
+	// "system"; that literal reached `WHERE id = $1` against a uuid column,
+	// Postgres rejected it as malformed input, and the error path below logged
+	// and dropped it — every time, for the entire life of that agent. Treating
+	// it as an instance alert is what makes that producer reach anyone.
+	pipelineID := strings.TrimSpace(p.PipelineID)
+	var (
+		recipients   []string
+		pipelineName string
+	)
+	if pipelineID == "" || isInstanceScope(pipelineID) {
+		pipelineID = ""
+		admins, err := n.instanceRecipients(ctx)
+		if err != nil {
+			return fmt.Errorf("instance recipient lookup: %w", err)
+		}
+		if len(admins) == 0 {
+			// Nobody to tell, and user_id is NOT NULL so there is not even a
+			// row to leave behind for later. Logged at Error because an
+			// instance with no active admin cannot receive ops alerts at all —
+			// that is a deployment problem, not a quiet edge case.
+			log.WithFields(log.Fields{
+				"topic": topic,
+				"type":  p.Type,
+			}).Error("notifier: instance alert has no active admin to deliver to; dropping")
 			return nil
 		}
+		recipients = admins
+		// Keeps uncoded fallback copy ("{pipeline} needs attention") readable
+		// for an alert that is about no pipeline at all.
+		extraParams["pipeline"] = instanceScopeLabel
+	} else {
+		if _, perr := uuid.Parse(pipelineID); perr != nil {
+			// Neither a uuid nor the instance sentinel. Re-reading the same
+			// bytes will not turn it into one.
+			return permanent("pipeline_id %q is neither a uuid nor an instance scope", pipelineID)
+		}
+		// Look up the pipeline's owner and display name. The name is what lets
+		// copy say "orders-sync ran into a problem" instead of leaving the user
+		// to guess which of their pipelines broke.
+		var owner, name sql.NullString
+		err := n.db.QueryRowContext(ctx,
+			`SELECT created_by, COALESCE(name, '') FROM pipelines WHERE id = $1`, pipelineID,
+		).Scan(&owner, &name)
+		if errors.Is(err, sql.ErrNoRows) {
+			// The pipeline was deleted. There will never be an owner to route
+			// to, so retrying this forever would wedge the topic for nothing.
+			return permanent("pipeline %s no longer exists", pipelineID)
+		}
+		if err != nil {
+			return fmt.Errorf("pipeline owner lookup: %w", err)
+		}
+		if !owner.Valid || strings.TrimSpace(owner.String) == "" {
+			return nil
+		}
+		recipients = []string{strings.TrimSpace(owner.String)}
+		pipelineName = strings.TrimSpace(name.String)
+		extraParams["pipeline"] = pipelineName
 	}
-
-	if strings.TrimSpace(p.PipelineID) == "" {
-		// No pipeline context — can't route to a user. Drop.
-		return nil
-	}
-
-	// Look up the pipeline's owner and display name. Notifications without an
-	// owner stay in the DB orphaned (queryable by admin) but skip external
-	// delivery. The name is what lets copy say "orders-sync ran into a problem"
-	// instead of leaving the user to guess which of their pipelines broke.
-	var (
-		userID       sql.NullString
-		pipelineName sql.NullString
-	)
-	err := n.db.QueryRowContext(ctx,
-		`SELECT created_by, COALESCE(name, '') FROM pipelines WHERE id = $1`, p.PipelineID,
-	).Scan(&userID, &pipelineName)
-	if err != nil {
-		return fmt.Errorf("pipeline owner lookup: %w", err)
-	}
-	if !userID.Valid || strings.TrimSpace(userID.String) == "" {
-		return nil
-	}
-	extraParams["pipeline"] = strings.TrimSpace(pipelineName.String)
 
 	// If the payload carries a StructuredError envelope, prefer its
 	// fields over the legacy top-level shape. This delivers the richer
@@ -551,11 +651,11 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	if se != nil {
 		dedupSubject = strings.TrimSpace(se.DedupSubject)
 	}
-	dedupKey := makeDedupKey(p.PipelineID, dedupIdentity, p.ActionURL, dedupSubject)
+	dedupKey := makeDedupKey(pipelineID, dedupIdentity, p.ActionURL, dedupSubject)
 
 	// Dedup: skip if an identical event landed within the dedup window.
 	var existingID sql.NullString
-	err = n.db.QueryRowContext(ctx, `
+	err := n.db.QueryRowContext(ctx, `
 		SELECT id::text FROM pipeline_notifications
 		WHERE dedup_key = $1 AND created_at > NOW() - INTERVAL '`+fmt.Sprintf("%d minutes", dedupWindowMinutes)+`'
 		ORDER BY created_at DESC LIMIT 1
@@ -581,8 +681,8 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 		"impact":       rendered.Impact,
 		"action_label": rendered.ActionLabel,
 	}
-	if pn := strings.TrimSpace(pipelineName.String); pn != "" {
-		metaMap["pipeline_name"] = pn
+	if pipelineName != "" {
+		metaMap["pipeline_name"] = pipelineName
 	}
 	if code != "" {
 		// Kept for support ("quote this code"), never shown as the headline.
@@ -607,52 +707,131 @@ func (n *Notifier) handleMessage(ctx context.Context, topic string, raw []byte) 
 	}
 	metaBytes, _ := json.Marshal(metaMap)
 
-	notifID := uuid.New().String()
-	_, err = n.db.ExecContext(ctx, `
-		INSERT INTO pipeline_notifications
-			(id, pipeline_id, user_id, type, severity, title, message, action_url, metadata, delivery_status, dedup_key, created_at)
-		VALUES
-			($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, 'pending', $10, NOW())
-	`, notifID, p.PipelineID, userID.String, p.Type, severity, rendered.Title, p.Message, p.ActionURL, metaBytes, dedupKey)
+	// NULL pipeline_id is how an instance alert says "about no pipeline"
+	// (migration 112). Casting an empty string to uuid would error instead.
+	pipelineArg := sql.NullString{String: pipelineID, Valid: pipelineID != ""}
+
+	// One row per recipient — the bell is per-user, so an instance alert that
+	// landed in only one admin's inbox is invisible to every other admin.
+	//
+	// All rows in ONE transaction: a fan-out that got halfway and then failed
+	// would be papered over on redelivery by the dedup check above, leaving the
+	// remaining admins permanently without the alert.
+	tx, err := n.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("insert notification: %w", err)
+		return fmt.Errorf("begin notification insert: %w", err)
+	}
+	notifIDs := make([]string, len(recipients))
+	for i, recipient := range recipients {
+		notifIDs[i] = uuid.New().String()
+		if _, err := tx.ExecContext(ctx, `
+			INSERT INTO pipeline_notifications
+				(id, pipeline_id, user_id, type, severity, title, message, action_url, metadata, delivery_status, dedup_key, created_at)
+			VALUES
+				($1, $2::uuid, $3::uuid, $4, $5, $6, $7, $8, $9, 'pending', $10, NOW())
+		`, notifIDs[i], pipelineArg, recipient, p.Type, severity, rendered.Title, p.Message, p.ActionURL, metaBytes, dedupKey); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("insert notification: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit notification insert: %w", err)
 	}
 
 	// A drift notification carries interactive Approve/Reject buttons only when
 	// it maps to a specific pipeline AND the structured error is schema drift —
 	// that's the one event the inbound receiver knows how to action.
-	actionable := se != nil && se.Code == "SCHEMA_DRIFT_DETECTED" && strings.TrimSpace(p.PipelineID) != ""
+	actionable := se != nil && se.Code == "SCHEMA_DRIFT_DETECTED" && pipelineID != ""
 
-	// External delivery is best-effort.
-	status, deliveryErr := n.deliver(ctx, userID.String, p, rendered, actionable, category)
-	var errStr sql.NullString
-	if deliveryErr != nil {
-		// Recorded even when another channel delivered, so a half-broken setup
-		// is visible on the row instead of hiding behind 'delivered'.
-		errStr = sql.NullString{String: deliveryErr.Error(), Valid: true}
+	for i, recipient := range recipients {
+		// Slack is a single instance-wide webhook and the alert list is a
+		// single instance-wide list, so they carry the alert exactly once
+		// however many people hold a row for it. Everyone still gets their own
+		// email, subject to their own mutes.
+		status, deliveryErr := n.deliver(ctx, recipient, p, rendered, actionable, category, i == 0)
+		var errStr sql.NullString
+		if deliveryErr != nil {
+			// Recorded even when another channel delivered, so a half-broken
+			// setup is visible on the row instead of hiding behind 'delivered'.
+			errStr = sql.NullString{String: deliveryErr.Error(), Valid: true}
+		}
+		_, _ = n.db.ExecContext(ctx, `
+			UPDATE pipeline_notifications
+			SET delivery_status = $1, delivered_at = CASE WHEN $1 = 'delivered' THEN NOW() ELSE delivered_at END,
+			    delivery_error = $2
+			WHERE id = $3::uuid
+		`, status, errStr, notifIDs[i])
+
+		log.WithFields(log.Fields{
+			"notification_id": notifIDs[i],
+			"pipeline_id":     pipelineID,
+			"instance_alert":  pipelineID == "",
+			"type":            p.Type,
+			"severity":        severity,
+			"category":        category,
+			"delivery_status": status,
+		}).Info("🔔 Notification persisted")
 	}
-	_, _ = n.db.ExecContext(ctx, `
-		UPDATE pipeline_notifications
-		SET delivery_status = $1, delivered_at = CASE WHEN $1 = 'delivered' THEN NOW() ELSE delivered_at END,
-		    delivery_error = $2
-		WHERE id = $3::uuid
-	`, status, errStr, notifID)
-
-	log.WithFields(log.Fields{
-		"notification_id": notifID,
-		"pipeline_id":     p.PipelineID,
-		"type":            p.Type,
-		"severity":        severity,
-		"category":        category,
-		"delivery_status": status,
-	}).Info("🔔 Notification persisted")
 
 	return nil
 }
 
+// instanceScopeLabel stands in for a pipeline name in copy that expects one,
+// for an alert that is about the instance rather than any pipeline.
+const instanceScopeLabel = "This instance"
+
+// instanceScopeIDs are the synthetic pipeline ids producers use to say "this is
+// not about a pipeline". They are matched case-insensitively and must never be
+// parsed as uuids.
+var instanceScopeIDs = map[string]bool{
+	"system":   true, // healthwatch/watchdog.go
+	"instance": true,
+	"global":   true,
+}
+
+func isInstanceScope(pipelineID string) bool {
+	return instanceScopeIDs[strings.ToLower(strings.TrimSpace(pipelineID))]
+}
+
+// instanceRecipients returns the user ids that receive instance-level alerts:
+// every active admin. Admin here is the instance role (users.role), not a
+// workspace role — an instance alert is not scoped to a workspace, and the
+// workspace admin of one workspace has no standing to be told about the host.
+//
+// Ordered by created_at so the fan-out is deterministic, which also makes the
+// "instance channels go to the first recipient only" rule in handleMessage
+// stable rather than whatever order Postgres felt like returning.
+func (n *Notifier) instanceRecipients(ctx context.Context) ([]string, error) {
+	rows, err := n.db.QueryContext(ctx, `
+		SELECT id::text
+		FROM users
+		WHERE role = 'admin' AND COALESCE(status, 'active') = 'active'
+		ORDER BY created_at, id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	return ids, rows.Err()
+}
+
 // deliver sends one alert through every channel its category is not muted on,
 // and returns the delivery_status to record plus any send error.
-func (n *Notifier) deliver(ctx context.Context, userID string, p notificationPayload, r Rendered, actionable bool, category string) (string, error) {
+// instanceChannels is false for every recipient after the first of a fanned-out
+// instance alert: the Slack webhook and the admin alert list are instance-wide,
+// so sending them once per recipient would post the same alert N times.
+func (n *Notifier) deliver(ctx context.Context, userID string, p notificationPayload, r Rendered, actionable bool, category string, instanceChannels bool) (string, error) {
 	cfg, err := CachedChannelConfig(ctx, n.db)
 	if err != nil {
 		return StatusFailed, err
@@ -671,6 +850,16 @@ func (n *Notifier) deliver(ctx context.Context, userID string, p notificationPay
 	}
 
 	plan := planDelivery(cfg, category, prefs)
+	if !instanceChannels {
+		plan.slack = false
+		plan.listEmail = nil
+		if !plan.ownerEmail {
+			// Everything that would have carried this copy is either muted or
+			// already sent to on another recipient's behalf.
+			return StatusSkipped, nil
+		}
+		plan.status = ""
+	}
 	if plan.status != "" {
 		return plan.status, nil
 	}

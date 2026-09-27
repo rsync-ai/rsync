@@ -41,7 +41,7 @@ func TestCDCTableStats_DLQRowsReported(t *testing.T) {
 
 	// Clean stream: dlq_rows is present and zero. Present-and-zero matters — an omitted
 	// field makes "nothing lost" indistinguishable from "this sink can't tell you".
-	clean := buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 0)
+	clean := buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 0, 0)
 	if got, ok := statsCounts(t, clean)["dlq_rows"]; !ok {
 		t.Error("counts.dlq_rows missing on a clean stream; projector cannot clear a stale value")
 	} else if got.(int64) != 0 {
@@ -52,7 +52,7 @@ func TestCDCTableStats_DLQRowsReported(t *testing.T) {
 	}
 
 	// Shedding rows: the count is carried and the table is NOT reported as running.
-	shed := buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 3)
+	shed := buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 3, 0)
 	if got := statsCounts(t, shed)["dlq_rows"].(int64); got != 3 {
 		t.Errorf("counts.dlq_rows = %d, want 3", got)
 	}
@@ -64,8 +64,8 @@ func TestCDCTableStats_DLQRowsReported(t *testing.T) {
 func TestCDCTableStats_DLQRowsNotFoldedIntoLandedCounts(t *testing.T) {
 	sm := &SinkMessage{PipelineID: "p1", ExecutionID: "e1", Table: "public.orders"}
 
-	clean := statsCounts(t, buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 0))
-	shed := statsCounts(t, buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 7))
+	clean := statsCounts(t, buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 0, 0))
+	shed := statsCounts(t, buildCDCTableStatsEvent(sm, 10, 5, 2, 1024, 7, 0))
 
 	// read_rows/inserted_rows/total_events mean "what landed". Folding a dropped row
 	// into any of them would restore the exact reconciliation that hid the loss.

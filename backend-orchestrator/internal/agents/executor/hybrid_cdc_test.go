@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/cdc"
+	"github.com/rsync-ai/shared/kafkaclient"
 )
 
 func TestBuildDebeziumMySQLOffsetRecord(t *testing.T) {
@@ -35,12 +36,15 @@ func TestBuildDebeziumMySQLOffsetRecord(t *testing.T) {
 		}
 	})
 
-	t.Run("topic prefix defaults to connector name", func(t *testing.T) {
+	t.Run("topic prefix defaults to the qualified connector name", func(t *testing.T) {
+		// The Debezium MCP sets topic.prefix to _qualify_topic(connector_name), and the
+		// MySQL source partition's "server" is topic.prefix.
+		t.Setenv(kafkaclient.EnvTopicPrefix, "rsync")
 		key, _, err := buildDebeziumMySQLOffsetRecord("cdc-zz", "", cdc.BinlogPosition{File: "b.1", Pos: 1})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		want := `["cdc-zz",{"server":"cdc-zz"}]`
+		want := `["cdc-zz",{"server":"rsync.cdc-zz"}]`
 		if string(key) != want {
 			t.Errorf("key = %s, want %s", key, want)
 		}

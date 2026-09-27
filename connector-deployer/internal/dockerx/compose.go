@@ -9,19 +9,25 @@ import (
 )
 
 // versionedNameRe parses the middle of a versioned runtime container name:
-// "rsync-ai-<id>-v<X-Y-Z>-mcp" → the middle is "<id>-vX-Y-Z". Mirrors
-// docker_builder.py::_parse_container_name.
+// "<stackPrefix>-<id>-v<X-Y-Z>-mcp" → the middle is "<id>-vX-Y-Z". Mirrors
+// container_names.py::parse_versioned_container_name.
 var versionedNameRe = regexp.MustCompile(`^(.*)-v(\d+-\d+-\d+)$`)
 
 // parseContainerName returns (connectorID, "X-Y-Z", true) for a versioned runtime
-// name "rsync-ai-<id>-v<X-Y-Z>-mcp", else ok=false. Mirrors _parse_container_name:
-// an UNversioned name (e.g. "rsync-ai-postgresql-mcp") does NOT parse.
-func parseContainerName(name string) (string, string, bool) {
+// name "<stackPrefix>-<id>-v<X-Y-Z>-mcp", else ok=false. The prefix is STACK_PREFIX
+// ("rsync-ai" by default), the same one the orchestrator and tool-generator name the
+// container with. Mirrors container_names.py::parse_versioned_container_name: an
+// UNversioned name (e.g. "rsync-ai-postgresql-mcp") does NOT parse.
+func parseContainerName(name, stackPrefix string) (string, string, bool) {
 	name = strings.TrimSpace(name)
-	if !strings.HasPrefix(name, "rsync-ai-") || !strings.HasSuffix(name, "-mcp") {
+	prefix := stackPrefix + "-"
+	const suffix = "-mcp"
+	// The length check keeps "rsync-ai-mcp", where prefix and suffix overlap, from
+	// slicing out of range.
+	if len(name) < len(prefix)+len(suffix) || !strings.HasPrefix(name, prefix) || !strings.HasSuffix(name, suffix) {
 		return "", "", false
 	}
-	middle := name[len("rsync-ai-") : len(name)-len("-mcp")]
+	middle := name[len(prefix) : len(name)-len(suffix)]
 	m := versionedNameRe.FindStringSubmatch(middle)
 	if m == nil {
 		return "", "", false
@@ -35,7 +41,7 @@ func parseContainerName(name string) (string, string, bool) {
 // false (JIT owns them). If current_version can't be resolved, conservatively protect
 // the legacy 1-0-0 container. Mirrors docker_builder.py::_is_protected_compose_container.
 func (d *Deployer) isProtectedComposeContainer(name string) bool {
-	connectorID, versionPart, ok := parseContainerName(name)
+	connectorID, versionPart, ok := parseContainerName(name, d.stackPrefix)
 	if !ok {
 		return false
 	}

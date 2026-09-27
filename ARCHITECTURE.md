@@ -14,10 +14,10 @@ The front door to rsync-ai's system design. **What it is, how it's built, and wh
 
 **Core thesis:** moving data isn't the hard part — *operating it safely* is. Ambiguity, schema drift, retries/idempotency, pause/resume/stop, "why did it do that?", and PII governance are the real problems. rsync-ai is built around those with an **event-sourced, agentic** architecture.
 
-The guiding runtime pattern: **Temporal thinks, Kafka talks, Agents act.**
+The guiding runtime pattern: **Temporal thinks, Kafka carries data, Agents act.**
 - **Temporal** owns durable workflow state and orchestration (the "thinking").
-- **Kafka** is the message bus between the orchestrator and stateless agent workers (the "talking").
-- **Agent workers** execute one stage each — intent, resolver, discovery, planner, validator, executor (the "acting").
+- **Kafka** carries pipeline data (batch and CDC topics) and domain events. Agent stages do not talk over Kafka: they hand off through Redis (the Kafka agent bus was removed in v0.1.6, [#1227](https://github.com/rsync-ai/rsync-ai/pull/1227)).
+- **Agent stages** execute one stage each — intent, resolver, discovery, planner, validator, executor (the "acting").
 
 ---
 
@@ -43,7 +43,7 @@ User → Frontend (Next.js)
      → Kafka Connect + Debezium    CDC streaming infrastructure
 Data: Postgres (system of record + event store) · Redis (ephemeral/cache) · MinIO (claim-check staging)
 AI:   Planner (Python) · LLM Service / Tool Generator (Python) · Context7 MCP
-Obs:  OpenTelemetry → OTLP collector → your backend, trace_id carried end-to-end
+Obs:  docker logs (bounded json-file); OpenTelemetry instrumentation, export opt-in
 ```
 
 Full Mermaid diagram + the draft-first sequence diagram: [`docs/architecture/overview.md`](docs/architecture/overview.md).
@@ -58,13 +58,13 @@ Full Mermaid diagram + the draft-first sequence diagram: [`docs/architecture/ove
 | **Planner, LLM Service, Tool Generator, agents** | **Python** | The AI layer lives where the ecosystem is — OpenAI/Azure SDKs, LangChain-style tooling, fast iteration on prompts and connector codegen. Rewriting this in Go would trade velocity for nothing. |
 | **Frontend** | **Next.js (React + SSR)** | Server-side rendering for the monitoring UI + a mature component ecosystem; same-origin API routing through Traefik keeps auth cookies simple. |
 | **Workflow orchestration** | **Temporal** | Pipelines are long-running and must survive process restarts, retries, and partial failure deterministically. Temporal gives durable execution, replay, and first-class signals for human-in-the-loop (table selection, pause/resume) — building this on cron + a queue would reinvent it badly. |
-| **Message bus** | **Kafka** (Apache 2.0, `apache/kafka:3.7.0`) | The event stream of truth. Decouples the orchestrator from stateless agent workers, and is the durable backbone for domain events (replay, WebSocket streaming, audit) and CDC. Migrated off Confluent images to Apache 2.0 to avoid CCL licensing constraints for self-hosters. |
+| **Message bus** | **Kafka** (Apache 2.0, `apache/kafka:3.7.0`) | The event stream of truth: pipeline data (batch and CDC topics) and domain events (replay, WebSocket streaming, audit). A default install creates 4 platform topics. Migrated off Confluent images to Apache 2.0 to avoid CCL licensing constraints for self-hosters. |
 | **CDC** | **Debezium** (Apache 2.0, `debezium/connect`) on Kafka Connect | Battle-tested log-based change capture across MySQL/Postgres/Mongo/SQL Server/Oracle. Publication-before-slot ordering is enforced (see CAPABILITIES §5). |
 | **Connectors** | **MCP servers (dockerized, versioned)** | A single uniform tool interface (`test_connection`, `discover_schema`, `export`, `import`) across every connected system — 17 pre-built connectors today, plus any connector the tool-generator writes on demand — each a versioned container. Lets the platform treat databases and SaaS APIs identically, deploy connectors on demand, and run customer-private connectors in isolation. |
 | **System of record** | **PostgreSQL** | Pipelines, executions, ownership, and the `pipeline_run_events` event store. One relational store for state + replay; managed (Azure Flexible Server) in production for backups/PITR with no DBA. |
 | **Ephemeral state** | **Redis** | Fast coordination, caching, short-lived state. |
 | **Large-payload staging** | **MinIO (S3-compatible)** | Claim-check pattern — batch chunks land in object storage and Kafka carries a reference, keeping the bus lean. |
-| **Observability** | **OpenTelemetry (OTLP)** | `trace_id` propagated through every event and service boundary for end-to-end correlation (UI → logs → traces). Vendor-neutral by design: the bundled collector forwards to whichever OTLP backend you point it at, and no backend ships with this repo — see [`deploy/TELEMETRY.md`](deploy/TELEMETRY.md). |
+| **Observability** | **`docker logs` + OpenTelemetry (opt-in)** | Every container writes a rotated json-file log (10 MB × 3), so a single-VM install needs no log shipper or log store. Services carry OpenTelemetry instrumentation and propagate `trace_id` through every event and service boundary; export is off (`OTEL_ENABLED=false`) until an operator adds a collector. |
 | **Reverse proxy / TLS** | **Traefik** | Single public entrypoint, automatic Let's Encrypt certs (DNS challenge via Cloudflare), routes `/api`→gateway, `/ws`→websocket, everything else→frontend. |
 
 ---

@@ -440,6 +440,9 @@ export function SavedQueries({
                   toast.info(`Loaded "${q.name}"`)
                 }}
                 onKeyDown={(e) => {
+                  // Only the row's own keys: a keydown from one of its buttons bubbles
+                  // here, and preventDefault would cancel that button's click.
+                  if (e.target !== e.currentTarget) return
                   if (e.key === "Enter" || e.key === " ") {
                     e.preventDefault()
                     onLoad(q.sql_text, q.nl_prompt)

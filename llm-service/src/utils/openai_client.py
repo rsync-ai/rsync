@@ -18,6 +18,11 @@ Azure OpenAI environment variables:
   AZURE_OPENAI_API_VERSION — default 2024-10-21 (latest GA)
   AZURE_OPENAI_DEPLOYMENT  — deployment name (falls back to LLM_MODEL)
 
+Output budget:
+  LLM_REASONING_TOKEN_HEADROOM — tokens added to every prompt's max_tokens so a
+      thinking model has room to answer after it reasons (default 4096; 0 sends
+      each prompt's max_tokens unchanged). See with_reasoning_headroom.
+
 Model selection priority:
   1. LLM_MODEL env var (overrides everything)
   2. Provider default: gpt-4o-mini (openai/azure), llama-3.3-70b-versatile (groq),
@@ -54,6 +59,8 @@ __all__ = [
     "make_sync_client",
     "make_async_client",
     "openai_api_key",
+    "with_reasoning_headroom",
+    "warn_if_cut_off",
     "client_egress_host",
     "_ollama_base_url",
 ]
@@ -203,6 +210,69 @@ def _warn_fallback(provider: str, needs: str) -> None:
         needs,
     )
 
+
+# Tokens a thinking model may spend reasoning before it writes its answer.
+DEFAULT_REASONING_TOKEN_HEADROOM = 4096
+
+
+def reasoning_token_headroom() -> int:
+    """LLM_REASONING_TOKEN_HEADROOM, or the default when it is unset or malformed."""
+    raw = os.getenv("LLM_REASONING_TOKEN_HEADROOM", "").strip()
+    if not raw:
+        return DEFAULT_REASONING_TOKEN_HEADROOM
+    try:
+        value = int(raw)
+    except ValueError:
+        value = -1
+    if value < 0:
+        _warn_once(
+            f"reasoning-headroom:{raw}",
+            "LLM_REASONING_TOKEN_HEADROOM=%r is not a whole number of tokens, so %d is used. "
+            "Set 0 to send each prompt's max_tokens unchanged.",
+            raw,
+            DEFAULT_REASONING_TOKEN_HEADROOM,
+        )
+        return DEFAULT_REASONING_TOKEN_HEADROOM
+    return value
+
+
+def with_reasoning_headroom(answer_tokens: int) -> int:
+    """The max_tokens to send for a prompt whose answer needs ``answer_tokens``.
+
+    A thinking model spends its hidden reasoning out of the same max_tokens as
+    the answer. gemini-3.6-flash on Google's OpenAI-compatible endpoint does, and
+    the prompt YAMLs size max_tokens for the answer alone: the reasoning used up
+    intent classification's 300 and the JSON stopped after about ten tokens.
+    max_tokens is a ceiling, not a target, so a model that does not think stops
+    when its answer is done and the headroom costs it nothing.
+
+    Set LLM_REASONING_TOKEN_HEADROOM=0 where the sum is refused: a model whose
+    output limit is below it (gpt-3.5-turbo allows 4096), or a server such as
+    vLLM that rejects a max_tokens past a short model context.
+    """
+    return int(answer_tokens) + reasoning_token_headroom()
+
+
+def warn_if_cut_off(response, *, prompt: str, max_tokens: int) -> bool:
+    """True, with a warning naming the prompt, when the reply stopped at max_tokens."""
+    try:
+        finish_reason = response.choices[0].finish_reason
+    except (AttributeError, IndexError, TypeError):
+        return False
+    if finish_reason != "length":
+        return False
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None)
+    logger.warning(
+        "LLM reply to %s was cut off at max_tokens=%s (completion_tokens=%s, reasoning_tokens=%s). "
+        "A thinking model spends max_tokens reasoning before it answers: raise "
+        "LLM_REASONING_TOKEN_HEADROOM.",
+        prompt,
+        max_tokens,
+        getattr(usage, "completion_tokens", None),
+        getattr(details, "reasoning_tokens", None),
+    )
+    return True
 
 # OPENAI_API_KEY_SOURCE: where an OpenAI-protocol client gets its bearer token.
 _KEY_SOURCE_GCP_METADATA = "gcp-metadata"

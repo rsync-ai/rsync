@@ -84,6 +84,15 @@ NO_ENVIRONMENT_PATTERNS = (
     r"(?i)\bnothing is deployed\b",
     r"(?i)\bhave no host\b",
     r"(?i)\bthere is no deploy target\b",
+    # Added 2026-09-24. The six above all passed while three tracked docs said the opposite,
+    # in wordings none of them spell: the runbook's banner, the demo runsheet's environment
+    # table, and PRODUCT_STATUS.md -- the last caught only because its row carries a history
+    # marker, which is an exemption, not a catch. A tuple of spellings is worth exactly its
+    # spellings. When a future doc invents a ninth wording, add it here, and arm it the way
+    # these two were armed: inject the wording into a tracked doc, watch this test go red
+    # naming that file and line, then remove the injection.
+    r"(?i)\bno target host\b",
+    r"(?i)\bserves nothing\b",
 )
 
 # Files whose job is to record history, or to hold the correction itself.

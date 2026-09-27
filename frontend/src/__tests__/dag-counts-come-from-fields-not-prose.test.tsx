@@ -34,7 +34,7 @@ vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn(), refresh: vi.fn() }),
 }))
 
-import type { ExecutionPlanStage } from "@/components/pipeline/DAGVisualization"
+import type { ExecutionPlanStage } from "@/components/pipeline/dagTypes"
 import { StageDetailPanel } from "@/components/pipeline/StageDetailPanel"
 import { PipelineInsightsBar } from "@/components/pipeline/PipelineInsightsBar"
 

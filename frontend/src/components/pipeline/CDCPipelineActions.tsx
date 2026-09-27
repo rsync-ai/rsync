@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { useRouter } from "next/navigation"
 import { Button } from "@/components/ui/button"
 import { Play, Pause, Loader2, RotateCcw, RefreshCw, AlertTriangle, LifeBuoy } from "lucide-react"
@@ -37,6 +37,7 @@ import {
   type NormalizedPipelineStatus,
 } from "@/lib/pipeline/statusNormalization"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
+import { usePipelineStatePoll } from "@/lib/hooks/usePipelineStatePoll"
 import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import { readResponseErrorMessage } from "@/lib/utils/error-handling"
 
@@ -54,7 +55,6 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
   const router = useRouter()
   const [isLoading, setIsLoading] = useState(false)
   const [loadingAction, setLoadingAction] = useState<string | null>(null)
-  const [liveStatus, setLiveStatus] = useState<NormalizedPipelineStatus>(() => normalizePipelineStatus(status))
   // Guards against double-invocation (rapid clicks / re-renders) for every action.
   const inFlightRef = useRef(false)
 
@@ -85,22 +85,11 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
   // offering recovery. Mirror PipelineExecutionStatusBadge's reconciliation.
   const { runtime } = usePipelineRuntime(pipelineId)
 
-  const fetchLiveStatus = useCallback(async () => {
-    try {
-      const res = await authFetch(`${API_ENDPOINTS.PIPELINES.GET(pipelineId)}/state`, { cache: "no-store" })
-      if (!res.ok) return
-      const data = (await res.json()) as { status?: string }
-      setLiveStatus(normalizePipelineStatus(data?.status))
-    } catch {
-      // ignore; keep last known status
-    }
-  }, [pipelineId])
-
-  useEffect(() => {
-    void fetchLiveStatus()
-    const t = window.setInterval(() => void fetchLiveStatus(), 4000)
-    return () => window.clearInterval(t)
-  }, [fetchLiveStatus])
+  // The header's one shared /state poll (usePipelineStatePoll); the server-rendered
+  // status stands in until its first answer. Every action below emits a refresh,
+  // which makes it read at once.
+  const live = usePipelineStatePoll(pipelineId)
+  const liveStatus: NormalizedPipelineStatus = live.status ?? normalizePipelineStatus(status)
 
   // Discover whether operator-guarded CDC recovery is enabled on this deployment.
   // One-shot + best-effort: the flag is deployment-static, so there is no need to
@@ -139,7 +128,6 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
       if (response.ok) {
         toast.success("CDC pipeline paused — Kafka connector stopped")
         router.refresh()
-        void fetchLiveStatus()
         emitPipelineRefresh(pipelineId)
       } else {
         toast.error(await readResponseErrorMessage(response, "Pause"))
@@ -165,7 +153,6 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
       if (response.ok) {
         toast.success("CDC pipeline resumed — Kafka connector restarted")
         router.refresh()
-        void fetchLiveStatus()
         emitPipelineRefresh(pipelineId)
       } else {
         toast.error(await readResponseErrorMessage(response, "Resume"))
@@ -200,7 +187,6 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
       await executePipelineWithRunMode(pipelineId, mode, { ackWarnings, nominatedKeys })
       toast.success(mode === "reload" ? "Pipeline reload started" : "Pipeline resumed")
       router.refresh()
-      void fetchLiveStatus()
       emitPipelineRefresh(pipelineId)
       return { awaitingAck: false }
     } catch (error) {
@@ -246,7 +232,6 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
       await restartPipelineCDC(pipelineId)
       toast.success("CDC restart requested — reconnecting the change stream")
       router.refresh()
-      void fetchLiveStatus()
       emitPipelineRefresh(pipelineId)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to restart CDC")
@@ -300,7 +285,6 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
       const resp = await recoverPipelineCDC(pipelineId, buildRecoverRequest(false))
       toast.success(resp?.message || "CDC recovery triggered — reconnecting the change stream")
       router.refresh()
-      void fetchLiveStatus()
       emitPipelineRefresh(pipelineId)
     } catch (error) {
       toast.error(error instanceof Error ? error.message : "Failed to recover CDC pipeline")
@@ -457,7 +441,7 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
         )}
       </div>
 
-      {/* Reload confirm — destructive: DROP + recreate the destination, full re-copy. */}
+      {/* Reload confirm: re-reads every captured table while streaming keeps its position (executor cdc_reload.go). */}
       <AlertDialog open={reloadConfirmOpen} onOpenChange={setReloadConfirmOpen}>
         <AlertDialogContent className="sm:max-w-[480px]">
           <AlertDialogHeader>
@@ -465,23 +449,24 @@ export function CDCPipelineActions({ pipelineId, status, destinationName }: CDCP
               <div className="p-2 rounded-full bg-amber-100 dark:bg-amber-900/30">
                 <AlertTriangle className="h-5 w-5 text-amber-600 dark:text-amber-400" />
               </div>
-              Reload from scratch?
+              Reload every table?
             </AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-2 text-zinc-600 dark:text-zinc-400">
                 <p>
-                  This drops and recreates the destination tables
+                  This re-reads <span className="font-medium">every</span> table the pipeline captures and writes it
                   {destinationName ? (
                     <>
                       {" "}
-                      in <span className="font-medium text-zinc-800 dark:text-zinc-200">{destinationName}</span>
+                      to <span className="font-medium text-zinc-800 dark:text-zinc-200">{destinationName}</span>
                     </>
                   ) : null}{" "}
-                  and re-copies <span className="font-medium">all</span> data from scratch.
+                  again. Streaming then continues from where it stopped, so no change is lost.
                 </p>
                 <p>
-                  Any change-stream checkpoint is discarded. Use <span className="font-medium">Resume</span> instead to
-                  continue from the last checkpoint.
+                  Object-storage folders are emptied before they are rewritten. In a database, every source row is
+                  written again, but a row that exists only in the destination is kept. Use{" "}
+                  <span className="font-medium">Resume</span> to continue without re-reading.
                 </p>
               </div>
             </AlertDialogDescription>

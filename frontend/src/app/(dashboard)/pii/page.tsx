@@ -32,7 +32,10 @@ import {
 } from "lucide-react";
 import { API_ENDPOINTS } from "@/lib/config/api";
 import { authFetch } from "@/lib/api/auth-fetch";
+import { toast } from "sonner";
 import { captureWorkspace, onActiveWorkspaceChange } from "@/lib/workspace/active-workspace";
+import { maskedColumnsNotScanned, type PIIMaskedColumn } from "@/lib/pii/masked-columns";
+import Link from "next/link";
 
 // Types
 interface PIIScanResult {
@@ -97,6 +100,8 @@ interface HashFunction {
 export default function PIIDashboardPage() {
   const [activeTab, setActiveTab] = useState("overview");
   const [scanResults, setScanResults] = useState<PIIScanResult[]>([]);
+  const [maskedColumns, setMaskedColumns] = useState<PIIMaskedColumn[]>([]);
+  const [maskedTruncated, setMaskedTruncated] = useState(false);
   const [approvalRequests, setApprovalRequests] = useState<ApprovalRequest[]>([]);
   const [policies, setPolicies] = useState<PIIPolicy[]>([]);
   const [hashFunctions, setHashFunctions] = useState<HashFunction[]>([]);
@@ -123,7 +128,7 @@ export default function PIIDashboardPage() {
 
   const fetchData = async () => {
     setLoading(true);
-    // Four sequential round-trips — a switch part-way through would otherwise
+    // Five sequential round-trips — a switch part-way through would otherwise
     // leave the page showing a mix of both workspaces' PII findings.
     const isStale = captureWorkspace();
     const errors: string[] = [];
@@ -162,6 +167,8 @@ export default function PIIDashboardPage() {
     try {
       if (!(await load<{ results?: PIIScanResult[] }>("Scan results", "/api/v1/pii/scan/results",
         (d) => setScanResults(d.results || [])))) return;
+      if (!(await load<{ columns?: PIIMaskedColumn[]; truncated?: boolean }>("Masked columns", "/api/v1/pii/masked-columns",
+        (d) => { setMaskedColumns(d.columns || []); setMaskedTruncated(Boolean(d.truncated)); }))) return;
       if (!(await load<{ requests?: ApprovalRequest[] }>("Approval requests", "/api/v1/pii/approvals?status=pending",
         (d) => setApprovalRequests(d.requests || [])))) return;
       if (!(await load<{ policies?: PIIPolicy[] }>("Policies", "/api/v1/pii/policies",
@@ -186,13 +193,31 @@ export default function PIIDashboardPage() {
       });
 
       if (res.ok) {
+        toast.success(decision === "approved" ? "Request approved" : "Request denied");
         setApprovalRequests(prev => prev.filter(r => r.id !== requestId));
         setShowDecisionDialog(false);
         setDecisionNotes("");
         setSelectedRequest(null);
+        return;
       }
+
+      // `if (res.ok)` with no else: a rejected decision produced no message, no
+      // console line and no state change -- the row simply stayed in the list and
+      // the dialog stayed open, which looks like a mis-click. On this page that
+      // silence is worse than cosmetic: an approval that never landed leaves PII
+      // masking un-applied while the operator believes they have decided it.
+      const body = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+      const raw = body?.error ?? body?.message ?? body?.detail;
+      const reason = typeof raw === "string" && raw.trim() ? raw.trim() : `The server answered ${res.status}.`;
+      toast.error(
+        decision === "approved" ? "Could not approve this request" : "Could not deny this request",
+        { description: `${reason} The request is unchanged.` }
+      );
     } catch (error) {
       console.error("Failed to submit decision:", error);
+      toast.error("Could not submit the decision", {
+        description: `${error instanceof Error ? error.message : "The request never reached the server."} The request is unchanged.`,
+      });
     }
   };
 
@@ -233,6 +258,8 @@ export default function PIIDashboardPage() {
     return matchesSearch && matchesFilter;
   });
 
+  const maskedOnly = maskedColumnsNotScanned(scanResults, maskedColumns);
+
   const piiTypeCounts = scanResults.reduce((acc, result) => {
     acc[result.pii_type] = (acc[result.pii_type] || 0) + 1;
     return acc;
@@ -258,7 +285,7 @@ export default function PIIDashboardPage() {
       </div>
 
       {/* A section that could not be loaded says so. The counts below are
-          derived from these four fetches, so a silent failure would show up as
+          derived from these five fetches, so a silent failure would show up as
           a confident zero rather than as a problem. */}
       {loadErrors.length > 0 && (
         <Alert variant="destructive">
@@ -277,7 +304,12 @@ export default function PIIDashboardPage() {
             <div className="flex items-center justify-between">
               <div>
                 <p className="text-sm text-muted-foreground">PII Columns Detected</p>
-                <p className="text-3xl font-bold">{scanResults.length}</p>
+                <p className="text-3xl font-bold" data-testid="pii-columns-detected">{scanResults.length + maskedOnly}</p>
+                {/* A pipeline that masks a column found PII there too; without
+                    this the headline read 0 while pipelines masked columns. */}
+                <p className="text-xs text-muted-foreground">
+                  {scanResults.length} from scans · {maskedOnly} masked by pipelines
+                </p>
               </div>
               <Eye className="w-10 h-10 text-blue-500 opacity-50" />
             </div>
@@ -453,6 +485,56 @@ export default function PIIDashboardPage() {
                   ))}
                 </TableBody>
               </Table>
+            </CardContent>
+          </Card>
+
+          {/* Read-only: this lists what the pipelines' saved transforms say,
+              and changes nothing. */}
+          <Card>
+            <CardHeader>
+              <CardTitle>Masked by pipelines</CardTitle>
+              <CardDescription>
+                Columns your pipelines&apos; saved transforms mask or hash. To change one, edit that pipeline&apos;s transforms.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              {maskedTruncated && (
+                <p className="text-sm text-muted-foreground mb-3">
+                  This workspace has more transform rules than one page reads, so this list is incomplete.
+                </p>
+              )}
+              {maskedColumns.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No pipeline in this workspace masks or hashes a column.</p>
+              ) : (
+                <Table aria-label="Columns masked by pipelines">
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Pipeline</TableHead>
+                      <TableHead>Table</TableHead>
+                      <TableHead>Column</TableHead>
+                      <TableHead>Action</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {maskedColumns.map((m) => (
+                      <TableRow key={`${m.pipeline_id}|${m.table ?? ""}|${m.column}|${m.action}`}>
+                        <TableCell>
+                          <Link href={`/pipelines/${m.pipeline_id}`} className="hover:underline">
+                            {m.pipeline_name || m.pipeline_id}
+                          </Link>
+                        </TableCell>
+                        <TableCell className="font-mono text-sm">
+                          {m.table || <span className="text-muted-foreground font-sans">Every table</span>}
+                        </TableCell>
+                        <TableCell className="font-mono text-sm">{m.column}</TableCell>
+                        <TableCell>
+                          <Badge variant="outline">{m.action}</Badge>
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              )}
             </CardContent>
           </Card>
         </TabsContent>

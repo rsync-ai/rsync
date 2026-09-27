@@ -5,7 +5,6 @@ This package contains the Planner Agent components:
 - strategies.py: Planning strategies (LLM, Heuristic, Composite)
 - cdc_config_generator.py: LLM-driven CDC configuration generation
 - service.py: HTTP service endpoints
-- kafka_consumer.py: Kafka consumer for async planning
 """
 
 from .strategies import (

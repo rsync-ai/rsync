@@ -103,9 +103,13 @@ func TestVerifyNoResidualPlaintext_JSONFlattenMoveLeaks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The flatten moves the plaintext to document_email (default prefix is
+	// col+sep), and the guard must find it wherever it lands — that is the whole
+	// point of this test, and the namespaced name exercises it harder than the
+	// old top-level "email" did.
 	violations, _ := VerifyNoResidualPlaintext(snap, out)
-	if !reflect.DeepEqual(violations, []string{"email"}) {
-		t.Fatalf("violations = %v, want [email]", violations)
+	if !reflect.DeepEqual(violations, []string{"document_email"}) {
+		t.Fatalf("violations = %v, want [document_email]", violations)
 	}
 }
 
