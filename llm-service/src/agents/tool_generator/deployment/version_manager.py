@@ -24,6 +24,29 @@ from enum import Enum
 
 logger = logging.getLogger(__name__)
 
+# Files in the connector volume are read by services running as other uids (the
+# orchestrator is uid 100, tool-generator uid 1000), so they must be world-readable.
+MANIFEST_FILE_MODE = 0o644
+
+
+def _write_json_atomically(path: Path, data: Dict[str, Any]) -> None:
+    """Write JSON to ``path`` via a temp file + rename, leaving it world-readable.
+
+    NamedTemporaryFile creates its file 0600 regardless of the umask, and the
+    rename keeps that mode — so without the chmod, latest.json was readable by
+    tool-generator alone and the orchestrator could not locate the connector.
+    """
+    with tempfile.NamedTemporaryFile(
+        mode='w',
+        dir=path.parent,
+        delete=False,
+        suffix='.json'
+    ) as temp_file:
+        json.dump(data, temp_file, indent=2)
+        temp_path = temp_file.name
+    os.chmod(temp_path, MANIFEST_FILE_MODE)
+    os.rename(temp_path, path)
+
 
 class VersionBumpType(str, Enum):
     """Type of version bump"""
@@ -335,18 +358,7 @@ class ConnectorVersionManager:
                     
                     # Write latest.json atomically (temp file + rename)
                     latest_json_path = self.get_latest_json_path(connector_name)
-                    
-                    with tempfile.NamedTemporaryFile(
-                        mode='w',
-                        dir=connector_path,
-                        delete=False,
-                        suffix='.json'
-                    ) as temp_file:
-                        json.dump(manifest.to_dict(), temp_file, indent=2)
-                        temp_path = temp_file.name
-                    
-                    # Atomic rename
-                    os.rename(temp_path, latest_json_path)
+                    _write_json_atomically(latest_json_path, manifest.to_dict())
                     logger.info(f"✅ Updated latest.json for {connector_name} to {version}")
 
                     # NOTE: connector artifacts are NOT copied back to the connector
@@ -404,16 +416,7 @@ class ConnectorVersionManager:
                     
                     # Write atomically
                     latest_json_path = self.get_latest_json_path(connector_name)
-                    with tempfile.NamedTemporaryFile(
-                        mode='w',
-                        dir=self.get_connector_path(connector_name),
-                        delete=False,
-                        suffix='.json'
-                    ) as temp_file:
-                        json.dump(manifest.to_dict(), temp_file, indent=2)
-                        temp_path = temp_file.name
-                    
-                    os.rename(temp_path, latest_json_path)
+                    _write_json_atomically(latest_json_path, manifest.to_dict())
                     logger.info(f"✅ Deprecated {connector_name} {version}: {reason}")
                     return True
                     

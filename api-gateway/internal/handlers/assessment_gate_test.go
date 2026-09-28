@@ -101,7 +101,7 @@ func TestEvaluateAssessmentGate(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := evaluateAssessmentGate(tc.rep, tc.ack); got != tc.want {
+			if got := evaluateAssessmentGate(tc.rep, tc.ack, nil); got != tc.want {
 				t.Errorf("evaluateAssessmentGate(ack=%v) = %v, want %v", tc.ack, got, tc.want)
 			}
 		})
@@ -110,7 +110,7 @@ func TestEvaluateAssessmentGate(t *testing.T) {
 	// An ERROR finding blocks even if Blocking was somehow left false.
 	r := report(AssessmentError)
 	r.Blocking = false
-	if got := evaluateAssessmentGate(r, true); got != assessmentGateBlocked {
+	if got := evaluateAssessmentGate(r, true, nil); got != assessmentGateBlocked {
 		t.Errorf("error finding with Blocking=false = %v, want blocked", got)
 	}
 }

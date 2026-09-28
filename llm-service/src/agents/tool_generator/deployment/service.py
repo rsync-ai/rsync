@@ -28,6 +28,26 @@ from .container_names import teardown_name_patterns, versioned_container_name
 
 logger = logging.getLogger(__name__)
 
+# The Helm chart sets this false: each pod copies the connector catalog out of the
+# release image into its own emptyDir, so a connector saved here would be invisible
+# to the api-gateway and orchestrator and gone at the next restart. Unset = a Docker
+# install, where every service mounts the one catalog volume.
+CATALOG_SHARED_ENV = "RSYNC_CONNECTOR_CATALOG_SHARED"
+
+PRIVATE_CATALOG_REFUSAL = (
+    "This install cannot keep a generated connector. Every service here reads its own "
+    "copy of the connector catalog from the release image "
+    f"({CATALOG_SHARED_ENV}=false, set by the Helm chart), so a connector saved by the "
+    "generator would be invisible to the rest of the platform and lost when the "
+    "generator restarts. Generate connectors on a Docker install (install.sh); on "
+    "Kubernetes, use the connectors the release ships, listed under connectors.fleet."
+)
+
+
+def connector_catalog_is_shared() -> bool:
+    return (os.getenv(CATALOG_SHARED_ENV) or "").strip().lower() not in ("false", "0", "no")
+
+
 # Lazy imports to avoid circular dependencies
 def _get_docker_builder():
     from .docker_builder import DockerBuilder
@@ -261,7 +281,13 @@ class DeploymentService:
         )
         
         logger.info(f"🚀 Deploying connector: {artifacts.name}")
-        
+
+        if not connector_catalog_is_shared():
+            logger.warning("refusing to save %s: %s=false", artifacts.name, CATALOG_SHARED_ENV)
+            result.error_message = PRIVATE_CATALOG_REFUSAL
+            result.status = DeploymentStatus.FAILED
+            return result
+
         try:
             # Determine a concrete version tag ONCE and use it consistently for:
             # - versions/<version>/ save
@@ -282,7 +308,13 @@ class DeploymentService:
             # Step 1: Create directory and save files
             self._update_status(DeploymentStatus.SAVING)
             
-            output_dir = self.connectors_path / artifacts.name
+            # The directory the version manager writes this version to:
+            # <root>/<name>/versions/<v>, where <root> is public/ (or the category
+            # folder the connector already lives in). The build, the verification
+            # and the reported path must all use it; joining the name onto the base
+            # path named a directory nothing writes, so every generation came back
+            # PARTIAL ("Connector directory not found").
+            output_dir = self.version_manager.get_version_path(artifacts.name, artifacts.version)
             save_success = await self._save_artifacts(
                 artifacts,
                 output_dir,
@@ -839,7 +871,7 @@ class DeploymentService:
         # Remove files
         if remove_files:
             try:
-                connector_dir = self.connectors_path / connector_name
+                connector_dir = self.version_manager.get_connector_path(connector_name)
                 if connector_dir.exists():
                     shutil.rmtree(str(connector_dir))
                     logger.info(f"Removed files: {connector_dir}")

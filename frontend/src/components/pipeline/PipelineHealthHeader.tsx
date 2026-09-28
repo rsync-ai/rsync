@@ -7,7 +7,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { DiagnosePanel } from "@/components/pipeline/DiagnosePanel"
 import { LoadStatusBadge } from "@/components/pipeline/LoadStatusBadge"
-import { backlogIncludesLoadRows, describeLoadStatus } from "@/lib/pipeline/loadStatus"
+import { backlogIncludesLoadRows, describeLoadStatus, isSettingUp } from "@/lib/pipeline/loadStatus"
 import { RUNTIME_PHASE_WAITING_FOR_DATA, runtimePhaseLabel } from "@/lib/pipeline/statusNormalization"
 import { cn } from "@/lib/utils"
 
@@ -68,6 +68,9 @@ export function backlogVital(runtime: PipelineRuntime): BacklogVital | null {
   if (typeof pending !== "number" || !Number.isFinite(pending) || pending < 0) return null
   if (pending === 0) {
     if (runtime.health !== "healthy") return null
+    // Nothing is caught up while the pipeline is being set up again or a load's
+    // rows are still to land: that zero is not a drained stream (item 32).
+    if (isSettingUp(runtime.phase) || backlogIncludesLoadRows(runtime)) return null
     return {
       text: "caught up",
       tone: "ok",
@@ -129,19 +132,18 @@ export function PipelineHealthHeader({ pipelineId }: { pipelineId: string }) {
     }
   } else {
     const p = runtime.progress
-    // On a finished run the header must read 100% / step N/N. Previously
+    // On a finished run the header must read 100%. Previously
     // runtime.progress.percent was rendered verbatim, so a Completed run could
-    // still show e.g. "88% · step 7/8" (the last progress tick before the
-    // terminal event). Clamp to 100 always (a >100% is never right) and, when
-    // the phase is terminal-completed, force 100% and the final step count.
+    // still show e.g. "88%" (the last progress tick before the terminal event).
+    // Clamp to 100 always (a >100% is never right) and force 100% once completed.
+    //
+    // No "step n/m" here: runtime.progress counts steps against a total the
+    // executor fixes, while the Overview timeline and the Monitoring header count
+    // the run's own stages (stepInfoFromEvents) — "step 7/8" sat above "7/7" on
+    // one screen (item 33). The timeline owns the step.
     const done = runtime.phase === "completed"
     if (p && typeof p.percent === "number") {
-      const pct = done ? 100 : Math.min(100, Math.round(p.percent))
-      const step =
-        typeof p.total_steps === "number"
-          ? ` · step ${done ? p.total_steps : (p.current_step ?? p.total_steps)}/${p.total_steps}`
-          : ""
-      vital = `${pct}%${step}`
+      vital = `${done ? 100 : Math.min(100, Math.round(p.percent))}%`
     } else if (done) {
       vital = "100%"
     } else {

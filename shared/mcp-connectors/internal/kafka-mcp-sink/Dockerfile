@@ -18,7 +18,11 @@ WORKDIR /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src
 RUN go mod download
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o kafka-sink-worker ./cmd/kafka-sink-worker
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o kafka-sink-worker ./cmd/kafka-sink-worker \
+    # `go version -m` rejects an incomplete binary; the hash is checked again after
+    # the COPY in the runtime stage (llm-service/tests/test_go_images_verify_their_binary.py).
+    && go version -m kafka-sink-worker >/dev/null \
+    && sha256sum kafka-sink-worker > kafka-sink-worker.sha256
 
 FROM python:3.13-slim
 
@@ -46,6 +50,9 @@ COPY shared/mcp-connectors/internal/kafka-mcp-sink/versions /app/versions
 
 # Build-time Go worker (overrides any checked-in binary).
 COPY --from=worker-builder /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/kafka-sink-worker /app/worker/kafka-sink-worker
+# The binary this stage received is the one the builder built, byte for byte.
+COPY --from=worker-builder /src/shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/kafka-sink-worker.sha256 /tmp/
+RUN cd /app/worker && sha256sum -c /tmp/kafka-sink-worker.sha256 && rm /tmp/kafka-sink-worker.sha256
 
 # Run as an unprivileged user (defense-in-depth: the sink processes untrusted
 # upstream data, so least privilege limits blast radius). Nothing here writes to

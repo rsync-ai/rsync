@@ -146,7 +146,7 @@ def mock_github():
     if not _container_running(MOCK_CONTAINER):
         if not os.path.exists(REPO_MOCK):
             _skip(f"mock server file not found at {REPO_MOCK}")
-        _docker("rm", "-f", MOCK_CONTAINER)
+        _docker("rm", "-fv", MOCK_CONTAINER)
         run = _docker(
             "run", "-d", "--name", MOCK_CONTAINER,
             "--network", MCP_NET, "--network-alias", MOCK_ALIAS,
@@ -174,7 +174,7 @@ def mock_github():
 
     yield
     if started_here:
-        _docker("rm", "-f", MOCK_CONTAINER)
+        _docker("rm", "-fv", MOCK_CONTAINER)
 
 
 @pytest.fixture(scope="module")

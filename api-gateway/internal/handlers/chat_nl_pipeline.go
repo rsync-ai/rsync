@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -981,7 +982,12 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 
 	// Fast path: if the message clearly looks like "<connector> to <connector>", trust deterministic parsing.
 	// This prevents misclassification like "postgresql to mysql" falling into the help flow.
-	intent := h.quickParseDataSyncIntent(message)
+	//
+	// Saved connection NAMES ("Demo warehouse") are read as their connector
+	// types first, so every parse below understands them. parseMsg is for
+	// parsing only; the pending intent keeps the user's own words.
+	parseMsg := h.rewriteNamedConnections(activeWorkspaceID(c), message)
+	intent := h.quickParseDataSyncIntent(parseMsg)
 
 	// Fast path: exactly one connector named ("sync mysql all data", "load data
 	// into postgresql"). Infer its role deterministically so we route to the
@@ -990,7 +996,7 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 	// the help flow below. When a connector is named but its role is ambiguous
 	// (bare "mysql"), ask the user which side it is before continuing.
 	if intent == nil && !looksLikeHelpRequest(message) {
-		if scIntent, ambiguousConn := h.quickParseSingleConnectorIntent(message); scIntent != nil {
+		if scIntent, ambiguousConn := h.quickParseSingleConnectorIntent(parseMsg); scIntent != nil {
 			intent = scIntent
 		} else if ambiguousConn != "" {
 			pendingIntent := &chat.PendingIntent{
@@ -1028,7 +1034,7 @@ func (h *ChatHandler) handleNewIntent(ctx context.Context, c *gin.Context, conv 
 	if intent == nil {
 		// Call LLM for intent classification
 		var err error
-		intent, err = h.parseIntent(llmCtx, message)
+		intent, err = h.parseIntent(llmCtx, parseMsg)
 		if err != nil {
 			log.WithError(err).Warn("Failed to parse intent")
 			return llmUnavailableChatReply(err, traceID, "work out what you're asking")
@@ -1914,12 +1920,16 @@ func (h *ChatHandler) callHelpResponseLLM(ctx context.Context, userMessage strin
 func (h *ChatHandler) handleSlotFilling(ctx context.Context, c *gin.Context, conv *chat.ConversationContext, message, traceID, sessionID string) ChatMessageResponse {
 	state := conv.GetState()
 
+	// The answer may be a saved connection's name ("Demo warehouse"); both
+	// extractors below know connector types only (see rewriteNamedConnections).
+	parseMsg := h.rewriteNamedConnections(activeWorkspaceID(c), message)
+
 	// Call slot-filling LLM prompt
-	slotResult, err := h.callSlotFillingLLM(ctx, conv, message)
+	slotResult, err := h.callSlotFillingLLM(ctx, conv, parseMsg)
 	if err != nil {
 		log.WithError(err).Warn("Slot-filling LLM call failed")
 		// Fallback: try to extract connector name directly
-		slotResult = h.extractConnectorFromMessage(message, state)
+		slotResult = h.extractConnectorFromMessage(parseMsg, state)
 	}
 
 	log.WithFields(log.Fields{
@@ -1934,6 +1944,11 @@ func (h *ChatHandler) handleSlotFilling(ctx context.Context, c *gin.Context, con
 	} else if strings.TrimSpace(pendingIntent.OriginalRequest) == "" {
 		// Best-effort fallback (normally set in handleNewIntent).
 		pendingIntent.OriginalRequest = message
+	} else if parseMsg != message {
+		// checkConnections picks the concrete connection by scanning
+		// OriginalRequest for a connection's name, so the name this answer gave
+		// must be in it, or a same-type connection could be picked instead.
+		pendingIntent.OriginalRequest += "; " + message
 	}
 
 	// Apply extracted value
@@ -2030,7 +2045,7 @@ func (h *ChatHandler) handleSlotFilling(ctx context.Context, c *gin.Context, con
 // and treat it as a new intent.
 func (h *ChatHandler) handleRoleClarification(ctx context.Context, c *gin.Context, conv *chat.ConversationContext, message, traceID, sessionID, userID string) ChatMessageResponse {
 	// User pivoted to a full new request ("mysql to s3") — start over with it.
-	if ni := h.quickParseDataSyncIntent(message); ni != nil && ni.RequiresExecution {
+	if ni := h.quickParseDataSyncIntent(h.rewriteNamedConnections(activeWorkspaceID(c), message)); ni != nil && ni.RequiresExecution {
 		conv.Reset()
 		return h.handleNewIntent(ctx, c, conv, message, traceID, sessionID, userID)
 	}
@@ -2140,7 +2155,10 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 	// If the user starts a new request while we're awaiting confirmation, do NOT keep
 	// looping on the previous pending intent (this is the root cause of "every message shows mysql→postgresql").
 	// Instead, reset and treat the message as a fresh intent.
-	if ni := h.quickParseDataSyncIntent(message); ni != nil && ni.RequiresExecution {
+	// A saved connection's name reads as its connector type (rewriteNamedConnections)
+	// both here and in a mid-confirmation edit below.
+	parseMsg := h.rewriteNamedConnections(activeWorkspaceID(c), message)
+	if ni := h.quickParseDataSyncIntent(parseMsg); ni != nil && ni.RequiresExecution {
 		conv.Reset()
 		return h.handleNewIntent(ctx, c, conv, message, traceID, sessionID, userID)
 	}
@@ -2400,7 +2418,7 @@ func (h *ChatHandler) handleConfirmation(ctx context.Context, c *gin.Context, co
 		// (the old behavior, which discarded the correction) or rerouting as a brand
 		// new intent (which lost the other side the user already gave).
 		if pi := conv.GetPendingIntent(); pi != nil && pi.SourceType != "" && pi.DestinationType != "" {
-			if h.tryEditPendingConnector(conv, pi, message) {
+			if h.tryEditPendingConnector(conv, pi, parseMsg) {
 				return ChatMessageResponse{
 					Message:   fmt.Sprintf("Updated: **%s → %s**. Create and run this pipeline?", getFriendlyName(pi.SourceType), getFriendlyName(pi.DestinationType)),
 					Type:      "confirmation",
@@ -3702,4 +3720,96 @@ func preserveCasing(userMessage, slug string) string {
 		return userMessage[i : i+len(lowerSlug)]
 	}
 	return getFriendlyName(slug)
+}
+
+// connectionNameSeparator is what a user may type between the words of a saved
+// connection's name: "Demo warehouse", "demo-warehouse" and "demo_warehouse" all
+// name the same connection.
+const connectionNameSeparator = `[\s_\-]+`
+
+var connectionNameSeparatorRe = regexp.MustCompile(connectionNameSeparator)
+
+// rewriteNamedConnections replaces each saved connection name (or alias) the
+// message mentions with that connection's connector_type, so the deterministic
+// parsers — which know only catalog ids — read "sync sample data to Demo
+// warehouse" exactly as "sync sample data to postgresql". Only the PARSE sees
+// the rewrite: the pending intent keeps the user's words, and checkConnections'
+// name-scan reads those to pick the concrete connection.
+//
+// A name two connections share across connector types is left alone (naming it
+// cannot choose one), as is a one-word name that is an everyday word ("data"),
+// which would otherwise rewrite that word wherever the user says it.
+func (h *ChatHandler) rewriteNamedConnections(wsID, message string) string {
+	if strings.TrimSpace(wsID) == "" {
+		return message
+	}
+	database := db.GetDB()
+	if database == nil {
+		return message
+	}
+	rows, err := database.Query(`
+		SELECT name, COALESCE(alias, ''), connector_type, type FROM connections
+		WHERE workspace_id = $1 AND status = 'active'`, wsID)
+	if err != nil {
+		log.WithError(err).Debug("chat: could not list connections for name matching")
+		return message
+	}
+	defer rows.Close()
+
+	// Keyed by the name's words, lowercased, so every separator spelling of one
+	// name lands on one entry.
+	types := map[string]map[string]bool{}
+	for rows.Next() {
+		var name, alias, connectorType, direction string
+		if rows.Scan(&name, &alias, &connectorType, &direction) != nil || strings.TrimSpace(connectorType) == "" {
+			continue
+		}
+		for _, candidate := range []string{name, alias} {
+			words := strings.Fields(connectionNameSeparatorRe.ReplaceAllString(strings.ToLower(candidate), " "))
+			key := strings.Join(words, " ")
+			if len(key) < 3 || (len(words) == 1 && (nlConnectorNoiseWords[key] || !chat.IsValidConnectorName(key))) {
+				continue
+			}
+			if types[key] == nil {
+				types[key] = map[string]bool{}
+			}
+			types[key][strings.ToLower(strings.TrimSpace(connectorType))] = true
+		}
+	}
+
+	// Longest first, so "demo warehouse" is replaced before a connection named
+	// "demo" could take half of it.
+	keys := make([]string, 0, len(types))
+	for key, cts := range types {
+		if len(cts) == 1 {
+			keys = append(keys, key)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if len(keys[i]) != len(keys[j]) {
+			return len(keys[i]) > len(keys[j])
+		}
+		return keys[i] < keys[j]
+	})
+
+	out := message
+	for _, key := range keys {
+		var connectorType string
+		for ct := range types[key] {
+			connectorType = ct
+		}
+		parts := strings.Split(key, " ")
+		for i, part := range parts {
+			parts[i] = regexp.QuoteMeta(part)
+		}
+		// Token boundaries as requestMentionsName draws them: a name never
+		// matches inside a longer identifier.
+		re := regexp.MustCompile(`(?i)(^|[^a-z0-9_\-])(` + strings.Join(parts, connectionNameSeparator) + `)($|[^a-z0-9_\-])`)
+		out = re.ReplaceAllString(out, "${1}"+connectorType+"${3}")
+	}
+	if out != message {
+		log.WithFields(log.Fields{"workspace_id": wsID, "rewritten": out}).
+			Info("chat: read saved connection names as their connector types")
+	}
+	return out
 }

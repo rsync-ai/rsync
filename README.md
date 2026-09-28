@@ -1,5 +1,6 @@
 # rsync.ai — Self-hosted AI Data Pipelines, CDC, Scheduled Models, and Lineage
 
+[![Release](https://img.shields.io/github/v/release/rsync-ai/rsync?label=release&color=16a34a)](https://github.com/rsync-ai/rsync/releases/latest)
 [![License: ELv2](https://img.shields.io/badge/license-ELv2-3b82f6)](LICENSE)
 [![Deploy: Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)](#docker--one-command)
 [![Deploy: Helm](https://img.shields.io/badge/deploy-Helm%20chart-0F1689?logo=helm&logoColor=white)](#kubernetes)
@@ -19,6 +20,9 @@ rsync.ai moves data between databases, warehouses, object stores and APIs. You d
 job in a sentence; an agent turns it into an explicit, staged plan, pauses for you when
 something is ambiguous, and executes it on Temporal so a long sync survives restarts. Batch
 and change-data-capture are both first-class. Twenty-one connectors ship in the box.
+
+It is unrelated to [`rsync(1)`](https://rsync.samba.org/), the file-synchronisation
+tool — this moves rows between systems, not files between hosts.
 
 It is **source-available** under the [Elastic License 2.0](LICENSE): run it, modify it,
 and use it internally for free — you just cannot resell it as a hosted service. The
@@ -48,6 +52,45 @@ and use it internally for free — you just cannot resell it as a hosted service
   → [Connector reference](docs/connectors/reference.md)
 
 More guides: [all solutions](docs/solutions/README.md).
+
+![The rsync.ai Data Explorer: a plain-English question turned into SQL against a Postgres source, with the result rows below](docs/assets/explorer.webp)
+
+*Ask in plain English, review the SQL it wrote, run it against a connected source. Here: how
+many swipes went left versus right.*
+
+![A finished pipeline run in rsync.ai: status Success, duration 3m 49s, data freshness, and a run log whose stages report "Data transfer complete! Processed 1183074 rows"](docs/assets/run-detail.webp)
+
+*A finished run, stage by stage: what each one did, the rows it moved, and how stale the
+destination has become since. Nothing here was typed in by hand.*
+
+![The rsync.ai pipelines list: 13 pipelines with type, source and destination, live status, and last run](docs/assets/pipelines.webp)
+
+*Every pipeline in a workspace on one screen: batch or CDC, source to destination, and
+whether it is running right now.*
+
+![The rsync.ai lineage view: the Total swipes model writes public.swipes_total, the Swipes total check model runs after it and writes public.swipes_total_check](docs/assets/lineage.webp)
+
+*Lineage across pipelines and scheduled SQL models: which table a model writes, which model
+reads it, and which one runs after which.*
+
+## How it compares
+
+Managed ELT tools move data well but hand off at the warehouse door. Orchestrators and
+automation tools are general-purpose and leave the data semantics to you. rsync.ai aims at
+the middle: get the data moving *and* keep it modelled, on hardware you control.
+
+| Instead of | What it does well | What rsync.ai does differently |
+|---|---|---|
+| **Fivetran** | Managed and reliable, hundreds of connectors, someone else is on call | Runs on your infrastructure with your keys. A connector you need is a container you can write, not a support ticket. |
+| **Airbyte** | Large connector ecosystem, self-hostable, mature ELT | You describe the pipeline in a sentence and approve a plan instead of configuring each sync by hand, and batch and CDC are the same product rather than separate paths. |
+| **dbt** | The standard for SQL transformation, with deep testing and a large package ecosystem | Scheduled, dependency-aware SQL models are built in, so moving and modelling data is one tool instead of two. dbt's testing and packages are considerably deeper. |
+| **Debezium on its own** | Best-in-class change data capture | rsync.ai runs Debezium and adds the provisioning, sinks, retries and UI around it, so you are not assembling Kafka Connect by hand. |
+| **Airflow / n8n** | General orchestration and automation, enormously flexible | A pipeline is a first-class object with row counts, lineage and CDC built in, rather than something you assemble from operators or nodes. |
+
+**Where it is honestly weaker.** There is no managed option — every install is yours to run.
+The catalogue is 21 connectors, not hundreds. Data-quality assertions are not built yet. And
+the Kubernetes path is younger than the Docker one (see [Project status](#project-status)). If
+you want someone else carrying the pager, use a managed tool.
 
 ## Quick start
 
@@ -82,6 +125,7 @@ component and data-flow diagrams.
 ## Contents
 
 - [What it does](#what-it-does)
+- [How it compares](#how-it-compares)
 - [Quick start](#quick-start)
 - [How it fits together](#how-it-fits-together)
 - [Install](#install) — [Docker](#docker--one-command) · [Kubernetes](#kubernetes)
@@ -117,7 +161,7 @@ shipped connectors still work; the LLM features say `Set up an LLM first` until 
 the stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
-> **Which code you get.** `v0.1.6`, the current release. Both halves of the install come
+> **Which code you get.** `v0.1.7`, the current release. Both halves of the install come
 > from that one tag: the compose file is fetched from `RSYNC_REF` and the images are
 > pulled at a tag derived from it, so the file and the containers it starts are the same
 > commit. Every image the default compose starts is published at that tag and pullable
@@ -138,6 +182,16 @@ success banner over a dead stack.
 > instead. That install is not reproducible: the compose file comes from the branch tip
 > and changes with every commit, while `main` images track the last publish rather than
 > the newest commit, so the two halves move at different rates.
+>
+> **A mirror, or your own build.** `RSYNC_IMAGE_REGISTRY=registry.example.com/rsync-ai`
+> pulls every first-party image from there instead of `ghcr.io/rsync-ai` — the same
+> variable `install-k8s.sh` reads — and is kept in `.env`, so a re-run keeps it. To
+> install a checkout instead of a release (a fork, or a commit no tag carries yet), run
+> `RSYNC_COMPOSE_DIR=<checkout> RSYNC_VERSION=<tag> bash <checkout>/install.sh`, where
+> `<tag>` is the tag you pushed the checkout's images under. The compose files are copied
+> from the checkout instead of downloaded. It refuses to run without `RSYNC_VERSION`,
+> because the default would pair the checkout's compose file with the last release's
+> images.
 
 ### Kubernetes
 

@@ -100,10 +100,7 @@ func TestWaitForTopicPartitionsGivesUpAtTheDeadline(t *testing.T) {
 }
 
 func TestWaitForTopicPartitionsResolvesAgainstLiveKafka(t *testing.T) {
-	broker := os.Getenv("SINK_LIVE_KAFKA_BROKER")
-	if broker == "" {
-		t.Skip("set SINK_LIVE_KAFKA_BROKER (e.g. localhost:9092) to run against a live kafka")
-	}
+	broker := liveKafkaBroker(t)
 	// The whole point of the fix: a topic that does not exist yet must be resolvable
 	// before we join, well inside the timeout (auto-create makes the first probe
 	// create it; without auto-create this test is expected to be run against a

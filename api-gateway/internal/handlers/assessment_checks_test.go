@@ -161,14 +161,13 @@ func TestAttachChecks_GroupsGradesAndCounts(t *testing.T) {
 	if !ok || pk.Level != LevelHigh || pk.Category != CategoryTables {
 		t.Fatalf("NO_PRIMARY_KEY row = %+v, ok=%v", pk, ok)
 	}
-	if len(pk.Objects) != 2 || pk.Objects[0].Name != "public.users" || pk.Objects[1].Name != "public.orders" {
+	// public.orders is the orchestrator's CDC_TABLE_MISSING_PRIMARY_KEY row's
+	// (TestAttachChecks_OneRowPerTitlePerObject); only users is left here.
+	if len(pk.Objects) != 1 || pk.Objects[0].Name != "public.users" {
 		t.Fatalf("NO_PRIMARY_KEY objects = %+v", pk.Objects)
 	}
-	if pk.Objects[1].Message != "orders has no primary key" {
-		t.Fatalf("per-object message lost: %+v", pk.Objects[1])
-	}
-	if pk.Message != "Reported on 2 objects — see each one below." {
-		t.Fatalf("row message = %q", pk.Message)
+	if pk.Objects[0].Message != "users has no primary key" || pk.Message != "users has no primary key" {
+		t.Fatalf("per-object message lost: row %q, object %+v", pk.Message, pk.Objects[0])
 	}
 
 	read, ok := findCheckRow(report.Checks, "CONNECTOR_TABLE_READABLE", ResultPassed)
@@ -808,4 +807,44 @@ func TestGetPipelineAssessment(t *testing.T) {
 			t.Fatalf("status %d: %s", w.Code, w.Body.String())
 		}
 	})
+}
+
+// 0.1.7-rc1: a keyless table on a CDC pipeline listed "Table primary key" twice
+// -- the orchestrator's CDC-aware drift warning and the gateway's batch wording
+// ("reruns will be idempotent on the row hash"), which is wrong for CDC. The
+// class is two codes that share a title reporting on the same object; the
+// orchestrator's check ran against the live source with the pipeline's mode,
+// so it is the one that stays.
+func TestAttachChecks_OneRowPerTitlePerObject(t *testing.T) {
+	report, ra := sampleReportAndReadiness()
+	attachChecks(report, ra)
+
+	seen := map[string]string{}
+	for _, c := range report.Checks {
+		for _, o := range c.Objects {
+			key := c.Title + " | " + o.Name
+			if prev, dup := seen[key]; dup {
+				t.Errorf("%q is listed under %q by both %s and %s", o.Name, c.Title, prev, c.Code)
+			}
+			seen[key] = c.Code
+		}
+	}
+	if got := seen["Table primary key | public.orders"]; got != "CDC_TABLE_MISSING_PRIMARY_KEY" {
+		t.Errorf("public.orders primary key row comes from %q, want the orchestrator's CDC_TABLE_MISSING_PRIMARY_KEY", got)
+	}
+	// Control: a table the orchestrator did not report on keeps the gateway's row.
+	if got := seen["Table primary key | public.users"]; got != FindingNoPrimaryKey {
+		t.Errorf("public.users primary key row comes from %q, want %s", got, FindingNoPrimaryKey)
+	}
+}
+
+// Without the orchestrator's checks (it was unreachable) the gateway's finding
+// is the only statement about the key, so it must survive.
+func TestAttachChecks_KeepsTheGatewayRowWhenTheOrchestratorSaidNothing(t *testing.T) {
+	report, _ := sampleReportAndReadiness()
+	attachChecks(report, nil)
+	pk, ok := findCheckRow(report.Checks, FindingNoPrimaryKey, ResultWarning)
+	if !ok || len(pk.Objects) != 2 {
+		t.Fatalf("NO_PRIMARY_KEY row = %+v, ok=%v; want both tables", pk, ok)
+	}
 }

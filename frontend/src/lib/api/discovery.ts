@@ -158,9 +158,12 @@ export interface Vendor {
 
 class DiscoveryError extends Error {
   status: number
-  constructor(message: string, status: number) {
+  /** What the generator suggests trying instead, when it refused. */
+  suggestions: string[]
+  constructor(message: string, status: number, suggestions: string[] = []) {
     super(message)
     this.status = status
+    this.suggestions = suggestions
   }
 }
 
@@ -196,6 +199,42 @@ export async function listVendors(query?: string): Promise<Vendor[]> {
 export async function getVendor(id: string): Promise<Vendor> {
   const res = await call<{ vendor: Vendor }>(`/v1/vendors/${encodeURIComponent(id)}`)
   return res.vendor
+}
+
+// ---------------------------------------------------------------------------
+// Is the discovery wizard served here?
+// ---------------------------------------------------------------------------
+
+/**
+ * The probe asks for the wizard's own first call, not for an edition name.
+ *
+ * `/v1/vendors` lives in discovery_routes.py beside `/v1/discover`, and that
+ * whole module is on llm-service/oss-strip-list.txt, so the community image
+ * answers it 404 exactly when it cannot serve the wizard. Not
+ * `/v1/discover/metrics`: that route is declared after
+ * `/v1/discover/{session_id}` and never matches, so it 404s in both images.
+ * test_generate_page_probe_names_a_stripped_route.py pins the pairing.
+ */
+export const DISCOVERY_PROBE_PATH = "/v1/vendors?include_learned=false"
+
+export type DiscoveryAvailability = "available" | "unavailable" | "unknown"
+
+/**
+ * "unavailable" only on a 404. Anything else that is not a 2xx -- a 502 from a
+ * restarting service, a 403, a network error -- is "unknown", and the page
+ * keeps the wizard: an outage must not quietly swap the cloud screen for the
+ * community one.
+ */
+export async function probeDiscovery(): Promise<DiscoveryAvailability> {
+  try {
+    const res = await authFetch(`${TOOLGEN_BASE}${DISCOVERY_PROBE_PATH}`, {
+      headers: { Accept: "application/json" },
+    })
+    if (res.ok) return "available"
+    return res.status === 404 ? "unavailable" : "unknown"
+  } catch {
+    return "unknown"
+  }
 }
 
 // Discovery session
@@ -260,6 +299,26 @@ export interface GenerateFromSessionResponse {
 }
 
 /**
+ * The error a non-2xx generate answer carries. error_message is the
+ * sentence; error can be a code such as llm_not_configured (api-gateway
+ * connector_generator.go), and is the only key on the gateway's own 400s.
+ */
+async function generateError(res: Response): Promise<DiscoveryError> {
+  let message = res.statusText
+  let suggestions: string[] = []
+  try {
+    const body = await res.json()
+    message = body?.error_message || body?.error || body?.detail || message
+    if (Array.isArray(body?.suggestions)) {
+      suggestions = body.suggestions.filter((s: unknown): s is string => typeof s === "string")
+    }
+  } catch {
+    // not JSON -- keep the status line
+  }
+  return new DiscoveryError(message || "generation failed", res.status, suggestions)
+}
+
+/**
  * Generate a connector from a confirmed discovery contract.
  *
  * Goes through the api-gateway's existing /api/v1/connectors/generate endpoint,
@@ -292,18 +351,53 @@ export async function generateFromSession(
     }),
   })
   if (!res.ok) {
-    let detail: string = res.statusText
-    try {
-      const body = await res.json()
-      // error_message is the sentence; error can be a code such as
-      // llm_not_configured (api-gateway connector_generator.go).
-      detail = body?.error_message || body?.error || body?.detail || detail
-    } catch {
-      // ignore
-    }
-    throw new DiscoveryError(detail || "generation failed", res.status)
+    throw await generateError(res)
   }
   return (await res.json()) as GenerateFromSessionResponse
+}
+
+// ---------------------------------------------------------------------------
+// Generate from an OpenAPI / Swagger document
+// ---------------------------------------------------------------------------
+
+export interface GenerateFromSpecResponse extends GenerateFromSessionResponse {
+  version?: string | null
+  output_path?: string | null
+  suggestions?: string[]
+  draft_warnings?: string[]
+  metadata?: { notes?: string[]; already_exists?: boolean } & Record<string, unknown>
+}
+
+/**
+ * The document itself, inline, to the same guarded endpoint the wizard uses.
+ * Never `openapi_spec_url`: the community service refuses to fetch URLs (it
+ * sits on the connector network with the Docker socket), so a URL is fetched
+ * by the browser and sent here as text.
+ *
+ * A 2xx can still be a failure -- the deterministic route reports a
+ * persistence error as `success: false` in a 200 -- so the caller reads
+ * `success`, not only the status.
+ */
+export async function generateFromSpec(
+  apiName: string,
+  openapiSpec: string,
+  options: { baseUrl?: string; forceRegenerate?: boolean } = {},
+): Promise<GenerateFromSpecResponse> {
+  const body: Record<string, unknown> = {
+    api_name: apiName,
+    openapi_spec: openapiSpec,
+    force_regenerate: options.forceRegenerate ?? false,
+  }
+  if (options.baseUrl?.trim()) body.base_url = options.baseUrl.trim()
+  const res = await authFetch(`${API_GATEWAY_URL}/api/v1/connectors/generate`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  })
+  if (!res.ok) {
+    throw await generateError(res)
+  }
+  return (await res.json()) as GenerateFromSpecResponse
 }
 
 // ---------------------------------------------------------------------------

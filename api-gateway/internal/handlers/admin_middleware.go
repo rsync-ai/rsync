@@ -310,6 +310,7 @@ func AdminRoleMiddleware() gin.HandlerFunc {
 
 		// Set IDs for downstream handlers + audit logger
 		c.Set("user_id", userID)
+		bindCallerToRequest(c, userID)
 		c.Set("admin_user_id", userID)
 		c.Set("admin_user_email", email)
 
@@ -416,6 +417,7 @@ func PowerUserOrAdminMiddleware() gin.HandlerFunc {
 		}
 
 		c.Set("user_id", userID)
+		bindCallerToRequest(c, userID)
 		c.Set("user_email", email)
 		c.Set("user_role", r)
 		c.Next()

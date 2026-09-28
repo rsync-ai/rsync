@@ -96,6 +96,7 @@ var codeCategory = map[string]string{
 	"SINK_WRITE_REJECTED":       CategoryDataLoss,
 	"CDC_SOURCE_STREAM_STALLED": CategoryDataLoss,
 	"CDC_CONNECTOR_DOWN":        CategoryHealth,
+	"CDC_CAPTURE_STOPPED":       CategoryHealth,
 	"SINK_WORKER_ABSENT":        CategoryHealth,
 	"CDC_SINK_WEDGED":           CategoryHealth,
 

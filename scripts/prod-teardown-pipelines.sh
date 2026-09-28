@@ -494,7 +494,7 @@ else
         if [ -n "$KAFKA_CONTAINER" ]; then docker stop "$KAFKA_CONTAINER"; say "stopped $KAFKA_CONTAINER"; fi
         # `docker volume rm` fails while any container still references the volume,
         # including stopped ones — remove the broker container, not just stop it.
-        [ -n "$KAFKA_CONTAINER" ] && docker rm -f "$KAFKA_CONTAINER" >/dev/null 2>&1 || true
+        [ -n "$KAFKA_CONTAINER" ] && docker rm -fv "$KAFKA_CONTAINER" >/dev/null 2>&1 || true
         docker volume rm "$KAFKA_VOLUME"
         say "removed volume $KAFKA_VOLUME"
     fi

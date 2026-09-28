@@ -115,7 +115,7 @@ func TestLockNamespaceForRun_ClassifiesMissingPipeline(t *testing.T) {
 	mock.ExpectQuery(regexp.QuoteMeta(nsLockWorkspaceQuery)).WillReturnError(sql.ErrNoRows)
 
 	_, err = lockNamespaceForRun(t.Context(), mockDB,
-		"12c3579c-52bc-47f2-96ae-10719e4e943c", []string{"demo_src.demo_customers"})
+		"12c3579c-52bc-47f2-96ae-10719e4e943c", []string{"demo_src.demo_customers"}, nil)
 	if err != errNamespaceLockNotFound {
 		t.Errorf("err = %v, want errNamespaceLockNotFound", err)
 	}

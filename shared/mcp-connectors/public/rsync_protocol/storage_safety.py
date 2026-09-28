@@ -44,9 +44,18 @@ def _host_of(endpoint: str) -> str:
 def _internal_minio_hosts() -> set:
     """The set of hostnames that ARE the internal infra MinIO. Always includes
     the `minio` alias and the `rsync-ai-minio` service name (the split-brain
-    footgun), plus whatever MINIO_ENDPOINT_URL points at, plus any operator
-    overrides in STORAGE_INTERNAL_MINIO_HOSTS (comma/space separated)."""
-    hosts = {"minio", "rsync-ai-minio"}
+    footgun), plus the blob lane's staging store under its compose service
+    and container names (it sits on the connector network, so a user
+    endpoint naming it would otherwise resolve), plus whatever
+    MINIO_ENDPOINT_URL points at, plus any operator overrides in
+    STORAGE_INTERNAL_MINIO_HOSTS (comma/space separated)."""
+    hosts = {
+        "minio",
+        "rsync-ai-minio",
+        "blob-staging",
+        "rsync-blob-staging",
+        "rsync-ai-blob-staging",
+    }
     for env_key in ("MINIO_ENDPOINT_URL", "MINIO_ENDPOINT"):
         h = _host_of(os.getenv(env_key) or "")
         if h:

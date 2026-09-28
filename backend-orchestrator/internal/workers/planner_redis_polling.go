@@ -76,11 +76,6 @@ func (w *PlannerWorker) pollAndProcessRequests() error {
 }
 
 func (w *PlannerWorker) processCorrelationRequest(req *correlation.PendingRequest) {
-	ctx, cancel := correlationWorkContext(w.ctx, "planner")
-	defer cancel()
-	deliverCtx, cancelDeliver := correlationDeliveryContext()
-	defer cancelDeliver()
-
 	logger := log.WithFields(log.Fields{
 		"correlation_id": req.CorrelationID,
 		"request_type":   req.RequestType,
@@ -109,19 +104,13 @@ func (w *PlannerWorker) processCorrelationRequest(req *correlation.PendingReques
 	}
 
 	// PHASE 2.4 FIX: Use main Execute() method from planner.go
-	result := w.Execute(ctx, task)
-
-	logger.Info("✅ Task processing succeeded")
-
-	// Write response to Redis
-	if routeErr := RouteResult(deliverCtx, task, result); routeErr != nil {
-		logger.WithError(routeErr).Error("Failed to route response")
-	}
-
-	// Delete request from Redis after processing
-	if delErr := w.correlationClient.DeleteRequest(deliverCtx, req.CorrelationID, "planner"); delErr != nil {
-		logger.WithError(delErr).Warn("Failed to delete request from Redis")
-	}
+	// Route the result and delete the request once Execute returns — on a fresh
+	// delivery context, so a planner that ran out its budget still reports it.
+	runCorrelationRequest(w.ctx, "planner", w.correlationClient, task, logger, func(ctx context.Context) TaskResult {
+		result := w.Execute(ctx, task)
+		logger.Info("✅ Task processing succeeded")
+		return result
+	})
 
 	logger.Info("📤 Planner request processed and response sent to Redis")
 }

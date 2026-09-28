@@ -76,7 +76,9 @@ def _is_local_db_host(host: Any) -> bool:
         ip = ipaddress.ip_address(h)
     except ValueError:
         # Not an IP literal => hostname: dotless = local service name, dotted = remote.
-        return "." not in h
+        # A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+        # suffix resolves on public DNS (shared/local_db_host_golden.json).
+        return "." not in h or h.endswith((".svc", ".cluster.local"))
     if ip.is_loopback or ip.is_link_local:
         return True
     # Narrow RFC1918/ULA + CGNAT membership (mirrors Go net.IP.IsPrivate plus the
@@ -739,38 +741,64 @@ class {{ spec.class_name }}(BaseMCPConnector):
         cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db}`")
 
         ct = column_types or {}
-        col_defs = ", ".join([f"`{c}` {self._normalize_ddl_type(ct.get(c, 'TEXT'))}" for c in safe_cols])
+        safe_keys = [c for c in (key_fields or []) if self._is_safe_ident(c)]
+        # MySQL cannot UNIQUE-index TEXT/BLOB/JSON (error 1170); without the index
+        # every upsert is a plain insert, so a key column gets a bounded type.
+        _unindexable = {"text", "tinytext", "mediumtext", "longtext", "json",
+                        "blob", "tinyblob", "mediumblob", "longblob"}
+
+        def _key_ddl(ddl: str) -> str:
+            if str(ddl).lower().split("(")[0].strip() in _unindexable:
+                return canonical_to_ddl("mysql", "string", is_key=True, single_key=len(safe_keys) == 1)
+            return ddl
+
+        def _ddl_for(c: str) -> str:
+            ddl = self._normalize_ddl_type(ct.get(c, 'TEXT'))
+            return _key_ddl(ddl) if c in safe_keys else ddl
+
+        col_defs = ", ".join([f"`{c}` {_ddl_for(c)}" for c in safe_cols])
         cursor.execute(f"CREATE TABLE IF NOT EXISTS `{db}`.`{name}` ({col_defs})")
 
         # Add missing columns (best-effort by querying information_schema)
+        existing: Dict[str, str] = {}
         try:
             cursor.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
                 (db, name),
             )
-            existing = set()
             for row in cursor.fetchall() or []:
                 # mysql dict cursor vs tuple cursor
                 if isinstance(row, dict):
                     v = row.get("column_name") or row.get("COLUMN_NAME")
+                    t = row.get("data_type") or row.get("DATA_TYPE") or ""
                 else:
                     v = row[0] if row else None
+                    t = row[1] if row and len(row) > 1 else ""
                 if v:
-                    existing.add(str(v))
+                    existing[str(v)] = str(t).lower()
             for c in safe_cols:
                 if c in existing:
                     continue
-                cursor.execute(f"ALTER TABLE `{db}`.`{name}` ADD COLUMN `{c}` {self._normalize_ddl_type(ct.get(c, 'TEXT'))}")
+                cursor.execute(f"ALTER TABLE `{db}`.`{name}` ADD COLUMN `{c}` {_ddl_for(c)}")
         except Exception:
             # If information_schema isn't accessible, avoid failing the write path.
             pass
 
         # Safe-widen existing columns whose type evolved (best-effort; the ADD COLUMN
         # loop above only adds NEW columns, so this applies an in-place type change).
-        self._widen_existing_columns(cursor, db, name, safe_cols, ct, "mysql")
+        # Key columns widen against their bounded type, never back to TEXT.
+        key_ct = {**ct, **{k: _ddl_for(k) for k in safe_keys if k in ct}}
+        self._widen_existing_columns(cursor, db, name, safe_cols, key_ct, "mysql")
 
-        safe_keys = [c for c in (key_fields or []) if self._is_safe_ident(c)]
         if safe_keys:
+            # A table created before key columns were bounded holds an unindexable
+            # key column; narrow it so the index below can land.
+            for c in safe_keys:
+                if existing.get(c, "") in _unindexable:
+                    try:
+                        cursor.execute(f"ALTER TABLE `{db}`.`{name}` MODIFY COLUMN `{c}` {_key_ddl(existing[c])}")
+                    except Exception as e:
+                        logger.warning("mysql: key column %s.%s.%s could not be narrowed: %s", db, name, c, e)
             idx = self._mk_index_name(db, name, safe_keys)
             # MySQL doesn't support CREATE UNIQUE INDEX IF NOT EXISTS; check by name.
             try:
@@ -782,9 +810,13 @@ class {{ spec.class_name }}(BaseMCPConnector):
                 if not row:
                     cols_sql = ", ".join([f"`{c}`" for c in safe_keys])
                     cursor.execute(f"CREATE UNIQUE INDEX `{idx}` ON `{db}`.`{name}` ({cols_sql})")
-            except Exception:
-                # Best-effort: do not fail table creation if index creation fails.
-                pass
+            except Exception as e:
+                # Do not fail table creation, but never silently: without this index
+                # upserts on the table insert duplicates instead of updating.
+                logger.warning(
+                    "mysql: could not create unique index %s on %s.%s; upserts will insert duplicates: %s",
+                    idx, db, name, e,
+                )
 
     # =========================================================================
     # DDL HELPERS (optional; only called when connector advertises support)

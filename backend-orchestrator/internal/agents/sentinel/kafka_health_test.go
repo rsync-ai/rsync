@@ -104,13 +104,18 @@ func TestProbeKafkaBrokerReportsHealthyWhenTheClusterAnswers(t *testing.T) {
 func TestCheckKafkaHealthMarksTheBrokerUnhealthyWhenItIsDown(t *testing.T) {
 	h, mock, cleanup := newHealthMonitorForTest(t)
 	defer cleanup()
-	mock.ExpectExec(`INSERT INTO sentinel_component_health`).
-		WillReturnResult(sqlmock.NewResult(0, 1))
-
 	probe := &stubKafkaProbe{err: errors.New("kafka metadata refresh failed: EOF")}
 	h.kafkaProbe = probe
 
-	h.checkKafkaHealth(context.Background())
+	// Debounced (debounceInfraFailure): the misses before the threshold are degraded.
+	for i := 1; i <= serviceFailureThreshold; i++ {
+		mock.ExpectExec(`INSERT INTO sentinel_component_health`).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+		h.checkKafkaHealth(context.Background())
+		if got := infraHealth(t, h, "infrastructure:kafka").Status; i < serviceFailureThreshold && got != HealthStatusDegraded {
+			t.Fatalf("miss %d recorded %q, want degraded", i, got)
+		}
+	}
 
 	if probe.calls == 0 {
 		t.Fatal("checkKafkaHealth never asked the broker anything — the verdict is a hardcoded constant")
@@ -156,6 +161,12 @@ func TestCheckKafkaHealthPublishesToTheTableTheMonitoringAPIReads(t *testing.T) 
 	h, mock, cleanup := newHealthMonitorForTest(t)
 	defer cleanup()
 
+	for i := 1; i < serviceFailureThreshold; i++ {
+		mock.ExpectExec(`INSERT INTO sentinel_component_health`).
+			WithArgs("infrastructure:kafka", ComponentTypeInfrastructure, HealthStatusDegraded,
+				sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg(), sqlmock.AnyArg()).
+			WillReturnResult(sqlmock.NewResult(0, 1))
+	}
 	mock.ExpectExec(`INSERT INTO sentinel_component_health`).
 		WithArgs(
 			"infrastructure:kafka",
@@ -171,7 +182,9 @@ func TestCheckKafkaHealthPublishesToTheTableTheMonitoringAPIReads(t *testing.T) 
 		WillReturnResult(sqlmock.NewResult(0, 1))
 
 	h.kafkaProbe = &stubKafkaProbe{err: errors.New("no brokers available")}
-	h.checkKafkaHealth(context.Background())
+	for i := 0; i < serviceFailureThreshold; i++ {
+		h.checkKafkaHealth(context.Background())
+	}
 
 	if err := mock.ExpectationsWereMet(); err != nil {
 		t.Errorf("kafka health verdict never reached sentinel_component_health: %v", err)
@@ -273,3 +286,45 @@ func (a argCapture) Match(v driver.Value) bool {
 }
 
 var _ sqlmock.Argument = argCapture{}
+
+// PostgreSQL gets the same debounce as Kafka and Kafka Connect: one failed ping is
+// degraded, not the CRITICAL INFRASTRUCTURE_DOWN an unhealthy row becomes, and a
+// good ping starts the count over.
+func TestCheckPostgreSQLHealthIsDebounced(t *testing.T) {
+	db, mock, err := sqlmock.New(sqlmock.MonitorPingsOption(true))
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	h := NewHealthMonitor(nil, db, DefaultSentinelConfig(), nil)
+	tick := func() HealthStatus {
+		mock.ExpectPing()
+		mock.ExpectExec(`INSERT INTO sentinel_component_health`).WillReturnResult(sqlmock.NewResult(0, 1))
+		h.checkPostgreSQLHealth(context.Background())
+		return infraHealth(t, h, "infrastructure:postgresql").Status
+	}
+	failTick := func() HealthStatus {
+		mock.ExpectPing().WillReturnError(errors.New("connection refused"))
+		mock.ExpectExec(`INSERT INTO sentinel_component_health`).WillReturnResult(sqlmock.NewResult(0, 1))
+		h.checkPostgreSQLHealth(context.Background())
+		return infraHealth(t, h, "infrastructure:postgresql").Status
+	}
+
+	for i := 1; i < serviceFailureThreshold; i++ {
+		if got := failTick(); got != HealthStatusDegraded {
+			t.Fatalf("miss %d recorded %q, want degraded", i, got)
+		}
+	}
+	if got := failTick(); got != HealthStatusUnhealthy {
+		t.Fatalf("miss %d recorded %q, want unhealthy", serviceFailureThreshold, got)
+	}
+	if got := tick(); got != HealthStatusHealthy {
+		t.Fatalf("recovery recorded %q, want healthy", got)
+	}
+	if got := failTick(); got != HealthStatusDegraded {
+		t.Errorf("first miss after recovery recorded %q, want degraded (count reset)", got)
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
+	}
+}

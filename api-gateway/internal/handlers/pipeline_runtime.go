@@ -243,7 +243,15 @@ func GetPipelineRuntime(c *gin.Context) {
 		}
 	}
 
-	rt.Phase = computeRuntimePhase(mode, pStatus.String, currentStage.String, depAggregate, rt.Liveness, rt.Blocker, firstDataWaitSince)
+	// Only a CDC run still in the executor stage needs the handoff lookup.
+	handoffDone := false
+	if mode == "cdc" && strings.Contains(strings.ToLower(currentStage.String), "executor") {
+		switch strings.ToLower(strings.TrimSpace(pStatus.String)) {
+		case "running", "processing":
+			handoffDone = executionClosedForStreaming(database, pipelineID, execID.String)
+		}
+	}
+	rt.Phase = computeRuntimePhase(mode, pStatus.String, currentStage.String, depAggregate, rt.Liveness, rt.Blocker, firstDataWaitSince, handoffDone)
 	// Pause writes pipelines.status only, so message is still the last pre-pause
 	// progress tick — the banner read "Streaming pipeline active" next to a correct
 	// "Paused" pill (KI-CDC-PAUSE-STALE-PROGRESS-MESSAGE). See runtimeMessage.
@@ -537,6 +545,13 @@ func applySinkLag(liveness *RuntimeLiveness, r sinkLagReading) {
 // never-probed rows — so the panel read "Unknown" across the board. Rows with a
 // NULL execution_id apply to every run (migration 049). When the current run has
 // no rows yet, or there is no progress row, it falls back to all rows as before.
+//
+// Health is the RESOURCE's, not the run row's: the join takes the newest probe of the
+// same (kind, identifier) on this pipeline, preferring the row's own verdict when it
+// has been probed. The prober only probes while a run is going, so a zero-row Resume
+// that finishes in a second registers rows nobody ever probes, and the header read
+// "unknown" + Diagnose on a clean pipeline (U-HEALTH-UNKNOWN). LastCheckedAt stays the
+// verdict's own time, so an older verdict reads as older.
 const runtimeDepsCurrentRunSQL = `(
 		    d.execution_id IS NULL
 		    OR NOT EXISTS (
@@ -562,7 +577,16 @@ func loadRuntimeDeps(database *sql.DB, pipelineID string) ([]RuntimeDep, string)
 		       COALESCE(h.last_error, ''),
 		       COALESCE(h.details, '{}'::jsonb)
 		FROM pipeline_dependencies d
-		LEFT JOIN pipeline_dependency_health h ON h.dependency_id = d.id
+		LEFT JOIN LATERAL (
+		  SELECT h2.*
+		  FROM pipeline_dependencies d2
+		  JOIN pipeline_dependency_health h2 ON h2.dependency_id = d2.id
+		  WHERE d2.pipeline_id = d.pipeline_id
+		    AND d2.kind = d.kind
+		    AND d2.identifier = d.identifier
+		  ORDER BY (h2.last_checked_at IS NOT NULL) DESC, (d2.id = d.id) DESC, h2.last_checked_at DESC
+		  LIMIT 1
+		) h ON true
 		WHERE d.pipeline_id = $1
 		  AND `+runtimeDepsCurrentRunSQL+`
 		ORDER BY d.kind, d.identifier, d.created_at DESC
@@ -629,7 +653,10 @@ func loadRuntimeDeps(database *sql.DB, pipelineID string) ([]RuntimeDep, string)
 //
 // firstDataWaitSince is loadCDCFirstDataWait's answer (zero = not known to be waiting); it
 // only matters on the CDC paths that reach cdcLivenessPhase.
-func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, liveness *RuntimeLiveness, blocker *RuntimeBlocker, firstDataWaitSince time.Time) string {
+//
+// handoffDone is executionClosedForStreaming's answer for a CDC run still in the executor
+// stage; it is false (not looked up) everywhere else.
+func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, liveness *RuntimeLiveness, blocker *RuntimeBlocker, firstDataWaitSince time.Time, handoffDone bool) string {
 	status := strings.ToLower(strings.TrimSpace(rawStatus))
 
 	// Terminal failure wins over everything else: a failed run must read "failed" even if a
@@ -661,8 +688,15 @@ func computeRuntimePhase(mode, rawStatus, currentStage, depHealth string, livene
 		// We diverge into streaming / idle / degraded / stalled based on liveness + dep health.
 		switch status {
 		case "running", "processing":
-			// Setup phase before stream starts. If we're past the executor stage we treat as streaming.
-			if strings.Contains(strings.ToLower(currentStage), "executor") || strings.Contains(strings.ToLower(currentStage), "stream") {
+			// Setup until the streaming handoff: it stamps current_stage 'streaming'
+			// (pipeline_status_activity.go) after the executor has started the
+			// connector and queued any Reload re-snapshot. The executor stage used to
+			// count as streaming, so a Reload's 10–15 s of starting the connector read
+			// "caught up" off the previous run's zero backlog
+			// (U-RELOAD-CAUGHTUP-WINDOW). handoffDone — the execution row closed — keeps
+			// a stream streaming when that best-effort progress reconcile did not land.
+			stage := strings.ToLower(currentStage)
+			if strings.Contains(stage, "stream") || (strings.Contains(stage, "executor") && handoffDone) {
 				return cdcLivenessPhase(depHealth, liveness, firstDataWaitSince)
 			}
 			return "syncing"

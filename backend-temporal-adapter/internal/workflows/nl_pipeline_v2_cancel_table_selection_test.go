@@ -95,6 +95,7 @@ func newTableSelectionEnv(h *tableSelectionHarness) *testsuite.TestWorkflowEnvir
 	env.RegisterActivityWithOptions(h.executor, activity.RegisterOptions{Name: "ExecutorNativeActivity"})
 	env.RegisterActivityWithOptions(h.stateUpdate, activity.RegisterOptions{Name: "StateUpdateActivity"})
 	env.RegisterActivityWithOptions(h.pipelineStatus, activity.RegisterOptions{Name: "UpdatePipelineStatusActivity"})
+	env.RegisterActivityWithOptions(finalizeVia(h.pipelineStatus), activity.RegisterOptions{Name: "FinalizeCompletedRunActivity"})
 	env.RegisterActivityWithOptions(h.domainEvent, activity.RegisterOptions{Name: "EmitDomainEventActivity"})
 	return env
 }

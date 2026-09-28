@@ -91,6 +91,9 @@ type AssessmentFinding struct {
 	Severity AssessmentSeverity     `json:"severity"`
 	Message  string                 `json:"message"`
 	Details  map[string]interface{} `json:"details,omitempty"`
+	// Acknowledged is true for a warning this pipeline's operator already
+	// acknowledged, unchanged, on an earlier run (assessment_acks.go, U-19).
+	Acknowledged bool `json:"acknowledged,omitempty"`
 }
 
 // AssessmentTable groups findings + per-table metadata that the user
@@ -156,7 +159,11 @@ const (
 // could start any subsequent run no matter what the assessment found. Extracted
 // as a pure function so that boundary is unit-testable rather than buried in an
 // HTTP handler.
-func evaluateAssessmentGate(report *AssessmentReport, ackWarnings bool) assessmentGateOutcome {
+//
+// acked holds the warning identities (assessmentWarningKey) this pipeline's
+// operator acknowledged on an earlier run; such a warning no longer gates while
+// it is unchanged (U-19). It never applies to errors.
+func evaluateAssessmentGate(report *AssessmentReport, ackWarnings bool, acked map[string]bool) assessmentGateOutcome {
 	if report == nil {
 		return assessmentGateAllow
 	}
@@ -176,7 +183,7 @@ func evaluateAssessmentGate(report *AssessmentReport, ackWarnings bool) assessme
 	}
 	for _, t := range report.Tables {
 		for _, f := range t.Findings {
-			if f.Severity == AssessmentWarning {
+			if f.Severity == AssessmentWarning && !acked[assessmentWarningKey(t, f)] {
 				return assessmentGateNeedsAck
 			}
 		}

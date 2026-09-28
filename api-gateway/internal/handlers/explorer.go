@@ -226,7 +226,7 @@ func GenerateSQL(c *gin.Context) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		log.Errorf("[GenerateSQL] Text2SQL returned %d: %s", resp.StatusCode, string(body))
-		c.JSON(resp.StatusCode, gin.H{
+		c.JSON(browserStatusForUpstream(resp.StatusCode), gin.H{
 			"error":   "SQL generation failed",
 			"details": string(body),
 		})
@@ -788,7 +788,9 @@ func isLocalDBHost(host string) bool {
 	}
 	// Non-literal hostname: dotless single-label names are docker-internal/local
 	// DNS; any dotted hostname is remote so callers default to verified TLS.
-	return !strings.Contains(h, ".")
+	// A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+	// suffix resolves on public DNS (shared/local_db_host_golden.json).
+	return !strings.Contains(h, ".") || strings.HasSuffix(h, ".svc") || strings.HasSuffix(h, ".cluster.local")
 }
 
 // isPrivateOrLoopbackIP reports whether ip is a loopback, RFC1918/ULA private,
@@ -3256,7 +3258,7 @@ func ResolveExplorerTables(c *gin.Context) {
 	}
 	if resp.StatusCode != http.StatusOK {
 		log.Errorf("[ResolveExplorerTables] LLM returned %d: %s", resp.StatusCode, string(body))
-		c.JSON(resp.StatusCode, gin.H{"error": "Table resolution failed", "details": string(body)})
+		c.JSON(browserStatusForUpstream(resp.StatusCode), gin.H{"error": "Table resolution failed", "details": string(body)})
 		return
 	}
 
@@ -3413,7 +3415,7 @@ func ResolveExplorerColumns(c *gin.Context) {
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		c.JSON(resp.StatusCode, gin.H{"error": "Column resolution failed", "details": string(body)})
+		c.JSON(browserStatusForUpstream(resp.StatusCode), gin.H{"error": "Column resolution failed", "details": string(body)})
 		return
 	}
 

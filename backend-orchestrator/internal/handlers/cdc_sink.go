@@ -105,7 +105,7 @@ func restartCDCSinkWorker(ctx context.Context, db *sql.DB, mcpManager *mcp.Serve
 		return nil, http.StatusBadRequest, errors.New("missing table.include.list / collection.include.list in connector config")
 	}
 
-	topics := deriveCDCSinkTopics(topicPrefix, tables)
+	topics := deriveCDCSinkTopics(cfg, topicPrefix, tables)
 	if len(topics) == 0 {
 		return nil, http.StatusBadRequest, errors.New("no topics derived from the connector include list")
 	}
@@ -281,27 +281,12 @@ func connectorIncludeList(cfg map[string]interface{}) []string {
 	return nil
 }
 
-// deriveCDCSinkTopics maps include-list entries to Debezium topic names
-// (<topic.prefix>.<db>.<table>), de-duplicated in order.
-func deriveCDCSinkTopics(topicPrefix string, tables []string) []string {
-	topics := make([]string, 0, len(tables))
-	seen := map[string]struct{}{}
-	for _, t := range tables {
-		tt := strings.TrimSpace(t)
-		if tt == "" {
-			continue
-		}
-		topic := tt
-		if !strings.HasPrefix(topic, topicPrefix+".") {
-			topic = topicPrefix + "." + tt
-		}
-		if _, ok := seen[topic]; ok {
-			continue
-		}
-		seen[topic] = struct{}{}
-		topics = append(topics, topic)
-	}
-	return topics
+// deriveCDCSinkTopics maps include-list entries to Debezium topic names,
+// de-duplicated in order, through cdcDataTopic — so a SQL Server connector's
+// "<schema>.<table>" entries get their database segment and the respawned sink
+// never subscribes to (and auto-creates) a topic Debezium does not write.
+func deriveCDCSinkTopics(cfg map[string]interface{}, topicPrefix string, tables []string) []string {
+	return cdcDataTopics(cfg, topicPrefix, tables)
 }
 
 func splitCommaList(s string) []string {

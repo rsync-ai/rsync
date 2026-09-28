@@ -145,7 +145,7 @@ func TestPG_DeletedPipelineNamespaceStaysProtected(t *testing.T) {
 	// pipeline locked the dead one's schema, adopted demo_orders, and the first
 	// run_mode=reload dropped it with the customer's rows in it.
 	addPipeline(next, "Orders v2", "public", selected)
-	resolved, rel := resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql", next, "public", selected)
+	resolved, rel := resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql", next, "public", selected, nil)
 	if resolved != "rsync_public" {
 		t.Fatalf("deleted owner's tables still present: resolved = %q, want \"rsync_public\"", resolved)
 	}
@@ -169,7 +169,7 @@ func TestPG_DeletedPipelineNamespaceStaysProtected(t *testing.T) {
 		t.Fatalf("drop leftover table: %v", err)
 	}
 	resolved, rel = resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql",
-		"f3f3f3f3-0000-0000-0000-000000000003", "public", selected)
+		"f3f3f3f3-0000-0000-0000-000000000003", "public", selected, nil)
 	if resolved != "public" || rel != nil {
 		t.Errorf("leftover data dropped: resolved = %q rel = %+v, want \"public\" and nil — a stale tombstone must not strand the namespace", resolved, rel)
 	}

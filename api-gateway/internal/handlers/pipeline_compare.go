@@ -286,6 +286,15 @@ func getExecutionSummary(database *sql.DB, pipelineID, executionID string) (*Exe
 	); err != nil {
 		return nil, err
 	}
+	// COUNT(*) above counts ROWS, and every stage transition has two
+	// (KI-EVENTS-DUAL-ID-NAMESPACE-DUPES), so a run read as twice as eventful and,
+	// on a failed stage, twice as erroneous. Recount from per-producer groups.
+	// Fail-soft: the raw counts are still an answer, just an inflated one.
+	if groups, gerr := loadRunEventGroups(database, pipelineID, executionID); gerr == nil {
+		eventCount, errorCount = logicalRunEventCounts(groups)
+	} else {
+		log.WithError(gerr).WithField("execution_id", executionID).Warn("trends: event group recount failed; event/error counts include both producers' copies")
+	}
 
 	status := "running"
 	if hasFailed {
@@ -344,4 +353,109 @@ func calculatePercentChange(a, b *int64) *float64 {
 	}
 	change := (float64(*b) - float64(*a)) / float64(*a) * 100
 	return &change
+}
+
+// runEventGroup is one (event_type, stage, producer) bucket of a run's events.
+type runEventGroup struct {
+	EventType string
+	StageID   string
+	Producer  string // payload schema_version: "1" orchestrator workers, "2" the V2 workflow
+	Count     int
+	Errors    int
+}
+
+func loadRunEventGroups(database *sql.DB, pipelineID, executionID string) ([]runEventGroup, error) {
+	rows, err := database.Query(`
+		SELECT COALESCE(e.event_type,''), COALESCE(e.stage_id,''), COALESCE(e.payload->>'schema_version',''),
+			COUNT(*), COUNT(*) FILTER (WHERE e.severity = 'error')
+		FROM pipeline_run_events e
+		WHERE e.pipeline_id = $1 AND e.execution_id = $2::uuid
+		GROUP BY 1, 2, 3
+	`, pipelineID, executionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []runEventGroup
+	for rows.Next() {
+		var g runEventGroup
+		if err := rows.Scan(&g.EventType, &g.StageID, &g.Producer, &g.Count, &g.Errors); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
+}
+
+// dualProducerLifecycleTypes are the transitions BOTH the orchestrator's stage
+// workers and the V2 workflow report, each from where it stands, with different
+// payloads and no shared id (KI-EVENTS-DUAL-ID-NAMESPACE-DUPES).
+var dualProducerLifecycleTypes = map[string]bool{
+	"STAGE_STARTED":   true,
+	"STAGE_COMPLETED": true,
+	"STAGE_FAILED":    true,
+	// Both park the run on HITL: the workflow via emitPipelineWaitingEvent, the
+	// orchestrator's resolver/validator/executor workers on their own.
+	"PIPELINE_WAITING": true,
+}
+
+// canonicalRunEventStage folds the two producers' names for one stage; it mirrors
+// canonicalStageId in frontend/src/lib/pipeline/eventNormalizer.ts.
+func canonicalRunEventStage(stage string) string {
+	s := strings.ToLower(strings.TrimSpace(stage))
+	switch s {
+	case "resolver":
+		return "capability_resolver"
+	case "connection_validator":
+		return "connection_validation"
+	}
+	return s
+}
+
+// logicalRunEventCounts counts each stage transition once however many producers
+// reported it. Every producer reports each transition it observes, so the number
+// of transitions of one (type, stage) is the MOST any single producer reported —
+// not the sum. MAX, not DISTINCT or a time window: the V2 workflow re-dispatches
+// the executor (chunked continuation, HITL repair, retries) and each dispatch's
+// STAGE_COMPLETED is a real, separate transition the orchestrator reports and the
+// workflow does not, so collapsing by key would undercount them. Everything else
+// is counted as stored.
+func logicalRunEventCounts(groups []runEventGroup) (events, errors int) {
+	type key struct{ typ, stage string }
+	type maxes struct{ count, errors int }
+	lifecycle := map[key]map[string]*maxes{}
+	for _, g := range groups {
+		typ := strings.ToUpper(strings.TrimSpace(g.EventType))
+		if !dualProducerLifecycleTypes[typ] || strings.TrimSpace(g.StageID) == "" {
+			events += g.Count
+			errors += g.Errors
+			continue
+		}
+		k := key{typ, canonicalRunEventStage(g.StageID)}
+		if lifecycle[k] == nil {
+			lifecycle[k] = map[string]*maxes{}
+		}
+		// Two stage names can fold into one producer's bucket; they add.
+		m := lifecycle[k][g.Producer]
+		if m == nil {
+			m = &maxes{}
+			lifecycle[k][g.Producer] = m
+		}
+		m.count += g.Count
+		m.errors += g.Errors
+	}
+	for _, byProducer := range lifecycle {
+		best := maxes{}
+		for _, m := range byProducer {
+			if m.count > best.count {
+				best.count = m.count
+			}
+			if m.errors > best.errors {
+				best.errors = m.errors
+			}
+		}
+		events += best.count
+		errors += best.errors
+	}
+	return events, errors
 }

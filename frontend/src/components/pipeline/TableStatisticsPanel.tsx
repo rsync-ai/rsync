@@ -156,11 +156,24 @@ export function batchRunMovedNothing(summary: TableStatsSummary | null | undefin
 type Props = {
   pipelineId: string
   executionId?: string
+  // The caller has not learned the run yet (its /state has not answered). No read
+  // is sent until it has: without an execution_id the API answers pipeline-wide,
+  // and that grid stood in for the run (U-TS-RACE).
+  executionPending?: boolean
   // The pipeline's status (the monitoring panel passes the reconciled one).
   // "paused" relabels the tables that would otherwise read Running (#14).
   pipelineStatus?: string
   blockingReasonType?: string
   mode?: "batch" | "cdc"
+}
+
+// How often a running pipeline's grid re-reads. It fetched only on a parameter
+// change or the refresh bus, so a Reload in progress froze at its first numbers
+// (U-TS-STALE). The same cadence panelStatePollMs gives a running pipeline.
+export const TABLE_STATS_POLL_MS = 10_000
+
+function isHidden(): boolean {
+  return typeof document !== "undefined" && document.visibilityState === "hidden"
 }
 
 function shortId(id?: string): string {
@@ -613,7 +626,14 @@ function SummaryTile({ label, value, className }: { label: string; value: ReactN
   )
 }
 
-export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, blockingReasonType, mode }: Props) {
+export function TableStatisticsPanel({
+  pipelineId,
+  executionId,
+  executionPending = false,
+  pipelineStatus,
+  blockingReasonType,
+  mode,
+}: Props) {
   const [loading, setLoading] = useState(true)
   const [fetching, setFetching] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -644,11 +664,14 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
   }, [executionId])
   const viewedExecutionId = shownRun ?? executionId
 
-  const fetchStats = useCallback(async () => {
+  // `background` is the poll: it does not dim the grid or spin the Refresh icon,
+  // and a failed poll keeps the last good rows instead of swapping them for an error.
+  const fetchStats = useCallback(async ({ background = false }: { background?: boolean } = {}) => {
+    if (executionPending) return
     const seq = ++requestSeq.current
-    setFetching(true)
+    if (!background) setFetching(true)
     try {
-      setError(null)
+      if (!background) setError(null)
       const params = new URLSearchParams()
       if (viewedExecutionId) params.set("execution_id", viewedExecutionId)
       if (mode) params.set("mode", mode)
@@ -696,8 +719,9 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
       }
       setTables(uniq)
       setTotal(nextTotal)
+      setError(null)
     } catch (e: any) {
-      if (seq !== requestSeq.current) return
+      if (seq !== requestSeq.current || background) return
       setError(String(e?.message || e || "Failed to load table stats"))
     } finally {
       if (seq === requestSeq.current) {
@@ -705,11 +729,42 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
         setFetching(false)
       }
     }
-  }, [pipelineId, executionId, viewedExecutionId, shownRun, showLatest, mode, search, sortBy, offset, pageSize])
+  }, [pipelineId, executionId, executionPending, viewedExecutionId, shownRun, showLatest, mode, search, sortBy, offset, pageSize])
 
   useEffect(() => {
     fetchStats()
   }, [fetchStats])
+
+  // A running pipeline re-reads on a tick; a hidden tab skips its ticks and reads
+  // on return. A ref, so a page or sort change does not restart the interval.
+  const fetchStatsRef = useRef(fetchStats)
+  useEffect(() => {
+    fetchStatsRef.current = fetchStats
+  }, [fetchStats])
+  const live = normalizePipelineStatus(pipelineStatus) === "running"
+  useEffect(() => {
+    if (!live || typeof window === "undefined") return
+    const t = window.setInterval(() => {
+      if (!isHidden()) void fetchStatsRef.current({ background: true })
+    }, TABLE_STATS_POLL_MS)
+    const onVisibility = () => {
+      if (!isHidden()) void fetchStatsRef.current({ background: true })
+    }
+    document.addEventListener("visibilitychange", onVisibility)
+    return () => {
+      window.clearInterval(t)
+      document.removeEventListener("visibilitychange", onVisibility)
+    }
+  }, [live])
+
+  // The last tick lands before the run's last tables commit, so a run that just
+  // finished kept its mid-run numbers until a manual Refresh. Read once more on the
+  // way out of running.
+  const wasLive = useRef(live)
+  useEffect(() => {
+    if (wasLive.current && !live) void fetchStatsRef.current({ background: true })
+    wasLive.current = live
+  }, [live])
 
   // Edit tables, Re-snapshot, Pause and Resume announce themselves on the
   // refresh bus. Without listening, a table just added or removed stayed off
@@ -799,7 +854,7 @@ export function TableStatisticsPanel({ pipelineId, executionId, pipelineStatus, 
         <CardContent className="p-6">
           <div className="flex items-center gap-2 text-sm text-muted-foreground">
             <Loader2 className="h-4 w-4 animate-spin" />
-            Loading table statistics…
+            {executionPending ? "Waiting for the pipeline's run before reading its tables…" : "Loading table statistics…"}
           </div>
         </CardContent>
       </Card>

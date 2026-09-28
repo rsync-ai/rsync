@@ -138,7 +138,6 @@ func RecoverCDCPipeline(db *sql.DB) gin.HandlerFunc {
 		}
 
 		dbType := inferDebeziumDatabaseType(connCfg)
-		defaultDB, defaultSchema := inferDefaultDBAndSchema(connCfg)
 		sourceConnID, err := findPipelineSourceConnectionID(ctx, db, pipelineID)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"success": false, "error": err.Error()})
@@ -151,52 +150,7 @@ func RecoverCDCPipeline(db *sql.DB) gin.HandlerFunc {
 			log.WithFields(log.Fields{
 				"pipeline_id":    pipelineID,
 				"connector_name": connectorName,
-			}).Warn("CDC recover: table.include.list empty; skipping PK validation")
-		}
-
-		requiresPK, destType, _ := pipelineDestinationRequiresPKValidation(ctx, db, pipelineID)
-		if requiresPK && len(tables) > 0 {
-			switch dbType {
-			case "mysql":
-				mgr := cdc.NewMySQLManager(db)
-				missing, verr := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, defaultDB, tables)
-				if verr != nil {
-					c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": verr.Error()})
-					return
-				}
-				if len(missing) > 0 {
-					c.JSON(http.StatusBadRequest, gin.H{
-						"success": false,
-						"error":   "missing_primary_key",
-						"message": fmt.Sprintf("CDC recovery blocked: destination %q requires PKs for upsert/delete correctness.", destType),
-						"tables":  missing,
-					})
-					return
-				}
-			case "postgresql":
-				mgr := cdc.NewPostgreSQLManager(db)
-				missing, verr := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, defaultSchema, tables)
-				if verr != nil {
-					c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": verr.Error()})
-					return
-				}
-				if len(missing) > 0 {
-					c.JSON(http.StatusBadRequest, gin.H{
-						"success": false,
-						"error":   "missing_primary_key",
-						"message": fmt.Sprintf("CDC recovery blocked: destination %q requires PKs for upsert/delete correctness.", destType),
-						"tables":  missing,
-					})
-					return
-				}
-			default:
-				c.JSON(http.StatusBadRequest, gin.H{
-					"success": false,
-					"error":   "cdc_pk_validation_unsupported",
-					"message": fmt.Sprintf("PK validation is not supported for Debezium connector type %q", dbType),
-				})
-				return
-			}
+			}).Warn("CDC recover: table.include.list empty")
 		}
 
 		plan := gin.H{

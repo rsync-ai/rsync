@@ -379,15 +379,26 @@ func attachChecks(report *AssessmentReport, ra *orchestratorAssessment) {
 		return
 	}
 	b := newCheckBuilder()
+	// What the orchestrator already said about each object, by check title. Its
+	// checks ran against the live source knowing the pipeline's mode, so where a
+	// gateway finding shares the title and the object -- NO_PRIMARY_KEY beside
+	// CDC_TABLE_MISSING_PRIMARY_KEY, both "Table primary key" -- the gateway's
+	// is a second, mode-blind row about the same thing and is dropped.
+	reported := map[string]bool{}
+	titledObject := func(code, object string) string {
+		return checkTitle(code) + "\x00" + strings.ToLower(object)
+	}
 	if ra != nil {
 		for _, c := range ra.Checks {
 			sev := AssessmentSeverity(strings.ToLower(strings.TrimSpace(c.Severity)))
 			level, result := gradeCheck(c.Code, sev, c.Passed)
 			category := CategorySource
-			if strings.TrimSpace(c.Object) != "" {
+			object := strings.TrimSpace(c.Object)
+			if object != "" {
 				category = CategoryTables
+				reported[titledObject(c.Code, object)] = true
 			}
-			b.add(c.Code, category, level, result, strings.TrimSpace(c.Object), c.Message, c.Remediation)
+			b.add(c.Code, category, level, result, object, c.Message, c.Remediation)
 		}
 	}
 	for _, t := range report.Tables {
@@ -400,6 +411,9 @@ func attachChecks(report *AssessmentReport, ra *orchestratorAssessment) {
 			object = qualifiedTableName(t)
 		}
 		for _, f := range t.Findings {
+			if object != "" && reported[titledObject(f.Code, object)] {
+				continue
+			}
 			level, result := gradeFinding(f.Code, f.Severity)
 			b.add(f.Code, category, level, result, object, f.Message, nil)
 		}

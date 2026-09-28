@@ -63,11 +63,19 @@ type DataPlaneSummary struct {
 	TotalRowsProcessed  int64   `json:"total_rows_processed"`
 	TotalBytesProcessed int64   `json:"total_bytes_processed"`
 	AvgThroughput       float64 `json:"avg_throughput_rows_per_sec,omitempty"`
-	CDCLagMs            *int64  `json:"cdc_lag_ms,omitempty"`
+	// CDCLagMs is a MEASURED time lag, reported only by an event that measured one.
+	// No emitter measures it today, so it is normally absent. The CDC status poll's
+	// old cdc_lag_ms was its message count times ten and is never read
+	// (KI-OVERVIEW-CDC-LAG-AND-ROWS-NOT-MEASURED).
+	CDCLagMs *int64 `json:"cdc_lag_ms,omitempty"`
+	// CDCRowsApplied is the rows the sink applied to the destination for this CDC
+	// pipeline: changes plus snapshot rows, from the same pipeline_run_table_stats
+	// counters Table stats shows. Absent when the pipeline has no CDC stats rows.
+	// When present, TotalRowsProcessed is at least this.
+	CDCRowsApplied *int64 `json:"cdc_rows_applied,omitempty"`
 	// SinkLagMessages is the sink consumer group's Kafka lag in messages from the
-	// newest CDC status poll: changes captured but not yet read by the sink.
-	// CDCLagMs is that count times ten, not a measured time, so a UI should show
-	// this count and LagMeasuredAt instead.
+	// newest CDC status poll: changes captured but not yet read by the sink. It is
+	// a count, not a time; show it with LagMeasuredAt.
 	SinkLagMessages *int64     `json:"sink_lag_messages,omitempty"`
 	LagMeasuredAt   *time.Time `json:"lag_measured_at,omitempty"`
 	ErrorCount      int        `json:"error_count"`
@@ -646,7 +654,7 @@ func fetchDataPlaneSummary(database *sql.DB, pipelineID string, timeRange TimeRa
 
 			// rows/bytes (prefer explicit counters)
 			if statusPoll {
-				// no row counter; its cdc_lag_ms is still read below
+				// no row counter; its sink_lag_messages is read below
 			} else if r, ok := meta["rows_processed"].(float64); ok {
 				if int64(r) > totalRows {
 					totalRows = int64(r)
@@ -698,22 +706,43 @@ func fetchDataPlaneSummary(database *sql.DB, pipelineID string, timeRange TimeRa
 				throughputSamples = append(throughputSamples, t)
 			}
 
-			// CDC lag (optional). Rows arrive newest first, so the first reading is
-			// the current one. This used to overwrite on every row, which reported
-			// the OLDEST reading in the window as the pipeline's lag.
-			if cdcLagMs == nil {
-				if lag, ok := numberField(meta, payload, "cdc_lag_ms"); ok {
-					lagVal := int64(lag)
-					cdcLagMs = &lagVal
+			// CDC lag (optional). Rows arrive newest first, so the first event that
+			// carries a lag reading is the current one; this used to overwrite on
+			// every row, which reported the OLDEST reading as the pipeline's lag.
+			// A reading is either field. A status poll's cdc_lag_ms is never read: it
+			// was its message count times ten, not a time, and the poll now sends
+			// sink_lag_messages alone (KI-OVERVIEW-CDC-LAG-AND-ROWS-NOT-MEASURED).
+			if lagMeasuredAt == nil {
+				msgs, hasMsgs := numberField(meta, payload, "sink_lag_messages")
+				lagMs, hasMs := numberField(meta, payload, "cdc_lag_ms")
+				hasMs = hasMs && !statusPoll
+				if hasMsgs || hasMs {
 					measuredAt := occurredAt
 					lagMeasuredAt = &measuredAt
-					if n, ok := numberField(meta, payload, "sink_lag_messages"); ok {
-						msgs := int64(n)
-						sinkLagMessages = &msgs
+					if hasMsgs {
+						n := int64(msgs)
+						sinkLagMessages = &n
+					}
+					if hasMs {
+						v := int64(lagMs)
+						cdcLagMs = &v
 					}
 				}
 			}
 		}
+	}
+
+	rows.Close()
+
+	// The sink emits no DATA_PLANE_METRICS, so a CDC pipeline's rows come from the
+	// destination-side counters Table stats shows. Best-effort: on error the
+	// Overview keeps the event-derived totals.
+	cdcRowsApplied, err := loadCDCRowsApplied(database, pipelineID)
+	if err != nil {
+		log.Debugf("data plane: cdc applied-rows query failed for pipeline %s: %v", pipelineID, err)
+	}
+	if cdcRowsApplied != nil && *cdcRowsApplied > totalRows {
+		totalRows = *cdcRowsApplied
 	}
 
 	avgThroughput := 0.0
@@ -730,11 +759,33 @@ func fetchDataPlaneSummary(database *sql.DB, pipelineID string, timeRange TimeRa
 		TotalBytesProcessed: totalBytes,
 		AvgThroughput:       avgThroughput,
 		CDCLagMs:            cdcLagMs,
+		CDCRowsApplied:      cdcRowsApplied,
 		SinkLagMessages:     sinkLagMessages,
 		LagMeasuredAt:       lagMeasuredAt,
 		ErrorCount:          errorCount,
 		LastMetricTime:      lastMetricTime,
 	}, nil
+}
+
+// loadCDCRowsApplied totals the rows the sink applied for a CDC pipeline — changes
+// plus snapshot rows — from pipeline_run_table_stats under the stable CDC key
+// (execution_id = pipeline_id), the counters Table stats shows. nil when the
+// pipeline has no CDC stats rows: "no CDC source" is not a measured zero.
+func loadCDCRowsApplied(database *sql.DB, pipelineID string) (*int64, error) {
+	var applied, tables int64
+	err := database.QueryRow(`
+		SELECT COALESCE(SUM(COALESCE(applied_inserts, 0) + COALESCE(applied_updates, 0)
+		                  + COALESCE(applied_deletes, 0) + COALESCE(applied_snapshot_rows, 0)), 0)::bigint,
+		       COUNT(*)
+		FROM pipeline_run_table_stats
+		WHERE pipeline_id = $1
+		  AND execution_id = $2::uuid
+		  AND mode = 'cdc'
+	`, pipelineID, pipelineID).Scan(&applied, &tables)
+	if err != nil || tables == 0 {
+		return nil, err
+	}
+	return &applied, nil
 }
 
 // numberField reads a numeric key from an event's metadata, falling back to the

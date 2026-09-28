@@ -87,6 +87,27 @@ func hasKafkaSignalChannel(cfg map[string]interface{}) bool {
 		strings.Contains(strings.ToLower(fmt.Sprint(cfg["signal.enabled.channels"])), "kafka")
 }
 
+// snapshotHurrier is the slice of *cdcsnapshot.Dispatcher a Reload uses.
+type snapshotHurrier interface {
+	Hurry(requestID string, proof cdcsnapshot.RunningProof)
+}
+
+// SetSnapshotHurrier wires the CDC snapshot dispatcher of this process.
+func (a *Agent) SetSnapshotHurrier(h snapshotHurrier) {
+	a.snapshotHurrier = h
+}
+
+// hurryCDCReload hands the dispatcher the RUNNING streak the start check just
+// watched, so the re-snapshot is sent on the next tick instead of after a
+// second ReadyStable wait. The dispatcher still reads the connector state
+// itself before sending; a zero proof (the check timed out) only wakes it.
+func (a *Agent) hurryCDCReload(r cdcsnapshot.Request, proof cdcsnapshot.RunningProof) {
+	if a.snapshotHurrier == nil || r.ID == "" {
+		return
+	}
+	a.snapshotHurrier.Hurry(r.ID, proof)
+}
+
 // queueCDCReload queues the Reload's re-snapshot. It fails rather than let a
 // Reload read "completed" while nothing is re-read.
 func (a *Agent) queueCDCReload(ctx context.Context, task ExecutorTask, connectorName string, startCollections []string) (cdcsnapshot.Request, error) {

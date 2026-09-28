@@ -58,9 +58,11 @@ GUARDS = [
     # `104 passed` with zero cases naming it.
     "test_flip_excludes_name_paths_that_exist.py",
     # Enrolled 2026-09-05 with the arm64 pass. Subjects are deploy/helm/rsync-ai/**,
-    # .github/workflows/docker-publish.yml, install.sh and docs/deployment/*.md -- all
-    # four already covered, by `deploy/helm/**`, `.github/workflows/**`, `install.sh` and
-    # `docs/**` respectively. Listed for the same reason as the entry above: GUARDS is a
+    # .github/workflows/docker-publish.yml, install.sh and docs/deployment/*.md. The first
+    # three are covered by `deploy/helm/**`, `.github/workflows/**` and `install.sh`; the
+    # markdown ones by doc-links.yml's unfiltered Doc guards job, which runs both guards
+    # (the `docs/**` glob that used to cover them matched every PR's drop-in -- see
+    # _unfiltered_doc_guards). Listed for the same reason as the entry above: GUARDS is a
     # hand-maintained literal, so a guard that is never added looks exactly like one that
     # passes.
     "test_chart_ships_no_developer_scaffolding.py",
@@ -212,12 +214,68 @@ GUARDS = [
     # matched it, so the filter gained it in the same change: a PR that edits
     # only the golden is the drift the two tests exist to catch.
     "test_pii_scan_names_only.py",
+    # Enrolled 2026-09-27 with the fix-PR check. Its subjects are
+    # scripts/check-fix-has-test.py, which ci.yml's env-templates job runs on
+    # every PR, and ci.yml itself. The workflow was covered by
+    # `.github/workflows/**`; the script was not, so the filter gained it in the
+    # same change.
+    "test_fix_pr_must_change_a_test.py",
 ]
 
 
 def _llm_filter_patterns():
     """The `llm` pattern list as dorny/paths-filter actually receives it."""
     return yaml.safe_load(open(CI_FILTERS))["llm"]
+
+
+DOC_LINKS_WORKFLOW = os.path.join(REPO_ROOT, ".github", "workflows", "doc-links.yml")
+
+
+def _unfiltered_doc_guards():
+    """Guards doc-links.yml's Doc guards job runs, on EVERY pull request.
+
+    The second way a subject can be covered. That job has no paths filter, so a
+    guard it runs sees every change, markdown included -- which no glob in the
+    `llm` filter can do without matching every PR: each PR writes a
+    docs/capabilities.d/ drop-in, so `docs/**` or `*.md` there ran the whole
+    llm-service suite (316 s on frontend-only #1255) on changes it cannot see.
+
+    Both halves are asserted, not assumed. A paths filter added to the workflow
+    would turn this list back into a filtered one, and the coverage it grants
+    into the skipped-reads-as-passed shape this file exists to close.
+    """
+    doc = yaml.safe_load(open(DOC_LINKS_WORKFLOW))
+    # PyYAML reads the bare key `on` as boolean True.
+    triggers = doc.get("on", doc.get(True)) or {}
+    pr = triggers.get("pull_request") or {}
+    assert "pull_request" in triggers and not (
+        set(pr) & {"paths", "paths-ignore", "branches", "branches-ignore"}
+    ), (
+        "doc-links.yml no longer runs on every pull request, so the guards in its "
+        "Doc guards job are not coverage for any subject. Remove the filter, or move "
+        "those guards' subjects back under a paths filter that fires for them."
+    )
+    job = doc["jobs"]["doc-guards"]
+    # The one `if:` allowed is the fork guard, which is true for every PR opened
+    # from this repository -- the only PRs this private repo runs CI on.
+    fork_guard = (
+        "${{ github.event_name != 'pull_request' || "
+        "github.event.pull_request.head.repo.full_name == github.repository }}"
+    )
+    assert job.get("if", fork_guard) == fork_guard, (
+        f"the Doc guards job's `if:` is now {job['if']!r}, so it may not run on every PR"
+    )
+    names = set()
+    for st in job["steps"]:
+        run = st.get("run") or ""
+        if "pytest" in run and "if" not in st:
+            names |= {
+                tok.split("/")[-1]
+                for tok in run.replace("\\", " ").split()
+                if tok.startswith("tests/test_") and tok.endswith(".py")
+            }
+    assert names, "found no guard in doc-links.yml's Doc guards pytest step; the parser is stale"
+    return names
 
 
 def _declared_paths(guard):
@@ -444,12 +502,101 @@ def test_the_ci_filter_covers_every_guard_subject(guard, subject):
     cannot fail a pattern CI would honour.
     """
     pats = _llm_filter_patterns()
+    if guard in _unfiltered_doc_guards():
+        return
     assert any(fnmatch.fnmatch(subject, p) for p in pats), (
         f"`{subject}` is read by {guard}, but no `llm` paths-filter pattern in "
         f".github/paths-filters.yml matches it. A PR touching only that file would skip "
         f"llm-service-unit, so the guard would not run on exactly the change it "
         f"exists to catch -- and a skipped check reads as a passing one.\n"
         f"Add a pattern covering it to the `llm:` filter in "
-        f"{os.path.relpath(CI_FILTERS, REPO_ROOT)}.\n"
+        f"{os.path.relpath(CI_FILTERS, REPO_ROOT)} -- or, if the subject is markdown, "
+        f"add the guard to doc-links.yml's unfiltered Doc guards job instead.\n"
         f"Patterns today: {pats}"
+    )
+
+
+# Paths a PR that changes only docs touches. The first is written by EVERY PR (the
+# capabilities drop-in rule in CLAUDE.md), which is what makes this matter.
+DOCS_ONLY_PATHS = [
+    "docs/capabilities.d/1255-some-frontend-fix.md",
+    "CAPABILITIES.md",
+    "CAPABILITIES-ARCHIVE.md",
+    "INVENTORY.md",
+    "BACKLOG.md",
+    "docs/status/verified.md",
+    "docs/services/INDEX.md",
+    "docs/getting-started/quickstart.md",
+]
+
+
+@pytest.mark.parametrize("path", DOCS_ONLY_PATHS)
+def test_a_docs_only_pr_runs_no_filtered_job(path):
+    """A markdown change must not fire any paths filter.
+
+    `docs/**` and `*.md` sat in the `llm` filter so markdown-subject guards ran on
+    a docs-only PR. Since every PR writes a drop-in, they fired on every PR: #1255
+    changed only frontend files and still ran the ~11,400-test llm-service lane
+    (316 s, the PR's critical path) and the OSS image build (98 s). Those guards
+    now run in doc-links.yml's unfiltered job; this keeps a markdown glob from
+    coming back into ANY filter -- the same leak would come through `go` or
+    `frontend` just as well.
+
+    fnmatch is looser than picomatch (its `*` crosses `/`), so a pattern that
+    fails this may be one CI would not actually honour -- but no pattern that
+    passes here can match in CI.
+    """
+    filters = yaml.safe_load(open(CI_FILTERS))
+    hits = sorted(
+        f"{name}: {pat}"
+        for name, pats in filters.items()
+        for pat in (pats or [])
+        if isinstance(pat, str) and fnmatch.fnmatch(path, pat)
+    )
+    assert not hits, (
+        f"`{path}` fires {hits}. Every PR writes a docs/capabilities.d/ drop-in, so a "
+        f"filter that matches markdown runs its job on every PR. A guard whose subject "
+        f"is markdown belongs in doc-links.yml's Doc guards job, which runs on every PR "
+        f"with no filter at all."
+    )
+
+
+def test_the_markdown_guards_the_llm_filter_dropped_run_unfiltered():
+    """The six that `docs/**`/`*.md` used to reach must be in the unfiltered job.
+
+    Named explicitly so a removal from doc-links.yml fails here by name, not only
+    as a subject-coverage case whose id says nothing about why it broke.
+    """
+    missing = {
+        "test_doc_links_into_the_moat_are_delinked.py",
+        "test_no_doc_promises_a_silent_gateway_db_failure.py",
+        "test_chart_ships_no_developer_scaffolding.py",
+        "test_published_image_platforms_match_the_docs.py",
+        "test_fix_pr_must_change_a_test.py",
+        # Its markdown subjects (CHANGELOG.md, docs/deployment/*.md, drop-ins) are
+        # found by a `git ls-files` scan, not named, so it is not in GUARDS; its own
+        # reach test accepts this job the same way the census does.
+        "test_shipped_images_are_anonymously_pullable.py",
+    } - _unfiltered_doc_guards()
+    assert not missing, f"not in doc-links.yml's Doc guards job: {sorted(missing)}"
+
+
+def test_a_guard_that_needs_release_tags_stays_out_of_the_doc_guards_job():
+    """test_shipped_images_are_publishable.py must NOT be in the Doc guards list.
+
+    It reads what a release tag built and FAILS when no v*.*.* tag is visible, by
+    design. doc-links.yml's public-cut job (scripts/flip/assert-public-suite.sh)
+    runs the Doc guards list in a fresh one-commit tree that has no tags, so the
+    guard fails there every time: 5 failures on #1254, which briefly listed it.
+    It runs in llm-service-unit, whose checkout fetches tags, and its markdown
+    subject README.md is in the `llm` filter by exact path.
+    """
+    assert "test_shipped_images_are_publishable.py" not in _unfiltered_doc_guards(), (
+        "test_shipped_images_are_publishable.py needs release tags; the public-cut "
+        "job runs the Doc guards list in a tagless tree, where it always fails."
+    )
+    llm = yaml.safe_load(open(CI_FILTERS))["llm"]
+    assert "README.md" in llm, (
+        "README.md is test_shipped_images_are_publishable.py's markdown subject and "
+        "must be in the `llm` filter by exact path, since the guard cannot run unfiltered."
     )

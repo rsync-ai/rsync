@@ -394,6 +394,8 @@ services:
       # Autonomous CDC sink self-heal (Bug B, #678): default OFF; arm by setting
       # CDC_SINK_AUTORESTART_ENABLED=true in prod .env (op-safety gate, not edition gate).
       - CDC_SINK_AUTORESTART_ENABLED=${CDC_SINK_AUTORESTART_ENABLED:-false}
+      # Orphan sink-worker reaper: off | dry_run | enforce; default OFF (op-safety gate).
+      - SINK_WORKER_REAPER_MODE=${SINK_WORKER_REAPER_MODE:-off}
       - ENCRYPTION_KEY=${ENCRYPTION_KEY}
       - TOOLS_DIR=/app/shared/mcp-connectors
       - TOOL_GENERATOR_URL=http://tool-generator:5010

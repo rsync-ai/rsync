@@ -277,7 +277,7 @@ func (h *SchemaRegistryHandler) RegisterSchema(c *gin.Context) {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		c.JSON(resp.StatusCode, gin.H{
+		c.JSON(browserStatusForUpstream(resp.StatusCode), gin.H{
 			"error":   "registration_failed",
 			"message": string(respBody),
 		})

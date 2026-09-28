@@ -195,7 +195,7 @@ func TestPG_RunBoundaryLocksNamespaceWithoutHITL(t *testing.T) {
 	if checkpointCount(quiet) != 1 {
 		t.Fatal("fixture has no checkpoint — the clear assertion below would prove nothing")
 	}
-	res, err := lockNamespaceForRun(ctx, db, quiet, selected)
+	res, err := lockNamespaceForRun(ctx, db, quiet, selected, nil)
 	if err != nil {
 		t.Fatalf("run-boundary lock: %v", err)
 	}
@@ -235,7 +235,7 @@ func TestPG_RunBoundaryLocksNamespaceWithoutHITL(t *testing.T) {
 	// The relocated run wrote its own checkpoint against the NEW namespace. Clearing
 	// that one too would make every subsequent run a full reload.
 	seedCheckpoint(quiet)
-	res2, err := lockNamespaceForRun(ctx, db, quiet, selected)
+	res2, err := lockNamespaceForRun(ctx, db, quiet, selected, nil)
 	if err != nil || !res2.Locked || res2.Namespace != "rsync_public" {
 		t.Errorf("second run: (%q, %v, %v), want (\"rsync_public\", true, nil)", res2.Namespace, res2.Locked, err)
 	}
@@ -256,7 +256,7 @@ func TestPG_RunBoundaryLocksNamespaceWithoutHITL(t *testing.T) {
 	const settled = "cccccccc-0000-0000-0000-000000000001"
 	addPipeline(settled, "analytics", selected, nil)
 	seedCheckpoint(settled)
-	resSettled, err := lockNamespaceForRun(ctx, db, settled, selected)
+	resSettled, err := lockNamespaceForRun(ctx, db, settled, selected, nil)
 	if err != nil || !resSettled.Locked {
 		t.Fatalf("unrelocated lock: (%+v, %v)", resSettled, err)
 	}
@@ -271,7 +271,7 @@ func TestPG_RunBoundaryLocksNamespaceWithoutHITL(t *testing.T) {
 	// namespace having proven nothing about it, and the lock is permanent.
 	const blank = "eeeeeeee-0000-0000-0000-000000000001"
 	addPipeline(blank, "public", selected, nil)
-	if _, err := lockNamespaceForRun(ctx, db, blank, nil); err != errNamespaceLockNoTables {
+	if _, err := lockNamespaceForRun(ctx, db, blank, nil, nil); err != errNamespaceLockNoTables {
 		t.Errorf("empty table set: err = %v, want errNamespaceLockNoTables", err)
 	}
 	if locked, _ := lockState(blank); locked {
@@ -282,7 +282,7 @@ func TestPG_RunBoundaryLocksNamespaceWithoutHITL(t *testing.T) {
 	// namespace to probe, and attaching one flattens every source schema into it.
 	const mirrored = "ffffffff-0000-0000-0000-000000000001"
 	addPipeline(mirrored, "public", selected, map[string]interface{}{"destination_schema_mode": "preserve"})
-	if r, err := lockNamespaceForRun(ctx, db, mirrored, selected); err != nil || r.Locked {
+	if r, err := lockNamespaceForRun(ctx, db, mirrored, selected, nil); err != nil || r.Locked {
 		t.Errorf("mirroring pipeline: (locked=%v, err=%v), want (false, nil)", r.Locked, err)
 	}
 	if locked, _ := lockState(mirrored); locked {

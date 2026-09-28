@@ -22,6 +22,7 @@ import (
 	"go.opentelemetry.io/otel"
 
 	"github.com/rsync-ai/backend-orchestrator/internal/cdc"
+	"github.com/rsync-ai/backend-orchestrator/internal/cdcsnapshot"
 	"github.com/rsync-ai/backend-orchestrator/internal/connections"
 	"github.com/rsync-ai/backend-orchestrator/internal/kafka"
 	"github.com/rsync-ai/backend-orchestrator/internal/mcp"
@@ -421,6 +422,10 @@ type Agent struct {
 	// run then reports. Tests only; NewAgent never sets it, so it is nil in
 	// production.
 	produceBatchStub func(topic string, key, value []byte, headers map[string]string) error
+	// snapshotHurrier is the CDC snapshot dispatcher (SetSnapshotHurrier); a
+	// Reload hands it the connector's RUNNING proof. nil: the dispatcher finds
+	// the request on its own tick.
+	snapshotHurrier snapshotHurrier
 }
 
 // NewAgent creates a new Executor agent
@@ -2659,19 +2664,20 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 		}
 	}
 
-	// Hard-block: database destinations require PKs for CDC correctness —
-	// relational ones upsert/delete on the key, and so does MongoDB (a keyless
-	// table there gets a guessed key that collapses rows, or duplicates on every
-	// re-snapshot). Object storage is append-only and only warns. Keep this list
-	// in lockstep with assessor.CDCBlocksWithoutPrimaryKey and the orchestrator
-	// handler's cdcDestinationRequiresPrimaryKeys.
+	// Database destinations: validate the source before creating the Debezium
+	// connector. A keyless table is NOT refused (policy 2026-09-27 — it used to
+	// be): it streams, and the pre-flight assessor has already shown the user a
+	// warning (assessor.keylessCDCDriftCheck) with the exact effect and the ALTER
+	// TABLE. Here it is only logged. The table lookup still runs because it is
+	// also the existence check — "table not found", an invalid identifier or an
+	// unreachable source still fails the run. Object storage skips this block.
 	if normalizedDest == "postgresql" || normalizedDest == "mysql" || normalizedDest == "mongodb" {
 		if strings.TrimSpace(sourceConnID) == "" || sourceConnID == "auto" {
 			return ExecutorResponse{
 				TaskID:     task.TaskID,
 				PipelineID: task.PipelineID,
 				Status:     "failed",
-				Error:      "source_connection_id is required for CDC PK validation",
+				Error:      "source_connection_id is required for CDC source validation",
 			}
 		}
 		if len(tablesForRouting) == 0 {
@@ -2679,7 +2685,7 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 				TaskID:     task.TaskID,
 				PipelineID: task.PipelineID,
 				Status:     "failed",
-				Error:      "tables are required for CDC PK validation",
+				Error:      "tables are required for CDC source validation",
 			}
 		}
 
@@ -2702,101 +2708,19 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 			}
 		}
 
-		switch normalizedSource {
-		case "mysql":
-			mgr := cdc.NewMySQLManager(a.db)
-			missing, err := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, sourceDBName, tablesForRouting)
+		if provider, ok := cdc.NewProvider(normalizedSource, a.db); ok {
+			missing, err := provider.ValidateTablesHavePrimaryKeys(ctx, sourceConnID,
+				cdcKeyCheckNamespace(normalizedSource, sourceDBName, sourceSchemaName), tablesForRouting)
 			if err != nil {
 				return ExecutorResponse{TaskID: task.TaskID, PipelineID: task.PipelineID, Status: "failed", Error: err.Error()}
 			}
-			if len(missing) > 0 {
-				return ExecutorResponse{
-					TaskID:     task.TaskID,
-					PipelineID: task.PipelineID,
-					Status:     "failed",
-					Error:      fmt.Sprintf("CDC requires PRIMARY KEY for DB destinations; missing PK on: %s", strings.Join(missing, ", ")),
-				}
+			if msg := keylessCDCTablesWarning(normalizedDest, missing); msg != "" {
+				log.Warnf("⚠️  pipeline %s: %s", task.PipelineID, msg)
 			}
-		case "postgresql":
-			mgr := cdc.NewPostgreSQLManager(a.db)
-			// Use the source schema from connection config (default "public") so that
-			// non-default schemas (e.g. "myschema.big_table") resolve correctly.
-			// tablesForRouting is pre-qualified (e.g. "public.driverb_big") by the
-			// normalization block above, so the defaultSchema is only a fallback for
-			// any unqualified table name that slipped through.
-			missing, err := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, sourceSchemaName, tablesForRouting)
-			if err != nil {
-				return ExecutorResponse{TaskID: task.TaskID, PipelineID: task.PipelineID, Status: "failed", Error: err.Error()}
-			}
-			if len(missing) > 0 {
-				return ExecutorResponse{
-					TaskID:     task.TaskID,
-					PipelineID: task.PipelineID,
-					Status:     "failed",
-					Error:      fmt.Sprintf("CDC requires PRIMARY KEY for DB destinations; missing PK on: %s", strings.Join(missing, ", ")),
-				}
-			}
-		case "sqlserver":
-			mgr := cdc.NewSQLServerManager(a.db)
-			// SQL Server namespace is the schema (default "dbo"); tables are
-			// pre-qualified (e.g. "dbo.cdc_test") by the normalization block, so
-			// the default is only a fallback for any unqualified table name.
-			missing, err := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, sourceSchemaName, tablesForRouting)
-			if err != nil {
-				return ExecutorResponse{TaskID: task.TaskID, PipelineID: task.PipelineID, Status: "failed", Error: err.Error()}
-			}
-			if len(missing) > 0 {
-				return ExecutorResponse{
-					TaskID:     task.TaskID,
-					PipelineID: task.PipelineID,
-					Status:     "failed",
-					Error:      fmt.Sprintf("CDC requires PRIMARY KEY for DB destinations; missing PK on: %s", strings.Join(missing, ", ")),
-				}
-			}
-		case "mongodb":
-			// MongoDB: _id is a mandatory, always-present field and is the primary
-			// key of the packed destination table (_id + document), so no collection
-			// can lack a PK. The manager's ValidateTablesHavePrimaryKeys is a no-op
-			// that never blocks; call it through the registry manager for symmetry.
-			// Namespace is the MongoDB database (mongo has no schema level).
-			mgr := cdc.NewMongoDBManager(a.db)
-			missing, err := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, sourceDBName, tablesForRouting)
-			if err != nil {
-				return ExecutorResponse{TaskID: task.TaskID, PipelineID: task.PipelineID, Status: "failed", Error: err.Error()}
-			}
-			if len(missing) > 0 {
-				return ExecutorResponse{
-					TaskID:     task.TaskID,
-					PipelineID: task.PipelineID,
-					Status:     "failed",
-					Error:      fmt.Sprintf("CDC requires PRIMARY KEY for DB destinations; missing PK on: %s", strings.Join(missing, ", ")),
-				}
-			}
-		case "oracle":
-			mgr := cdc.NewOracleManager(a.db)
-			// Oracle namespace is the schema/owner (uppercase); tables are
-			// pre-qualified by the normalization block, so the default is only a
-			// fallback for any unqualified table name.
-			missing, err := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, sourceSchemaName, tablesForRouting)
-			if err != nil {
-				return ExecutorResponse{TaskID: task.TaskID, PipelineID: task.PipelineID, Status: "failed", Error: err.Error()}
-			}
-			if len(missing) > 0 {
-				return ExecutorResponse{
-					TaskID:     task.TaskID,
-					PipelineID: task.PipelineID,
-					Status:     "failed",
-					Error:      fmt.Sprintf("CDC requires PRIMARY KEY for DB destinations; missing PK on: %s", strings.Join(missing, ", ")),
-				}
-			}
-		default:
-			// If we don't know how to validate, fail closed for DB destinations.
-			return ExecutorResponse{
-				TaskID:     task.TaskID,
-				PipelineID: task.PipelineID,
-				Status:     "failed",
-				Error:      fmt.Sprintf("unsupported CDC source for PK validation: %s", sourceConnector),
-			}
+		} else {
+			// No provider means no Debezium connector either; the start path below
+			// fails on that with its own message. Nothing to check here.
+			log.Warnf("⚠️  pipeline %s: no CDC provider for source %q; skipping the source table check", task.PipelineID, sourceConnector)
 		}
 	}
 
@@ -3455,8 +3379,11 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 	// Debezium task actually started before the sink is attached and the run is
 	// reported as "running" — a task that FAILED on its first source connection used
 	// to leave the pipeline Running while it wrote nothing.
+	var startProof cdcsnapshot.RunningProof
 	if cdcProvider == "debezium" {
-		if reason := verifyCDCConnectorStarted(ctx, kafkaConnectStatusURL(debeziumConnName), startResultBool(startResp.Result, "already_running")); reason != "" {
+		reason, proof := checkCDCConnectorStarted(ctx, kafkaConnectStatusURL(debeziumConnName), startResultBool(startResp.Result, "already_running"))
+		startProof = proof
+		if reason != "" {
 			log.WithFields(log.Fields{
 				"pipeline_id":  task.PipelineID,
 				"cdc_provider": cdcProvider,
@@ -3562,7 +3489,8 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 	// Reload: re-read every table the connector captures (cdc_reload.go). An
 	// incremental snapshot this start already triggered is that full read.
 	if cdcReloadNeeded(incrementalTriggered, cdcProvider, func() storage.RunMode { return taskRunMode(ctx, a.db, task) }) {
-		if _, err := a.queueCDCReload(ctx, task, debeziumConnName, stringSliceFromResult(startResp.Result["data_collections"])); err != nil {
+		r, err := a.queueCDCReload(ctx, task, debeziumConnName, stringSliceFromResult(startResp.Result["data_collections"]))
+		if err != nil {
 			log.WithError(err).WithField("pipeline_id", task.PipelineID).
 				Error("❌ CDC Reload: re-snapshot not queued; failing the run")
 			return ExecutorResponse{
@@ -3572,6 +3500,7 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 				Error:      fmt.Sprintf("CDC restarted but the Reload could not queue its re-snapshot, so no table would be re-read: %v", err),
 			}
 		}
+		a.hurryCDCReload(r, startProof)
 	}
 
 	log.Infof("✅ CDC pipeline started - %s → Kafka (%s) → Sink → %s", cdcProvider, cdcTopic, task.Destination.Type)
@@ -3888,6 +3817,11 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		// re-dispatches it with the same execution_id and resumes from them
 		// (reloadContinuesTable).
 		_ = cdc.DeleteCheckpointsNotFromExecution(ctx, a.db, task.PipelineID, executionID)
+	} else if a.db != nil {
+		// Before any table reads its checkpoint: an earlier run that was cancelled,
+		// crashed, or ended unverified may have lost batches the sink only
+		// negatively acked later — put its tables back so this run re-reads them.
+		rewindCheckpointsBehindNegativeAcks(ctx, a.db, task.PipelineID, executionID)
 	}
 
 	// Track per-table stats for DMS-like table statistics view.
@@ -3899,6 +3833,10 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		startedAt    time.Time
 	}
 	perTableStats := make(map[string]*tableStats)
+
+	// One MinIO outage must not cost every batch of every table a failed staging
+	// round-trip (staging_breaker.go).
+	minioStaging := newStagingBreaker(minioStagingBreakerThreshold, minioStagingBreakerCooldown)
 
 	// Optional: emit file/object write metrics (recent_files[], files_written) in DATA_PLANE_METRICS.
 	// Default OFF to keep current behavior unchanged.
@@ -4381,7 +4319,10 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		}
 		if runModeGlobal == storage.RunModeReload && !reloadContinuing && task.Destination != nil && objectLayoutMsg == nil {
 			destType := strings.TrimSpace(task.Destination.Type)
-			looksLikeObjectStorage := destType == "minio" || strings.Contains(destType, "s3")
+			// Same set as destIsObjectStorage: gcs and azure-blob used to fall through
+			// to the relational drop_table branch, which they do not implement, so
+			// their table folder was never emptied here.
+			looksLikeObjectStorage := destIsObjectStorage
 			destConfig := task.Destination.Config
 			destVersion := strings.TrimSpace(task.Destination.Version)
 			if destVersion == "" {
@@ -4390,33 +4331,34 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 			traceLog := log.WithField("trace_id", telemetry.TraceIDFromContext(ctx))
 
 			if looksLikeObjectStorage && destConfig != nil {
-				bucket := strings.TrimSpace(destConfig["bucket"])
-				if bucket == "" {
-					bucket = strings.TrimSpace(destConfig["bucket_name"])
-				}
-				prefix := strings.TrimSpace(destConfig["path_prefix"])
-				if prefix == "" {
-					prefix = strings.TrimSpace(destConfig["prefix"])
-				}
-
-				kb := storage.NewKeyBuilder().
-					WithPathPrefix(prefix).
-					WithDataset(dataset).
-					WithDBOrSchema(dbOrSchema).
-					WithTable(tableName)
-				tablePrefixToDelete := kb.TablePrefix()
+				// The folder the sink writes this table under (see reloadObjectTablePrefix).
+				tablePrefixToDelete := reloadObjectTablePrefix(destConfig, dataset, dbOrSchema, tableName)
 
 				traceLog.Infof("🗑️ Reload mode: cleaning destination scope %s", tablePrefixToDelete)
-				_, _ = a.executeWithRetry(ctx, mcp.ExecuteRequest{
+				delResp, delErr := a.executeWithRetry(ctx, mcp.ExecuteRequest{
 					Connector: destType,
 					Version:   destVersion,
 					Operation: "delete_prefix",
 					Config:    destConfig,
-					Params: map[string]interface{}{
-						"bucket": bucket,
-						"prefix": tablePrefixToDelete,
-					},
+					Params:    reloadObjectDeleteParams(destType, destConfig, tablePrefixToDelete),
 				})
+				// Fail closed: a reload that cannot prove the folder empty would write
+				// the new generation beside the old files.
+				if fatal, detail := classifyReloadDeleteResult(delResp, delErr); fatal {
+					fatalErrMu.Lock()
+					if fatalErr == nil {
+						fatalErr = &ExecutorResponse{
+							TaskID:     task.TaskID,
+							PipelineID: task.PipelineID,
+							Status:     "failed",
+							Error:      fmt.Sprintf("reload could not empty %s on %s (table=%s): %s", tablePrefixToDelete, destType, tableName, detail),
+						}
+					}
+					fatalErrMu.Unlock()
+					traceLog.Errorf("❌ reload delete_prefix failed on %s (prefix=%s): %s — aborting so old and new files are not mixed", destType, tablePrefixToDelete, detail)
+					return
+				}
+				traceLog.Infof("✅ Destination scope emptied for reload (prefix=%s deleted=%v)", tablePrefixToDelete, delResp.Result["deleted"])
 			} else if !looksLikeObjectStorage && destConfig != nil {
 				// Relational sink: DROP TABLE so the next batch's ensure_table
 				// rebuilds from scratch. CASCADE matches DMS/Fivetran semantics.
@@ -4539,6 +4481,10 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 		// (cdc.RewindCheckpointsOfExecution). A reload's first dispatch has just
 		// deleted every earlier checkpoint, so it starts from none.
 		runStart := cdc.RunStartPosition(nil, executionID)
+		// The position this table's checkpoint row holds right now: the resumed one,
+		// then each one this run saves. An empty page after a full one re-saves it
+		// with table_complete (sweepEndPosition).
+		var lastSavedPosition map[string]interface{}
 		if runModeGlobal != storage.RunModeReload || reloadContinuing {
 			// Check for existing checkpoint (resume support for batch transfers)
 			existingCheckpoint, checkpointErr := cdc.GetCheckpointForTable(ctx, a.db, task.PipelineID, tableName)
@@ -4588,9 +4534,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 				}
 				// Cumulative rows already transferred for this table across prior
 				// chunks — used by the EXECUTOR_TABLE_MAX_ROWS runaway backstop.
-				if rsf, ok := existingCheckpoint.Position["rows_so_far"].(float64); ok && rsf > 0 {
-					startRowsSoFar = int(rsf)
-				}
+				startRowsSoFar = resumeTableRowsSoFar(existingCheckpoint.Position)
 
 				// Fresh sweep vs mid-table continuation (INCREMENTAL.md §5).
 				// `table_complete` is written by the checkpoint save when a
@@ -4627,6 +4571,9 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					// run started with, or later chunks would filter on a
 					// different baseline than the earlier ones.
 					sinceCursor = sc
+				}
+				if startBatchIdx > 0 {
+					lastSavedPosition = existingCheckpoint.Position
 				}
 
 				// Incremental sync: translate persisted mode + watermark into a
@@ -4669,6 +4616,19 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 								incrementalSince, incrementalField, tableName,
 							)
 						}
+					}
+					// A mid-table continuation keeps the since its sweep started
+					// with; the watermark above is only this sweep's running max.
+					// (The table_complete branch zeroed these for a new sweep.)
+					if midTable := startBatchIdx > 0 || startOffset > 0 || resumeCursor != nil; midTable {
+						baseline := resumeIncrementalSince(existingCheckpoint.Position, true, incrementalSince)
+						if baseline != incrementalSince {
+							log.WithField("trace_id", telemetry.TraceIDFromContext(ctx)).Infof(
+								"📍 Mid-table continuation keeps this sweep's since=%q, not the running watermark %q (table=%s)",
+								baseline, incrementalSince, tableName,
+							)
+						}
+						incrementalSince = baseline
 					}
 				}
 
@@ -4865,6 +4825,31 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					log.Warnf("  Table %s: keyset page %d returned 0 rows after a full page (rows this dispatch=%d); treating as end of table — if the source holds more rows, the connector's cursor did not match its key type",
 						tableName, batchIdx, dispatchRows)
 				}
+				// The last full page saved table_complete=false; this empty page is
+				// what proves the sweep reached the end, so record it.
+				if pos := sweepEndPosition(lastSavedPosition, executionID, time.Now()); pos != nil && a.db != nil {
+					sourceConnID, _ := task.Params["source_connection_id"].(string)
+					if err := cdc.SaveCheckpoint(ctx, a.db, cdc.Checkpoint{
+						PipelineID:   task.PipelineID,
+						ConnectionID: sourceConnID,
+						SourceTable:  tableName,
+						Position:     pos,
+					}); err != nil {
+						log.WithError(err).Error("Failed to mark the batch sweep complete")
+						fatalErrMu.Lock()
+						if fatalErr == nil {
+							fatalErr = &ExecutorResponse{
+								TaskID:     task.TaskID,
+								PipelineID: task.PipelineID,
+								Status:     "failed",
+								Error:      fmt.Sprintf("FATAL: Failed to save batch checkpoint: %v", err),
+							}
+						}
+						fatalErrMu.Unlock()
+						return
+					}
+					lastSavedPosition = pos
+				}
 				break
 			}
 
@@ -5037,8 +5022,11 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 				// CLAIM-CHECK PATH: Upload to MinIO → Send URL to Kafka
 				log.Infof("  📁 Claim-check payload (%d KB, inline_max=%d KB), using MinIO staging", dataSize/1024, inlineMax/1024)
 
-				claimCheckURL, err := a.stageDataToMinIO(ctx, rows, tableName, primaryKeys, task.PipelineID, executionID, traceID)
-				if err != nil {
+				var claimCheckURL string
+				var err error
+				if !minioStaging.allow() {
+					err = fmt.Errorf("skipped: MinIO staging failed on the last batches (breaker open)")
+				} else if claimCheckURL, err = a.stageDataToMinIO(ctx, rows, tableName, primaryKeys, task.PipelineID, executionID, traceID); err != nil {
 					// Retry once before abandoning the claim-check contract: a single
 					// transient blip (pod restart, brief network hiccup) should not push the
 					// rest of this table's batches onto the inline Kafka path, which bypasses
@@ -5046,9 +5034,15 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					log.Warnf("MinIO staging failed: %v - retrying once before Kafka-chunk fallback", err)
 					time.Sleep(500 * time.Millisecond)
 					claimCheckURL, err = a.stageDataToMinIO(ctx, rows, tableName, primaryKeys, task.PipelineID, executionID, traceID)
+					if err != nil && minioStaging.failure() {
+						log.Warnf("MinIO staging failed on %d batches in a row - sending batches straight to Kafka chunks for %s before trying MinIO again", minioStagingBreakerThreshold, minioStagingBreakerCooldown)
+					}
+				}
+				if err == nil {
+					minioStaging.success()
 				}
 				if err != nil {
-					log.Warnf("MinIO staging failed after retry: %v - falling back to Kafka chunks", err)
+					log.Warnf("MinIO staging unavailable: %v - falling back to Kafka chunks", err)
 					// Fallback to chunked Kafka
 					chunkDelivered, chunkUndelivered, chunkFailures := a.sendChunkedToKafka(ctx, rows, tableName, destTableName, statsSourceTable, dbOrSchema, primaryKeys, colTypesForTable, kafkaTopic, traceID, task.PipelineID, executionID, batchIdx, keyOrdinal, runMode, objectLayoutMsg)
 					accMu.Lock()
@@ -5226,13 +5220,16 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					// Reuse the snapshots taken under accMu above; the bare
 					// totalRows/totalBytes reads are unsafe under concurrency
 					// (sibling table goroutines may be mid-add).
-					"rows_so_far":   snapshotTotalRows,
-					"bytes_so_far":  snapshotTotalBytes,
-					"updated_at":    time.Now().UTC().Format(time.RFC3339),
-					"paging_mode":   pagingMode,
-					"cursor_column": cursorColumn,
-					"cursor":        cursor,
-					"cursor_json":   cursorJSON,
+					"rows_so_far":  snapshotTotalRows,
+					"bytes_so_far": snapshotTotalBytes,
+					// This table's own count for the runaway backstop; dispatchRows
+					// does not include this batch yet.
+					tableRowsSoFarKey: startRowsSoFar + dispatchRows + sourceRowCount,
+					"updated_at":      time.Now().UTC().Format(time.RFC3339),
+					"paging_mode":     pagingMode,
+					"cursor_column":   cursorColumn,
+					"cursor":          cursor,
+					"cursor_json":     cursorJSON,
 					// Incremental delta state (INCREMENTAL.md §5).
 					// `table_complete` says this batch came back short, i.e.
 					// the sweep reached the end of the table — the resume path
@@ -5243,6 +5240,9 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					"table_complete": sourceRowCount < exportBatchSize,
 					"since_cursor":   sinceCursor,
 					"pk_high_water":  pkHighWater,
+					// The incremental since this sweep started with; a mid-table
+					// resume filters on it (resumeIncrementalSince).
+					sinceWatermarkKey: incrementalSince,
 					// Which run wrote this checkpoint: a reload continuation
 					// resumes only from its own (reloadContinuesTable).
 					"execution_id": executionID,
@@ -5298,6 +5298,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					fatalErrMu.Unlock()
 					return
 				}
+				lastSavedPosition = checkpointPosition
 			}
 			// Track cumulative rows for the runaway backstop (resumed prior
 			// chunks + this dispatch). exportBatchSize bounds each page; total
@@ -5603,7 +5604,7 @@ func (a *Agent) executeBatchDataTransfer(ctx context.Context, task ExecutorTask,
 					TaskID:     task.TaskID,
 					PipelineID: task.PipelineID,
 					Status:     drop.Status,
-					Error:      drop.Reason,
+					Error:      drop.Reason + rewindAfterLostBatches(ctx, a.db, task.PipelineID, executionID),
 					Result: map[string]interface{}{
 						"rows_transferred": totalRows,
 						"source_row_count": drop.SourceRowCount,
@@ -6311,9 +6312,9 @@ const cdcDataTopicPartitions int32 = 1
 // keyed table is ordered correctly at any partition count. A table with no primary
 // key produces null-keyed records, which the producer spreads round-robin: two
 // versions of the same row land in different partitions, and a partition offset stops
-// being a total order over the table. CDC into a database destination already refuses
-// a keyless table outright; into object storage it is a warning, and that is the case
-// this clamp protects. It is pipeline-wide rather than per-table because one number
+// being a total order over the table. A keyless table streams into every destination
+// type (into a database since 2026-09-27, when the start-time refusal was dropped), so
+// this clamp protects all of them. It is pipeline-wide rather than per-table because one number
 // has to serve topic.creation.default.*, which Connect applies to every topic the
 // connector creates.
 //
@@ -6363,6 +6364,36 @@ func applyCDCTopicShapeParams(params map[string]interface{}, shape kafka.CDCTopi
 	if shape.MinInsyncReplicas > 0 {
 		params["topic_min_insync_replicas"] = shape.MinInsyncReplicas
 	}
+}
+
+// cdcKeyCheckNamespace is the default namespace ValidateTablesHavePrimaryKeys
+// qualifies bare table names with: the database for MySQL and MongoDB (no
+// schema level), the schema for PostgreSQL, SQL Server and Oracle.
+func cdcKeyCheckNamespace(source, dbName, schemaName string) string {
+	switch source {
+	case "mysql", "mongodb":
+		return dbName
+	default:
+		return schemaName
+	}
+}
+
+// keylessCDCTablesWarning is the log line for keyless source tables in a CDC
+// pipeline into a database destination, or "" when there are none. It never
+// fails the run (policy 2026-09-27): inserts land once, each UPDATE adds a new
+// row/document, and the sink dead-letters DELETEs it has no key to match.
+func keylessCDCTablesWarning(destType string, missing []string) string {
+	if len(missing) == 0 {
+		return ""
+	}
+	unit := "row"
+	if destType == "mongodb" {
+		unit = "document"
+	}
+	return fmt.Sprintf(
+		"CDC into %s: no primary key on %s — inserts are copied once, each UPDATE adds a new %s and DELETEs are dead-lettered, so the destination drifts from the source. Add a primary key for an exact copy.",
+		destType, strings.Join(missing, ", "), unit,
+	)
 }
 
 // clampPartitionsForKeys is the keyless decision on its own, so it can be tested
@@ -6682,22 +6713,9 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 	// Try to infer destination table/resource from the user request (UI pipelines include this).
 	// This is required for DB destinations because the sink worker calls destination connectors generically.
 	// For PostgreSQL we normalize to public.<table> if no schema provided.
-	userReq := ""
-	if task.Params != nil {
-		if s, ok := task.Params["user_request"].(string); ok && s != "" {
-			userReq = s
-		} else if s, ok := task.Params["request"].(string); ok && s != "" {
-			userReq = s
-		}
-	}
-	if userReq == "" && task.Payload != nil {
-		if s, ok := task.Payload["user_request"].(string); ok && s != "" {
-			userReq = s
-		} else if s, ok := task.Payload["request"].(string); ok && s != "" {
-			userReq = s
-		}
-	}
-	_, inferredDestTable := inferTablesFromUserRequest(userReq, task.Source.Type, task.Destination.Type)
+	// Shared with the run-boundary namespace lock (sink_destination_table.go) so the
+	// destination table api-gateway probes is the one this sink writes.
+	inferredDestTable := taskInferredDestTable(&task)
 
 	// IMPORTANT:
 	// - For CDC pipelines with multiple selected tables, we MUST NOT force a single destination table,
@@ -6725,64 +6743,10 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 		}
 	}
 
-	coerceStringList := func(v interface{}) []string {
-		if v == nil {
-			return nil
-		}
-		out := make([]string, 0, 4)
-		switch tv := v.(type) {
-		case []string:
-			for _, it := range tv {
-				s := strings.TrimSpace(it)
-				if s != "" {
-					out = append(out, s)
-				}
-			}
-		case []interface{}:
-			for _, it := range tv {
-				s := strings.TrimSpace(fmt.Sprint(it))
-				if s != "" {
-					out = append(out, s)
-				}
-			}
-		default:
-			// ignore unsupported shapes
-		}
-		return out
-	}
-
 	// Tables may be provided as either `tables` or `selected_tables` depending on the caller
 	// (planner, HITL resume, legacy direct calls). For CDC multi-table correctness we must
 	// treat both as authoritative.
-	getTables := func() []string {
-		if task.Params != nil {
-			if v, ok := task.Params["tables"]; ok && v != nil {
-				if out := coerceStringList(v); len(out) > 0 {
-					return out
-				}
-			}
-			if v, ok := task.Params["selected_tables"]; ok && v != nil {
-				if out := coerceStringList(v); len(out) > 0 {
-					return out
-				}
-			}
-		}
-		if task.Payload != nil {
-			if v, ok := task.Payload["tables"]; ok && v != nil {
-				if out := coerceStringList(v); len(out) > 0 {
-					return out
-				}
-			}
-			if v, ok := task.Payload["selected_tables"]; ok && v != nil {
-				if out := coerceStringList(v); len(out) > 0 {
-					return out
-				}
-			}
-		}
-		return nil
-	}
-
-	tablesList := getTables()
+	tablesList := taskSinkTables(&task)
 	tablesCount := len(tablesList)
 	if syncMode == "cdc" && tablesCount > 1 && strings.TrimSpace(inferredDestTable) != "" {
 		log.WithFields(log.Fields{
@@ -6812,45 +6776,13 @@ func (a *Agent) startKafkaMCPSink(ctx context.Context, task ExecutorTask, kafkaT
 	if tablesCount != 1 {
 		// Multi-table runs (CDC or batch): route per-table and don't pin a single destination.
 		delete(destCfg, "table")
-	} else if syncMode == "cdc" {
-		// CDC single-table: prefer explicit destination table from the prompt; else route to the selected table.
-		// This prevents cross-pipeline bleed where a connection-level "table" default writes into the wrong table.
-		override := strings.TrimSpace(inferredDestTable)
-		if override == "" && len(tablesList) == 1 {
-			only := strings.TrimSpace(tablesList[0])
-			if only != "" {
-				_, t := storage.ExtractSchemaAndTable(only)
-				if strings.TrimSpace(t) != "" {
-					override = strings.TrimSpace(t)
-				} else {
-					override = only
-				}
-			}
-		}
-		if override != "" {
-			destCfg["table"] = override
-		} else {
-			delete(destCfg, "table")
-		}
+	} else if override := singleTableDestination(inferredDestTable, tablesList); override != "" {
+		// Single-table (CDC or batch): prefer the destination table named in the prompt,
+		// else the selected table's bare name. Overriding the connection-level default
+		// prevents cross-pipeline bleed into whatever table that default names.
+		destCfg["table"] = override
 	} else {
-		// Batch single-table: override connection-level defaults to avoid cross-pipeline bleed.
-		override := strings.TrimSpace(inferredDestTable)
-		if override == "" && len(tablesList) == 1 {
-			only := strings.TrimSpace(tablesList[0])
-			if only != "" {
-				_, t := storage.ExtractSchemaAndTable(only)
-				if strings.TrimSpace(t) != "" {
-					override = strings.TrimSpace(t)
-				} else {
-					override = only
-				}
-			}
-		}
-		if override != "" {
-			destCfg["table"] = override
-		} else {
-			delete(destCfg, "table")
-		}
+		delete(destCfg, "table")
 	}
 
 	// CDC streaming-only semantics: avoid backfilling old topic data when starting a new execution.

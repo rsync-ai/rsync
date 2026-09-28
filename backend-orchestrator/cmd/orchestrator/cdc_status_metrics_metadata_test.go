@@ -32,8 +32,13 @@ func TestCDCStatusMetricsMetadata_ReportsLagButNoRowCount(t *testing.T) {
 			t.Errorf("%s = %v, want no number (lag is not a row or byte count)", key, v)
 		}
 	}
-	if lag, ok := got["cdc_lag_ms"].(float64); !ok || lag != 12800 {
-		t.Errorf("cdc_lag_ms = %v, want 12800", got["cdc_lag_ms"])
+	// KI-OVERVIEW-CDC-LAG-AND-ROWS-NOT-MEASURED: the poll measures messages, not time.
+	// It used to send messages x 10 as cdc_lag_ms and cdc_freshness_ms, so 1,280
+	// messages behind read as 12,800 ms. No time-unit field may carry a count.
+	for _, key := range []string{"cdc_lag_ms", "cdc_freshness_ms"} {
+		if v, ok := got[key].(float64); ok {
+			t.Errorf("%s = %v, want null (a message count is not a time; the poll has no timestamp to measure one)", key, v)
+		}
 	}
 	if n, ok := got["sink_lag_messages"].(float64); !ok || n != 1280 {
 		t.Errorf("sink_lag_messages = %v, want 1280 (the summed lag across topics)", got["sink_lag_messages"])

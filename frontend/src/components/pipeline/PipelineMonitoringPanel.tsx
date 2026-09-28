@@ -36,7 +36,7 @@ import {
   type TableEditOutcome,
 } from "@/lib/pipeline/cdcBackfill"
 import { makeTableMatcher, parseTableStatsRows } from "@/lib/pipeline/tableStatsRows"
-import { extractLatestRowMetrics } from "@/lib/pipeline/dataPlaneRowMetrics"
+import { headerRowLine } from "@/lib/pipeline/dataPlaneRowMetrics"
 import {
   isWaitingForFirstData,
   normalizePipelineStatus,
@@ -46,6 +46,7 @@ import {
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
 import { emitPipelineRefresh, onPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import { mergeNewestPage } from "@/lib/pipeline/mergeNewestEvents"
+import { PANEL_STATE_RETRY_MAX_MS, PANEL_STATE_RETRY_MS, panelStatePollMs } from "@/lib/pipeline/panelStatePoll"
 import { STATUS_EVENT_TYPES } from "@/lib/pipeline/eventNormalizer"
 import { stepInfoFromEvents } from "@/components/pipeline/PipelineLiveStatePanel"
 import type { PipelineStateResponse, BlockingReasonDetails } from "@/lib/api/types"
@@ -511,20 +512,39 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     return () => window.clearInterval(t)
   }, [activityOpen, pollNewestEvents])
 
-  // Poll state while active. Status-aware interval: keep a fast cadence while
-  // actively processing, back off for the slower waiting/pending states.
+  // Poll state while the run is live; panelStatePollMs holds the per-status cadence.
+  // No state yet because the first read failed: retry, as PipelineLiveStatePanel
+  // does. Nothing else re-reads a finished run's /state, so the Table statistics
+  // grid — which waits for the run — stayed unscoped until a manual refresh (U-TS-RACE).
+  // A missing pipeline or a denied one is not retried.
+  const stateRetryable = !!stateError && stateError !== "Pipeline not found" && stateError !== "Access denied"
+  const hasState = state !== null
   useEffect(() => {
-    const status = state?.status
-    if (!status) return
-    if (!["processing", "waiting_for_user", "pending"].includes(status)) return
-    const pollIntervalMs = status === "processing" ? 2500 : 5000
+    // A hidden tab skips its reads (#13); the next visible tick reads.
+    const hidden = () => typeof document !== "undefined" && document.visibilityState === "hidden"
+    if (!hasState && stateRetryable) {
+      // The retry backs off (5 s, 10 s, 20 s … capped at a minute) so a down API
+      // is not read every 5 s by every open tab for as long as it stays down.
+      let attempt = 0
+      let t: ReturnType<typeof setTimeout>
+      const schedule = () => {
+        const delay = Math.min(PANEL_STATE_RETRY_MS * 2 ** attempt, PANEL_STATE_RETRY_MAX_MS)
+        t = setTimeout(() => {
+          attempt += 1
+          if (!hidden()) void fetchState()
+          schedule()
+        }, delay)
+      }
+      schedule()
+      return () => clearTimeout(t)
+    }
+    const pollIntervalMs = hasState ? panelStatePollMs(state?.status) : null
+    if (pollIntervalMs === null) return
     const t = setInterval(() => {
-      // A hidden tab skips its reads (#13); the next visible tick reads.
-      if (typeof document !== "undefined" && document.visibilityState === "hidden") return
-      void fetchState()
+      if (!hidden()) void fetchState()
     }, pollIntervalMs)
     return () => clearInterval(t)
-  }, [state?.status, fetchState])
+  }, [hasState, state?.status, stateRetryable, fetchState])
 
   const status = state?.status || (loading ? "loading" : "unknown")
 
@@ -745,12 +765,9 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
     if (msg.includes("streaming") || summary.includes("streaming")) return "cdc"
     return null
   }, [pipelineSyncMode, state?.message, state?.summary])
-  // Batch: this run's rows only — the events span earlier runs too. CDC runs keep
-  // every metrics event (their counters belong to the stream, not one execution).
-  const latestRowMetrics = useMemo(
-    () => extractLatestRowMetrics(events, effectiveSyncMode === "cdc" ? undefined : state?.execution_id),
-    [events, effectiveSyncMode, state?.execution_id],
-  )
+  // This run's rows only, in both modes: the events span earlier runs, and the
+  // Table statistics panel below reads this run (item 34).
+  const latestRowMetrics = useMemo(() => headerRowLine(events, state?.execution_id), [events, state?.execution_id])
 
   const isCdcTableEdit = showEditTables && effectiveSyncMode === "cdc" && !isWaitingForTableSelection
   useEffect(() => {
@@ -1176,7 +1193,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
 
                       {typeof latestRowMetrics?.read === "number" || typeof latestRowMetrics?.written === "number" ? (
                         <div className="text-xs text-muted-foreground">
-                          {effectiveSyncMode === "cdc" ? "Latest data-plane rows:" : "Rows this run:"}
+                          {latestRowMetrics.label}
                           {typeof latestRowMetrics.read === "number" ? (
                             <>
                               {" "}
@@ -1201,6 +1218,7 @@ export function PipelineMonitoringPanel(props: { pipelineId: string; variant?: "
               <TableStatisticsPanel
                 pipelineId={pipelineId}
                 executionId={state?.execution_id}
+                executionPending={!state && (!stateError || stateRetryable)}
                 pipelineStatus={reconciledStatus}
                 blockingReasonType={state?.blocking_reason?.type ?? state?.blocking_reason_type}
                 mode={effectiveSyncMode ?? undefined}

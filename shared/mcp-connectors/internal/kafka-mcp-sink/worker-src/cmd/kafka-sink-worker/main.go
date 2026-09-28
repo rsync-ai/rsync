@@ -73,6 +73,9 @@ var logSafeFields = map[string]bool{
 	"attempt": true, "max_attempts": true, "sleep_ms": true,
 	"raw_count": true, "rows": true, "rows_fetched": true,
 	"rows_written": true, "imported": true, "bytes_written": true,
+	// Batch write success line (O-1, logBatchWriteOK): a count, a flag, the batch
+	// offset and the run-mode enum (resume / reload / …).
+	"rows_sent": true, "count_reported": true, "batch_offset": true, "run_mode": true,
 	// CDC apply-path metadata (KI-CDC-DELETE-PATH-UNLOGGED). Every key here is a
 	// NAME, a COORDINATE, a COUNT or a HASH — never a value:
 	//   op / debezium_op — the DMS code (I/U/D) and the raw Debezium op (c/r/u/d)
@@ -175,8 +178,52 @@ func logMsgEvent(level string, sm *SinkMessage, msg kafka.Message, text string, 
 		"partition", msg.Partition,
 		"offset", msg.Offset,
 	}
+	// O-2: the line names the run THIS message belongs to, not the worker's first
+	// run (logEvent's global). Caller fields come after base, so they still win.
+	if id := runExecutionID(sm); id != "" {
+		base = append(base, "execution_id", id)
+	}
 	// Scrubbing (message + fields) happens in logEvent.
 	logEvent(level, text, append(base, fields...)...)
+}
+
+// runExecutionID is the execution id a log line about sm should carry, or "" to
+// keep logEvent's worker-level default.
+//
+// O-2: logEvent stamps gExecutionID, which main() sets ONCE from the worker config
+// — the first run's id. A batch worker is reused across runs, so every line after
+// the first run named that first run (journal: 9a094389 lines after 15:10 said
+// 88a72a09 while the acks said 3b705571/33a72150). The batch lane's
+// sm.ExecutionID is the orchestration id of the message's own run. The CDC lane
+// forces sm.ExecutionID to the pipeline id (a stats key, not a run), so there the
+// orchestration id is used when present and the worker default otherwise.
+func runExecutionID(sm *SinkMessage) string {
+	if sm == nil {
+		return ""
+	}
+	if oid := strings.TrimSpace(sm.OrchestrationExecutionID); oid != "" {
+		return oid
+	}
+	if sm.IsCDC {
+		return ""
+	}
+	return strings.TrimSpace(sm.ExecutionID)
+}
+
+// noteRunExecutionID moves the worker-level log default (gExecutionID) to the run
+// of the batch message just parsed, so lines logged without a message in hand —
+// logf retries, "destination tool call ok" — name the run being processed, not
+// the worker's first one. Batch lane only: the main loop processes batch messages
+// one at a time, so the latest parsed message IS the current run. The CDC lane is
+// left alone: its worker is started per run and its batchers log from other
+// goroutines.
+func noteRunExecutionID(sm *SinkMessage) {
+	if sm == nil || sm.IsCDC {
+		return
+	}
+	if id := runExecutionID(sm); id != "" && id != loadStr(&gExecutionID) {
+		gExecutionID.Store(id)
+	}
 }
 
 // pkFingerprint returns a short, stable, non-reversible token for a CDC primary
@@ -1577,8 +1624,18 @@ func (b *cdcDBBatcher) add(ctx context.Context, msg kafka.Message, sm *SinkMessa
 	if len(keyFields) == 0 && sm != nil && len(sm.KeyFields) > 0 {
 		keyFields = append([]string{}, sm.KeyFields...)
 	}
-	if len(keyFields) == 0 {
-		keyFields = inferKeyFieldsForRow(row)
+	// No third source: a key is what the source (its message key) or the destination
+	// config declares, never a column that looks like one (`id`, a lone `*_id`) —
+	// naming a column does not make it unique, and upserting on a non-unique one
+	// collapses rows (KI-CDC-SINK-GUESSED-KEY-COLLAPSES-ROWS). A keyless row takes the
+	// synthetic row hash (relational, flushBatch) or its Kafka-record _id (below).
+	//
+	// A keyless row bound for a document destination is keyed on its Kafka record
+	// (KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES): a deterministic _id, upserted, so
+	// a redelivery replaces its own document instead of inserting a second one.
+	if len(keyFields) == 0 && isDocumentDBConnector(b.destType) {
+		row = withKeylessDocumentID(row, b.cfg.PipelineID, msg, 0)
+		keyFields = append([]string{}, keylessDocumentKey...)
 	}
 
 	targetTable := normalizeTargetTable(b.destType, b.destCfg, sm.Table)
@@ -1950,8 +2007,9 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 	// connector plain-inserts a NULL hash and the NOT NULL constraint rejects every
 	// row — a silent drop of a keyless/GIPK table. Append-mode keeps plain INSERT.
 	//
-	// A document DB never synthesizes a PK: MongoDB auto-assigns _id, so a keyless
-	// source is a plain insert (import_data). Excluded here so keyless → import_data below.
+	// A document DB never synthesizes a PK and never reaches here keyless: add() keys
+	// a keyless row on a deterministic _id from its Kafka record (withKeylessDocumentID),
+	// so it is an idempotent upsert_data. Excluded anyway so a doc DB never gets a hash.
 	useSyntheticPK := len(batch.keyFields) == 0 && !cdcAppendMode(b.cfg) && !isDocumentDBConnector(b.destType)
 	if useSyntheticPK {
 		args["synthetic_pk"] = true
@@ -2037,6 +2095,15 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 	// per-row isolation on purpose: during an outage every row looks individually
 	// poisonous, so per-row isolation would convert one infrastructure error into a
 	// whole-batch DLQ.
+	//
+	// KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA — a refused credential is neither a
+	// poison row nor an outage: fail closed at once, before the infra hold (which
+	// would wait 300 s on a password that will never start working) and before
+	// per-row isolation (which would dead-letter every row).
+	if isDestAuthFault(lastErr) {
+		failClosedOnDestAuth("cdc db batch", batch.targetTable, lastErr)
+		return
+	}
 	if isDestInfraFault(lastErr) {
 		var landed bool
 		var heldResult map[string]interface{}
@@ -2064,6 +2131,11 @@ func (b *cdcDBBatcher) flushBatch(ctx context.Context, key string, batch *cdcDBB
 		if isDestInfraFault(lastErr) {
 			sinkFailClosed("fatal: cdc db batch destination unreachable for the whole %s infrastructure-fault budget — failing closed: offsets NOT committed and NO rows dead-lettered, so Kafka redelivers this batch to the respawned worker (reason=%s, rows=%d, table=%s): %v",
 				infraRetryBudget(), reason, len(batch.rows), batch.targetTable, lastErr)
+			return
+		}
+		if isDestAuthFault(lastErr) {
+			// The destination came back and refused the credential.
+			failClosedOnDestAuth("cdc db batch", batch.targetTable, lastErr)
 			return
 		}
 		// The destination came back and now names a row-level fault. Fall through to
@@ -2145,7 +2217,8 @@ func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *
 	// _rsync_row_hash (see flushBatch). Only genuine append-mode keyless rows take the
 	// plain-INSERT import_data path. Keeps the per-row recovery path consistent with the
 	// whole-batch path so a retried keyless row doesn't NULL-violate _rsync_row_hash.
-	// Document DBs never synthesize a PK (Mongo auto-assigns _id), so keyless → import_data.
+	// Document DBs never synthesize a PK; add() already keyed a keyless row on its
+	// Kafka-record _id (withKeylessDocumentID), so it is never keyless here.
 	useSyntheticPK := len(batch.keyFields) == 0 && !cdcAppendMode(b.cfg) && !isDocumentDBConnector(b.destType)
 	toolBase := "upsert_data"
 	op := "upsert"
@@ -2248,6 +2321,15 @@ func (b *cdcDBBatcher) flushBatchPerRow(ctx context.Context, key string, batch *
 			}
 			sinkFailClosed("fatal: cdc per-row isolation hit a destination infrastructure fault at row offset=%d — failing closed: offsets NOT committed and this row NOT dead-lettered, so Kafka redelivers the batch (reason=%s, table=%s, landed_so_far=%d): %v",
 				m.Offset, reason, batch.targetTable, good, rowErr)
+			return
+		}
+		// KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA — same reasoning for a credential
+		// refused mid-recovery: the row is not poison, so never dead-letter it.
+		if isDestAuthFault(rowErr) {
+			if ctx.Err() != nil {
+				return
+			}
+			failClosedOnDestAuth("cdc per-row isolation", batch.targetTable, rowErr)
 			return
 		}
 
@@ -2531,8 +2613,12 @@ func (b *cdcObjectBatcher) flushBatch(ctx context.Context, key string, batch *cd
 		destKey = cdcObjectKey(batch.prefix, cdcPipelineSegment(b.cfg, batchSM), dbOrSchema, tbl, timeSeg, batch.partSegs, batch.firstEventTS, batch.partition, batch.firstOffset, batch.lastOffset, batch.format, batch.compression)
 	}
 
+	writeCfg := b.destCfg
+	if b.v2 {
+		writeCfg = objectLayoutV2DestConfig(b.destCfg, batch.compression)
+	}
 	args := map[string]interface{}{
-		"config":      b.destCfg,
+		"config":      writeCfg,
 		"key":         destKey,
 		"data":        batch.events,
 		"format":      batch.format,
@@ -2645,6 +2731,12 @@ func (b *cdcObjectBatcher) flushBatch(ctx context.Context, key string, batch *cd
 
 	// Fail-closed: do NOT commit offsets when flush fails. Exiting forces operator action and
 	// prevents silent data loss (dropping to DLQ + committing offsets would lose the stream).
+	// A refused credential exits with exitDestAuthRefused so the supervisor reports
+	// "needs user config" instead of crash-looping into a generic message.
+	if isDestAuthFault(lastErr) {
+		failClosedOnDestAuth("cdc object batch", batch.table, lastErr)
+		return
+	}
 	logf("error", "fatal cdc batch flush error: %v", lastErr)
 	os.Exit(1)
 }
@@ -2853,8 +2945,15 @@ func cdcAppendMode(cfg *WorkerConfig) bool {
 //
 // Why ts-led and not LSN/GTID-led: the commit timestamp is monotonic across PG failover,
 // MySQL binlog rotation, and GTID resets, whereas the log position is not universally
-// comparable across those events. The log position only breaks intra-millisecond ties (a
-// binlog/WAL segment cannot rotate within 1ms), so (ts_ms, position) is a safe total order.
+// comparable across those events. The log position only breaks ties between changes that
+// share a source timestamp. Per source family (see parseCDCMessage):
+//   - PostgreSQL (source.lsn), MySQL (source.pos), SQL Server (commit_lsn/change_lsn):
+//     ts_ms is millisecond-resolution and the position orders changes inside it, except
+//     across a MySQL binlog rotation inside one millisecond (pos restarts per file).
+//   - MongoDB: ts_ms is whole SECONDS (the oplog timestamp), and source.ord is the oplog
+//     increment inside that second, so (ts_ms, ord) is the oplog's own total order.
+//   - A source with none of those fields gets position 0: its seq orders by time only,
+//     and changes sharing a timestamp tie. Use kafka_offset as the tie-breaker there.
 func cdcSeq(sm *SinkMessage) string {
 	if sm == nil {
 		return ""
@@ -2868,7 +2967,7 @@ func cdcSeq(sm *SinkMessage) string {
 //
 //	_rsync_cdc_op       I/U/D operation (snapshot reads "r" map to I)
 //	_rsync_cdc_event_ts source commit time (epoch ms) — the event_timestamp
-//	_rsync_cdc_lsn      log position: Postgres LSN / MySQL binlog offset
+//	_rsync_cdc_lsn      log position: Postgres LSN / MySQL binlog offset / SQL Server LSN / MongoDB oplog ord
 //	_rsync_cdc_gtid     transaction identity: MySQL GTID / Postgres txId
 //	_rsync_cdc_seq      composite ordering token (see cdcSeq)
 //
@@ -3315,12 +3414,9 @@ func pkObjectForCDC(sm *SinkMessage, operation string) map[string]interface{} {
 	if row == nil {
 		return nil
 	}
-	keys := []string{}
-	if len(sm.KeyFields) > 0 {
-		keys = append(keys, sm.KeyFields...)
-	} else {
-		keys = inferKeyFieldsForRow(row)
-	}
+	// Only the source's declared key fields; a keyless row has no pk (never a
+	// guessed column — KI-CDC-SINK-GUESSED-KEY-COLLAPSES-ROWS).
+	keys := append([]string{}, sm.KeyFields...)
 	if len(keys) == 0 {
 		return nil
 	}
@@ -3681,15 +3777,15 @@ func objectFlushIntervalOverride(destCfg map[string]interface{}) (time.Duration,
 }
 
 // stallWindowCoveringFlush widens the consumer stall watchdog's window so it can never
-// fire while the object batcher is still legitimately holding changes. Buffered,
-// unwritten changes are uncommitted, so to the watchdog they look like "records
-// waiting on the broker"; once the topic goes quiet, no message arrives for a whole
-// flush interval. If the watchdog's window were shorter than that, it would restart
-// the worker before the file is written, the restart would drop the buffer and
-// redeliver the same records, and the timer would start again: no loss, but the
-// file would never be written. The window must cover the interval plus the time the
-// flush itself may take (consumeLoopAliveWindow). A disabled watchdog (0) stays
-// disabled. With the 30s default this is exactly the 60s default window.
+// fire while the object batcher is still legitimately holding changes. waitingFloor
+// already counts buffered changes as fetched rather than waiting; this is the second
+// guard. Without either, once the topic goes quiet no message arrives for a whole
+// flush interval, the watchdog would restart the worker before the file is written,
+// the restart would drop the buffer and redeliver the same records, and the timer
+// would start again: no loss, but the file would never be written. The window covers
+// the interval plus the time the flush itself may take (consumeLoopAliveWindow). A
+// disabled watchdog (0) stays disabled. With the 30s default this is exactly the 60s
+// default window.
 func stallWindowCoveringFlush(stall, flushInterval time.Duration) time.Duration {
 	if stall <= 0 || flushInterval <= 0 {
 		return stall
@@ -4070,8 +4166,9 @@ func main() {
 	// at join stays alive, healthy-looking and Stable forever while consuming nothing
 	// (see watchConsumerStall). Nothing else in this process — or in start_sink's
 	// readiness probe — can see that, so watch for it explicitly.
-	// Buffered object-storage changes look like waiting records until they are written,
-	// so the window must outlast the flush interval (see consumerStallWindow).
+	// Records this loop fetched are in hand, not waiting, however long a batch or a
+	// flush lane holds them (waitingFloor) — so neither a flush interval nor a
+	// destination-outage hold reads as a wedge.
 	activity := newConsumerActivity(time.Now())
 	go watchConsumerStall(ctx, cfg.KafkaBootstrapServers, cfg.ConsumerGroup, groupTopics,
 		startOffset(cfg) == kafka.FirstOffset, activity, consumerStallWindow(cdcBatcher),
@@ -4134,7 +4231,7 @@ func main() {
 			continue
 		}
 
-		activity.messageTick()
+		activity.messageTick(msg)
 		updateReaderStats(metrics, reader)
 		if strings.TrimSpace(msg.Topic) != "" {
 			metrics.setLastTopic(msg.Topic)
@@ -4155,6 +4252,7 @@ func main() {
 			atomic.StoreInt64(&metrics.lastCommittedAtUnixMs, time.Now().UTC().UnixMilli())
 			continue
 		}
+		noteRunExecutionID(sm)
 
 		if sm.Ignore {
 			logMsgEvent("debug", sm, msg, "message marked ignore (tombstone/bootstrap), committing and skipping")
@@ -4537,6 +4635,16 @@ func main() {
 			// outlasts it would dead-letter a live change event and commit its offset.
 			// Hold the offset and keep probing instead; only fail closed if the
 			// destination is still gone at the end of the extended budget.
+			//
+			// KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA — a refused credential fails
+			// closed at once: never held, never dead-lettered.
+			if !commit && err != nil && isDestAuthFault(err) {
+				if ctx.Err() != nil {
+					return
+				}
+				failClosedOnDestAuth("cdc single event", sm.Table, err)
+				return
+			}
 			if !commit && err != nil && isDestInfraFault(err) {
 				var landed bool
 				err, landed = holdForInfraFault(ctx, "cdc single event", sm.Table, err, func() error {
@@ -4558,6 +4666,9 @@ func main() {
 				} else if isDestInfraFault(err) {
 					sinkFailClosed("fatal: cdc single event destination unreachable for the whole %s infrastructure-fault budget — failing closed: offset NOT committed and the event NOT dead-lettered, so Kafka redelivers it (table=%s, offset=%d): %v",
 						infraRetryBudget(), sm.Table, msg.Offset, err)
+					return
+				} else if isDestAuthFault(err) {
+					failClosedOnDestAuth("cdc single event", sm.Table, err)
 					return
 				}
 			}
@@ -5724,6 +5835,15 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 			// no Data, no Before/PK for a delete) can never be written. DLQ + advance.
 			return 0, "", poisonError{err: fmt.Errorf("append-only CDC missing row payload for op=%q table=%q", sm.CDCOp, sm.Table)}
 		}
+		if isDocumentDBConnector(destType) {
+			// Every event is one document, so its Kafka record is its identity: a
+			// deterministic _id makes a redelivered event a duplicate-key no-op
+			// (import_data tolerates it) instead of a second history entry
+			// (KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES).
+			for i := range rows {
+				rows[i] = withKeylessDocumentID(rows[i], cfg.PipelineID, msg, i)
+			}
+		}
 		params["data"] = rows
 		// No key_fields: import_data / <warehouse>_load perform a plain INSERT. The append
 		// table intentionally carries no unique constraint on the business key (it stores
@@ -5757,7 +5877,7 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 			row["_rsync_deleted"] = true
 		}
 
-		// Best-effort PK inference (prefer explicit destination config; else fallback to "id" if present).
+		// Merge keys: the destination config's declaration first.
 		pks := toStringSlice(destCfg["primary_keys"])
 		if len(pks) == 0 {
 			pks = toStringSlice(destCfg["key_fields"])
@@ -5765,13 +5885,14 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 		if len(pks) == 0 {
 			pks = toStringSlice(destCfg["primary_key_fields"])
 		}
-		if len(pks) == 0 {
-			if _, ok := row["id"]; ok {
-				pks = []string{"id"}
-			}
+		// Then the source's declared key (the Debezium message key). Never a guessed
+		// `id` column (KI-CDC-SINK-GUESSED-KEY-COLLAPSES-ROWS): a merge on a
+		// non-unique column collapses rows, so a keyless table is refused.
+		if len(pks) == 0 && len(sm.KeyFields) > 0 {
+			pks = append([]string{}, sm.KeyFields...)
 		}
 		if len(pks) == 0 {
-			return 0, "", fmt.Errorf("missing primary_keys for warehouse merge (set destination_config.primary_keys)")
+			return 0, "", fmt.Errorf("missing primary_keys for warehouse merge (the source table declares no primary key; set destination_config.primary_keys)")
 		}
 		keyFieldsForDDL = append([]string{}, pks...)
 
@@ -5826,21 +5947,30 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 		if len(explicit) == 0 && sm != nil && len(sm.KeyFields) > 0 {
 			explicit = append([]string{}, sm.KeyFields...)
 		}
-		if len(explicit) == 0 {
-			var row map[string]interface{}
-			if operation == "delete" && sm.Before != nil {
-				row = sm.Before
-			} else if len(sm.Data) > 0 {
-				row = sm.Data[0]
-			} else if sm.After != nil {
-				row = sm.After
+		// No guessed key from the row (KI-CDC-SINK-GUESSED-KEY-COLLAPSES-ROWS): with
+		// neither declaration the table is keyless.
+		// Keyless upsert to a document destination: key it on its Kafka record, as
+		// cdcDBBatcher.add does (KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES). Without a
+		// key the connector falls back to _id, which the row lacks, and skips it.
+		if len(explicit) == 0 && operation != "delete" && isDocumentDBConnector(destType) {
+			if data, ok := params["data"].([]map[string]interface{}); ok && len(data) > 0 {
+				keyed := make([]map[string]interface{}, len(data))
+				for i, r := range data {
+					keyed[i] = withKeylessDocumentID(r, cfg.PipelineID, msg, i)
+				}
+				params["data"] = keyed
+				explicit = append([]string{}, keylessDocumentKey...)
 			}
-			explicit = inferKeyFieldsForRow(row)
 		}
 		if len(explicit) > 0 {
 			params["key_fields"] = explicit
 			params["primary_key_fields"] = explicit
 			keyFieldsForDDL = append([]string{}, explicit...)
+		} else if operation == "upsert" && !isDocumentDBConnector(destType) {
+			// Keyless relational upsert: the synthetic row hash, as flushBatch sends.
+			// Without it the connector defaults key_fields to `id` — the same guess —
+			// and a table with no `id` fails ON CONFLICT on every row.
+			params["synthetic_pk"] = true
 		}
 
 		// Add CDC metadata for audit/logging
@@ -5954,15 +6084,14 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			continue
+			continue // no answer at all: the only case that tries the next candidate
 		}
 		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		var out map[string]interface{}
 		if err := json.Unmarshal(raw, &out); err != nil {
-			lastErr = fmt.Errorf("dest response not json: %w", err)
-			continue
+			return 0, destKey, answeredNotJSON("dest", host, resp, err)
 		}
 
 		// Destination MCPs may respond in either shape:
@@ -5994,8 +6123,7 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 					raw, _ = io.ReadAll(resp.Body)
 					resp.Body.Close()
 					if err := json.Unmarshal(raw, &out); err != nil {
-						lastErr = fmt.Errorf("dest fallback response not json: %w", err)
-						continue
+						return 0, destKey, answeredNotJSON("dest fallback", host, resp, err)
 					}
 					res = out
 					if nested, ok := out["result"].(map[string]interface{}); ok && nested != nil {
@@ -6005,8 +6133,9 @@ func writeCDCToDestination(ctx context.Context, httpClient *http.Client, cfg *Wo
 				}
 			}
 			if !success {
-				lastErr = fmt.Errorf("dest error: %v", res["error"])
-				continue
+				// This host answered: its refusal is final — never replayed on an alias,
+				// never masked by an absent one (destinationHostCandidates).
+				return 0, destKey, fmt.Errorf("dest error: %v", res["error"])
 			}
 		}
 
@@ -6151,14 +6280,13 @@ func writeBlobToDestination(ctx context.Context, httpClient *http.Client, cfg *W
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			continue
+			continue // no answer at all: the only case that tries the next candidate
 		}
 		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		var out map[string]interface{}
 		if err := json.Unmarshal(raw, &out); err != nil {
-			lastErr = fmt.Errorf("blob dest response not json: %w", err)
-			continue
+			return "", answeredNotJSON("blob dest", host, resp, err)
 		}
 		// Connectors answer either {"success":...} or JSON-RPC {"result":{...}}.
 		res := out
@@ -6166,8 +6294,7 @@ func writeBlobToDestination(ctx context.Context, httpClient *http.Client, cfg *W
 			res = nested
 		}
 		if success, _ := res["success"].(bool); !success {
-			lastErr = fmt.Errorf("blob dest error: %v", res["error"])
-			continue
+			return "", fmt.Errorf("blob dest error: %v", res["error"]) // answered: final
 		}
 		return destKey, nil
 	}
@@ -6991,6 +7118,14 @@ keyDone:
 			if sm.LSN == 0 {
 				logf("warning", "warn: SQL Server change_lsn %q parsed to LSN 0 (unparseable or all-zeros) — ordering/idempotency key degraded", chlsn)
 			}
+		} else if ord := toInt64(source["ord"]); ord > 0 {
+			// MongoDB has no lsn/pos. Its oplog position is the BSON timestamp
+			// (seconds, increment): source.ts_ms carries the seconds and source.ord the
+			// increment, which orders every oplog entry inside that second. Without it
+			// two changes in one second share a _rsync_cdc_seq
+			// (KI-CDC-SEQ-UNORDERED-FOR-MONGODB). Last in the chain, so a source that
+			// emits lsn/pos/commit_lsn/change_lsn is unaffected.
+			sm.LSN = ord
 		}
 
 		// Layout v2 names the folder from these (MongoDB sends collection, not table).
@@ -8341,15 +8476,14 @@ func callDestinationTool(ctx context.Context, httpClient *http.Client, cfg *Work
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			continue
+			continue // no answer at all: the only case that tries the next candidate
 		}
 		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		var out map[string]interface{}
 		if err := json.Unmarshal(raw, &out); err != nil {
-			lastErr = fmt.Errorf("dest response not json: %w", err)
-			continue
+			return nil, answeredNotJSON("dest", host, resp, err)
 		}
 		res := out
 		if nested, ok := out["result"].(map[string]interface{}); ok && nested != nil {
@@ -8365,7 +8499,7 @@ func callDestinationTool(ctx context.Context, httpClient *http.Client, cfg *Work
 			// DIAG: destination tool call returned success=false. This is the silent-drop
 			// blind spot — surface the tool, host and error so 0-row writes are explainable.
 			logEvent("warn", "destination tool call failed", "tool", toolName, "host", host, "error", lastErr.Error())
-			continue
+			return nil, lastErr // this host answered: its error is final (destinationHostCandidates)
 		}
 		// DIAG: destination tool call succeeded — log tool + any returned row/table info
 		// so a "completed but 0 rows" run is fully traceable in the logs.
@@ -8655,27 +8789,6 @@ func columnsFromRows(rows []map[string]interface{}) []string {
 		}
 	}
 	return cols
-}
-
-func inferKeyFieldsForRow(row map[string]interface{}) []string {
-	if row == nil {
-		return nil
-	}
-	if _, ok := row["id"]; ok {
-		return []string{"id"}
-	}
-	// If there's exactly one *_id field, prefer it.
-	cands := []string{}
-	for k := range row {
-		kk := strings.TrimSpace(k)
-		if strings.HasSuffix(strings.ToLower(kk), "_id") {
-			cands = append(cands, kk)
-		}
-	}
-	if len(cands) == 1 {
-		return []string{cands[0]}
-	}
-	return nil
 }
 
 // pipelineID identifies which pipeline owns the destination namespace.
@@ -9120,6 +9233,7 @@ func writeToDestination(ctx context.Context, httpClient *http.Client, cfg *Worke
 			destKey = v2.Key
 			format = "parquet"
 			compression = v2.Compression
+			params["config"] = objectLayoutV2DestConfig(destCfg, compression)
 			if len(v2.Metadata) > 0 {
 				params["object_metadata"] = v2.Metadata
 			}
@@ -9188,15 +9302,14 @@ func writeToDestination(ctx context.Context, httpClient *http.Client, cfg *Worke
 		resp, err := httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			continue
+			continue // no answer at all: the only case that tries the next candidate
 		}
 		raw, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		var out map[string]interface{}
 		if err := json.Unmarshal(raw, &out); err != nil {
-			lastErr = fmt.Errorf("dest response not json: %w", err)
-			continue
+			return 0, destKey, answeredNotJSON("dest", host, resp, err)
 		}
 
 		// Destination MCPs may respond in either shape:
@@ -9227,8 +9340,7 @@ func writeToDestination(ctx context.Context, httpClient *http.Client, cfg *Worke
 					raw, _ = io.ReadAll(resp.Body)
 					resp.Body.Close()
 					if err := json.Unmarshal(raw, &out); err != nil {
-						lastErr = fmt.Errorf("dest fallback response not json: %w", err)
-						continue
+						return 0, destKey, answeredNotJSON("dest fallback", host, resp, err)
 					}
 					res = out
 					if nested, ok := out["result"].(map[string]interface{}); ok && nested != nil {
@@ -9243,7 +9355,9 @@ func writeToDestination(ctx context.Context, httpClient *http.Client, cfg *Worke
 				} else {
 					lastErr = fmt.Errorf("dest error: %v", res["error"])
 				}
-				continue
+				// This host answered: its refusal is final — never replayed on an alias,
+				// never masked by an absent one (destinationHostCandidates).
+				return 0, destKey, lastErr
 			}
 		}
 
@@ -9259,21 +9373,55 @@ func writeToDestination(ctx context.Context, httpClient *http.Client, cfg *Worke
 		// To re-enable the old behavior set RSYNC_SINK_TRUST_LEN_FALLBACK=1
 		// (operator override only; should never be on in prod).
 		if n, ok := extractDestRowCount(res); ok {
+			logBatchWriteOK(sm, toolName, host, targetTable, len(rows), n, true)
 			return n, destKey, nil
 		}
 		if strings.TrimSpace(os.Getenv("RSYNC_SINK_TRUST_LEN_FALLBACK")) == "1" {
+			logBatchWriteOK(sm, toolName, host, targetTable, len(rows), int64(len(rows)), false)
 			return int64(len(rows)), destKey, nil
 		}
 		// No usable count — refuse to claim success. Caller treats this as a
-		// transient error → retry → eventually DLQ-poison after maxAttempts.
-		lastErr = fmt.Errorf("dest response missing write-count field (any of %v): %s",
+		// transient error → retry → eventually DLQ-poison after maxAttempts. Not a
+		// cue to try an alias: the write may have run, and on compose the alias is
+		// the same container.
+		return 0, destKey, fmt.Errorf("dest response missing write-count field (any of %v): %s",
 			destWriteCountFields, truncateForErr(raw, 200))
-		continue
 	}
 	if lastErr == nil {
 		lastErr = fmt.Errorf("destination call failed")
 	}
 	return 0, destKey, lastErr
+}
+
+// logBatchWriteOK is the success line for a batch-lane destination write (O-1).
+//
+// writeToDestination does its own MCP HTTP round-trip instead of going through
+// callDestinationTool, so a relational/document batch write that landed logged
+// nothing — only the ack ledger proved it (same shape as the old
+// KI-CDC-DELETE-PATH-UNLOGGED). One line per write call, i.e. per batch (per
+// chunk for a chunked object-store batch). Metadata only: ids, table names,
+// counts and the batch offset — never row values, never the destination key
+// (an object key can carry partition-column values).
+func logBatchWriteOK(sm *SinkMessage, toolName, host, destTable string, rowsSent int, rowsWritten int64, countReported bool) {
+	fields := []any{
+		"tool", toolName,
+		"host", host,
+		"dest_table", destTable,
+		"rows_sent", rowsSent,
+		"rows_written", rowsWritten,
+		"count_reported", countReported,
+	}
+	if sm != nil {
+		fields = append(fields,
+			"pipeline_id", strings.TrimSpace(sm.PipelineID),
+			"table", sm.Table,
+			"batch_offset", sm.BatchOffset,
+			"run_mode", sm.RunMode)
+		if id := runExecutionID(sm); id != "" {
+			fields = append(fields, "execution_id", id)
+		}
+	}
+	logEvent("info", "batch destination write ok", fields...)
 }
 
 func truncateForErr(b []byte, n int) string {
@@ -9333,6 +9481,15 @@ func extractDestRowCount(res map[string]interface{}) (int64, bool) {
 	return 0, false
 }
 
+// destinationHostCandidates lists the names one destination MCP may answer on: the
+// versioned container name, then compose-era aliases. On Helm only the versioned
+// name resolves; on compose several of them reach the SAME container.
+//
+// A caller walks the list only past a host it could not reach (httpClient.Do
+// failed). The first host that answers is the destination and its answer is final:
+// trying the next name would replay a write that already ran on compose, and on
+// Helm the absent alias's "no such host" would overwrite the real error — so a row
+// fault or a refused credential would be classified as an outage.
 func destinationHostCandidates(connectorType, version string) []string {
 	// Prefer versioned container name used by compose/JIT: rsync-ai-<connector>-vX-Y-Z-mcp
 	connectorType = strings.TrimSpace(connectorType)
@@ -9354,6 +9511,14 @@ func destinationHostCandidates(connectorType, version string) []string {
 	// Underscore variant
 	candidates = append(candidates, fmt.Sprintf("rsync-ai-%s-mcp", strings.ReplaceAll(connectorType, "-", "_")))
 	return uniqStrings(candidates)
+}
+
+// answeredNotJSON reports a destination host that answered with something other
+// than a JSON reply. The HTTP status is kept so classifyDestFault reads a proxy's
+// 502/503/504 page as the outage it is; a 200 with a garbled body stays unclassified.
+func answeredNotJSON(what, host string, resp *http.Response, err error) error {
+	return fmt.Errorf("%s response not json (HTTP %d %s from %s): %w",
+		what, resp.StatusCode, http.StatusText(resp.StatusCode), host, err)
 }
 
 func uniqStrings(in []string) []string {
@@ -10343,13 +10508,26 @@ func stallWatchdogTimeout() time.Duration {
 // The two clocks are deliberately separate: pollTick says "the loop is running",
 // messageTick says "the loop is receiving data". Only their combination tells a
 // wedged member apart from a busy one.
+//
+// fetched is the third fact: per partition, the offset after the highest record this
+// process has fetched. A record fetched but not yet committed — buffered in a batch,
+// or held in a flush lane through a destination outage — is in hand, not waiting on
+// the broker, and must not read as a wedge (see waitingFloor).
 type consumerActivity struct {
 	lastPollUnixNano    atomic.Int64
 	lastMessageUnixNano atomic.Int64
+
+	mu      sync.Mutex
+	fetched map[topicPartition]int64
+}
+
+type topicPartition struct {
+	topic     string
+	partition int
 }
 
 func newConsumerActivity(now time.Time) *consumerActivity {
-	a := &consumerActivity{}
+	a := &consumerActivity{fetched: map[topicPartition]int64{}}
 	a.lastPollUnixNano.Store(now.UnixNano())
 	// Seeded with the start time so the first stall window is also the grace period
 	// for joining and receiving the first record.
@@ -10357,8 +10535,31 @@ func newConsumerActivity(now time.Time) *consumerActivity {
 	return a
 }
 
-func (a *consumerActivity) pollTick()    { a.lastPollUnixNano.Store(time.Now().UnixNano()) }
-func (a *consumerActivity) messageTick() { a.lastMessageUnixNano.Store(time.Now().UnixNano()) }
+func (a *consumerActivity) pollTick() { a.lastPollUnixNano.Store(time.Now().UnixNano()) }
+
+// messageTick records that the loop fetched m. The fetched mark only moves forward:
+// a rebalance can redeliver from the committed offset, and those records were
+// already in hand once.
+func (a *consumerActivity) messageTick(m kafka.Message) {
+	a.lastMessageUnixNano.Store(time.Now().UnixNano())
+	tp := topicPartition{m.Topic, m.Partition}
+	a.mu.Lock()
+	if next := m.Offset + 1; next > a.fetched[tp] {
+		a.fetched[tp] = next
+	}
+	a.mu.Unlock()
+}
+
+// fetchedNext is the offset after the highest record fetched from topic/partition,
+// or 0 when none has been.
+func (a *consumerActivity) fetchedNext(topic string, partition int) int64 {
+	if a == nil {
+		return 0
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.fetched[topicPartition{topic, partition}]
+}
 
 func (a *consumerActivity) lastPoll() time.Time {
 	return time.Unix(0, a.lastPollUnixNano.Load())
@@ -10397,17 +10598,45 @@ func shouldRestartForStall(s stallSnapshot, stall time.Duration) bool {
 	return true
 }
 
-// unconsumedRecords reports whether groupID still has records waiting on any
-// partition of topics, along with a human-readable detail for the log.
+// partitionPosition is what the watchdog knows about one partition at one instant.
+type partitionPosition struct {
+	first, end  int64
+	committed   int64 // the group's committed offset; < 0 when it never committed
+	baseline    int64 // end offset when the watchdog first looked
+	fetchedNext int64 // offset after the highest record this process fetched; 0 = none
+}
+
+// waitingFloor is the offset below which a partition's records are not waiting on the
+// broker. A record is not waiting if the group committed it, or if this process
+// already fetched it: a fetched-but-uncommitted record is in hand — buffered, or held
+// in a flush lane through a destination outage while the consume loop keeps polling
+// (the nightly test_chaos_dest_down_dlq_healthy shape: end=3 committed=1 with rows
+// 2-3 held) — and a restart would only drop it and fetch it again.
 //
-// The floor it compares the end offset against is the group's committed offset. When
-// the group has never committed (CommittedOffset < 0 — exactly the wedge case, since
-// a member that consumed nothing committed nothing) the floor falls back to where
-// this reader would have started: the partition's first offset when reading from the
-// earliest offset, otherwise the end offset observed when the watchdog started, held
-// in baseline. Without that fallback a `latest` reader would look wedged whenever the
-// topic merely had pre-existing data.
-func unconsumedRecords(ctx context.Context, broker, groupID string, topics []string, fromEarliest bool, baseline map[string]int64) (bool, string, error) {
+// When the group never committed (committed < 0 — the empty-assignment wedge, since a
+// member that consumed nothing committed nothing) the floor falls back to where this
+// reader would have started: the first offset when reading from the earliest, else
+// the baseline. Without that fallback a `latest` reader would look wedged whenever
+// the topic merely had pre-existing data.
+func waitingFloor(p partitionPosition, fromEarliest bool) int64 {
+	floor := p.committed
+	if floor < 0 {
+		if fromEarliest {
+			floor = p.first
+		} else {
+			floor = p.baseline
+		}
+	}
+	if p.fetchedNext > floor {
+		floor = p.fetchedNext
+	}
+	return floor
+}
+
+// unconsumedRecords reports whether groupID still has records waiting on any
+// partition of topics — past waitingFloor — along with a human-readable detail for
+// the log. act may be nil (nothing fetched).
+func unconsumedRecords(ctx context.Context, broker, groupID string, topics []string, fromEarliest bool, baseline map[string]int64, act *consumerActivity) (bool, string, error) {
 	conn, err := dialBroker("tcp", broker)
 	if err != nil {
 		return false, "", fmt.Errorf("dial %s: %w", broker, err)
@@ -10458,16 +10687,15 @@ func unconsumedRecords(ctx context.Context, broker, groupID string, topics []str
 			if _, seen := baseline[key]; !seen {
 				baseline[key] = po.LastOffset
 			}
-			floor, ok := committedBy[key]
-			if !ok || floor < 0 {
-				if fromEarliest {
-					floor = po.FirstOffset
-				} else {
-					floor = baseline[key]
-				}
+			committedAt, ok := committedBy[key]
+			if !ok {
+				committedAt = -1
 			}
-			if po.LastOffset > floor {
-				return true, fmt.Sprintf("%s end=%d floor=%d committed=%d", key, po.LastOffset, floor, committedBy[key]), nil
+			pos := partitionPosition{first: po.FirstOffset, end: po.LastOffset, committed: committedAt,
+				baseline: baseline[key], fetchedNext: act.fetchedNext(topic, po.Partition)}
+			if floor := waitingFloor(pos, fromEarliest); pos.end > floor {
+				return true, fmt.Sprintf("%s end=%d floor=%d committed=%d fetched=%d",
+					key, pos.end, floor, pos.committed, pos.fetchedNext), nil
 			}
 		}
 	}
@@ -10501,7 +10729,7 @@ func watchConsumerStall(ctx context.Context, broker, groupID string, topics []st
 			continue // consuming; don't touch the broker at all
 		}
 
-		waiting, detail, err := unconsumedRecords(ctx, broker, groupID, topics, fromEarliest, baseline)
+		waiting, detail, err := unconsumedRecords(ctx, broker, groupID, topics, fromEarliest, baseline, act)
 		if err != nil {
 			// Can't see the broker, so can't distinguish a wedge from an outage.
 			// Restarting on a metadata blip would be worse than waiting.

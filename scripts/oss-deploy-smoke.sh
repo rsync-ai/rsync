@@ -105,26 +105,48 @@ VERSION_PART="$(printf '%s' "$CV" | sed 's/^v//; s/\./-/g')"
 CONTAINER="rsync-ai-${CONNECTOR}-v${VERSION_PART}-mcp"     # e.g. rsync-ai-petstore-v1-0-3-mcp
 IMAGE_REF="mcp-${CONNECTOR}:${CV}"                         # e.g. mcp-petstore:v1.0.3
 
+# $CONTAINER and $IMAGE_REF are names the SHARED stack uses too, so they are this run's to
+# remove only once preflight has seen them absent. The trap is armed before preflight, and it
+# used to remove both unconditionally -- so the preflight abort below ("already exists --
+# aborting to avoid touching a shared-stack container") went on to delete that very container.
+OWN_JIT=0
+OWN_IMAGE=0
 cleanup() {
   # Best-effort teardown of ONLY the resources this smoke created. Never targets the shared
   # rsync-ai / rsync-ai-mcp projects.
-  docker rm -f "$LIFECYCLE_CN" >/dev/null 2>&1 || true
-  docker rm -f "$CONTAINER"    >/dev/null 2>&1 || true
+  docker rm -fv "$LIFECYCLE_CN" >/dev/null 2>&1 || true
+  if [ "$OWN_JIT" = 1 ]; then docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true; fi
   docker network rm "$NET"     >/dev/null 2>&1 || true
   docker volume rm  "$VOL"     >/dev/null 2>&1 || true
-  docker rmi -f "$IMAGE_REF"   >/dev/null 2>&1 || true
+  if [ "$OWN_IMAGE" = 1 ]; then docker rmi -f "$IMAGE_REF" >/dev/null 2>&1 || true; fi
 }
 trap cleanup EXIT
 
 # ── preflight ────────────────────────────────────────────────────────────────────────────
 say "PREFLIGHT"
 if ! docker info >/dev/null 2>&1; then echo "docker daemon not reachable"; exit 1; fi
+# Reclaim what a KILLED earlier run left. A runner cancel or timeout can SIGKILL this script
+# before its trap finishes: the 2026-09-24 nightly was cancelled mid-deploy, and the
+# 2026-09-25 nightly then failed on `network create` ("rsync-oss-smoke-net already exists").
+# The rsync-oss-smoke-* names are this script's alone and the job's concurrency group runs one
+# copy at a time, so they are reclaimed outright. $CONTAINER is reclaimed only when its sole
+# network is $NET -- the smoke's JIT container; a shared-stack one sits on rsync-ai-mcp.
+if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER" \
+   && [ "$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}} {{end}}' "$CONTAINER" 2>/dev/null)" = "$NET " ]; then
+  echo "  reclaiming $CONTAINER left on $NET by an earlier smoke run"
+  docker rm -fv "$CONTAINER" >/dev/null 2>&1 || true
+fi
+docker rm -fv "$LIFECYCLE_CN" >/dev/null 2>&1 || true
+docker network rm "$NET"     >/dev/null 2>&1 || true
+docker volume rm  "$VOL"     >/dev/null 2>&1 || true
 # Refuse to run if the target JIT connector container already exists — it may belong to the
 # shared stack, and start_container would reuse/remove it. Fail loud instead of clobbering.
 if docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER"; then
   echo "  ✗ $CONTAINER already exists on this host — aborting to avoid touching a shared-stack container"
   exit 1
 fi
+OWN_JIT=1
+docker image inspect "$IMAGE_REF" >/dev/null 2>&1 || OWN_IMAGE=1
 ok "docker reachable; $CONTAINER not present (safe to proceed)"
 
 # ── build the OSS lifecycle image ────────────────────────────────────────────────────────

@@ -909,6 +909,7 @@ class PostgresqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         is_local_host = (
             host_val in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal")
             or "." not in host_val
+            or host_val.endswith((".svc", ".cluster.local"))  # Kubernetes in-cluster service
         )
         explicit_tls = any(
             config.get(k) not in (None, "")

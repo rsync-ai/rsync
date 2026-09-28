@@ -33,7 +33,11 @@ ARG TARGETARCH
 # DWARF. Panics still print file:line (that is pclntab, which stays), only a debugger loses.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o bin/orchestrator ./cmd/orchestrator
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o bin/orchestrator ./cmd/orchestrator \
+    # `go version -m` rejects an incomplete binary; the hash is checked again after
+    # the COPY in the runtime stage (llm-service/tests/test_go_images_verify_their_binary.py).
+    && go version -m bin/orchestrator >/dev/null \
+    && cd bin && sha256sum orchestrator > orchestrator.sha256
 
 FROM alpine:3.24
 
@@ -44,6 +48,9 @@ WORKDIR /app
 RUN apk add --no-cache python3 py3-pip ca-certificates curl
 
 COPY --from=builder --chown=appuser:appgroup /build/backend-orchestrator/bin/orchestrator .
+# The binary this stage received is the one the builder built, byte for byte.
+COPY --from=builder /build/backend-orchestrator/bin/orchestrator.sha256 /tmp/
+RUN sha256sum -c /tmp/orchestrator.sha256 && rm /tmp/orchestrator.sha256
 
 USER appuser
 

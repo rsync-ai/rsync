@@ -126,6 +126,13 @@ var notifiableIssueTypes = map[IssueType]sentinelAlert{
 				"but they will stop arriving at their destination until it is running again."
 		},
 	},
+	IssueTypeCaptureStopped: {
+		code: "CDC_CAPTURE_STOPPED",
+		message: func(m map[string]interface{}) string {
+			return "The connector that captures changes from your source is not running. " +
+				"No new changes are being captured until it is back, and the destination looking caught up does not mean it is."
+		},
+	},
 	IssueTypeSourceStreamStalled: {
 		code: "CDC_SOURCE_STREAM_STALLED",
 		message: func(m map[string]interface{}) string {

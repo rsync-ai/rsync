@@ -294,9 +294,29 @@ The demo needs a `postgresql` entry. Each connector is ~100 MiB of requests, so 
 what you use, not all 20. `install-k8s.sh` generates this list for you from
 `RSYNC_CONNECTORS`.
 
-**MongoDB in the same cluster:** the mongodb connector defaults to TLS for any
-non-local host. A plaintext in-cluster Mongo needs `"sslmode": "disable"` in the
-connection config, or the handshake fails.
+**Generating a connector from an OpenAPI document is a Docker-install feature.** Each pod
+reads its own copy of the connector catalog out of the `connector-seed` image (see
+[below](#verify)), so a connector the generator saved would reach no other service and be
+gone at the generator's next restart. The chart sets `RSYNC_CONNECTOR_CATALOG_SHARED=false`
+on `tool-generator`, and **Generate** answers with that reason instead of saving.
+
+**A database in the same cluster connects without TLS unless you ask for it.** The
+database connectors turn TLS on by default only for a remote host. A Kubernetes service
+name (`*.svc`, `*.cluster.local`) counts as local, like a docker service name, because
+neither suffix resolves on public DNS. Before v0.1.7 such a name read as remote, so a
+plaintext in-cluster MongoDB failed with `SSL handshake failed`, and saved only from a
+hand-written connection string.
+
+For MongoDB in the cluster, put the service name in **Host**
+(`mongo.sources.svc.cluster.local`) with the port, user and password; no connection
+string is needed. **Advanced settings** holds two more fields:
+
+- **TLS** — set `true` if that Mongo does serve TLS. A remote Mongo without TLS
+  needs `disable`.
+- **Auth Source** — the database the user is defined in, default `admin`.
+
+Use **Connection String** for Atlas or any other `mongodb+srv://` address: SRV has no
+single host and port to type.
 
 ---
 
@@ -397,7 +417,9 @@ kafka:
     # Port 9092 is the SASL listener. On Managed Kafka the password is an OAuth
     # access token that dies after ~1h — use mutual TLS on 9192 for a real
     # deployment. See gcp-managed-kafka.md.
-    bootstrapServers: "bootstrap.mycluster.europe-west1.managedkafka.myproject.cloud.goog:9092"
+    # The address `clusters describe` prints may not resolve from a pod; take the
+    # bootstrap-… record from the cluster's private DNS zone (gcp-managed-kafka.md, step 6).
+    bootstrapServers: "bootstrap-ID.HASH.europe-west1.managedkafka.s.cloud.goog:9092"
     saslUsername: rsync
     saslPassword: "…"
 objectStorage:

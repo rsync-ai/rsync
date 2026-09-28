@@ -9,8 +9,18 @@ on:
       - 'LICENSE*'
       - '.gitignore'
       - '.editorconfig'
-  push:
-    branches: [main]
+  # No `push: branches: [main]`, on purpose (2026-09-27). A push run re-did the
+  # PR's own work: on a push, dorny/paths-filter diffs the squash commit, which IS
+  # the PR's diff, so it picked the same jobs the PR had just passed. From
+  # 2026-09-26 08:10 to 09-27 07:08 UTC it cost 211 runner-min here (and 161 more
+  # in security.yml) out of 1,540 -- on four runners whose p90 wait was 11-28 min.
+  # It also killed the nightly: both runs share the concurrency group
+  # ci-refs/heads/main, so merge run 36247715314 cancelled schedule run
+  # 36245965147 32 min in. The one thing only a push run could catch -- two PRs
+  # each green alone, broken together -- the nightly catches now, because on
+  # schedule and workflow_dispatch every filtered job below runs in full. (Left to
+  # its filter, a schedule run would diff only main's LAST commit: the event has
+  # no `before`, so dorny falls back to it.)
   workflow_dispatch:
   # Nightly trigger for the non-blocking a11y suite. It used to run on
   # every PR purely to upload a report (continue-on-error, known-unfixed
@@ -74,13 +84,25 @@ jobs:
   # the WHOLE merged config, so the symptom is not a degraded service — nothing starts.
   # It only bites a FRESH stand-up (an existing host's .env already has the variable),
   # i.e. precisely a cloud migration, which is when it is most expensive.
+  #
+  # Second step, added 2026-09-27: a PR titled `fix:`/`fix(scope):` must change a
+  # test file, or say why not on a `No-test: <reason>` line in its description. It
+  # lives here rather than in a job of its own because every job costs a queue wait
+  # on every PR, and this is the one job that already runs on every PR unfiltered.
+  # It reads the PR from the API, hence GH_TOKEN and `pull-requests: read` above.
   env-templates:
-    name: Env templates satisfy compose
+    name: Env templates + fix PR has a test
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - run: ./scripts/check-env-templates.sh
+      - name: A fix PR changes a test, or says why not
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PY=/opt/homebrew/opt/python@3.11/bin/python3.11; [ -x "$PY" ] || PY=python3
+          "$PY" scripts/check-fix-has-test.py
 
   # ONE job for every Go module, not a job per module. This used to be three
   # jobs -- a 4-way `go` matrix, a 5-way `go-shared` matrix and `sink-worker`
@@ -113,7 +135,7 @@ jobs:
       # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
       - name: Does this job have anything to do?
         env:
-          WANTED: ${{ steps.filter.outputs.go == 'true' || steps.filter.outputs.go-shared == 'true' || steps.filter.outputs.sink == 'true' }}
+          WANTED: ${{ steps.filter.outputs.go == 'true' || steps.filter.outputs.go-shared == 'true' || steps.filter.outputs.sink == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           if [ "$WANTED" = 'true' ]; then
             echo 'RUN=1' >> "$GITHUB_ENV"
@@ -195,9 +217,10 @@ jobs:
       - name: go test (includes build + vet via compiler)
         if: env.RUN == '1'
         env:
-          SERVICES: ${{ steps.filter.outputs.go }}
-          SHARED: ${{ steps.filter.outputs.go-shared }}
-          SINK: ${{ steps.filter.outputs.sink }}
+          # Nightly and on demand: every module, whatever main's last commit touched.
+          SERVICES: ${{ steps.filter.outputs.go == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          SHARED: ${{ steps.filter.outputs.go-shared == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          SINK: ${{ steps.filter.outputs.sink == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         # `go test ./...` compiles every package, so the explicit
         # `go build` + `go vet` steps that used to run before were
         # redundant — `go test` already runs the same compile checks
@@ -265,7 +288,7 @@ jobs:
       # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
       - name: Does this job have anything to do?
         env:
-          WANTED: ${{ steps.filter.outputs.llm == 'true' }}
+          WANTED: ${{ steps.filter.outputs.llm == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           if [ "$WANTED" = 'true' ]; then
             echo 'RUN=1' >> "$GITHUB_ENV"
@@ -438,7 +461,11 @@ jobs:
         # longer ships it. The runtime image (python:3.11-slim) still bundles an older
         # setuptools, so this is a CI-only divergence — without the pin, tests/ fails at
         # COLLECTION with ModuleNotFoundError: pkg_resources, not at runtime in prod.
-        run: pip install pymongo 'setuptools<81'
+        #
+        # pytest-xdist is not a driver either: it runs invocation (2) of "Run unit
+        # tests" on 4 workers. Installed here, not in "Install dependencies", for the
+        # same reason as the drivers -- a venv cache HIT skips that step.
+        run: pip install pymongo 'setuptools<81' 'pytest-xdist>=3.8'
       # Eight cases across six suites are `skipif(shutil.which("helm") is None)`.
       # They render the chart: the documented `helm install` blocks, the four
       # cloud overlays, the external-Postgres TLS wiring, the docker-host
@@ -614,9 +641,17 @@ jobs:
           # error without a live LLM backend. It now stubs both module-level clients
           # (explorer_api.explorer_client, gateway_main.sql_client) in an autouse
           # fixture, so it is offline-clean and gated like everything else.
+          #
+          # -n 4: this invocation is ~11,400 tests and took 533 s serially (run
+          # 36317140151), the longest step on the PR path. On 4 xdist workers it
+          # ran in 94-123 s across four local runs, collecting the same 11,395
+          # tests. Four, not auto: four runners share this Mac's 11 cores. Invocation (1)
+          # stays serial -- 46 s, and the tool_generator suites were never proven
+          # worker-safe.
           pytest tests/ \
             --ignore=tests/unit \
             ../shared/mcp-connectors/tests/ \
+            -n 4 \
             -v
       - name: Per-connector regression tests (offline suites)
         if: env.RUN == '1'
@@ -724,7 +759,7 @@ jobs:
       # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
       - name: Does this job have anything to do?
         env:
-          WANTED: ${{ steps.filter.outputs.e2e == 'true' }}
+          WANTED: ${{ steps.filter.outputs.e2e == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           if [ "$WANTED" = 'true' ]; then
             echo 'RUN=1' >> "$GITHUB_ENV"
@@ -875,9 +910,10 @@ jobs:
       # an unguarded step would work on a PR that changed none of this job's paths,
       # and a step wrongly left outside the gate would report green having done
       # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
+      # `oss`, not `llm`: see that filter in .github/paths-filters.yml.
       - name: Does this job have anything to do?
         env:
-          WANTED: ${{ steps.filter.outputs.llm == 'true' || github.event_name == 'schedule' }}
+          WANTED: ${{ steps.filter.outputs.oss == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           if [ "$WANTED" = 'true' ]; then
             echo 'RUN=1' >> "$GITHUB_ENV"
@@ -918,7 +954,7 @@ jobs:
   frontend:
     name: Frontend (lint + test + build)
     # Runs on frontend PRs AND on the nightly schedule (the a11y job below
-    # needs this job's build artifact, so the build must run nightly too).
+    # needs this job's build output, so the build must run nightly too).
     if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     runs-on: ubuntu-latest
     steps:
@@ -935,7 +971,7 @@ jobs:
       # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
       - name: Does this job have anything to do?
         env:
-          WANTED: ${{ steps.filter.outputs.frontend == 'true' || github.event_name == 'schedule' }}
+          WANTED: ${{ steps.filter.outputs.frontend == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           if [ "$WANTED" = 'true' ]; then
             echo 'RUN=1' >> "$GITHUB_ENV"
@@ -1113,25 +1149,28 @@ jobs:
             echo "::warning title=Next.js cache::copy to $d failed; the next build on this runner starts cold"
           fi
       - name: Archive build output
-        # Only the frontend-a11y job consumes this artifact, and it runs
-        # nightly/manual only (schedule || workflow_dispatch). Gate the archive +
-        # upload to the SAME condition so PR/push runs don't upload an artifact
-        # nothing downloads -- which previously failed the whole gate whenever the
-        # Actions artifact-storage quota was exhausted.
+        # Only the frontend-a11y job consumes this archive, and it runs
+        # nightly/manual only (schedule || workflow_dispatch), so the archive and
+        # the hand-off below are gated to the SAME condition.
         if: env.RUN == '1' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-        # Next.js 16 emits internal chunk files whose names contain ':' (e.g.
-        # `[externals]_node:inspector_*.js`). upload-artifact@v4 rejects colons
-        # for NTFS compatibility, so we tar the build first and ship a single
-        # archive that the a11y job extracts on the other side.
+        # One archive, not the tree: Next.js 16 emits chunk files whose names
+        # contain ':' (e.g. `[externals]_node:inspector_*.js`). `.next/cache`
+        # is left out -- `next start` never reads it, and it is the ~400 MB this
+        # runner already keeps on its own disk (the step above).
         working-directory: frontend
-        run: tar -cf frontend-build.tar .next public
-      - name: Cache build output
+        run: tar -cf frontend-build.tar --exclude .next/cache .next public
+      - name: Hand the build to frontend-a11y (actions cache, not an artifact)
+        # Through the ACTIONS CACHE, not upload-artifact. The account's artifact
+        # storage quota is exhausted (no artifact has landed since 2026-08-23), and
+        # an exhausted quota failed THIS step -- which turned the nightly's
+        # Frontend job red on a build that had passed, and skipped a11y. The cache
+        # is a separate 10 GB per-repo budget; an entry nobody restores is evicted
+        # after 7 days. test_no_job_depends_on_the_artifact_quota.py holds the class.
         if: env.RUN == '1' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          name: frontend-build
           path: frontend/frontend-build.tar
-          retention-days: 1
+          key: frontend-build-${{ github.run_id }}-${{ github.run_attempt }}
 
   frontend-a11y:
     name: Frontend a11y (axe-core)
@@ -1181,7 +1220,7 @@ jobs:
       # nothing -- KI-DATAPATH-FILTER-EXCLUDES-THE-WORKFLOW, same class.
       - name: Does this job have anything to do?
         env:
-          WANTED: ${{ steps.filter.outputs.frontend == 'true' || github.event_name == 'schedule' }}
+          WANTED: ${{ steps.filter.outputs.frontend == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
         run: |
           if [ "$WANTED" = 'true' ]; then
             echo 'RUN=1' >> "$GITHUB_ENV"
@@ -1220,10 +1259,17 @@ jobs:
         run: npm ci
       - name: Restore build output
         if: env.RUN == '1'
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
-          name: frontend-build
-          path: frontend
+          # `path` must match the save step's byte for byte: it is part of the
+          # cache version, so a different spelling is a miss, not a restore.
+          path: frontend/frontend-build.tar
+          key: frontend-build-${{ github.run_id }}-${{ github.run_attempt }}
+          # "Re-run failed jobs" re-runs this job alone under a new run_attempt,
+          # while the build it needs was saved under the attempt that built it.
+          restore-keys: |
+            frontend-build-${{ github.run_id }}-
+          fail-on-cache-miss: true
       - name: Extract build output
         if: env.RUN == '1'
         working-directory: frontend

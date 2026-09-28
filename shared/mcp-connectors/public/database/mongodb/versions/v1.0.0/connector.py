@@ -569,8 +569,9 @@ def _is_local_db_host(host: str) -> bool:
     address (loopback / RFC1918-private / link-local / CGNAT 100.64.0.0/10 →
     local) so an IPv6 literal or a public IPv4 literal is treated remote instead
     of by a textual '.' heuristic that would miss them; non-literal hostnames
-    keep the dotless=local heuristic (docker service names), and any dotted
-    hostname is remote so callers default to TLS.
+    keep the dotless=local heuristic (docker service names), a Kubernetes
+    in-cluster name (*.svc, *.cluster.local) is local for the same reason, and
+    any other dotted hostname is remote so callers default to TLS.
     """
     h = str(host or "").strip().lower().strip("[]")  # tolerate bracketed IPv6
     if h in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal"):
@@ -588,7 +589,9 @@ def _is_local_db_host(host: str) -> bool:
         return False
     # Non-literal hostname: dotless single-label names are docker-internal/local
     # DNS; any dotted hostname is remote so callers default to verified TLS.
-    return "." not in h
+    # A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+    # suffix resolves on public DNS (shared/local_db_host_golden.json).
+    return "." not in h or h.endswith((".svc", ".cluster.local"))
 
 
 class MongodbMCPServer(BaseMCPConnector):
@@ -1162,6 +1165,26 @@ class MongodbMCPServer(BaseMCPConnector):
                                 seen[key] = _widen_type(seen.get(key), t)
                     except Exception as e:
                         result["warnings_messages"].append(f"{label}: sample failed: {e}")
+                    # B-MONGO-4: the natural-order sample can miss a mixed _id (the
+                    # 1,035 int ids of a 1.1M-ObjectId collection were never in it),
+                    # so _id was declared "integer". The export pages in _id order,
+                    # where BSON sorts every number before every string/ObjectId, so
+                    # the first files were all-int and landed as int64 parquet while
+                    # the rest landed as string — two schemas in one table folder.
+                    # The _id index's lowest and highest entries name the lowest and
+                    # highest type bracket present; widening over both ends declares
+                    # a mixed _id "string" BEFORE the first batch, so every file of the
+                    # table gets the same type. Two index-bounded reads, no scan.
+                    try:
+                        left = max(1, int((deadline - time.monotonic()) * 1000))
+                        for direction in (1, -1):
+                            for doc in coll.find({}, {"_id": 1}, max_time_ms=left) \
+                                    .sort("_id", direction).limit(1):
+                                val = doc.get("_id")
+                                t = None if val is None else _infer_type(val)
+                                seen["_id"] = _widen_type(seen.get("_id"), t)
+                    except Exception as e:
+                        result["warnings_messages"].append(f"{label}: _id range probe failed: {e}")
                     # A field that was null in every sampled document stays a string.
                     seen = {k: (t or "string") for k, t in seen.items()}
                     # _id first, then the rest in first-seen order.
@@ -1705,15 +1728,14 @@ class MongodbMCPServer(BaseMCPConnector):
     # written AFTER the data and best-effort — the model is the BigQuery adapter
     # in shared/mcp-connectors/public/warehouse_adapters.py.
     #
-    # RESIDUAL, recorded because Tier B's safety argument does not fully cover
-    # this connector: best-effort offsets are safe only for an IDEMPOTENT load.
-    # upsert_data/delete_data are idempotent (ReplaceOne(upsert=True) /
-    # delete_many by key); import_data's KEYLESS append is not, so a crash
-    # strictly between insert_many returning and the offset write below still
-    # duplicates those rows on replay. That window is one in-process round-trip
-    # instead of the entire uncommitted batch window it replaces, but it is not
-    # zero, and closing it needs either per-ROW identity from the sink (it sends
-    # one high-water mark per BATCH) or a replica-set transaction.
+    # Best-effort offsets are safe only for an IDEMPOTENT load. upsert_data /
+    # delete_data are (ReplaceOne(upsert=True) / delete_many by key). A keyless
+    # CDC row is too, because the sink gives it per-ROW identity: a deterministic
+    # _id from its Kafka record (kafka-sink-worker cdc_keyless_identity.go), written
+    # with upsert_data keyed on _id — or, in append-only mode, with import_data,
+    # whose duplicate-key tolerance below turns a redelivery into a no-op. A plain
+    # insert_many of documents WITHOUT _id (a non-CDC caller) is still not
+    # idempotent (KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES, resolved sink-side).
 
     _CDC_OFFSETS_COLLECTION = "_rsync_cdc_offsets"
 

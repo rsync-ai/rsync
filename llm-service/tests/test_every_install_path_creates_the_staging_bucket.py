@@ -70,6 +70,19 @@ def _buckets_made(service):
     return made
 
 
+# `mc alias set <alias> http(s)://<host>:<port> ...` -> the host, a compose service.
+_ALIAS_RE = re.compile(r"""mc\s+alias\s+set\s+\S+\s+["']?https?://([\w.-]+)""")
+
+
+def _alias_servers(service):
+    """-> the MinIO service names this service's command points `mc` at."""
+    return sorted(
+        {m.group(1) for line in _script(service).splitlines()
+         if not line.lstrip().startswith("#")
+         for m in [_ALIAS_RE.search(line)] if m}
+    )
+
+
 def _bucket_makers(compose):
     """-> {service: [buckets]} for every always-on service that runs `mc mb`."""
     out = {}
@@ -91,13 +104,35 @@ def _assert_compose_creates_bucket(filename):
         "creates the bucket, so the first batch pipeline fails staging on a fresh "
         f"install. Services running `mc mb` at all: {sorted(makers) or 'none'}"
     )
-    # It must wait for MinIO to be healthy, or it races the server and exits.
+    # It must wait for the server it creates the bucket IN to be healthy, or it
+    # races that server and exits. There are two such servers: the claim-check
+    # MinIO and the blob lane's staging store on the connector network.
     for name, svc in creating.items():
-        dep = (svc.get("depends_on") or {}).get("minio")
-        assert isinstance(dep, dict) and dep.get("condition") == "service_healthy", (
-            f"{filename}: {name} creates the bucket but does not wait on "
-            "minio: service_healthy"
-        )
+        servers = _alias_servers(svc)
+        assert servers, f"{filename}: {name} runs `mc mb` without `mc alias set`; the check read nothing"
+        for server in servers:
+            assert server in compose["services"], (
+                f"{filename}: {name} creates the bucket on `{server}`, which is not a service here"
+            )
+            dep = (svc.get("depends_on") or {}).get(server)
+            assert isinstance(dep, dict) and dep.get("condition") == "service_healthy", (
+                f"{filename}: {name} creates the bucket but does not wait on "
+                f"{server}: service_healthy"
+            )
+
+
+def test_both_bucket_stores_are_created_and_waited_on():
+    """The claim-check MinIO and the blob lane's staging store each get the bucket.
+    The sink validates a blob data_ref against one bucket name, so both hold it."""
+    for filename in ("docker-compose.quickstart.yml", "docker-compose.yml"):
+        compose = _load(filename)
+        servers = {
+            server
+            for svc, made in _bucket_makers(compose).values()
+            if BUCKET in made
+            for server in _alias_servers(svc)
+        }
+        assert servers == {"minio", "blob-staging"}, f"{filename}: bucket made on {sorted(servers)}"
 
 
 def test_quickstart_compose_creates_the_staging_bucket():

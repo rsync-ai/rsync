@@ -20,15 +20,17 @@
 //
 // The handler persists every run to pipeline_assessments so:
 //   - The UI can render the latest result alongside the pipeline status.
-//   - When STRICT_PREFLIGHT=true, the start-pipeline path can block on
-//     the latest row's blocks_start flag without re-running the checks.
+//   - Operators can audit why a run was refused. The refusal itself is the
+//     api-gateway's run gate (RunPipeline → evaluateAssessmentGate), which
+//     re-runs these checks via POST /api/v1/pipelines/:id/assess
+//     (fetchSourceReadiness) and always blocks on an error finding — there
+//     is no opt-in flag.
 package handlers
 
 import (
 	"database/sql"
 	"encoding/json"
 	"net/http"
-	"os"
 	"strings"
 	"time"
 
@@ -61,13 +63,6 @@ func (h *AssessmentHandler) RegisterRoutes(rg *gin.RouterGroup) {
 	rg.GET("/assess/supported-types", h.SupportedTypes)
 }
 
-// strictPreflightEnabled is read from the env at request time so an
-// operator can flip the policy without a restart (controller-style flag).
-func strictPreflightEnabled() bool {
-	v := strings.ToLower(strings.TrimSpace(os.Getenv("STRICT_PREFLIGHT")))
-	return v == "1" || v == "true" || v == "yes" || v == "on"
-}
-
 // assessmentRow mirrors a pipeline_assessments DB row.
 type assessmentRow struct {
 	ID                 string          `json:"id"`
@@ -83,7 +78,6 @@ type assessmentRow struct {
 	FailedCount        int             `json:"failed_count"`
 	ErrorCount         int             `json:"error_count"`
 	BlocksStart        bool            `json:"blocks_start"`
-	StrictPreflightOn  bool            `json:"strict_preflight_on"`
 }
 
 // RunAssessment runs the SourceAssessor for the pipeline's source and
@@ -204,7 +198,6 @@ func (h *AssessmentHandler) RunAssessment(c *gin.Context) {
 		"source_type":  pipelineSourceType,
 		"status":       result.OverallStatus,
 		"blocks_start": result.BlocksStart(),
-		"strict_on":    strictPreflightEnabled(),
 	}).Info("🛫 Pre-flight assessment run")
 
 	c.JSON(http.StatusOK, row)
@@ -253,8 +246,7 @@ func (h *AssessmentHandler) GetOne(c *gin.Context) {
 // pre-flight" button.
 func (h *AssessmentHandler) SupportedTypes(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{
-		"supported":        h.registry.SupportedTypes(),
-		"strict_preflight": strictPreflightEnabled(),
+		"supported": h.registry.SupportedTypes(),
 	})
 }
 
@@ -379,7 +371,6 @@ func (h *AssessmentHandler) persistResult(c *gin.Context, pipelineID, sourceConn
 		FailedCount:        r.FailedCount,
 		ErrorCount:         r.ErrorCount,
 		BlocksStart:        blocksStart,
-		StrictPreflightOn:  strictPreflightEnabled(),
 	}, nil
 }
 
@@ -446,35 +437,5 @@ func scanAssessmentRow(row *sql.Row) (*assessmentRow, error) {
 		r.FinishedAt = &t
 	}
 	r.Checks = json.RawMessage(rawJSON)
-	r.StrictPreflightOn = strictPreflightEnabled()
 	return &r, nil
-}
-
-// IsPipelineBlockedByPreflight is called by the start-pipeline code path
-// to enforce STRICT_PREFLIGHT. Returns (blocked, latestStatus, err).
-// blocked=true only when STRICT_PREFLIGHT is on AND the latest assessment
-// row's blocks_start=true. When no assessment row exists, blocks if strict.
-//
-// Public so the executor (or whichever code initiates pipeline start) can
-// call it without coupling to gin.
-func IsPipelineBlockedByPreflight(db *sql.DB, pipelineID string) (bool, string, error) {
-	if !strictPreflightEnabled() {
-		return false, "", nil
-	}
-	var status string
-	var blocks bool
-	err := db.QueryRow(`
-		SELECT status, blocks_start FROM pipeline_assessments
-		WHERE pipeline_id = $1::uuid
-		ORDER BY started_at DESC LIMIT 1`,
-		pipelineID,
-	).Scan(&status, &blocks)
-	if err == sql.ErrNoRows {
-		// Strict mode and never assessed → block until an assessment is run.
-		return true, "no_assessment", nil
-	}
-	if err != nil {
-		return true, "", err
-	}
-	return blocks, status, nil
 }

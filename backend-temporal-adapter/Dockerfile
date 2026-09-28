@@ -28,7 +28,11 @@ ARG TARGETARCH
 # DWARF. Panics still print file:line (that is pclntab, which stays), only a debugger loses.
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o temporal-adapter ./cmd/adapter
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o temporal-adapter ./cmd/adapter \
+    # `go version -m` rejects an incomplete binary; the hash is checked again after
+    # the COPY in the runtime stage (llm-service/tests/test_go_images_verify_their_binary.py).
+    && go version -m temporal-adapter >/dev/null \
+    && sha256sum temporal-adapter > temporal-adapter.sha256
 
 # Runtime stage
 FROM alpine:3.24
@@ -42,6 +46,9 @@ RUN apk --no-cache add ca-certificates curl
 
 # Copy binary from builder
 COPY --from=builder --chown=appuser:appgroup /build/backend-temporal-adapter/temporal-adapter .
+# The binary this stage received is the one the builder built, byte for byte.
+COPY --from=builder /build/backend-temporal-adapter/temporal-adapter.sha256 /tmp/
+RUN sha256sum -c /tmp/temporal-adapter.sha256 && rm /tmp/temporal-adapter.sha256
 
 USER appuser
 

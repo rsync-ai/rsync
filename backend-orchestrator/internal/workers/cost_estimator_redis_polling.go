@@ -83,11 +83,6 @@ func (w *CostEstimatorWorker) pollAndProcessRequests() error {
 }
 
 func (w *CostEstimatorWorker) processCorrelationRequest(req *correlation.PendingRequest) {
-	ctx, cancel := correlationWorkContext(w.ctx, "cost_estimator")
-	defer cancel()
-	deliverCtx, cancelDeliver := correlationDeliveryContext()
-	defer cancelDeliver()
-
 	logger := log.WithFields(log.Fields{
 		"correlation_id": req.CorrelationID,
 		"request_type":   req.RequestType,
@@ -121,22 +116,16 @@ func (w *CostEstimatorWorker) processCorrelationRequest(req *correlation.Pending
 	}
 
 	// Reuse the existing cost-estimation logic.
-	result, err := w.ProcessTask(ctx, task)
-	if err != nil {
-		logger.WithError(err).Warn("Cost estimation failed (advisory)")
-		result.Status = "failed"
-		result.Error = err.Error()
-	}
-
-	// Write response to Redis
-	if routeErr := RouteResult(deliverCtx, task, result); routeErr != nil {
-		logger.WithError(routeErr).Error("Failed to route response")
-	}
-
-	// Delete request from Redis after processing
-	if delErr := w.correlationClient.DeleteRequest(deliverCtx, req.CorrelationID, "cost_estimator"); delErr != nil {
-		logger.WithError(delErr).Warn("Failed to delete request from Redis")
-	}
+	// Route the result and delete the request once the work returns (fresh delivery context).
+	runCorrelationRequest(w.ctx, "cost_estimator", w.correlationClient, task, logger, func(ctx context.Context) TaskResult {
+		result, err := w.ProcessTask(ctx, task)
+		if err != nil {
+			logger.WithError(err).Warn("Cost estimation failed (advisory)")
+			result.Status = "failed"
+			result.Error = err.Error()
+		}
+		return result
+	})
 
 	logger.Info("📤 Cost estimator request processed and response sent to Redis")
 }

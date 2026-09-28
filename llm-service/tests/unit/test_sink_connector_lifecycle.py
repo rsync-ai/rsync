@@ -428,6 +428,93 @@ def test_supervisor_loop_records_last_exit_before_respawn(monkeypatch):
                 p.terminate()
 
 
+def test_supervisor_does_not_respawn_a_worker_the_destination_refused(monkeypatch):
+    """KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA: the Go worker exits
+    DEST_AUTH_REFUSED_EXIT_CODE (78, EX_CONFIG) when the destination refuses its
+    credential or grant. A respawn cannot fix that — it re-hits the same refusal — so
+    the supervisor must go terminal `crashed` at once with a needs-user-config error,
+    not burn the rapid-restart budget and end as an opaque "crash-looped"."""
+    c = C()
+    c._supervisor_stop.set()
+    monkeypatch.setattr(connector, "_read_cgroup_oom_kill_count", lambda: 0)
+    code = getattr(connector, "DEST_AUTH_REFUSED_EXIT_CODE", 78)
+    assert code == 78, "must equal exitDestAuthRefused in the Go worker's infra_fault.go"
+    wid = "authrefused"
+    dead = subprocess.Popen(["python3", "-c", f"import sys; sys.exit({code})"])
+    dead.wait(timeout=5)
+    with c._lock:
+        c.workers[wid] = {
+            "process": dead, "pid": dead.pid, "config": {"consumer_group": wid},
+            "metrics_port": 1, "restart_attempts": 0, "intentional_stop": False,
+            "auto_restart": True,
+        }
+    spawned = []
+
+    def spawn(wc):
+        p = subprocess.Popen(["sleep", "30"])
+        spawned.append(p)
+        return p
+
+    monkeypatch.setattr(c, "_spawn_worker_process", spawn)
+    c._supervisor_stop = _OnePassStop()
+    try:
+        c._supervisor_loop()
+        worker = c.workers[wid]
+        assert spawned == [], "respawned a worker whose destination refused the credential"
+        assert worker.get("crashed") is True, worker
+        err = worker.get("last_error") or ""
+        assert "authentication" in err and "needs user config" in err, err
+        assert worker["last_exit"]["returncode"] == code, worker["last_exit"]
+        st = c.sink_status({"config": {"consumer_group": wid}})
+        assert st["status"] == "crashed" and "needs user config" in st.get("error", ""), st
+    finally:
+        for p in spawned:
+            if p.poll() is None:
+                p.terminate()
+
+
+def test_dest_auth_exit_code_matches_the_go_worker():
+    """The supervisor and the Go worker must agree on the auth-refused exit code."""
+    import re
+    go = os.path.join(_V, "../../worker-src/cmd/kafka-sink-worker/infra_fault.go")
+    with open(go) as f:
+        m = re.search(r"const exitDestAuthRefused = (\d+)", f.read())
+    assert m, "exitDestAuthRefused not found in infra_fault.go"
+    assert int(m.group(1)) == connector.DEST_AUTH_REFUSED_EXIT_CODE
+
+
+def test_supervisor_still_respawns_an_ordinary_crash(monkeypatch):
+    """Sibling guard: only exit 78 is terminal; a generic exit 1 still respawns."""
+    c = C()
+    c._supervisor_stop.set()
+    monkeypatch.setattr(connector, "_read_cgroup_oom_kill_count", lambda: 0)
+    wid = "plaincrash"
+    dead = subprocess.Popen(["python3", "-c", "import sys; sys.exit(1)"])
+    dead.wait(timeout=5)
+    with c._lock:
+        c.workers[wid] = {
+            "process": dead, "pid": dead.pid, "config": {"consumer_group": wid},
+            "metrics_port": 1, "restart_attempts": 0, "intentional_stop": False,
+            "auto_restart": True,
+        }
+    spawned = []
+
+    def spawn(wc):
+        p = subprocess.Popen(["sleep", "30"])
+        spawned.append(p)
+        return p
+
+    monkeypatch.setattr(c, "_spawn_worker_process", spawn)
+    c._supervisor_stop = _OnePassStop()
+    try:
+        c._supervisor_loop()
+        assert len(spawned) == 1 and not c.workers[wid].get("crashed"), c.workers[wid]
+    finally:
+        for p in spawned:
+            if p.poll() is None:
+                p.terminate()
+
+
 def _spawned_worker_config(monkeypatch, config):
     """start_sink's worker_config as handed to the Go worker (the CONFIG env)."""
     c = C()
@@ -476,3 +563,33 @@ def test_start_sink_forwards_mirror_source_namespace(monkeypatch):
     }
     assert _spawned_worker_config(monkeypatch, dict(base, mirror_source_namespace=True))["mirror_source_namespace"] is True
     assert _spawned_worker_config(monkeypatch, base)["mirror_source_namespace"] is False
+
+
+def test_list_sinks_reports_each_group_once_with_its_pipeline():
+    # KI-CDC-SINK-WORKER-NO-REAPER: the orchestrator's orphan reaper finds workers
+    # whose stop_sink failed through list_sinks. Replicas fold into their base group,
+    # and pipeline_id is what start_sink was given, so the reaper can ask the DB.
+    c = C()
+    pid = "abd8a64d-1f2e-4c3b-9a7d-5e6f70819234"
+    procs = []
+    try:
+        for wid, cfg in (
+            ("sink-abd8a64d", {"consumer_group": "sink-abd8a64d", "pipeline_id": pid}),
+            ("sink-abd8a64d#1", {"consumer_group": "sink-abd8a64d", "pipeline_id": pid}),
+            ("legacy-group", {}),
+        ):
+            proc = subprocess.Popen(["sleep", "30"])
+            procs.append(proc)
+            with c._lock:
+                c.workers[wid] = {
+                    "process": proc, "pid": proc.pid, "config": cfg, "metrics_port": 1,
+                    "restart_attempts": 0, "intentional_stop": False, "auto_restart": True,
+                }
+        res = c.list_sinks({})
+        assert res["success"] is True, res
+        got = sorted((w["consumer_group"], w["pipeline_id"]) for w in res["workers"])
+        assert got == [("legacy-group", ""), ("sink-abd8a64d", pid)], got
+        assert "list_sinks" in {op["name"] for op in c.get_capabilities()["operations"]}
+    finally:
+        for p in procs:
+            p.kill()

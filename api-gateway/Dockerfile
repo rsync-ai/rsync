@@ -54,7 +54,11 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     # this image. Prod could not be redeployed for two days as a result, which also
     # stranded two pending migrations. Every other Dockerfile here already uses the
     # package form; this was the last single-file build.
-    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o bin/server ./cmd/server
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -trimpath -ldflags "-s -w" -o bin/server ./cmd/server \
+    # `go version -m` rejects an incomplete binary; the hash is checked again after
+    # the COPY in the runtime stage (llm-service/tests/test_go_images_verify_their_binary.py).
+    && go version -m bin/server >/dev/null \
+    && cd bin && sha256sum server > server.sha256
 
 FROM alpine:3.24
 
@@ -65,6 +69,9 @@ WORKDIR /app
 
 COPY --from=builder --chown=appuser:appgroup /build/api-gateway/bin/server .
 COPY --from=builder --chown=appuser:appgroup /build/api-gateway/migrations ./migrations
+# The binary this stage received is the one the builder built, byte for byte.
+COPY --from=builder /build/api-gateway/bin/server.sha256 /tmp/
+RUN sha256sum -c /tmp/server.sha256 && rm /tmp/server.sha256
 
 USER appuser
 

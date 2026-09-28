@@ -70,6 +70,16 @@ REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "..")
 
 FIRST_PARTY = "ghcr.io/rsync-ai/"
 
+# The quickstart names its registry as `${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}`
+# so an install can pull from a mirror. Resolved to the default compose uses when
+# nothing is set: a literal `ghcr.io/rsync-ai/` match reads that form as a
+# third-party image, and every first-party check here would lose the quickstart.
+_REGISTRY_KNOB = re.compile(r"\$\{RSYNC_IMAGE_REGISTRY:-([^}]*)\}")
+
+
+def _default_registry(image):
+    return _REGISTRY_KNOB.sub(r"\1", image)
+
 # A tag that names a moving target rather than a build. `latest` is the one that
 # bit us; the rest are the conventional aliases that mean the same thing and
 # would sail past a check that only looked for `latest`.
@@ -228,7 +238,7 @@ def _shipped_third_party():
     return [
         (f, svc, img)
         for f, svc, img in _compose_image_refs()
-        if FIRST_PARTY not in img and (f, svc) not in ALLOWLIST
+        if FIRST_PARTY not in _default_registry(img) and (f, svc) not in ALLOWLIST
     ]
 
 
@@ -256,6 +266,11 @@ def test_the_image_census_is_not_empty():
     assert len(refs) >= 60, f"only {len(refs)} compose image refs found; the census under-read its subject"
     shipped = _shipped_third_party()
     assert len(shipped) >= 25, f"only {len(shipped)} shipped third-party refs; assertions below are near-vacuous"
+    # The quickstart alone names 15. A prefix match that stopped recognising them
+    # would not shrink the census -- it would move them into the third-party set
+    # above, where `${RSYNC_VERSION:-latest}` passes as "resolved by design".
+    first = [i for _, _, i in refs if FIRST_PARTY in _default_registry(i)]
+    assert len(first) >= 15, f"only {len(first)} first-party refs; the quickstart's were misread"
     chart = _chart_image_refs()
     assert len(chart) >= 6, f"only {len(chart)} chart image strings found: {chart}"
 
@@ -294,7 +309,7 @@ def test_no_chart_image_floats(values_file, key, image):
     [
         pytest.param(f, s, i, id=f"{f}::{s}")
         for f, s, i in _compose_image_refs()
-        if FIRST_PARTY in i
+        if FIRST_PARTY in _default_registry(i)
     ],
 )
 def test_no_first_party_image_is_pinned_to_latest(compose_file, service, image):

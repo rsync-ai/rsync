@@ -10,6 +10,8 @@ package workers
 // For BATCH pipelines:
 //   - Source MCP container   (stdio fallback ok)
 //   - Destination MCP container (stdio fallback ok; HTTP attempted first)
+//   - kafka-mcp-sink           (Kafka → destination writer; REQUIRED — every
+//                               batch row is dispatched through it)
 //   - MinIO MCP               (large-batch staging; OPTIONAL — see below)
 //
 // For CDC pipelines:
@@ -220,6 +222,19 @@ func (p *infraPreflightStage) requiredServices(execTask executor.ExecutorTask, i
 		})
 	}
 
+	// kafka-mcp-sink drains the pipeline topic into the destination for BOTH
+	// modes: a batch run produces to pipeline.<id>.data (or a MinIO claim-check
+	// pointer) and a sink worker writes it. Without it a batch run starts, fills
+	// Kafka, and sits "running" until the reconcile deadline — so it is required
+	// whenever there is a destination, same probe for batch and CDC.
+	kafkaSink := preflightService{
+		name:       "kafka-mcp-sink",
+		kind:       "mcp_core",
+		healthURL:  fmt.Sprintf("http://%s-kafka-mcp-sink-v1-0-0-mcp:8000/health", mcp.StackPrefix()),
+		mcpName:    "kafka-mcp-sink",
+		mcpVersion: "v1.0.0",
+	}
+
 	if isCDC {
 		kafkaConnectURL := strings.TrimRight(os.Getenv("KAFKA_CONNECT_URL"), "/")
 		if kafkaConnectURL == "" {
@@ -239,15 +254,12 @@ func (p *infraPreflightStage) requiredServices(execTask executor.ExecutorTask, i
 				mcpName:    "debezium",
 				mcpVersion: "v1.0.0",
 			},
-			preflightService{
-				name:       "kafka-mcp-sink",
-				kind:       "mcp_core",
-				healthURL:  fmt.Sprintf("http://%s-kafka-mcp-sink-v1-0-0-mcp:8000/health", mcp.StackPrefix()),
-				mcpName:    "kafka-mcp-sink",
-				mcpVersion: "v1.0.0",
-			},
+			kafkaSink,
 		)
 	} else {
+		if dstName != "" {
+			services = append(services, kafkaSink)
+		}
 		// Batch: MinIO stages any batch over the inline limit, whatever the
 		// destination. Optional — the executor falls back to chunked Kafka.
 		services = append(services, preflightService{

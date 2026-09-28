@@ -312,6 +312,9 @@ _DDL_DIALECT_ALIASES = {"mssql": "sqlserver", "postgres": "postgresql", "pg": "p
 # binary). "lone" = the table's only key column; "composite" = one of several
 # (kept smaller to fit the dialect's index-key byte limit).
 _KEY_BOUNDED_DDL = {
+    # MySQL refuses a UNIQUE index on TEXT/BLOB/JSON (error 1170); InnoDB's key
+    # limit is 3072 bytes = 768 utf8mb4 chars, and 4 x 191 still fits a composite.
+    "mysql": {"lone": "VARCHAR(768)", "composite": "VARCHAR(191)"},
     "sqlserver": {"lone": "NVARCHAR(450)", "composite": "NVARCHAR(200)"},
     "oracle": {"lone": "VARCHAR2(400)", "composite": "VARCHAR2(200)"},
 }

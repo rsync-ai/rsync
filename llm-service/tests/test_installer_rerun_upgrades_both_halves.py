@@ -117,11 +117,14 @@ def _refresh_block():
     raise AssertionError("upgrade block is not closed at main()'s indentation")
 
 
-def _harness(tmp_path, ref, version):
+def _harness(tmp_path, ref, version, compose_dir="", registry=""):
     """install.sh's own env_value, set_env_value and upgrade block, nothing else.
 
     download_compose is stubbed to a marker write plus a call log, so the cases
     can assert both that it ran and that it did not, and never reach the network.
+
+    `compose_dir` is checkout mode (RSYNC_COMPOSE_DIR) and `registry` is an
+    RSYNC_IMAGE_REGISTRY named on this run; both default to a plain release run.
     """
     return (
         "set -euo pipefail\n"
@@ -130,6 +133,9 @@ def _harness(tmp_path, ref, version):
         'COMPOSE_FILE="docker-compose.quickstart.yml"\n'
         f'RSYNC_REF="{ref}"\n'
         f'RSYNC_VERSION="{version}"\n'
+        f'RSYNC_COMPOSE_DIR="{compose_dir}"\n'
+        f'RSYNC_IMAGE_REGISTRY_REQUESTED="{registry}"\n'
+        'RSYNC_IMAGE_REGISTRY="${RSYNC_IMAGE_REGISTRY_REQUESTED:-ghcr.io/rsync-ai}"\n'
         "info(){ :; }\nwarn(){ :; }\n"
         'download_compose(){\n'
         f'  printf %s "{REFRESHED}" > "${{INSTALL_DIR}}/${{COMPOSE_FILE}}"\n'
@@ -141,6 +147,10 @@ def _harness(tmp_path, ref, version):
         # would answer for the installer, and answering correctly is the whole
         # question.
         + _function_body("ref_is_release_tag")
+        # What the gate compares against and what the block records. Lifted for
+        # the same reason: a checkout recorded as the tag it defaulted to is a
+        # defect this stand-in would have to reproduce to catch.
+        + _function_body("installed_ref")
         + "rerun_branch() {\n"
         + _refresh_block()
         + "}\nrerun_branch\n"
@@ -156,9 +166,9 @@ def _seed(tmp_path, env_body, compose=PINNED):
     return env
 
 
-def _run(tmp_path, ref, version):
+def _run(tmp_path, ref, version, **mode):
     harness = tmp_path / "harness.sh"
-    harness.write_text(_harness(tmp_path, ref, version))
+    harness.write_text(_harness(tmp_path, ref, version, **mode))
     out = subprocess.run(["bash", str(harness)], capture_output=True, text=True)
     assert out.returncode == 0, f"upgrade block exited {out.returncode}:\n{out.stderr}"
     return out
@@ -299,9 +309,11 @@ def test_write_env_records_the_ref_it_installed_from():
     while every new install came out unrecorded."""
     src = _read_install_sh()
     # Inside the interpolating heredoc, next to the version it pairs with --
-    # a quoted heredoc would ship the literal text `${RSYNC_REF}` into the .env.
+    # a quoted heredoc would ship the literal text `$(installed_ref)` into the
+    # .env. The same function the re-run block records through, so a fresh
+    # install and a re-run cannot disagree about what a checkout is called.
     m = re.search(
-        r"^RSYNC_VERSION=\$\{RSYNC_VERSION\}$.*?^RSYNC_INSTALLED_REF=\$\{RSYNC_REF\}$",
+        r"^RSYNC_VERSION=\$\{RSYNC_VERSION\}$.*?^RSYNC_INSTALLED_REF=\$\(installed_ref\)$",
         src,
         re.MULTILINE | re.DOTALL,
     )
@@ -417,3 +429,78 @@ def test_a_no_op_branch_rerun_leaves_the_env_byte_identical(tmp_path):
     before = env.read_text()
     _run(tmp_path, ref="main", version="main")
     assert env.read_text() == before
+
+
+# ---------------------------------------------------------------------------
+# Checkout mode (RSYNC_COMPOSE_DIR) and a registry named on the command line.
+# ---------------------------------------------------------------------------
+
+
+def test_a_checkout_rerun_refreshes_and_records_where_it_came_from(tmp_path):
+    """A checkout is whatever is on disk now, so it moves the way a branch does.
+
+    Re-running from the same directory after a `git pull` must re-copy the
+    compose file and re-record the tag the operator named. Under a name-only
+    gate, `local:/src` against `local:/src` would read as "nothing to do".
+    """
+    env = _seed(tmp_path, "RSYNC_VERSION=0.1.7-rc1\nRSYNC_INSTALLED_REF=local:/src\n")
+    _run(tmp_path, ref="v0.1.6", version="0.1.7-rc2", compose_dir="/src")
+
+    assert _calls(tmp_path) == 1, "a checkout re-run copied nothing from the checkout"
+    got = _env_map(env)
+    assert got["RSYNC_INSTALLED_REF"] == ["local:/src"]
+    assert got["RSYNC_VERSION"] == ["0.1.7-rc2"]
+
+
+def test_a_release_run_over_a_checkout_install_is_an_upgrade(tmp_path):
+    """The reason a checkout is recorded as `local:<dir>` and not as its ref.
+
+    Both runs name the SAME release tag. The first is a checkout; the second is
+    the ordinary `curl | bash` of that release. Had the first recorded
+    `v0.1.7`, the second would compare it with `v0.1.7`, see a tag that cannot
+    move, and keep the checkout's compose file running against the release's
+    images -- the two-commit pairing checkout mode itself refuses to create.
+    """
+    env = _seed(tmp_path, "RSYNC_VERSION=0.1.7-rc1\n")
+    _run(tmp_path, ref="v0.1.7", version="0.1.7-rc1", compose_dir="/src")
+    assert _env_map(env)["RSYNC_INSTALLED_REF"] == ["local:/src"]
+
+    _run(tmp_path, ref="v0.1.7", version="0.1.7")
+
+    assert _calls(tmp_path) == 2, "the release run kept the checkout's compose file"
+    got = _env_map(env)
+    assert got["RSYNC_INSTALLED_REF"] == ["v0.1.7"]
+    assert got["RSYNC_VERSION"] == ["0.1.7"]
+
+
+def test_a_registry_is_rewritten_only_when_this_run_names_one(tmp_path):
+    """RSYNC_IMAGE_REGISTRY sits in the .env so a hand-run `docker compose`
+    pulls from the same place. An ordinary re-run must keep a mirror recorded
+    there, which is the same-tag control; naming one must replace it, without
+    the compose refresh a registry change does not need."""
+    env = _seed(
+        tmp_path,
+        "RSYNC_VERSION=0.1.2\nRSYNC_INSTALLED_REF=v0.1.2\n"
+        "RSYNC_IMAGE_REGISTRY=mirror.example/rsync\n",
+    )
+    before = env.read_text()
+    _run(tmp_path, ref="v0.1.2", version="0.1.2")
+    assert env.read_text() == before, "a re-run that named no registry rewrote the .env"
+
+    _run(tmp_path, ref="v0.1.2", version="0.1.2", registry="registry.internal:5000/rsync")
+    got = _env_map(env)
+    assert got["RSYNC_IMAGE_REGISTRY"] == ["registry.internal:5000/rsync"]
+    assert _calls(tmp_path) == 0, "a registry change re-downloaded the compose file"
+
+
+def test_write_env_records_the_registry_the_images_come_from():
+    """The producer half of the case above: a fresh install writes the value
+    into the same interpolating heredoc as the version it pairs with."""
+    src = _read_install_sh()
+    m = re.search(
+        r"^RSYNC_VERSION=\$\{RSYNC_VERSION\}$.*?^RSYNC_IMAGE_REGISTRY=\$\{RSYNC_IMAGE_REGISTRY\}$",
+        src,
+        re.MULTILINE | re.DOTALL,
+    )
+    assert m, "write_env no longer records RSYNC_IMAGE_REGISTRY beside RSYNC_VERSION"
+    assert "EOF" not in m.group(0)

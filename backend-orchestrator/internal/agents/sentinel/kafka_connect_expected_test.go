@@ -119,8 +119,8 @@ func TestKafkaConnectIsProbedWhileACDCPipelineExists(t *testing.T) {
 	if f.stub.calls != 1 {
 		t.Fatalf("Kafka Connect probed %d time(s), want 1", f.stub.calls)
 	}
-	if got := infraHealth(t, f.h, kafkaConnectComponentID); got.Status != HealthStatusUnhealthy {
-		t.Errorf("status = %q for a Connect answering 503, want unhealthy", got.Status)
+	if got := infraHealth(t, f.h, kafkaConnectComponentID); got.Status != HealthStatusDegraded {
+		t.Errorf("status = %q for a first 503 from Connect, want degraded (debounced)", got.Status)
 	}
 	if err := f.mock.ExpectationsWereMet(); err != nil {
 		t.Error(err)
@@ -164,8 +164,52 @@ func TestKafkaConnectIsProbedWhenTheCDCPipelineQueryFails(t *testing.T) {
 	if f.stub.calls != 1 {
 		t.Fatalf("Kafka Connect probed %d time(s) after a failed CDC-pipeline query, want 1", f.stub.calls)
 	}
-	if got := infraHealth(t, f.h, kafkaConnectComponentID); got.Status != HealthStatusUnhealthy {
-		t.Errorf("status = %q, want unhealthy", got.Status)
+	if got := infraHealth(t, f.h, kafkaConnectComponentID); got.Status != HealthStatusDegraded {
+		t.Errorf("status = %q, want degraded (probed, first miss)", got.Status)
+	}
+}
+
+// A fresh install probes Connect while it is still starting. One miss used to record
+// it unhealthy, which the detector turns into a CRITICAL INFRASTRUCTURE_DOWN for every
+// admin. It now takes serviceFailureThreshold consecutive misses, the same debounce
+// as the core services, and a success or a stretch with nothing needing Connect
+// starts the count over.
+func TestKafkaConnectIsReportedDownOnlyAfterConsecutiveMisses(t *testing.T) {
+	f := newConnectFixture(t, http.StatusServiceUnavailable)
+	ctx := context.Background()
+	tick := func() HealthStatus {
+		f.expectCDCPipelines(true)
+		f.expectRecorded()
+		f.h.checkKafkaConnectHealth(ctx)
+		return infraHealth(t, f.h, kafkaConnectComponentID).Status
+	}
+
+	for i := 1; i < serviceFailureThreshold; i++ {
+		if got := tick(); got != HealthStatusDegraded {
+			t.Fatalf("miss %d recorded %q, want degraded", i, got)
+		}
+	}
+	if got := tick(); got != HealthStatusUnhealthy {
+		t.Fatalf("miss %d recorded %q, want unhealthy", serviceFailureThreshold, got)
+	}
+
+	f.stub.status = http.StatusOK
+	if got := tick(); got != HealthStatusHealthy {
+		t.Fatalf("recovery recorded %q, want healthy", got)
+	}
+	f.stub.status = http.StatusServiceUnavailable
+	if got := tick(); got != HealthStatusDegraded {
+		t.Errorf("first miss after a recovery recorded %q, want degraded (count reset)", got)
+	}
+
+	f.expectCDCPipelines(false)
+	f.expectForgotten()
+	f.h.checkKafkaConnectHealth(ctx)
+	if got := tick(); got != HealthStatusDegraded {
+		t.Errorf("first miss after Connect was forgotten recorded %q, want degraded (count reset)", got)
+	}
+	if err := f.mock.ExpectationsWereMet(); err != nil {
+		t.Error(err)
 	}
 }
 

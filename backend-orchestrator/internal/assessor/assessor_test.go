@@ -2,7 +2,6 @@ package assessor
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/rsync-ai/backend-orchestrator/pkg/diagnose"
@@ -100,7 +99,7 @@ func TestSummarize_FailureBlocksStart(t *testing.T) {
 		t.Errorf("got failed=%d status=%s", r.FailedCount, r.OverallStatus)
 	}
 	if !r.BlocksStart() {
-		t.Error("failed-check result MUST block start under STRICT_PREFLIGHT")
+		t.Error("failed-check result MUST block start")
 	}
 }
 
@@ -228,20 +227,5 @@ func TestInput_RequiresTablePrimaryKeys(t *testing.T) {
 		if got := in.RequiresTablePrimaryKeys(); got != tc.want {
 			t.Errorf("%s: RequiresTablePrimaryKeys()=%v, want %v", tc.name, got, tc.want)
 		}
-	}
-}
-
-// TestMissingPKReason ensures the failure message is mode-accurate — it must not
-// claim "CDC requires one" on a batch run, and must mention the upsert for batch.
-func TestMissingPKReason(t *testing.T) {
-	if got := missingPKReason(true); !strings.Contains(got, "CDC") {
-		t.Errorf("cdc reason should mention CDC, got %q", got)
-	}
-	batch := missingPKReason(false)
-	if strings.Contains(batch, "CDC") {
-		t.Errorf("batch reason must not mention CDC, got %q", batch)
-	}
-	if !strings.Contains(batch, "ON CONFLICT") || !strings.Contains(batch, "silently dropped") {
-		t.Errorf("batch reason should explain the upsert drop, got %q", batch)
 	}
 }

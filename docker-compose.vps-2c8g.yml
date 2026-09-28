@@ -29,10 +29,10 @@ services:
   # rows through it on BOTH lanes — direct-kafka and the MinIO claim-check lane
   # (executor/silent_drop_check.go:30-60, "both go through kafka-mcp-sink").
   #
-  # Pre-flight cannot catch its absence, which is what made this expensive:
-  # requiredServices() only lists kafka-mcp-sink under the isCDC branch
-  # (infra_preflight.go:190-200), so a batch run sails through pre-flight, ships
-  # its rows into Kafka with nothing consuming them, and fails at the reconcile
+  # Pre-flight now requires it for batch too (infra_preflight.go
+  # requiredServices). Before that it was listed only under the isCDC
+  # branch, so a batch run sailed through pre-flight, shipped
+  # its rows into Kafka with nothing consuming them, and failed at the reconcile
   # deadline with "dispatched N rows via sink but no acks were recorded …
   # failing closed as a total drop" (silent_drop_check.go:93). That message
   # reads as an unreachable DESTINATION, so it sends you to the wrong end of

@@ -100,13 +100,32 @@ gcloud managed-kafka acls add-acl-entry cluster \
   --principal='User:rsync-client' --operation=DESCRIBE --permission-type=ALLOW --host='*'
 ```
 
-**6. Install with the certificate and an empty `caCert`.**
+**6. Find the bootstrap address your pods can resolve.** The `bootstrapAddress`
+that `gcloud managed-kafka clusters describe` prints
+(`bootstrap.MY_CLUSTER.us-central1.managedkafka.MY_PROJECT.cloud.goog`) did not
+resolve from a GKE pod on the v0.1.7 release test (2026-09-28): every client failed
+with a DNS error (`gaierror`). The cluster also creates a private Cloud DNS zone in
+the attached VPC, and the `bootstrap-…` A record there does resolve. Read it from
+that zone:
+
+```bash
+gcloud dns managed-zones list --project MY_PROJECT \
+  --filter='dnsName~managedkafka' --format='value(name,dnsName)'
+gcloud dns record-sets list --project MY_PROJECT --zone=ZONE_NAME_FROM_ABOVE \
+  --filter='type=A' --format='value(name,rrdatas)'
+```
+
+Use the `bootstrap-<id>.<hash>.us-central1.managedkafka.s.cloud.goog` name, without
+the trailing dot. Add port `9192` for mutual TLS or `9092` for SASL. The
+`broker-N` records are the brokers the bootstrap hands out; you do not list them.
+
+**7. Install with the certificate and an empty `caCert`.**
 
 ```yaml
 kafka:
   enabled: false
   external:
-    bootstrapServers: "bootstrap.MY_CLUSTER.us-central1.managedkafka.MY_PROJECT.cloud.goog:9192"
+    bootstrapServers: "bootstrap-ID.HASH.us-central1.managedkafka.s.cloud.goog:9192"  # step 6
     securityProtocol: SSL
     tls:
       caCert: ""                    # MUST stay empty — see below
@@ -142,7 +161,7 @@ file, which the chart builds for you only when it holds the values itself.
 - **Reaching the cluster at all requires being inside the VPC.** The bootstrap
   address resolves to a private Private Service Connect endpoint. From outside the
   attached network it does not resolve, which looks like a hang rather than a
-  networking error.
+  networking error. Inside the network, use the name from step 6.
 - **A bad credential can appear to work on the SASL listener.** Once a principal
   has authenticated successfully, Google will accept later connections from it
   carrying a token that is merely *shaped* like one. If you are testing that
@@ -155,7 +174,7 @@ file, which the chart builds for you only when it holds the values itself.
 kafka:
   enabled: false
   external:
-    bootstrapServers: "bootstrap.MY_CLUSTER.us-central1.managedkafka.MY_PROJECT.cloud.goog:9092"
+    bootstrapServers: "bootstrap-ID.HASH.us-central1.managedkafka.s.cloud.goog:9092"  # step 6
     securityProtocol: SASL_SSL
     saslMechanism: PLAIN
     saslUsername: "you@example.com"          # the principal, verbatim

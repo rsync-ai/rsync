@@ -33,7 +33,11 @@ COPY . .
 ARG TARGETOS
 ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
-    go build -trimpath -ldflags "-s -w" -o /out/deployer ./cmd/deployer
+    go build -trimpath -ldflags "-s -w" -o /out/deployer ./cmd/deployer \
+    # `go version -m` rejects an incomplete binary; the hash is checked again after
+    # the COPY in the runtime stage (llm-service/tests/test_go_images_verify_their_binary.py).
+    && go version -m /out/deployer >/dev/null \
+    && cd /out && sha256sum deployer > deployer.sha256
 
 # ---- runtime ----
 # docker:27-cli is Alpine-based and bundles the docker CLI + buildx (needed for
@@ -41,6 +45,9 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
 FROM docker:29-cli AS runtime
 RUN apk add --no-cache ca-certificates
 COPY --from=build /out/deployer /usr/local/bin/deployer
+# The binary this stage received is the one the build stage built, byte for byte.
+COPY --from=build /out/deployer.sha256 /tmp/
+RUN cd /usr/local/bin && sha256sum -c /tmp/deployer.sha256 && rm /tmp/deployer.sha256
 # buildctl for the rootless build path — version-locked to the buildkitd sidecar via
 # the BUILDKIT_VERSION-parameterized `buildkit` stage above.
 COPY --from=buildkit /usr/bin/buildctl /usr/local/bin/buildctl

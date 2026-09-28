@@ -213,7 +213,7 @@ func UpdatePipelineCDCTables(c *gin.Context) {
 				"connector_name": connectorName,
 				"status_code":    status,
 			}).Warn("Orchestrator rejected CDC table update")
-			c.Data(status, "application/json", body)
+			c.Data(browserStatusForUpstream(status), "application/json", body)
 			return
 		}
 		// BUG #6: the diff above is against the SAVED list, which lags the connector

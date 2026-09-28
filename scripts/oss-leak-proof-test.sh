@@ -232,7 +232,7 @@ $(docker run --rm --user root --entrypoint sh "$img" -c '
   cid=$(docker create "$img")
   tmp=$(mktemp -d)
   docker cp "$cid":/app/src "$tmp/src" >/dev/null 2>&1
-  docker rm "$cid" >/dev/null
+  docker rm -v "$cid" >/dev/null
   audit=$(find "$tmp/src" \( -name '*.yaml' -o -name '*.yml' -o -name '*.jsonl' \) 2>/dev/null \
           | sed "s|^$tmp/||")
   local C_ALLOWED=''   # none today; see the note above before adding to this

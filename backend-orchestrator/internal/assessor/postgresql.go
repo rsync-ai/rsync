@@ -102,7 +102,7 @@ func (a *PostgresAssessor) Assess(ctx context.Context, in Input) (*Result, error
 	// matches nothing, and those rows are silently dropped). Skipped for a
 	// batch load to a file/SaaS destination, which appends rather than upserts.
 	if len(in.Tables) > 0 && in.RequiresTablePrimaryKeys() {
-		r.Checks = append(r.Checks, checkPostgresTablePrimaryKeys(ctx, db, in.ConnectionConfig, in.Tables, in.IsCDC(), in.CDCBlocksWithoutPrimaryKey(), in.NominatedKeys)...)
+		r.Checks = append(r.Checks, checkPostgresTablePrimaryKeys(ctx, db, in.ConnectionConfig, in.Tables, in.CDCDatabaseDestination(), in.NominatedKeys)...)
 	}
 
 	// The publication covers every table in the database, so a keyless table
@@ -353,7 +353,7 @@ func checkPostgresSchemaVisible(ctx context.Context, db *sql.DB, cfg map[string]
 // checkPostgresTablePrimaryKeys returns one check per selected table.
 // A table without a PK fails its own check; tables that don't exist also
 // fail (with a more specific code).
-func checkPostgresTablePrimaryKeys(ctx context.Context, db *sql.DB, cfg map[string]string, tables []string, cdcMode, cdcBlocks bool, nominated map[string][]string) []Check {
+func checkPostgresTablePrimaryKeys(ctx context.Context, db *sql.DB, cfg map[string]string, tables []string, cdcDBDest string, nominated map[string][]string) []Check {
 	defaultSchema := strings.TrimSpace(cfg["schema"])
 	if defaultSchema == "" {
 		defaultSchema = "public"
@@ -372,12 +372,15 @@ func checkPostgresTablePrimaryKeys(ctx context.Context, db *sql.DB, cfg map[stri
 			schemaName = defaultSchema
 			tableName = strings.Trim(t, `"`)
 		}
-		out = append(out, withObject(oneTablePKCheck(ctx, db, schemaName, tableName, cdcMode, cdcBlocks, nominatedColsFor(nominated, schemaName, tableName)), schemaName+"."+tableName))
+		out = append(out, withObject(oneTablePKCheck(ctx, db, schemaName, tableName, cdcDBDest, nominatedColsFor(nominated, schemaName, tableName)), schemaName+"."+tableName))
 	}
 	return out
 }
 
-func oneTablePKCheck(ctx context.Context, db *sql.DB, schema, table string, cdcMode, cdcBlocks bool, nominatedCols []string) Check {
+// oneTablePKCheck checks one selected table for a primary key. cdcDBDest is
+// Input.CDCDatabaseDestination(): non-empty for CDC into a database, where a
+// keyless table gets keylessCDCDriftCheck's exact-effect warning.
+func oneTablePKCheck(ctx context.Context, db *sql.DB, schema, table string, cdcDBDest string, nominatedCols []string) Check {
 	code := "CDC_TABLE_MISSING_PRIMARY_KEY"
 	// First verify the table exists in the source — distinguish "no table"
 	// from "no PK" so the user fixes the right problem.
@@ -432,14 +435,15 @@ func oneTablePKCheck(ctx context.Context, db *sql.DB, schema, table string, cdcM
 			Message: fmt.Sprintf("%s.%s has a primary key", schema, table),
 		}
 	}
-	// Past this point the table is keyless. If the CDC executor will refuse to
-	// start over it, say so as an ERROR — neither the surrogate key nor a column
-	// nomination reaches its validator, so both of the passes below would be
-	// promises the run cannot keep (KI-CDC-ASSESS-PK-FALLBACK-NOT-IMPLEMENTED).
-	if cdcBlocks {
-		return blockingMissingPKCheck(
+	// Past this point the table is keyless. CDC into a database streams it
+	// (policy 2026-09-27; it used to be blocked) but cannot apply its UPDATEs or
+	// DELETEs in place — say exactly that, with the ALTER TABLE that fixes it.
+	// A nomination does not reach the CDC sink, so it does not change this.
+	if cdcDBDest != "" {
+		return keylessCDCDriftCheck(
 			fmt.Sprintf("%s.%s", schema, table),
 			fmt.Sprintf("ALTER TABLE %q.%q ADD PRIMARY KEY (id);", schema, table),
+			cdcDBDest,
 			nominatedCols,
 		)
 	}

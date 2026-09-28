@@ -696,3 +696,133 @@ def test_a_code_default_host_this_bundle_lacks_is_overridden():
         f"code falls back to a host docker-compose.quickstart.yml does not define, and the "
         f"service is not given the variable that overrides it: {offenders}"
     )
+
+
+# A URL that a service hands ON to a connector is resolved by the connector, not by the
+# service that holds it. Connectors join ONLY rsync-ai-mcp (SEC-M-06; the deployer's
+# DEPLOYER_DOCKER_NETWORK/MCP_SHARED_NETWORK), and Docker's DNS answers only for the
+# networks a container is on. So a host that exists in the compose file, and that the
+# holding service can reach, can still be a name the connector cannot look up.
+#
+# The demo seed shipped exactly that: RSYNC_DEMO_DESTINATION_DSN names demo-warehouse,
+# the gateway (on both networks) builds a postgresql connection from it, and the
+# JIT-deployed postgresql connector, on rsync-ai-mcp alone, answered "could not
+# translate host name demo-warehouse" -- a 502 on every fresh install since #986.
+# test_every_in_network_url_names_a_quickstart_host passed throughout: it checks the
+# host exists, not that the reader is on its network.
+#
+# The list is (holding service, variable, the file that reads it and passes it to a
+# connector). The file is asserted to still read the variable, so a list entry cannot
+# outlive the code path it describes.
+HANDED_TO_CONNECTORS = (
+    ("api-gateway", "RSYNC_DEMO_DESTINATION_DSN", "api-gateway/internal/handlers/demo.go"),
+    ("orchestrator", "BLOB_STAGING_ENDPOINT_URL", "backend-orchestrator/internal/agents/executor/blob_lane.go"),
+)
+CONNECTOR_NETWORK = "rsync-ai-mcp"
+CONNECTOR_STACKS = ("docker-compose.quickstart.yml", "docker-compose.yml")
+
+# A variable in this set must be SET on its holder in every stack, not merely readable:
+# the blob lane falls back to MINIO_ENDPOINT_URL when BLOB_STAGING_ENDPOINT_URL is
+# unset, and that fallback is the claim-check MinIO on `default` only. A stack that
+# drops the variable would skip the network check below and ship the unreachable host
+# again. -> KI-BLOB-LANE-STAGING-UNREACHABLE-FROM-CONNECTORS (resolved)
+_MUST_BE_SET = {"BLOB_STAGING_ENDPOINT_URL"}
+
+
+def _host_owner(services: dict, host: str) -> str | None:
+    for name, svc in services.items():
+        svc = svc or {}
+        if host in (name, svc.get("container_name")):
+            return name
+        nets = svc.get("networks")
+        if isinstance(nets, dict):
+            for cfg in nets.values():
+                if host in ((cfg or {}).get("aliases") or []):
+                    return name
+    return None
+
+
+def _networks(svc: dict) -> set[str]:
+    nets = (svc or {}).get("networks")
+    if not nets:
+        return {"default"}
+    return set(nets) if isinstance(nets, (list, dict)) else {"default"}
+
+
+def _handed_cases():
+    for filename in CONNECTOR_STACKS:
+        for holder, var, reader in HANDED_TO_CONNECTORS:
+            yield pytest.param(filename, holder, var, reader, id=f"{filename}:{var}")
+
+
+@pytest.mark.parametrize("filename,holder,var,reader", list(_handed_cases()))
+def test_a_host_handed_to_a_connector_is_on_the_connector_network(filename, holder, var, reader):
+    assert var in (REPO / reader).read_text(), f"{reader} no longer reads {var}; update HANDED_TO_CONNECTORS"
+    services = _services(REPO / filename)
+    if holder not in services:
+        pytest.skip(f"{filename} has no {holder}")
+    raw = _env(services[holder] or {}).get(var)
+    if not raw:
+        assert var not in _MUST_BE_SET, (
+            f"{filename} does not set {var} on {holder}; without it the reader falls back to "
+            f"a host connectors cannot resolve"
+        )
+        pytest.skip(f"{filename} does not set {var} on {holder}")
+    value = re.sub(r"\$\{[A-Z0-9_]+:?-([^}]*)\}", r"\1", raw)
+    match = re.search(r"\b[a-z]+://(?:[^@/\s]*@)?([A-Za-z0-9_.-]+)", value)
+    assert match, f"{filename} {holder}.{var} is not a URL: {raw!r}"
+    host = match.group(1)
+    owner = _host_owner(services, host)
+    assert owner, f"{filename} {holder}.{var} names {host!r}, which no service in the file answers to"
+    assert CONNECTOR_NETWORK in _networks(services[owner]), (
+        f"{filename}: {holder}.{var} hands {host!r} to a connector, but service {owner!r} is "
+        f"only on {sorted(_networks(services[owner]))}. Connectors join only {CONNECTOR_NETWORK}, "
+        f"so the connector cannot resolve the name. Add {CONNECTOR_NETWORK} to {owner}'s networks."
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM cost logging. src.utils.llm_cost writes one llm_usage_events row per call
+# through record_usage, into the same database the api-gateway migrates. With no
+# DATABASE_URL and no POSTGRES_PASSWORD it logs "No DATABASE_URL; LLM cost logging
+# disabled" and every call goes unmetered. Only the modules that CALL record_usage
+# need the database; importing llm_cost for compute_cost_cents does not.
+# ---------------------------------------------------------------------------
+_RECORD_USAGE_CALL = re.compile(r"\brecord_usage\(")
+
+
+@functools.lru_cache(maxsize=None)
+def _cost_writer_modules() -> frozenset[str]:
+    out = set()
+    for path in (LLM_SRC / "src").rglob("*.py"):
+        if path.name == "llm_cost.py":
+            continue
+        if _RECORD_USAGE_CALL.search(path.read_text(encoding="utf-8", errors="replace")):
+            out.add(".".join(path.relative_to(LLM_SRC).with_suffix("").parts))
+    return frozenset(out)
+
+
+def test_the_cost_writer_census_is_not_vacuous():
+    writers = _cost_writer_modules()
+    assert writers, "found no module calling record_usage -- the census regex is broken"
+    reaching = {
+        name for name, svc in _python_services().items()
+        if writers & _reachable(_entrypoint_module(svc))
+    }
+    assert reaching, f"no quickstart service reaches any of {sorted(writers)}"
+    assert reaching != set(_python_services()), "every service reaches the cost writer; the walk is not discriminating"
+
+
+@pytest.mark.parametrize("name", sorted(_python_services()))
+def test_a_service_that_logs_llm_cost_gets_the_gateways_database(name):
+    svc = _python_services()[name]
+    if not (_cost_writer_modules() & _reachable(_entrypoint_module(svc))):
+        pytest.skip(f"{name} never calls record_usage")
+    want = _env(_services(QUICKSTART)["api-gateway"]).get("DATABASE_URL")
+    assert want, "setup: the quickstart api-gateway has no DATABASE_URL to compare with"
+    got = _env(svc).get("DATABASE_URL")
+    assert got == want, (
+        f"{name} calls record_usage but docker-compose.quickstart.yml gives it "
+        f"DATABASE_URL={got!r}, not the api-gateway's {want!r}. Without it every LLM "
+        "call goes unmetered (llm_cost.py: 'No DATABASE_URL; LLM cost logging disabled')."
+    )

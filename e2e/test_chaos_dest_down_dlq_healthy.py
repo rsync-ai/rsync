@@ -255,7 +255,7 @@ def main():
         # 1. Throwaway destination Postgres, on the same network the MCP
         #    connectors resolve e2e hostnames on. Never touch shared infra.
         # ------------------------------------------------------------------
-        quiet(["docker", "rm", "-f", DEST_PG])
+        quiet(["docker", "rm", "-fv", DEST_PG])
         sh([
             "docker", "run", "-d", "--name", DEST_PG, "--network", NETWORK,
             "-e", f"POSTGRES_USER={DEST_USER}",
@@ -433,7 +433,7 @@ INSERT INTO e2e_db.{table} VALUES (1, 1);
             requests.delete(f"{KAFKA_CONNECT}/connectors/{connector}", timeout=10)
         except Exception:
             pass
-        quiet(["docker", "rm", "-f", DEST_PG])
+        quiet(["docker", "rm", "-fv", DEST_PG])
         quiet(["docker", "exec", "-i", MYSQL_CONTAINER, "mysql", "-uroot", "-prootpassword",
                "-e", f"DROP TABLE IF EXISTS e2e_db.{table};"])
 

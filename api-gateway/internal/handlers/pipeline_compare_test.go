@@ -151,6 +151,9 @@ func TestGetPipelineTrends_TheExecutionsRowDecidesTheStatus(t *testing.T) {
 			WithArgs(gatePipeID, run.id).
 			WillReturnRows(sqlmock.NewRows(eventCols).
 				AddRow(now.Add(-time.Minute), now, 9, 0, 0, true, false))
+		mock.ExpectQuery(runEventGroupsQuery).
+			WithArgs(gatePipeID, run.id).
+			WillReturnRows(sqlmock.NewRows(runEventGroupCols).AddRow("PIPELINE_COMPLETED", "", "2", 1, 0))
 		rows := sqlmock.NewRows([]string{"status"})
 		if run.execStatus != nil {
 			rows.AddRow(*run.execStatus)

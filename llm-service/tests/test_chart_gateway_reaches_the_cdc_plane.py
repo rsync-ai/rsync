@@ -196,20 +196,35 @@ def test_cdc_on_gives_the_gateway_both_real_addresses(naming):
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
-def test_cdc_off_gives_the_gateway_neither_address():
+def test_cdc_off_keeps_the_sink_and_drops_only_connect():
+    """connectors.cdc.enabled=false removes kafka-connect, never kafka-mcp-sink.
+
+    Batch runs write through the sink, and batch pre-flight requires it whenever
+    a pipeline has a destination (infra_preflight.go), so a batch-only install
+    without it would fail every run pre-flight.
+    """
     docs = _render("r", "--set", "connectors.cdc.enabled=false")
 
-    # Anti-vacuity: the switch really removed the CDC plane from this render,
-    # so the absence below is about the gateway and not about a broken render.
-    for component in ("kafka-connect", "kafka-mcp-sink"):
-        assert not _component(docs, "Service", component), (
-            f"connectors.cdc.enabled=false still renders a {component} Service"
-        )
+    # Anti-vacuity: the switch really removed Connect from this render, so the
+    # absence of its address below is about the gateway, not a broken render.
+    assert not _component(docs, "Service", "kafka-connect"), (
+        "connectors.cdc.enabled=false still renders a kafka-connect Service"
+    )
+    assert _component(docs, "Service", "kafka-mcp-sink"), (
+        "connectors.cdc.enabled=false dropped the kafka-mcp-sink Service; batch "
+        "pre-flight requires it, so every batch run on this install would fail"
+    )
+    assert _component(docs, "Deployment", "kafka-mcp-sink"), (
+        "connectors.cdc.enabled=false dropped the kafka-mcp-sink Deployment"
+    )
 
     env = _gateway_env(docs)
-    leaked = sorted(v for v in CDC_ADDRESS_VARS if v in env)
-    assert not leaked, (
-        f"the {GATEWAY} Deployment sets {leaked} on an install with no CDC plane. "
-        "admin/health lists a CDC card whenever its address is set, so this would "
-        "show a service the install never runs, reading down."
+    assert "KAFKA_CONNECT_URL" not in env, (
+        f"the {GATEWAY} Deployment sets KAFKA_CONNECT_URL on an install with no "
+        "Kafka Connect; admin/health would show a card for a service never run"
+    )
+    assert "KAFKA_SINK_URL" in env, (
+        f"the {GATEWAY} Deployment lost KAFKA_SINK_URL with CDC off; the sink "
+        "still runs, and kafkaSinkURL() falls back to a compose name that does "
+        "not resolve here"
     )

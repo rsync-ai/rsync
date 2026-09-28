@@ -133,6 +133,41 @@ spec:
         - protocol: TCP
           port: 8000
 ---
+{{- if include "rsync-ai.blobStaging.enabled" . }}
+{{/*
+The ONE platform-side store a connector may reach: blob-staging
+(templates/infra/blob-staging.yaml), where the blob-passthrough lane's source
+connector puts bytes and its destination connector fetches them. It holds
+nothing but staged blobs, under its own login -- which is why it exists instead
+of a rule admitting connectors to the platform MinIO
+(KI-CHART-NETWORKPOLICY-BLOCKS-CONNECTOR-STAGING). S3 port only. Platform pods
+(the bucket Job) still reach it through allow-intra-release.
+*/}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fullname }}-allow-connector-blob-staging
+  labels:
+    {{- include "rsync-ai.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: blob-staging
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "rsync-ai.selectorLabels" . | nindent 14 }}
+            matchExpressions:
+              - key: rsync.ai/connector-id
+                operator: Exists
+      ports:
+        - protocol: TCP
+          port: 9000
+---
+{{- end }}
 # The two externally-reachable tiers. Nothing else in the release accepts
 # traffic from outside it — notably the orchestrator, whose topology API is
 # authenticated by INTERNAL_SERVICE_SECRET and should never be exposed.

@@ -176,6 +176,19 @@ def _canonical_mysql_type(t: Any) -> str:
 SYNTHETIC_PK_COL = "_rsync_row_hash"
 SYNTHETIC_TS_COL = "_rsync_synced_at"
 
+# MySQL cannot put a UNIQUE index on these without a prefix length (error 1170).
+_UNINDEXABLE_KEY_BASES = {
+    "text", "tinytext", "mediumtext", "longtext", "json",
+    "blob", "tinyblob", "mediumblob", "longblob",
+}
+
+
+def _indexable_key_ddl(ddl: str, single_key: bool) -> str:
+    """A key column's DDL, bounded when MySQL could not index it as declared."""
+    if str(ddl).lower().split("(")[0].strip() in _UNINDEXABLE_KEY_BASES:
+        return canonical_to_ddl("mysql", "string", is_key=True, single_key=single_key)
+    return ddl
+
 
 def _compute_row_hash(row: Dict[str, Any], source_cols: List[str]) -> str:
     """sha256 over canonical JSON of the source columns only."""
@@ -296,7 +309,9 @@ def _is_local_db_host(host: str) -> bool:
     except ValueError:
         # Not an IP literal => hostname. Dotless single-label = docker service
         # name (local); any dotted name is remote.
-        return "." not in h
+        # A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+        # suffix resolves on public DNS (shared/local_db_host_golden.json).
+        return "." not in h or h.endswith((".svc", ".cluster.local"))
     if ip.is_loopback or ip.is_link_local:
         return True
     # Narrow RFC1918/ULA + CGNAT membership, mirroring Go net.IP.IsPrivate plus
@@ -506,45 +521,78 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         if not safe_cols:
             raise Exception("No safe columns to create destination table")
 
+        safe_keys = [c for c in (key_fields or []) if self._is_safe_ident(c)]
+
+        def _ddl_for(c: str) -> str:
+            return _indexable_key_ddl("TEXT", len(safe_keys) == 1) if c in safe_keys else "TEXT"
+
         cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db}`")
-        col_defs = ", ".join([f"`{c}` TEXT" for c in safe_cols])
+        col_defs = ", ".join([f"`{c}` {_ddl_for(c)}" for c in safe_cols])
         cursor.execute(f"CREATE TABLE IF NOT EXISTS `{db}`.`{name}` ({col_defs})")
 
         # Add missing columns (best-effort by querying information_schema)
+        existing: Dict[str, str] = {}
         try:
             cursor.execute(
-                "SELECT column_name FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
+                "SELECT column_name, data_type FROM information_schema.columns WHERE table_schema=%s AND table_name=%s",
                 (db, name),
             )
-            existing = set()
             for row in cursor.fetchall() or []:
                 if isinstance(row, dict):
                     v = row.get("column_name") or row.get("COLUMN_NAME")
+                    t = row.get("data_type") or row.get("DATA_TYPE") or ""
                 else:
                     v = row[0] if row else None
+                    t = row[1] if row and len(row) > 1 else ""
                 if v:
-                    existing.add(str(v))
+                    existing[str(v)] = str(t).lower()
             for c in safe_cols:
                 if c in existing:
                     continue
-                cursor.execute(f"ALTER TABLE `{db}`.`{name}` ADD COLUMN `{c}` TEXT")
+                cursor.execute(f"ALTER TABLE `{db}`.`{name}` ADD COLUMN `{c}` {_ddl_for(c)}")
         except Exception:
             pass
 
-        safe_keys = [c for c in (key_fields or []) if self._is_safe_ident(c)]
-        if safe_keys:
-            idx = self._mk_index_name(db, name, safe_keys)
-            try:
-                cursor.execute(
-                    "SELECT 1 FROM information_schema.statistics WHERE table_schema=%s AND table_name=%s AND index_name=%s LIMIT 1",
-                    (db, name, idx),
-                )
-                row = cursor.fetchone()
-                if not row:
-                    cols_sql = ", ".join([f"`{c}`" for c in safe_keys])
-                    cursor.execute(f"CREATE UNIQUE INDEX `{idx}` ON `{db}`.`{name}` ({cols_sql})")
-            except Exception:
-                pass
+        self._ensure_unique_key_index(cursor, db, name, safe_keys, existing)
+
+    def _ensure_unique_key_index(self, cursor, db: str, name: str, safe_keys: List[str],
+                                 existing: Dict[str, str]) -> None:
+        """Create the UNIQUE index that ON DUPLICATE KEY UPDATE upserts on.
+
+        Without it every upsert is a plain insert: a replay, re-snapshot or retried
+        batch duplicates rows while the write reports success. MySQL cannot index a
+        TEXT/BLOB/JSON column (error 1170), and tables created before key columns
+        were bounded hold exactly that, so an existing unindexable key column is
+        narrowed first. A failure is logged, never silent.
+        """
+        if not safe_keys:
+            return
+        for c in safe_keys:
+            if existing.get(c, "") in _UNINDEXABLE_KEY_BASES:
+                bounded = _indexable_key_ddl(existing[c], len(safe_keys) == 1)
+                try:
+                    cursor.execute(f"ALTER TABLE `{db}`.`{name}` MODIFY COLUMN `{c}` {bounded}")
+                except Exception as e:
+                    logger.warning(
+                        "mysql: key column %s.%s.%s is %s and could not be narrowed to %s: %s",
+                        db, name, c, existing[c], bounded, e,
+                    )
+        idx = self._mk_index_name(db, name, safe_keys)
+        try:
+            cursor.execute(
+                "SELECT 1 FROM information_schema.statistics "
+                "WHERE table_schema=%s AND table_name=%s AND index_name=%s LIMIT 1",
+                (db, name, idx),
+            )
+            if not cursor.fetchone():
+                cols_sql = ", ".join([f"`{c}`" for c in safe_keys])
+                cursor.execute(f"CREATE UNIQUE INDEX `{idx}` ON `{db}`.`{name}` ({cols_sql})")
+        except Exception as e:
+            logger.warning(
+                "mysql: could not create unique index %s on %s.%s (%s); upserts on this "
+                "table will insert duplicates instead of updating: %s",
+                idx, db, name, ", ".join(safe_keys), e,
+            )
 
     # MySQL DDL type keyword → DATA_TYPE from information_schema (used for safe widening).
     _KEYWORD_TO_DATA_TYPE = {
@@ -721,6 +769,13 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
             #    DDL via the shared authority; unknown folds to TEXT.
             return canonical_to_ddl("mysql", raw)
 
+        cdc_keys = [c for c in (key_fields or []) if self._is_safe_ident(c)]
+        _type_ddl = _ddl_for
+
+        def _ddl_for(col: str) -> str:  # noqa: F811 — key columns must be indexable
+            ddl = _type_ddl(col)
+            return _indexable_key_ddl(ddl, len(cdc_keys) == 1) if col in cdc_keys else ddl
+
         # Create DB and table if absent
         cursor.execute(f"CREATE DATABASE IF NOT EXISTS `{db}`")
         col_defs = ", ".join([f"`{c}` {_ddl_for(c)}" for c in safe_cols])
@@ -777,20 +832,7 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
                     )
 
         # Ensure unique index on key fields
-        safe_keys = [c for c in (key_fields or []) if self._is_safe_ident(c)]
-        if safe_keys:
-            idx = self._mk_index_name(db, name, safe_keys)
-            try:
-                cursor.execute(
-                    "SELECT 1 FROM information_schema.statistics "
-                    "WHERE table_schema=%s AND table_name=%s AND index_name=%s LIMIT 1",
-                    (db, name, idx),
-                )
-                if not cursor.fetchone():
-                    cols_sql = ", ".join([f"`{c}`" for c in safe_keys])
-                    cursor.execute(f"CREATE UNIQUE INDEX `{idx}` ON `{db}`.`{name}` ({cols_sql})")
-            except Exception:
-                pass
+        self._ensure_unique_key_index(cursor, db, name, cdc_keys, existing)
 
     def upsert_data(self, params: Dict = None) -> Dict[str, Any]:
         """CDC upsert: INSERT ... ON DUPLICATE KEY UPDATE (MySQL syntax)."""

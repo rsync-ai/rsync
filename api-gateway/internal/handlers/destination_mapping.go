@@ -278,8 +278,9 @@ func destTableBareName(sel string) string {
 // segment, so the bare source names are the right probe set for a multi-table
 // run. A SINGLE-table run is the exception: it can be redirected to a
 // differently-named destination table, and the only redirect visible from here
-// at lock time is the destination connection's `table` setting — the NL
-// "…into table X" override is inferred later, in the executor. Include that name
+// from the source names alone is the destination connection's `table` setting —
+// the NL "…into table X" override is inferred in the executor, which reports it
+// on the run-boundary lock (see namespaceProbeSet). Include that name
 // as well rather than pick between them: a wider probe set can only find more
 // pre-existing tables, never miss one, and the ownership gate in
 // namespaceProbe.isCollision keeps the extra name from causing a spurious
@@ -299,6 +300,25 @@ func destTableProbeSet(selectedTables []string, destCfg map[string]interface{}) 
 	}
 	if v, ok := destCfg["table"].(string); ok {
 		if b := destTableBareName(v); b != "" {
+			want[b] = struct{}{}
+		}
+	}
+	return want
+}
+
+// namespaceProbeSet is the full set of destination tables a pipeline writes, as
+// far as the control plane can know it: the names derived from its source tables
+// (destTableProbeSet) plus the destination tables its run boundary REPORTED
+// (destTables). The second part exists for KI-NSPROBE-USES-SOURCE-TABLE-NAMES: a
+// single-table run renamed by its prompt ("… into table orders_archive") writes a
+// table the source names cannot reveal, because the rename is parsed from the
+// natural-language request in the orchestrator. A union, never a replacement —
+// a wider set can only find more pre-existing tables, never miss one, and the
+// ownership half of isCollision keeps an extra name from relocating on its own.
+func namespaceProbeSet(selectedTables, destTables []string, destCfg map[string]interface{}) map[string]struct{} {
+	want := destTableProbeSet(selectedTables, destCfg)
+	for _, t := range destTables {
+		if b := destTableBareName(t); b != "" {
 			want[b] = struct{}{}
 		}
 	}
@@ -345,7 +365,7 @@ func (p namespaceProbe) isCollision() bool {
 // plane for who owns it. Returns a non-nil error only on infrastructure failure
 // (unreachable / bad creds) — the caller treats that as "cannot verify" and
 // proceeds with the user's chosen namespace rather than blocking.
-func probeNamespaceCollision(ctx context.Context, database *sql.DB, workspaceID, destConnID, destType, namespace, pipelineID string, selectedTables []string) (namespaceProbe, error) {
+func probeNamespaceCollision(ctx context.Context, database *sql.DB, workspaceID, destConnID, destType, namespace, pipelineID string, selectedTables, destTables []string) (namespaceProbe, error) {
 	var out namespaceProbe
 	namespace = strings.TrimSpace(namespace)
 	if namespace == "" || len(selectedTables) == 0 || !isDBConnector(destType) {
@@ -376,7 +396,7 @@ func probeNamespaceCollision(ctx context.Context, database *sql.DB, workspaceID,
 		return out, fmt.Errorf("ping: %w", err)
 	}
 
-	want := destTableProbeSet(selectedTables, cfg)
+	want := namespaceProbeSet(selectedTables, destTables, cfg)
 	if len(want) == 0 {
 		return out, nil
 	}
@@ -508,7 +528,9 @@ func writeDestinationNamespaceTombstone(ctx context.Context, tx *sql.Tx, pipelin
 			(workspace_id, pipeline_id, pipeline_name, destination_connection_id, namespace, tables)
 		SELECT p.workspace_id, p.id, COALESCE(p.name, ''), p.destination_connection_id,
 		       `+pipelineNamespaceExpr+`,
-		       COALESCE(p.config->'selected_tables', '[]'::jsonb)
+		       COALESCE(p.config->'selected_tables', '[]'::jsonb) ||
+		       CASE WHEN jsonb_typeof(p.config->'destination_tables') = 'array'
+		            THEN p.config->'destination_tables' ELSE '[]'::jsonb END
 		FROM pipelines p
 		WHERE p.id::text = $1
 		  AND p.workspace_id::text = $2
@@ -623,7 +645,8 @@ func namespaceTableOwner(ctx context.Context, database *sql.DB, workspaceID, des
 	// id must read as "matches nothing", not raise a runtime SQL error that fails
 	// the probe and (per the caller's fail-soft) silently skips collision checks.
 	rows, err := database.QueryContext(ctx, `
-		SELECT p.id::text, COALESCE(p.config->'selected_tables', '[]'::jsonb)::text
+		SELECT p.id::text, COALESCE(p.config->'selected_tables', '[]'::jsonb)::text,
+		       COALESCE(p.config->'destination_tables', '[]'::jsonb)::text
 		FROM pipelines p
 		WHERE p.id::text <> $1
 		  AND p.workspace_id::text = $2
@@ -637,8 +660,8 @@ func namespaceTableOwner(ctx context.Context, database *sql.DB, workspaceID, des
 	defer rows.Close()
 
 	for rows.Next() {
-		var otherID, rawTables string
-		if err := rows.Scan(&otherID, &rawTables); err != nil {
+		var otherID, rawTables, rawDest string
+		if err := rows.Scan(&otherID, &rawTables, &rawDest); err != nil {
 			return "", err
 		}
 		var selected []string
@@ -648,7 +671,12 @@ func namespaceTableOwner(ctx context.Context, database *sql.DB, workspaceID, des
 			// whole probe.
 			continue
 		}
-		for name := range destTableProbeSet(selected, destCfg) {
+		// destination_tables is what that pipeline's run boundary reported it
+		// WRITES (a prompt-renamed table the source names cannot reveal). Absent
+		// or unreadable, it adds nothing and the source-derived set stands.
+		var dest []string
+		_ = json.Unmarshal([]byte(rawDest), &dest)
+		for name := range namespaceProbeSet(selected, dest, destCfg) {
 			if _, ok := want[name]; ok {
 				return otherID, nil
 			}
@@ -706,13 +734,13 @@ type namespaceRelocation struct {
 // A non-nil second return means the pipeline was relocated and the user needs to
 // be told where its data actually went. The owner it routes around may be a
 // deleted pipeline: its rows outlive it, so they are protected the same way.
-func resolveFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID, destConnID, destType, pipelineID, chosen string, selectedTables []string) (string, *namespaceRelocation) {
+func resolveFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID, destConnID, destType, pipelineID, chosen string, selectedTables, destTables []string) (string, *namespaceRelocation) {
 	chosen = strings.TrimSpace(chosen)
 	if chosen == "" || !isDBConnector(destType) {
 		return chosen, nil
 	}
 
-	probe, err := probeNamespaceCollision(ctx, database, workspaceID, destConnID, destType, chosen, pipelineID, selectedTables)
+	probe, err := probeNamespaceCollision(ctx, database, workspaceID, destConnID, destType, chosen, pipelineID, selectedTables, destTables)
 	if err != nil {
 		log.WithContext(ctx).WithError(err).WithFields(map[string]interface{}{
 			"pipeline_id": pipelineID,
@@ -738,7 +766,7 @@ func resolveFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID
 		prefixed = ""
 	}
 	if prefixed != "" {
-		probe2, err2 := probeNamespaceCollision(ctx, database, workspaceID, destConnID, destType, prefixed, pipelineID, selectedTables)
+		probe2, err2 := probeNamespaceCollision(ctx, database, workspaceID, destConnID, destType, prefixed, pipelineID, selectedTables, destTables)
 		if err2 != nil {
 			log.WithContext(ctx).WithError(err2).WithFields(map[string]interface{}{
 				"pipeline_id": pipelineID,

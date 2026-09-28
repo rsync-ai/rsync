@@ -120,6 +120,14 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Fingerprint the build context so Deploy can tell an image or container made
+	// from older code (an upgrade, a re-generation) from a current one.
+	contextHash, herr := dockerx.ContextHash(contextDir)
+	if herr != nil {
+		s.log.Warn("cannot fingerprint build context; an existing image or container is reused as is",
+			"context_subdir", body.ContextSubdir, "err", herr.Error())
+	}
+
 	opts := dockerx.DeployOptions{
 		Recreate:         body.Recreate,
 		ContextDir:       contextDir,
@@ -127,6 +135,7 @@ func (s *Server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 		Version:          body.Version,
 		BuildArgs:        body.BuildArgs,
 		MCPSharedNetwork: s.cfg.MCPSharedNetwork,
+		ContextHash:      contextHash,
 	}
 
 	res, err := s.deployer.Deploy(r.Context(), req, dcfg, opts)

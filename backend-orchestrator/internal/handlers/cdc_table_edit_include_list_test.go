@@ -72,7 +72,7 @@ func TestUpdateConnectorTableList_MongoWritesCollectionIncludeList(t *testing.T)
 	}
 
 	// The sink respawn path (restartCDCSinkWorker) derives its topics this way.
-	topics := deriveCDCSinkTopics(connectorConfigString(cfg, "topic.prefix"), connectorIncludeList(cfg))
+	topics := deriveCDCSinkTopics(cfg, connectorConfigString(cfg, "topic.prefix"), connectorIncludeList(cfg))
 	want := []string{"rsync.cdc-aaa0ded3.datingapp.matches", "rsync.cdc-aaa0ded3.datingapp.messages"}
 	if !reflect.DeepEqual(topics, want) {
 		t.Fatalf("respawn topics = %v, want %v", topics, want)
@@ -128,7 +128,7 @@ func TestUpdateConnectorTableList_PostgresUnchanged(t *testing.T) {
 	if _, ok := cfg["collection.include.list"]; ok {
 		t.Fatalf("collection.include.list written on a Postgres connector")
 	}
-	topics := deriveCDCSinkTopics(connectorConfigString(cfg, "topic.prefix"), connectorIncludeList(cfg))
+	topics := deriveCDCSinkTopics(cfg, connectorConfigString(cfg, "topic.prefix"), connectorIncludeList(cfg))
 	want := []string{"rsync.cdc-12345678.public.orders", "rsync.cdc-12345678.customers"}
 	if !reflect.DeepEqual(topics, want) {
 		t.Fatalf("respawn topics = %v, want %v", topics, want)

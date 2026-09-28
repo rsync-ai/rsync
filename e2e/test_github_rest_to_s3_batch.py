@@ -269,7 +269,7 @@ def dest_minio():
     tear it down afterwards. Kept separate from the internal rsync-ai-minio,
     which the aws-s3 connector's storage-safety guard rejects."""
     if not _container_running(DEST_MINIO):
-        subprocess.run(["docker", "rm", "-f", DEST_MINIO],
+        subprocess.run(["docker", "rm", "-fv", DEST_MINIO],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.check_call(
             ["docker", "run", "-d", "--name", DEST_MINIO, "--network", MCP_NET,
@@ -288,7 +288,7 @@ def dest_minio():
     assert ready, f"external MinIO {DEST_MINIO} did not become ready"
     yield
     # Teardown: remove the throwaway MinIO entirely (drops the data with it).
-    subprocess.run(["docker", "rm", "-f", DEST_MINIO],
+    subprocess.run(["docker", "rm", "-fv", DEST_MINIO],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

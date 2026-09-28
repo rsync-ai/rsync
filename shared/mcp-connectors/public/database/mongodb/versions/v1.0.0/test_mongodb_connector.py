@@ -322,6 +322,101 @@ def test_discover_schema_widens_a_field_whose_sampled_types_conflict():
     assert cols["only_null"] == "string", cols  # null in every sample
 
 
+def _messages_like_collection(n_int=30, n_oid=30):
+    """B-MONGO-4 shape: the int _ids were inserted first, so the natural-order
+    sample (20 docs) sees only ints while the collection also holds ObjectIds."""
+    return ([{"_id": i, "body": f"m{i}"} for i in range(1, n_int + 1)]
+            + [{"_id": ObjectId(), "body": "o"} for _ in range(n_oid)])
+
+
+def test_discover_schema_sees_a_mixed_id_the_sample_missed():
+    # B-MONGO-4: the 20-doc natural-order sample held only int _ids, so discover
+    # declared _id "integer". The export pages in _id order, where BSON puts every
+    # number before every ObjectId, so the first batches were all-int and landed as
+    # int64 parquet while the rest landed as string. The _id index's two ends name
+    # the lowest and highest BSON type bracket, so they reveal the mix up front.
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"messages": _messages_like_collection()}})
+    out = s.discover_schema(CFG)
+    cols = {c["name"]: c["type"] for c in out["tables"][0]["columns"]}
+    assert cols["_id"] == "string", cols
+    assert cols["body"] == "string", cols
+    assert out["overall_status"] == "success", out
+
+
+def test_discover_schema_keeps_a_single_type_id_typed():
+    # Control: an all-int _id collection must stay "integer" — the probe widens only
+    # when the index's two ends really are different types.
+    docs = [{"_id": i, "v": i} for i in range(1, 60)]
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"counters": docs}})
+    cols = {c["name"]: c["type"] for c in s.discover_schema(CFG)["tables"][0]["columns"]}
+    assert cols["_id"] == "integer", cols
+    docs = [{"_id": ObjectId(), "v": 1} for _ in range(60)]
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"plain": docs}})
+    cols = {c["name"]: c["type"] for c in s.discover_schema(CFG)["tables"][0]["columns"]}
+    assert cols["_id"] == "string", cols
+
+
+def test_discover_schema_id_probe_failure_is_a_warning_not_a_failure():
+    coll = _mongo_fakes.FakeCollection(_messages_like_collection())
+
+    class _SortFails(_mongo_fakes.FakeCursor):
+        def sort(self, *a, **kw):
+            raise RuntimeError("sort not allowed")
+
+    real_find = coll.find
+
+    def find(filter=None, projection=None, limit=None, **kw):
+        cur = real_find(filter, projection, limit, **kw)
+        return _SortFails(list(cur))
+
+    coll.find = find
+    s, _ = _mongo_fakes.make_connector(mg, dbs={"appdb": {"messages": coll}})
+    out = s.discover_schema(CFG)
+    assert out["tables"][0]["columns"][0]["name"] == "_id", out
+    assert any("_id range probe failed" in w for w in out["warnings_messages"]), out
+
+
+def _load_file_formats():
+    import importlib.util
+    path = os.path.normpath(os.path.join(_HERE, "..", "..", "..", "..",
+                                         "rsync_protocol", "file_formats.py"))
+    spec = importlib.util.spec_from_file_location("rsync_file_formats_for_mongo_test", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_every_batch_of_a_mixed_id_collection_gets_one_id_type():
+    # B-MONGO-4 end to end on the batch path: discover_schema -> the executor's
+    # column_types -> export pages in _id order -> the destination's columnar
+    # normaliser, once per file. Every file of the table must carry the SAME _id
+    # type, or a hive/BigQuery external table over the folder breaks.
+    ff = _load_file_formats()
+    dbs = {"appdb": {"messages": _messages_like_collection(n_int=25, n_oid=40)}}
+    s, _ = _mongo_fakes.make_connector(mg, dbs=dbs)
+    table = s.discover_schema(CFG)["tables"][0]
+    column_types = {c["name"]: c["type"] for c in table["columns"]}
+
+    cursor, kinds_per_file, batches = None, [], 0
+    while True:
+        params = {**CFG, "table": "messages", "limit": 10}
+        if cursor is not None:
+            params["cursor"] = cursor
+        out = s.export(params)
+        assert out.get("success", True) is not False, out
+        rows = out.get("data") or []
+        if not rows:
+            break
+        batches += 1
+        written = ff.normalize_rows_for_columnar(rows, "parquet", column_types)
+        kinds_per_file.append({type(r["_id"]).__name__ for r in written})
+        cursor = out.get("next_cursor")
+        if not out.get("has_more"):
+            break
+    assert batches >= 5, batches               # the ints span several whole files
+    assert kinds_per_file and all(k == {"str"} for k in kinds_per_file), kinds_per_file
+
+
 def test_widen_type_rules():
     w = mg._widen_type
     assert w(None, "integer") == "integer" and w("integer", None) == "integer"

@@ -307,7 +307,7 @@ def mongo_source():
     collections. Batch export needs no replica set (that is a CDC requirement),
     so this stays a plain single-node mongod."""
     if not _container_running(MONGO_SRV):
-        subprocess.run(["docker", "rm", "-f", MONGO_SRV],
+        subprocess.run(["docker", "rm", "-fv", MONGO_SRV],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.check_call(
             ["docker", "run", "-d", "--name", MONGO_SRV, "--network", MCP_NET,
@@ -336,7 +336,7 @@ def mongo_source():
         assert f"{coll}={n}" in out, f"seed mismatch for {coll}: {out!r}"
     print(f"seeded {MONGO_DB}: {COLLECTIONS}")
     yield
-    subprocess.run(["docker", "rm", "-f", MONGO_SRV],
+    subprocess.run(["docker", "rm", "-fv", MONGO_SRV],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -345,7 +345,7 @@ def gcs_dest():
     """A throwaway fake-gcs-server plus the destination bucket. No credential of
     any kind is created or handled — the connector uses AnonymousCredentials."""
     if not _container_running(GCS_EMU):
-        subprocess.run(["docker", "rm", "-f", GCS_EMU],
+        subprocess.run(["docker", "rm", "-fv", GCS_EMU],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.check_call(
             ["docker", "run", "-d", "--name", GCS_EMU, "--network", MCP_NET,
@@ -369,7 +369,7 @@ print("@@ok")
             time.sleep(2)
     assert ready, f"fake-gcs-server {GCS_EMU} did not become ready"
     yield
-    subprocess.run(["docker", "rm", "-f", GCS_EMU],
+    subprocess.run(["docker", "rm", "-fv", GCS_EMU],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

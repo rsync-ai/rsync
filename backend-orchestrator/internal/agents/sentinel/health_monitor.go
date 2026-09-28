@@ -75,6 +75,9 @@ type HealthMonitor struct {
 	// is the previous tick's CDC-pipeline query outcome, so a failing query logs once.
 	kafkaConnectForgotten bool
 	cdcDemandFailing      bool
+	// infraFailures counts each infrastructure probe's consecutive misses for
+	// debounceInfraFailure. Touched only on the infrastructure goroutine.
+	infraFailures map[string]int
 
 	// onComponentsEvicted lets the Agent drop its in-memory issues for components this
 	// monitor has just collected as garbage. Without it, handleDetectedIssue's
@@ -679,6 +682,31 @@ func (h *HealthMonitor) checkInfrastructureHealth() {
 	h.checkServiceProbes(ctx)
 }
 
+// debounceInfraFailure turns one failed infrastructure probe into a verdict with the
+// same debounce the core services use (serviceFailureThreshold, service_probes.go):
+// degraded for the misses before the threshold, which the detector does not alert on,
+// and unhealthy from the threshold on. An unhealthy infrastructure component is a
+// CRITICAL INFRASTRUCTURE_DOWN for every admin, so one refused dial during a restart,
+// or a probe that lands while a fresh install's service is still starting, must not
+// be one.
+func (h *HealthMonitor) debounceInfraFailure(componentID, lastErr string) (HealthStatus, string) {
+	if h.infraFailures == nil {
+		h.infraFailures = make(map[string]int)
+	}
+	h.infraFailures[componentID]++
+	n := h.infraFailures[componentID]
+	if n < serviceFailureThreshold {
+		return HealthStatusDegraded, fmt.Sprintf("%s (failed %d of %d checks before it is reported down)",
+			lastErr, n, serviceFailureThreshold)
+	}
+	return HealthStatusUnhealthy, lastErr
+}
+
+// resetInfraFailures starts a component's miss count over after a success.
+func (h *HealthMonitor) resetInfraFailures(componentID string) {
+	delete(h.infraFailures, componentID)
+}
+
 // checkPostgreSQLHealth checks PostgreSQL connectivity
 func (h *HealthMonitor) checkPostgreSQLHealth(ctx context.Context) {
 	componentID := "infrastructure:postgresql"
@@ -689,10 +717,14 @@ func (h *HealthMonitor) checkPostgreSQLHealth(ctx context.Context) {
 	}
 
 	if err := h.db.PingContext(ctx); err != nil {
-		log.WithError(err).Error("PostgreSQL health check failed")
-		h.recordInfraHealth(componentID, HealthStatusUnhealthy, err.Error(), nil)
+		status, lastErr := h.debounceInfraFailure(componentID, err.Error())
+		if status == HealthStatusUnhealthy {
+			log.WithError(err).Error("PostgreSQL health check failed")
+		}
+		h.recordInfraHealth(componentID, status, lastErr, nil)
 		return
 	}
+	h.resetInfraFailures(componentID)
 	h.recordInfraHealth(componentID, HealthStatusHealthy, "", nil)
 }
 
@@ -721,11 +753,17 @@ func probeKafkaBroker(probe kafkaBrokerProbe) (HealthStatus, string) {
 // kafka.Manager.Ping() issues a metadata request; see its doc comment for why the cheaper
 // IsConnected()/ListTopics() would have reproduced the same always-healthy answer.
 func (h *HealthMonitor) checkKafkaHealth(ctx context.Context) {
+	const componentID = "infrastructure:kafka"
 	status, lastErr := probeKafkaBroker(h.kafkaProbe)
+	if status == HealthStatusUnhealthy {
+		status, lastErr = h.debounceInfraFailure(componentID, lastErr)
+	} else {
+		h.resetInfraFailures(componentID)
+	}
 	if status == HealthStatusUnhealthy {
 		log.WithField("error", lastErr).Error("Kafka health check failed")
 	}
-	h.recordInfraHealth("infrastructure:kafka", status, lastErr, nil)
+	h.recordInfraHealth(componentID, status, lastErr, nil)
 }
 
 // cdcPipelinesExistQuery is the predicate the CDC sentinel selects its pipelines by
@@ -778,6 +816,7 @@ func (h *HealthMonitor) kafkaConnectExpected(ctx context.Context) bool {
 // earlier tick or an older build left. That happens once, and again only if Connect
 // has been recorded since.
 func (h *HealthMonitor) forgetKafkaConnect(componentID string) {
+	h.resetInfraFailures(componentID)
 	h.mu.Lock()
 	_, inMap := h.componentHealth[componentID]
 	delete(h.componentHealth, componentID)
@@ -827,15 +866,18 @@ func (h *HealthMonitor) checkKafkaConnectHealth(ctx context.Context) {
 		}
 	}
 
+	// A fresh install's first probes land while Connect is still starting, and each
+	// used to file a CRITICAL INFRASTRUCTURE_DOWN for a service seconds from coming up.
 	status := HealthStatusHealthy
 	if !healthy {
-		status = HealthStatusUnhealthy
-		// Helpful hint: frequent exit code 137 indicates OOM.
 		if lastErr == "" {
 			lastErr = "kafka-connect not healthy"
 		}
-		lastErr = fmt.Sprintf("%s (CDC requires Kafka Connect; if it keeps restarting, check memory/KAFKA_HEAP_OPTS)", lastErr)
+		// Helpful hint: frequent exit code 137 indicates OOM.
+		status, lastErr = h.debounceInfraFailure(componentID,
+			fmt.Sprintf("%s (CDC requires Kafka Connect; if it keeps restarting, check memory/KAFKA_HEAP_OPTS)", lastErr))
 	} else {
+		h.resetInfraFailures(componentID)
 		lastErr = ""
 	}
 

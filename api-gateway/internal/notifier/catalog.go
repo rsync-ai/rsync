@@ -86,8 +86,10 @@ var catalog = map[string]Entry{
 	// persisted on existing notification rows, and each has a published doc URL.
 	// Only the user-facing copy below is allowed to describe them.
 	"CDC_TABLE_MISSING_PRIMARY_KEY": {
-		Title:       "A table needs a primary key before it can sync",
-		Impact:      "That table isn't syncing. The rest of {pipeline} is unaffected.",
+		// Always a passed warning: a keyless table syncs (since 2026-09-27 into a
+		// database destination too), but without a key the copy can drift.
+		Title:       "A table has no primary key",
+		Impact:      "That table still syncs, but its updates and deletes may not match the source exactly. Add a primary key for an exact copy. The rest of {pipeline} is unaffected.",
 		ActionLabel: "See how to fix",
 		Severity:    severityWarning,
 	},
@@ -251,6 +253,15 @@ var catalog = map[string]Entry{
 	"CDC_CONNECTOR_DOWN": {
 		Title:       "Change capture has stopped on {pipeline}",
 		Impact:      "New changes at the source are not being captured, so nothing new will reach the destination until the connector is running again.",
+		ActionLabel: "View pipeline",
+		Severity:    severityCritical,
+	},
+	// Raised while the pipeline still reads 'running': the capture connector (or the
+	// Kafka Connect worker hosting it) has been unhealthy for four consecutive
+	// dependency probes. CDC_CONNECTOR_DOWN is the terminal verdict after restarts.
+	"CDC_CAPTURE_STOPPED": {
+		Title:       "Change capture is not running on {pipeline}",
+		Impact:      "New changes at the source are not being captured. The destination can look caught up while this is true, because nothing new is arriving.",
 		ActionLabel: "View pipeline",
 		Severity:    severityCritical,
 	},

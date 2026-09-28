@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"net"
+	"os"
 	"strings"
 	"testing"
 
@@ -50,6 +51,23 @@ func withSecurity(t *testing.T, brokers string) {
 	if err := initKafkaSecurity(brokers); err != nil {
 		t.Fatalf("initKafkaSecurity(%q): %v", brokers, err)
 	}
+}
+
+// liveKafkaBroker is the one way into a live-broker test: it skips without
+// SINK_LIVE_KAFKA_BROKER and otherwise initialises the security profile the way
+// main does. Every dial goes through kafkaSecurity, so a live test that reads the
+// env var itself dials with a zero profile and dies on
+// `unsupported KAFKA_SECURITY_PROTOCOL=""` before it reaches the broker — which is
+// how all four pre-existing live tests failed from #797 on, unseen because CI
+// never sets the variable.
+func liveKafkaBroker(t *testing.T) string {
+	t.Helper()
+	broker := os.Getenv("SINK_LIVE_KAFKA_BROKER")
+	if broker == "" {
+		t.Skip("set SINK_LIVE_KAFKA_BROKER (e.g. localhost:9092) to run this against a live broker")
+	}
+	withSecurity(t, broker)
+	return broker
 }
 
 // TestDialBrokerFailsOverAcrossACSVList is the two-sided proof that the collapse

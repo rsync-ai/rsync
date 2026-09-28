@@ -182,6 +182,30 @@ spec:
               (KI-CHART-ORCHESTRATOR-LOSES-OBJECTSTORAGE-ENV.)
             */}}
             {{- include "rsync-ai.objectStorageEnv" . | nindent 12 }}
+            {{- if include "rsync-ai.blobStaging.enabled" . }}
+            {{/*
+              The store blob_lane.go buildStagingConfig hands BOTH connectors of a
+              blob pipeline. Without it they are handed the MinIO above, which
+              networkpolicy.yaml keeps connector pods out of
+              (KI-CHART-NETWORKPOLICY-BLOCKS-CONNECTOR-STAGING). Optional refs: an
+              existingSecret without these keys must not stop the orchestrator --
+              only blob pipelines depend on them.
+            */}}
+            - name: BLOB_STAGING_ENDPOINT_URL
+              value: {{ include "rsync-ai.blobStaging.endpoint" . | quote }}
+            - name: BLOB_STAGING_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: BLOB_STAGING_ACCESS_KEY
+                  optional: true
+            - name: BLOB_STAGING_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: BLOB_STAGING_SECRET_KEY
+                  optional: true
+            {{- end }}
           volumeMounts:
             - name: connector-catalog
               mountPath: /app/shared/mcp-connectors

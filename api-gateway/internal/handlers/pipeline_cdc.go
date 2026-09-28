@@ -29,10 +29,20 @@ func orchestratorBaseURL() string {
 // orchestrator's requirePrincipal middleware accepts this proxied call as a
 // trusted internal principal. The orchestrator CDC/agent endpoints are no longer
 // anonymously reachable, so every api-gateway → orchestrator proxy call MUST
-// carry this header. No-op when INTERNAL_SERVICE_SECRET is unset (dev/e2e).
+// carry this header.
+//
+// It also forwards the authenticated caller as X-User-ID when the request's
+// context carries one (bindCallerToRequest, service_principal.go). With
+// INTERNAL_SERVICE_SECRET unset (dev/e2e) that is the ONLY principal the
+// orchestrator sees, and without it every ownership-gated orchestrator route
+// answered 401 (KI-CDC-STATUS-401-FORCES-LOGOUT). The orchestrator ignores
+// X-User-ID in production, where the secret is required.
 func setInternalServiceSecret(req *http.Request) {
 	if s := os.Getenv("INTERNAL_SERVICE_SECRET"); s != "" {
 		req.Header.Set("X-Internal-Secret", s)
+	}
+	if uid := callerUserIDFromContext(req.Context()); uid != "" {
+		req.Header.Set("X-User-ID", uid)
 	}
 }
 
@@ -49,8 +59,9 @@ func setInternalServiceSecret(req *http.Request) {
 //   - the read error is logged (scrubbed, per the LLM/log privacy rule and
 //     matching error_response.go) instead of being thrown away;
 //   - a blank >= 400 body is replaced by an actionable one naming the action and
-//     the HTTP status. The status code is ALWAYS forwarded verbatim, and a body
-//     that has any content at all — success or failure — is forwarded untouched.
+//     the HTTP status. A body that has any content at all — success or failure —
+//     is forwarded untouched, and the status is forwarded verbatim EXCEPT a 401,
+//     which becomes 502 (browserStatusForUpstream; KI-CDC-STATUS-401-FORCES-LOGOUT).
 func forwardOrchestratorJSON(c *gin.Context, resp *http.Response, action string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -60,20 +71,33 @@ func forwardOrchestratorJSON(c *gin.Context, resp *http.Response, action string)
 			"path":   c.FullPath(),
 		}).WithField("error", llmscrub.Scrub(err.Error())).Warn("orchestrator response body unreadable")
 	}
+	// KI-CDC-STATUS-401-FORCES-LOGOUT: an upstream 401 is about the gateway's
+	// service credentials, never the browser's session — never relay it as one.
+	if resp.StatusCode == http.StatusUnauthorized {
+		log.WithFields(log.Fields{
+			"action": action,
+			"path":   c.FullPath(),
+		}).Warn("orchestrator refused the gateway's service credentials (401); answering 502")
+		c.JSON(browserStatusForUpstream(resp.StatusCode), gin.H{
+			"error":   "orchestrator_auth_failed",
+			"message": action + " failed: " + upstreamAuthFailedMessage,
+		})
+		return
+	}
 	if len(bytes.TrimSpace(body)) == 0 && resp.StatusCode >= 400 {
-		c.JSON(resp.StatusCode, gin.H{
+		c.JSON(browserStatusForUpstream(resp.StatusCode), gin.H{
 			"error":   "orchestrator_error",
 			"message": fmt.Sprintf("%s failed: the orchestrator answered HTTP %d with no detail", action, resp.StatusCode),
 		})
 		return
 	}
-	c.Data(resp.StatusCode, "application/json", body)
+	c.Data(browserStatusForUpstream(resp.StatusCode), "application/json", body)
 }
 
 // GetPipelineCDCStatus returns CDC connector status for a pipeline (best-effort).
 // Proxies to backend-orchestrator, which calls Debezium MCP (Kafka Connect).
-// Ownership is enforced here because the orchestrator endpoint has no caller
-// identity — it would otherwise act on any pipeline_id we hand it.
+// Ownership is enforced here AND re-checked by the orchestrator for the caller
+// that setInternalServiceSecret forwards.
 func GetPipelineCDCStatus(c *gin.Context) {
 	pipelineID, ok := requireUUIDParam(c, "id", "invalid_pipeline_id", "Invalid pipeline ID format")
 	if !ok {

@@ -513,3 +513,123 @@ func TestGetCDCOffsetsArgsLayoutV2Prefix(t *testing.T) {
 		t.Fatal("minio is not a layout v2 store; it must keep the v1 prefix")
 	}
 }
+
+// connectorWrittenFormat is what the object-storage connectors actually serialize for
+// an import_data call: gcs, aws-s3 and azure-blob all run the same
+// base_connector.py prepare_destination_params. Its _enforce_config_precedence lets a
+// connection config value OVERWRITE the call's format/file_format/output_format/
+// compression, then an unknown format ("infer", the gcs/azure form default) falls back
+// to json. Asserting the top-level args, as the tests above do, cannot see that: on
+// GKE every v2 file was gzip JSON under a .parquet name while those tests passed.
+func connectorWrittenFormat(args map[string]interface{}) (format, compression string) {
+	cfg, _ := args["config"].(map[string]interface{})
+	str := func(m map[string]interface{}, k string) string { s, _ := m[k].(string); return s }
+	p := map[string]string{}
+	for _, k := range []string{"format", "file_format", "output_format", "compression"} {
+		p[k] = str(args, k)
+		if v := str(cfg, k); v != "" {
+			p[k] = v
+		}
+	}
+	for _, k := range []string{"output_format", "file_format", "format"} {
+		if v := str(cfg, k); v != "" {
+			p["format"] = v
+			break
+		}
+	}
+	format = "json"
+	for _, v := range []string{p["format"], p["file_format"], p["output_format"]} {
+		if v != "" {
+			format = strings.ToLower(v)
+			break
+		}
+	}
+	switch format {
+	case "json", "csv", "parquet":
+	case "jsonl", "json_lines", "ndjson":
+		format = "jsonl"
+	default:
+		format = "json"
+	}
+	compression = "none"
+	if p["compression"] != "" {
+		compression = strings.ToLower(p["compression"])
+	}
+	return format, compression
+}
+
+// The connection's saved format and compression are exactly what layout v2 must not
+// inherit. Each row is a destination form a user can save.
+var v2ConnectionFormats = []map[string]interface{}{
+	{"file_format": "infer", "compression": "gzip"},  // gcs/azure-blob form defaults (the GKE finding)
+	{"file_format": "jsonl"},                         // aws-s3 style
+	{"output_format": "csv", "compression": "bzip2"}, // bzip2 has no parquet codec
+	{"format": "json", "compression": "zstd"},
+}
+
+func TestWriteToDestinationLayoutV2FileIsParquetWhateverTheConnectionSays(t *testing.T) {
+	for _, conn := range v2ConnectionFormats {
+		client, ct := nsTestClient()
+		cfg, sm := v2BatchConfig()
+		for k, v := range conn {
+			cfg.DestinationConfig[k] = v
+		}
+		codec := objectLayoutV2ParquetCodec(objectStorageCompression("gcs", cfg.DestinationConfig))
+		v2 := &objectV2Write{Key: "exports/sales/datingapp/public/users/dt=2026-09-18/LOAD00000001.parquet", Compression: codec}
+		if _, _, err := writeToDestination(context.Background(), client, cfg, nil, sm, []map[string]interface{}{{"id": 1}}, "", "", v2); err != nil {
+			t.Fatalf("%v: writeToDestination: %v", conn, err)
+		}
+		_, args := ct.lastArgs(t)
+		if f, c := connectorWrittenFormat(args); f != "parquet" || c != codec {
+			t.Errorf("connection %v: the connector writes %s/%s, want parquet/%s", conn, f, c, codec)
+		}
+		for k, v := range conn {
+			if cfg.DestinationConfig[k] != v {
+				t.Errorf("connection %v: the shared connection config was mutated (%s=%v)", conn, k, cfg.DestinationConfig[k])
+			}
+		}
+	}
+}
+
+// Control: layout v1 still writes what the connection asks for, so the fix above is
+// scoped to v2 and not a blanket override.
+func TestWriteToDestinationLayoutV1KeepsTheConnectionFormat(t *testing.T) {
+	client, ct := nsTestClient()
+	cfg, sm := v2BatchConfig()
+	cfg.DestinationConfig["file_format"] = "csv"
+	sm.ObjectLayout = nil
+	if _, _, err := writeToDestination(context.Background(), client, cfg, nil, sm, []map[string]interface{}{{"id": 1}}, "", "", nil); err != nil {
+		t.Fatalf("writeToDestination: %v", err)
+	}
+	_, args := ct.lastArgs(t)
+	if f, _ := connectorWrittenFormat(args); f != "csv" {
+		t.Fatalf("a v1 write became %s; only layout v2 may override the connection format", f)
+	}
+}
+
+func TestCDCBatcherLayoutV2FileIsParquetWhateverTheConnectionSays(t *testing.T) {
+	ts := time.Date(2026, 9, 18, 10, 11, 12, 0, time.UTC).UnixMilli()
+	for _, conn := range v2ConnectionFormats {
+		b, rec := v2CDCBatcher(t, newFakeLoadStore())
+		delete(b.destCfg, "file_format")
+		for k, v := range conn {
+			b.destCfg[k] = v
+		}
+		codec := objectLayoutV2ParquetCodec(objectStorageCompression("gcs", b.destCfg))
+		msg, sm := v2CDCMessage(10, false, ts)
+		b.add(t.Context(), msg, sm)
+		b.flushDue(t.Context(), time.Now().Add(time.Hour))
+		imports := rec.named("import_data")
+		if len(imports) != 1 {
+			t.Fatalf("connection %v: want 1 file, got %d", conn, len(imports))
+		}
+		if f, c := connectorWrittenFormat(imports[0].args); f != "parquet" || c != codec {
+			t.Errorf("connection %v: the connector writes %s/%s, want parquet/%s", conn, f, c, codec)
+		}
+		for k, v := range conn {
+			if b.destCfg[k] != v {
+				t.Errorf("connection %v: the batcher's connection config was mutated (%s=%v)", conn, k, b.destCfg[k])
+			}
+		}
+	}
+}

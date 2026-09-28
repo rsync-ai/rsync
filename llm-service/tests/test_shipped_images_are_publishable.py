@@ -76,6 +76,17 @@ CHART_VALUES = os.path.join(REPO_ROOT, "deploy", "helm", "rsync-ai", "values.yam
 KNOWN_UNPUBLISHABLE = set()
 
 
+# The quickstart names its registry as `${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}`
+# so an install can pull from a mirror. Resolved to the default compose uses when
+# nothing is set: a literal `ghcr.io/rsync-ai/` match reads that form as a
+# third-party image, and every first-party check here would lose the quickstart.
+_REGISTRY_KNOB = re.compile(r"\$\{RSYNC_IMAGE_REGISTRY:-([^}]*)\}")
+
+
+def _default_registry(image):
+    return _REGISTRY_KNOB.sub(r"\1", image)
+
+
 def _discovered_connectors(workflow_text):
     """The connector images the workflow builds from a DISCOVERED matrix.
 
@@ -116,7 +127,7 @@ def _quickstart_images():
         if not isinstance(spec, dict):
             continue
         image = spec.get("image") or ""
-        if "ghcr.io/rsync-ai/" in image:
+        if "ghcr.io/rsync-ai/" in _default_registry(image):
             short = image.split("/")[-1].split(":")[0]
             out.setdefault(short, []).append((name, spec.get("profiles") or []))
     return out
@@ -240,13 +251,43 @@ def test_every_first_party_image_reads_the_same_version_knob():
     find it. Third-party images (postgres, redis, kafka, minio, temporal) are
     excluded on purpose: they carry their own upstream versions.
     """
-    with open(QUICKSTART) as fh:
-        text = fh.read()
-    pinned = re.findall(r"image:\s*(ghcr\.io/rsync-ai/[a-z0-9-]+:(?!\$\{RSYNC_VERSION)\S+)", text)
+    images = _first_party_quickstart_lines()
+    pinned = [i for i in images if not i.split("/")[-1].split(":", 1)[-1].startswith("${RSYNC_VERSION")]
     assert pinned == [], (
         f"first-party images not on the shared version knob: {pinned}. "
-        f"Use ghcr.io/rsync-ai/<name>:${{RSYNC_VERSION:-latest}} so one variable moves "
-        f"the whole stack together."
+        f"Use ${{RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}}/<name>:${{RSYNC_VERSION:-latest}} "
+        f"so one variable moves the whole stack together."
+    )
+
+
+def _first_party_quickstart_lines():
+    """Every first-party `image:` value in the quickstart, as written."""
+    with open(QUICKSTART) as fh:
+        doc = yaml.safe_load(fh)
+    out = [
+        spec["image"]
+        for spec in (doc.get("services") or {}).values()
+        if isinstance(spec, dict)
+        and "ghcr.io/rsync-ai/" in _default_registry(str(spec.get("image") or ""))
+    ]
+    # The quickstart ships 15; fewer means this parse stopped recognising them.
+    assert len(out) >= 10, f"only {len(out)} first-party quickstart images parsed: {out}"
+    return out
+
+
+def test_every_first_party_image_reads_the_same_registry_knob():
+    """One stack, one registry -- the version knob's twin.
+
+    install.sh writes RSYNC_IMAGE_REGISTRY so a mirror, an air-gapped registry
+    or a release candidate is one variable. An image line that still names
+    ghcr.io literally ignores it: that one service is pulled from the public
+    registry at the requested tag, which on an air-gapped host is a pull failure
+    and on a release-candidate host is a stack built from two registries.
+    """
+    literal = [i for i in _first_party_quickstart_lines() if not _REGISTRY_KNOB.match(i)]
+    assert literal == [], (
+        f"first-party images that ignore RSYNC_IMAGE_REGISTRY: {literal}. "
+        f"Write them as ${{RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}}/<name>:${{RSYNC_VERSION:-latest}}."
     )
 
 
@@ -491,8 +532,8 @@ def test_every_default_rendered_image_is_buildable_here():
     ErrImagePull -- on kind, where the private GHCR org cannot be pulled from,
     that pod never starts and nothing says why.
 
-    The direction matters. ALL_IMAGES may legitimately be a SUPERSET: mcp-debezium,
-    mcp-kafka-sink and kafka-connect render only with connectors.cdc.enabled, and
+    The direction matters. ALL_IMAGES may legitimately be a SUPERSET: mcp-debezium and
+    kafka-connect render only with connectors.cdc.enabled, and
     mcp-postgresql only with a connectors.fleet entry. What must never happen is
     the other way round -- an image the chart renders by default that the harness
     cannot build.

@@ -47,8 +47,12 @@ type Dispatcher struct {
 	// readySince is when each queued request's connector was first seen ready in
 	// the current streak; a not-ready tick resets it.
 	readySince map[string]time.Time
-	cancel     context.CancelFunc
-	done       chan struct{}
+	// proofs are RUNNING streaks the executor watched for a request (Hurry);
+	// kick wakes the loop before the next tick.
+	proofs map[string]RunningProof
+	kick   chan struct{}
+	cancel context.CancelFunc
+	done   chan struct{}
 	// startedAt is this dispatcher's first tick. No in-flight clock starts
 	// earlier: see ClampToStart.
 	startedAt time.Time
@@ -64,6 +68,8 @@ func NewDispatcher(store *Store, producer Producer, connect Connect, tracked boo
 		tick:       5 * time.Second,
 		now:        time.Now,
 		readySince: map[string]time.Time{},
+		proofs:     map[string]RunningProof{},
+		kick:       make(chan struct{}, 1),
 	}
 }
 
@@ -92,6 +98,7 @@ func (d *Dispatcher) Start() {
 			case <-ctx.Done():
 				return
 			case <-t.C:
+			case <-d.kick:
 			}
 			if err := d.Tick(ctx); err != nil {
 				if errors.Is(err, ErrUnavailable) {
@@ -293,6 +300,11 @@ func (d *Dispatcher) Tick(ctx context.Context) error {
 			delete(d.readySince, id)
 		}
 	}
+	for id := range d.proofs {
+		if !open[id] {
+			delete(d.proofs, id)
+		}
+	}
 	d.mu.Unlock()
 	return nil
 }
@@ -325,6 +337,7 @@ func (d *Dispatcher) ready(ctx context.Context, r Request) (ok bool, failed bool
 	if state != Ready {
 		d.mu.Lock()
 		delete(d.readySince, r.ID)
+		delete(d.proofs, r.ID)
 		d.mu.Unlock()
 		// A paused pipeline waits as long as it stays paused; anything else is
 		// bounded, measured from the request (or, for a re-send, the last send).
@@ -349,8 +362,13 @@ func (d *Dispatcher) ready(ctx context.Context, r Request) (ok bool, failed bool
 	d.mu.Lock()
 	first, seen := d.readySince[r.ID]
 	if !seen {
-		d.readySince[r.ID] = now
 		first = now
+		// The executor watched this connector run for ReadyStable just before
+		// queueing the request (a Reload): that streak counts.
+		if since, ok := d.provenReadySince(r.ID, now); ok {
+			first = since
+		}
+		d.readySince[r.ID] = first
 	}
 	d.mu.Unlock()
 	return now.Sub(first) >= d.timing.ReadyStable, false

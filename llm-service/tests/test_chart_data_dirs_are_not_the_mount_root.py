@@ -84,11 +84,12 @@ STRICT = {
 }
 
 # Components that may keep a data directory at the volume root, each with the
-# reason it survives finding `lost+found` there. All three were observed Running
+# reason it survives finding `lost+found` there. minio, redis and ollama were observed Running
 # on GKE `standard-rwo` (ext4 pd-balanced) in the same install where Kafka died.
 TOLERANT = {
     "minio.yaml": "a stray top-level directory is not a valid bucket name, and "
                   "MinIO ignores it rather than failing startup",
+    "blob-staging.yaml": "the same MinIO image as minio.yaml, for the same reason",
     "redis.yaml": "redis addresses dump.rdb/appendonly by name and never "
                   "enumerates its dir",
     "ollama.yaml": "the model cache is content-addressed under subdirectories "

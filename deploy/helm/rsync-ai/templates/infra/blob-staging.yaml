@@ -1,0 +1,185 @@
+{{- if include "rsync-ai.blobStaging.enabled" . }}
+{{/*
+Blob-passthrough staging: a second, blob-only MinIO that connector pods may
+reach. The source connector stages a file's bytes here and the destination
+connector fetches them (backend-orchestrator/internal/agents/executor/blob_lane.go
+buildStagingConfig, told this address by the orchestrator's
+BLOB_STAGING_ENDPOINT_URL).
+
+Not the MinIO in minio.yaml, on purpose. That one holds every pipeline's staged
+claim-check rows, and networkpolicy.yaml keeps connector pods -- tenant code,
+tenant credentials -- out of it along with the other platform datastores
+(KI-CHART-NO-CONNECTOR-NETWORK-BOUNDARY). Handing connectors that MinIO is what
+left blob pipelines unable to stage under networkPolicy.enabled
+(KI-CHART-NETWORKPOLICY-BLOCKS-CONNECTOR-STAGING). Compose runs the same second
+store, `blob-staging`, on the connector network only.
+*/}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-blob-staging
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: blob-staging
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9000
+      targetPort: api
+      name: api
+  selector:
+{{- include "rsync-ai.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: blob-staging
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-blob-staging
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: blob-staging
+spec:
+  serviceName: {{ include "rsync-ai.fullname" . }}-blob-staging
+  replicas: 1
+  selector:
+    matchLabels:
+{{- include "rsync-ai.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: blob-staging
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: blob-staging
+      {{- with .Values.global.podAnnotations }}
+      annotations:
+{{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: minio
+          image: {{ .Values.objectStorage.minio.image | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          args: ["server", "/data"]
+          env:
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: BLOB_STAGING_ACCESS_KEY
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: BLOB_STAGING_SECRET_KEY
+          ports:
+            - name: api
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: api
+            initialDelaySeconds: 10
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: api
+            initialDelaySeconds: 30
+            periodSeconds: 20
+            failureThreshold: 6
+          resources:
+{{- toYaml .Values.objectStorage.blobStaging.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with (default .Values.global.storageClass .Values.objectStorage.blobStaging.persistence.storageClass) }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.objectStorage.blobStaging.persistence.size | quote }}
+---
+{{/*
+Bucket + expiry, as minio.yaml's minio-mb does for the other store. The bucket
+keeps objectStorage.bucket's name: the sink accepts a blob's data_ref only in
+its staging-bucket allow-list, which defaults to MINIO_BUCKET (claimcheck_url.go).
+Nothing deletes a staged blob per message -- blobs are content-addressed and
+shared between messages -- so the expiry rule is the only cleanup.
+*/}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "rsync-ai.fullname" . }}-blob-staging-mb
+  labels:
+{{- include "rsync-ai.labels" . | nindent 4 }}
+    app.kubernetes.io/component: blob-staging-mb
+  annotations:
+    helm.sh/hook: post-install,post-upgrade
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 10
+  template:
+    metadata:
+      labels:
+{{- include "rsync-ai.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: blob-staging-mb
+    spec:
+      restartPolicy: OnFailure
+{{- include "rsync-ai.podBoilerplate" . | nindent 6 }}
+      containers:
+        - name: mc
+          image: {{ .Values.objectStorage.minio.mcImage | quote }}
+          imagePullPolicy: {{ .Values.global.image.pullPolicy }}
+          securityContext:
+{{- toYaml .Values.global.containerSecurityContext | nindent 12 }}
+          env:
+            - name: BLOB_STAGING_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: BLOB_STAGING_ACCESS_KEY
+            - name: BLOB_STAGING_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rsync-ai.secretName" . }}
+                  key: BLOB_STAGING_SECRET_KEY
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              # No home directory for uid 1000; see minio.yaml's minio-mb.
+              export MC_CONFIG_DIR=/tmp/.mc
+              attempt=0
+              until mc alias set staging {{ include "rsync-ai.blobStaging.endpoint" . }} "$BLOB_STAGING_ACCESS_KEY" "$BLOB_STAGING_SECRET_KEY" >/tmp/mc-alias.err 2>&1; do
+                attempt=$((attempt + 1))
+                if [ "$attempt" -ge 40 ]; then
+                  echo "ERROR: could not reach blob-staging at {{ include "rsync-ai.blobStaging.endpoint" . }} after ${attempt} attempts. Last error:" >&2
+                  cat /tmp/mc-alias.err >&2
+                  exit 1
+                fi
+                echo "waiting for blob-staging (attempt ${attempt}/40)..."
+                sleep 3
+              done
+              mc mb --ignore-existing staging/{{ .Values.objectStorage.bucket }}
+              mc ilm rule add staging/{{ .Values.objectStorage.bucket }} \
+                    --expire-days "{{ .Values.objectStorage.stagingExpireDays }}" \
+                    --prefix "{{ .Values.objectStorage.prefix }}/" \
+                || mc ilm add staging/{{ .Values.objectStorage.bucket }} \
+                    --expiry-days "{{ .Values.objectStorage.stagingExpireDays }}" \
+                    --prefix "{{ .Values.objectStorage.prefix }}/" \
+                || echo "WARN: could not set the blob staging expiry rule"
+              echo "blob-staging bucket {{ .Values.objectStorage.bucket }} ready"
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { memory: 128Mi }
+{{- end }}

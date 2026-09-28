@@ -67,6 +67,17 @@ MIN_QUICKSTART_IMAGES = 10
 MIN_PUSH_JOBS = 2
 
 
+# The quickstart names its registry as `${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}`
+# so an install can pull from a mirror. Resolved to the default compose uses when
+# nothing is set: a literal `ghcr.io/rsync-ai/` match reads that form as a
+# third-party image, and every first-party check here would lose the quickstart.
+_REGISTRY_KNOB = re.compile(r"\$\{RSYNC_IMAGE_REGISTRY:-([^}]*)\}")
+
+
+def _default_registry(image):
+    return _REGISTRY_KNOB.sub(r"\1", image)
+
+
 def _text(path):
     with open(path, encoding="utf-8") as fh:
         return fh.read()
@@ -293,7 +304,7 @@ def _quickstart_references(quickstart=None, workflow=None):
         image = spec.get("image")
         if not isinstance(image, str) or not image:
             continue
-        ref = _strip_tag(image)
+        ref = _strip_tag(_default_registry(image))
         if ref.rsplit("/", 1)[-1] in ours:
             out[name] = ref
     return out

@@ -55,10 +55,10 @@ VALUES_FILE="values.generated.yaml"
 # rendering the chart with an empty fleet and no demo, then adding one connector
 # / the demo at a time; test_install_k8s_defaults_work.py re-measures on every
 # run, so a chart change that moves these fails CI instead of the next user.
-# BASE includes the post-install hook pods (kafka-init, minio-mb): they run after
+# BASE includes the post-install hook pods (kafka-init, minio-mb, blob-staging-mb): they run after
 # every Deployment is up, and on a full node they are what stays Pending.
-BASE_MEM_MIB=8416
-BASE_CPU_M=3410
+BASE_MEM_MIB=8608
+BASE_CPU_M=3510
 CONNECTOR_MEM_MIB=96
 CONNECTOR_CPU_M=50
 DEMO_MEM_MIB=128
@@ -72,8 +72,8 @@ OLLAMA_CPU_M=1050
 LEAN_CONNECTORS="postgresql,mongodb"
 
 # The rung below lean. Trimming connectors cannot rescue a 4-vCPU node: BASE
-# alone asks 3410m, and a GKE e2-standard-4 has ~3920m allocatable with several
-# hundred more taken by kube-system DaemonSets, so the lean set's 3510m still
+# alone asks 3510m, and a GKE e2-standard-4 has ~3920m allocatable with several
+# hundred more taken by kube-system DaemonSets, so the lean set's 3610m still
 # does not fit and its pods sit Pending. What does fit is one replica of each
 # front-end Deployment (both default to 2) and a smaller CPU request for the
 # orchestrator. The chart sets no CPU limit anywhere, so a smaller CPU request
@@ -366,7 +366,7 @@ load_settings() {
 
 # .env key -> Secret key. Same names compose's .env uses, except that the chart's
 # Secret calls the warehouse password DEMO_WAREHOUSE_PASSWORD.
-SECRET_KEYS="JWT_SECRET ENCRYPTION_KEY INTERNAL_SERVICE_SECRET POSTGRES_PASSWORD REDIS_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY RSYNC_DEMO_WAREHOUSE_PASSWORD"
+SECRET_KEYS="JWT_SECRET ENCRYPTION_KEY INTERNAL_SERVICE_SECRET POSTGRES_PASSWORD REDIS_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY BLOB_STAGING_ACCESS_KEY BLOB_STAGING_SECRET_KEY RSYNC_DEMO_WAREHOUSE_PASSWORD"
 
 cluster_secret_key() {
   case "$1" in
@@ -717,6 +717,9 @@ write_values() {
     echo "  redisPassword: $(yq "$(env_value REDIS_PASSWORD)")"
     echo "  minioAccessKey: $(yq "$(env_value MINIO_ACCESS_KEY)")"
     echo "  minioSecretKey: $(yq "$(env_value MINIO_SECRET_KEY)")"
+    # Its own login, not the MinIO pair: connector pods can reach this store.
+    echo "  blobStagingAccessKey: $(yq "$(env_value BLOB_STAGING_ACCESS_KEY)")"
+    echo "  blobStagingSecretKey: $(yq "$(env_value BLOB_STAGING_SECRET_KEY)")"
     echo "  demoWarehousePassword: $(yq "$(env_value RSYNC_DEMO_WAREHOUSE_PASSWORD)")"
     [[ -z "$OPENAI_KEY" ]] || echo "  openaiApiKey: $(yq "$OPENAI_KEY")"
     echo "frontend:"

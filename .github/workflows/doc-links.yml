@@ -208,6 +208,14 @@ jobs:
           # drop-ins a PR writes instead of editing CAPABILITIES.md directly. A drop-in
           # is folded days later by a scheduled job nobody watches, so a malformed one
           # has to fail on the PR that wrote it, not in that job.
+          # The last six read markdown and used to be reached through `docs/**` and
+          # `*.md` in paths-filters.yml's `llm` filter. Every PR writes a drop-in, so
+          # those globs ran the whole llm-service suite on every PR; the globs are
+          # gone and this unfiltered job runs the six instead (~12 s). The census in
+          # test_ci_filter_covers_every_guard_subject.py counts this list as coverage.
+          # NOT test_shipped_images_are_publishable.py: it fails without release tags,
+          # and this list also runs against the published tree, which has none. It
+          # stays in llm-service-unit, which fetches tags, with README.md in the filter.
           pytest -q \
             tests/test_doc_merge_claims_are_true.py \
             tests/test_doc_links_resolve.py \
@@ -230,5 +238,11 @@ jobs:
             tests/test_no_bundled_observability_vendor.py \
             tests/test_capabilities_drops_are_foldable.py \
             tests/test_no_public_file_references_the_enterprise_tree.py \
-            tests/test_enterprise_images_cannot_overwrite_a_public_one.py
+            tests/test_enterprise_images_cannot_overwrite_a_public_one.py \
+            tests/test_doc_links_into_the_moat_are_delinked.py \
+            tests/test_no_doc_promises_a_silent_gateway_db_failure.py \
+            tests/test_chart_ships_no_developer_scaffolding.py \
+            tests/test_published_image_platforms_match_the_docs.py \
+            tests/test_fix_pr_must_change_a_test.py \
+            tests/test_shipped_images_are_anonymously_pullable.py
 

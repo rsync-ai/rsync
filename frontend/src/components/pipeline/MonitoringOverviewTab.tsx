@@ -29,8 +29,9 @@ import { authFetch } from "@/lib/api/auth-fetch"
 import { formatSpanCoarse } from "@/lib/duration"
 import { API_ENDPOINTS } from "@/lib/config/api"
 import type { PipelineRuntime, RuntimeDep, RuntimePhase } from "@/lib/hooks/usePipelineRuntime"
-import { backlogIncludesLoadRows } from "@/lib/pipeline/loadStatus"
+import { backlogIncludesLoadRows, isSettingUp } from "@/lib/pipeline/loadStatus"
 import { formatAbsoluteTime, formatAge, formatCount } from "@/lib/transform-format"
+import { onPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import { cn } from "@/lib/utils"
 import type { TableStatsSummaryPayload } from "./executionSummary"
 
@@ -239,8 +240,16 @@ export function captureTile(state: CaptureState, deps: RuntimeDep[] | undefined)
  *
  * `measured` is false when nothing has been counted; the caller reads it off the
  * table-stats summary, which now omits its totals rather than publishing zeros.
+ *
+ * `settling` is true while the pipeline is being set up again or a load is under
+ * way: a zero then is not a drained stream, so it is not "Caught up" (item 32).
  */
-export function backlogTile(pending: number | undefined, measured: boolean, unit: BacklogUnit = "change"): TileState {
+export function backlogTile(
+  pending: number | undefined,
+  measured: boolean,
+  unit: BacklogUnit = "change",
+  settling = false,
+): TileState {
   if (typeof pending !== "number") return { value: "—", detail: "not reported by this server", tone: "neutral" }
   if (pending > 0) return { value: plural(pending, unit), detail: "read by the sink, not yet written", tone: "warn" }
   if (!measured) {
@@ -250,7 +259,15 @@ export function backlogTile(pending: number | undefined, measured: boolean, unit
       tone: "neutral",
     }
   }
+  if (settling) return NOTHING_WAITING_YET
   return { value: "Caught up", detail: "nothing waiting to be written", tone: "ok" }
+}
+
+// Zero while a set-up or a load is under way: honest, but not health.
+const NOTHING_WAITING_YET: TileState = {
+  value: "Nothing waiting yet",
+  detail: "the pipeline is being set up or loading, so zero is not caught up",
+  tone: "neutral",
 }
 
 /**
@@ -280,6 +297,8 @@ export function kafkaTile(
     stalled?: boolean
     stalledSeconds?: number
     unit?: BacklogUnit
+    // See backlogTile: a zero during set-up or a load is not "Caught up".
+    settling?: boolean
   } = {
     capture: "unknown",
   },
@@ -305,6 +324,7 @@ export function kafkaTile(
         tone: "warn",
       }
     }
+    if (opts.settling) return NOTHING_WAITING_YET
     return { value: "Caught up", detail: "nothing waiting in Kafka", tone: "ok" }
   }
 
@@ -522,8 +542,14 @@ function useOverviewSources(pipelineId: string) {
       if (document.visibilityState === "visible") void tick()
     }
     document.addEventListener("visibilitychange", onVisibility)
+    // Run, Stop, Reload and a status change seen by the /state poller announce
+    // themselves here; without listening this tab trailed them by up to 30 s (item 35).
+    const unsubscribeRefresh = onPipelineRefresh((pid) => {
+      if (pid === pipelineId) void tick()
+    })
     return () => {
       cancelled = true
+      unsubscribeRefresh()
       window.clearInterval(timer)
       document.removeEventListener("visibilitychange", onVisibility)
       inflight?.abort()
@@ -633,6 +659,7 @@ export function MonitoringOverviewTab({
   const backlogged = (pending ?? 0) > 0 || (kafkaLag ?? 0) > 0
   // Both backlogs count the initial load's rows alongside changes.
   const backlogUnit: BacklogUnit = backlogIncludesLoadRows(rt) ? "row" : "change"
+  const settling = isCdc && (isSettingUp(rt?.phase) || backlogIncludesLoadRows(rt))
   const lagState: TileState | null =
     rt && (usingRuntimeLag || overview.data)
       ? kafkaTile(kafkaLag, {
@@ -641,9 +668,10 @@ export function MonitoringOverviewTab({
           stalled: rt.liveness?.sink_stalled,
           stalledSeconds: rt.liveness?.sink_stalled_seconds,
           unit: backlogUnit,
+          settling,
         })
       : null
-  const backlogState = backlogTile(pending, changesMeasured, backlogUnit)
+  const backlogState = backlogTile(pending, changesMeasured, backlogUnit, settling)
   const delivery = deliveryTile(lagState, backlogState)
   const deliveryFromCounters = delivery === backlogState
   const hasRun = Boolean(rt?.execution_id)

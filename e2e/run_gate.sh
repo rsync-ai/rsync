@@ -78,6 +78,11 @@ STACK_PREFIX="${STACK_PREFIX:-rsync-ai}"
 MAIN_PROJECT="${STACK_PREFIX}"
 E2E_PROJECT="${STACK_PREFIX}-e2e"
 MCP_PROJECT="${STACK_PREFIX}-mcp"
+# Both stacks name their broker <prefix>-kafka (rsync-ai-kafka / rsync-ci-kafka).
+KAFKA_CONTAINER="${STACK_PREFIX}-kafka"
+# And their sink service <prefix>-kafka-mcp-sink-v1-0-0-mcp (docker-compose.yml,
+# docker-compose.ci-isolate.yml container_name).
+KAFKA_SINK_CONTAINER="${STACK_PREFIX}-kafka-mcp-sink-v1-0-0-mcp"
 if [[ "${STACK_PREFIX}" == "rsync-ai" ]]; then
   # default: shared single-stack behavior, unchanged
   CI_MAIN=(); CI_DBS=(); CI_MCP=()
@@ -220,7 +225,7 @@ reclaim_orphan_recreate_containers() {
       *) continue ;;
     esac
     warn "removing ${name} (${state}): left in project ${project} by an interrupted compose recreate"
-    docker rm -f "${id}" >/dev/null 2>&1 || warn "could not remove ${name}"
+    docker rm -fv "${id}" >/dev/null 2>&1 || warn "could not remove ${name}"
   done <<<"$(docker ps -a --filter "label=com.docker.compose.project=${project}" \
                --format '{{.ID}} {{.Names}} {{.State}}' 2>/dev/null)"
   return 0
@@ -241,7 +246,7 @@ reclaim_conflicting_recreate_containers() {
       continue
     fi
     warn "removing ${name}: left in project ${project} by an interrupted compose recreate"
-    docker rm -f "${name}" >/dev/null 2>&1 && removed=0
+    docker rm -fv "${name}" >/dev/null 2>&1 && removed=0
   done <<<"$(grep -oE 'container name "/?[0-9a-f]{12}_[^"]+" is already in use' <<<"${out}" \
                | sed -E 's/^container name "\/?//; s/" is already in use$//' | sort -u)"
   return "${removed}"
@@ -292,15 +297,17 @@ compose_up_selfheal() {
 # --- RAM hygiene: reclaim leftover e2e Debezium connectors ------------------
 # The .py CDC tests register connectors named `debug-<kind>-<db>-<ts>` with a
 # fresh timestamp per run and (by design) only pre-delete their OWN exact name
-# before creating — they never delete on exit. Across runs these pile up (76
+# before creating — they never delete on exit. (The .sh tests name theirs
+# `e2e-*` or `debug-*` and delete them in a trap, which a killed run skips, so
+# `e2e-*` is reclaimed too.) Across runs these pile up (76
 # observed on the self-hosted box), each pinning kafka-connect heap PLUS a live
 # source replication-slot / binlog reader. On an 18 GB box already deep in swap
 # that degrades every later test, and the heaviest namespace test runs LAST
 # (SERIAL_TAIL) on the most-degraded stack — which is exactly what pushes it
-# past E2E_PIPELINE_TIMEOUT_S. Reclaim the test-owned `debug-` namespace up front
-# so each gate starts on a clean connect cluster. Best-effort: never fails the
-# gate. Scope is the `debug-` prefix ONLY — never a prod/manual connector.
-# Opt out with E2E_SKIP_CONNECTOR_RECLAIM=1.
+# past E2E_PIPELINE_TIMEOUT_S. Reclaim the test-owned `debug-`/`e2e-` namespace up
+# front so each gate starts on a clean connect cluster. Best-effort: never fails
+# the gate. Scope is those two prefixes ONLY — never a pipeline's `cdc-<id8>` or a
+# manual connector. Opt out with E2E_SKIP_CONNECTOR_RECLAIM=1.
 #
 # NB: defined HERE, above on_exit()/the EXIT trap, on purpose. bash resolves
 # function names at call time, so on_exit (which calls reclaim_e2e_connection_rows)
@@ -314,15 +321,203 @@ reclaim_e2e_connectors() {
   local removed
   removed="$(docker exec "${KAFKA_CONNECT_CONTAINER}" bash -lc '
     n=0
-    for c in $(curl -s localhost:8083/connectors 2>/dev/null | tr ",[]\"" "\n" | grep "^debug-"); do
+    for c in $(curl -s localhost:8083/connectors 2>/dev/null | tr ",[]\"" "\n" | grep -E "^(debug|e2e)-"); do
       curl -s -X DELETE "localhost:8083/connectors/${c}" >/dev/null 2>&1 && n=$((n+1))
     done
     echo "${n}"' 2>/dev/null || echo 0)"
   if [[ "${removed:-0}" -gt 0 ]]; then
-    log "connector reclaim: removed ${removed} leftover debug-* connector(s) (freed connect heap + source CDC readers)"
+    log "connector reclaim: removed ${removed} leftover debug-*/e2e-* connector(s) (freed connect heap + source CDC readers)"
   else
-    log "connector reclaim: no leftover debug-* connectors"
+    log "connector reclaim: no leftover debug-*/e2e-* connectors"
   fi
+}
+
+# --- Kafka hygiene: reclaim leftover e2e TOPICS -----------------------------
+# Deleting a connector does not delete its topics. Every CDC test registers one
+# whose topic.prefix is its fresh, timestamped name, so each run leaves `<name>`,
+# `<name>.<db>.<table>` (+ `.dlq`) and `schemahistory.<name>` behind: 916 had
+# piled up in the warm CI Kafka by 2026-09-27. Delete the tests' own namespace,
+# `debug-*`/`e2e-*` and their `schemahistory.` twins -- never a pipeline's
+# `rsync.*`/`cdc-*` topics, never Kafka's or Connect's own. Run it AFTER
+# reclaim_e2e_connectors: a live connector recreates the topics it writes to.
+# test_e2e_test_topics_are_reclaimed.py holds every e2e test to this namespace.
+# Best-effort: never fails the gate. Opt out with E2E_SKIP_TOPIC_RECLAIM=1.
+reclaim_e2e_topics() {
+  [[ "${E2E_SKIP_TOPIC_RECLAIM:-}" == "1" ]] && { log "topic reclaim: skipped (E2E_SKIP_TOPIC_RECLAIM=1)"; return 0; }
+  local kt=(docker exec "${KAFKA_CONTAINER}" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092)
+  local listed names total removed
+  if ! listed="$("${kt[@]}" --list 2>/dev/null)"; then
+    warn "topic reclaim: could not list the topics in ${KAFKA_CONTAINER}; skipped, the next gate retries"
+    return 0
+  fi
+  names="$(grep -E '^(schemahistory\.)?(debug|e2e)-' <<<"${listed}" || true)"
+  if [[ -z "${names}" ]]; then
+    log "topic reclaim: no leftover e2e topics"
+    return 0
+  fi
+  total="$(grep -c . <<<"${names}")"
+  if removed="$(delete_topics_exactly <<<"${names}")"; then
+    log "topic reclaim: deleted ${removed} leftover e2e topic(s)"
+  else
+    warn "topic reclaim: a delete failed after ${removed}/${total} topic(s); the rest wait for the next gate"
+  fi
+}
+
+# Deletes the topic names on stdin, one per line, as exact names. kafka-topics
+# reads --topic as a regex, so each call is an alternation of up to 50 names
+# with every `.` escaped. Prints how many it deleted; returns 1 at the first
+# failed batch and leaves the rest.
+delete_topics_exactly() {
+  local kt=(docker exec "${KAFKA_CONTAINER}" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092)
+  local names batch removed=0
+  names="$(cat)"
+  [[ -n "${names}" ]] || { echo 0; return 0; }
+  while IFS= read -r batch; do
+    if ! "${kt[@]}" --delete --if-exists --topic "^(${batch})\$" >/dev/null 2>&1 </dev/null; then
+      echo "${removed}"
+      return 1
+    fi
+    removed=$(( removed + $(awk -F'|' '{ print NF }' <<<"${batch}") ))
+  done < <(sed 's/\./\\./g' <<<"${names}" \
+             | awk '{ printf "%s%s", (NR == 1 ? "" : (NR % 50 == 1 ? "\n" : "|")), $0 } END { print "" }')
+  echo "${removed}"
+}
+
+# Stops the sink workers of the pipelines on stdin (full UUIDs, one per line)
+# through the sink service's own list_sinks/stop_sink (connector.py), and prints
+# `stopped <uuid>` or `kept <uuid>` for each worker it found. "Worker not found"
+# means it is already gone, as cdc_kafka_teardown.go sinkStopFailure reads it.
+# Returns 1 when the workers could not be listed at all.
+stop_sink_workers_of() {
+  local prog='
+import json, sys, urllib.request
+def call(tool, cfg, timeout):
+    req = urllib.request.Request("http://localhost:8000/" + tool, data=json.dumps({"config": cfg}).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+doomed = set(sys.stdin.read().split())
+try:
+    workers = call("list_sinks", {}, 30)["workers"]
+except Exception as e:
+    sys.exit("list_sinks failed: %s" % e)
+for w in workers:
+    pid = w.get("pipeline_id") or ""
+    if pid in doomed:
+        try:
+            r = call("stop_sink", {"consumer_group": w["worker_id"]}, 120)
+            ok = r.get("success") is True or "Worker not found" in str(r.get("error") or "")
+        except Exception:
+            ok = False
+        print(("stopped " if ok else "kept ") + pid)
+'
+  docker exec -i "${KAFKA_SINK_CONTAINER}" python3 -c "${prog}" 2>/dev/null
+}
+
+# --- DB + Kafka hygiene: reclaim leftover e2e PIPELINES ---------------------
+# The gated tests create a pipeline per run and never delete it (a killed run
+# skips even the one test that tries), so the row -- and the
+# `pipeline.<id8>.data` topic and `sink-<id8>-batch` group its run left -- stay
+# for good: 249 rows in the warm CI stack by 2026-09-27, 193 of them
+# golden-types-*. The API delete cannot do this job: it calls the orchestrator's
+# kafka-teardown with the INTERNAL_SERVICE_SECRET the gate stack leaves empty,
+# and gets a 403.
+# So the gate reclaims the pipelines its own tests name -- E2E_PIPELINE_NAME_RE
+# is a test's name prefix PLUS its run suffix of 8+ hex digits, never a name a
+# person picks. Their sink workers first (stop_sink, as the orchestrator's delete
+# does), then Kafka -- only the names derived from those rows, as
+# cdc_kafka_teardown.go ownsTopic/ownsGroup spell them: bare, and under the
+# stack's default `rsync.` namespace. An id8 that a kept pipeline shares is not
+# swept (that file's id8IsUnique rule). Then the rows: every FK to pipelines
+# cascades except cdc_resources.pipeline_id (SET NULL), so a row delete leaves
+# nothing pointing at a missing pipeline. test_e2e_test_pipelines_are_reclaimed.py
+# holds every gated test's pipeline name to the pattern. Best-effort: never
+# fails the gate. Opt out with E2E_SKIP_PIPELINE_RECLAIM=1.
+E2E_PIPELINE_NAME_RE='^(golden-types|e2e-batch-minio|e2e-batch-reload-resume|pgns|pgleak|e2e-ns-batch|e2e-ss-cdc|e2e-ora-cdc|gh-oauth-pipe|widgets-graphql-to-postgres)-[0-9a-f]{8,}$'
+reclaim_e2e_pipelines() {
+  [[ "${E2E_SKIP_PIPELINE_RECLAIM:-}" == "1" ]] && { log "pipeline reclaim: skipped (E2E_SKIP_PIPELINE_RECLAIM=1)"; return 0; }
+  local psql=(docker exec "${ORCH_PG_CONTAINER}" psql -U "${PGUSER:-user}" -d "${PGDATABASE:-pipeline_db}" -tAc)
+  local kt=(docker exec "${KAFKA_CONTAINER}" /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092)
+  local kg=(docker exec "${KAFKA_CONTAINER}" /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092)
+  local uuid='[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}'
+  local rows doomed workers stuck kept8 ids8 uuids shared alts all_topics all_groups topics groups removed left gone g args=()
+  # psql -tA prints `<id>|<name>`. grep, not awk: mawk has no {n}.
+  if ! rows="$("${psql[@]}" "SELECT id, name FROM pipelines" 2>/dev/null)"; then
+    warn "pipeline reclaim: could not read the pipelines in ${ORCH_PG_CONTAINER}; skipped, the next gate retries"
+    return 0
+  fi
+  doomed="$(grep -E "^${uuid}\|${E2E_PIPELINE_NAME_RE#^}" <<<"${rows}" | cut -c1-36 || true)"
+  if [[ -z "${doomed}" ]]; then
+    log "pipeline reclaim: no leftover e2e pipelines"
+    return 0
+  fi
+
+  # Kafka goes first: once a row is gone nothing can derive its names again. So
+  # a Kafka that cannot even be listed leaves the rows for the next gate.
+  if ! all_topics="$("${kt[@]}" --list 2>/dev/null)" || ! all_groups="$("${kg[@]}" --list 2>/dev/null)"; then
+    warn "pipeline reclaim: could not list the topics/groups in ${KAFKA_CONTAINER}; skipped, the next gate retries"
+    return 0
+  fi
+  # And before Kafka, the sink workers. A batch run's worker outlives it -- nothing
+  # stops it, and the orchestrator's reaper is off by default -- and a live worker
+  # recreates the topic it reads the moment that is deleted, and holds its group so
+  # the group delete is refused. A pipeline whose worker would not stop keeps its row
+  # and its Kafka names for the next gate.
+  if ! workers="$(stop_sink_workers_of <<<"${doomed}")"; then
+    warn "pipeline reclaim: could not list the sink workers in ${KAFKA_SINK_CONTAINER}; skipped, the next gate retries"
+    return 0
+  fi
+  removed="$(grep -c '^stopped ' <<<"${workers}" || true)"
+  [[ "${removed}" -gt 0 ]] && log "pipeline reclaim: stopped ${removed} sink worker(s) of those pipelines"
+  stuck="$(grep '^kept ' <<<"${workers}" | cut -c6- || true)"
+  if [[ -n "${stuck}" ]]; then
+    warn "pipeline reclaim: $(grep -c . <<<"${stuck}") sink worker(s) would not stop; their pipelines stay for the next gate"
+    doomed="$(grep -vxF -f <(printf '%s\n' "${stuck}") <<<"${doomed}" || true)"
+    [[ -n "${doomed}" ]] || return 0
+  fi
+  kept8="$(cut -c1-36 <<<"${rows}" | grep -vxF -f <(printf '%s\n' "${doomed}") | cut -c1-8 | sort -u || true)"
+  ids8="$(cut -c1-8 <<<"${doomed}" | sort -u | comm -23 - <(printf '%s\n' "${kept8}") | paste -sd'|' - || true)"
+  shared="$(cut -c1-8 <<<"${doomed}" | sort -u | comm -12 - <(printf '%s\n' "${kept8}") | grep -c . || true)"
+  uuids="$(paste -sd'|' - <<<"${doomed}")"
+  [[ "${shared}" -gt 0 ]] && warn "pipeline reclaim: ${shared} id8(s) are shared with a kept pipeline; their Kafka names stay"
+  if [[ -n "${ids8}" ]]; then
+    # A live connector recreates the topics it writes to, so it goes before them.
+    removed="$(docker exec "${KAFKA_CONNECT_CONTAINER}" bash -lc "
+      n=0
+      for c in \$(curl -s localhost:8083/connectors 2>/dev/null | tr ',[]\"' '\n' | grep -E '^cdc-(${ids8})\$'); do
+        curl -s -X DELETE \"localhost:8083/connectors/\${c}\" >/dev/null 2>&1 && n=\$((n+1))
+      done
+      echo \"\${n}\"" 2>/dev/null || echo 0)"
+    [[ "${removed}" =~ ^[1-9][0-9]*$ ]] && log "pipeline reclaim: removed ${removed} connector(s) of those pipelines"
+    topics="$(grep -E "^(rsync\.)?((schemahistory\.)?cdc-(${ids8})(\..+)?|signals\.(${ids8})|heartbeat\.(rsync\.)?cdc-(${ids8})|pipeline\.(${ids8})\..+)\$" <<<"${all_topics}" || true)"
+    if removed="$(delete_topics_exactly <<<"${topics}")"; then
+      log "pipeline reclaim: deleted ${removed} topic(s) of those pipelines"
+    else
+      warn "pipeline reclaim: a topic delete failed after ${removed}/$(grep -c . <<<"${topics}") topic(s); the rest are orphans now"
+    fi
+  fi
+  alts="cdc-(schema-changes|table-stats)-(${uuids})"
+  [[ -n "${ids8}" ]] && alts="sink-(${ids8})(-.+)?|cdc-(${ids8})-signal|${alts}"
+  groups="$(grep -E "^(rsync\.)?(${alts})\$" <<<"${all_groups}" || true)"
+  if [[ -n "${groups}" ]]; then
+    while IFS= read -r g; do args+=(--group "${g}"); done <<<"${groups}"
+    # One call for all of them. A group with live members refuses the delete,
+    # so count what a fresh listing no longer shows rather than trust the exit.
+    "${kg[@]}" --delete "${args[@]}" >/dev/null 2>&1 </dev/null || true
+    if all_groups="$("${kg[@]}" --list 2>/dev/null)"; then
+      left="$(grep -Fxc -f <(printf '%s\n' "${groups}") <<<"${all_groups}" || true)"
+      log "pipeline reclaim: deleted $(( $(grep -c . <<<"${groups}") - left )) consumer group(s) of those pipelines"
+      [[ "${left}" -gt 0 ]] && warn "pipeline reclaim: ${left} consumer group(s) still have members; they are orphans now"
+    else
+      warn "pipeline reclaim: asked Kafka to delete $(grep -c . <<<"${groups}") consumer group(s); could not list them again to confirm"
+    fi
+  fi
+
+  if ! gone="$("${psql[@]}" "WITH del AS (DELETE FROM pipelines WHERE id = ANY('{$(paste -sd, - <<<"${doomed}")}'::uuid[]) RETURNING id) SELECT count(*) FROM del" 2>/dev/null)"; then
+    warn "pipeline reclaim: deleting $(grep -c . <<<"${doomed}") leftover e2e pipeline row(s) failed; the next gate retries"
+    return 0
+  fi
+  log "pipeline reclaim: deleted $(tr -d '[:space:]' <<<"${gone}") leftover e2e pipeline row(s)"
 }
 
 # --- DB hygiene: reclaim leftover e2e/gate CONNECTION ROWS ------------------
@@ -384,17 +579,30 @@ fi
 
 on_exit() {
   local rc=$?
+  # Every teardown below reaps state the stack-lock OWNER is using: its e2e DB
+  # fixtures, its connection rows, its connectors and topics. So none of it runs
+  # unless this gate holds the lock. An exit after a failed acquire (another gate
+  # or staging owns the stack) used to `down -v` that owner's fixtures and delete
+  # its connection rows mid-run -- the very clobber the lock exists to prevent.
+  if [[ "$(cat "${STACK_LOCK_DIR}/pid" 2>/dev/null || true)" != "$$" ]]; then
+    log "Not the stack-lock owner: leaving the e2e fixtures, rows, connectors and topics alone"
   # RAM hygiene: remove ONLY the rsync-ai-e2e fixtures — never the shared
   # rsync-ai stack, whose volumes the self-hosted runner relies on (see the
   # ci.yml "we do NOT down -v" note). The fixtures are recreated with
   # --renew-anon-volumes every run, so this loses nothing. E2E_KEEP=1 leaves
   # them up for post-run inspection / fast local iteration.
-  if [[ "${E2E_KEEP:-}" != "1" ]]; then
+  elif [[ "${E2E_KEEP:-}" != "1" ]]; then
     log "Tearing down e2e DB fixtures (set E2E_KEEP=1 to keep them)"
     dc_e2e down -v >/dev/null 2>&1 || warn "e2e fixture teardown returned non-zero"
     # Also reap the connection ROWS the tests wrote into the shared pipeline_db
     # (the e2e DB fixtures above are separate Docker containers). Best-effort.
     reclaim_e2e_connection_rows
+    # The pipelines this run's tests created, and their Kafka names.
+    reclaim_e2e_pipelines
+    # And the Kafka topics this run's CDC tests created, connectors first (a
+    # live connector recreates its topics).
+    reclaim_e2e_connectors
+    reclaim_e2e_topics
   fi
   release_stack_lock
   exit $rc
@@ -939,10 +1147,16 @@ fi
 # bloated. Each leftover connector pins connect heap + a live source CDC reader
 # on the memory-constrained box. Best-effort; see reclaim_e2e_connectors().
 reclaim_e2e_connectors
+# Then the topics those connectors (and any run killed before its on_exit) left
+# in Kafka. Best-effort; see reclaim_e2e_topics().
+reclaim_e2e_topics
 # Same idea for the connections TABLE: clear any rows older runs left in the
 # shared pipeline_db (e.g. a crashed run that skipped on_exit teardown) so every
 # gate -- and any manual staging session after it -- starts on a clean list.
 reclaim_e2e_connection_rows
+# And the pipelines older runs' tests left, with their Kafka topics and groups.
+# Best-effort; see reclaim_e2e_pipelines().
+reclaim_e2e_pipelines
 
 # Allow GATE_ONLY="t1 t2" to scope a run (e.g. when vetting a single test).
 if [[ -n "${GATE_ONLY:-}" ]]; then

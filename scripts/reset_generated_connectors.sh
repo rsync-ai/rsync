@@ -21,7 +21,7 @@ log "Stopping generated connector containers (label rsync-ai.mcp=true)…"
 docker ps --filter "label=rsync-ai.mcp=true" --format "{{.Names}}" | xargs -r docker stop >/dev/null 2>&1 || true
 
 log "Removing generated connector containers (label rsync-ai.mcp=true)…"
-docker ps -a --filter "label=rsync-ai.mcp=true" --format "{{.Names}}" | xargs -r docker rm >/dev/null 2>&1 || true
+docker ps -a --filter "label=rsync-ai.mcp=true" --format "{{.Names}}" | xargs -r docker rm -v >/dev/null 2>&1 || true
 
 log "Deleting generated connector directories (shared/mcp-connectors/* with latest.json)…"
 find shared/mcp-connectors -mindepth 1 -maxdepth 1 -type d -exec test -f '{}/latest.json' \; -print0 | xargs -0 -r rm -rf

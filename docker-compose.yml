@@ -870,6 +870,75 @@ services:
         echo "✅ minio-init: bucket + lifecycle ready"
     restart: "no"
 
+  # The blob lane's staging store: a second MinIO on the connector network ONLY.
+  # Blob passthrough has the SOURCE connector stage each object here and the
+  # DESTINATION connector fetch it, and connectors join only rsync-ai-mcp
+  # (SEC-M-06). `minio` above is on `default` only, so a connector cannot resolve
+  # it, and bridging it would hand every connector the store that holds every
+  # pipeline's staged claim-check rows. This one holds only staged blobs, under
+  # its own login. Keep ":9000" in its URL: the connectors' staging client uses
+  # path-style addressing only for an endpoint with "minio", "localhost" or
+  # ":9000" in it (base_connector.py _get_staging_client).
+  # KI-BLOB-LANE-STAGING-UNREACHABLE-FROM-CONNECTORS.
+  blob-staging:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    container_name: ${STACK_PREFIX:-rsync-ai}-blob-staging
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${BLOB_STAGING_ACCESS_KEY:-${MINIO_ACCESS_KEY_ID:-minioadmin}}
+      MINIO_ROOT_PASSWORD: ${BLOB_STAGING_SECRET_KEY:-${MINIO_SECRET_ACCESS_KEY:-minioadmin}}
+    command: server /data
+    volumes:
+      - blob_staging_data:/data
+    networks:
+      - rsync-ai-mcp
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Bucket + expiry for blob-staging. Nothing deletes a staged blob per message:
+  # blobs are content-addressed and shared between messages, so this rule is the
+  # only cleanup. Same TTL floor as minio-lifecycle-init, for the same reason.
+  blob-staging-init:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    container_name: ${STACK_PREFIX:-rsync-ai}-blob-staging-init
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    depends_on:
+      blob-staging:
+        condition: service_healthy
+    environment:
+      - MINIO_BUCKET=${MINIO_BUCKET:-pipeline-data}
+      - MINIO_PREFIX=${MINIO_PREFIX:-staging}
+      - BLOB_STAGING_ACCESS_KEY=${BLOB_STAGING_ACCESS_KEY:-${MINIO_ACCESS_KEY_ID:-minioadmin}}
+      - BLOB_STAGING_SECRET_KEY=${BLOB_STAGING_SECRET_KEY:-${MINIO_SECRET_ACCESS_KEY:-minioadmin}}
+      - MINIO_STAGING_EXPIRE_DAYS=${MINIO_STAGING_EXPIRE_DAYS:-7}
+    networks:
+      - rsync-ai-mcp
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until mc alias set local http://blob-staging:9000 "$$BLOB_STAGING_ACCESS_KEY" "$$BLOB_STAGING_SECRET_KEY"; do
+          echo "waiting for blob-staging..."; sleep 2;
+        done
+        mc mb --ignore-existing "local/$$MINIO_BUCKET"
+        mc ilm rule add "local/$$MINIO_BUCKET" --expire-days "$$MINIO_STAGING_EXPIRE_DAYS" --prefix "$$MINIO_PREFIX/" \
+          || mc ilm add --expiry-days "$$MINIO_STAGING_EXPIRE_DAYS" --prefix "$$MINIO_PREFIX/" "local/$$MINIO_BUCKET" \
+          || echo "WARN: could not set the blob staging expiry rule"
+        echo "blob-staging-init: bucket + lifecycle ready"
+    restart: "no"
+
   # Internal: MinIO staging MCP (claim-check upload/read/delete)
   minio-mcp:
     build:
@@ -1181,14 +1250,17 @@ services:
       # an explicit empty value means "disable" (keep pre-prefix topic names) and
       # `:-` would silently turn that back into the default.
       KAFKA_TOPIC_PREFIX: "${KAFKA_TOPIC_PREFIX-rsync.}"
-      # Claim-check / blob-passthrough staging (universal-blob-passthrough plan §3):
-      # the executor's blob lane hands these MinIO creds to the source connector (to
-      # stage object bytes) and, via the sink message, to the destination connector
-      # (to fetch them). Same MinIO the minio-mcp + sink already use; buildStagingConfig
-      # falls back to these exact defaults if unset.
-      MINIO_ENDPOINT_URL: "${MINIO_ENDPOINT_URL:-http://rsync-ai-minio:9000}"
-      MINIO_ACCESS_KEY_ID: "${MINIO_ACCESS_KEY_ID:-minioadmin}"
-      MINIO_SECRET_ACCESS_KEY: "${MINIO_SECRET_ACCESS_KEY:-minioadmin}"
+      # Blob-passthrough staging (universal-blob-passthrough plan §3): the
+      # executor's blob lane hands these to the source connector (to stage object
+      # bytes) and, via the sink message, to the destination connector (to fetch
+      # them). blob-staging, NOT minio: connectors join only rsync-ai-mcp and
+      # cannot resolve minio (KI-BLOB-LANE-STAGING-UNREACHABLE-FROM-CONNECTORS).
+      # The lane reads no other MinIO credential, so the orchestrator holds none.
+      # MINIO_BUCKET/PREFIX stay: the staged blob's bucket must be in the sink's
+      # allow-list and its prefix under blob-staging-init's expiry rule.
+      BLOB_STAGING_ENDPOINT_URL: "${BLOB_STAGING_ENDPOINT_URL:-http://blob-staging:9000}"
+      BLOB_STAGING_ACCESS_KEY_ID: "${BLOB_STAGING_ACCESS_KEY:-${MINIO_ACCESS_KEY_ID:-minioadmin}}"
+      BLOB_STAGING_SECRET_ACCESS_KEY: "${BLOB_STAGING_SECRET_KEY:-${MINIO_SECRET_ACCESS_KEY:-minioadmin}}"
       MINIO_REGION: "${MINIO_REGION:-us-east-1}"
       MINIO_BUCKET: "${MINIO_BUCKET:-pipeline-data}"
       MINIO_PREFIX: "${MINIO_PREFIX:-staging}"
@@ -1205,6 +1277,9 @@ services:
       # OFF everywhere (operational-safety gate mirroring CDC_RECOVERY_ENABLED, NOT an
       # edition gate — preserves OSS/cloud parity). Arm by setting the env var to true.
       CDC_SINK_AUTORESTART_ENABLED: "${CDC_SINK_AUTORESTART_ENABLED:-false}"
+      # Orphan sink-worker reaper (KI-CDC-SINK-WORKER-NO-REAPER): off | dry_run | enforce.
+      # Default OFF, same op-safety gate; stops only workers whose pipeline is deleted or stopped.
+      SINK_WORKER_REAPER_MODE: "${SINK_WORKER_REAPER_MODE:-off}"
       # Self-healing schema-drift detector (P0/P1): the drift-detect -> approve loop.
       # Default OFF. Flip to true to activate the executor's baseline+diff+emit
       # (schema_drift.go) AND the healer's schema-change consumer (StartSchemaOnly in
@@ -1927,6 +2002,7 @@ volumes:
   kafka_data:
   redis_data:
   minio_data:
+  blob_staging_data:
   # Debezium source secrets: written by debezium-mcp, read-only-mounted by
   # kafka-connect, so credentials resolve via FileConfigProvider instead of being
   # stored plaintext in the Kafka config topic.

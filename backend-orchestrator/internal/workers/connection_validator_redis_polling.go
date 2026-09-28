@@ -76,11 +76,6 @@ func (w *ConnectionValidatorWorker) pollAndProcessRequests() error {
 }
 
 func (w *ConnectionValidatorWorker) processCorrelationRequest(req *correlation.PendingRequest) {
-	ctx, cancel := correlationWorkContext(w.ctx, "connection_validator")
-	defer cancel()
-	deliverCtx, cancelDeliver := correlationDeliveryContext()
-	defer cancelDeliver()
-
 	logger := log.WithFields(log.Fields{
 		"correlation_id": req.CorrelationID,
 		"request_type":   req.RequestType,
@@ -109,23 +104,15 @@ func (w *ConnectionValidatorWorker) processCorrelationRequest(req *correlation.P
 	}
 
 	// Use main ProcessTask() method from connection_validator.go
-	result, err := w.ProcessTask(ctx, task)
-	if err != nil {
-		logger.WithError(err).Warn("Task processing failed")
-		result.Status = "failed"
-		result.Error = err.Error()
-	}
-
-	logger.Info("✅ Task processing completed")
-
-	// Write response to Redis
-	if routeErr := RouteResult(deliverCtx, task, result); routeErr != nil {
-		logger.WithError(routeErr).Error("Failed to route response")
-	}
-
-	// Delete request from Redis after processing
-	if delErr := w.correlationClient.DeleteRequest(deliverCtx, req.CorrelationID, "connection_validator"); delErr != nil {
-		logger.WithError(delErr).Warn("Failed to delete request from Redis")
-	}
+	// Route the result and delete the request once the work returns (fresh delivery context).
+	runCorrelationRequest(w.ctx, "connection_validator", w.correlationClient, task, logger, func(ctx context.Context) TaskResult {
+		result, err := w.ProcessTask(ctx, task)
+		if err != nil {
+			logger.WithError(err).Warn("Task processing failed")
+			result.Status = "failed"
+			result.Error = err.Error()
+		}
+		logger.Info("✅ Task processing completed")
+		return result
+	})
 }
-

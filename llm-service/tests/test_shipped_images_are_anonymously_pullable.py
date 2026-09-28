@@ -51,12 +51,14 @@ distroless (no shell for the `sh -c` jobs) and `cgr.dev/chainguard/mc` is not
 anonymous, which is why both `mc` keys below map to the server image.
 
 A GUARD IS ONLY WORTH ITS REACH. This file runs from ci.yml's
-`llm-service-unit` job, gated on the `llm` paths filter. The subjects here are
-not only compose files: five of them are shell and Python e2e scripts that
-`docker run` the `mc` client directly, and the `llm` filter did not name
-`e2e/**` or `tests/**` when this was written. The last test below is what keeps
-that true, and adding those two patterns to the filter is what made it pass --
-a skipped job and a passing one look identical in a PR's check list.
+`llm-service-unit` job, gated on the `llm` paths filter, AND from doc-links.yml's
+Doc guards job, which has no paths filter. The subjects here are not only compose
+files: five of them are shell and Python e2e scripts that `docker run` the `mc`
+client directly, and the `llm` filter did not name `e2e/**` or `tests/**` when
+this was written. Others are markdown (CHANGELOG.md, docs/deployment/*.md), which
+no filter may match, because every PR writes a markdown drop-in -- the Doc guards
+job is what reaches those. The last test below is what keeps that true: a skipped
+job and a passing one look identical in a PR's check list.
 """
 
 import fnmatch
@@ -396,6 +398,12 @@ def test_the_ci_filter_covers_every_file_holding_one_of_these_images(subject):
     fnmatch's `*` crosses `/` where picomatch's does not, so this is strictly the
     more permissive of the two: it can never fail a pattern CI would honour.
     """
+    # The census's own reading of the unfiltered job: it asserts that job runs on
+    # every PR (no paths filter, only the fork guard) before counting it as coverage.
+    from test_ci_filter_covers_every_guard_subject import _unfiltered_doc_guards
+
+    if os.path.basename(__file__) in _unfiltered_doc_guards():
+        return
     pats = _llm_filter_patterns()
     assert any(fnmatch.fnmatch(subject, p) for p in pats), (
         f"`{subject}` pulls the replacement MinIO image, but no `llm` "
@@ -404,5 +412,7 @@ def test_the_ci_filter_covers_every_file_holding_one_of_these_images(subject):
         f"to a walled name would skip llm-service-unit, and a skipped check "
         f"reads as a passing one.\n"
         f"Add a pattern covering it to the `llm:` filter in "
-        f"{os.path.relpath(CI_FILTERS, REPO_ROOT)}.\nPatterns today: {pats}"
+        f"{os.path.relpath(CI_FILTERS, REPO_ROOT)} -- or, for a markdown subject, "
+        f"keep this guard in doc-links.yml's unfiltered Doc guards job.\n"
+        f"Patterns today: {pats}"
     )

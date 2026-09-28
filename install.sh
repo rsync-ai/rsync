@@ -23,7 +23,7 @@ RSYNC_REPO="${RSYNC_REPO:-rsync-ai/rsync}"
 # compose half and a "last publish" pointer on the image half, so the two halves
 # advance at different rates and a curl-pipe install is not reproducible. A tag
 # takes both halves from the same commit. Pass RSYNC_REF=main to track the branch.
-RSYNC_REF="${RSYNC_REF:-v0.1.6}"
+RSYNC_REF="${RSYNC_REF:-v0.1.7}"
 # The image tag that pairs with RSYNC_REF. Both halves of an install have to name
 # the same code: the compose file is fetched from RSYNC_REF, and the images that
 # compose file starts are pulled at this tag. Left independent they drift, and did
@@ -54,6 +54,9 @@ RSYNC_REF="${RSYNC_REF:-v0.1.6}"
 ref_is_release_tag() {
   [[ "$1" =~ ^v[0-9]+\.[0-9]+\.[0-9]+ ]]
 }
+# Captured before the derivation below fills it in: the checkout mode further
+# down has to know whether the operator NAMED a tag or merely inherited one.
+RSYNC_VERSION_REQUESTED="${RSYNC_VERSION:-}"
 if ref_is_release_tag "${RSYNC_REF}"; then
   RSYNC_VERSION="${RSYNC_VERSION:-${RSYNC_REF#v}}"
 else
@@ -92,6 +95,26 @@ OLLAMA_FILE="docker-compose.ollama.yml"
 # a second exception.
 OLLAMA_REF="${RSYNC_OLLAMA_REF:-main}"
 OLLAMA_RAW_BASE="https://raw.githubusercontent.com/${RSYNC_REPO}/${OLLAMA_REF}"
+# Where the first-party images are pulled from. The quickstart names each one as
+# ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/<name>, so a mirror, an air-gapped
+# registry or a pre-release build is one variable, not an edit to fifteen image
+# lines. Same name and meaning as install-k8s.sh's. Written to the .env, so a
+# later hand-run `docker compose` pulls from the same place; the REQUESTED copy
+# is what a re-run uses to tell "change it" from "leave the recorded one alone".
+RSYNC_IMAGE_REGISTRY_REQUESTED="${RSYNC_IMAGE_REGISTRY:-}"
+RSYNC_IMAGE_REGISTRY="${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}"
+# Install from a local checkout instead of downloading: a directory holding
+# docker-compose.quickstart.yml and its overlays -- a clone of this repository,
+# or of a fork. fetch() then copies each compose file from there rather than
+# downloading it from RSYNC_REPO@RSYNC_REF, so what is installed is exactly the
+# checkout, including commits no release tag carries yet.
+#
+# It needs RSYNC_VERSION named explicitly (main() refuses otherwise). The images
+# are still pulled, and a checkout cannot say which tag its code was published
+# under; the default derived from RSYNC_REF names the last release, which is the
+# compose-from-one-commit, images-from-another pairing the RSYNC_REF comment at
+# the top of this file exists to prevent.
+RSYNC_COMPOSE_DIR="${RSYNC_COMPOSE_DIR:-}"
 COMPOSE_ARGS=()
 # Which optional compose profiles this install activates. `cdc` is in the
 # default because the change-data-capture services are not an add-on: pick a
@@ -739,6 +762,10 @@ prompt_env() {
   # assignment at this level, the same failure aborts.
   MINIO_ACCESS_KEY=$(generate_secret)
   MINIO_SECRET_KEY=$(generate_secret)
+  # The blob-passthrough staging store's own login. Every storage connector on a
+  # blob run is handed it, so it is deliberately not MinIO's.
+  BLOB_STAGING_ACCESS_KEY=$(generate_secret)
+  BLOB_STAGING_SECRET_KEY=$(generate_secret)
 
   info "Secrets generated"
 }
@@ -815,6 +842,9 @@ AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-}
 # ── Object Storage (internal MinIO) ───────────────────────────────────────────
 MINIO_ACCESS_KEY=${MINIO_ACCESS_KEY}
 MINIO_SECRET_KEY=${MINIO_SECRET_KEY}
+# Blob-passthrough staging store (blob-staging), a separate MinIO the connectors reach
+BLOB_STAGING_ACCESS_KEY=${BLOB_STAGING_ACCESS_KEY}
+BLOB_STAGING_SECRET_KEY=${BLOB_STAGING_SECRET_KEY}
 
 # ── OAuth (optional — leave blank to use email login only) ────────────────────
 GITHUB_CLIENT_ID=
@@ -844,12 +874,16 @@ SMTP_FROM=
 # the images match the compose file this .env sits next to; written out rather
 # than left empty so the pairing survives re-running compose by hand later.
 RSYNC_VERSION=${RSYNC_VERSION}
+# Where those images come from. A mirror or a private registry goes here, and
+# moves every first-party image at once; the tag above still applies.
+RSYNC_IMAGE_REGISTRY=${RSYNC_IMAGE_REGISTRY}
 # The ref the line above was derived from, recorded so a LATER run can tell an
 # upgrade from an ordinary re-run. Same ref, and that run touches nothing here;
 # a different one, and it re-downloads the compose files and rewrites the
 # version above to match. Delete this line and the next run treats the install
-# as unrecorded and refreshes both halves once.
-RSYNC_INSTALLED_REF=${RSYNC_REF}
+# as unrecorded and refreshes both halves once. A checkout install records
+# local:<dir> here, which no release ref equals.
+RSYNC_INSTALLED_REF=$(installed_ref)
 EOF
 
   # A SECOND heredoc, and quoted: <<'EOF'. Everything above needs interpolation
@@ -996,6 +1030,20 @@ EOF
 
 fetch() {
   local url="$1" dest="$2"
+  # Checkout mode: the same file, by name, from the local directory. Every
+  # compose file this script installs goes through here, so the mode cannot
+  # cover some of them and leave the rest downloading from a release tag.
+  if [[ -n "$RSYNC_COMPOSE_DIR" ]]; then
+    local src="${RSYNC_COMPOSE_DIR}/${url##*/}"
+    if [[ ! -s "$src" ]]; then
+      error "${src} is missing or empty."
+      echo "  RSYNC_COMPOSE_DIR must be a checkout holding every compose file this installer uses." >&2
+      exit 1
+    fi
+    # An install dir that IS the checkout: cp would refuse "same file" and stop the install.
+    [[ "$src" -ef "$dest" ]] || cp "$src" "$dest"
+    return 0
+  fi
   if command -v curl &>/dev/null; then
     curl -fsSL "$url" -o "$dest"
   elif command -v wget &>/dev/null; then
@@ -1017,14 +1065,30 @@ fetch() {
   fi
 }
 
+# What RSYNC_INSTALLED_REF records. A checkout is not a ref, and must never
+# compare equal to one: recorded as the release tag it happened to default to, a
+# later plain `curl | bash` of that same tag would read "same ref, nothing to
+# fetch" and leave the checkout's compose file running against release images.
+installed_ref() {
+  if [[ -n "$RSYNC_COMPOSE_DIR" ]]; then
+    echo "local:${RSYNC_COMPOSE_DIR}"
+  else
+    echo "${RSYNC_REF}"
+  fi
+}
+
 download_compose() {
-  section "Downloading rsync.ai"
+  if [[ -n "$RSYNC_COMPOSE_DIR" ]]; then
+    section "Copying rsync.ai compose files from ${RSYNC_COMPOSE_DIR}"
+  else
+    section "Downloading rsync.ai"
+  fi
   mkdir -p "$INSTALL_DIR"
   fetch "$COMPOSE_URL"                  "${INSTALL_DIR}/${COMPOSE_FILE}"
   fetch "${RAW_BASE}/${BYO_PG_FILE}"    "${INSTALL_DIR}/${BYO_PG_FILE}"
   fetch "${RAW_BASE}/${BYO_KAFKA_FILE}" "${INSTALL_DIR}/${BYO_KAFKA_FILE}"
   fetch "${OLLAMA_RAW_BASE}/${OLLAMA_FILE}" "${INSTALL_DIR}/${OLLAMA_FILE}"
-  info "compose files downloaded (quickstart + both bring-your-own overlays + bundled LLM)"
+  info "compose files in place (quickstart + both bring-your-own overlays + bundled LLM)"
 }
 
 # The `-f` set is a computed thing, and until now it was computed only in here.
@@ -1155,13 +1219,15 @@ build_compose_args() {
 #                            data file carries no password
 #   MINIO_ACCESS_KEY/SECRET  MinIO's root login, read at start by the server and
 #                            by every client from this same .env
+#   BLOB_STAGING_ACCESS_KEY/SECRET_KEY  the same, for blob-staging; it holds only
+#                            staged blobs that expire in 7 days
 # Deliberately NOT in the list, and reported instead:
 #   POSTGRES_PASSWORD  the database volume was created with the old one; a new
 #                      value locks every service out of the existing data (and
 #                      for bring-your-own Postgres it is someone else's password)
 #   ENCRYPTION_KEY     every saved connection credential is encrypted under the
 #                      old one; a new value makes all of them unreadable
-ENV_BACKFILLABLE_SECRETS="INTERNAL_SERVICE_SECRET JWT_SECRET REDIS_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY"
+ENV_BACKFILLABLE_SECRETS="INTERNAL_SERVICE_SECRET JWT_SECRET REDIS_PASSWORD MINIO_ACCESS_KEY MINIO_SECRET_KEY BLOB_STAGING_ACCESS_KEY BLOB_STAGING_SECRET_KEY"
 
 # Every ${VAR:?} in the -f files this install runs with, one per line. The same
 # extraction as scripts/check-env-templates.sh required_vars(). A static grep is
@@ -1773,12 +1839,38 @@ set_env_value() {
   mv "$tmp" "$file"
 }
 
+# Checkout mode's preconditions, before anything is written: an absolute path
+# (it is recorded in the .env and compared on every later run, so `.` from one
+# directory must not differ from `.` from another), a directory that really holds
+# the quickstart, and an image tag the operator chose rather than inherited.
+check_compose_dir() {
+  [[ -n "$RSYNC_COMPOSE_DIR" ]] || return 0
+  if [[ ! -d "$RSYNC_COMPOSE_DIR" ]]; then
+    error "RSYNC_COMPOSE_DIR=${RSYNC_COMPOSE_DIR} is not a directory."
+    exit 1
+  fi
+  RSYNC_COMPOSE_DIR="$(cd "$RSYNC_COMPOSE_DIR" && pwd -P)"
+  if [[ ! -s "${RSYNC_COMPOSE_DIR}/${COMPOSE_FILE}" ]]; then
+    error "${RSYNC_COMPOSE_DIR} has no ${COMPOSE_FILE}; RSYNC_COMPOSE_DIR must be a checkout of this repository."
+    exit 1
+  fi
+  if [[ -z "$RSYNC_VERSION_REQUESTED" ]]; then
+    error "RSYNC_COMPOSE_DIR needs RSYNC_VERSION: the tag your checkout's images were pushed under."
+    echo "  Without it the images default to ${RSYNC_VERSION}, the release named by RSYNC_REF," >&2
+    echo "  and would run against a compose file from a different commit." >&2
+    echo "    RSYNC_COMPOSE_DIR=${RSYNC_COMPOSE_DIR} RSYNC_VERSION=<tag> [RSYNC_IMAGE_REGISTRY=<registry>] bash install.sh" >&2
+    exit 1
+  fi
+  info "Installing from checkout ${RSYNC_COMPOSE_DIR}: images ${RSYNC_IMAGE_REGISTRY}/*:${RSYNC_VERSION}"
+}
+
 main() {
   setup_tty
   banner
   section "Pre-flight checks"
   check_docker
   check_ram
+  check_compose_dir
   # Documented by earlier versions of this script as a recognised variable, so
   # an automated install may still pass it. Say it does nothing rather than
   # accept it silently.
@@ -1833,6 +1925,10 @@ main() {
     # re-run adopts the requested ref and records it for next time.
     local recorded_ref
     recorded_ref="$(env_value RSYNC_INSTALLED_REF)"
+    # A registry named on this run replaces the recorded one; none named leaves it
+    # alone, so an ordinary re-run of a mirrored install keeps its mirror. One
+    # line, not an if-block: this block ends at the first `fi` at this depth.
+    [[ -z "$RSYNC_IMAGE_REGISTRY_REQUESTED" ]] || set_env_value RSYNC_IMAGE_REGISTRY "${RSYNC_IMAGE_REGISTRY}"
     # Two questions, not one: has the ref CHANGED, and can the ref MOVE. The
     # second was missing, and it is the only one a branch-tracking install can
     # answer. A release tag is fixed, so recorded == requested genuinely means
@@ -1844,8 +1940,13 @@ main() {
     # hours after the first install re-read that first file and died pulling an
     # image the branch had already moved off -- with the fix for that image
     # sitting in main, fetched by nothing.
-    if [[ "$recorded_ref" != "$RSYNC_REF" ]] || ! ref_is_release_tag "$RSYNC_REF"; then
-      if [[ "$recorded_ref" == "$RSYNC_REF" ]]; then
+    # A checkout moves like a branch does -- it is whatever is on disk now -- so
+    # it refreshes on every run, for the same reason `main` does.
+    if [[ "$recorded_ref" != "$(installed_ref)" ]] || [[ -n "$RSYNC_COMPOSE_DIR" ]] \
+       || ! ref_is_release_tag "$RSYNC_REF"; then
+      if [[ -n "$RSYNC_COMPOSE_DIR" ]]; then
+        info "Installing from checkout ${RSYNC_COMPOSE_DIR} -- re-copying compose files and setting the image tag."
+      elif [[ "$recorded_ref" == "$RSYNC_REF" ]]; then
         info "Tracking ${RSYNC_REF}, which moves -- re-fetching compose files in case it has."
       elif [[ -n "$recorded_ref" ]]; then
         info "Installed at ref ${recorded_ref}, ${RSYNC_REF} requested -- refreshing compose files and image tag."
@@ -1883,7 +1984,7 @@ main() {
       # from the .env on disk -- never from this script's environment, which is
       # why deriving it correctly at the top was not enough on this path.
       set_env_value RSYNC_VERSION "${RSYNC_VERSION}"
-      set_env_value RSYNC_INSTALLED_REF "${RSYNC_REF}"
+      set_env_value RSYNC_INSTALLED_REF "$(installed_ref)"
     fi
   else
     prompt_env

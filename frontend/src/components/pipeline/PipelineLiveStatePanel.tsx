@@ -13,6 +13,8 @@ import { authFetch, authFetchOrThrow } from "@/lib/api/auth-fetch"
 import { truncatedTableTotal } from "@/lib/api/connections"
 import { classifyError } from "@/lib/utils/error-handling"
 import { usePipelineRuntime } from "@/lib/hooks/usePipelineRuntime"
+import { onPipelineRefresh } from "@/lib/events/pipelineRefresh"
+import { PANEL_STATE_RETRY_MS, panelStatePollMs } from "@/lib/pipeline/panelStatePoll"
 import { StageTimeline } from "@/components/pipeline/StageTimeline"
 import { stageDurationMs } from "@/components/pipeline/dagHelpers"
 import { formatDuration, stageTiming, type StageTransitionPoint } from "@/lib/duration"
@@ -358,6 +360,20 @@ export function buildAgenticStagesFromEvents(
     agg.progress = 100
   }
 
+  // A stage before the active one is completed only on evidence: its own
+  // STAGE_COMPLETED (already terminal) or the execution plan saying so. Position
+  // alone is not evidence — marking every earlier stage done painted a stage whose
+  // completion event was dropped green at 100 %
+  // (KI-LIVE-STATE-STAGES-COMPLETED-BY-POSITION). One that started with no such
+  // evidence reads "unknown"; one that never reported stays pending, and
+  // passedOverAgentStages drops it below.
+  const planSaysCompleted = new Set(
+    (state?.execution_plan?.stages || [])
+      .filter((s) => ["completed", "complete"].includes(String(s?.status || "").toLowerCase()))
+      .map((s) => String(s?.id || "").trim())
+      .filter(Boolean)
+  )
+
   const inferLinearStatuses = (activeKey: string, activeStatus: "waiting" | "failed") => {
     const idx = AGENT_STAGE_ORDER.indexOf(activeKey as (typeof AGENT_STAGE_ORDER)[number])
     if (idx < 0) return
@@ -371,7 +387,14 @@ export function buildAgenticStagesFromEvents(
       // Keep explicitly terminal states from events, except we force the activeKey below.
       const terminal = agg.status === "completed" || agg.status === "failed" || agg.status === "cancelled"
       if (i < idx) {
-        if (!terminal) setCompleted(agg)
+        if (terminal) continue
+        if (planSaysCompleted.has(key)) {
+          setCompleted(agg)
+        } else if (agg.status !== "pending") {
+          agg.status = "unknown"
+          agg.progress = undefined
+          agg.completedAt = undefined
+        }
         continue
       }
       if (i === idx) {
@@ -900,8 +923,20 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
     }
   }, [pipelineId, fetchState])
 
-  // Poll while processing / waiting. Status-aware interval: keep a fast cadence
-  // while actively processing, back off for the slower waiting/pending states.
+  // Resume, Stop, Reload and Pause announce themselves on the refresh bus. The
+  // panel did not listen, so after Stop → Resume it kept the old execution id
+  // and its "Failed" until a hard reload (U-18).
+  useEffect(() => {
+    if (!pipelineId) return
+    return onPipelineRefresh((pid) => {
+      if (pid !== pipelineId) return
+      void fetchState()
+      void fetchEvents()
+    })
+  }, [pipelineId, fetchState, fetchEvents])
+
+  // Poll while the run is live; panelStatePollMs holds the per-status cadence
+  // (including "running", a streaming pipeline's steady state).
   useEffect(() => {
     const status = state?.status
     if (!status) {
@@ -913,11 +948,11 @@ export function PipelineLiveStatePanel(props: { pipelineId: string }) {
         // A hidden tab skips its reads (#13); the next visible tick reads.
         if (document.visibilityState === "hidden") return
         void fetchState()
-      }, 5000)
+      }, PANEL_STATE_RETRY_MS)
       return () => clearInterval(retry)
     }
-    if (!["processing", "waiting_for_user", "pending"].includes(status)) return
-    const pollIntervalMs = status === "processing" ? 2500 : 5000
+    const pollIntervalMs = panelStatePollMs(status)
+    if (pollIntervalMs === null) return
     const t = setInterval(() => {
       if (document.visibilityState === "hidden") return
       void fetchState()

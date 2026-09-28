@@ -202,6 +202,7 @@ func runHITLPark(t *testing.T, sc hitlParkScenario, setup func(env *testsuite.Te
 		"CleanupPartialDataActivityV2":        h.cleanup,
 		"StateUpdateActivity":                 h.stateUpdate,
 		"UpdatePipelineStatusActivity":        h.pipelineStatus,
+		"FinalizeCompletedRunActivity":        finalizeVia(h.pipelineStatus),
 		"EmitDomainEventActivity":             h.domainEvent,
 	} {
 		env.RegisterActivityWithOptions(fn, activity.RegisterOptions{Name: name})

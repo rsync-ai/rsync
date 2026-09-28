@@ -357,7 +357,7 @@ if [[ -n "$E2E_LEFT" ]]; then
   fi
   say "--fix: reclaiming rsync-ai-e2e leftovers (frees the 'minio' alias)"
   # shellcheck disable=SC2086
-  docker rm -f $E2E_LEFT >/dev/null 2>&1 || true
+  docker rm -fv $E2E_LEFT >/dev/null 2>&1 || true
   if [[ -z "$(e2e_leftovers)" ]]; then
     ok "e2e leftovers reclaimed — 'minio' now resolves to a single store."
   else
@@ -395,7 +395,7 @@ handle_stray_postgres() {
     printf '\n\033[31m🛑 stray local postgres — staging is NOT safe to test.\033[0m\n' >&2
     echo "   A bare 'docker compose up' (no staging -f/--env-file) starts it and" >&2
     echo "   silently rewires services to local pipeline_db. Re-run with --fix," >&2
-    echo "   or remove it: docker rm -f $stray" >&2
+    echo "   or remove it: docker rm -fv $stray" >&2
     return 1
   fi
   # Only safe once nothing resolves the local `postgres` host any more.
@@ -409,8 +409,8 @@ handle_stray_postgres() {
   done
   [[ -n "$refs" ]] && die "stray postgres still referenced by:$refs — heal those first, then re-run --fix."
   say "--fix: removing stray local postgres container ($stray)"
-  docker rm -f "$stray" >/dev/null 2>&1 || true
-  [[ -z "$(stray_postgres || true)" ]] || die "stray postgres persists after 'docker rm -f' — remove it manually."
+  docker rm -fv "$stray" >/dev/null 2>&1 || true
+  [[ -z "$(stray_postgres || true)" ]] || die "stray postgres persists after 'docker rm -fv' — remove it manually."
   ok "stray local postgres removed."
   return 0
 }

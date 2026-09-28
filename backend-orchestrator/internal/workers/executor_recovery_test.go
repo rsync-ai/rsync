@@ -24,7 +24,8 @@ func TestSuggestRecoveryActionCDCProvisioning(t *testing.T) {
 		name string
 		msg  string
 	}{
-		// internal/agents/executor/executor.go:2732 (and 4 sibling sites)
+		// No longer emitted: the executor stopped refusing keyless CDC tables on
+		// 2026-09-27. Kept because runs recorded before then still carry it.
 		{"missing primary key", "CDC requires PRIMARY KEY for DB destinations; missing PK on: public.events"},
 		// internal/cdc/{postgresql,mysql,sqlserver,oracle}.go PK validators
 		{"table absent from postgres source", "table not found in source postgresql: public.driverb_big"},

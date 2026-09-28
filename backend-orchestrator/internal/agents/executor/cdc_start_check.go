@@ -12,6 +12,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 
+	"github.com/rsync-ai/backend-orchestrator/internal/cdcsnapshot"
 	"github.com/rsync-ai/backend-orchestrator/pkg/llmscrub"
 )
 
@@ -175,6 +176,15 @@ func restartFailedConnectorTasks(ctx context.Context, statusURL string) error {
 // "" when the connector held RUNNING for the settle period or no verdict was
 // reached inside the window (the pre-check behaviour: proceed).
 func verifyCDCConnectorStarted(ctx context.Context, statusURL string, alreadyRunning bool) string {
+	reason, _ := checkCDCConnectorStarted(ctx, statusURL, alreadyRunning)
+	return reason
+}
+
+// checkCDCConnectorStarted is verifyCDCConnectorStarted plus the RUNNING streak
+// that passed the check. The proof is zero unless the check passed on a streak
+// (not on a window timeout or a cancelled context): only a watched streak may
+// stand in for the snapshot dispatcher's own ReadyStable wait.
+func checkCDCConnectorStarted(ctx context.Context, statusURL string, alreadyRunning bool) (string, cdcsnapshot.RunningProof) {
 	start := time.Now()
 	deadline := start.Add(cdcStartCheckWindow)
 	var runningSince time.Time
@@ -193,13 +203,13 @@ func verifyCDCConnectorStarted(ctx context.Context, statusURL string, alreadyRun
 						break
 					}
 				}
-				return reason
+				return reason, cdcsnapshot.RunningProof{}
 			case cdcStartRunning:
 				if runningSince.IsZero() {
 					runningSince = time.Now()
 				}
 				if time.Since(runningSince) >= cdcStartCheckSettle {
-					return ""
+					return "", cdcsnapshot.RunningProof{Since: runningSince, At: time.Now()}
 				}
 			default:
 				runningSince = time.Time{}
@@ -212,11 +222,11 @@ func verifyCDCConnectorStarted(ctx context.Context, statusURL string, alreadyRun
 				"status_url": statusURL,
 				"waited":     time.Since(start).Round(time.Second).String(),
 			}).Warn("CDC start check: no verdict from Kafka Connect inside the window; continuing (the dependency probe keeps watching the connector)")
-			return ""
+			return "", cdcsnapshot.RunningProof{}
 		}
 		select {
 		case <-ctx.Done():
-			return ""
+			return "", cdcsnapshot.RunningProof{}
 		case <-time.After(cdcStartCheckPoll):
 		}
 	}

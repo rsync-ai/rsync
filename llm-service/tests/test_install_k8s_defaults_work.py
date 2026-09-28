@@ -56,6 +56,8 @@ SECRET_KEYS = (
     "REDIS_PASSWORD",
     "MINIO_ACCESS_KEY",
     "MINIO_SECRET_KEY",
+    "BLOB_STAGING_ACCESS_KEY",
+    "BLOB_STAGING_SECRET_KEY",
     "RSYNC_DEMO_WAREHOUSE_PASSWORD",
 )
 
@@ -911,7 +913,7 @@ def test_a_small_cluster_gets_a_lean_install_instead_of_a_pending_one(tmp_path):
 def test_a_single_four_vcpu_node_gets_an_install_that_fits(tmp_path):
     """The GKE smoke test, as a test. One e2-standard-4 (3920m allocatable) with the
     kube-system DaemonSets GKE puts on every node leaves ~3.4 CPU -- and trimming connectors
-    cannot reach that, because BASE alone asks 3410m and the whole lean fleet is worth 100m.
+    cannot reach that, because BASE alone asks 3510m and the whole lean fleet is worth 100m.
     The run this encodes ended with helm 'context deadline exceeded' and four pods that never
     scheduled. What has to fit is the install, not the fleet."""
     free_cpu, free_mem = 3920 - 520, 13622 - 600

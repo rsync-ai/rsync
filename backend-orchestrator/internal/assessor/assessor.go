@@ -9,10 +9,9 @@
 // Why a first-class service (vs. inline pre-flight at pipeline start):
 //   - Users can run assessments BEFORE clicking Run, fix issues, re-run.
 //   - Operators have audit history of which checks passed when.
-//   - When STRICT_PREFLIGHT=true, an explicit "blocks_start" flag gates
-//     the created→running transition. Pre-flight is enforced, not advisory.
-//   - The data shape (one row per assessment) survives the policy decision
-//     (strict vs. warn) — you can flip the env flag without re-running.
+//   - Pre-flight is enforced, not advisory: the api-gateway's run gate
+//     (RunPipeline → evaluateAssessmentGate) runs these checks on every Run
+//     and refuses to start on an error finding. There is no opt-in flag.
 //
 // Adding a new source connector requires exactly one new SourceAssessor
 // implementation. The orchestrator's HTTP handler dispatches by source_type;
@@ -50,7 +49,7 @@ type Check struct {
 	Code string `json:"code"`
 
 	// Severity — info | warning | error.
-	// 'error' findings block pipeline start when STRICT_PREFLIGHT=true.
+	// 'error' findings block pipeline start (api-gateway run gate).
 	Severity Severity `json:"severity"`
 
 	// Passed — true means the check found no issue. When false, see Message
@@ -209,37 +208,28 @@ func (in Input) RequiresTablePrimaryKeys() bool {
 	return in.IsCDC() || in.DestinationUsesUpsert()
 }
 
-// CDCBlocksWithoutPrimaryKey reports whether the CDC executor will HARD-FAIL
-// this run when a selected source table has no PRIMARY KEY — i.e. whether a
-// keyless table is a blocking error rather than a degraded-but-working load.
-//
-// It mirrors, deliberately and literally, the gate in
-// agents/executor/executor.go executeStreamingDataTransfer: CDC plus a
-// destination normalising to "postgresql", "mysql" or "mongodb" runs
-// ValidateTablesHavePrimaryKeys and fails the run with "CDC requires PRIMARY
-// KEY for DB destinations; missing PK on: …" for every keyless table. No
-// override reaches that validator — not the sink's content-hash surrogate key,
-// not user-nominated key columns; it has no parameter for either. The assessor
-// promised that fallback anyway (KI-CDC-ASSESS-PK-FALLBACK-NOT-IMPLEMENTED), so
-// the pre-flight cleared the table as a WARNING that "the run succeeds" and the
-// run then failed on the exact thing the pre-flight had cleared.
-//
-// Keep the destination list in step with executor.go's normalizeDBType + the
-// hard-block condition: postgres→postgresql and mariadb→mysql are aliases, and
-// oracle/sqlserver destinations are deliberately NOT here — the executor lets
-// those through, so a keyless table there really is only a warning. MongoDB IS
-// here: its CDC sink upserts on the key too, so a keyless source table either
-// gets a guessed key (rows sharing it replace each other) or is inserted blind
-// (every re-snapshot duplicates it) — the product rule blocks both.
-func (in Input) CDCBlocksWithoutPrimaryKey() bool {
+// CDCDatabaseDestination returns the normalised database destination
+// ("postgresql", "mysql" or "mongodb") when this is a CDC pipeline writing to
+// one, and "" otherwise. It picks the wording of the keyless-table finding: a
+// keyless source table streams into these destinations (policy 2026-09-27 —
+// it used to be blocked), but its UPDATEs and DELETEs cannot be matched to the
+// destination row, so the copy drifts and the finding has to say exactly how.
+// Aliases fold as the executor's normalizeDBType does (postgres→postgresql,
+// mariadb→mysql). Oracle/SQL Server/object-storage destinations keep the
+// generic surrogate-key warning.
+func (in Input) CDCDatabaseDestination() string {
 	if !in.IsCDC() {
-		return false
+		return ""
 	}
 	switch strings.ToLower(strings.TrimSpace(in.DestinationType)) {
-	case "postgresql", "postgres", "mysql", "mariadb", "mongodb":
-		return true
+	case "postgresql", "postgres":
+		return "postgresql"
+	case "mysql", "mariadb":
+		return "mysql"
+	case "mongodb":
+		return "mongodb"
 	default:
-		return false
+		return ""
 	}
 }
 
@@ -265,52 +255,44 @@ func nominatedColsFor(nominated map[string][]string, schemaOrDB, tableName strin
 	return nil
 }
 
-// missingPKReason returns the explanation tail for a
-// CDC_TABLE_MISSING_PRIMARY_KEY finding, tailored to WHY the primary key is
-// required so the message isn't misleadingly CDC-specific on a batch run.
-// Both code paths fail without a PK; the wording tells the user which one
-// applies. Shared by the MySQL and PostgreSQL assessors.
-func missingPKReason(cdcMode bool) string {
-	if cdcMode {
-		return "CDC to a database destination requires one"
-	}
-	return "this batch load upserts into the destination via INSERT … ON CONFLICT (pk); " +
-		"without a primary key the auto-created destination table has no unique constraint to match, " +
-		"so these rows are silently dropped"
-}
-
-// blockingMissingPKCheck builds the finding for a keyless table that the CDC
-// executor will refuse to run (see Input.CDCBlocksWithoutPrimaryKey).
-// Severity ERROR / Passed=false is the operative part: the pre-flight modal
-// gates its submit on errorCount == 0, so the user is stopped here with the fix
-// in hand instead of after a run that was always going to fail.
+// keylessCDCDriftCheck is the finding for a keyless source table in a CDC
+// pipeline into a database destination (see Input.CDCDatabaseDestination). The
+// run is allowed — WARNING, Passed=true — and the message states the exact
+// effect: inserts land once, every UPDATE adds a new row/document beside the
+// old one, and DELETEs are not applied (the sink dead-letters a keyless delete,
+// having nothing to match it on). The ALTER TABLE is in the message itself as
+// well as in SQLToRun, so the fix survives any surface that shows only text.
 //
 // `qualified` is the display name ("schema.table" / "db.table"), `alterSQL` the
-// family-correct ALTER TABLE, and `nominatedCols` the columns the user picked as
-// a key, if any. Nomination does NOT satisfy this gate, and saying so out loud is
-// half the point — the old code reported nominated columns as a clean pass.
-func blockingMissingPKCheck(qualified, alterSQL string, nominatedCols []string) Check {
+// family-correct ALTER TABLE, `destType` the normalised destination, and
+// `nominatedCols` the columns the user picked as a key, if any — nomination is
+// a batch-load feature (executeBatchDataTransfer's pkByTable) that does not
+// reach the CDC sink, and the message says so rather than implying it helps.
+func keylessCDCDriftCheck(qualified, alterSQL, destType string, nominatedCols []string) Check {
+	unit := "row"
+	if destType == "mongodb" {
+		unit = "document"
+	}
 	msg := fmt.Sprintf(
-		"Table %s has no PRIMARY KEY — %s. This run will fail at start with \"CDC requires PRIMARY KEY for DB destinations; missing PK on: %s\".",
-		qualified, missingPKReason(true), qualified,
+		"%s has no primary key. CDC will copy inserts exactly once, but each UPDATE adds a new %s (the old version stays) and DELETEs are not applied, so the destination drifts from the source. Add a primary key for an exact copy: %s",
+		qualified, unit, alterSQL,
 	)
 	if len(nominatedCols) > 0 {
 		msg += fmt.Sprintf(
-			" The nominated key column(s) (%s) do not satisfy it: CDC validates a PRIMARY KEY declared on the source table, and the nomination is not passed to that validator.",
+			" The nominated key column(s) (%s) apply to batch loads only; CDC does not use them.",
 			strings.Join(nominatedCols, ", "),
 		)
 	}
 	return Check{
-		Code: "CDC_TABLE_MISSING_PRIMARY_KEY", Severity: SeverityError, Passed: false,
+		Code: "CDC_TABLE_MISSING_PRIMARY_KEY", Severity: SeverityWarning, Passed: true,
 		Message: msg,
 		Remediation: &diagnose.Remediation{
 			Steps: []string{
-				"Add a PRIMARY KEY on the source table (or promote an existing unique NOT NULL index) — the only fix that lets CDC stream it.",
-				"Or deselect this table and stream the keyed tables only.",
-				"Or switch this pipeline to a batch (full-refresh) sync, which does load keyless tables via a content-hash surrogate key.",
+				"No action needed to run — the table streams without a primary key.",
+				"For an exact copy (updates in place, deletes applied): add a PRIMARY KEY on the source table.",
 			},
 			SQLToRun: []string{
-				"-- Required — CDC to a database destination validates a declared PRIMARY KEY (replace 'id' with the natural key):",
+				"-- For an exact copy — replace 'id' with the column(s) that identify a row:",
 				alterSQL,
 			},
 			DocURL:           diagnose.ErrorDocURL("cdc-missing-pk"),
@@ -433,8 +415,8 @@ func withObject(c Check, object string) Check {
 	return c
 }
 
-// BlocksStart returns true when the Result should prevent pipeline start
-// under STRICT_PREFLIGHT=true. Only hard failures block — warnings are
+// BlocksStart returns true when the Result should prevent pipeline start.
+// Only hard failures block — warnings are
 // surfaced but don't gate.
 func (r *Result) BlocksStart() bool {
 	return r.FailedCount > 0 || r.ErrorCount > 0

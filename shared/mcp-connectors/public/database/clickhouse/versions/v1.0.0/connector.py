@@ -126,7 +126,9 @@ def _is_local_db_host(host: str) -> bool:
     except ValueError:
         # Not an IP literal → treat as a hostname. Dotless names resolve on the
         # local/container network; a dotted FQDN is remote.
-        return "." not in h
+        # A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+        # suffix resolves on public DNS (shared/local_db_host_golden.json).
+        return "." not in h or h.endswith((".svc", ".cluster.local"))
     if ip.is_loopback or ip.is_private or ip.is_link_local:
         return True
     # CGNAT / RFC 6598 shared address space is not flagged is_private on older

@@ -74,7 +74,9 @@ def _is_local_db_host(host: Optional[str]) -> bool:
     try:
         ip = ipaddress.ip_address(h)
     except ValueError:
-        return "." not in h  # hostname: dotless => local (service name)
+        # A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+        # suffix resolves on public DNS (shared/local_db_host_golden.json).
+        return "." not in h or h.endswith((".svc", ".cluster.local"))
     return (ip.is_loopback or ip.is_private or ip.is_link_local
             or ip in _CGNAT_NET)
 

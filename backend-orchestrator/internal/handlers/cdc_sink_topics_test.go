@@ -12,7 +12,7 @@ func TestDeriveCDCSinkTopics_MongoCollectionIncludeList(t *testing.T) {
 		"collection.include.list": "datingapp.matches, datingapp.users,datingapp.matches",
 	}
 	prefix := connectorConfigString(cfg, "topic.prefix")
-	got := deriveCDCSinkTopics(prefix, connectorIncludeList(cfg))
+	got := deriveCDCSinkTopics(cfg, prefix, connectorIncludeList(cfg))
 	want := []string{"rsync.cdc-aaa0ded3.datingapp.matches", "rsync.cdc-aaa0ded3.datingapp.users"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("topics = %v, want %v", got, want)
@@ -24,7 +24,7 @@ func TestDeriveCDCSinkTopics_TableIncludeList(t *testing.T) {
 		"topic.prefix":       "rsync.cdc-12345678",
 		"table.include.list": "public.orders,rsync.cdc-12345678.public.users",
 	}
-	got := deriveCDCSinkTopics(connectorConfigString(cfg, "topic.prefix"), connectorIncludeList(cfg))
+	got := deriveCDCSinkTopics(cfg, connectorConfigString(cfg, "topic.prefix"), connectorIncludeList(cfg))
 	want := []string{"rsync.cdc-12345678.public.orders", "rsync.cdc-12345678.public.users"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("topics = %v, want %v", got, want)

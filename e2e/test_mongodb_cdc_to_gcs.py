@@ -165,7 +165,7 @@ def _mongosh(script: str) -> str:
 
 
 def _docker_rm(name: str) -> None:
-    subprocess.run(["docker", "rm", "-f", name],
+    subprocess.run(["docker", "rm", "-fv", name],
                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 

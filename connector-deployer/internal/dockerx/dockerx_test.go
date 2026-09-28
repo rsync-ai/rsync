@@ -26,6 +26,7 @@ var testDcfg = spec.DeployerConfig{
 // lifecycle (including the ValidateHostConfigSafe gate) runs with no docker daemon.
 type fakeBackend struct {
 	imageExists bool
+	imageLabels map[string]string
 	imageErr    error
 	snap        *ContainerSnapshot
 	inspectErr  error
@@ -46,8 +47,11 @@ type fakeBackend struct {
 	pingErr      error
 }
 
-func (f *fakeBackend) ImageExists(_ context.Context, _ string) (bool, error) {
-	return f.imageExists, f.imageErr
+func (f *fakeBackend) InspectImage(_ context.Context, _ string) (*ImageSnapshot, error) {
+	if !f.imageExists {
+		return nil, f.imageErr
+	}
+	return &ImageSnapshot{Labels: f.imageLabels}, f.imageErr
 }
 func (f *fakeBackend) BuildImage(_ context.Context, contextDir, imageRef string, _ map[string]string, labels []string) error {
 	f.buildCalled = true

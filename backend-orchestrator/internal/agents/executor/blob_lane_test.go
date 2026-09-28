@@ -130,3 +130,49 @@ func TestBuildStagingConfigHonoursExplicitCredentials(t *testing.T) {
 		t.Errorf("explicit credentials dropped: access_key=%v secret_key=%v", sc["access_key"], sc["secret_key"])
 	}
 }
+
+// The dedicated staging store (KI-BLOB-LANE-STAGING-UNREACHABLE-FROM-CONNECTORS)
+// wins over the claim-check MinIO, and carries only its OWN credentials: the
+// claim-check MinIO's keys must not ride along to the connectors, and the
+// minioadmin default must not be substituted for an empty pair.
+func TestBuildStagingConfigPrefersTheDedicatedStore(t *testing.T) {
+	t.Setenv("MINIO_ENDPOINT_URL", "http://minio:9000")
+	t.Setenv("MINIO_ACCESS_KEY_ID", "claim-check-key")
+	t.Setenv("MINIO_SECRET_ACCESS_KEY", "claim-check-secret")
+	t.Setenv("MINIO_BUCKET", "pipeline-data")
+	t.Setenv("MINIO_PREFIX", "staging")
+	t.Setenv("BLOB_STAGING_ENDPOINT_URL", "http://blob-staging:9000")
+	t.Setenv("BLOB_STAGING_ACCESS_KEY_ID", "")
+	t.Setenv("BLOB_STAGING_SECRET_ACCESS_KEY", "")
+
+	sc := (&Agent{}).buildStagingConfig()
+	if sc["endpoint"] != "http://blob-staging:9000" {
+		t.Fatalf("endpoint=%v, want the dedicated store", sc["endpoint"])
+	}
+	if sc["access_key"] != "" || sc["secret_key"] != "" {
+		t.Fatalf("credentials=%v/%v, want empty: never the claim-check keys, never minioadmin", sc["access_key"], sc["secret_key"])
+	}
+	// Same bucket and prefix as before: the sink's allow-list and the store's
+	// expiry rule are both keyed on them.
+	if sc["bucket"] != "pipeline-data" || sc["prefix"] != "staging/blobs" {
+		t.Fatalf("bucket/prefix=%v/%v", sc["bucket"], sc["prefix"])
+	}
+
+	t.Setenv("BLOB_STAGING_ACCESS_KEY_ID", "staging-key")
+	t.Setenv("BLOB_STAGING_SECRET_ACCESS_KEY", "staging-secret")
+	sc = (&Agent{}).buildStagingConfig()
+	if sc["access_key"] != "staging-key" || sc["secret_key"] != "staging-secret" {
+		t.Fatalf("credentials=%v/%v, want the staging store's own", sc["access_key"], sc["secret_key"])
+	}
+}
+
+// Unset, the lane keeps its old source: the chart sets no BLOB_STAGING_* and
+// relies on MINIO_ENDPOINT_URL.
+func TestBuildStagingConfigFallsBackWithoutADedicatedStore(t *testing.T) {
+	t.Setenv("BLOB_STAGING_ENDPOINT_URL", "")
+	t.Setenv("MINIO_ENDPOINT_URL", "http://release-minio:9000")
+	sc := (&Agent{}).buildStagingConfig()
+	if sc["endpoint"] != "http://release-minio:9000" {
+		t.Fatalf("endpoint=%v, want MINIO_ENDPOINT_URL", sc["endpoint"])
+	}
+}
