@@ -250,7 +250,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > The chart is also published to the registry, so you can install without cloning:
 >
 > ```bash
-> helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.5 \
+> helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.7 \
 >   --namespace rsync --create-namespace \
 >   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
 >   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
@@ -266,15 +266,15 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > render without them, because the browser calls the API directly and NextAuth
 > builds its callback URLs from `publicUrl`. Point them at the hostnames your
 > ingress will serve. MinIO withdrew anonymous pulls from `docker.io/minio/*` and then
-> from `quay.io/minio/*`, and chart **0.1.5** and older name those images, so their
-> MinIO pod and bucket job cannot pull. Add
+> from `quay.io/minio/*`. Chart **0.1.6** onward and a checkout's `values.yaml` name
+> Chainguard's build instead, so neither path needs a MinIO override. Chart **0.1.5**
+> and older still name the withdrawn images; to install one of those, add
 > `--set objectStorage.minio.image=cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1`
-> and the same value for `objectStorage.minio.mcImage` to the OCI install. A checkout
-> needs no override: its `values.yaml` already names that image, as the chart will
-> from **0.1.6**. Both paths pull rsync's own images at `.Chart.AppVersion`
-> (**0.1.5**), and every `ghcr.io/rsync-ai` image the chart names is published at
-> that tag for both `amd64` and `arm64` (0.1.2 and older are `amd64` only, so they will
-> not start on Apple Silicon, Graviton, Axion or Ampere nodes).
+> and the same value for `objectStorage.minio.mcImage`. Both paths pull rsync's own
+> images at `.Chart.AppVersion` (**0.1.7**), and every `ghcr.io/rsync-ai` image the
+> chart names is published at that tag for both `amd64` and `arm64` (0.1.2 and older
+> are `amd64` only, so they will not start on Apple Silicon, Graviton, Axion or Ampere
+> nodes).
 
 ---
 
