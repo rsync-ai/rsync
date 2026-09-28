@@ -28,6 +28,8 @@ import re
 
 import yaml
 
+import _flip_cut
+
 REPO = pathlib.Path(__file__).resolve().parents[2]
 RUN_PY = REPO / "deploy/helm/rsync-ai/test/kind/kafka-matrix/run.py"
 FILTERS = REPO / ".github/paths-filters.yml"
@@ -188,7 +190,12 @@ def test_the_compose_filter_holds_only_what_the_gate_can_compare():
     rendered = set(re.findall(r'render\("([^"]+)"', RUN_PY.read_text()))
     assert compose and compose == rendered, (compose, rendered)
     assert not compose & set(filters["kafkasec"]), "a compose file in `kafkasec` always runs the matrix"
-    gate = next(st for st in yaml.safe_load(CI.read_text())["jobs"]["kafka-security-matrix"]["steps"]
+    jobs = yaml.safe_load(CI.read_text()).get("jobs") or {}
+    if "kafka-security-matrix" not in jobs and not _flip_cut.is_a_pre_cut_tree():
+        # The public cut drops the matrix job whole (scripts/flip/apply-ci-split.py),
+        # so there is no gate to read there. Private still has to have it.
+        return
+    gate = next(st for st in jobs["kafka-security-matrix"]["steps"]
                 if "RUN=1" in str(st.get("run", "")))
     for path in compose:
         assert f"git show HEAD^1:{path}" in gate["run"], f"the gate never fetches the base {path}"

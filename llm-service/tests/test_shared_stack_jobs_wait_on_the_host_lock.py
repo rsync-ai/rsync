@@ -110,6 +110,8 @@ def test_no_github_concurrency_group(name):
 
 def test_all_lockers_share_one_stack():
     """The premise: same STACK_PREFIX means same lock dir means real contention."""
+    if not _lockers() and not _flip_cut.is_a_pre_cut_tree():
+        pytest.skip("the public cut drops both lockers whole; the census test checks that")
     prefixes = {
         n: (_gate_step(j).get("env") or {}).get("STACK_PREFIX") for n, j in _lockers().items()
     }
