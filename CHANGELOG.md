@@ -7,10 +7,9 @@ All notable changes to Rsync AI are documented in this file.
      this file used to open with `## [1.0.0] - December 2025`, a version no tag
      has ever pointed at, and nothing in the repo could disagree with it. -->
 
-## [Unreleased]
+## [0.1.7] - 2026-09-28
 
-Changes since the last release. They move under a version heading when that version
-is tagged.
+Everything since v0.1.6.
 
 ### Batch pipelines
 - A Reload onto object storage (GCS, S3, Azure Blob, MinIO) fails the run when the old files
