@@ -95,7 +95,7 @@ cleanup() {
   done
   for e in "${STARTED_EMULATORS[@]:-}"; do
     [ -n "$e" ] || continue
-    docker rm -f "$e" >/dev/null 2>&1 || true
+    docker rm -fv "$e" >/dev/null 2>&1 || true
   done
 }
 trap cleanup EXIT
@@ -119,7 +119,7 @@ wait_running() {
 # ---- emulator setup + readback (reuse each MCP container's own SDK) ----------
 
 setup_gcs() {
-  docker rm -f "${GCS_EMU}" >/dev/null 2>&1 || true
+  docker rm -fv "${GCS_EMU}" >/dev/null 2>&1 || true
   docker run -d --name "${GCS_EMU}" --network "${MCP_NET}" \
     fsouza/fake-gcs-server:latest -scheme http -port 4443 -external-url "http://${GCS_EMU}:4443" >/dev/null
   STARTED_EMULATORS+=("${GCS_EMU}")
@@ -154,7 +154,7 @@ print("".join(b.download_as_text() for b in c.list_blobs("'"${BUCKET}"'",prefix=
 }
 
 setup_azure() {
-  docker rm -f "${AZ_EMU}" >/dev/null 2>&1 || true
+  docker rm -fv "${AZ_EMU}" >/dev/null 2>&1 || true
   docker run -d --name "${AZ_EMU}" --network "${MCP_NET}" \
     -e "AZURITE_ACCOUNTS=${AZ_ACCT}:${AZ_KEY}" \
     mcr.microsoft.com/azure-storage/azurite \

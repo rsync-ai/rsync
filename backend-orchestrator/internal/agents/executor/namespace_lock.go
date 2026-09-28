@@ -90,7 +90,17 @@ func (a *Agent) ensureDestinationNamespaceLocked(ctx context.Context, task *Exec
 	}
 	url := fmt.Sprintf("%s/api/v1/internal/pipelines/%s/namespace/lock", gwURL, pipelineID)
 
-	body, err := json.Marshal(map[string]interface{}{"selected_tables": tables})
+	// destination_tables: the table this run will actually WRITE when that is not
+	// derivable from the source names — a single-table run renamed by its prompt
+	// ("… into table orders_archive"). api-gateway cannot parse the prompt, so
+	// without this it probes only the source name and never sees the table it is
+	// about to write into (KI-NSPROBE-USES-SOURCE-TABLE-NAMES). Same helper the
+	// sink pins destCfg["table"] with, so the probed and written names agree.
+	payload := map[string]interface{}{"selected_tables": tables}
+	if dest := namespaceLockDestinationTables(task); len(dest) > 0 {
+		payload["destination_tables"] = dest
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		log.WithError(err).WithField("pipeline_id", pipelineID).Warn("namespace lock: marshal failed (ignored)")
 		return

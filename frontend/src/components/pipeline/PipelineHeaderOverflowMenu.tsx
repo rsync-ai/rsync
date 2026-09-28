@@ -277,10 +277,11 @@ export function PipelineHeaderOverflowMenu(props: {
               in PipelineActions, so this item never renders for them. */}
           {canStop && (
             <DropdownMenuItem
-              onSelect={(e) => {
-                e.preventDefault()
-                void handleStop()
-              }}
+              // Let the select close the menu. Keeping this modal menu open
+              // (preventDefault) left body pointer-events:none, so the first click
+              // on the Resume/Reload that Stop reveals only dismissed it (U-16).
+              // The toast is Stop's feedback.
+              onSelect={() => void handleStop()}
               disabled={stopping}
             >
               {stopping ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <Square className="h-4 w-4 mr-2" />}

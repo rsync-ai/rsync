@@ -58,7 +58,9 @@ def _is_local_db_host(host: str) -> bool:
         ip = ipaddress.ip_address(h)
     except ValueError:
         # Hostname: bare single label (no dot) is local; dotted/FQDN is remote.
-        return "." not in h
+        # A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+        # suffix resolves on public DNS (shared/local_db_host_golden.json).
+        return "." not in h or h.endswith((".svc", ".cluster.local"))
     if ip.is_loopback or ip.is_private or ip.is_link_local:
         return True
     # 100.64.0.0/10 carrier-grade NAT (not covered by is_private on older Python).
@@ -1871,6 +1873,7 @@ class MysqlMCPServer(DestinationLoadMixin, BaseMCPConnector):
         is_local_host = (
             host_val in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal")
             or "." not in host_val
+            or host_val.endswith((".svc", ".cluster.local"))  # Kubernetes in-cluster service
         )
         explicit_tls = any(
             config.get(k) not in (None, "")

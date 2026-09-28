@@ -143,7 +143,7 @@ func TestPG_ResolveFirstRunNamespace(t *testing.T) {
 
 	// ---- The regression. Pre-fix this returned ("rsync_public", non-nil) and
 	// the pipeline was frozen there for life on 14 consecutive prod runs.
-	resolved, rel := resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql", me, "public", selected)
+	resolved, rel := resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql", me, "public", selected, nil)
 	if resolved != "public" {
 		t.Errorf("pre-existing table with no other owner: resolved = %q, want \"public\" (this is KI-NSLOCK-SILENT-RELOCATION)", resolved)
 	}
@@ -155,7 +155,7 @@ func TestPG_ResolveFirstRunNamespace(t *testing.T) {
 	// on the same destination connection writes demo_customers into public.
 	addPipeline(bulk, "public", []string{"demo_src.demo_customers", "demo_src.orders"})
 
-	resolved, rel = resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql", me, "public", selected)
+	resolved, rel = resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql", me, "public", selected, nil)
 	if resolved != "rsync_public" {
 		t.Fatalf("table owned by another pipeline: resolved = %q, want \"rsync_public\"", resolved)
 	}
@@ -181,7 +181,7 @@ func TestPG_ResolveFirstRunNamespace(t *testing.T) {
 	}
 	addPipeline("0f023bf3-1d3e-4a1e-9f6a-2b7c8d9e0f11", "rsync_public", []string{"demo_src.demo_customers"})
 
-	resolved, rel = resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql", me, "public", selected)
+	resolved, rel = resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql", me, "public", selected, nil)
 	want := "rsync_public_20912e3b"
 	if resolved != want {
 		t.Errorf("both namespaces owned: resolved = %q, want %q", resolved, want)
@@ -199,7 +199,7 @@ func TestPG_ResolveFirstRunNamespace(t *testing.T) {
 	t.Cleanup(func() { _, _ = db.ExecContext(ctx, `DROP TABLE IF EXISTS public.unrelated_table`) })
 
 	resolved, rel = resolveFirstRunNamespace(ctx, db, ws, destConn, "postgresql",
-		"cccccccc-0000-0000-0000-000000000009", "public", []string{"demo_src.unrelated_table"})
+		"cccccccc-0000-0000-0000-000000000009", "public", []string{"demo_src.unrelated_table"}, nil)
 	if resolved != "public" || rel != nil {
 		t.Errorf("table nobody else writes: resolved = %q rel = %+v, want \"public\" and nil", resolved, rel)
 	}

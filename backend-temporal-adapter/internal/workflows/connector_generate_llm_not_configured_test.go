@@ -443,6 +443,7 @@ func runLLMGatePipeline(t *testing.T, h *llmGateHarness, setup func(env *testsui
 		"GenerateConnectorActivityV2":     generate,
 		"StateUpdateActivity":             h.stateUpdate,
 		"UpdatePipelineStatusActivity":    h.pipelineStatus,
+		"FinalizeCompletedRunActivity":    finalizeVia(h.pipelineStatus),
 		"EmitDomainEventActivity":         h.domainEvent,
 	} {
 		env.RegisterActivityWithOptions(fn, activity.RegisterOptions{Name: name})

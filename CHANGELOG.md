@@ -12,6 +12,95 @@ All notable changes to Rsync AI are documented in this file.
 Changes since the last release. They move under a version heading when that version
 is tagged.
 
+### Batch pipelines
+- A Reload onto object storage (GCS, S3, Azure Blob, MinIO) fails the run when the old files
+  could not all be deleted, instead of loading on top of them.
+- A resumed run continues a table from where that table's own sweep stopped, and a table whose
+  row count is an exact multiple of the page size records that it finished.
+- A MongoDB collection whose `_id` mixes types gets one column type per run.
+- A run completes only after its post-run row check passes; a failed check fails the run. The
+  next run re-sends batches the destination refused in an earlier run.
+- Stop also stops the pipeline's sink worker.
+- The sink connector runs on every install, Helm with `connectors.cdc.enabled=false`
+  included, and a batch pipeline with a destination checks for it before it starts.
+- When MinIO is down, a run stops staging through it after the first failure instead of
+  retrying on every batch.
+- The `STRICT_PREFLIGHT` setting is removed. It had no effect; the run gate already blocks on
+  error findings.
+
+### Change data capture
+- **Behaviour change:** a keyless table into a PostgreSQL, MySQL or MongoDB destination is a
+  warning, not a blocker. On such a table an UPDATE adds a row and a DELETE is dead-lettered.
+- The sink upserts only on a declared key, from the source's message key or the destination
+  config, never on a guessed `id` column that could merge distinct rows.
+- Keyless MongoDB rows are keyed on their Kafka record, so a replay does not duplicate them,
+  and MongoDB changes within the same second keep their order.
+- MySQL destination key columns are created indexable (`VARCHAR`), so an upsert matches its row
+  instead of inserting it again on every replay.
+- A Reload sends its re-snapshot only once the connector reports it is running.
+- A destination that refuses the sink's credentials stops the pipeline as needing
+  configuration instead of retrying.
+- Removing a table from a SQL Server pipeline deletes its topic, and the sink no longer creates
+  phantom topics when it restarts after an edit.
+- CDC lag is reported in messages, from the newest reading.
+
+### Sink
+- A worker holding rows through a destination outage is no longer restarted as stalled.
+- The first destination host that answers is final: a refused write is not sent again under
+  another name for the same service, and on Helm the destination's real error is no longer
+  replaced by a `no such host`.
+- Layout v2 object files are always Parquet. A connection saved with format `infer`, the GCS
+  and Azure Blob form default, used to get gzip JSON under a `.parquet` name.
+
+### Connectors
+- A database inside the same Kubernetes cluster (`*.svc`, `*.cluster.local`) gets TLS off by
+  default, like a Docker service name, so an in-cluster MongoDB or PostgreSQL connects from
+  host, port, user and password without a connection string. An explicit TLS or `sslmode`
+  setting still wins.
+- Generate a connector from an OpenAPI document in the UI: upload a file, paste it, or give a
+  URL, which your browser fetches, not the server.
+- A generated connector deploys: its files are saved readable by the orchestrator, and it is
+  deployed from its saved version.
+- An upgrade runs the new release's connector code. The `connector-seed` image replaces each
+  shipped connector version and keeps generated connectors, and a connector container is
+  rebuilt when its code changed, not only when its version tag did.
+
+### Interface
+- Pipeline pages say only what they measured: a stage is marked done on its own evidence, a
+  CDC header reads "Setting up" during a Reload, the header's row count and step agree with the
+  table statistics and the timeline, and a status change shows within seconds.
+- Table statistics refresh while a run is going and take a final reading when it ends. CDC
+  health reads the current run's probe.
+- The batch Checkpoints card stays readable with many tables: a summary line, a filter and
+  search, and one compact row per table. It counts every table of the latest run.
+- Stop closes the actions menu, and a CDC pipeline no longer sticks at "Failed" after Stop and
+  Resume.
+- A keyless CDC table shows one "Table primary key" check, not two.
+- Chat resolves a saved connection by its name, such as "Demo warehouse".
+- The `/chat` heading reads "Data Pipeline".
+
+### Self-hosting
+- Blob passthrough stages through its own `blob-staging` MinIO, which connectors can reach; the
+  platform MinIO stays off the connector network. Re-running `install.sh` on an existing
+  install adds its keys.
+- The orchestrator waits for the database migrations before its boot queries.
+- A Postgres, Kafka or Kafka Connect that is still starting no longer raises a CRITICAL alert.
+- LLM cost logging works: llm-service gets `DATABASE_URL`.
+- The first-run demo seed works: `demo-warehouse` joins the connector network.
+- `install.sh` installs from a checkout (`RSYNC_COMPOSE_DIR`, with an explicit
+  `RSYNC_VERSION`) or pulls images from a mirror (`RSYNC_IMAGE_REGISTRY`).
+
+### Kubernetes
+- The chart ships a dedicated `blob-staging` MinIO that only connector pods may reach under
+  `networkPolicy.enabled`; `install-k8s.sh` generates its keys.
+- Generate refuses to save a connector, and says why, instead of reporting "Generated": each
+  pod keeps its own copy of the connector catalog, so a generated connector would reach no
+  other service.
+
+## [0.1.6] - 2026-09-27
+
+Everything since v0.1.5.
+
 ### Self-hosting
 - MinIO now pulls `cgr.dev/chainguard/minio`, pinned by digest, for both the server and the
   `mc` bucket/lifecycle job. MinIO stopped serving anonymous pulls from `docker.io/minio/*` and

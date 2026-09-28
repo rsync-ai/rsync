@@ -22,13 +22,16 @@
  * operator the opposite of what a restart does.
  */
 
-import { useCallback, useEffect, useState } from "react"
-import { RefreshCw } from "lucide-react"
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { ChevronRight, RefreshCw } from "lucide-react"
 
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
+import { cn, formatRelativeTime } from "@/lib/utils"
 
 type Checkpoint = {
   id: string
@@ -50,25 +53,141 @@ const POSITION_LABELS: Record<string, string> = {
 }
 
 /**
- * Flatten `position` into "key: value" pairs, one level deep into nested
- * objects so `{"watermark":{"value":"2026-09-01T…"}}` reads as
- * `watermark.value: 2026-09-01T…` instead of as raw JSON.
+ * The position's leaf key/value pairs, one level deep into nested objects so
+ * `{"watermark":{"value":"2026-09-01T…"}}` reads as `watermark.value` instead
+ * of as raw JSON. The run-wide keys carry their POSITION_LABELS wording.
  */
-export function formatPosition(position: Record<string, unknown> | null | undefined): string {
-  if (!position || typeof position !== "object") return "—"
-  const parts: string[] = []
+export function positionEntries(position: Record<string, unknown> | null | undefined): [string, string][] {
+  if (!position || typeof position !== "object") return []
+  const out: [string, string][] = []
   for (const [k, v] of Object.entries(position)) {
     if (v && typeof v === "object" && !Array.isArray(v)) {
       for (const [k2, v2] of Object.entries(v as Record<string, unknown>)) {
-        parts.push(`${k}.${k2}: ${String(v2)}`)
+        out.push([`${k}.${k2}`, String(v2)])
       }
     } else {
-      parts.push(`${POSITION_LABELS[k] ?? k}: ${Array.isArray(v) ? JSON.stringify(v) : String(v)}`)
+      out.push([POSITION_LABELS[k] ?? k, Array.isArray(v) ? JSON.stringify(v) : String(v)])
     }
   }
+  return out
+}
+
+/** `positionEntries` joined as "key: value · key: value". */
+export function formatPosition(position: Record<string, unknown> | null | undefined): string {
+  if (!position || typeof position !== "object") return "—"
+  const parts = positionEntries(position).map(([k, v]) => `${k}: ${v}`)
   // An empty object is a real state — the row exists but carries no position —
   // and is not the same as having no row at all.
   return parts.length > 0 ? parts.join(" · ") : "(empty)"
+}
+
+function asNumber(v: unknown): number | null {
+  const n = typeof v === "string" && v.trim() !== "" ? Number(v) : v
+  return typeof n === "number" && Number.isFinite(n) ? n : null
+}
+
+function present(v: unknown): boolean {
+  return v !== null && v !== undefined && v !== ""
+}
+
+export type CheckpointSummary = {
+  /** null when the position is not the batch executor's shape — no claim made. */
+  state: "complete" | "in_progress" | null
+  /** One short line: where a restart resumes this table from. */
+  resume: string
+  /** This table's own row count (table_rows_so_far), when the executor wrote one. */
+  tableRows: number | null
+}
+
+/**
+ * summarizeCheckpoint reads the batch executor's position (executor.go
+ * checkpointPosition: batch_idx, table_complete, cursor_column/cursor, offset,
+ * table_rows_so_far, watermark) into one scannable line. Any other shape — a
+ * Postgres LSN, a Mongo resume token — keeps the full formatPosition text: it
+ * is short, and guessing at an unknown engine's vocabulary would misread it.
+ */
+export function summarizeCheckpoint(position: Record<string, unknown> | null | undefined): CheckpointSummary {
+  const isBatch = !!position && ("batch_idx" in position || "table_complete" in position)
+  if (!position || !isBatch) {
+    return { state: null, resume: formatPosition(position), tableRows: null }
+  }
+  const complete = position.table_complete === true
+  const parts: string[] = []
+  const batch = asNumber(position.batch_idx)
+  if (complete) {
+    parts.push("sweep finished")
+  } else if (batch !== null) {
+    parts.push(`after batch ${batch.toLocaleString("en-US")}`)
+  }
+  if (!complete) {
+    if (present(position.cursor)) {
+      const col = present(position.cursor_column) ? String(position.cursor_column) : "cursor"
+      parts.push(`${col} > ${String(position.cursor)}`)
+    } else if (asNumber(position.offset)) {
+      parts.push(`offset ${asNumber(position.offset)!.toLocaleString("en-US")}`)
+    }
+  }
+  const wm = position.watermark
+  if (wm && typeof wm === "object" && present((wm as Record<string, unknown>).value)) {
+    parts.push(`since ${String((wm as Record<string, unknown>).value)}`)
+  }
+  return {
+    state: complete ? "complete" : "in_progress",
+    resume: parts.length > 0 ? parts.join(" · ") : formatPosition(position),
+    tableRows: asNumber(position.table_rows_so_far),
+  }
+}
+
+export type RunTotals = { rows: number | null; bytes: number | null; executionId: string | null; at: string }
+
+/**
+ * The run-wide totals every batch checkpoint repeats (rows_so_far/bytes_so_far
+ * are the whole run's, #13), stated once for the latest run. The latest run is
+ * the one whose checkpoint was committed last; its figure is the LARGEST any of
+ * its tables carries, not the last-committed one: each table goroutine
+ * snapshots the shared totals and then saves, so a table that snapshotted early
+ * can commit after a sibling that saw more (0.1.7-rc1 showed 32 of 42 rows).
+ * Within one run the totals only grow, so the largest is the newest. Rows from
+ * an earlier run stay in the table until that table is swept again, so they
+ * are left out.
+ */
+export function latestRunTotals(checkpoints: Checkpoint[]): RunTotals | null {
+  const runOf = (cp: Checkpoint) => {
+    const exec = cp.position?.execution_id
+    return present(exec) ? String(exec) : null
+  }
+  const batch = checkpoints.filter(
+    (cp) => cp.position && ("rows_so_far" in cp.position || "bytes_so_far" in cp.position)
+  )
+  let last: Checkpoint | null = null
+  for (const cp of batch) {
+    if (!last || new Date(cp.updated_at).getTime() > new Date(last.updated_at).getTime()) last = cp
+  }
+  if (!last) return null
+  const run = runOf(last)
+  let rows: number | null = null
+  let bytes: number | null = null
+  for (const cp of batch) {
+    if (runOf(cp) !== run) continue
+    const r = asNumber(cp.position?.rows_so_far)
+    const b = asNumber(cp.position?.bytes_so_far)
+    if (r !== null && (rows === null || r > rows)) rows = r
+    if (b !== null && (bytes === null || b > bytes)) bytes = b
+  }
+  return { rows, bytes, executionId: run, at: last.updated_at }
+}
+
+const exactCount = new Intl.NumberFormat("en-US")
+
+function fmtBytes(n: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"]
+  let v = n
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`
 }
 
 function fmtWhen(iso: string): string {
@@ -76,6 +195,17 @@ function fmtWhen(iso: string): string {
   if (Number.isNaN(d.getTime())) return "—"
   return d.toLocaleString()
 }
+
+function fmtAgo(iso: string): string {
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return "—"
+  return formatRelativeTime(d)
+}
+
+type StateFilter = "all" | "in_progress" | "complete"
+
+// Past this many tables the filter row appears; below it, it is clutter.
+const FILTER_THRESHOLD = 8
 
 export function PipelineCheckpointsCard({
   pipelineId,
@@ -92,21 +222,74 @@ export function PipelineCheckpointsCard({
   // anywhere, which is exactly the wrong thing to say when the read failed.
   const [error, setError] = useState<string | null>(null)
 
+  const [query, setQuery] = useState("")
+  const [stateFilter, setStateFilter] = useState<StateFilter>("all")
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set())
+
+  const rows = useMemo(() => {
+    const list = (checkpoints ?? []).map((cp) => ({ cp, summary: summarizeCheckpoint(cp.position) }))
+    // Unfinished tables first — they are the ones a restart resumes mid-way —
+    // then by name, so a long list reads in a stable order across refreshes.
+    list.sort((a, b) => {
+      const ra = a.summary.state === "in_progress" ? 0 : 1
+      const rb = b.summary.state === "in_progress" ? 0 : 1
+      return ra - rb || a.cp.source_table.localeCompare(b.cp.source_table)
+    })
+    return list
+  }, [checkpoints])
+
+  const counts = useMemo(() => {
+    let complete = 0
+    let inProgress = 0
+    for (const r of rows) {
+      if (r.summary.state === "complete") complete++
+      else if (r.summary.state === "in_progress") inProgress++
+    }
+    return { complete, inProgress }
+  }, [rows])
+
+  const runTotals = useMemo(() => latestRunTotals(checkpoints ?? []), [checkpoints])
+
+  const visible = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    return rows.filter(
+      (r) =>
+        (stateFilter === "all" || r.summary.state === stateFilter) &&
+        (q === "" || r.cp.source_table.toLowerCase().includes(q))
+    )
+  }, [rows, query, stateFilter])
+
+  const toggle = useCallback((id: string) => {
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
+  // A Refresh clicked while an earlier read is in flight must not let that older
+  // response land last and revert the list.
+  const requestSeq = useRef(0)
   const load = useCallback(async () => {
+    const seq = ++requestSeq.current
     setLoading(true)
     try {
       const res = await authFetch(API_ENDPOINTS.PIPELINES.CHECKPOINTS(pipelineId), { cache: "no-store" })
+      if (seq !== requestSeq.current) return
       if (!res.ok) {
         setError(`Could not load checkpoints (HTTP ${res.status})`)
         return
       }
       const data = (await res.json().catch(() => null)) as { checkpoints?: Checkpoint[] } | null
+      if (seq !== requestSeq.current) return
       setCheckpoints(Array.isArray(data?.checkpoints) ? data!.checkpoints : [])
       setError(null)
     } catch {
+      if (seq !== requestSeq.current) return
       setError("Could not load checkpoints — the API is unreachable")
     } finally {
-      setLoading(false)
+      if (seq === requestSeq.current) setLoading(false)
     }
   }, [pipelineId])
 
@@ -149,25 +332,176 @@ export function PipelineCheckpointsCard({
             </div>
           )
         ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b text-left text-xs text-muted-foreground">
-                  <th className="py-2 pr-4 font-medium">Table</th>
-                  <th className="py-2 pr-4 font-medium">Position</th>
-                  <th className="py-2 font-medium">Updated</th>
-                </tr>
-              </thead>
-              <tbody>
-                {checkpoints.map((cp) => (
-                  <tr key={cp.id} className="border-b last:border-0 align-top">
-                    <td className="py-2 pr-4 font-medium">{cp.source_table}</td>
-                    <td className="py-2 pr-4 font-mono text-xs break-all">{formatPosition(cp.position)}</td>
-                    <td className="py-2 whitespace-nowrap text-xs text-muted-foreground">{fmtWhen(cp.updated_at)}</td>
+          <div className="space-y-3">
+            <div
+              data-testid="checkpoints-summary"
+              className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground"
+            >
+              <span>
+                <span className="font-medium text-foreground">{exactCount.format(rows.length)}</span>{" "}
+                {rows.length === 1 ? "table" : "tables"}
+              </span>
+              {counts.inProgress + counts.complete > 0 && (
+                <>
+                  <span aria-hidden="true">·</span>
+                  <span>{exactCount.format(counts.inProgress)} mid-table</span>
+                  <span aria-hidden="true">·</span>
+                  <span>{exactCount.format(counts.complete)} finished</span>
+                </>
+              )}
+              {runTotals && (
+                <span
+                  data-testid="checkpoints-run-totals"
+                  title={`The whole run's running total when a table last committed (${fmtWhen(runTotals.at)}).`}
+                  className="sm:ml-auto"
+                >
+                  Run total at last commit:{" "}
+                  {runTotals.rows !== null && <>{exactCount.format(runTotals.rows)} rows</>}
+                  {runTotals.rows !== null && runTotals.bytes !== null && " · "}
+                  {runTotals.bytes !== null && fmtBytes(runTotals.bytes)}
+                  {runTotals.executionId && (
+                    <span className="font-mono"> · run {runTotals.executionId.slice(0, 8)}</span>
+                  )}
+                </span>
+              )}
+            </div>
+
+            {rows.length > FILTER_THRESHOLD && (
+              <div className="flex flex-wrap items-center gap-2">
+                <Input
+                  type="search"
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="Filter tables…"
+                  aria-label="Filter checkpoints by table name"
+                  className="h-8 w-full text-xs sm:w-64"
+                />
+                <div role="group" aria-label="Filter by table state" className="flex gap-1">
+                  {(
+                    [
+                      ["all", "All"],
+                      ["in_progress", "Mid-table"],
+                      ["complete", "Finished"],
+                    ] as const
+                  ).map(([value, label]) => (
+                    <Button
+                      key={value}
+                      type="button"
+                      size="sm"
+                      variant={stateFilter === value ? "secondary" : "ghost"}
+                      aria-pressed={stateFilter === value}
+                      className="h-8 px-2 text-xs"
+                      onClick={() => setStateFilter(value)}
+                    >
+                      {label}
+                    </Button>
+                  ))}
+                </div>
+                {visible.length !== rows.length && (
+                  <span className="text-xs text-muted-foreground">
+                    {exactCount.format(visible.length)} of {exactCount.format(rows.length)}
+                  </span>
+                )}
+              </div>
+            )}
+
+            <div className="max-h-[28rem] overflow-auto rounded-md border">
+              <table className="w-full text-sm">
+                <thead className="sticky top-0 z-10 bg-card">
+                  <tr className="border-b text-left text-xs text-muted-foreground">
+                    <th className="w-8 py-2 pl-2" aria-label="Details" />
+                    <th className="py-2 pr-4 font-medium">Table</th>
+                    <th className="py-2 pr-4 font-medium">State</th>
+                    <th className="py-2 pr-4 font-medium">Resumes from</th>
+                    <th className="py-2 pr-4 text-right font-medium">Table rows</th>
+                    <th className="py-2 pr-3 font-medium">Updated</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody>
+                  {visible.length === 0 ? (
+                    <tr>
+                      <td colSpan={6} className="py-4 text-center text-xs text-muted-foreground">
+                        No table matches this filter.
+                      </td>
+                    </tr>
+                  ) : (
+                    visible.map(({ cp, summary }) => {
+                      const open = expanded.has(cp.id)
+                      const detailsId = `checkpoint-details-${cp.id}`
+                      return (
+                        <Fragment key={cp.id}>
+                          <tr className={cn("border-b align-top", open && "bg-muted/40")}>
+                            <td className="py-2 pl-2">
+                              <button
+                                type="button"
+                                aria-expanded={open}
+                                aria-controls={detailsId}
+                                aria-label={`${open ? "Hide" : "Show"} the full position for ${cp.source_table}`}
+                                onClick={() => toggle(cp.id)}
+                                className="rounded p-0.5 text-muted-foreground hover:bg-muted hover:text-foreground"
+                              >
+                                <ChevronRight className={cn("h-4 w-4 transition-transform", open && "rotate-90")} />
+                              </button>
+                            </td>
+                            <td className="max-w-[16rem] break-words py-2 pr-4 font-medium">{cp.source_table}</td>
+                            <td className="whitespace-nowrap py-2 pr-4">
+                              {summary.state === "complete" ? (
+                                <Badge
+                                  variant="outline"
+                                  className="border-emerald-300 text-emerald-700 dark:border-emerald-800 dark:text-emerald-400"
+                                >
+                                  Finished
+                                </Badge>
+                              ) : summary.state === "in_progress" ? (
+                                <Badge
+                                  variant="outline"
+                                  className="border-sky-300 text-sky-700 dark:border-sky-800 dark:text-sky-400"
+                                >
+                                  Mid-table
+                                </Badge>
+                              ) : (
+                                <span className="text-xs text-muted-foreground">—</span>
+                              )}
+                            </td>
+                            <td className="wrap-anywhere py-2 pr-4 font-mono text-xs">{summary.resume}</td>
+                            <td className="whitespace-nowrap py-2 pr-4 text-right text-xs tabular-nums">
+                              {summary.tableRows !== null ? exactCount.format(summary.tableRows) : "—"}
+                            </td>
+                            <td
+                              className="whitespace-nowrap py-2 pr-3 text-xs text-muted-foreground"
+                              title={fmtWhen(cp.updated_at)}
+                            >
+                              {fmtAgo(cp.updated_at)}
+                            </td>
+                          </tr>
+                          {open && (
+                            <tr id={detailsId} className="border-b bg-muted/40">
+                              <td />
+                              <td colSpan={5} className="pb-3 pr-3">
+                                {positionEntries(cp.position).length === 0 ? (
+                                  <span className="font-mono text-xs text-muted-foreground">
+                                    {formatPosition(cp.position)}
+                                  </span>
+                                ) : (
+                                  <dl className="grid grid-cols-1 gap-x-6 gap-y-1 font-mono text-xs sm:grid-cols-[max-content_1fr]">
+                                    {positionEntries(cp.position).map(([k, v]) => (
+                                      <div key={k} className="contents">
+                                        <dt className="text-muted-foreground">{k}</dt>
+                                        <dd className="break-all">{v}</dd>
+                                      </div>
+                                    ))}
+                                  </dl>
+                                )}
+                              </td>
+                            </tr>
+                          )}
+                        </Fragment>
+                      )
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         )}
       </CardContent>

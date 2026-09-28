@@ -4,7 +4,10 @@
 {{- $sinkName := include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "kafka-mcp-sink" "version" "v1.0.0") }}
 {{/*
 The CDC plane. Three components, and pre-flight requires all three together
-(internal/workers/infra_preflight.go, CDC branch) — kafka-connect at
+for a CDC run. kafka-connect and debezium-mcp are gated on
+connectors.cdc.enabled; kafka-mcp-sink (end of this file) renders on every
+install, because batch pre-flight requires it too. CDC pre-flight
+(internal/workers/infra_preflight.go) probes kafka-connect at
 KAFKA_CONNECT_URL, plus these two literal hosts:
 
     http://<STACK_PREFIX>-debezium-v1-0-0-mcp:8000/health
@@ -495,6 +498,15 @@ spec:
           emptyDir: {}
           {{- end }}
         {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
+{{- end }}
+{{/*
+kafka-mcp-sink is NOT part of the optional CDC plane: it writes every batch run
+to the destination too, and batch pre-flight requires it whenever a pipeline
+has a destination (infra_preflight.go). So it renders even with
+connectors.cdc.enabled=false, like the quickstart compose runs it unprofiled.
+*/}}
+{{- $fullname := include "rsync-ai.fullname" . }}
+{{- $sinkName := include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "kafka-mcp-sink" "version" "v1.0.0") }}
 ---
 apiVersion: v1
 kind: Service
@@ -632,4 +644,3 @@ spec:
       volumes:
         {{- include "rsync-ai.kafkaTLSVolume" . | nindent 8 }}
       {{- end }}
-{{- end }}

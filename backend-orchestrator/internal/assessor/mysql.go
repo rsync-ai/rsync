@@ -88,7 +88,7 @@ func (a *MySQLAssessor) Assess(ctx context.Context, in Input) (*Result, error) {
 	// matches nothing, and those rows are silently dropped). Skipped for a
 	// batch load to a file/SaaS destination, which appends rather than upserts.
 	if len(in.Tables) > 0 && in.RequiresTablePrimaryKeys() {
-		r.Checks = append(r.Checks, checkMySQLTablePrimaryKeys(ctx, db, in.ConnectionConfig, in.Tables, in.IsCDC(), in.CDCBlocksWithoutPrimaryKey(), in.NominatedKeys)...)
+		r.Checks = append(r.Checks, checkMySQLTablePrimaryKeys(ctx, db, in.ConnectionConfig, in.Tables, in.CDCDatabaseDestination(), in.NominatedKeys)...)
 	}
 
 	Summarize(r)
@@ -195,7 +195,9 @@ func isLocalAssessorMySQLHost(host string) bool {
 		}
 		return false
 	}
-	return !strings.Contains(h, ".")
+	// A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+	// suffix resolves on public DNS (shared/local_db_host_golden.json).
+	return !strings.Contains(h, ".") || strings.HasSuffix(h, ".svc") || strings.HasSuffix(h, ".cluster.local")
 }
 
 // showVariable runs `SHOW VARIABLES LIKE 'name'` and returns the value.
@@ -415,7 +417,7 @@ func checkMySQLReplicationGrants(ctx context.Context, db *sql.DB, cfg map[string
 	}
 }
 
-func checkMySQLTablePrimaryKeys(ctx context.Context, db *sql.DB, cfg map[string]string, tables []string, cdcMode, cdcBlocks bool, nominated map[string][]string) []Check {
+func checkMySQLTablePrimaryKeys(ctx context.Context, db *sql.DB, cfg map[string]string, tables []string, cdcDBDest string, nominated map[string][]string) []Check {
 	defaultDB := strings.TrimSpace(cfg["database"])
 	if defaultDB == "" {
 		defaultDB = strings.TrimSpace(cfg["db_name"])
@@ -434,12 +436,12 @@ func checkMySQLTablePrimaryKeys(ctx context.Context, db *sql.DB, cfg map[string]
 			dbName = defaultDB
 			tableName = strings.Trim(t, "`\"")
 		}
-		out = append(out, withObject(oneMySQLTablePKCheck(ctx, db, dbName, tableName, cdcMode, cdcBlocks, nominatedColsFor(nominated, dbName, tableName)), dbName+"."+tableName))
+		out = append(out, withObject(oneMySQLTablePKCheck(ctx, db, dbName, tableName, cdcDBDest, nominatedColsFor(nominated, dbName, tableName)), dbName+"."+tableName))
 	}
 	return out
 }
 
-func oneMySQLTablePKCheck(ctx context.Context, db *sql.DB, dbName, table string, cdcMode, cdcBlocks bool, nominatedCols []string) Check {
+func oneMySQLTablePKCheck(ctx context.Context, db *sql.DB, dbName, table string, cdcDBDest string, nominatedCols []string) Check {
 	code := "CDC_TABLE_MISSING_PRIMARY_KEY"
 	var tableExists bool
 	err := db.QueryRowContext(ctx,
@@ -513,21 +515,17 @@ func oneMySQLTablePKCheck(ctx context.Context, db *sql.DB, dbName, table string,
 			Message: fmt.Sprintf("%s.%s has a primary key", dbName, table),
 		}
 	}
-	// Past this point the table has no VISIBLE primary key. When the table has
-	// no PRIMARY constraint at all (pkCols == 0) and the CDC executor blocks on
-	// that, neither the surrogate key nor a column nomination can save the run —
-	// say so as an ERROR rather than clearing it
-	// (KI-CDC-ASSESS-PK-FALLBACK-NOT-IMPLEMENTED).
-	//
-	// A GIPK table (pkCols > 0, all invisible) is deliberately excluded: the
-	// executor's validator counts information_schema.KEY_COLUMN_USAGE rows for
-	// CONSTRAINT_NAME='PRIMARY', which includes invisible columns, so those
-	// tables really do start — they degrade to the content-hash path, which is
-	// what the existing warning below already says.
-	if cdcBlocks && pkCols == 0 {
-		return blockingMissingPKCheck(
+	// Past this point the table has no VISIBLE primary key. With no PRIMARY
+	// constraint at all (pkCols == 0), CDC into a database streams the table
+	// (policy 2026-09-27; it used to be blocked) but cannot apply its UPDATEs or
+	// DELETEs in place — say exactly that, with the ALTER TABLE that fixes it.
+	// A GIPK table (pkCols > 0, every key column invisible) keeps its own
+	// MYSQL_TABLE_PRIMARY_KEY_INVISIBLE warning below, unchanged.
+	if cdcDBDest != "" && pkCols == 0 {
+		return keylessCDCDriftCheck(
 			fmt.Sprintf("%s.%s", dbName, table),
 			fmt.Sprintf("ALTER TABLE `%s`.`%s` ADD PRIMARY KEY (`id`);", dbName, table),
+			cdcDBDest,
 			nominatedCols,
 		)
 	}

@@ -114,9 +114,11 @@ spec:
             # /health itself. Names mirror cdc.yaml, which this block must track.
             - name: KAFKA_CONNECT_URL
               value: "http://{{ $fullname }}-kafka-connect:8083"
+            {{- end }}
+            # Outside the cdc gate: cdc.yaml renders kafka-mcp-sink on every
+            # install, because batch runs write through it too.
             - name: KAFKA_SINK_URL
               value: "http://{{ include "rsync-ai.connectorServiceName" (dict "prefix" .Values.global.stackPrefix "id" "kafka-mcp-sink" "version" "v1.0.0") }}:8000"
-            {{- end }}
             {{- if .Values.generation.enabled }}
             - name: TOOL_GENERATOR_URL
               value: "http://{{ $fullname }}-tool-generator:5010"

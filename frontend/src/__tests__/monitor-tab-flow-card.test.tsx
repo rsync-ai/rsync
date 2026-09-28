@@ -117,10 +117,18 @@ async function tick(ms: number) {
   })
 }
 
+// The card mounts on "Loading throughput…" and draws its rows only once
+// /table-stats answers, so waiting for the card alone races that response.
+async function findLoadedFlowCard() {
+  const card = await screen.findByTestId("flow-card")
+  await within(card).findByTestId("flow-row-load")
+  return card
+}
+
 describe("CDC Flow card", () => {
   it("shows the full-load rows, not a wall of zeros", async () => {
     render(<MonitorTab pipelineId="p1" />)
-    const card = await screen.findByTestId("flow-card")
+    const card = await findLoadedFlowCard()
     const load = within(card).getByTestId("flow-row-load")
     expect(within(load).getAllByText("16,909")).toHaveLength(2) // captured, written
     expect(within(card).getByText(/Changes since the load/i)).toBeInTheDocument()
@@ -131,7 +139,7 @@ describe("CDC Flow card", () => {
   // as four rows of 0 / 0 (prod, 600b012e): one line says it.
   it("says 'none yet' once, not four rows of zeros, when no change has been captured", async () => {
     render(<MonitorTab pipelineId="p1" />)
-    const card = await screen.findByTestId("flow-card")
+    const card = await findLoadedFlowCard()
     expect(within(card).getByTestId("flow-row-changes-none")).toHaveTextContent("Changes since the loadNone yet")
     for (const label of ["Inserts", "Updates", "Deletes", "All changes"]) {
       expect(within(card).queryByText(label)).toBeNull()
@@ -142,7 +150,7 @@ describe("CDC Flow card", () => {
     stats = () =>
       snapshotOnly({ total_inserts: 12, total_cdc_events: 12, total_applied_inserts: 10, total_applied_cdc_events: 10 })
     render(<MonitorTab pipelineId="p1" />)
-    const card = await screen.findByTestId("flow-card")
+    const card = await findLoadedFlowCard()
     expect(within(card).queryByTestId("flow-row-changes-none")).toBeNull()
     for (const label of ["Inserts", "Updates", "Deletes", "All changes"]) {
       expect(within(card).getByText(label)).toBeInTheDocument()
@@ -158,14 +166,14 @@ describe("CDC Flow card", () => {
       return s
     }
     render(<MonitorTab pipelineId="p1" />)
-    const card = await screen.findByTestId("flow-card")
+    const card = await findLoadedFlowCard()
     expect(within(card).queryByTestId("flow-row-changes-none")).toBeNull()
     expect(within(card).getByText("All changes")).toBeInTheDocument()
   })
 
   it("links to Table statistics for the per-table view", async () => {
     render(<MonitorTab pipelineId="p1" />)
-    const card = await screen.findByTestId("flow-card")
+    const card = await findLoadedFlowCard()
     const link = within(card).getByRole("link", { name: /table statistics/i })
     expect(link.getAttribute("href")).toContain("tab=table-stats")
   })
@@ -185,7 +193,7 @@ describe("CDC Flow card", () => {
   it("lists only tables that need attention, and no 'Tables completed' for a stream", async () => {
     stats = () => snapshotOnly({ total_tables: 5, tables_running: 2, tables_degraded: 1, tables_waiting_for_data: 2 })
     render(<MonitorTab pipelineId="p1" />)
-    const card = await screen.findByTestId("flow-card")
+    const card = await findLoadedFlowCard()
     expect(within(card).getByText("Tables degraded")).toBeInTheDocument()
     expect(within(card).getByText("Tables with no data yet")).toBeInTheDocument()
     expect(within(card).queryByText("Tables completed")).toBeNull()

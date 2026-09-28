@@ -68,7 +68,7 @@ GCS_MCP="${GCS_MCP:-rsync-ai-gcs-v1-0-0-mcp}"
 cleanup() {
   log ""
   log "🧹 Cleanup (best-effort)…"
-  docker rm -f "${BS}" "${AZ}" "${GE}" >/dev/null 2>&1 || true
+  docker rm -fv "${BS}" "${AZ}" "${GE}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -82,13 +82,13 @@ log "=================================================="
 
 # ---- emulators ---------------------------------------------------------------
 log "▶ starting throwaway MinIO '${BS}' (source+dest+claim-check)…"
-docker rm -f "${BS}" >/dev/null 2>&1 || true
+docker rm -fv "${BS}" >/dev/null 2>&1 || true
 docker run -d --name "${BS}" --network "${MCP_NET}" \
   -e MINIO_ROOT_USER="${BS_KEY}" -e MINIO_ROOT_PASSWORD="${BS_SECRET}" \
   cgr.dev/chainguard/minio:latest server /data >/dev/null || die "failed to start MinIO ${BS}"
 
 log "▶ starting throwaway Azurite '${AZ}' (cross-provider dest)…"
-docker rm -f "${AZ}" >/dev/null 2>&1 || true
+docker rm -fv "${AZ}" >/dev/null 2>&1 || true
 docker run -d --name "${AZ}" --network "${MCP_NET}" \
   -e "AZURITE_ACCOUNTS=${AZ_ACCT}:${AZ_KEY}" \
   mcr.microsoft.com/azure-storage/azurite \
@@ -96,7 +96,7 @@ docker run -d --name "${AZ}" --network "${MCP_NET}" \
   || die "failed to start Azurite ${AZ}"
 
 log "▶ starting throwaway fake-gcs-server '${GE}' (cross-provider dest)…"
-docker rm -f "${GE}" >/dev/null 2>&1 || true
+docker rm -fv "${GE}" >/dev/null 2>&1 || true
 docker run -d --name "${GE}" --network "${MCP_NET}" \
   fsouza/fake-gcs-server:latest -scheme http -port 4443 -external-url "${GE_ENDPOINT}" >/dev/null \
   || die "failed to start fake-gcs-server ${GE}"

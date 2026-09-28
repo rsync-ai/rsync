@@ -10,7 +10,7 @@
  *
  * Pinned here:
  *  - the whole header sends one /state request per tick;
- *  - a finished, idle or paused pipeline is read every 30 s, a live one every 4 s;
+ *  - a finished pipeline is read every 30 s, a paused or idle one every 10 s, a live one every 4 s;
  *  - a hidden tab sends nothing on its ticks and reads once on return;
  *  - the refresh bus reads at once, without leaving a second timer behind;
  *  - a 404 stops the poll for good; the last reader leaving stops it;
@@ -51,6 +51,7 @@ vi.mock("@/lib/api/pipelines", async (importOriginal) => {
 
 import {
   ACTIVE_POLL_MS,
+  PAUSED_POLL_MS,
   SETTLED_POLL_MS,
   statePollMs,
   usePipelineStatePoll,
@@ -112,9 +113,10 @@ afterEach(() => {
 })
 
 describe("statePollMs", () => {
-  it("4 s while live or unknown, 30 s once only a user or a schedule can move it on", () => {
+  it("4 s while live or unknown, 10 s paused or idle, 30 s once finished", () => {
     for (const s of [null, "running", "waiting_for_user", "unknown"] as const) expect(statePollMs(s)).toBe(ACTIVE_POLL_MS)
-    for (const s of ["completed", "failed", "cancelled", "idle", "paused"] as const)
+    for (const s of ["idle", "paused"] as const) expect(statePollMs(s)).toBe(PAUSED_POLL_MS)
+    for (const s of ["completed", "failed", "cancelled"] as const)
       expect(statePollMs(s)).toBe(SETTLED_POLL_MS)
   })
 })
@@ -199,11 +201,12 @@ describe("usePipelineStatePoll — refresh bus and 404", () => {
     await tick(0)
     await tick(20_000)
     expect(stateCalls()).toBe(1)
-    stateOf.p1 = "paused"
+    // Another 30 s status, so the old timer and the new one are due at different times.
+    stateOf.p1 = "failed"
     act(() => emitPipelineRefresh("p1"))
     await tick(0)
     expect(stateCalls()).toBe(2)
-    expect(screen.getByTestId("s")).toHaveTextContent("paused")
+    expect(screen.getByTestId("s")).toHaveTextContent("failed")
     // t=30 s, when the timer set before the refresh was due: it is gone.
     await tick(10_000)
     expect(stateCalls()).toBe(2)
@@ -307,12 +310,13 @@ describe("overflow menu — Stop hides itself until the next read", () => {
     render(<PipelineHeaderOverflowMenu pipelineId="p1" pipelineName="P1" pipelineType="cdc" status="running" />)
     await waitFor(() => expect(stateCalls()).toBe(1))
 
-    // Stop keeps the menu open (onSelect prevents the close), so the item's
-    // disappearance and return are both visible in it.
+    // Stop closes the menu (U-16), so reopen it to see the item gone, then back.
     await user.click(screen.getByRole("button", { name: /open pipeline menu/i }))
     await user.click(screen.getByRole("menuitem", { name: /stop pipeline/i }))
     await waitFor(() => expect(release).not.toBeNull())
-    await waitFor(() => expect(screen.queryByRole("menuitem", { name: /stop pipeline/i })).not.toBeInTheDocument())
+    await user.click(screen.getByRole("button", { name: /open pipeline menu/i }))
+    await screen.findByRole("menu")
+    expect(screen.queryByRole("menuitem", { name: /stop pipeline/i })).not.toBeInTheDocument()
 
     await act(async () => {
       release?.()

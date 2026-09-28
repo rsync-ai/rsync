@@ -59,6 +59,48 @@ func TestBatchPreflightChecksMinioAsAnOptionalStagingStore(t *testing.T) {
 	}
 }
 
+// Every batch run dispatches its rows through kafka-mcp-sink (the executor
+// starts a sink worker for the batch topic before producing), so a batch
+// preflight that skipped the sink let a run start, fill Kafka with nothing
+// consuming it, and sit "running" until the reconcile deadline. The sink is
+// required for batch exactly as it is for CDC: no fallback.
+func TestBatchPreflightRequiresTheKafkaSink(t *testing.T) {
+	p := &infraPreflightStage{}
+	task := executor.ExecutorTask{
+		Source:      &executor.ConnectorConfig{Type: "postgresql"},
+		Destination: &executor.ConnectorConfig{Type: "gcs"},
+	}
+
+	sink, ok := findService(p.requiredServices(task, false), "kafka-mcp-sink")
+	if !ok {
+		t.Fatal("batch preflight does not check kafka-mcp-sink, so a batch run starts with nothing draining its topic")
+	}
+	if sink.fallback != "" {
+		t.Errorf("batch kafka-mcp-sink is optional (fallback %q) — no batch row reaches the destination without it", sink.fallback)
+	}
+	if sink.kind != "mcp_core" || sink.mcpName != "kafka-mcp-sink" {
+		t.Errorf("batch kafka-mcp-sink probed as kind=%q mcp=%q, want the CDC probe (mcp_core, kafka-mcp-sink)", sink.kind, sink.mcpName)
+	}
+	if !strings.Contains(sink.healthURL, "kafka-mcp-sink-v1-0-0-mcp:8000/health") {
+		t.Errorf("batch kafka-mcp-sink health URL %q is not the sink container", sink.healthURL)
+	}
+
+	// Batch and CDC must probe the same container, not two drifting copies.
+	cdcSink, ok := findService(p.requiredServices(task, true), "kafka-mcp-sink")
+	if !ok {
+		t.Fatal("CDC preflight lost kafka-mcp-sink")
+	}
+	if cdcSink.healthURL != sink.healthURL {
+		t.Errorf("batch probes %q but CDC probes %q", sink.healthURL, cdcSink.healthURL)
+	}
+
+	// No destination → nothing for a sink to write to; don't demand one.
+	noDst := executor.ExecutorTask{Source: &executor.ConnectorConfig{Type: "postgresql"}}
+	if _, ok := findService(p.requiredServices(noDst, false), "kafka-mcp-sink"); ok {
+		t.Error("batch preflight requires kafka-mcp-sink for a task with no destination")
+	}
+}
+
 func TestAnUnreachableOptionalServiceDegradesInsteadOfFailing(t *testing.T) {
 	orig := preflightInfraRetryDelay
 	preflightInfraRetryDelay = time.Millisecond

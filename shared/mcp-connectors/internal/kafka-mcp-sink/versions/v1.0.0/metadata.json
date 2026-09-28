@@ -136,6 +136,13 @@
       ]
     },
     {
+      "name": "list_sinks",
+      "type": "core",
+      "description": "List the sink workers this container holds",
+      "method": "kafka-mcp-sink_list_sinks",
+      "parameters": []
+    },
+    {
       "name": "test_connection",
       "type": "core",
       "description": "Test connectivity",

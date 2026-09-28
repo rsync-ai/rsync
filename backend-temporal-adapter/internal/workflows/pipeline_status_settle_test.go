@@ -309,7 +309,8 @@ func TestWaitUntilSettledStopsOnErrorAndCancel(t *testing.T) {
 }
 
 // The tests above drive the wait directly; none of them proves the activity still calls
-// it. UpdatePipelineStatusActivity needs a live DB and an activity context, so the
+// it. writePipelineStatus (the body behind UpdatePipelineStatusActivity and
+// FinalizeCompletedRunActivity) needs a live DB and an activity context, so the
 // wiring is pinned against the source, as TestTheTerminalWriteSiteStillRaisesTheAlert
 // does: the wait must run before the check it protects, inside the same function.
 func TestTheTerminalWriteSiteWaitsBeforeJudgingStats(t *testing.T) {
@@ -323,9 +324,9 @@ func TestTheTerminalWriteSiteWaitsBeforeJudgingStats(t *testing.T) {
 		t.Fatalf("%s read back as %d bytes; that is not the activity", path, len(src))
 	}
 
-	fnIdx := strings.Index(src, "func UpdatePipelineStatusActivity(")
+	fnIdx := strings.Index(src, "func writePipelineStatus(")
 	if fnIdx < 0 {
-		t.Fatal("cannot find UpdatePipelineStatusActivity; this guard is now inert")
+		t.Fatal("cannot find writePipelineStatus; this guard is now inert")
 	}
 	body := src[fnIdx:]
 	if end := strings.Index(body[1:], "\nfunc "); end >= 0 {
@@ -334,12 +335,12 @@ func TestTheTerminalWriteSiteWaitsBeforeJudgingStats(t *testing.T) {
 
 	checkIdx := strings.Index(body, "postflightSilentDropCheck(ctx, db, executionID)")
 	if checkIdx < 0 {
-		t.Fatal("UpdatePipelineStatusActivity no longer calls postflightSilentDropCheck; " +
+		t.Fatal("writePipelineStatus no longer calls postflightSilentDropCheck; " +
 			"this guard is anchored to that call and is now inert")
 	}
 	waitIdx := strings.Index(body, "awaitTableStatsSettled(ctx, db, executionID,")
 	if waitIdx < 0 {
-		t.Fatal("UpdatePipelineStatusActivity judges table stats without waiting for them to " +
+		t.Fatal("writePipelineStatus judges table stats without waiting for them to " +
 			"settle — a run whose last TABLE_STATS is still in flight is failed as a silent drop")
 	}
 	if waitIdx > checkIdx {

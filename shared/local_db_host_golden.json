@@ -1,0 +1,33 @@
+{
+  "_comment": "Every copy of the local-vs-remote DB host classifier must answer these the same way. A LOCAL host gets TLS off by default (an explicit tls/sslmode setting still wins); a REMOTE host gets TLS on. The copies: Go api-gateway handlers.isLocalDBHost, backend-orchestrator cdc.IsLocalDBHost and assessor.isLocalAssessorMySQLHost; Python _is_local_db_host in each hand-curated DB connector and in connector_database.py.j2, plus the inline dotless checks in the postgresql, oracle and sqlserver connectors. Kubernetes in-cluster names (*.svc, *.cluster.local) are local for the same reason a dotless docker service name is: neither suffix resolves on public DNS, so only an in-cluster service can answer to it. Tests: shared/mcp-connectors/tests/test_local_db_host_golden.py and a Go test beside each Go copy.",
+  "local": [
+    "",
+    "localhost",
+    "LOCALHOST",
+    "127.0.0.1",
+    "::1",
+    "host.docker.internal",
+    "postgres",
+    "analytics-db",
+    "10.0.0.5",
+    "192.168.1.20",
+    "100.64.1.1",
+    "mongo.sources.svc.cluster.local",
+    "rsync-mongo.sources.svc.cluster.local",
+    "Mongo.Sources.SVC.Cluster.Local",
+    "mongo.sources.svc",
+    "pg-0.pg-headless.sources.svc.cluster.local",
+    "  mongo.sources.svc.cluster.local  "
+  ],
+  "remote": [
+    "cluster0.abcd1.mongodb.net",
+    "db.example.com",
+    "mydb.postgres.database.azure.com",
+    "8.8.8.8",
+    "2001:4860:4860::8888",
+    "svc.example.com",
+    "mongo.svc.example.com",
+    "cluster.local.example.com",
+    "db.cluster.localhost.example.com"
+  ]
+}

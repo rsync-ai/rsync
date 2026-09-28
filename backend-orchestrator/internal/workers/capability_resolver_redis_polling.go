@@ -76,11 +76,6 @@ func (w *CapabilityResolverWorker) pollAndProcessRequests() error {
 }
 
 func (w *CapabilityResolverWorker) processCorrelationRequest(req *correlation.PendingRequest) {
-	ctx, cancel := correlationWorkContext(w.ctx, "connector_resolver")
-	defer cancel()
-	deliverCtx, cancelDeliver := correlationDeliveryContext()
-	defer cancelDeliver()
-
 	logger := log.WithFields(log.Fields{
 		"correlation_id": req.CorrelationID,
 		"request_type":   req.RequestType,
@@ -109,39 +104,26 @@ func (w *CapabilityResolverWorker) processCorrelationRequest(req *correlation.Pe
 	}
 
 	// PHASE 2.4 FIX: Use main ProcessTask method which has connection ID resolution logic
-	result, err := w.ProcessTask(ctx, task)
-
-	if err != nil {
-		logger.WithError(err).Error("❌ Task processing failed")
-
-		// Write error response to Redis
-		errorResult := TaskResult{
-			TaskID:      task.TaskID,
-			WorkflowID:  task.WorkflowID,
-			StepID:      task.StepID,
-			Status:      "failure",
-			Error:       err.Error(),
-			Output:      map[string]interface{}{"error": err.Error()},
-			CompletedAt: time.Now(),
-			TraceID:     task.TraceID,
+	// Route the result (or the error result) and delete the request once the
+	// work returns — on a fresh delivery context.
+	runCorrelationRequest(w.ctx, "connector_resolver", w.correlationClient, task, logger, func(ctx context.Context) TaskResult {
+		result, err := w.ProcessTask(ctx, task)
+		if err != nil {
+			logger.WithError(err).Error("❌ Task processing failed")
+			return TaskResult{
+				TaskID:      task.TaskID,
+				WorkflowID:  task.WorkflowID,
+				StepID:      task.StepID,
+				Status:      "failure",
+				Error:       err.Error(),
+				Output:      map[string]interface{}{"error": err.Error()},
+				CompletedAt: time.Now(),
+				TraceID:     task.TraceID,
+			}
 		}
-
-		if routeErr := RouteResult(deliverCtx, task, errorResult); routeErr != nil {
-			logger.WithError(routeErr).Error("Failed to route error response")
-		}
-	} else {
 		logger.Info("✅ Task processing succeeded")
-
-		// Write success response to Redis
-		if routeErr := RouteResult(deliverCtx, task, result); routeErr != nil {
-			logger.WithError(routeErr).Error("Failed to route success response")
-		}
-	}
-
-	// Delete request from Redis after processing
-	if delErr := w.correlationClient.DeleteRequest(deliverCtx, req.CorrelationID, "connector_resolver"); delErr != nil {
-		logger.WithError(delErr).Warn("Failed to delete request from Redis")
-	}
+		return result
+	})
 
 	logger.Info("📤 Capability_resolver request processed and response sent to Redis")
 }

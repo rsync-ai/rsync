@@ -335,53 +335,9 @@ func UpdateCDCTables(db *sql.DB, reaper *RemovedTopicReaper) gin.HandlerFunc {
 			return
 		}
 
-		// P0 guard: For relational destinations, CDC tables MUST have PKs.
-		// We validate at table-update time to prevent silently adding non-upsertable tables.
-		if requiresPK, _, derr := pipelineDestinationRequiresPKValidation(ctx, db, req.PipelineID); derr == nil && requiresPK {
-			kafkaConnectURL := strings.TrimRight(getKafkaConnectURL(), "/")
-			connCfg, cfgErr := fetchKafkaConnectConfig(ctx, kafkaConnectURL, connectorName)
-			if cfgErr != nil {
-				c.JSON(http.StatusBadGateway, gin.H{"success": false, "error": cfgErr.Error()})
-				return
-			}
-
-			sourceConnID, scErr := findPipelineSourceConnectionID(ctx, db, req.PipelineID)
-			if scErr != nil {
-				c.JSON(http.StatusNotFound, gin.H{"success": false, "error": scErr.Error()})
-				return
-			}
-
-			dbType := inferDebeziumDatabaseType(connCfg)
-			defaultDB, defaultSchema := inferDefaultDBAndSchema(connCfg)
-
-			// Dispatch PK validation through the provider registry. The provider
-			// selects which default namespace (database vs schema) qualifies
-			// unqualified table names for its family.
-			mgr, ok := cdc.NewProvider(dbType, db)
-			if !ok {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"success": false,
-					"error":   "cdc_pk_validation_unsupported",
-					"message": fmt.Sprintf("PK validation is not supported for Debezium connector type %q", dbType),
-				})
-				return
-			}
-			namespace := mgr.PrimaryKeyNamespace(defaultDB, defaultSchema)
-			missing, verr := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, namespace, req.Tables)
-			if verr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"success": false, "error": verr.Error()})
-				return
-			}
-			if len(missing) > 0 {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"success": false,
-					"error":   "missing_primary_key",
-					"message": missingPrimaryKeyMessage,
-					"tables":  missing,
-				})
-				return
-			}
-		}
+		// No primary-key gate here: a keyless table is allowed into every
+		// destination (policy 2026-09-27). The pre-flight assessor warns about the
+		// drift it causes in a database destination.
 
 		// Update connector configuration via Kafka Connect API
 		kafkaConnectURL := getKafkaConnectURL()
@@ -429,19 +385,10 @@ func UpdateCDCTables(db *sql.DB, reaper *RemovedTopicReaper) gin.HandlerFunc {
 	}
 }
 
-// missingPrimaryKeyMessage is the refusal text for a keyless table headed to a
-// database destination. CDC auto-pickup keys on the "missing_primary_key" error
-// code, not on this text.
-const missingPrimaryKeyMessage = "CDC to a database destination (PostgreSQL, MySQL or MongoDB) needs a PRIMARY KEY on every table: the destination upserts and deletes on it. Add a PRIMARY KEY or remove these tables."
-
-func pipelineDestinationRequiresPKValidation(ctx context.Context, db *sql.DB, pipelineID string) (bool, string, error) {
-	// Enforce PKs for every DATABASE destination: relational (upsert/delete on the
-	// key) and MongoDB, where the sink upserts on the key too — a keyless table
-	// there either gets a guessed key (rows sharing it replace each other) or is
-	// inserted blind (every re-snapshot duplicates it). Object storage is
-	// append-only, so a keyless table there is only a warning. The product rule:
-	// keyless → blocked for any DB destination (the executor's hard-block and
-	// assessor.CDCBlocksWithoutPrimaryKey carry the same list).
+// pipelineDestinationType returns the pipeline's destination connector_type,
+// lower-cased and alias-folded (normalizeCDCDestType). The backfill handlers
+// use it for the object-storage rules.
+func pipelineDestinationType(ctx context.Context, db *sql.DB, pipelineID string) (string, error) {
 	var destConnectorType sql.NullString
 	err := db.QueryRowContext(ctx, `
 		SELECT c.connector_type
@@ -450,10 +397,9 @@ func pipelineDestinationRequiresPKValidation(ctx context.Context, db *sql.DB, pi
 		WHERE p.id = $1::uuid
 	`, pipelineID).Scan(&destConnectorType)
 	if err != nil {
-		return false, "", err
+		return "", err
 	}
-	dest := strings.ToLower(strings.TrimSpace(destConnectorType.String))
-	return cdcDestinationRequiresPrimaryKeys(dest), normalizeCDCDestType(dest), nil
+	return normalizeCDCDestType(strings.ToLower(strings.TrimSpace(destConnectorType.String))), nil
 }
 
 // normalizeCDCDestType folds destination connector_type aliases the same way the
@@ -466,17 +412,6 @@ func normalizeCDCDestType(dest string) string {
 		return "mysql"
 	default:
 		return dest
-	}
-}
-
-// cdcDestinationRequiresPrimaryKeys is the destination list of the keyless-table
-// block: every database destination rsync upserts into.
-func cdcDestinationRequiresPrimaryKeys(dest string) bool {
-	switch normalizeCDCDestType(strings.ToLower(strings.TrimSpace(dest))) {
-	case "postgresql", "mysql", "mongodb":
-		return true
-	default:
-		return false
 	}
 }
 
@@ -902,8 +837,8 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer, requests *cdcsnaps
 
 		connectorClass := strings.ToLower(strings.TrimSpace(fmt.Sprint(connCfg["connector.class"])))
 
-		// Find the source connection up front: both channels validate primary keys
-		// against the source before signalling.
+		// Find the source connection up front: the source-table signal channel
+		// writes its signal row through it.
 		sourceConnID, err := findPipelineSourceConnectionID(ctx, db, pipelineID)
 		if err != nil {
 			c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
@@ -917,10 +852,9 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer, requests *cdcsnaps
 		// every engine that wires it, and it writes nothing to the source.
 		channel := backfillSignalChannel(connCfg)
 
-		// One destination lookup serves the primary-key gate and the object
-		// storage rules. A failed lookup keeps the old fail-open behaviour: no
-		// PK gate, no object-storage rules.
-		requiresPK, destType, destErr := pipelineDestinationRequiresPKValidation(ctx, db, pipelineID)
+		// The destination type drives the object-storage rules. A failed lookup
+		// keeps the old fail-open behaviour: no object-storage rules.
+		destType, destErr := pipelineDestinationType(ctx, db, pipelineID)
 		if destErr != nil {
 			log.WithError(destErr).WithField("pipeline_id", pipelineID).Warn("CDC backfill: could not read the destination type")
 		}
@@ -956,10 +890,6 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer, requests *cdcsnaps
 				})
 				return
 			}
-			if halt := backfillMissingPKs(ctx, c, db, requiresPK, sourceConnID, dbType, defaultDB, defaultSchema, tables); halt {
-				return
-			}
-
 			collections := normalizeDebeziumCollections(pkNamespaceFor(dbType, defaultDB, defaultSchema), tables)
 			if dbType == "mongodb" {
 				// "db.collection", qualified exactly as the Edit tables include-list
@@ -1080,24 +1010,6 @@ func BackfillCDCTables(db *sql.DB, signals cdcSignalProducer, requests *cdcsnaps
 		if needsUpdate {
 			if err := putKafkaConnectConfig(ctx, kafkaConnectURL, connectorName, connCfg); err != nil {
 				c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
-				return
-			}
-		}
-
-		// P0 guard: for database destinations (relational and MongoDB), ensure PKs exist before emitting snapshot signals.
-		if requiresPK {
-			mgr := cdc.NewMySQLManager(db)
-			missing, verr := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, dbName, tables)
-			if verr != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": verr.Error()})
-				return
-			}
-			if len(missing) > 0 {
-				c.JSON(http.StatusBadRequest, gin.H{
-					"error":   "missing_primary_key",
-					"message": missingPrimaryKeyMessage,
-					"tables":  missing,
-				})
 				return
 			}
 		}
@@ -1276,7 +1188,7 @@ func GetCDCBackfillCapability(db *sql.DB) gin.HandlerFunc {
 		}
 
 		channel := backfillSignalChannel(connCfg)
-		_, destType, destErr := pipelineDestinationRequiresPKValidation(ctx, db, pipelineID)
+		destType, destErr := pipelineDestinationType(ctx, db, pipelineID)
 		objectStorage := destErr == nil && isObjectStorageDest(destType)
 		modes := backfillModesFor(connCfg, channel, objectStorage)
 		resp := gin.H{
@@ -1412,40 +1324,6 @@ func pkNamespaceFor(dbType, defaultDB, defaultSchema string) string {
 		return defaultSchema
 	}
 	return defaultDB
-}
-
-// backfillMissingPKs applies the same primary-key policy as UpdateCDCTables
-// before a snapshot is signalled: a relational destination needs a PK for
-// upsert/delete. It answers the request itself on any failure and reports
-// halt=true, so the caller just returns. The refusal shape is identical to
-// UpdateCDCTables' — CDC auto-pickup reads {"error":"missing_primary_key",
-// "tables":[…]} from both.
-func backfillMissingPKs(ctx context.Context, c *gin.Context, db *sql.DB, requiresPK bool, sourceConnID, dbType, defaultDB, defaultSchema string, tables []string) (halt bool) {
-	if !requiresPK {
-		return false
-	}
-	mgr, ok := cdc.NewProvider(dbType, db)
-	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":   "cdc_pk_validation_unsupported",
-			"message": fmt.Sprintf("PK validation is not supported for Debezium connector type %q", dbType),
-		})
-		return true
-	}
-	missing, verr := mgr.ValidateTablesHavePrimaryKeys(ctx, sourceConnID, mgr.PrimaryKeyNamespace(defaultDB, defaultSchema), tables)
-	if verr != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": verr.Error()})
-		return true
-	}
-	if len(missing) > 0 {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"error":   "missing_primary_key",
-			"message": missingPrimaryKeyMessage,
-			"tables":  missing,
-		})
-		return true
-	}
-	return false
 }
 
 func normalizeDebeziumCollections(dbName string, tables []string) []string {

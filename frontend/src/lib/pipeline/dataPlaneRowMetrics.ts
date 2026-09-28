@@ -82,3 +82,24 @@ export function extractLatestRowMetrics(
 
   return { read, written }
 }
+
+/**
+ * headerRowLine is the Monitoring header's row line: the current run's rows, in
+ * both modes. It used to take the highest count across every run for CDC, so a
+ * CDC pipeline whose Reload read 75,230 rows showed "Latest data-plane rows: read
+ * 75230" right above a Table statistics tile reading "Total Rows Read 0" for the
+ * run on screen (item 34). The stream's own counters (status polls) never fed
+ * this line anyway — extractLatestRowMetrics skips them — so every event left is
+ * one run's, and the Table statistics panel below reads that same run.
+ *
+ * Returns null when the run has no row counts yet, or no run is known.
+ */
+export function headerRowLine(
+  events: PipelineRunEvent[],
+  executionId: string | null | undefined,
+): { label: string; read?: number; written?: number } | null {
+  if (!executionId) return null
+  const { read, written } = extractLatestRowMetrics(events, executionId)
+  if (read === undefined && written === undefined) return null
+  return { label: "Rows this run:", read, written }
+}

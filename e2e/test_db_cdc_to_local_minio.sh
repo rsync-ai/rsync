@@ -113,7 +113,7 @@ trap cleanup EXIT
 
 setup_minio() {
   if ! docker ps --format '{{.Names}}' | grep -qx "${DEST_MINIO}"; then
-    docker rm -f "${DEST_MINIO}" >/dev/null 2>&1 || true
+    docker rm -fv "${DEST_MINIO}" >/dev/null 2>&1 || true
     docker run -d --name "${DEST_MINIO}" --network "${MCP_NET}" \
       -e "MINIO_ROOT_USER=${MINIO_USER}" -e "MINIO_ROOT_PASSWORD=${MINIO_PASS}" \
       cgr.dev/chainguard/minio:latest server /data >/dev/null

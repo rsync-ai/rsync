@@ -193,7 +193,7 @@ def test_sweep_touches_only_stopped_temporary_names_in_its_own_project(gate):
         "0123456789b1_rsync-ci-mcp-mysql",
     ]
     assert sorted(c for c in gate.calls("docker") if c.startswith("rm ")) == [
-        "rm -f aaaaaaaaaaa1", "rm -f aaaaaaaaaaa2", "rm -f aaaaaaaaaaa3",
+        "rm -fv aaaaaaaaaaa1", "rm -fv aaaaaaaaaaa2", "rm -fv aaaaaaaaaaa3",
     ]
 
 
@@ -216,7 +216,7 @@ def test_name_conflict_removes_the_leftover_and_retries_once(gate):
     assert r.returncode == 0, r.stderr
     assert gate.remaining() == []
     assert gate.calls("compose") == [f"{PROJECT} up -d api-gateway"] * 2
-    assert f"rm -f {LEFTOVER}" in gate.calls("docker")
+    assert f"rm -fv {LEFTOVER}" in gate.calls("docker")
     assert "is already in use" in r.stdout  # the first failure is still shown
 
 

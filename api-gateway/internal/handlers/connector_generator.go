@@ -79,31 +79,43 @@ func isKebabCaseConnectorID(name string) bool {
 	return !prevHyphen
 }
 
-func connectorDirCandidates(connectorName string) []string {
-	c := strings.TrimSpace(connectorName)
-	if c == "" {
-		return []string{}
-	}
-	// Try canonical + common separator swaps.
-	candidates := []string{
-		c,
-		strings.ReplaceAll(c, "-", "_"),
-		strings.ReplaceAll(c, "_", "-"),
-	}
-	seen := make(map[string]struct{}, len(candidates))
-	out := make([]string, 0, len(candidates))
-	for _, v := range candidates {
-		v = strings.TrimSpace(v)
-		if v == "" {
+// connectorLookupRoots are the trees a connector can live in: the public catalog
+// (public/<id> or public/<category>/<id>) and internal plumbing. On an install
+// with no public/ directory GetMCPPublicConnectorsPath falls back to the base
+// path, which is the pre-public flat layout.
+func connectorLookupRoots() []string {
+	seen := map[string]struct{}{}
+	roots := []string{}
+	for _, r := range []string{GetMCPPublicConnectorsPath(), GetMCPInternalConnectorsPath()} {
+		if strings.TrimSpace(r) == "" {
 			continue
 		}
-		if _, ok := seen[v]; ok {
+		r = filepath.Clean(r)
+		if _, ok := seen[r]; ok {
 			continue
 		}
-		seen[v] = struct{}{}
-		out = append(out, v)
+		seen[r] = struct{}{}
+		roots = append(roots, r)
 	}
-	return out
+	return roots
+}
+
+// findConnectorDirs returns the connector root folder (the one holding latest.json,
+// or a legacy top-level metadata.json) in every lookup root where connectorName
+// resolves. Resolution goes through the metadata index, so category folders, id /
+// name / alias spellings and -/_ swaps all match, and the raw name is never joined
+// onto a path. These checks used to join it onto the base path alone, which is
+// not where any connector lives, so already_exists never fired.
+func findConnectorDirs(connectorName string) []string {
+	dirs := []string{}
+	for _, root := range connectorLookupRoots() {
+		rel, err := resolveConnectorDirName(root, connectorName)
+		if err != nil || !isCleanRelDir(rel) {
+			continue
+		}
+		dirs = append(dirs, filepath.Join(root, filepath.FromSlash(rel)))
+	}
+	return dirs
 }
 
 // mcpConnectorIsVersioned returns true only if the connector is present in the required
@@ -111,15 +123,8 @@ func connectorDirCandidates(connectorName string) []string {
 // This prevents legacy (non-versioned) connectors from blocking generation while still
 // being unusable at runtime due to strict version resolution.
 func mcpConnectorIsVersioned(connectorName string) bool {
-	connectorsPath := GetMCPConnectorsPath()
-	for _, cand := range connectorDirCandidates(connectorName) {
-		latestPath := filepath.Join(connectorsPath, cand, "latest.json")
-		if _, err := os.Stat(latestPath); err != nil {
-			continue
-		}
-
-		// Best-effort validate current_version path exists
-		b, err := os.ReadFile(latestPath)
+	for _, dir := range findConnectorDirs(connectorName) {
+		b, err := os.ReadFile(filepath.Join(dir, "latest.json"))
 		if err != nil {
 			continue
 		}
@@ -129,11 +134,11 @@ func mcpConnectorIsVersioned(connectorName string) bool {
 		if err := json.Unmarshal(b, &manifest); err != nil {
 			continue
 		}
-		if strings.TrimSpace(manifest.CurrentVersion) == "" {
+		cv := strings.TrimSpace(manifest.CurrentVersion)
+		if cv == "" || !isCleanRelDir(cv) || strings.ContainsAny(cv, `/\`) {
 			continue
 		}
-		versionedMetadata := filepath.Join(connectorsPath, cand, "versions", manifest.CurrentVersion, "metadata.json")
-		if _, err := os.Stat(versionedMetadata); err != nil {
+		if _, err := os.Stat(filepath.Join(dir, "versions", cv, "metadata.json")); err != nil {
 			continue
 		}
 		return true
@@ -144,14 +149,11 @@ func mcpConnectorIsVersioned(connectorName string) bool {
 // mcpConnectorLegacyExists detects a connector directory that has top-level metadata.json but is missing latest.json.
 // These connectors are considered "legacy" and should be upgradeable via generation.
 func mcpConnectorLegacyExists(connectorName string) bool {
-	connectorsPath := GetMCPConnectorsPath()
-	for _, cand := range connectorDirCandidates(connectorName) {
-		metadataPath := filepath.Join(connectorsPath, cand, "metadata.json")
-		if _, err := os.Stat(metadataPath); err != nil {
+	for _, dir := range findConnectorDirs(connectorName) {
+		if _, err := os.Stat(filepath.Join(dir, "metadata.json")); err != nil {
 			continue
 		}
-		latestPath := filepath.Join(connectorsPath, cand, "latest.json")
-		if _, err := os.Stat(latestPath); err == nil {
+		if _, err := os.Stat(filepath.Join(dir, "latest.json")); err == nil {
 			// Not legacy; it is versioned (or at least has latest.json)
 			continue
 		}
@@ -509,7 +511,7 @@ func GenerateConnector(c *gin.Context) {
 		log.Infof("✅ Successfully generated connector: %s", apiName)
 	}
 
-	c.JSON(resp.StatusCode, payload)
+	c.JSON(browserStatusForUpstream(resp.StatusCode), payload)
 }
 
 // fastAPIDetail flattens a FastAPI error body's `detail` into a single line.
@@ -847,6 +849,6 @@ func ToolGeneratorProxy(c *gin.Context) {
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		c.Header("Content-Type", ct)
 	}
-	c.Status(resp.StatusCode)
+	c.Status(browserStatusForUpstream(resp.StatusCode))
 	c.Writer.Write(respBody)
 }

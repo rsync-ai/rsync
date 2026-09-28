@@ -191,6 +191,11 @@ interface Poller {
 
 const pollers = new Map<string, Poller>()
 
+// A /runtime request gives up after this long. The interval tick waits for the
+// request in flight instead of cancelling it, so without a bound one hung request
+// would hold the poll forever.
+export const RUNTIME_REQUEST_TIMEOUT_MS = 10_000
+
 function isHidden(): boolean {
   return typeof document !== "undefined" && document.visibilityState === "hidden"
 }
@@ -215,9 +220,14 @@ function startPoller(pipelineId: string, pollMs: number): Poller {
     poller.listeners.forEach((l) => l())
   }
 
-  const fetchOnce = async () => {
+  // `supersede` is for a refresh-bus read: something just changed, so a request
+  // sent before it may carry the old answer — cancel it and ask again. A timer
+  // tick never cancels: when /runtime answers slower than the interval, aborting
+  // on every tick meant no answer ever landed and the store kept its last one (a
+  // transient CDC "failed") with no error shown (U-18). The tick skips instead.
+  const fetchOnce = async (supersede = false) => {
     if (stopped || disabled) return
-    // Cancel any in-flight request from the previous tick.
+    if (inflight && !supersede) return
     inflight?.abort()
     const ac = new AbortController()
     inflight = ac
@@ -226,6 +236,7 @@ function startPoller(pipelineId: string, pollMs: number): Poller {
       const res = await authFetch(API_ENDPOINTS.PIPELINES.RUNTIME(pipelineId), {
         cache: "no-store",
         signal: ac.signal,
+        timeoutMs: RUNTIME_REQUEST_TIMEOUT_MS,
       })
       if (!res.ok) {
         if (res.status === 404) {
@@ -248,8 +259,11 @@ function startPoller(pipelineId: string, pollMs: number): Poller {
       if ((e as { name?: string })?.name === "AbortError") return
       update({ error: String((e as Error)?.message ?? e) })
     } finally {
-      // A request a newer tick aborted must not clear the newer one's loading flag.
-      if (inflight === ac) update({ loading: false })
+      // A request a newer read aborted must not clear the newer one's loading flag.
+      if (inflight === ac) {
+        inflight = null
+        update({ loading: false })
+      }
     }
   }
 
@@ -263,7 +277,7 @@ function startPoller(pipelineId: string, pollMs: number): Poller {
   const unsubscribeRefresh = onPipelineRefresh((pid) => {
     if (pid !== pipelineId) return
     if (!notFound) disabled = false
-    void fetchOnce()
+    void fetchOnce(true)
   })
 
   let timer: number | undefined
@@ -275,7 +289,7 @@ function startPoller(pipelineId: string, pollMs: number): Poller {
       if (!isHidden()) void fetchOnce()
     }, pollMs)
     onVisibility = () => {
-      if (!isHidden()) void fetchOnce()
+      if (!isHidden()) void fetchOnce(true)
     }
     document.addEventListener("visibilitychange", onVisibility)
   }

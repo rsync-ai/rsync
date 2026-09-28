@@ -50,6 +50,7 @@ The settings that already stop a service from starting are unchanged. Examples a
 | `POSTGRES_DB` | `rsync` | Database name |
 | `POSTGRES_USER` | `rsync` | Database user |
 | `POSTGRES_PASSWORD` | — | Database password |
+| `ORCHESTRATOR_SCHEMA_WAIT_TIMEOUT` | `120s` | How long the orchestrator waits at boot for the gateway's migrations to create the tables its startup queries read (a Go duration). On timeout it logs the missing tables and starts anyway |
 
 ---
 
@@ -385,6 +386,14 @@ Used by the S3 MCP connector:
 | `S3_ACCESS_KEY` | — | Access key ID |
 | `S3_SECRET_KEY` | — | Secret access key |
 | `S3_REGION` | `us-east-1` | AWS region |
+
+Used by the blob-passthrough lane, which stages file bytes between two storage connectors. The compose files run a separate `blob-staging` MinIO on the connector network for this; the internal MinIO stays unreachable from connectors:
+
+| Variable | Default | Description |
+|---|---|---|
+| `BLOB_STAGING_ACCESS_KEY` | — (required by the quickstart, where `install.sh` generates it) | Root user of the `blob-staging` MinIO |
+| `BLOB_STAGING_SECRET_KEY` | — (required by the quickstart, where `install.sh` generates it) | Root password of the `blob-staging` MinIO |
+| `BLOB_STAGING_ENDPOINT_URL` | set by the compose files to `http://blob-staging:9000` | Staging endpoint the orchestrator hands to connectors. Unset → the lane falls back to `MINIO_ENDPOINT_URL` (Helm, BYO S3) |
 
 ---
 

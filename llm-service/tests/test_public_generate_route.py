@@ -25,16 +25,16 @@ independent readers have to receive it:
   * ``api-gateway/internal/handlers/connector_generator.go:479`` copies ``error``
     into ``error_message`` only when ``error_message`` is ABSENT, and passes the
     upstream status through unchanged (``:491``).
-  * ``frontend/src/lib/api/discovery.ts:298`` (the generate call) reads
-    ``body?.error || body?.detail``.
-  * ``frontend/src/lib/api/discovery.ts:180`` (the generic helper) reads
+  * ``frontend/src/lib/api/discovery.ts:306`` (``generateError``, used by both
+    generate calls) reads ``error_message || error || detail`` and ``suggestions``.
+  * ``frontend/src/lib/api/discovery.ts:183`` (the generic helper) reads
     ``body?.detail || body?.error``.
 
-Neither frontend reader looks at ``error_message`` at all, and neither reads
-``detail`` from a body this route emits. So a refusal that set only
-``error_message`` -- the field the response MODEL declares -- would reach the user
-as a bare "Bad Request". Both fields are set for that reason, and asserting only
-one of them would leave the other free to be dropped.
+Until the spec-upload screen (#1264) the generate reader looked only at ``error``
+and ``detail``, so a refusal that set only ``error_message`` -- the field the
+response MODEL declares -- reached the user as a bare "Bad Request". Both fields
+are still set, because the generic helper and any older frontend read ``error``,
+and asserting only one of them would leave the other free to be dropped.
 
 WHY THERE IS AN IMAGE-TREE GROUP AT THE BOTTOM. The route is only delivered if it
 is reachable in the image the quickstart pulls. ``Dockerfile.oss`` is an
@@ -512,6 +512,10 @@ print("PROBE " + json.dumps({
     "class_name": body.get("class_name"),
     "error_message": body.get("error_message"),
     "moat_modules": moat,
+    # The generate page's discovery probe, when the caller names one.
+    "probe_status": (
+        TestClient(entrypoint.app).get(sys.argv[1]).status_code if len(sys.argv) > 1 else None
+    ),
 }))
 """
 
@@ -551,10 +555,10 @@ def _materialise(dest):
     return copied
 
 
-def _probe(tree):
+def _probe(tree, *argv):
     """`env -i`-equivalent: no inherited PYTHONPATH can put the stripped tree back."""
     return subprocess.run(
-        [sys.executable, "-c", _ROUTE_PROBE],
+        [sys.executable, "-c", _ROUTE_PROBE, *argv],
         cwd=tree,
         env={
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
@@ -609,6 +613,93 @@ def test_the_lifecycle_image_serves_a_generate_request(oss_image_tree):
         "the community entrypoint loaded moat modules: "
         f"{result['moat_modules']}. They are absent from the image, so this would "
         "be a boot failure there."
+    )
+
+
+# ---------------------------------------------------------------------------
+# The generate page's probe: which screen a self-hoster gets
+# ---------------------------------------------------------------------------
+#
+# frontend/src/app/(dashboard)/connectors/generate/page.tsx asks the service for
+# DISCOVERY_PROBE_PATH and offers the OpenAPI upload screen only on a 404. That
+# is a capability probe, not an edition flag, so it is right only while the path
+# is one this image does NOT serve and the cloud service DOES. If the community
+# entrypoint grew the route, self-hosters would get a wizard that cannot run; if
+# the cloud one lost it, cloud users would silently get the upload screen.
+
+FRONTEND_DISCOVERY_CLIENT = os.path.join(
+    LLM_DIR, "..", "frontend", "src", "lib", "api", "discovery.ts"
+)
+DISCOVERY_ROUTES = os.path.join(SRC_DIR, "agents", "tool_generator", "discovery_routes.py")
+
+
+def _frontend_probe_path():
+    with open(FRONTEND_DISCOVERY_CLIENT, encoding="utf-8") as handle:
+        match = re.search(r'DISCOVERY_PROBE_PATH\s*=\s*"([^"]+)"', handle.read())
+    assert match, f"no DISCOVERY_PROBE_PATH literal in {FRONTEND_DISCOVERY_CLIENT}"
+    return match.group(1)
+
+
+def test_the_generate_page_probe_is_answered_404_by_this_image(oss_image_tree):
+    probe_path = _frontend_probe_path()
+    result = _probe_result(_probe(oss_image_tree, probe_path))
+    assert result is not None, "the probe produced no result line"
+    # Vacuity guard: the same app did answer the route it does serve.
+    assert result["http_status"] == 200, result
+    assert result["probe_status"] == 404, (
+        f"the community lifecycle image answers {probe_path} with "
+        f"{result['probe_status']}, not 404, so the generate page would show "
+        "self-hosters the discovery wizard, which this image cannot run"
+    )
+
+
+def _declared_routes(path):
+    """(method, path) for each route decorator, in declaration order."""
+    routes = []
+    for node in ast.walk(_parse(path)):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        for decorator in node.decorator_list:
+            if (
+                isinstance(decorator, ast.Call)
+                and isinstance(decorator.func, ast.Attribute)
+                and decorator.args
+                and isinstance(decorator.args[0], ast.Constant)
+            ):
+                routes.append((decorator.lineno, decorator.func.attr, decorator.args[0].value))
+    return [(method, route) for _, method, route in sorted(routes)]
+
+
+def _first_match(routes, method, path):
+    """The route Starlette dispatches to: the first declared one whose pattern matches."""
+    for declared_method, declared in routes:
+        pattern = re.sub(r"\{[^}:]+:path\}", ".*", declared)
+        pattern = re.sub(r"\{[^}]+\}", "[^/]+", pattern)
+        if declared_method == method and re.fullmatch(pattern, path):
+            return declared
+    return None
+
+
+def test_the_generate_page_probe_names_a_route_the_cloud_service_serves():
+    """Reachable, not merely declared.
+
+    GET /v1/discover/metrics is declared in the same module but after
+    GET /v1/discover/{session_id}, which matches it first, so the cloud service
+    answers it 404 too. A declared-only check would accept that path.
+    """
+    if not os.path.exists(DISCOVERY_ROUTES) and not tree_is_intact():
+        pytest.skip("discovery_routes.py stripped by the public cut (llm-service/oss-strip-list.txt)")
+    routes = _declared_routes(DISCOVERY_ROUTES)
+    assert ("post", "/v1/discover") in routes, (
+        "the discovery module no longer declares POST /v1/discover; this parse is "
+        f"not reading the routes it should: {routes}"
+    )
+    probe_route = _frontend_probe_path().split("?", 1)[0]
+    assert _first_match(routes, "get", probe_route) == probe_route, (
+        f"GET {probe_route} does not dispatch to its own route in discovery_routes.py "
+        f"(first match: {_first_match(routes, 'get', probe_route)}), so the cloud "
+        "service would answer the generate page's probe 404 and every cloud user "
+        "would get the OpenAPI upload screen instead of the discovery wizard"
     )
 
 

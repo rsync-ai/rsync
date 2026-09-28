@@ -140,3 +140,74 @@ func TestStopPipeline_CDCConnectorRefusedKeepsStatus(t *testing.T) {
 		t.Fatalf("db expectations: %v", err)
 	}
 }
+
+// A batch Stop cancelled the Temporal run and flipped the row but never told
+// kafka-mcp-sink, whose "sink-<id8>-batch" worker kept writing the run's
+// backlog into the destination for ~8.5 minutes on prod. Stop must ask the
+// orchestrator to stop that worker — and, being best effort, must still stop
+// the pipeline when the orchestrator cannot.
+func stopBatchHarness(t *testing.T, orchestratorStatus int) (sqlmock.Sqlmock, *[]string, func()) {
+	t.Helper()
+	var calls []string
+	orch := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls = append(calls, r.Method+" "+r.URL.Path)
+		w.WriteHeader(orchestratorStatus)
+		_, _ = w.Write([]byte(`{"success":true,"warnings":["sink-w1"]}`))
+	}))
+	t.Setenv("ORCHESTRATOR_URL", orch.URL)
+
+	mock, cleanup := wsScopeMockDB(t)
+	mock.MatchExpectationsInOrder(false)
+	mock.ExpectQuery(`SELECT wm\.role\s+FROM pipelines r`).
+		WithArgs(wsScopePipeline, wsScopeUser, wsScopeWS).
+		WillReturnRows(gateRoleRows("member"))
+	mock.ExpectQuery(`SELECT p\.status, .* FROM pipelines p WHERE p\.id = \$1 AND p\.workspace_id = \$2`).
+		WithArgs(wsScopePipeline, wsScopeWS).
+		WillReturnRows(sqlmock.NewRows([]string{"status", "is_cdc"}).AddRow("running", false))
+	mock.ExpectExec(`UPDATE pipelines SET status = 'stopped'`).
+		WithArgs(wsScopePipeline, wsScopeWS).WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectQuery(`FROM pipeline_progress`).WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{"execution_id"}))
+	mock.ExpectQuery(`FROM executions`).WithArgs(wsScopePipeline).
+		WillReturnRows(sqlmock.NewRows([]string{"id"}))
+	return mock, &calls, func() { cleanup(); orch.Close() }
+}
+
+func TestStopPipeline_BatchStopsTheSinkWorker(t *testing.T) {
+	mock, calls, cleanup := stopBatchHarness(t, http.StatusOK)
+	defer cleanup()
+
+	w := serveStop(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s", w.Code, w.Body.String())
+	}
+	want := "PUT /api/v1/pipelines/" + wsScopePipeline + "/sink/stop"
+	if len(*calls) != 1 || (*calls)[0] != want {
+		t.Fatalf("orchestrator calls = %v; want exactly [%s] — the batch sink worker keeps draining after Stop", *calls, want)
+	}
+	if !strings.Contains(w.Body.String(), "sink-w1") {
+		t.Fatalf("sink warnings not passed on: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}
+
+func TestStopPipeline_BatchStopSucceedsWhenTheSinkStopFails(t *testing.T) {
+	mock, calls, cleanup := stopBatchHarness(t, http.StatusInternalServerError)
+	defer cleanup()
+
+	w := serveStop(t)
+	if w.Code != http.StatusOK {
+		t.Fatalf("code=%d body=%s; a failed sink stop must not fail the user's Stop", w.Code, w.Body.String())
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("orchestrator calls = %v; want the sink stop to be attempted", *calls)
+	}
+	if !strings.Contains(w.Body.String(), "sink worker") {
+		t.Fatalf("a failed sink stop is not reported as a warning: %s", w.Body.String())
+	}
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("db expectations: %v", err)
+	}
+}

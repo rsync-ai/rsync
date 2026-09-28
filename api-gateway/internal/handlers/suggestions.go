@@ -78,5 +78,5 @@ func GenerateSuggestions(c *gin.Context) {
 	defer resp.Body.Close()
 
 	respBody, _ := io.ReadAll(resp.Body)
-	c.Data(resp.StatusCode, "application/json", respBody)
+	c.Data(browserStatusForUpstream(resp.StatusCode), "application/json", respBody)
 }

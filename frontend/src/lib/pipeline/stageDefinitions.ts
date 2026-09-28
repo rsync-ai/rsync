@@ -13,6 +13,10 @@ export type StageStatus =
   | "failed" 
   | "retrying"
   | "cancelled"
+  // The run went past this stage but nothing says it finished: it started and its
+  // completion was never reported. Neither green nor red — the panel must not
+  // claim a success it did not observe (KI-LIVE-STATE-STAGES-COMPLETED-BY-POSITION).
+  | "unknown"
 
 export type ExecutionState = 
   | "idle" 
@@ -37,6 +41,8 @@ export const VALID_STAGE_TRANSITIONS: Record<StageStatus, StageStatus[]> = {
   // Allow failed -> running for robust out-of-order/compact event streams.
   "failed": ["retrying", "running", "cancelled"], // Can retry if enabled
   "cancelled": [], // Terminal state
+  // A late STAGE_COMPLETED / STAGE_FAILED can still resolve it.
+  "unknown": ["running", "completed", "failed", "cancelled"],
 }
 
 /**

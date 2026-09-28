@@ -1,10 +1,12 @@
 "use client"
 
-import { Suspense } from "react"
+import { Suspense, useEffect, useState } from "react"
 import Link from "next/link"
 import { Loader2, Sparkles, Lock } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { DiscoveryFlow } from "@/components/connectors/discovery/DiscoveryFlow"
+import { SpecUploadFlow } from "@/components/connectors/discovery/SpecUploadFlow"
+import { probeDiscovery, type DiscoveryAvailability } from "@/lib/api/discovery"
 import { canGenerateConnectors } from "@/contexts/CurrentUserContext"
 import { useWorkspaceRole } from "@/contexts/WorkspaceContext"
 
@@ -21,6 +23,11 @@ import { useWorkspaceRole } from "@/contexts/WorkspaceContext"
  *
  * The `?discover=1` query param is no longer required (kept silently for
  * back-compat with any old bookmarks).
+ *
+ * Where the discovery service is not served (the community image strips
+ * it), the page offers SpecUploadFlow instead: the same generate endpoint,
+ * fed an OpenAPI document. Which one is decided by probing the service, never
+ * by an edition flag, and only a 404 selects the upload screen.
  */
 export default function GenerateConnectorPage() {
   return (
@@ -37,6 +44,17 @@ export default function GenerateConnectorPage() {
 function GeneratePageContent() {
   const { role: workspaceRole, isLoading } = useWorkspaceRole()
   const allowed = canGenerateConnectors(workspaceRole)
+  const [discovery, setDiscovery] = useState<DiscoveryAvailability | null>(null)
+  useEffect(() => {
+    let live = true
+    probeDiscovery().then((a) => {
+      if (live) setDiscovery(a)
+    })
+    return () => {
+      live = false
+    }
+  }, [])
+  const specMode = discovery === "unavailable"
   return (
     <div className="container mx-auto px-6 py-8 max-w-6xl">
       {/* Hero */}
@@ -51,34 +69,55 @@ function GeneratePageContent() {
               Generate a connector
             </h1>
             <p className="text-sm text-zinc-600 dark:text-zinc-400 mt-1 max-w-2xl">
-              From any API name to a running MCP connector. We discover protocol, auth,
-              and operations from public docs — and refuse to ship anything we couldn&apos;t verify.
+              {specMode ? (
+                <>
+                  From an OpenAPI or Swagger document to a running MCP connector. Every
+                  operation comes from the document itself — nothing is guessed.
+                </>
+              ) : (
+                <>
+                  From any API name to a running MCP connector. We discover protocol, auth,
+                  and operations from public docs — and refuse to ship anything we couldn&apos;t verify.
+                </>
+              )}
             </p>
           </div>
         </div>
 
         {/* Stepper */}
         <ol className="relative mt-5 flex items-center gap-2 text-xs">
-          <Step n={1} label="Discover" active />
-          <StepConnector />
-          <Step n={2} label="Confirm" />
-          <StepConnector />
-          <Step n={3} label="Generate" />
+          {specMode ? (
+            <>
+              <Step n={1} label="Upload" active />
+              <StepConnector />
+              <Step n={2} label="Generate" />
+            </>
+          ) : (
+            <>
+              <Step n={1} label="Discover" active />
+              <StepConnector />
+              <Step n={2} label="Confirm" />
+              <StepConnector />
+              <Step n={3} label="Generate" />
+            </>
+          )}
         </ol>
       </div>
 
-      {isLoading ? (
+      {isLoading || discovery === null ? (
         <div className="flex items-center justify-center py-16">
           <Loader2 className="h-6 w-6 animate-spin text-violet-500" />
         </div>
-      ) : allowed ? (
+      ) : !allowed ? (
+        <GenerationAccessRequired />
+      ) : specMode ? (
+        <SpecUploadFlow />
+      ) : (
         <DiscoveryFlow
           onGenerate={async (contract) => {
             console.info("[discovery] generation complete", contract.session_id)
           }}
         />
-      ) : (
-        <GenerationAccessRequired />
       )}
     </div>
   )

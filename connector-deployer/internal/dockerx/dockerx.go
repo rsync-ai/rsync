@@ -91,6 +91,10 @@ type DeployOptions struct {
 	Version          string // build label mcp.connector.version (e.g. "v1.0.0")
 	BuildArgs        map[string]string
 	MCPSharedNetwork string // "also-join" net; no-op when == the primary network
+	// ContextHash is ContextHash(ContextDir), computed by the caller. Empty means
+	// the context could not be fingerprinted: an existing image or container is
+	// then reused as it is, as before fingerprints existed.
+	ContextHash string
 }
 
 // DeployResult is the successful outcome of a Deploy.
@@ -188,9 +192,11 @@ func (d *Deployer) Undeploy(ctx context.Context, name string) error {
 //  1. Protected compose containers: running ⇒ reuse (skip); stopped ⇒ start (never
 //     rebuild — may serve a live CDC stream); missing ⇒ nothing to protect, so
 //     fall through to the JIT path (see the note at the branch).
-//  2. Reuse running: an existing running container of this name with recreate=false ⇒ reuse.
+//  2. Reuse running: an existing running container of this name with recreate=false,
+//     made from the current build context (ContextHashLabel), ⇒ reuse.
 //  3. Remove a stale/stopped container of that name if present.
-//  4. Ensure image: build via the BuildKit CLI if the derived image is absent (or recreate).
+//  4. Ensure image: build via the BuildKit CLI if the derived image is absent, was
+//     built from another build context, or recreate is set.
 //  5. spec.BuildContainerSpec → spec.ValidateHostConfigSafe (REFUSE before any create).
 //  6. Merge the JIT discovery labels, ContainerCreate + ContainerStart.
 //  7. Attach aliases on the primary net; also-join MCP_SHARED_NETWORK when it differs
@@ -246,22 +252,23 @@ func (d *Deployer) Deploy(ctx context.Context, req spec.DeployRequest, dcfg spec
 		return DeployResult{}, newErr(KindDaemon, "inspect %s: %v", name, err)
 	}
 	if snap != nil {
-		if snap.Running && !opts.Recreate {
+		if snap.Running && !opts.Recreate && fromContext(snap.Labels, opts.ContextHash) {
 			return DeployResult{ContainerID: shortID(snap.ID), Built: false}, nil // reuse, no rebuild
 		}
 		// Never leave a stale container squatting the name. Swallow errors like the Python.
 		_ = d.backend.Remove(ctx, name, true)
 	}
 
-	// (4) Ensure the image exists (build if missing or recreate).
+	// (4) Ensure the image exists and was built from this context (build if missing,
+	// stale or recreate).
 	built := false
 	imageRef := req.Image
-	exists, err := d.backend.ImageExists(ctx, imageRef)
+	img, err := d.backend.InspectImage(ctx, imageRef)
 	if err != nil {
 		return DeployResult{}, newErr(KindDaemon, "image lookup %s: %v", imageRef, err)
 	}
-	if !exists || opts.Recreate {
-		labels := buildLabels(opts.ConnectorID, opts.Version)
+	if img == nil || opts.Recreate || !fromContext(img.Labels, opts.ContextHash) {
+		labels := buildLabels(opts.ConnectorID, opts.Version, opts.ContextHash)
 		if err := d.backend.BuildImage(ctx, opts.ContextDir, imageRef, opts.BuildArgs, labels); err != nil {
 			return DeployResult{}, newErr(KindBuildFailed, "%v", err)
 		}
@@ -286,6 +293,9 @@ func (d *Deployer) Deploy(ctx context.Context, req spec.DeployRequest, dcfg spec
 	}
 	for k, v := range discoveryLabels(opts.ConnectorID) {
 		cfg.Labels[k] = v
+	}
+	if opts.ContextHash != "" {
+		cfg.Labels[ContextHashLabel] = opts.ContextHash
 	}
 
 	// (6 cont.) Create + start.
@@ -314,6 +324,15 @@ func (d *Deployer) Deploy(ctx context.Context, req spec.DeployRequest, dcfg spec
 	return DeployResult{ContainerID: shortID(id), Built: built}, nil
 }
 
+// fromContext reports whether an image or container carrying labels was made from
+// the build context contextHash fingerprints. One made before fingerprints existed
+// has no label and so counts as stale: an upgrade rebuilds it once. With no
+// fingerprint to compare (contextHash empty) everything counts as current -- reuse,
+// as before.
+func fromContext(labels map[string]string, contextHash string) bool {
+	return contextHash == "" || labels[ContextHashLabel] == contextHash
+}
+
 // discoveryLabels are the runtime container labels from start_container (~603-619)
 // that keep a JIT-spawned container visible to api-gateway's catalog and grouped in
 // the rsync-ai-mcp compose view.
@@ -334,9 +353,10 @@ func discoveryLabels(connectorID string) map[string]string {
 }
 
 // buildLabels are the six build-time labels from _cli_build_with_shared_context,
-// returned in the SAME ORDER the Python emits them so the argv diffs cleanly.
-func buildLabels(connectorID, version string) []string {
-	return []string{
+// returned in the SAME ORDER the Python emits them so the argv diffs cleanly, then
+// the build-context fingerprint when there is one.
+func buildLabels(connectorID, version, contextHash string) []string {
+	labels := []string{
 		"com.docker.compose.project=rsync-ai-mcp",
 		"com.docker.compose.service=" + connectorID,
 		"mcp.connector.version=" + version,
@@ -344,6 +364,10 @@ func buildLabels(connectorID, version string) []string {
 		"mcp.managed=true",
 		"mcp.auto.generated=true",
 	}
+	if contextHash != "" {
+		labels = append(labels, ContextHashLabel+"="+contextHash)
+	}
+	return labels
 }
 
 // ResolveContextDir joins subdir onto toolsDir and returns an absolute build-context

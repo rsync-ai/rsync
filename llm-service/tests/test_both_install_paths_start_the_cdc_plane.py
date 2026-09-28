@@ -39,6 +39,14 @@ PREFLIGHT = os.path.join(
 # making this file guard a service that no longer exists.
 CDC_PLANE = ("kafka-connect", "debezium-mcp", "kafka-mcp-sink")
 
+# The subset that lives behind the `cdc` profile. kafka-mcp-sink is required by
+# the CDC pre-flight too, but it is also the Kafka -> destination writer for
+# BATCH runs (the batch pre-flight requires it whenever there is a
+# destination), so profiling it out would break every batch pipeline on an
+# install without `--profile cdc`. It must always start.
+CDC_PROFILED = ("kafka-connect", "debezium-mcp")
+ALWAYS_ON = tuple(n for n in CDC_PLANE if n not in CDC_PROFILED)
+
 
 def _installer_default_profiles():
     with open(INSTALL_SH) as fh:
@@ -74,7 +82,7 @@ def test_the_preflight_still_requires_all_three():
 
 
 def test_the_compose_file_still_parks_the_plane_behind_one_profile():
-    """A denominator check: three services, one profile, no stragglers."""
+    """A denominator check: two services behind one profile, the sink outside it."""
     services = yaml.safe_load(open(COMPOSE))["services"]
     profiled = {
         name: set(body["profiles"])
@@ -90,7 +98,7 @@ def test_the_compose_file_still_parks_the_plane_behind_one_profile():
     # be unique in both directions so the looser comparison cannot hide a
     # service that quietly left the profile.
     matched = {}
-    for wanted in CDC_PLANE:
+    for wanted in CDC_PROFILED:
         hits = {n for n in behind_cdc if n == wanted or n.startswith(wanted + "-")}
         assert len(hits) == 1, (
             f"the `cdc` profile should hold exactly one service for the "
@@ -102,6 +110,28 @@ def test_the_compose_file_still_parks_the_plane_behind_one_profile():
         f"{sorted(behind_cdc - set(matched.values()))}. Either the pre-flight "
         f"stopped requiring one, or the profile grew a service that will not be "
         f"waited for."
+    )
+
+    for wanted in ALWAYS_ON:
+        hits = {
+            n for n in services if n == wanted or n.startswith(wanted + "-")
+        }
+        assert len(hits) == 1, f"compose should define exactly one {wanted!r} service; got {sorted(hits)}"
+        name = hits.pop()
+        assert not services[name].get("profiles"), (
+            f"{name} is behind profiles {services[name]['profiles']} -- batch runs "
+            "write through it too, so a batch-only install would fail every batch "
+            "run at pre-flight"
+        )
+
+
+def test_the_batch_preflight_requires_the_sink():
+    """The premise for keeping the sink unprofiled: batch needs it too."""
+    with open(PREFLIGHT) as fh:
+        body = fh.read()
+    assert "services = append(services, kafkaSink)" in body, (
+        "the batch pre-flight no longer requires kafka-mcp-sink; re-check whether "
+        "the sink still needs to run outside the `cdc` profile"
     )
 
 

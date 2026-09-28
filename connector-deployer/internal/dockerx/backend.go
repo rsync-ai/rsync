@@ -31,14 +31,21 @@ type ContainerSnapshot struct {
 	ID      string
 	Status  string // "running" | "exited" | "created" | ...
 	Running bool
+	Labels  map[string]string
+}
+
+// ImageSnapshot is the minimal image state the lifecycle needs.
+type ImageSnapshot struct {
+	Labels map[string]string
 }
 
 // Backend is the set of daemon primitives Deploy/Undeploy/Status/Ping use. It is an
 // interface so the lifecycle (including the ValidateHostConfigSafe gate) is testable
-// with a fake and never needs a live docker daemon. Inspect returns (nil, nil) when
-// the container does not exist (mirrors the Python's NotFound handling).
+// with a fake and never needs a live docker daemon. Inspect and InspectImage return
+// (nil, nil) when the container or image does not exist (mirrors the Python's
+// NotFound handling).
 type Backend interface {
-	ImageExists(ctx context.Context, ref string) (bool, error)
+	InspectImage(ctx context.Context, ref string) (*ImageSnapshot, error)
 	BuildImage(ctx context.Context, contextDir, imageRef string, buildArgs map[string]string, labels []string) error
 	Inspect(ctx context.Context, name string) (*ContainerSnapshot, error)
 	Create(ctx context.Context, cfg *container.Config, hc *container.HostConfig, netCfg *network.NetworkingConfig, name string) (string, error)
@@ -81,15 +88,19 @@ func (b *dockerBackend) Ping(ctx context.Context) error {
 	return err
 }
 
-func (b *dockerBackend) ImageExists(ctx context.Context, ref string) (bool, error) {
-	_, _, err := b.cli.ImageInspectWithRaw(ctx, ref)
+func (b *dockerBackend) InspectImage(ctx context.Context, ref string) (*ImageSnapshot, error) {
+	j, _, err := b.cli.ImageInspectWithRaw(ctx, ref)
 	if err != nil {
 		if errdefs.IsNotFound(err) {
-			return false, nil
+			return nil, nil
 		}
-		return false, err
+		return nil, err
 	}
-	return true, nil
+	snap := &ImageSnapshot{}
+	if j.Config != nil {
+		snap.Labels = j.Config.Labels
+	}
+	return snap, nil
 }
 
 func (b *dockerBackend) Inspect(ctx context.Context, name string) (*ContainerSnapshot, error) {
@@ -104,6 +115,9 @@ func (b *dockerBackend) Inspect(ctx context.Context, name string) (*ContainerSna
 	if j.State != nil {
 		snap.Status = j.State.Status
 		snap.Running = j.State.Running
+	}
+	if j.Config != nil {
+		snap.Labels = j.Config.Labels
 	}
 	return snap, nil
 }
@@ -195,7 +209,7 @@ func (b *dockerBackend) buildLegacy(ctx context.Context, contextDir, sharedDir, 
 // buildRootless builds imageRef in the ROOTLESS buildkitd sidecar (BuildConfig.Host) and
 // pushes it to the local registry (RegistryPush), then the HOST daemon pulls the image
 // from the loopback registry alias (RegistryPull) and re-tags it to the bare imageRef —
-// so ImageExists / Create / labels / the response JSON are byte-identical to buildLegacy.
+// so InspectImage / Create / labels / the response JSON are byte-identical to buildLegacy.
 // The connector's (untrusted) Dockerfile RUN/FROM steps run ONLY in the unprivileged
 // rootless builder, which holds no docker.sock; the host daemon fetches finished layers
 // and never executes build steps (SEC-H-02 increment 2).

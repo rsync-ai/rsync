@@ -67,6 +67,34 @@ func (a *Agent) buildStagingConfig() map[string]interface{} {
 		return def
 	}
 	prefix := env("MINIO_PREFIX", "staging")
+	region := env("MINIO_REGION", "us-east-1")
+	// The sink accepts a blob's data_ref only in its staging-bucket allow-list,
+	// which defaults to MINIO_BUCKET (claimcheck_url.go), so the dedicated store
+	// keeps the same bucket name unless both sides are told otherwise.
+	bucket := env("MINIO_BUCKET", "pipeline-data")
+
+	// A dedicated staging store, when the stack runs one. Both connectors resolve
+	// this host themselves, and they join ONLY the connector network (SEC-M-06),
+	// while the claim-check MinIO below is on the internal network only. Handing
+	// them the claim-check MinIO was unresolvable from there, and bridging it
+	// would expose every pipeline's staged rows to every connector. So compose
+	// runs a second, blob-only MinIO on the connector network and names it here
+	// (KI-BLOB-LANE-STAGING-UNREACHABLE-FROM-CONNECTORS). The Helm chart does the
+	// same with its bundled MinIO (templates/infra/blob-staging.yaml), because its
+	// NetworkPolicy keeps connectors out of the platform MinIO
+	// (KI-CHART-NETWORKPOLICY-BLOCKS-CONNECTOR-STAGING). Against external
+	// S3/GCS/Azure neither sets it: the store is outside the cluster anyway.
+	if endpoint := env("BLOB_STAGING_ENDPOINT_URL", ""); endpoint != "" {
+		return map[string]interface{}{
+			"endpoint":   endpoint,
+			"access_key": strings.TrimSpace(os.Getenv("BLOB_STAGING_ACCESS_KEY_ID")),
+			"secret_key": strings.TrimSpace(os.Getenv("BLOB_STAGING_SECRET_ACCESS_KEY")),
+			"region":     env("BLOB_STAGING_REGION", region),
+			"bucket":     env("BLOB_STAGING_BUCKET", bucket),
+			"prefix":     strings.Trim(prefix, "/") + "/blobs",
+		}
+	}
+
 	endpoint := env("MINIO_ENDPOINT_URL", bundledMinIOEndpoint)
 
 	// The static credentials are defaulted ONLY against the bundled MinIO.
@@ -112,8 +140,8 @@ func (a *Agent) buildStagingConfig() map[string]interface{} {
 		"endpoint":   endpoint,
 		"access_key": accessKey,
 		"secret_key": secretKey,
-		"region":     env("MINIO_REGION", "us-east-1"),
-		"bucket":     env("MINIO_BUCKET", "pipeline-data"),
+		"region":     region,
+		"bucket":     bucket,
 		"prefix":     strings.Trim(prefix, "/") + "/blobs",
 	}
 }

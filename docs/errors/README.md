@@ -189,37 +189,32 @@ ran.
 
 ## cdc-missing-pk
 
-**Code:** `CDC_TABLE_MISSING_PRIMARY_KEY` · severity depends on the destination.
+**Code:** `CDC_TABLE_MISSING_PRIMARY_KEY` · a warning; the run proceeds.
 
-A selected table has no `PRIMARY KEY`. What happens next depends on where the data is going:
+A selected table has no `PRIMARY KEY`. It still syncs, but what the destination ends up
+holding depends on the sync type and where the data is going:
 
-- **CDC into a database destination — this BLOCKS the run.** The executor validates a
-  `PRIMARY KEY` *declared on the source table*. Neither the content-hash surrogate key nor a
-  user column nomination reaches that validator, so the run would fail at start with
-  `CDC requires PRIMARY KEY for DB destinations; missing PK on: <table>`.
-- **Otherwise — a warning, and the run proceeds.** rsync loads keyless tables using a
+- **CDC into a database destination (PostgreSQL, MySQL, MongoDB).** Inserts are copied
+  exactly once. Each UPDATE adds a new row (a new document on MongoDB) and the old version
+  stays; DELETEs are not applied (they go to the dead-letter queue). So the destination
+  drifts from the source. A nominated key column does not change this: nominations apply to
+  batch loads only.
+- **Batch loads, and CDC into object storage.** rsync loads keyless tables using a
   content-hash surrogate key (`_rsync_row_hash`). Because the hash covers all columns, a
   later change to any column is written as a **new row** and the prior version is retained,
   so updates accumulate duplicates rather than applying in place.
 
-**Fix (blocking case — pick one)**
+**Fix — for an exact copy**
 
 1. Add a `PRIMARY KEY` on the source table, or promote an existing unique `NOT NULL` index.
-   This is the only fix that lets CDC stream it.
-2. Or deselect this table and stream the keyed tables only.
-3. Or switch this pipeline to a batch (full-refresh) sync, which *does* load keyless tables
-   via the content-hash surrogate key.
+   This is the only fix that makes CDC apply updates and deletes in place.
+2. For a batch load, you can instead nominate the column(s) that uniquely identify a row as
+   the key.
 
 ```sql
--- Required for CDC to a database destination (replace 'id' with the natural key):
+-- Replace 'id' with the natural key:
 ALTER TABLE schema_name.table_name ADD PRIMARY KEY (id);
 ```
-
-**Fix (warning case)**
-
-No action is needed to run. For correct in-place updates, nominate the column(s) that
-uniquely identify a row as the key (recommended), or declare a real primary key on the
-source.
 
 ## cdc-table-not-found
 

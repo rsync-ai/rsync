@@ -45,7 +45,7 @@ APP_DB="${BYO_PG_DB:-pipeline_db}"
 PWFILE="${BYO_PG_PWFILE:-$(dirname "$0")/.byo-postgres-password}"
 
 if [ "${1:-}" = "--down" ]; then
-  docker rm -f "$NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$NAME" >/dev/null 2>&1 || true
   kubectl --context "$KCTX" -n "$NS" delete endpointslice "$NAME" >/dev/null 2>&1 || true
   kubectl --context "$KCTX" -n "$NS" delete service "$NAME" >/dev/null 2>&1 || true
   echo "OK: $NAME removed (password file left at $PWFILE)"
@@ -71,7 +71,7 @@ if [ "${#PW}" -ne 48 ]; then
   exit 1
 fi
 
-docker rm -f "$NAME" >/dev/null 2>&1 || true
+docker rm -fv "$NAME" >/dev/null 2>&1 || true
 
 # POSTGRES_USER/POSTGRES_DB make initdb create the role AND its database, with
 # the role as a superuser of this instance. That is deliberate and is NOT the

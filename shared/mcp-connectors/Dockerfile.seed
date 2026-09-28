@@ -2,8 +2,9 @@
 #
 # Populates the `mcp_connectors` named volume so a COLD self-host boots WITH connectors
 # instead of an empty volume (the "zero connectors = dead-on-arrival" P0). A one-shot init
-# container copies the baked artifacts into the volume on first boot (idempotent — it skips
-# if the volume is already populated, so it never clobbers user-generated connectors).
+# container runs seed-connectors.sh on every boot: it seeds an empty volume, refreshes the
+# shipped connectors after an upgrade, keeps generated connectors, and hands the tree to
+# tool-generator's uid. Its header says exactly what it replaces and keeps.
 #
 # ALLOWLIST COPY — bakes ONLY runtime connector artifacts (all verified YAML-free):
 #   public/         pre-built public connectors + their versions/<v>/ snapshots
@@ -25,6 +26,8 @@ COPY internal/ ./internal/
 COPY schemas/ ./schemas/
 COPY base_connector.py ./base_connector.py
 
-# Default: copy the seed into a volume mounted at /target. The OSS compose overrides this
-# with an idempotency guard (only seed when /target is empty).
-CMD ["sh", "-c", "cp -a /seed/. /target/ && echo 'connectors seeded'"]
+# Outside /seed so the script itself is not copied into the volume. Compose runs this CMD
+# as is -- an inline `command:` there once skipped any populated volume, which is how an
+# upgrade kept the previous release's connector code.
+COPY seed-connectors.sh /usr/local/bin/seed-connectors.sh
+CMD ["sh", "/usr/local/bin/seed-connectors.sh"]

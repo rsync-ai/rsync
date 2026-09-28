@@ -18,10 +18,15 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { render, screen, waitFor } from "@testing-library/react"
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import "@testing-library/jest-dom"
 
-import { PipelineCheckpointsCard, formatPosition } from "@/components/pipeline/PipelineCheckpointsCard"
+import {
+  PipelineCheckpointsCard,
+  formatPosition,
+  latestRunTotals,
+  summarizeCheckpoint,
+} from "@/components/pipeline/PipelineCheckpointsCard"
 
 const mockFetch = vi.fn()
 vi.stubGlobal("fetch", mockFetch)
@@ -211,5 +216,172 @@ describe("PipelineCheckpointsCard — CDC pipelines", () => {
 
     expect(await screen.findByText(/could not load checkpoints \(http 500\)/i)).toBeInTheDocument()
     expect(screen.queryByText(CDC_EMPTY)).not.toBeInTheDocument()
+  })
+})
+
+// The batch executor's real position shape (executor.go checkpointPosition).
+function batchPos(over: Record<string, unknown> = {}) {
+  return {
+    batch_idx: 12,
+    offset: 0,
+    rows_so_far: 680000,
+    bytes_so_far: 5 * 1024 * 1024,
+    table_rows_so_far: 12000,
+    paging_mode: "keyset",
+    cursor_column: "id",
+    cursor: 12000,
+    table_complete: false,
+    execution_id: "0321ff04-475f-4480-b045-7191969747fb",
+    updated_at: "2026-09-27T15:58:00Z",
+    ...over,
+  }
+}
+
+describe("summarizeCheckpoint — one scannable line per table, not every key", () => {
+  it("a mid-table batch position says where it resumes and this table's own rows", () => {
+    const s = summarizeCheckpoint(batchPos())
+    expect(s.state).toBe("in_progress")
+    expect(s.resume).toBe("after batch 12 · id > 12000")
+    expect(s.tableRows).toBe(12000)
+    // The run-wide totals are NOT repeated on the row — they are hoisted once.
+    expect(s.resume).not.toMatch(/run rows|680/)
+  })
+
+  it("a finished sweep says so, without a stale cursor", () => {
+    const s = summarizeCheckpoint(batchPos({ table_complete: true }))
+    expect(s.state).toBe("complete")
+    expect(s.resume).toBe("sweep finished")
+  })
+
+  it("keeps an incremental watermark visible", () => {
+    const s = summarizeCheckpoint(batchPos({ table_complete: true, watermark: { field: "updated_at", value: "2026-09-01" } }))
+    expect(s.resume).toBe("sweep finished · since 2026-09-01")
+  })
+
+  it("control: a non-batch position (Postgres LSN) is shown whole and makes no state claim", () => {
+    const s = summarizeCheckpoint({ lsn: "0/1A2B3C4" })
+    expect(s.state).toBeNull()
+    expect(s.resume).toBe("lsn: 0/1A2B3C4")
+    expect(s.tableRows).toBeNull()
+  })
+})
+
+describe("latestRunTotals", () => {
+  it("reads the run-wide totals once for the run, not per table", () => {
+    const t = latestRunTotals([
+      checkpoint({ id: "a", updated_at: "2026-09-27T15:00:00Z", position: batchPos({ rows_so_far: 100 }) }),
+      checkpoint({ id: "b", updated_at: "2026-09-27T15:59:00Z", position: batchPos({ rows_so_far: 900 }) }),
+      checkpoint({ id: "c", updated_at: "2026-09-27T16:30:00Z", position: { lsn: "0/1" } }),
+    ] as never)
+    expect(t?.rows).toBe(900)
+    expect(t?.executionId).toBe("0321ff04-475f-4480-b045-7191969747fb")
+  })
+
+  it("control: no batch rows → no totals line at all", () => {
+    expect(latestRunTotals([checkpoint()] as never)).toBeNull()
+  })
+
+  // 0.1.7-rc1, 42-row batch run: the card said 32. Each table goroutine
+  // snapshots the shared run totals and THEN saves, so a table that snapshotted
+  // early can commit last. Within a run the totals only grow, so the run's
+  // figure is its largest -- never the last-committed row's.
+  it("a table that commits last with an older snapshot does not shrink the run total", () => {
+    const run = "5a7d9e0c-1111-4d2a-9c3b-000000000042"
+    const t = latestRunTotals([
+      checkpoint({ id: "a", updated_at: "2026-09-28T07:00:01Z", position: batchPos({ execution_id: run, rows_so_far: 42, bytes_so_far: 4200 }) }),
+      checkpoint({ id: "b", updated_at: "2026-09-28T07:00:02Z", position: batchPos({ execution_id: run, rows_so_far: 32, bytes_so_far: 3200 }) }),
+    ] as never)
+    expect(t?.rows).toBe(42)
+    expect(t?.bytes).toBe(4200)
+    expect(t?.executionId).toBe(run)
+    expect(t?.at).toBe("2026-09-28T07:00:02Z")
+  })
+
+  it("an earlier, bigger run's leftover rows do not count toward the latest run", () => {
+    const t = latestRunTotals([
+      checkpoint({ id: "old", updated_at: "2026-09-27T07:00:00Z", position: batchPos({ execution_id: "run-1", rows_so_far: 9000 }) }),
+      checkpoint({ id: "new", updated_at: "2026-09-28T07:00:00Z", position: batchPos({ execution_id: "run-2", rows_so_far: 12 }) }),
+    ] as never)
+    expect(t?.rows).toBe(12)
+    expect(t?.executionId).toBe("run-2")
+  })
+})
+
+describe("PipelineCheckpointsCard with many tables", () => {
+  function manyTables(n: number) {
+    return Array.from({ length: n }, (_, i) =>
+      checkpoint({
+        id: `cp${i}`,
+        source_table: `public.t${String(i).padStart(2, "0")}`,
+        position: batchPos({ table_complete: i % 3 === 0, table_rows_so_far: i * 10 }),
+      })
+    )
+  }
+
+  it("states the run total once — not on every row", async () => {
+    mockFetch.mockResolvedValue(res(200, { checkpoints: manyTables(20) }))
+    render(<PipelineCheckpointsCard pipelineId="p1" />)
+    const totals = await screen.findByTestId("checkpoints-run-totals")
+    expect(totals).toHaveTextContent("680,000 rows")
+    expect(screen.getAllByText(/680,000/)).toHaveLength(1)
+    // 20 tables: 7 finished (i % 3 === 0), 13 mid-table.
+    expect(screen.getByTestId("checkpoints-summary")).toHaveTextContent(/20 tables.*13 mid-table.*7 finished/)
+  })
+
+  it("filters by table name and by state", async () => {
+    mockFetch.mockResolvedValue(res(200, { checkpoints: manyTables(20) }))
+    render(<PipelineCheckpointsCard pipelineId="p1" />)
+    const box = await screen.findByLabelText(/filter checkpoints by table name/i)
+    fireEvent.change(box, { target: { value: "t1" } })
+    // t10..t19 — "t01" does not contain "t1"
+    expect(screen.getByText("10 of 20")).toBeInTheDocument()
+    expect(screen.getByText("public.t14")).toBeInTheDocument()
+    expect(screen.queryByText("public.t01")).not.toBeInTheDocument()
+
+    fireEvent.change(box, { target: { value: "" } })
+    fireEvent.click(screen.getByRole("button", { name: "Finished" }))
+    expect(screen.getByText("7 of 20")).toBeInTheDocument()
+    expect(screen.getByText("public.t03")).toBeInTheDocument()
+    expect(screen.queryByText("public.t01")).not.toBeInTheDocument()
+  })
+
+  it("the resume cell wraps between words, not inside them", async () => {
+    // prod, narrow pane: `break-all` split "sweep finished" as "sweep f / inished".
+    // jsdom has no layout, so this pins the class: wrap-anywhere breaks a word
+    // only when it cannot fit whole.
+    mockFetch.mockResolvedValue(res(200, { checkpoints: manyTables(3) }))
+    render(<PipelineCheckpointsCard pipelineId="p1" />)
+    const cell = (await screen.findAllByText("sweep finished"))[0]
+    expect(cell).toHaveClass("wrap-anywhere")
+    expect(cell).not.toHaveClass("break-all")
+  })
+
+  it("control: a short list shows no filter row", async () => {
+    mockFetch.mockResolvedValue(res(200, { checkpoints: manyTables(3) }))
+    render(<PipelineCheckpointsCard pipelineId="p1" />)
+    await screen.findByText("public.t00")
+    expect(screen.queryByLabelText(/filter checkpoints by table name/i)).not.toBeInTheDocument()
+  })
+
+  it("expands a row to show every raw position key, and collapses it again", async () => {
+    mockFetch.mockResolvedValue(res(200, { checkpoints: manyTables(2) }))
+    render(<PipelineCheckpointsCard pipelineId="p1" />)
+    const toggle = await screen.findByRole("button", { name: /show the full position for public\.t01/i })
+    expect(screen.queryByText("paging_mode")).not.toBeInTheDocument()
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute("aria-expanded", "true")
+    const details = document.getElementById(toggle.getAttribute("aria-controls")!)!
+    expect(within(details).getByText("paging_mode")).toBeInTheDocument()
+    expect(within(details).getByText("run rows so far (all tables)")).toBeInTheDocument()
+    fireEvent.click(toggle)
+    expect(screen.queryByText("paging_mode")).not.toBeInTheDocument()
+  })
+
+  it("lists mid-table rows before finished ones", async () => {
+    mockFetch.mockResolvedValue(res(200, { checkpoints: manyTables(4) }))
+    render(<PipelineCheckpointsCard pipelineId="p1" />)
+    await screen.findByText("public.t00")
+    const names = screen.getAllByText(/^public\.t\d\d$/).map((el) => el.textContent)
+    expect(names).toEqual(["public.t01", "public.t02", "public.t00", "public.t03"])
   })
 })

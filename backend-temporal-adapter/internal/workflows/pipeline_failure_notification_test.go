@@ -290,6 +290,8 @@ func TestEveryEmittedCodeHasCatalogCopy(t *testing.T) {
 // A behavioural test can't reach the call site — UpdatePipelineStatusActivity needs a
 // live DB and a Temporal activity context — so the wiring is pinned against the source,
 // the way TestStageCompletedNeverCarriesRunTerminalStatus already does in this package.
+// The body lives in writePipelineStatus, which both UpdatePipelineStatusActivity and
+// FinalizeCompletedRunActivity call, so that is the function the guard anchors to.
 func TestTheTerminalWriteSiteStillRaisesTheAlert(t *testing.T) {
 	const path = "pipeline_status_activity.go"
 	raw, err := os.ReadFile(path)
@@ -306,9 +308,9 @@ func TestTheTerminalWriteSiteStillRaisesTheAlert(t *testing.T) {
 
 	// Positive controls: the anchors the assertions are expressed in terms of must
 	// themselves be findable, or a miss below proves nothing.
-	fnIdx := strings.Index(src, "func UpdatePipelineStatusActivity(")
+	fnIdx := strings.Index(src, "func writePipelineStatus(")
 	if fnIdx < 0 {
-		t.Fatal("cannot find UpdatePipelineStatusActivity; this guard is anchored to a " +
+		t.Fatal("cannot find writePipelineStatus; this guard is anchored to a " +
 			"function that no longer exists under that name and is now inert")
 	}
 	commitIdx := strings.Index(src[fnIdx:], "tx.Commit()")
@@ -319,7 +321,7 @@ func TestTheTerminalWriteSiteStillRaisesTheAlert(t *testing.T) {
 
 	emitIdx := strings.Index(src, "emitTerminalRunNotification(")
 	if emitIdx < 0 {
-		t.Fatal("UpdatePipelineStatusActivity no longer calls emitTerminalRunNotification: " +
+		t.Fatal("writePipelineStatus no longer calls emitTerminalRunNotification: " +
 			"every run can now fail with no Slack or email alert, and no other test notices")
 	}
 
@@ -331,7 +333,7 @@ func TestTheTerminalWriteSiteStillRaisesTheAlert(t *testing.T) {
 	}
 	fnEnd += fnIdx + 1
 	if emitIdx > fnEnd {
-		t.Fatal("the emit moved out of UpdatePipelineStatusActivity; outside this function " +
+		t.Fatal("the emit moved out of writePipelineStatus; outside this function " +
 			"nothing sees all three executor dispatch paths")
 	}
 

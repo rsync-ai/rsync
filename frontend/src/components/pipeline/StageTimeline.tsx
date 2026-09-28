@@ -16,6 +16,7 @@ import {
   Pause,
   RefreshCw,
   Square,
+  HelpCircle,
 } from 'lucide-react'
 import type { StageExecution, StageStatus } from '@/lib/pipeline/stageDefinitions'
 import { formatDuration } from '@/components/pipeline/dagHelpers'
@@ -37,6 +38,7 @@ const statusIcons: Record<StageStatus, React.ReactNode> = {
   'completed': <CheckCircle2 className="h-4 w-4 text-green-600" />,
   'failed': <XCircle className="h-4 w-4 text-red-600" />,
   'cancelled': <Square className="h-4 w-4 text-zinc-500 dark:text-zinc-400" />,
+  'unknown': <HelpCircle className="h-4 w-4 text-zinc-400" />,
 }
 
 const statusColors: Record<StageStatus, string> = {
@@ -47,6 +49,7 @@ const statusColors: Record<StageStatus, string> = {
   'completed': 'bg-green-50 text-green-700 dark:bg-green-950 dark:text-green-300',
   'failed': 'bg-red-50 text-red-700 dark:bg-red-950 dark:text-red-300',
   'cancelled': 'bg-zinc-50 text-zinc-700 border-zinc-200 dark:bg-zinc-900/40 dark:text-zinc-300',
+  'unknown': 'bg-zinc-50 text-zinc-600 border-zinc-200 dark:bg-zinc-900/40 dark:text-zinc-400',
 }
 
 

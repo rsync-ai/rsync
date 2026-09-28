@@ -273,7 +273,14 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 
 	// Keep pipelines.status in sync with the workflow outcome (completed/failed).
 	// We do this in a deterministic defer so EVERY exit path updates the DB row once.
+	// terminalStatusWritten is set when a completion path already wrote it through
+	// FinalizeCompletedRunActivity (completedEventAfterPostflightVersion); writing
+	// again would run the postflight twice and raise a second alert.
+	terminalStatusWritten := false
 	defer func() {
+		if terminalStatusWritten {
+			return
+		}
 		var finalStatus string
 		switch state.CurrentState {
 		case StateCompleted:
@@ -1353,7 +1360,13 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 			return err
 		}
 
-		// DAG completed successfully
+		// DAG completed successfully — unless the postflight says otherwise.
+		if written, failed := finalizeBeforeCompletedEvent(ctx, input, state); written {
+			terminalStatusWritten = true
+			if failed {
+				return nil
+			}
+		}
 		_ = emitPipelineCompletedEvent(ctx, input.PipelineID, input.ExecutionID, map[string]interface{}{
 			"execution_plan": state.ExecutionPlan,
 			"is_dag":         true,
@@ -2098,6 +2111,14 @@ func NLPipelineWorkflowV2(ctx workflow.Context, input NLPipelineWorkflowV2Input)
 	// ==========================================================================
 	// COMPLETION
 	// ==========================================================================
+	// Record the run and let the postflight silent-drop guard judge it BEFORE
+	// PIPELINE_COMPLETED goes out (KI-SILENTDROP-COMPLETED-EVENT).
+	if written, failed := finalizeBeforeCompletedEvent(ctx, input, state); written {
+		terminalStatusWritten = true
+		if failed {
+			return nil
+		}
+	}
 	_ = emitPipelineCompletedEvent(ctx, input.PipelineID, input.ExecutionID, mergeMetadata(executionResult, map[string]interface{}{
 		"execution_plan": state.ExecutionPlan,
 	}))
@@ -2638,6 +2659,67 @@ func updateExecutionPlanForWaiting(plan *workflowtypes.ExecutionPlan, stageID st
 		stage.Progress = 0
 	}
 	_ = details
+}
+
+// completedEventAfterPostflightVersion gates writing the terminal status before
+// PIPELINE_COMPLETED instead of after it (KI-SILENTDROP-COMPLETED-EVENT).
+//
+// The status write runs the postflight silent-drop guard, which can still fail a
+// run the executor called a success. It used to run from the workflow's deferred
+// status updater — after PIPELINE_COMPLETED had already gone out. So a run that
+// ended failed first told the event stream it had completed, and the projector's
+// PIPELINE_COMPLETED hook fired the pipeline's downstream model refreshes for it.
+// Moving the write adds an activity ahead of the emit, a different command
+// sequence, so histories recorded before this marker keep the old order.
+const completedEventAfterPostflightVersion = "completed-event-after-postflight"
+
+// finalizeBeforeCompletedEvent writes the terminal status of a run the workflow
+// believes completed and reports whether it was written and whether the postflight
+// failed it. On failed it has already emitted PIPELINE_FAILED and moved the state
+// to StateFailed; the caller must return without emitting PIPELINE_COMPLETED.
+// written=false (old history, or the activity itself failed) leaves the caller on
+// the old path: emit completed, and the deferred updater writes the status.
+func finalizeBeforeCompletedEvent(ctx workflow.Context, input NLPipelineWorkflowV2Input, state *WorkflowState) (written bool, failed bool) {
+	if workflow.GetVersion(ctx, completedEventAfterPostflightVersion, workflow.DefaultVersion, 1) == workflow.DefaultVersion {
+		return false, false
+	}
+	var outcome runOutcome
+	if err := workflow.ExecuteActivity(ctx, FinalizeCompletedRunActivity, input.PipelineID, input.ExecutionID).Get(ctx, &outcome); err != nil {
+		workflow.GetLogger(ctx).Warn("Finalizing the completed run failed; falling back to the deferred status write", "error", err)
+		return false, false
+	}
+	if outcome.Status != "failed" {
+		return true, false
+	}
+	reason := outcome.ErrorMessage
+	if reason == "" {
+		reason = "Pipeline failed its post-run check"
+	}
+	_ = emitPipelineFailedEvent(ctx, input.PipelineID, input.ExecutionID, reason, map[string]interface{}{
+		"execution_plan": state.ExecutionPlan,
+	})
+	_ = state.Transition(StateFailed, workflow.Now(ctx), reason)
+	return true, true
+}
+
+// emitPipelineFailedEvent emits the run-terminal failure event. The projector sets
+// pipeline_progress to failed from it and the UI reads `message` as the error.
+func emitPipelineFailedEvent(ctx workflow.Context, pipelineID, executionID, reason string, metadata map[string]interface{}) error {
+	event := map[string]interface{}{
+		"schema_version": 2,
+		"event_type":     "PIPELINE_FAILED",
+		"pipeline_id":    pipelineID,
+		"execution_id":   executionID,
+		"stage":          "executor",
+		"stage_group":    "executing",
+		"state":          "failed",
+		"status":         "failed",
+		"message":        reason,
+		"error_message":  reason,
+		"timestamp":      workflow.Now(ctx).Format(time.RFC3339),
+		"metadata":       metadata,
+	}
+	return emitDomainEvent(ctx, event)
 }
 
 // emitPipelineCompletedEvent emits pipeline completion event

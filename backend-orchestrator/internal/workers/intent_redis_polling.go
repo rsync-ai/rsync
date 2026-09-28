@@ -76,11 +76,6 @@ func (w *IntentWorker) pollAndProcessRequests() error {
 }
 
 func (w *IntentWorker) processCorrelationRequest(req *correlation.PendingRequest) {
-	ctx, cancel := correlationWorkContext(w.ctx, "intent")
-	defer cancel()
-	deliverCtx, cancelDeliver := correlationDeliveryContext()
-	defer cancelDeliver()
-
 	logger := log.WithFields(log.Fields{
 		"correlation_id": req.CorrelationID,
 		"request_type":   req.RequestType,
@@ -109,19 +104,12 @@ func (w *IntentWorker) processCorrelationRequest(req *correlation.PendingRequest
 	}
 
 	// PHASE 2.4 FIX: Use main Execute() method from intent.go
-	result := w.Execute(ctx, task)
-
-	logger.Info("✅ Task processing completed")
-
-	// Write response to Redis
-	if routeErr := RouteResult(deliverCtx, task, result); routeErr != nil {
-		logger.WithError(routeErr).Error("Failed to route response")
-	}
-
-	// Delete request from Redis after processing
-	if delErr := w.correlationClient.DeleteRequest(deliverCtx, req.CorrelationID, "intent"); delErr != nil {
-		logger.WithError(delErr).Warn("Failed to delete request from Redis")
-	}
+	// Route the result and delete the request once Execute returns (fresh delivery context).
+	runCorrelationRequest(w.ctx, "intent", w.correlationClient, task, logger, func(ctx context.Context) TaskResult {
+		result := w.Execute(ctx, task)
+		logger.Info("✅ Task processing completed")
+		return result
+	})
 
 	logger.Info("📤 Intent request processed and response sent to Redis")
 }

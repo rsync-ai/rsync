@@ -799,11 +799,11 @@ func ResumePipelineTables(c *gin.Context) {
 	// single namespace would itself be wrong, i.e. when source schemas are being
 	// mirrored.
 	if cfg := req.DestinationConfig; cfg != nil {
-		lockFirstRunNamespace(c.Request.Context(), database, c.GetString("workspace_id"), pipelineID, *cfg, tables, "ResumeTables")
+		lockFirstRunNamespace(c.Request.Context(), database, c.GetString("workspace_id"), pipelineID, *cfg, tables, nil, "ResumeTables")
 	} else {
 		persisted, schemaMode := pipelineDestinationState(database, pipelineID)
 		if seeded, probe := serverSideFirstRunNamespace(clientSentDestinationConfig, persisted, schemaMode); probe {
-			lockFirstRunNamespace(c.Request.Context(), database, c.GetString("workspace_id"), pipelineID, seeded, tables, "ResumeTables")
+			lockFirstRunNamespace(c.Request.Context(), database, c.GetString("workspace_id"), pipelineID, seeded, tables, nil, "ResumeTables")
 		}
 	}
 
@@ -918,7 +918,7 @@ func ResumePipelineTables(c *gin.Context) {
 // Returns (resolved namespace, relocation or nil, checkpoints cleared by that
 // relocation). The second and third values are for the caller that has to report
 // them over the wire; both HITL call sites ignore them.
-func lockFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID, pipelineID string, cfg DestinationConfig, tables []string, caller string) (string, *namespaceRelocation, int64) {
+func lockFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID, pipelineID string, cfg DestinationConfig, tables, destTables []string, caller string) (string, *namespaceRelocation, int64) {
 	if locked, lockedNS := destinationNamespaceLock(database, pipelineID); locked && strings.TrimSpace(lockedNS) != "" {
 		cfg.Namespace = lockedNS
 		log.WithFields(log.Fields{"pipeline_id": pipelineID, "namespace": lockedNS, "caller": caller}).
@@ -938,7 +938,7 @@ func lockFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID, p
 	resolved := cfg.Namespace
 	var relocated *namespaceRelocation
 	if destConnID != "" && destType != "" {
-		resolved, relocated = resolveFirstRunNamespace(ctx, database, workspaceID, destConnID, destType, pipelineID, cfg.Namespace, tables)
+		resolved, relocated = resolveFirstRunNamespace(ctx, database, workspaceID, destConnID, destType, pipelineID, cfg.Namespace, tables, destTables)
 	} else {
 		log.WithFields(log.Fields{"pipeline_id": pipelineID, "caller": caller}).Warn("namespace lock: missing destination conn/type; locking chosen namespace without collision probe")
 	}
@@ -946,6 +946,10 @@ func lockFirstRunNamespace(ctx context.Context, database *sql.DB, workspaceID, p
 	if err := persistResolvedDestinationConfig(database, pipelineID, cfg); err != nil {
 		log.WithError(err).WithFields(log.Fields{"pipeline_id": pipelineID, "caller": caller}).Warn("namespace lock: failed to persist resolved destination_config (ignored)")
 	}
+	// Record what this pipeline writes beyond its source names, so a LATER
+	// pipeline's probe counts it as the owner of those tables (namespaceTableOwner)
+	// and a delete tombstones them (writeDestinationNamespaceTombstone).
+	recordDestinationTables(ctx, database, pipelineID, destTables)
 	// A relocated pipeline's resume checkpoints were written against the namespace
 	// it just left, and carry no namespace of their own — left in place they resume
 	// "already complete" and the new namespace is never even created.

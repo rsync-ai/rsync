@@ -111,7 +111,7 @@ class TestTableValidator:
         assert len(result.errors) == 0
     
     def test_validate_table_without_pk(self):
-        """Test validating table without primary key (should block)"""
+        """A keyless table warns with the exact drift and is NOT blocked (policy 2026-09-27)."""
         validator = TableValidator(require_pk=True)
         
         table_schema = {
@@ -129,11 +129,16 @@ class TestTableValidator:
             SourceType.MYSQL,
         )
         
-        assert not result.is_valid
+        assert result.is_valid
         assert not result.has_primary_key
-        assert result.should_block
-        assert result.block_reason == "No primary key or replica identity"
-        assert len(result.errors) > 0
+        assert not result.should_block
+        assert result.block_reason is None
+        assert result.errors == []
+        drift = [w for w in result.warnings if "no primary key" in w]
+        assert len(drift) == 1
+        assert "mydb.logs" in drift[0]
+        assert "each UPDATE adds a new row" in drift[0]
+        assert "DELETEs are not applied" in drift[0]
     
     def test_validate_table_with_critical_pii(self):
         """Test table with critical PII (should block if policy enabled)"""

@@ -187,7 +187,7 @@ func TestCheckPostgresPublicationPrivilege(t *testing.T) {
 	})
 }
 
-// An advisory that fails must not count as a failure, or STRICT_PREFLIGHT would
+// An advisory that fails must not count as a failure, or the run gate would
 // block the run on it.
 func TestSummarize_FailingInfoIsNotBlocking(t *testing.T) {
 	r := &Result{Checks: []Check{

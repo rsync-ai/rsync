@@ -314,6 +314,38 @@ func persistResolvedDestinationConfig(database *sql.DB, pipelineID string, cfg D
 	return err
 }
 
+// recordDestinationTables stores, on the pipeline row, the destination tables its
+// run boundary reported it writes (config.destination_tables). It is the ownership
+// half of KI-NSPROBE-USES-SOURCE-TABLE-NAMES: probing a prompt-renamed table only
+// protects it if a LATER pipeline's probe can tell whose table it is, and ownership
+// is answered from pipelines.config. Nothing to record → no write. Fail-soft like
+// every other write on the lock path: a failure costs ownership detection for a
+// renamed table, never the run.
+func recordDestinationTables(ctx context.Context, database *sql.DB, pipelineID string, destTables []string) {
+	clean := make([]string, 0, len(destTables))
+	for _, t := range destTables {
+		if s := strings.TrimSpace(t); s != "" {
+			clean = append(clean, s)
+		}
+	}
+	if database == nil || len(clean) == 0 {
+		return
+	}
+	raw, err := json.Marshal(clean)
+	if err != nil {
+		return
+	}
+	if _, err := database.ExecContext(ctx, `
+		UPDATE pipelines
+		SET config = jsonb_set(COALESCE(config, '{}'::jsonb), '{destination_tables}', $2::jsonb, true),
+		    updated_at = NOW()
+		WHERE id::text = $1
+	`, pipelineID, string(raw)); err != nil {
+		log.WithError(err).WithField("pipeline_id", pipelineID).
+			Warn("namespace lock: failed to record destination_tables (ignored); a renamed table will not count toward ownership")
+	}
+}
+
 // destinationNamespaceLock reports whether this pipeline's destination namespace
 // has already been resolved + locked, and returns the locked namespace. When
 // locked, callers MUST reuse the returned namespace verbatim and skip first-run
@@ -3100,7 +3132,12 @@ func RunPipeline(c *gin.Context) {
 				report.RunID = runID
 			}
 			recCancel()
-			switch evaluateAssessmentGate(report, ackWarnings) {
+			// Acks are remembered per pipeline + warning (U-19), so an
+			// acknowledged, unchanged warning does not stop the next run.
+			gateCtx, gateCancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+			outcome := runAssessmentGate(gateCtx, database, id, userID, report, ackWarnings)
+			gateCancel()
+			switch outcome {
 			case assessmentGateBlocked:
 				c.JSON(http.StatusUnprocessableEntity, gin.H{
 					"error":      "pre_migration_assessment_blocked",
@@ -3647,10 +3684,10 @@ func StopPipeline(c *gin.Context) {
 	// finished snapshot, so cancelling that and flipping the row left the connector
 	// and sink running. The orchestrator parks the connector (offsets, slot and
 	// publication kept) and stops the sink first; if it cannot, nothing changes here.
-	var cdcStopWarnings []string
+	var stopWarnings []string
 	if isCDC {
 		var stopped bool
-		cdcStopWarnings, stopped = stopCDCStreaming(c, id)
+		stopWarnings, stopped = stopCDCStreaming(c, id)
 		if !stopped {
 			return
 		}
@@ -3726,6 +3763,15 @@ func StopPipeline(c *gin.Context) {
 		}
 	}
 
+	if !isCDC {
+		// A batch run's sink worker ("sink-<id8>-batch") runs until told to stop,
+		// so without this it kept writing the cancelled run's backlog into the
+		// destination for minutes after Stop. After the cancel signal, so the
+		// executor is already winding down; best effort — the group keeps its
+		// committed offset either way.
+		stopWarnings = stopBatchSinkWorkers(c, id)
+	}
+
 	log.Printf("✓ Pipeline %s stopped", id)
 
 	resp := gin.H{
@@ -3733,8 +3779,8 @@ func StopPipeline(c *gin.Context) {
 		"pipeline_id": id,
 		"status":      "stopped",
 	}
-	if len(cdcStopWarnings) > 0 {
-		resp["warnings"] = cdcStopWarnings
+	if len(stopWarnings) > 0 {
+		resp["warnings"] = stopWarnings
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -3779,6 +3825,37 @@ func stopCDCStreaming(c *gin.Context, pipelineID string) ([]string, bool) {
 	}
 	_ = json.NewDecoder(resp.Body).Decode(&out)
 	return out.Warnings, true
+}
+
+// stopBatchSinkWorkers asks the orchestrator to stop a batch pipeline's sink
+// worker (PUT /api/v1/pipelines/:id/sink/stop). Best effort: the pipeline is
+// already stopped, so a failure becomes a warning, never an error response.
+func stopBatchSinkWorkers(c *gin.Context, pipelineID string) []string {
+	const unstopped = "the sink worker for this batch run may still be writing already-produced rows to the destination: "
+	url := fmt.Sprintf("%s/api/v1/pipelines/%s/sink/stop", orchestratorBaseURL(), pipelineID)
+	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodPut, url, nil)
+	if err != nil {
+		return []string{unstopped + err.Error()}
+	}
+	if traceID := c.GetHeader("X-Trace-ID"); traceID != "" {
+		req.Header.Set("X-Trace-ID", traceID)
+	}
+	setInternalServiceSecret(req)
+	resp, err := (&http.Client{Timeout: 15 * time.Second}).Do(req)
+	if err != nil {
+		log.Printf("⚠️ [StopPipeline] batch sink stop for %s: %v", pipelineID, err)
+		return []string{unstopped + "the orchestrator is unreachable"}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		log.Printf("⚠️ [StopPipeline] batch sink stop for %s: HTTP %d", pipelineID, resp.StatusCode)
+		return []string{fmt.Sprintf("%sthe orchestrator answered HTTP %d", unstopped, resp.StatusCode)}
+	}
+	var out struct {
+		Warnings []string `json:"warnings"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&out)
+	return out.Warnings
 }
 
 type ControlPlaneRequest struct {

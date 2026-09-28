@@ -34,7 +34,7 @@ cleanup_named_container() {
   local name="$1"
   if docker ps -a --format '{{.Names}}' | grep -qx "${name}"; then
     log "🧹 Removing conflicting container: ${name}"
-    docker rm -f "${name}" >/dev/null 2>&1 || true
+    docker rm -fv "${name}" >/dev/null 2>&1 || true
   fi
 }
 

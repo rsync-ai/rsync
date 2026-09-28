@@ -540,9 +540,73 @@ func TestComputeRuntimePhase_StoppedIsNotPaused(t *testing.T) {
 			{"paused", "paused"},
 			{"failed", "failed"},
 		} {
-			if got := computeRuntimePhase(mode, tc.status, "", "healthy", nil, nil, time.Time{}); got != tc.want {
+			if got := computeRuntimePhase(mode, tc.status, "", "healthy", nil, nil, time.Time{}, false); got != tc.want {
 				t.Errorf("%s %q: phase = %q, want %q", mode, tc.status, got, tc.want)
 			}
 		}
+	}
+}
+
+// U-HEALTH-UNKNOWN (prod 2026-09-27, P2 fa72e904 / P3 9a094389): a zero-row batch
+// Resume registers fresh dependency rows and finishes in ~1–8 s, before the prober's
+// next tick — it probes only while a run is going — so the current run's rows are never
+// probed and the header read health "unknown" with a Diagnose button on a clean
+// pipeline, while the SAME dependencies (kind + identifier) had been probed healthy
+// seconds earlier under the previous run. Bug class: a per-run row read as the
+// resource's health. The health join must fall back to the newest probe of the same
+// dependency, preferring the row's own verdict when it has one.
+func TestLoadRuntimeDeps_UnprobedCurrentRunUsesSameDependencysNewestProbe(t *testing.T) {
+	database, mock, err := sqlmock.New()
+	if err != nil {
+		t.Fatalf("sqlmock.New: %v", err)
+	}
+	defer database.Close()
+
+	pipelineID := "fa72e904-03fd-4bc2-8c9e-2ee9a9675105"
+	mock.ExpectQuery(`LEFT JOIN LATERAL \([\s\S]*d2\.pipeline_id = d\.pipeline_id\s+AND d2\.kind = d\.kind\s+AND d2\.identifier = d\.identifier[\s\S]*ORDER BY \(h2\.last_checked_at IS NOT NULL\) DESC, \(d2\.id = d\.id\) DESC, h2\.last_checked_at DESC`).
+		WithArgs(pipelineID).
+		WillReturnRows(sqlmock.NewRows([]string{
+			"kind", "identifier", "status", "last_checked_at", "last_healthy_at",
+			"consecutive_failures", "last_error", "details",
+		}).
+			AddRow("mcp_source", "mongodb@v1.0.0", "healthy", time.Now(), time.Now(), 0, "", []byte("{}")).
+			AddRow("mcp_dest", "gcs@v1.0.0", "healthy", time.Now(), time.Now(), 0, "", []byte("{}")))
+
+	_, health := loadRuntimeDeps(database, pipelineID)
+	if err := mock.ExpectationsWereMet(); err != nil {
+		t.Fatalf("health is not read from the same dependency's newest probe: %v", err)
+	}
+	if health != "healthy" {
+		t.Fatalf("aggregate = %q, want healthy", health)
+	}
+}
+
+// U-RELOAD-CAUGHTUP-WINDOW (prod 2026-09-27, P4 011b0c85 Reload 5335883c): the new run
+// sat in the executor stage for 14 s (16:10:54 → 16:11:08) starting the connector, and
+// only at the end queued the re-snapshot request. computeRuntimePhase read the executor
+// stage as already streaming, so with the PREVIOUS run's zero backlog the header said
+// "Load completed, replication ongoing · caught up" for that whole window. Bug class: a
+// setup stage read as the steady state. The executor stage is setup until the streaming
+// handoff has closed the run (current_stage 'streaming', or the execution row closed when
+// the best-effort progress reconcile did not land).
+func TestComputeRuntimePhase_CDCExecutorStageIsSetupUntilHandoff(t *testing.T) {
+	quietPrev := &RuntimeLiveness{StaleSeconds: 20, PendingEvents: 0}
+	for _, tc := range []struct {
+		name        string
+		stage       string
+		handoffDone bool
+		want        string
+	}{
+		{"reload starting the connector is setup, not caught up", "executor", false, "syncing"},
+		{"executor stage after the handoff closed the run streams", "executor", true, "streaming"},
+		{"control: the handoff's own stage streams", "streaming", false, "streaming"},
+		{"control: an earlier stage is setup", "infra_preflight", false, "syncing"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := computeRuntimePhase("cdc", "running", tc.stage, "healthy", quietPrev, nil, time.Time{}, tc.handoffDone)
+			if got != tc.want {
+				t.Fatalf("phase = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }

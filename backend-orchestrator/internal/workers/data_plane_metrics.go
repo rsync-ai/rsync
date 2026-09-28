@@ -12,8 +12,10 @@ package workers
 // For CDC pipelines:
 //   - rows_processed: cumulative count from Kafka topic offsets (if available)
 //   - bytes_processed: cumulative bytes from Kafka topic (if available)
-//   - cdc_lag_ms: consumer group lag in milliseconds
-//   - cdc_freshness_ms: time since last CDC event in milliseconds
+//   - cdc_lag_ms / cdc_freshness_ms: a MEASURED time only (from event
+//     timestamps). Never a message count scaled to milliseconds: the CDC status
+//     poll has no timestamp, so it sends sink_lag_messages and neither of these
+//     (KI-OVERVIEW-CDC-LAG-AND-ROWS-NOT-MEASURED).
 //
 // All fields are optional; the UI will gracefully handle missing fields.
 type DataPlaneMetrics struct {

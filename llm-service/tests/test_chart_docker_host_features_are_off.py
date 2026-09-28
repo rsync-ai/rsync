@@ -248,3 +248,45 @@ def test_forcing_a_docker_host_toggle_exits_nonzero(key, flag):
         f"The failure does not name '{flag}', so the operator cannot tell which "
         f"setting caused it:\n{proc.stderr[-2000:]}"
     )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_a_generator_on_a_private_catalog_is_told_so():
+    """Generated connectors are the third Docker-host feature, and the quiet one.
+
+    The chart gives each pod its own emptyDir copy of the connector catalog. A pod
+    that SAVES generated connectors into it keeps them where no other service
+    reads, until its next restart -- and the spec-upload screen (#1264) reported
+    "Generated" anyway. Such a container must carry
+    RSYNC_CONNECTOR_CATALOG_SHARED=false, which makes generation refuse
+    (llm-service/src/agents/tool_generator/deployment/service.py).
+
+    A generator is recognised by its own setting, RSYNC_MANAGED_CONNECTORS, not by
+    TOOLS_DIR: the api-gateway and orchestrator read the catalog through TOOLS_DIR
+    too, and neither writes connectors into it.
+    """
+    proc = _helm_template()
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    writers = []
+    for doc in yaml.safe_load_all(proc.stdout):
+        if not doc or doc.get("kind") not in ("Deployment", "StatefulSet"):
+            continue
+        pod = doc["spec"]["template"]["spec"]
+        private = any(
+            v.get("name") == "connector-catalog" and "emptyDir" in v
+            for v in pod.get("volumes") or []
+        )
+        for c in pod.get("containers") or []:
+            env = {e["name"]: e.get("value") for e in c.get("env") or []}
+            if private and "RSYNC_MANAGED_CONNECTORS" in env:
+                writers.append((doc["metadata"]["name"], c["name"], env.get("RSYNC_CONNECTOR_CATALOG_SHARED")))
+    assert writers, (
+        "No container writes generated connectors into a private emptyDir catalog. "
+        "If the chart now shares the catalog, retire this test with the refusal it pins."
+    )
+    wrong = [w for w in writers if w[2] != "false"]
+    assert not wrong, (
+        "These containers save generated connectors into their own emptyDir without "
+        "RSYNC_CONNECTOR_CATALOG_SHARED=false, so generation reports success for a "
+        f"connector nothing else can see: {wrong}"
+    )

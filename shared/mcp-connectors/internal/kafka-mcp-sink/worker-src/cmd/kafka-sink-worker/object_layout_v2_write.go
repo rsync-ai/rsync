@@ -152,6 +152,28 @@ func objectLayoutV2ParquetCodec(compression string) string {
 	return "snappy"
 }
 
+// objectLayoutV2DestConfig is the connection config a layout v2 data write sends: a
+// copy whose format keys say parquet and whose compression is the parquet codec.
+//
+// Setting the call's own format/compression args is not enough. The object-storage
+// connectors (base_connector.py _enforce_config_precedence, shared by gcs, aws-s3 and
+// azure-blob) let the connection config OVERWRITE those args, and map a format they do
+// not know — "infer", the gcs/azure form default — to json. A v2 table folder then
+// fills with gzip JSON named .parquet, which no hive/BigQuery reader can open. The
+// caller's map is shared by every other write this worker makes, so it is copied, never
+// edited.
+func objectLayoutV2DestConfig(destCfg map[string]interface{}, codec string) map[string]interface{} {
+	out := make(map[string]interface{}, len(destCfg)+4)
+	for k, v := range destCfg {
+		out[k] = v
+	}
+	for _, k := range []string{"format", "file_format", "output_format"} {
+		out[k] = "parquet"
+	}
+	out["compression"] = codec
+	return out
+}
+
 // objectBucketParams adds the bucket (or Azure container) the destination call targets.
 func objectBucketParams(destType string, destCfg map[string]interface{}, params map[string]interface{}) {
 	bucket := firstStr(destCfg, "bucket", "bucket_name")

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest"
-import { render, screen } from "@testing-library/react"
+import { render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import "@testing-library/jest-dom"
 
@@ -123,5 +123,37 @@ describe("PipelineHeaderOverflowMenu — ?rename=1", () => {
     render(<PipelineHeaderOverflowMenu pipelineId="p1" pipelineName="orders-sync" />)
     expect(screen.queryByRole("dialog")).toBeNull()
     expect(nav.replace).not.toHaveBeenCalled()
+  })
+})
+
+// U-16: Stop used to preventDefault its onSelect, which kept the (modal) Radix menu
+// open. An open modal menu sets body pointer-events:none, so the user's next click
+// on Resume/Reload only dismissed the menu and sent nothing. Every other test here
+// passes pointerEventsCheck: 0, which is exactly what hid it — this one must not.
+describe("PipelineHeaderOverflowMenu — Stop closes the menu (U-16)", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    nav.search = ""
+    mockLiveStatus("running")
+  })
+
+  it("after Stop lands, the very next click on the page reaches its button", async () => {
+    const user = userEvent.setup()
+    const nextButton = vi.fn()
+    render(
+      <>
+        <PipelineHeaderOverflowMenu pipelineId="p1" pipelineName="P1" pipelineType="cdc" status="running" />
+        <button onClick={nextButton}>Resume</button>
+      </>
+    )
+    await openMenu(user)
+    await user.click(await screen.findByRole("menuitem", { name: /stop pipeline/i }))
+    await waitFor(() =>
+      expect(vi.mocked(authFetch)).toHaveBeenCalledWith(expect.stringContaining("/stop"), expect.objectContaining({ method: "POST" }))
+    )
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument())
+    expect(document.body.style.pointerEvents).not.toBe("none")
+    await user.click(screen.getByRole("button", { name: "Resume" }))
+    expect(nextButton).toHaveBeenCalledTimes(1)
   })
 })

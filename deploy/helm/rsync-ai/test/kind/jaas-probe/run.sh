@@ -29,7 +29,7 @@ trap 'rm -rf "$WORK"' EXIT
 # not the JDK's, and pinning the image is what makes the numbers reproducible.
 cid="$(docker create "$KAFKA_IMAGE")"
 docker cp "$cid:/opt/kafka/libs" "$WORK/libs" >/dev/null
-docker rm "$cid" >/dev/null
+docker rm -v "$cid" >/dev/null
 
 for p in "${PROBES[@]}"; do
   cp "$p.java" "$WORK/"

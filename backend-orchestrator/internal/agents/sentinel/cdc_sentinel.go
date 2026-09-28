@@ -365,6 +365,12 @@ func (s *CDCSentinel) checkActivePipelines(ctx context.Context) {
 	// FOR LIVE READINESS: We'll do a generic probe to the Kafka Connect API (via the Debezium MCP tool interface).
 	// We will manually construct a call to the Debezium MCP tool.
 
+	// Before asking Connect anything: surface a capture side the dependency probe has
+	// seen dead. This must not sit behind getDebeziumStatus, whose early return on an
+	// unreachable Connect is exactly the dead-worker case it exists for
+	// (KI-DEBEZIUM-WORKER-DEATH-NOT-SURFACED).
+	s.surfaceCaptureDown(ctx)
+
 	status, err := s.getDebeziumStatus(ctx)
 	if err != nil {
 		log.WithError(err).Warn("🛡️ Sentinel could not reach Debezium/Connect")

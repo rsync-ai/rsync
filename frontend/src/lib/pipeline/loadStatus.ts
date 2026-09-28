@@ -11,6 +11,16 @@ export interface LoadStatus {
   since?: { label: "started" | "finished"; at: string }
 }
 
+// Phases in which the pipeline is being set up (again): after a Reload or a
+// Start the gateway reports one of these (pipeline_runtime.go
+// computeRuntimePhase) while runtime.load still holds the previous run's row.
+const SETUP_PHASES: ReadonlySet<string> = new Set(["initializing", "planning", "validating", "syncing"])
+
+/** Whether the pipeline is being set up, so no stream is live to be "ongoing" or "caught up". */
+export function isSettingUp(phase: string | null | undefined): boolean {
+  return SETUP_PHASES.has(String(phase ?? ""))
+}
+
 const tables = (n: number) => `${n.toLocaleString()} ${n === 1 ? "table" : "tables"}`
 const rows = (n: number) => `${n.toLocaleString("en-US")} ${n === 1 ? "row" : "rows"}`
 
@@ -55,6 +65,12 @@ export function describeLoadStatus(
       return { text: `Full load ${verb}${count}`, tone: stopped ? "error" : "info", ...started }
     }
     case "completed": {
+      // A Reload or Start is setting the pipeline up again: the completed row is
+      // the previous load's, and reloading_tables stays 0 until the re-snapshot
+      // request exists, so nothing here says replication is running (item 32).
+      if (isSettingUp(runtime.phase)) {
+        return { text: "Setting up · previous load completed", tone: "info", ...(load.completed_at ? { since: { label: "finished" as const, at: load.completed_at } } : {}) }
+      }
       const finished = load.completed_at ? { since: { label: "finished" as const, at: load.completed_at } } : {}
       const reloading = Number(load.reloading_tables) || 0
       const waiting = Math.max(0, Number(load.snapshot_rows_waiting) || 0)

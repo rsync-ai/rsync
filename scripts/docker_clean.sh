@@ -72,7 +72,7 @@ for c in \
   rsync-ai-minio \
   rsync-ai-minio-init
 do
-  docker rm -f "${c}" >/dev/null 2>&1 || true
+  docker rm -fv "${c}" >/dev/null 2>&1 || true
 done
 
 log "✅ Docker cleanup complete. (volumes removed: ${WITH_VOLUMES})"

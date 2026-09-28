@@ -289,7 +289,9 @@ log ""
 # ─────────────────────────────────────────────────────────────
 # Step 2: Prep test row + create Debezium connector (mysql-e2e -> Kafka)
 # ─────────────────────────────────────────────────────────────
-CONNECTOR_NAME="cdc-mysql-e2e-s3-$(date +%s)"
+# e2e-/debug- names are the ones run_gate.sh reclaims (connector and topics);
+# a cdc- name would sit among the pipelines' own connectors and never be.
+CONNECTOR_NAME="e2e-mysql-cdc-s3-$(date +%s)"
 TOPIC="${CONNECTOR_NAME}.${DB}.${TABLE}"
 
 # Pick a high random ID to avoid collisions with earlier runs.

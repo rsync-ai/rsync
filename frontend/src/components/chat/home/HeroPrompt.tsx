@@ -26,7 +26,7 @@ export function HeroPrompt({ inputRef, examples, onSubmit }: HeroPromptProps) {
         <Sparkles className="w-7 h-7" aria-hidden />
       </div>
       <h1 className="text-3xl font-bold tracking-tight text-gray-900 dark:text-white mb-2">
-        Agentic Data Pipeline
+        Data Pipeline
       </h1>
       <p className="text-gray-500 dark:text-gray-400 max-w-md mx-auto mb-6">
         Describe your data pipeline in plain English, or start from a suggestion below

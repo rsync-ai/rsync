@@ -23,13 +23,15 @@ type fakeDeployer struct {
 	deployRes    dockerx.DeployResult
 	deployErr    error
 	deployCalled bool
+	deployOpts   dockerx.DeployOptions
 	statusRes    dockerx.StatusResult
 	statusErr    error
 	pingErr      error
 }
 
-func (f *fakeDeployer) Deploy(_ context.Context, _ spec.DeployRequest, _ spec.DeployerConfig, _ dockerx.DeployOptions) (dockerx.DeployResult, error) {
+func (f *fakeDeployer) Deploy(_ context.Context, _ spec.DeployRequest, _ spec.DeployerConfig, opts dockerx.DeployOptions) (dockerx.DeployResult, error) {
 	f.deployCalled = true
+	f.deployOpts = opts
 	return f.deployRes, f.deployErr
 }
 func (f *fakeDeployer) Undeploy(_ context.Context, _ string) error { return f.deployErr }
@@ -220,6 +222,14 @@ func TestDeploy_HappyPath_200(t *testing.T) {
 	}
 	if resp["ok"] != true || resp["image"] != "mcp-hubspot:v1.0.0" || resp["built"] != true || resp["status"] != "running" {
 		t.Errorf("unexpected response body: %v", resp)
+	}
+	// Deploy only rebuilds stale code when it is handed the context's fingerprint.
+	want, err := dockerx.ContextHash(filepath.Join(toolsDir, goodSubdir))
+	if err != nil || want == "" {
+		t.Fatalf("ContextHash on the test context: %q, %v", want, err)
+	}
+	if fd.deployOpts.ContextHash != want {
+		t.Errorf("Deploy got ContextHash %q, want %q", fd.deployOpts.ContextHash, want)
 	}
 }
 

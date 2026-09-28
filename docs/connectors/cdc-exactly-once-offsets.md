@@ -191,10 +191,12 @@ key so Mongo's own unique index carries it, merged with `$max`. Two cautions it 
 concrete: read `kafka_offset` from RAW `params` (`prepare_import_data` has a fixed key
 whitelist that drops out-of-band params), and keep the offsets in the CONNECTION's database
 rather than `destination_namespace` — the seed call forwards no namespace, exactly as the
-BigQuery adapter notes for its dataset. Its residual is the honest limit of Tier B: the
-keyless `import_data` append is not idempotent, so a crash between the insert and the
-best-effort offset write still duplicates that batch
-(`KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES`).
+BigQuery adapter notes for its dataset. Tier B's gap for a keyless table (a crash between
+the data write and the best-effort offset write re-inserted the batch under new `_id`s) is
+closed sink-side, not here: the kafka-mcp-sink stamps each keyless row with a deterministic
+`_id` built from its Kafka record (`keylessDocumentID` in
+`kafka-sink-worker/cdc_keyless_identity.go`) and upserts on it, so a redelivered record
+replaces its own document (`KI-MONGODB-DEST-KEYLESS-REPLAY-DUPLICATES`, resolved).
 
 Warehouse destination connectors delegate `load`/`merge`/`discover_schema`/`get_cdc_offsets`
 to `self._warehouse_adapter` (obtained via

@@ -73,6 +73,13 @@ const (
 	// faultInfra — the write never landed for a reason unrelated to the row.
 	// Never DLQ, never commit.
 	faultInfra
+	// faultAuth — the destination is reachable and refused the CREDENTIAL (wrong,
+	// rotated or revoked password/key/token, or a missing grant). Never DLQ, never
+	// commit — the row is fine — and never hold for the infrastructure budget
+	// either: a credential does not start working by waiting. Fail closed at once
+	// with exitDestAuthRefused so the supervisor stops the worker and reports it as
+	// needing user config. KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA.
+	faultAuth
 )
 
 func (f destFault) String() string {
@@ -81,6 +88,8 @@ func (f destFault) String() string {
 		return "data"
 	case faultInfra:
 		return "infra"
+	case faultAuth:
+		return "auth"
 	default:
 		return "unclassified"
 	}
@@ -125,6 +134,73 @@ var destDataFaultMarkers = []string{
 	"unknown column",
 	"undefined column",
 	"no such column",
+}
+
+// destAuthFaultMarkers are replies from a destination that is REACHABLE and
+// refuses the credential or the grant, per destination driver. Checked after the
+// data list and BEFORE the infrastructure list, because libpq prefixes every
+// connection-phase failure — a wrong password included — with the infrastructure
+// marker "connection to server at", which is how a rotated password came to be
+// held for the whole 300 s outage budget (KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA).
+//
+// A shape listed here fails closed immediately (no DLQ, no commit, no hold).
+// Never move one to destDataFaultMarkers: that would dead-letter every row of a
+// pipeline whose password merely needs rotating.
+var destAuthFaultMarkers = []string{
+	// PostgreSQL (libpq / psycopg).
+	"password authentication failed",
+	"no pg_hba.conf entry",
+	"sasl authentication failed",
+	"invalidpassword",
+	"invalidauthorizationspecification",
+	"insufficientprivilege",
+	"permission denied for",
+	"must be owner of",
+	// MySQL / MariaDB.
+	"access denied for user",
+	"command denied to user",
+	// SQL Server.
+	"login failed for user",
+	// Oracle: invalid username/password, insufficient privileges, account locked.
+	"ora-01017",
+	"ora-01031",
+	"ora-28000",
+	// Snowflake.
+	"incorrect username or password",
+	"jwt token is invalid",
+	// MongoDB, ClickHouse and generic driver wordings.
+	"authentication failed",
+	"not authorized on",
+	"not enough privileges",
+	"invalid credentials",
+	"invalid username or password",
+	// Object stores and cloud APIs (S3 / GCS / BigQuery / Azure Blob).
+	"invalidaccesskeyid",
+	"signaturedoesnotmatch",
+	"the aws access key id you provided does not exist",
+	"security token included in the request is invalid",
+	"expiredtoken",
+	"accessdenied",
+	"access denied",
+	"authorizationfailure",
+	"authorizationpermissionmismatch",
+	"authenticationfailed",
+	"invalid_grant",
+	"request had invalid authentication credentials",
+	"does not have storage.",
+	"does not have bigquery.",
+	// HTTP status shapes relayed by a connector or an API client.
+	"http 401",
+	"401 unauthorized",
+	"status 401",
+	"status code 401",
+	"http 403",
+	"403 forbidden",
+	"status 403",
+	"status code 403",
+	"invalid token",
+	"token expired",
+	"token has expired",
 }
 
 // destInfraFaultMarkers are replies that mean the row never reached a
@@ -226,6 +302,11 @@ func classifyDestFault(err error) destFault {
 	if matchesAnyMarker(low, destDataFaultMarkers) {
 		return faultData
 	}
+	// Auth before infra: libpq wraps a refused password in the infra marker
+	// "connection to server at" (KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA).
+	if matchesAnyMarker(low, destAuthFaultMarkers) {
+		return faultAuth
+	}
 	if matchesAnyMarker(low, destInfraFaultMarkers) || bareEOF(low) {
 		return faultInfra
 	}
@@ -234,6 +315,34 @@ func classifyDestFault(err error) destFault {
 
 // isDestInfraFault is the guard the condemn paths branch on.
 func isDestInfraFault(err error) bool { return classifyDestFault(err) == faultInfra }
+
+// isDestAuthFault is the guard for a refused credential or grant.
+func isDestAuthFault(err error) bool { return classifyDestFault(err) == faultAuth }
+
+// exitDestAuthRefused is the worker's exit status when the destination refuses
+// its credential: EX_CONFIG from sysexits.h. The supervisor (connector.py
+// DEST_AUTH_REFUSED_EXIT_CODE — keep the two equal) reads it as "needs user
+// config": it marks the worker crashed with a plain-words last_error instead of
+// respawning it into the same refusal until the crash-loop breaker trips with a
+// generic "crash-looped" message.
+const exitDestAuthRefused = 78
+
+// sinkFailClosedAuth halts the worker like sinkFailClosed — no commit, no DLQ,
+// so Kafka redelivers once the credential is fixed — but exits with
+// exitDestAuthRefused. A variable so tests can observe the branch.
+var sinkFailClosedAuth = func(format string, args ...interface{}) {
+	logf("error", format, args...)
+	os.Exit(exitDestAuthRefused)
+}
+
+// failClosedOnDestAuth is the single wording of the auth halt, so the batch,
+// per-row, single-event and object-storage paths cannot drift apart. The text
+// carries "authentication failed" so the orchestrator's diagnoser (pkg/diagnose
+// auth-scope rule) routes it to ActionRequestUserConfig, never to a retry.
+func failClosedOnDestAuth(where, table string, err error) {
+	sinkFailClosedAuth("fatal: %s: destination authentication failed or permission denied — the credential or grant was refused, needs user config: failing closed with offsets NOT committed and NO rows dead-lettered, so Kafka redelivers once the destination connection is fixed and the pipeline restarted (table=%s): %v",
+		where, table, err)
+}
 
 const (
 	// A destination restart takes tens of seconds; the pre-existing budget was
@@ -258,10 +367,12 @@ const (
 // and fails closed immediately, other values are clamped to
 // [minInfraRetrySeconds, maxInfraRetrySeconds]. Mirrors stallWatchdogTimeout().
 //
-// Blocking the consume loop here is deliberate: it is backpressure, and it is
-// also why the stall watchdog cannot misread it as a wedge — shouldRestartForStall
-// returns false once lastPoll is older than consumeLoopAliveWindow ("blocked in
-// message handling, not starved").
+// The hold is backpressure, and the stall watchdog must not misread it as a wedge.
+// Flushing inline (RSYNC_SINK_FLUSH_LANES <= 1) it blocks the consume loop, so
+// lastPoll goes stale and shouldRestartForStall returns false ("blocked in message
+// handling, not starved"). With flush lanes the loop keeps polling while a lane
+// holds the batch; there the held records were fetched, so waitingFloor does not
+// count them as waiting on the broker.
 func infraRetryBudget() time.Duration {
 	raw := strings.TrimSpace(os.Getenv("RSYNC_SINK_INFRA_RETRY_SECONDS"))
 	if raw == "" {

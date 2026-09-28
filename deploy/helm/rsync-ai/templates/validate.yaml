@@ -58,10 +58,11 @@ worker startup instead.
 {{- end }}
 
 {{/*
-The CDC plane is all-three-or-none: infra_preflight requires kafka-connect,
-debezium-mcp AND kafka-mcp-sink together before it will start a CDC run. The
-chart models them as one unit, so this only guards the BYO-Kafka combination
-that cannot work: Kafka Connect needs a bootstrap server it can reach.
+infra_preflight requires kafka-connect, debezium-mcp AND kafka-mcp-sink
+together before it will start a CDC run. connectors.cdc.enabled gates the first
+two; the sink renders on every install (batch writes through it). This only
+guards the BYO-Kafka combination that cannot work: Kafka Connect needs a
+bootstrap server it can reach.
 */}}
 {{- if and .Values.connectors.cdc.enabled (not .Values.kafka.enabled) }}
 {{- if not .Values.kafka.external.bootstrapServers }}

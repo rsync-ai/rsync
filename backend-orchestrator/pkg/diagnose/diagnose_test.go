@@ -137,6 +137,27 @@ func TestSchemaDriftIncludesShopifyRelay(t *testing.T) {
 	}
 }
 
+// KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA: a destination that refuses the
+// credential is a user-config fault, never a transient one — even when the driver
+// wraps it in connection wording (libpq's "connection to server at … failed:").
+// Retrying re-hits the same refusal; the user has to fix the connection.
+func TestCredentialRefusalIsUserConfigNotRetry(t *testing.T) {
+	d := New()
+	cases := []string{
+		`failed to connect to host=pg user=e2e_user database=db: connection to server at "10.0.0.5", port 5432 failed: FATAL: password authentication failed for user "e2e_user" (SQLSTATE 28P01)`,
+		"mssql: Login failed for user 'loader'.",
+		"MongoServerError: Authentication failed.",
+		"390100 (08004): Incorrect username or password was specified.",
+		"sink: invalid credentials for destination; i/o timeout while closing",
+	}
+	for _, msg := range cases {
+		got := d.Diagnose(Signal{ErrorMessage: msg})
+		if got.SuggestedAction != ActionRequestUserConfig {
+			t.Errorf("msg=%q: want request_user_config, got %s (%s)", msg, got.SuggestedAction, got.Category)
+		}
+	}
+}
+
 func TestNetworkClassifiesAsBackoff(t *testing.T) {
 	d := New()
 	cases := []string{

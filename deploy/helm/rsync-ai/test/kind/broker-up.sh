@@ -137,7 +137,7 @@ ensure_oidc() {
     docker build -q -t "$OIDC_IMAGE" "$dir" >/dev/null
   fi
 
-  docker rm -f "$OIDC_NAME" >/dev/null 2>&1 || true
+  docker rm -fv "$OIDC_NAME" >/dev/null 2>&1 || true
   # --env-file, not -e, for the one value that is a secret: `docker run -e K=$V`
   # spells V in the HOST process table for the lifetime of the command.
   local envf; envf="$(mktemp)"; chmod 600 "$envf"
@@ -346,7 +346,7 @@ EXT
   echo "TLS material OK: CA + broker cert with SAN DNS:$FQDN"
 }
 
-docker rm -f "$NAME" >/dev/null 2>&1 || true
+docker rm -fv "$NAME" >/dev/null 2>&1 || true
 
 # Per-stage extras. Declared here rather than inside the case so `set -u` cannot
 # turn "this stage did not set it" into a crash on an unrelated line -- and so

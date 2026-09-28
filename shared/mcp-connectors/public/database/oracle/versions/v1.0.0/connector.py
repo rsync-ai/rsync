@@ -155,7 +155,9 @@ def _is_local_db_host(host: Any) -> bool:
         return ip in ipaddress.ip_network("100.64.0.0/10")
     except ValueError:
         # Not an IP literal -> treat as a hostname: dotless = local service name.
-        return "." not in h
+        # A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+        # suffix resolves on public DNS (shared/local_db_host_golden.json).
+        return "." not in h or h.endswith((".svc", ".cluster.local"))
 
 
 # Detect driver pattern from connector type
@@ -1943,6 +1945,7 @@ class OracleMCPServer(DestinationLoadMixin, BaseMCPConnector):
         is_local_host = (
             host_val in ("", "localhost", "127.0.0.1", "::1", "host.docker.internal")
             or "." not in host_val
+            or host_val.endswith((".svc", ".cluster.local"))  # Kubernetes in-cluster service
         )
         explicit_tls = any(
             config.get(k) not in (None, "")

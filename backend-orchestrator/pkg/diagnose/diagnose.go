@@ -248,7 +248,10 @@ func (d *RuleBasedDiagnoser) Diagnose(signal Signal) Diagnosis {
 			Rationale:       "Phase 2.5 CredentialAgent classified failure as auth_scope",
 		}
 	}
-	if matchesAny(low, []string{"http 403", "403 forbidden", "access denied", "accessdenied", "permission denied", "missing scope", "insufficient scope"}) {
+	// Credential refusals (KI-CDC-SINK-AUTH-MISCLASSIFIED-AS-INFRA) belong here too:
+	// drivers wrap them in connection wording, and a retry re-hits the same refusal.
+	if matchesAny(low, []string{"http 403", "403 forbidden", "access denied", "accessdenied", "permission denied", "missing scope", "insufficient scope",
+		"authentication failed", "login failed for user", "invalid credentials", "incorrect username or password", "invalid username or password"}) {
 		return Diagnosis{
 			Category:        CategoryAuthScope,
 			SuggestedAction: ActionRequestUserConfig,

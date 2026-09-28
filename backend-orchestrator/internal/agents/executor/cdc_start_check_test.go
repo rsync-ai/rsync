@@ -359,6 +359,11 @@ func TestCDCStartCheckIsWiredBeforeTheRunIsReportedRunning(t *testing.T) {
 				return true
 			})
 			checkPos := firstCall("verifyCDCConnectorStarted")
+			if !checkPos.IsValid() {
+				// The streaming path calls the variant that also returns the RUNNING
+				// proof a Reload hands the snapshot dispatcher.
+				checkPos = firstCall("checkCDCConnectorStarted")
+			}
 			beforePos := firstCall(tc.before)
 			if !startSyncPos.IsValid() || !beforePos.IsValid() {
 				t.Fatalf("start_sync (%v) or %s (%v) not found in %s — re-point this guard",

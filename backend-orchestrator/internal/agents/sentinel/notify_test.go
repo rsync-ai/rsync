@@ -55,6 +55,7 @@ func TestEveryStoppedDataIssueReachesTheUser(t *testing.T) {
 	}{
 		{"connector down", IssueTypeConnectorDown, IssueSeverityCritical, "connector_down", "CDC_CONNECTOR_DOWN"},
 		{"source stream stalled", IssueTypeSourceStreamStalled, IssueSeverityCritical, "source_stream_stalled", "CDC_SOURCE_STREAM_STALLED"},
+		{"capture stopped", IssueTypeCaptureStopped, IssueSeverityCritical, "capture_stopped", "CDC_CAPTURE_STOPPED"},
 		{"sink worker absent", IssueTypeSinkWorkerAbsent, IssueSeverityCritical, "sink_worker_absent", "SINK_WORKER_ABSENT"},
 		{"sink write rejected", IssueTypeSinkWriteRejected, IssueSeverityCritical, "sink_write_rejected", "SINK_WRITE_REJECTED"},
 		// The terminal wedge rides in through emitLagIssue as a WARNING with

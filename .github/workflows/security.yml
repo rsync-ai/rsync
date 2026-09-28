@@ -53,14 +53,18 @@ name: Security
 #   * A PR that changes this file or scripts/security/ci-scan.py (which does
 #     the selecting) scans every module and the whole tree, so an edit to a
 #     scan is proven on everything that scan covers.
-#   * push to main, the nightly schedule and workflow_dispatch scan everything.
+#   * The nightly schedule and workflow_dispatch scan everything. There is no
+#     push-to-main run (removed 2026-09-27): it ran the full scan once per merge,
+#     161 of the 1,540 runner-min all workflows used from 2026-09-26 08:10 to
+#     09-27 07:08 UTC, on runners whose p90 queue wait was 11-28 min. The
+#     nightly full scan covers the same ground once a day.
 #   * Trivy's license gate is the last step of the `trivy` job, not a job.
 #
 # What that trades away, on purpose: a CVE published against a module a PR does
-# not touch no longer turns that PR red. It turns the next push to main -- or
-# the nightly run, whichever comes first -- red instead, which is why the
-# schedule moved from weekly to nightly. The flip side is the old behaviour's
-# cost: an unrelated PR blocked on a vulnerability it did not introduce.
+# not touch no longer turns that PR red. It turns the next nightly run red
+# instead, which is why the schedule moved from weekly to nightly. The flip
+# side is the old behaviour's cost: an unrelated PR blocked on a vulnerability
+# it did not introduce.
 #
 # Code-scanning upload is gated on the repository variable
 # CODE_SCANNING_ENABLED == 'true' (Settings -> Secrets and variables -> Actions
@@ -142,8 +146,6 @@ on:
       - '**.md'
       - 'docs/**'
       - 'LICENSE*'
-  push:
-    branches: [main]
   schedule:
     - cron: '0 8 * * *'   # daily 08:00 UTC — full-tree sweep; catches new CVEs a scoped PR scan no longer does
   workflow_dispatch:

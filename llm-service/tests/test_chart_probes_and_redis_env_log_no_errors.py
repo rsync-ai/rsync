@@ -13,10 +13,16 @@
    logs "Redis rate limiter unreachable ... degrading to in-memory limits" at
    startup: limits stop being shared between replicas.
 
+3. llm-service got no DATABASE_URL either. LLM cost logging
+   (src/utils/llm_cost.py) then logs "No DATABASE_URL; LLM cost logging
+   disabled" and no llm_usage_events row is ever written: every call goes
+   unmetered. Only llm-service calls record_usage (src/gateway/main.py).
+
 This proves the rendered manifests, not a live install.
 """
 
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -112,3 +118,35 @@ def test_generation_tier_gets_the_same_redis_as_the_gateway():
             "rate limiter dials 'redis', which does not resolve, and falls back to "
             "per-replica in-memory limits."
         )
+
+
+_VAR_REF = re.compile(r"\$\(([A-Z0-9_]+)\)")
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_llm_service_gets_the_same_database_as_the_gateway():
+    envs = {}
+    for d, c in _containers(_render(), kinds=("Deployment",)):
+        envs[c["name"]] = c.get("env", [])
+
+    def database_url(name):
+        entries = envs[name]
+        names = [e["name"] for e in entries]
+        assert "DATABASE_URL" in names, (
+            f"{name} renders no DATABASE_URL; llm_cost.py disables cost logging "
+            "and every LLM call goes unmetered"
+        )
+        at = names.index("DATABASE_URL")
+        url = entries[at].get("value") or ""
+        # Kubernetes expands $(VAR) only from entries defined EARLIER in the
+        # same list; a later or absent one stays as the literal text.
+        unresolved = [v for v in _VAR_REF.findall(url) if v not in names[:at]]
+        assert not unresolved, f"{name} DATABASE_URL uses {unresolved} before defining them: {url}"
+        return url, {e["name"]: e for e in entries}
+
+    peer_url, peer_env = database_url("api-gateway")
+    assert _VAR_REF.findall(peer_url), f"setup: api-gateway DATABASE_URL has no $(VAR) refs: {peer_url}"
+    got_url, got_env = database_url("llm-service")
+    assert got_url == peer_url, f"llm-service DATABASE_URL {got_url!r} != api-gateway {peer_url!r}"
+    for var in _VAR_REF.findall(peer_url):
+        assert got_env[var] == peer_env[var], f"{var}: llm-service {got_env[var]} != api-gateway {peer_env[var]}"

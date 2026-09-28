@@ -151,6 +151,14 @@ secrets:
   # without these when mode is "minio".
   minioAccessKey: ""
   minioSecretKey: ""
+  # The blob-staging store's login (objectStorage.blobStaging). Connectors are
+  # handed it, so give it its own; empty falls back to the MinIO pair above,
+  # which connectors then hold but -- with networkPolicy.enabled -- cannot use
+  # against that MinIO. install-k8s.sh generates both. With existingSecret, add
+  # BLOB_STAGING_ACCESS_KEY/BLOB_STAGING_SECRET_KEY to it: the store's pod does
+  # not start without them (the orchestrator does, and only blob pipelines fail).
+  blobStagingAccessKey: ""
+  blobStagingSecretKey: ""
 
   # Optional; every LLM feature degrades gracefully when absent.
   openaiApiKey: ""
@@ -503,6 +511,23 @@ objectStorage:
     resources:
       requests: { cpu: 100m, memory: 256Mi }
       limits: { memory: 768Mi }
+  # A second, blob-only MinIO for the blob-passthrough lane, rendered only with
+  # mode=minio. Both connectors of a blob pipeline read and write it, and
+  # connector pods are kept off the MinIO above (it holds every pipeline's staged
+  # rows) -- with networkPolicy.enabled they cannot reach it at all. So they get
+  # this one, admitted by its own policy, under its own login
+  # (secrets.blobStagingAccessKey/SecretKey). Same image, bucket name and expiry
+  # as the MinIO above; blobs are content-addressed and shared between messages,
+  # so the expiry rule is their only cleanup.
+  blobStaging:
+    enabled: true
+    persistence:
+      size: 10Gi
+      # Overrides global.storageClass for this volume only. Empty = inherit it.
+      storageClass: ""
+    resources:
+      requests: { cpu: 50m, memory: 128Mi }
+      limits: { memory: 512Mi }
   external:
     # e.g. https://s3.eu-west-1.amazonaws.com
     endpointUrl: ""
@@ -837,20 +862,22 @@ connectors:
       requests: { cpu: 10m, memory: 32Mi }
       limits: { memory: 128Mi }
 
-  # The CDC plane. All three or none — pre-flight requires kafka-connect,
-  # debezium-mcp and kafka-mcp-sink together (infra_preflight.go:177-201).
+  # The CDC plane: kafka-connect + debezium-mcp. kafka-mcp-sink is configured
+  # here too but renders on EVERY install — batch runs write through it, and
+  # batch pre-flight requires it whenever a pipeline has a destination
+  # (infra_preflight.go). CDC pre-flight requires all three.
   # debezium-mcp runs as a sidecar of kafka-connect, not a separate Deployment,
   # because debezium writes source-DB credentials to a directory kafka-connect
   # reads through FileConfigProvider. One pod means the shared volume is an
   # ordinary ReadWriteOnce claim (kafkaConnect.secretsPersistence), so those
   # credentials stay off the Kafka config topic AND survive a pod restart.
   #
-  # On by default, because "all three or none" has no third branch that degrades:
-  # a streaming pipeline on a release without them does not fall back to batch,
-  # it polls three absent Services for two minutes and fails the run. The install
-  # that left them out reported success, so the first evidence anything is
-  # missing is a failed pipeline. Set false on a cluster that will only ever run
-  # batch syncs — it frees a JVM and two Deployments.
+  # On by default, because a streaming pipeline on a release without them does
+  # not fall back to batch: it polls absent Services for two minutes and fails
+  # the run. The install that left them out reported success, so the first
+  # evidence anything is missing is a failed pipeline. Set false on a cluster
+  # that will only ever run batch syncs — it frees the kafka-connect JVM and its
+  # debezium sidecar; kafka-mcp-sink keeps running.
   cdc:
     enabled: true
     kafkaConnect:

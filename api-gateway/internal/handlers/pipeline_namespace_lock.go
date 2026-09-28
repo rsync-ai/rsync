@@ -53,7 +53,7 @@ type namespaceLockResult struct {
 // namespace having proven nothing about it, and the lock is permanent: the pipeline
 // could never afterwards be moved off a namespace it should never have been given.
 // A run with no tables writes nothing, so there is nothing to protect yet.
-func lockNamespaceForRun(ctx context.Context, database *sql.DB, pipelineID string, tables []string) (namespaceLockResult, error) {
+func lockNamespaceForRun(ctx context.Context, database *sql.DB, pipelineID string, tables, destTables []string) (namespaceLockResult, error) {
 	pipelineID = strings.TrimSpace(pipelineID)
 	if database == nil || pipelineID == "" {
 		return namespaceLockResult{}, errNamespaceLockBadRequest
@@ -106,7 +106,7 @@ func lockNamespaceForRun(ctx context.Context, database *sql.DB, pipelineID strin
 		return namespaceLockResult{}, nil
 	}
 
-	ns, relocated, cleared := lockFirstRunNamespace(ctx, database, workspaceID, pipelineID, seeded, clean, "run-boundary")
+	ns, relocated, cleared := lockFirstRunNamespace(ctx, database, workspaceID, pipelineID, seeded, clean, destTables, "run-boundary")
 	return namespaceLockResult{
 		Namespace:          ns,
 		Locked:             true,
@@ -146,13 +146,18 @@ func LockPipelineNamespaceInternal(c *gin.Context) {
 
 	var req struct {
 		SelectedTables []string `json:"selected_tables"`
+		// DestinationTables is what the run will actually WRITE where the source
+		// names do not say (a prompt-renamed single table). Optional: an executor
+		// predating KI-NSPROBE-USES-SOURCE-TABLE-NAMES omits it and the probe runs
+		// on the source-derived names alone, exactly as before.
+		DestinationTables []string `json:"destination_tables"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "message": err.Error()})
 		return
 	}
 
-	res, err := lockNamespaceForRun(c.Request.Context(), database, id, req.SelectedTables)
+	res, err := lockNamespaceForRun(c.Request.Context(), database, id, req.SelectedTables, req.DestinationTables)
 	if err != nil {
 		if err == errNamespaceLockNoTables {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "no_tables", "message": "selected_tables must be non-empty"})

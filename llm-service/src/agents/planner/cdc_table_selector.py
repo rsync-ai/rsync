@@ -196,7 +196,7 @@ class TableValidator:
     """
     Validates tables for CDC eligibility.
     Implements all validation rules from the plan:
-    - PK/replica identity requirement
+    - PK/replica identity (a keyless table warns; it does not block)
     - PII detection
     - Size estimation
     """
@@ -264,11 +264,15 @@ class TableValidator:
                 result.has_primary_key = True
                 result.primary_key_columns = primary_keys
         
+        # A keyless table is allowed (policy 2026-09-27 — it used to block): CDC
+        # copies its inserts once, but each UPDATE adds a new row and DELETEs are
+        # not applied, so the copy drifts. Warn with the fix; never block.
         if self.require_pk and not result.has_primary_key:
-            result.is_valid = False
-            result.should_block = True
-            result.block_reason = "No primary key or replica identity"
-            result.errors.append("Table must have a primary key for CDC")
+            result.warnings.append(
+                f"⚠️  {table_name} has no primary key. CDC will copy inserts exactly once, "
+                "but each UPDATE adds a new row (the old version stays) and DELETEs are not "
+                "applied, so the destination drifts from the source. Add a primary key for an exact copy."
+            )
         
         # PII detection
         if self.enable_pii_detection:

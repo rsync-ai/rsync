@@ -697,12 +697,13 @@ services:
     volumes: *kafka-certs
   llm-service:
     volumes: *kafka-certs
-  # The three below belong to the `cdc` profile. The installer activates it, and
-  # the compose.sh it writes carries the flag; a compose command you type yourself
-  # does not, so the `--profile cdc` below is what keeps these three in the project.
-  debezium-mcp:
-    volumes: *kafka-certs
+  # kafka-mcp-sink-mcp always runs: batch and CDC both write through it.
   kafka-mcp-sink-mcp:
+    volumes: *kafka-certs
+  # The two below belong to the `cdc` profile. The installer activates it, and
+  # the compose.sh it writes carries the flag; a compose command you type yourself
+  # does not, so the `--profile cdc` below is what keeps these two in the project.
+  debezium-mcp:
     volumes: *kafka-certs
   # Kafka Connect additionally reads its own CONNECT_*_TRUSTSTORE settings.
   kafka-connect:

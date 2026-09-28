@@ -4,7 +4,7 @@ import { useCallback, useSyncExternalStore } from "react"
 
 import { authFetch } from "@/lib/api/auth-fetch"
 import { API_ENDPOINTS } from "@/lib/config/api"
-import { onPipelineRefresh } from "@/lib/events/pipelineRefresh"
+import { emitPipelineRefresh, onPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import {
   isTerminalPipelineStatus,
   normalizePipelineStatus,
@@ -26,15 +26,19 @@ import {
 
 export const ACTIVE_POLL_MS = 4000
 export const SETTLED_POLL_MS = 30_000
+// Paused or idle: a schedule or another tab moves these on more often than a
+// finished run, and 30 s left the page trailing the database (item 35).
+export const PAUSED_POLL_MS = 10_000
 
 /**
- * How long to wait before the next read. A status that only a user or a
- * schedule can move on from (finished, idle, paused) is read every 30 s; a live
- * or unknown one (including no answer yet) every 4 s, as each reader used to.
+ * How long to wait before the next read. A finished run is read every 30 s, a
+ * paused or idle one every 10 s; a live or unknown one (including no answer yet)
+ * every 4 s, as each reader used to.
  */
 export function statePollMs(status: NormalizedPipelineStatus | null): number {
   if (status === null) return ACTIVE_POLL_MS
-  if (isTerminalPipelineStatus(status) || status === "idle" || status === "paused") return SETTLED_POLL_MS
+  if (status === "idle" || status === "paused") return PAUSED_POLL_MS
+  if (isTerminalPipelineStatus(status)) return SETTLED_POLL_MS
   return ACTIVE_POLL_MS
 }
 
@@ -70,14 +74,29 @@ function startPoller(pipelineId: string): Poller {
   let notFound = false
   let inflight: AbortController | null = null
   let timer: ReturnType<typeof setTimeout> | undefined
+  // Set while this poller announces a change, so it does not answer itself.
+  let announcing = false
 
-  const update = (next: Partial<PipelineStatePoll>) => {
+  const update = (next: Partial<PipelineStatePoll>, announce = false) => {
     if (stopped) return
     const merged = { ...poller.state, ...next }
     const cur = poller.state
     if (merged.status === cur.status && merged.error === cur.error && merged.reads === cur.reads) return
     poller.state = merged
     poller.listeners.forEach((l) => l())
+    // The status moved (a run finished, a schedule started one, another tab
+    // paused it): tell /runtime and the panels, which otherwise wait out their
+    // own slower timers — the page trailed the database by ~20 s (item 35).
+    // The first answer is not a change, and a read the refresh bus asked for
+    // was already heard by every listener.
+    if (announce && cur.status !== null && merged.status !== cur.status) {
+      announcing = true
+      try {
+        emitPipelineRefresh(pipelineId)
+      } finally {
+        announcing = false
+      }
+    }
   }
 
   const schedule = () => {
@@ -90,7 +109,9 @@ function startPoller(pipelineId: string): Poller {
     }, statePollMs(poller.state.status))
   }
 
-  const fetchOnce = async () => {
+  // `announce`: this read was not asked for on the refresh bus, so a change it
+  // finds is news to the other panels.
+  const fetchOnce = async (announce = true) => {
     if (stopped || notFound) return
     inflight?.abort()
     const ac = new AbortController()
@@ -110,7 +131,7 @@ function startPoller(pipelineId: string): Poller {
       }
       const data = (await res.json()) as { status?: string }
       if (stopped) return
-      update({ status: normalizePipelineStatus(data?.status), error: null, reads: poller.state.reads + 1 })
+      update({ status: normalizePipelineStatus(data?.status), error: null, reads: poller.state.reads + 1 }, announce)
     } catch (e) {
       // Aborted by a newer read (which owns the schedule now) or by the last
       // reader leaving.
@@ -129,7 +150,7 @@ function startPoller(pipelineId: string): Poller {
   // Run, Pause, Resume and Stop announce themselves on the refresh bus, so the
   // header flips as soon as the POST lands, not a poll later (#13).
   const unsubscribeRefresh = onPipelineRefresh((pid) => {
-    if (pid === pipelineId) void fetchOnce()
+    if (pid === pipelineId && !announcing) void fetchOnce(false)
   })
 
   const onVisibility = () => {

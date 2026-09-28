@@ -348,8 +348,11 @@ func emitCDCStatusMetrics(ctx context.Context, kafkaManager *kafka.Manager, db *
 // "written 12800" on a pipeline that had applied 72,670 rows. Row counts come from the
 // sink's own counters (pipeline table stats).
 func cdcStatusMetricsMetadata(connectorName string, lagByTopic map[string]int64, result map[string]interface{}) map[string]interface{} {
-	var cdcLagMs *int64
-	var cdcFreshnessMs *int64
+	// The poll measures one thing: the sink consumer group's Kafka lag, in messages.
+	// It has no timestamp to turn that into a time, so it sends no cdc_lag_ms or
+	// cdc_freshness_ms. It used to send messages x 10 under both names, and the
+	// Overview showed 1,280 messages behind as 12,800 ms
+	// (KI-OVERVIEW-CDC-LAG-AND-ROWS-NOT-MEASURED).
 	var sinkLagMessages *int64
 	if len(lagByTopic) > 0 {
 		// Sum lag across all topics (usually just one topic per pipeline)
@@ -357,25 +360,14 @@ func cdcStatusMetricsMetadata(connectorName string, lagByTopic map[string]int64,
 		for _, lag := range lagByTopic {
 			totalLag += lag
 		}
-		// The measured value: changes in Kafka the sink has not read yet. The
-		// Monitoring overview shows this count; cdc_lag_ms below is only an estimate.
+		// Changes in Kafka the sink has not read yet.
 		sinkLagMessages = &totalLag
-		// Approximate lag in milliseconds (assume 1 message = 1ms, very rough)
-		// In a real system, you'd compute this from Kafka timestamps.
-		lagMs := totalLag * 10 // Rough heuristic: 10ms per message lag
-		cdcLagMs = &lagMs
-
-		// Freshness: if lag is 0, freshness is ~0; else it's proportional to lag.
-		freshnessMs := lagMs
-		cdcFreshnessMs = &freshnessMs
 	}
 
 	return map[string]interface{}{
 		"source":            "cdc_status_poll",
 		"metrics_schema":    "v2", // Standardized schema version
 		"connector_name":    connectorName,
-		"cdc_lag_ms":        cdcLagMs,
-		"cdc_freshness_ms":  cdcFreshnessMs,
 		"sink_lag_messages": sinkLagMessages,
 		"health_status":     result["health_status"],
 		"connector_state":   result["connector_state"],
@@ -491,6 +483,10 @@ func main() {
 	}
 
 	log.Infof("✅ Database connected (%s:%s)", cfg.Database.Host, cfg.Database.Port)
+
+	// api-gateway owns the migrations; on a fresh install the workers below
+	// would otherwise query tables that do not exist yet (schema_wait.go).
+	waitForBootSchema(context.Background(), db, bootSchemaWaitTimeout(), 2*time.Second, time.Sleep)
 
 	// Initialize Kafka using config
 	kafkaConfig := kafka.Config{
@@ -831,6 +827,9 @@ func main() {
 	snapshotDispatcher := cdcsnapshot.NewDispatcher(snapshotRequests, kafkaManager,
 		cdcsnapshot.NewConnectClient(snapshotConnectURL), os.Getenv("ENABLE_CDC_TABLE_STATS") == "true")
 	cdcStatsAgent.SetSnapshotObserver(snapshotDispatcher.Observe)
+	// A CDC Reload hands the dispatcher the connector's RUNNING streak it just
+	// watched, so its re-snapshot is not held for a second ReadyStable wait.
+	executorAgent.SetSnapshotHurrier(snapshotDispatcher)
 	snapshotDispatcher.Start()
 	defer snapshotDispatcher.Stop()
 
@@ -895,7 +894,7 @@ func main() {
 	if batchSentinel != nil {
 		batchSentinel.SetMCPManager(mcpServerManager)
 	}
-
+	startSinkWorkerReaper(db, mcpServerManager) // KI-CDC-SINK-WORKER-NO-REAPER; off unless SINK_WORKER_REAPER_MODE is set
 	// Start HTTP server
 	router := setupRouter(kafkaManager, topologyManager, executorAgent, consumerRegistry, retentionAgent, db, mcpServerManager, cdcStatsAgent)
 
@@ -2097,6 +2096,9 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 			// Stop keeps the position: connector parked in STOPPED with its offsets,
 			// sink workers stopped, slot and publication kept (handlers/cdc_stop.go).
 			cdcGrp.PUT("/cdc/pipelines/:pipeline_id/stop", handlers.StopCDCPipeline(db, mcpServerManager, topologyManager))
+			// Batch Stop: stop the pipeline's "sink-<id8>-batch" worker so it stops
+			// draining the cancelled run's backlog (handlers/batch_sink_stop.go).
+			cdcGrp.PUT("/pipelines/:id/sink/stop", handlers.StopBatchSinkWorkers(db, mcpServerManager, topologyManager))
 
 			// DMS-like "reload/backfill" for newly added tables (Debezium ad-hoc snapshot),
 			// queued in cdc_snapshot_requests for the snapshot dispatcher started in main.

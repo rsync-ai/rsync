@@ -38,6 +38,7 @@ Needs: docker (with compose v2), go, git. Exit 0 = every cell as expected,
 """
 import argparse
 import concurrent.futures
+import fcntl
 import json
 import os
 import re
@@ -68,14 +69,55 @@ RUNTIMES = ("go-sarama", "go-kafkago", "python", "jvm")
 CELL_TIMEOUT = 150
 WORKER_TIMEOUT = 180
 WORKER_READY = "Finished starting connectors and tasks"
-JAVA = ["java", "-Dlog4j.configuration=file:/kmx/log4j.properties", "-cp", "/kafka/libs/*",
-        "/kmx/RoundTrip.java"]
+# RoundTrip.java is compiled ONCE, in build(), into W/cls, mounted at CLS in every
+# container that runs it. Launching the .java source instead compiles it on every
+# JVM start -- ~4 s on an idle Mac, 30-60 s on a loaded CI one, 30+ starts a run.
+CLS = "/kmx-cls"
+# Every JVM here -- a RoundTrip cell, or a row's Connect worker -- lives seconds
+# to a few minutes beside up to eight others on one shared 7-vCPU Docker VM. C2
+# and G1 start compiler and GC threads per core for work a process that short
+# never pays back; C1 alone and the serial collector cut its start-up CPU. The
+# harness's own flags: no service runs with them, and no security setting moves.
+JVM_LEAN = ["-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC"]
+JAVA = ["java", *JVM_LEAN, "-Dlog4j.configuration=file:/kmx/log4j.properties", "-cp", f"{CLS}:/kafka/libs/*",
+        "RoundTrip"]
+# Four CI runners share one Mac and one Docker VM. Two matrices at once double
+# every JVM's wait for a CPU: run 36305855777 overlapped another for ~32 min, and
+# its lone plaintext control worker did not start within WORKER_TIMEOUT.
+LOCK = os.environ.get("KMX_LOCK") or "/tmp/rsync-kafka-matrix.lock"
 
 W = PKI = ""  # the per-run work dir (0700) and its pki/; set in main()
 SECRET = {k: secrets.token_hex(16) for k in ("PLAIN_PW", "SCRAM_PW", "OIDC_SECRET")}
+T0 = time.time()
 
 
 # ---------------------------------------------------------------- helpers
+
+def say(msg):
+    """Progress, with elapsed time: a slow phase must be visible in the CI log as it happens."""
+    print(f"[{PFX} +{time.time() - T0:.0f}s] {msg}", flush=True)
+
+
+def host_lock():
+    """Wait until no other matrix run on this machine holds LOCK, then hold it.
+
+    Returns the open file: the lock lives as long as it does, and the kernel drops
+    it when this process exits, however it exits -- a killed CI job cannot leave it
+    stuck. Child processes do not inherit it (subprocess closes fds by default)."""
+    fh = open(LOCK, "a+")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.seek(0)
+        say(f"waiting for the Kafka matrix already running on this host ({fh.read().strip() or '?'}) to finish")
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        say("host lock acquired")
+    fh.seek(0)
+    fh.truncate()
+    fh.write(PFX)
+    fh.flush()
+    return fh
+
 
 def redact(text):
     for value in SECRET.values():
@@ -123,7 +165,7 @@ def cleanup(keep):
         return
     ids = docker("ps", "-aq", "--filter", f"label={LABEL}").stdout.split()
     if ids:
-        docker("rm", "-f", *ids)
+        docker("rm", "-fv", *ids)
     docker("network", "rm", NET)
     docker("rmi", "-f", IMG_CONNECT, IMG_OIDC, IMG_PY)
     shutil.rmtree(W, ignore_errors=True)
@@ -132,7 +174,7 @@ def cleanup(keep):
 # ---------------------------------------------------------------- setup
 
 def build():
-    print(f"[{PFX}] building images and the Go probe")
+    say("building images and the Go probe")
     arch = docker("version", "--format", "{{.Server.Arch}}", check=True).stdout.strip()
     go = subprocess.run(["go", "build", "-o", os.path.join(W, "kmatrix-probe"), "./cmd/kmatrix-probe"],
                         cwd=os.path.join(ROOT, "shared/go/kafkaclient"), capture_output=True, text=True,
@@ -161,6 +203,22 @@ def build():
             res = fut.result()
             if res.returncode != 0:
                 raise SystemExit(f"harness: building {futs[fut]} failed:\n{res.stderr[-3000:]}")
+    compile_roundtrip()
+
+
+def compile_roundtrip():
+    """javac RoundTrip.java against the image's own kafka-clients, once per run.
+
+    The image ships no `javac`; the JDK's compiler module does the same job. Its
+    -cp takes no `*` wildcard, hence the explicit jar list."""
+    out = os.path.join(W, "cls")
+    os.makedirs(out)
+    res = docker("run", "--rm", "--label", LABEL, "-u", f"{os.getuid()}:{os.getgid()}",
+                 "-v", f"{HERE}:/kmx:ro", "-v", f"{out}:/out", "--entrypoint", "sh", IMG_CONNECT, "-c",
+                 'java -m jdk.compiler/com.sun.tools.javac.Main -nowarn -cp "$(printf "%s:" /kafka/libs/*.jar)"'
+                 " -d /out /kmx/RoundTrip.java", timeout=600)
+    if res.returncode != 0 or not os.path.exists(os.path.join(out, "RoundTrip.class")):
+        raise SystemExit(f"harness: compiling RoundTrip.java failed:\n{(res.stdout + res.stderr)[-3000:]}")
 
 
 def _pin(requirements, package):
@@ -232,7 +290,7 @@ def wait_for(what, probe, tries=90):
 
 
 def infra():
-    print(f"[{PFX}] PKI, OIDC provider, broker")
+    say("PKI, OIDC provider, broker")
     docker("network", "create", "--label", LABEL, NET, check=True)
     os.makedirs(PKI)
     docker("run", "--rm", "--label", LABEL, "-u", f"{os.getuid()}:{os.getgid()}",
@@ -429,7 +487,7 @@ def client_cell(row, runtime):
     try:
         return _client_cell(row, runtime)
     except subprocess.TimeoutExpired:
-        docker("rm", "-f", f"{PFX}-{row.name}-{runtime}", f"{PFX}-{row.name}-{runtime}-props")
+        docker("rm", "-fv", f"{PFX}-{row.name}-{runtime}", f"{PFX}-{row.name}-{runtime}-props")
         return "ERROR", f"timed out after {CELL_TIMEOUT}s"
 
 
@@ -438,7 +496,8 @@ def _client_cell(row, runtime):
     cname = f"{PFX}-{row.name}-{runtime}"
     pid = f"{row.name}-{runtime}-{secrets.token_hex(4)}"
     base = ["run", "--rm", "--name", cname, "--label", LABEL, "--network", NET, "--env-file", envf,
-            "-e", f"PROBE_ID={pid}", "-v", f"{PKI}:/pki:ro", "-v", f"{HERE}:/kmx:ro"]
+            "-e", f"PROBE_ID={pid}", "-v", f"{PKI}:/pki:ro", "-v", f"{HERE}:/kmx:ro",
+            "-v", f"{W}/cls:{CLS}:ro"]
     stdin = None
     if runtime.startswith("go-"):
         args = base + ["-v", f"{W}/kmatrix-probe:/probe:ro", "--entrypoint", "/probe", IMG_PY, runtime[3:]]
@@ -451,7 +510,7 @@ def _client_cell(row, runtime):
                      IMG_PY, "python", "/kmx/schema_history_props.py", timeout=CELL_TIMEOUT)
         if gen.returncode != 0:
             return result_line(gen.stderr) or ("ERROR", "props generator: " + gen.stderr[-400:])
-        args, stdin = ["run", "-i", *base[1:], IMG_CONNECT, *JAVA, "-"], gen.stdout
+        args, stdin = ["run", "-i", *base[1:], "--no-healthcheck", IMG_CONNECT, *JAVA, "-"], gen.stdout
     res = docker(*args, timeout=CELL_TIMEOUT, input=stdin)
     return result_line(res.stdout) or ("ERROR", "no RESULT line: " + (res.stdout + res.stderr)[-400:])
 
@@ -465,8 +524,8 @@ def client_matrix(rows):
         again = [c for c in cells if timed_out(*c[0].expectation(c[1]), *results[c])]
         if not again:
             break
-        print(f"[{PFX}] attempt {attempt}: re-running {len(again)} cell(s) that timed out before any verdict: "
-              + ", ".join(f"{row.name}/{rt}" for row, rt in again))
+        say(f"attempt {attempt}: re-running {len(again)} cell(s) that timed out before any verdict: "
+            + ", ".join(f"{row.name}/{rt}" for row, rt in again))
         for cell, (got, msg) in _run_cells(again, RETRY_WORKERS).items():
             results[cell] = (got, f"attempt {attempt}: {msg}")
     return [(row.name, rt, *row.expectation(rt), *results[(row, rt)]) for row, rt in cells]
@@ -482,18 +541,33 @@ def _run_cells(cells, workers):
 
 SECURITY_KEY = re.compile(r"^(KAFKA_BROKERS|BOOTSTRAP_SERVERS|KAFKA_(SECURITY|SASL|SSL)_\w+"
                           r"|CONNECT_(PRODUCER_|CONSUMER_)?(SECURITY|SASL|SSL)_\w+)$")
-# docker-compose.quickstart.yml aborts on these (`${VAR:?}`) -- none is read by the
-# two services rendered here.
-QUICKSTART_DUMMIES = {k: "kmatrix-render-only" for k in (
-    "ENCRYPTION_KEY", "JWT_SECRET", "MINIO_ACCESS_KEY", "MINIO_SECRET_KEY",
-    "POSTGRES_PASSWORD", "REDIS_PASSWORD")}
 
 
-def render(compose_file, env, extra=()):
+def quickstart_dummies(root=None):
+    """docker-compose.quickstart.yml aborts on any `${VAR:?}` it cannot fill -- none is
+    read by the two services rendered here. Read from the file, not listed by hand:
+    a hand list aborted every cell the day BLOB_STAGING_ACCESS_KEY became required.
+    Per root, because --renders-match renders the base branch's copy too."""
+    with open(os.path.join(root or ROOT, "docker-compose.quickstart.yml")) as fh:
+        return {k: "kmatrix-render-only" for k in sorted(set(re.findall(r"\$\{([A-Z0-9_]+):\?", fh.read())))}
+
+
+QUICKSTART_DUMMIES = quickstart_dummies()
+# Worker settings that are the harness's, not the compose file's. The default
+# plugin discovery (hybrid_warn) runs the ServiceLoader scan AND a reflective scan
+# of every jar under the image's 12 connectors: on CI (run 36325162072) the
+# reflective one took 39-67 s per worker, and a lone worker needed 147 s of
+# WORKER_TIMEOUT's 180 to start. service_load keeps only the first scan. What it
+# drops -- plugins without a ServiceLoader manifest (the rsync SMT, the Mongo
+# sink, vitess transforms) -- is never loaded by a row: no row creates a connector.
+HARNESS_WORKER_ENV = {"CONNECT_PLUGIN_DISCOVERY": "service_load"}
+
+
+def render(compose_file, env, extra=(), root=None):
     """`docker compose config` with NOTHING from the caller's shell or a .env file."""
     envf = write_env(os.path.join(W, f"render-{secrets.token_hex(4)}.env"), env)
     clean = {k: os.environ[k] for k in ("PATH", "HOME", "DOCKER_HOST", "DOCKER_CONTEXT") if k in os.environ}
-    res = run(["docker", "compose", "-f", os.path.join(ROOT, compose_file), "--env-file", envf, *extra,
+    res = run(["docker", "compose", "-f", os.path.join(root or ROOT, compose_file), "--env-file", envf, *extra,
                "config", "--format", "json", "kafka-connect", "debezium-mcp"], env=clean)
     os.unlink(envf)
     if res.returncode != 0:
@@ -513,24 +587,52 @@ def parity(main, quick):
     return names
 
 
-def connect_row(row):
-    main = render("docker-compose.yml", row.env)
-    quick = render("docker-compose.quickstart.yml", {**row.env, **QUICKSTART_DUMMIES}, ("--profile", "cdc"))
+def renders(row, root=None):
+    """(main, quickstart): what connect_row takes from the two compose files -- nothing else."""
+    return (render("docker-compose.yml", row.env, root=root),
+            render("docker-compose.quickstart.yml", {**row.env, **quickstart_dummies(root)}, ("--profile", "cdc"),
+                   root=root))
+
+
+def renders_match(base):
+    """Does every connect row render the same from the compose files in `base` as from ROOT?
+
+    The PR gate asks this when a compose file changed and nothing else the matrix
+    covers did. The matrix reads a compose file ONLY through renders(): the rendered
+    environment of kafka-connect and debezium-mcp, per row. Identical renders for
+    every row mean identical cells, so the run can only repeat the base branch's
+    verdict. Any render error answers "no" -- the matrix then runs and reports it."""
+    def pair(row):
+        return row, renders(row), renders(row, root=base)
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        differ = [row.name for row, head, old in pool.map(pair, CONNECT_ROWS) if head != old]
+    for name in differ:
+        print(f"{name}: the kafka-connect/debezium-mcp environment renders differently", flush=True)
+    return not differ
+
+
+def connect_row(row, attempt=1):
+    main, quick = renders(row)
     drift = parity(main, quick)
     worker_env, dbz_env = main
-    cname = f"{PFX}-{row.name}"
+    cname = f"{PFX}-{row.name}" + (f"-r{attempt}" if attempt > 1 else "")
     worker_env = {**worker_env,
                   "GROUP_ID": cname, "ADVERTISED_HOST_NAME": cname,
                   "CONFIG_STORAGE_TOPIC": f"{cname}-configs",
                   "OFFSET_STORAGE_TOPIC": f"{cname}-offsets",
                   "STATUS_STORAGE_TOPIC": f"{cname}-status",
-                  "KAFKA_HEAP_OPTS": "-Xms256M -Xmx512M"}
+                  "KAFKA_HEAP_OPTS": "-Xms256M -Xmx512M",
+                  "KAFKA_JVM_PERFORMANCE_OPTS": " ".join([*JVM_LEAN, "-Djava.awt.headless=true"]),
+                  **HARNESS_WORKER_ENV}
     secrets_dir = os.path.join(W, "connect-secrets")
     os.makedirs(secrets_dir, exist_ok=True)
-    docker("run", "-d", "--name", cname, "--label", LABEL, "--network", NET,
+    # --no-healthcheck: this loop reads the log for readiness, so the image's
+    # 30 s curl probe is one more process competing for the same CPUs.
+    started = time.time()
+    docker("run", "-d", "--name", cname, "--label", LABEL, "--network", NET, "--no-healthcheck",
            "--env-file", write_env(os.path.join(W, "rows", row.name + ".worker.env"), worker_env),
            "-v", f"{PKI}:/pki:ro", "-v", f"{HERE}:/kmx:ro", "-v", f"{secrets_dir}:/connect-secrets:ro",
-           IMG_CONNECT, check=True)
+           "-v", f"{W}/cls:{CLS}:ro", IMG_CONNECT, check=True)
 
     cells = {"worker": None, "tasks": ("-", ""), "history": ("-", "")}
     deadline = time.time() + WORKER_TIMEOUT
@@ -545,9 +647,13 @@ def connect_row(row):
         running = docker("inspect", "-f", "{{.State.Running}}", cname).stdout.strip() == "true"
         logs = redact(_logs(cname))
         if WORKER_READY in logs:
-            cells["worker"] = ("PASS", "worker started")
+            # The boot time stays in the CI log: the one number that says how
+            # close this host runs to WORKER_TIMEOUT.
+            cells["worker"] = ("PASS", f"worker started in {time.time() - started:.0f}s")
         elif not running or time.time() > deadline:
-            why = "exited" if not running else f"not started after {WORKER_TIMEOUT}s"
+            # Still running at the deadline is the clock, not a verdict: worded to
+            # match R_TIMEOUT, so connect_matrix re-runs it like any other timeout.
+            why = "exited" if not running else f"timed out: not started after {WORKER_TIMEOUT}s"
             cells["worker"] = ("FAIL", f"{why}: " + _cause(logs, row.reason))
         else:
             time.sleep(2)
@@ -560,7 +666,7 @@ def connect_row(row):
             for cell in ("tasks", "history"):
                 if cells[cell][0] == "-":
                     cells[cell] = ("ERROR", f"timed out after {CELL_TIMEOUT}s")
-    docker("rm", "-f", cname, cname + "-props")
+    docker("rm", "-fv", cname, cname + "-props")
 
     out = []
     for cell, (got, msg) in cells.items():
@@ -611,7 +717,9 @@ def _cause(logs, reason):
         hit = next((ln for ln in lines if re.search(reason, ln)), None)
         if hit:
             return hit.strip()
-    pick = [ln for ln in lines if re.search(r"FATAL|ERROR|Exception", ln)]
+    # Not "=ERROR": the entrypoint's first line sets a logger level to ERROR, and
+    # every worker that timed out without an error was reported as that line.
+    pick = [ln for ln in lines if re.search(r"(?<![=\w])(FATAL|ERROR)\b|Exception", ln)]
     return (pick[-1] if pick else (lines[-1] if lines else "no output")).strip()
 
 
@@ -619,15 +727,49 @@ def connect_matrix(rows):
     if not rows:
         return []
     first, rest = rows[0], rows[1:]
-    out = connect_row(first)  # alone: if the simplest worker cannot boot, stop here
-    probes = [c for c in out if c[1] in ("worker", "tasks", "history")]
+    # Alone, and retried like any row: if the simplest worker cannot boot, stop
+    # here. Judged on its first attempt, one slow boot ended the run as a
+    # "harness failure" (run 36305855777) that its retry would have passed.
+    results = {first.name: connect_retries(first, connect_row(first))}
+    probes = [c for c in results[first.name] if c[1] in ("worker", "tasks", "history")]
     if first.name == "cx-01-plaintext" and not all(grade(e, r, g, m) for _, _, e, r, g, m in probes):
-        report(out)
+        report(results[first.name])
         raise SystemExit("harness: the plaintext Connect control failed; the harness, not the code, is broken")
     with concurrent.futures.ThreadPoolExecutor(3) as pool:
-        for cells in pool.map(connect_row, rest):
-            out += cells
-    return out
+        for row, cells in zip(rest, pool.map(connect_row, rest)):
+            results[row.name] = cells
+    with concurrent.futures.ThreadPoolExecutor(RETRY_WORKERS) as pool:
+        for row, cells in zip(rest, pool.map(lambda row: connect_retries(row, results[row.name]), rest)):
+            results[row.name] = cells
+    return [c for row in rows for c in results[row.name]]
+
+
+def connect_retries(row, cells):
+    """The client matrix's timeout rule (see RETRIES), for one connect row.
+
+    A worker that timed out re-runs the whole row -- its tasks and history cells
+    never ran. A tasks/history cell that timed out re-runs the row for THAT cell
+    only; every cell that reached a verdict keeps its first result."""
+    for attempt in range(2, RETRIES + 2):
+        again = {c[1] for c in cells if c[1] != "quickstart" and timed_out(*c[2:])}
+        if "worker" in again:
+            again |= {"tasks", "history"}
+        if not again:
+            break
+        say(f"attempt {attempt}: re-running {row.name} ({', '.join(sorted(again))}): timed out before any verdict")
+        fresh = {c[1]: c for c in connect_row(row, attempt)}
+        worker = fresh["worker"]
+        for i, c in enumerate(cells):
+            if c[1] not in again:
+                continue
+            new = fresh[c[1]]
+            if c[1] != "worker" and worker[4] != "PASS" and c[2] != "-":
+                # The re-run's worker did not start, so this cell could not run. It
+                # keeps its expectation and fails with the worker's reason -- a
+                # skipped retry must never read as a pass.
+                new = (*c[:4], "ERROR", f"worker did not start: {worker[5]}")
+            cells[i] = (*new[:5], f"attempt {attempt}: {new[5]}")
+    return cells
 
 
 # ---------------------------------------------------------------- report
@@ -648,6 +790,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--rows", default="", help="only rows whose name matches this regex")
     ap.add_argument("--keep", action="store_true", help="leave containers, images and the work dir")
+    ap.add_argument("--renders-match", metavar="DIR",
+                    help="run nothing; exit 0 if docker-compose.yml and docker-compose.quickstart.yml in DIR "
+                         "render every connect row exactly as this checkout's do, else 1 (the CI gate)")
     opts = ap.parse_args()
     pick = re.compile(opts.rows)
     clients = [r for r in CLIENT_ROWS if pick.search(r.name)]
@@ -660,7 +805,13 @@ def main():
     global W, PKI
     W = tempfile.mkdtemp(prefix="kmatrix-")
     PKI = os.path.join(W, "pki")
+    if opts.renders_match:
+        try:
+            return 0 if renders_match(os.path.abspath(opts.renders_match)) else 1
+        finally:
+            shutil.rmtree(W, ignore_errors=True)
     try:
+        lock = host_lock()  # held until this process exits  # noqa: F841
         os.makedirs(os.path.join(W, "rows"))
         build()
         infra()
@@ -673,12 +824,12 @@ def main():
                     report(ctl)
                     raise SystemExit("harness: the plaintext control failed; the harness, not the code, is broken")
                 results += ctl
-            print(f"[{PFX}] client matrix: {len(clients)} rows x {len(RUNTIMES)} runtimes")
+            say(f"client matrix: {len(clients)} rows x {len(RUNTIMES)} runtimes")
             results += client_matrix([r for r in clients if r.name != "01-plaintext"])
         if connects:
-            print(f"[{PFX}] connect matrix: {len(connects)} rows")
+            say(f"connect matrix: {len(connects)} rows")
             results += connect_matrix(connects)
-        print(f"\n[{PFX}] results")
+        say("results")
         bad = report(results)
         print(f"\n{len(results) - bad}/{len(results)} cells as expected")
         return 1 if bad else 0
@@ -687,6 +838,10 @@ def main():
 
 
 if __name__ == "__main__":
+    # Line-buffer EVERY print, not just say()'s. Under CI stdout is a pipe, so
+    # Python block-buffers it: run 36308137826 sat 45 min on a 0-byte step log,
+    # and a run killed at its timeout loses the buffered verdict lines outright.
+    sys.stdout.reconfigure(line_buffering=True)
     try:
         sys.exit(main())
     except SystemExit as e:

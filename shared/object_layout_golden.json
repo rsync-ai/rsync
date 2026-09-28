@@ -86,6 +86,16 @@
         "name": "a trailing dot keeps the whole table name",
         "in": {"dest_config": {}, "pipeline_id": "p", "dataset": "", "db_or_schema": "", "table": "schema."},
         "want": "p/default/schema./"
+      },
+      {
+        "name": "bucket root adds no leading slash; a schema-qualified table is written under its bare name",
+        "in": {"dest_config": {}, "pipeline_id": "Pipe-9", "dataset": "", "db_or_schema": "public", "table": "public.users"},
+        "want": "pipe-9/public/users/"
+      },
+      {
+        "name": "base_path is a prefix key too, and its slashes are trimmed",
+        "in": {"dest_config": {"base_path": "/lake/raw/"}, "pipeline_id": "p", "dataset": "", "db_or_schema": "mydb", "table": "orders"},
+        "want": "lake/raw/p/mydb/orders/"
       }
     ],
     "cdc_object_key": [

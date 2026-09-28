@@ -301,6 +301,21 @@ already sets the value explicitly, and the in-chart broker below is knowable.
 {{- end -}}
 {{- end -}}
 
+{{/*
+The blob-passthrough staging store (templates/infra/blob-staging.yaml): "true"
+or "". Only beside the bundled MinIO -- against external S3/GCS/Azure the store
+is outside the cluster, where the NetworkPolicy (ingress-only) does not reach.
+*/}}
+{{- define "rsync-ai.blobStaging.enabled" -}}
+{{- if and (eq .Values.objectStorage.mode "minio") .Values.objectStorage.blobStaging.enabled -}}true{{- end -}}
+{{- end -}}
+
+{{/* ":9000" is load-bearing: base_connector.py _get_staging_client uses
+path-style addressing only for an endpoint naming "minio", "localhost" or ":9000". */}}
+{{- define "rsync-ai.blobStaging.endpoint" -}}
+{{- printf "http://%s-blob-staging:9000" (include "rsync-ai.fullname" .) -}}
+{{- end -}}
+
 {{/* ── Shared env blocks ───────────────────────────────────────────────────── */}}
 
 {{/*
@@ -893,6 +908,11 @@ Safe because nothing in the Go services writes to this tree at runtime: the one
 write (internal/mcp/server_manager.go:942) belongs to the stdio-venv fallback,
 which is only reached when a connector has NO HTTP endpoint — and in this chart
 every connector is an HTTP Service.
+
+The one writer is tool-generator, saving a connector generated from an OpenAPI
+document. Its copy is private and dies with the pod, so the chart sets
+RSYNC_CONNECTOR_CATALOG_SHARED=false on it and generation refuses to save
+(apps/generation.yaml).
 */}}
 {{- define "rsync-ai.catalogInitContainer" -}}
 - name: connector-catalog

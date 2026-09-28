@@ -3722,7 +3722,7 @@ func GetConnectionMetadata(c *gin.Context) {
 			"status":        resp.StatusCode,
 		}).Warn("GetConnectionMetadata schema discovery failed")
 		// Not cached: only a successful discovery reaches schemaCache.Set below.
-		c.JSON(resp.StatusCode, gin.H{
+		c.JSON(browserStatusForUpstream(resp.StatusCode), gin.H{
 			"error":   "Schema discovery failed",
 			"details": orchestratorErrorDetail(resp.StatusCode, body),
 		})
@@ -4054,7 +4054,7 @@ func GetRecommendedTables(c *gin.Context) {
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-		c.JSON(resp.StatusCode, gin.H{
+		c.JSON(browserStatusForUpstream(resp.StatusCode), gin.H{
 			"error":   "Schema discovery failed",
 			"details": orchestratorErrorDetail(resp.StatusCode, body),
 		})

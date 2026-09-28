@@ -20,11 +20,13 @@ takes 19-47s, and `actions/jobs/<id>/logs` returns BlobNotFound for a job that
 produced none.
 
 The moat job's collision was over a NAME, so it is fixed by making the name
-unique per run rather than by serializing. The other three protect a genuine
-singleton (one compose project, one host port) and cannot be parameterized away,
-so they keep their group and are declared below -- the point of the declaration
-is that adding a fourth is a deliberate act taken against the cost above, not an
-edit nobody weighs.
+unique per run rather than by serializing. The two data-pipeline gates protect a
+genuine singleton (the one rsync-ci compose project) and dropped their group for
+the host lock run_gate.sh already takes, with a wait sized to the other job's
+hold (test_shared_stack_jobs_wait_on_the_host_lock.py). oss-deploy-smoke keeps
+its group and is declared below -- the point of the declaration is that adding
+another is a deliberate act taken against the cost above, not an edit nobody
+weighs.
 
 Neither `helm lint`-style structural validation nor `actionlint` can see any of
 this: a `concurrency:` block is valid YAML whatever it names, and a cancelled job
@@ -53,14 +55,6 @@ IMAGE = "rsync-oss-leaktest"
 # _constant_group below deletes the entry's cover if that stops being true, so a
 # declaration cannot decay into a blind spot for a job somebody later fixed.
 SERIALIZED_ON_PURPOSE = {
-    ("ci.yml", "data-pipeline-gate"): (
-        "drives the ONE shared compose project rsync-ci with hard-pinned "
-        "container_names; the box cannot fit a second"
-    ),
-    ("ci.yml", "data-pipeline-smoke"): (
-        "same compose project rsync-ci as data-pipeline-gate, which is why the "
-        "two deliberately share one group"
-    ),
     ("ci.yml", "oss-deploy-smoke"): (
         "fixed isolated resource names rsync-oss-smoke-* AND a fixed host port"
     ),

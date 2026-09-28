@@ -151,9 +151,12 @@ def test_each_gate_names_only_filters_that_exist():
     assert known, "paths-filters.yml parsed empty -- this check would pass vacuously"
     for name, steps in _gated_jobs().items():
         idx = next(i for i, st in enumerate(steps) if st.get("id") == "filter")
-        cond = str((steps[idx + 1].get("env") or {}).get("WANTED", ""))
+        gate_env = steps[idx + 1].get("env") or {}
+        cond = str(gate_env.get("WANTED", ""))
         assert cond, f"{name}: the RUN gate reads no filter output at all"
-        used = set(re.findall(r"steps\.filter\.outputs\.([A-Za-z0-9_-]+)", cond))
+        # Every gate variable, not just WANTED: a typo in a second one (the
+        # matrix's COMPOSE) fails the same quiet way.
+        used = set(re.findall(r"steps\.filter\.outputs\.([A-Za-z0-9_-]+)", " ".join(map(str, gate_env.values()))))
         assert used, f"{name}: gate condition {cond!r} names no filter output"
         assert used <= known, (
             f"{name} gates on {sorted(used - known)}, which "

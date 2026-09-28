@@ -489,6 +489,7 @@ func registerWorkflowsAndActivities(r worker.Registry) {
 	r.RegisterActivity(workflows.EmitDomainEventActivity)
 	r.RegisterActivity(workflows.StateUpdateActivity)          // Architecture Phase 1: Authoritative state writer
 	r.RegisterActivity(workflows.UpdatePipelineStatusActivity) // Keeps pipelines.status in sync with workflow outcome
+	r.RegisterActivity(workflows.FinalizeCompletedRunActivity) // Same write for a completed run; returns the postflight verdict before PIPELINE_COMPLETED is emitted
 
 	// Register V2 activities (Phase D: Request/Reply pattern)
 	r.RegisterActivity(workflows.IntentActivityV2)

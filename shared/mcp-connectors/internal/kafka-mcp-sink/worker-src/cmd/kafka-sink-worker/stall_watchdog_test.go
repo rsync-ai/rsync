@@ -105,7 +105,7 @@ func TestConsumerActivitySeedsBothClocksSoTheFirstWindowIsAGracePeriod(t *testin
 	}
 
 	act.pollTick()
-	act.messageTick()
+	act.messageTick(kafka.Message{Topic: "t", Partition: 0, Offset: 0})
 	if !act.lastPoll().After(start.Add(-time.Millisecond)) || !act.lastMessage().After(start.Add(-time.Millisecond)) {
 		t.Fatal("ticks did not advance the clocks")
 	}
@@ -117,10 +117,7 @@ func TestConsumerActivitySeedsBothClocksSoTheFirstWindowIsAGracePeriod(t *testin
 //
 //	SINK_LIVE_KAFKA_BROKER=localhost:9092 go test -run LiveKafka ./...
 func TestUnconsumedRecordsAgainstLiveKafka(t *testing.T) {
-	broker := os.Getenv("SINK_LIVE_KAFKA_BROKER")
-	if broker == "" {
-		t.Skip("set SINK_LIVE_KAFKA_BROKER to run this against a live broker")
-	}
+	broker := liveKafkaBroker(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -155,7 +152,7 @@ func TestUnconsumedRecordsAgainstLiveKafka(t *testing.T) {
 
 	group := fmt.Sprintf("stallwatch-group-%d", stamp) // never joined, so never committed
 
-	waiting, detail, err := unconsumedRecords(ctx, broker, group, []string{full}, true, map[string]int64{})
+	waiting, detail, err := unconsumedRecords(ctx, broker, group, []string{full}, true, map[string]int64{}, nil)
 	if err != nil {
 		t.Fatalf("unconsumedRecords(full): %v", err)
 	}
@@ -164,7 +161,7 @@ func TestUnconsumedRecordsAgainstLiveKafka(t *testing.T) {
 	}
 	t.Logf("waiting detail: %s", detail)
 
-	waiting, _, err = unconsumedRecords(ctx, broker, group, []string{empty}, true, map[string]int64{})
+	waiting, _, err = unconsumedRecords(ctx, broker, group, []string{empty}, true, map[string]int64{}, nil)
 	if err != nil {
 		t.Fatalf("unconsumedRecords(empty): %v", err)
 	}
@@ -181,10 +178,7 @@ func TestUnconsumedRecordsAgainstLiveKafka(t *testing.T) {
 //
 //	SINK_LIVE_KAFKA_BROKER=localhost:9092 go test -count=1 -v -run LiveReaderOutcome ./...
 func TestStallDecisionMatchesLiveReaderOutcome(t *testing.T) {
-	broker := os.Getenv("SINK_LIVE_KAFKA_BROKER")
-	if broker == "" {
-		t.Skip("set SINK_LIVE_KAFKA_BROKER to run this against a live broker")
-	}
+	broker := liveKafkaBroker(t)
 
 	const (
 		trials = 6
@@ -264,7 +258,7 @@ func TestStallDecisionMatchesLiveReaderOutcome(t *testing.T) {
 			if ferr != nil {
 				continue
 			}
-			act.messageTick()
+			act.messageTick(msg)
 			// The worker commits only after the destination ack; mirror that here so
 			// the broker-side view matches a healthy sink that has done its work.
 			if cerr := reader.CommitMessages(ctx, msg); cerr != nil {
@@ -274,7 +268,7 @@ func TestStallDecisionMatchesLiveReaderOutcome(t *testing.T) {
 			break
 		}
 
-		waiting, detail, uerr := unconsumedRecords(ctx, broker, group, []string{topic}, true, map[string]int64{})
+		waiting, detail, uerr := unconsumedRecords(ctx, broker, group, []string{topic}, true, map[string]int64{}, act)
 		if uerr != nil {
 			reader.Close()
 			cancel()
@@ -324,10 +318,7 @@ func TestStallDecisionMatchesLiveReaderOutcome(t *testing.T) {
 //
 //	SINK_LIVE_KAFKA_BROKER=localhost:9092 go test -count=1 -v -run EmptyAssignment ./...
 func TestStallDecisionDetectsLiveEmptyAssignmentMember(t *testing.T) {
-	broker := os.Getenv("SINK_LIVE_KAFKA_BROKER")
-	if broker == "" {
-		t.Skip("set SINK_LIVE_KAFKA_BROKER to run this against a live broker")
-	}
+	broker := liveKafkaBroker(t)
 
 	const (
 		// kafka-go's range assignor hands partition 0 to the lowest-sorted member, so
@@ -417,7 +408,7 @@ func TestStallDecisionDetectsLiveEmptyAssignmentMember(t *testing.T) {
 			if ferr != nil {
 				continue
 			}
-			act.messageTick()
+			act.messageTick(msg)
 			if cerr := watched.CommitMessages(ctx, msg); cerr != nil {
 				t.Fatalf("trial %d: commit: %v", i, cerr)
 			}
@@ -425,7 +416,7 @@ func TestStallDecisionDetectsLiveEmptyAssignmentMember(t *testing.T) {
 			break
 		}
 
-		waiting, detail, uerr := unconsumedRecords(ctx, broker, group, []string{topic}, true, map[string]int64{})
+		waiting, detail, uerr := unconsumedRecords(ctx, broker, group, []string{topic}, true, map[string]int64{}, act)
 		restart := shouldRestartForStall(stallSnapshot{
 			now:         time.Now(),
 			lastPoll:    act.lastPoll(),

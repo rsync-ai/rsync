@@ -106,7 +106,7 @@
       "required": false,
       "secret": false,
       "default": null,
-      "description": "TLS mode: 'true'/'require' to force TLS. Auto-on for *.mongodb.net.",
+      "description": "TLS mode: 'true'/'require' forces TLS on, 'disable' turns it off. Unset: on for *.mongodb.net (Atlas) and other remote hosts; off for localhost, private IPs, docker service names and Kubernetes in-cluster names (*.svc, *.cluster.local).",
       "env_var": null
     }
   ]

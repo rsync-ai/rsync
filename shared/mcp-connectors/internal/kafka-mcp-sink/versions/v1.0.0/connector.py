@@ -46,6 +46,17 @@ RAPID_RESTART_WINDOW_SECONDS = 30.0
 # explicit start_sink (which drops the dead worker and spawns a fresh one).
 MAX_RAPID_RESTARTS = 5
 
+# Exit code the Go worker uses when the destination refused its credential or grant
+# (EX_CONFIG). Must equal exitDestAuthRefused in worker-src/.../infra_fault.go. A
+# respawn re-hits the same refusal, so the supervisor goes terminal `crashed` at once
+# with a needs-user-config error instead of spending the rapid-restart budget.
+DEST_AUTH_REFUSED_EXIT_CODE = 78
+DEST_AUTH_REFUSED_ERROR = (
+    "destination authentication failed or permission denied — the credential or grant "
+    "was refused (needs user config): update the destination connection and restart "
+    "the pipeline; offsets were not committed and nothing was dead-lettered"
+)
+
 # Destination-config key for the object-storage CDC flush interval: the longest time
 # changes wait in the worker before they are written as one file. Only object-storage
 # destinations use it; unset keeps the worker's 30-second default. The bounds mirror
@@ -252,6 +263,12 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                 "name": "sink_status",
                 "method": f"{self.connector_type}_sink_status",
                 "description": "Get status of a Kafka sink worker",
+                "type": "core",
+            },
+            {
+                "name": "list_sinks",
+                "method": f"{self.connector_type}_list_sinks",
+                "description": "List the Kafka sink workers this container holds",
                 "type": "core",
             },
             {
@@ -626,6 +643,31 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
             self.log(f"Failed to stop sink: {e}", level="error")
             return {"success": False, "error": str(e)}
 
+    def list_sinks(self, params: Dict = None) -> Dict[str, Any]:
+        """
+        List the sink workers this container holds, one entry per consumer group
+        (replicas "<group>#<n>" fold into their base). Read-only.
+
+        The orchestrator's orphan reaper (sink_worker_reaper.go) calls this to find
+        workers whose pipeline was deleted or stopped while their stop_sink failed.
+        pipeline_id is whatever start_sink was given; the reaper ignores a worker
+        whose pipeline_id is not a UUID.
+        """
+        with self._lock:
+            workers = []
+            for wid, w in self.workers.items():
+                if "#" in wid:
+                    continue
+                cfg = w.get("config") or {}
+                workers.append({
+                    "worker_id": wid,
+                    "consumer_group": cfg.get("consumer_group") or wid,
+                    "pipeline_id": cfg.get("pipeline_id") or "",
+                    "intentional_stop": bool(w.get("intentional_stop")),
+                    "crashed": bool(w.get("crashed")),
+                })
+        return {"success": True, "status": "ok", "workers": workers}
+
     def sink_status(self, params: Dict = None) -> Dict[str, Any]:
         """
         Get status of a sink worker
@@ -924,7 +966,11 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                         if not self._is_worker_alive(worker_id):
                             # Record exit code / signal / cgroup OOM count once per
                             # dead pid, before the backoff or the breaker can skip it.
-                            self._record_worker_exit(worker_id, worker)
+                            last_exit = self._record_worker_exit(worker_id, worker)
+                            # The destination refused the credential/grant: a respawn
+                            # cannot succeed, so go terminal now (needs user config).
+                            if self._trip_on_dest_auth_refusal(worker, worker_id, last_exit):
+                                continue
                             now = time.monotonic()
                             # Respect the crash-loop backoff window: a fast-failing
                             # worker must not be respawned every poll (tight loop that
@@ -941,6 +987,26 @@ class KafkaMCPSinkConnector(BaseMCPConnector):
                             worker["restart_not_before"] = time.monotonic() + backoff
             except Exception as e:  # never let the supervisor thread die
                 self.log(f"Supervisor loop error: {e}", level="error")
+
+    def _trip_on_dest_auth_refusal(
+        self, worker: Dict[str, Any], worker_id: str, last_exit: Optional[Dict[str, Any]]
+    ) -> bool:
+        """Mark a worker terminal ``crashed`` when it exited DEST_AUTH_REFUSED_EXIT_CODE.
+
+        Returns True when it tripped (caller must not respawn). Caller holds ``self._lock``.
+        """
+        if not last_exit or last_exit.get("returncode") != DEST_AUTH_REFUSED_EXIT_CODE:
+            return False
+        worker["crashed"] = True
+        worker["crashed_at"] = time.time()
+        worker["error_category"] = "auth"
+        worker["last_error"] = DEST_AUTH_REFUSED_ERROR
+        self.log(
+            f"Worker {worker_id} exited {DEST_AUTH_REFUSED_EXIT_CODE}: {DEST_AUTH_REFUSED_ERROR}; "
+            f"not respawning -> status=crashed",
+            level="error",
+        )
+        return True
 
     def _record_rapid_restart_and_maybe_trip(self, worker: Dict[str, Any], worker_id: str, now: float) -> bool:
         """Account for a just-observed dead worker and decide whether to respawn it.
@@ -1139,6 +1205,10 @@ def create_http_app():
     @app.post("/sink_status")
     async def sink_status(params: dict = {}):
         return server.sink_status(params)
+
+    @app.post("/list_sinks")
+    async def list_sinks(params: dict = {}):
+        return server.list_sinks(params)
 
     return app
 

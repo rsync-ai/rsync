@@ -31,6 +31,7 @@ import { normalizePipelineStatus, type NormalizedPipelineStatus } from "@/lib/pi
 import { emitPipelineRefresh } from "@/lib/events/pipelineRefresh"
 import { usePipelineStatePoll } from "@/lib/hooks/usePipelineStatePoll"
 import { classifyError } from "@/lib/utils/error-handling"
+import { isObjectStorageDestination } from "@/lib/pipeline/destinationNamespace"
 import type { ApiErrorBody } from "@/lib/api/types"
 
 interface PipelineActionsProps {
@@ -49,8 +50,12 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
   // Destination namespace, surfaced in the Reload confirm dialog so the user sees
   // exactly what gets dropped + rebuilt.
   const [destinationNamespace, setDestinationNamespace] = useState<string | null>(null)
-  // Destructive-reload confirm dialog. Reload drops + recreates the destination and
-  // re-copies all data, so we gate it behind an explicit confirmation (parity with CDC).
+  // Object storage has no tables to drop: a reload empties each table's folder and
+  // fails closed if it cannot (executor.go classifyReloadDeleteResult), so the
+  // confirm dialog must say that instead of "drops and recreates".
+  const [destIsObjectStorage, setDestIsObjectStorage] = useState(false)
+  // Destructive-reload confirm dialog. Reload wipes the destination tables (or folders)
+  // and re-copies all data, so we gate it behind an explicit confirmation (parity with CDC).
   const [reloadConfirmOpen, setReloadConfirmOpen] = useState(false)
 
   // Pre-migration assessment modal state
@@ -77,6 +82,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
           .toLowerCase()
         if (!cancelled && (drm === "resume" || drm === "reload")) setDefaultRunMode(drm)
         if (!cancelled && p.destination_namespace) setDestinationNamespace(p.destination_namespace)
+        if (!cancelled) setDestIsObjectStorage(isObjectStorageDestination(p.destination_connection?.connector_type))
       } catch {
         // ignore; default stays resume
       }
@@ -134,7 +140,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
   }
 
   const handleRun = (mode: "resume" | "reload" = "resume") => {
-    // Reload is destructive (drop + recreate destination, full re-copy) — gate it
+    // Reload is destructive (wipe destination tables/folders, full re-copy) — gate it
     // behind an explicit confirmation. Resume goes straight through.
     if (mode === "reload") {
       setReloadConfirmOpen(true)
@@ -322,7 +328,7 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
         )}
       </Button>
 
-      {/* Reload confirm — destructive: DROP + recreate the destination, full re-copy. */}
+      {/* Reload confirm — destructive: DROP + recreate the tables (or empty the folders), full re-copy. */}
       <AlertDialog open={reloadConfirmOpen} onOpenChange={setReloadConfirmOpen}>
         <AlertDialogContent className="sm:max-w-[480px]">
           <AlertDialogHeader>
@@ -334,16 +340,35 @@ export function PipelineActions({ pipelineId, status }: PipelineActionsProps) {
             </AlertDialogTitle>
             <AlertDialogDescription asChild>
               <div className="space-y-2 text-zinc-600 dark:text-zinc-400">
-                <p>
-                  This drops and recreates the destination tables
+                {destIsObjectStorage ? (
+                  <>
+                    <p>
+                      This empties each table&apos;s folder
                   {destinationNamespace ? (
-                    <>
-                      {" "}
-                      in <span className="font-medium text-zinc-800 dark:text-zinc-200">{destinationNamespace}</span>
-                    </>
-                  ) : null}{" "}
-                  and re-copies <span className="font-medium">all</span> data from scratch.
-                </p>
+                        <>
+                          {" "}
+                          in <span className="font-medium text-zinc-800 dark:text-zinc-200">{destinationNamespace}</span>
+                        </>
+                      ) : null}{" "}
+                      and re-copies <span className="font-medium">all</span> data from scratch.
+                    </p>
+                    <p>
+                      If a folder cannot be emptied completely, the reload fails instead of writing new files
+                      next to the old ones.
+                    </p>
+                  </>
+                ) : (
+                  <p>
+                    This drops and recreates the destination tables
+                  {destinationNamespace ? (
+                      <>
+                        {" "}
+                        in <span className="font-medium text-zinc-800 dark:text-zinc-200">{destinationNamespace}</span>
+                      </>
+                    ) : null}{" "}
+                    and re-copies <span className="font-medium">all</span> data from scratch.
+                  </p>
+                )}
                 <p>
                   Use <span className="font-medium">Resume</span> instead to continue from the last checkpoint.
                 </p>

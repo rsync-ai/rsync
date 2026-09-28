@@ -82,6 +82,10 @@ go:
   # handlers/chat_insight_chip_prompts_golden_test.go and the frontend's
   # PipelineInsightsBar.chipPrompts.test.tsx pin the chat chips' prompts.
   - 'shared/chat_insight_chip_prompts_golden.json'
+  # handlers/, cdc/ and assessor/ local_db_host_golden_test.go pin the Go
+  # local-vs-remote DB host checks to it; the Python copies are pinned by
+  # shared/mcp-connectors/tests/test_local_db_host_golden.py (llm filter).
+  - 'shared/local_db_host_golden.json'
   - '.github/workflows/ci.yml'
   # Self-protection: see the header.
   - '.github/paths-filters.yml'
@@ -122,6 +126,8 @@ llm:
   # test_pii_scan_names_only.py pins the PII scanner's Kafka answer to
   # it (the gateway's pii_scan_contract_test.go reads it too).
   - 'shared/pii_scan_contract_golden.json'
+  # test_local_db_host_golden.py pins every Python DB host check to it.
+  - 'shared/local_db_host_golden.json'
   # The Helm chart is here because llm-service/tests holds the chart
   # guards (test_chart_service_hostnames_resolve.py,
   # test_chart_kafka_security_env.py) -- they parse deploy/helm as
@@ -132,9 +138,9 @@ llm:
   # PR. A guard gated on a filter that excludes its own subject is
   # not a guard.
   - 'deploy/helm/**'
-  # Same reasoning one step further out: this filter gates the
-  # oss-leak-proof job, whose subject IS this script. Without the
-  # path, editing the moat-leak proof itself would not run it.
+  # Same reasoning one step further out: test_oss_image_boundary.py and
+  # test_moat_job_is_not_serialized_by_a_shared_tag.py read this script.
+  # (The oss-leak-proof job that RUNS it is gated on `oss` below, not here.)
   - 'scripts/oss-leak-proof-test.sh'
   # And once more, one directory over. test_validate_connector_script_
   # finds_connectors.py guards scripts/mcp-connectors/validate_connector.py
@@ -242,12 +248,18 @@ llm:
   # modules and files security.yml scans on a PR. Listed for the same
   # reason as the two above: the security.yml glob does not cover it.
   - 'scripts/security/ci-scan.py'
+  # test_fix_pr_must_change_a_test.py drives this script, which ci.yml's
+  # env-templates job runs on every PR. A PR editing only the script must
+  # run the test that pins what it counts as a test file.
+  - 'scripts/check-fix-has-test.py'
   # Same guard, third subject. test_retired_claims_are_not_quoted_verbatim
   # sweeps this report for two sentences retired from security.yml's
   # header, so the report is an INPUT to the guard and has to be able to
   # trigger it. Caveat recorded honestly: `pull_request` above carries
   # `paths-ignore: '**.md'`, so a REPORT.md-ONLY PR still runs nothing --
-  # this only helps a mixed PR, and `push: [main]` (unfiltered) after it.
+  # this only helps a mixed PR. A REPORT.md-only change is caught by the
+  # nightly ci.yml run, where every filtered job runs in full (ci.yml has
+  # had no `push: [main]` trigger since 2026-09-27).
   # Second caveat, for the public repo: security-audit-results/ is on
   # scripts/flip/excludes.txt, so there this glob matches nothing and is a
   # silent no-op. Kept anyway rather than deleted -- it is load-bearing
@@ -266,9 +278,9 @@ llm:
   # and reported green.
   # Same honest caveat as security-audit-results above: `pull_request`
   # carries `paths-ignore: '**.md'`, so a runbook-ONLY PR still runs
-  # nothing; the markdown path helps a mixed PR and the unfiltered
-  # `push: [main]` after it. The three non-markdown paths are not
-  # subject to that.
+  # nothing; the markdown path helps a mixed PR, and the nightly run
+  # (every filtered job in full) catches a runbook-only one. The three
+  # non-markdown paths are not subject to that.
   # test_ci_filter_covers_every_guard_subject.py derives each guard's
   # subjects from the guard's own source and asserts this list still
   # matches them, so the next subject added to one of those guards
@@ -277,34 +289,26 @@ llm:
   - 'scripts/preflight-prod-config.sh'
   - 'docs/internal/public-flip-runbook.md'
   - 'scripts/flip/**'
-  # A seventh time, and this one's subject cannot be read out of the guard's
-  # source at all. test_doc_links_into_the_moat_are_delinked.py sweeps EVERY
-  # tracked *.md for links into the paths llm-service/oss-strip-list.txt
-  # strips -- the three that survived un-de-linked aborted the cut at
-  # check-doc-links.sh -- and test_doc_links_resolve.py reads ARCHITECTURE.md,
-  # the one pinned doc the cut keeps. Both subjects are computed from
-  # `git ls-files '*.md'`, so the census in
-  # test_ci_filter_covers_every_guard_subject.py sees no literal to match and
-  # stays green while the guards sit dead on exactly the PR shape that breaks
-  # them: a docs-only edit adding a fourth link into the moat.
-  - 'docs/**'
-  - '*.md'
-  # Same shape again, and the widest subject of any guard here.
-  # test_no_doc_promises_a_silent_gateway_db_failure.py sweeps EVERY
-  # tracked file -- not `git ls-files '*.md'` like every other doc
-  # guard -- because that markdown restriction is exactly how the
-  # retired claim survived an earlier sweep in 10 of the 12 files
-  # that carried it, all .tpl/.yaml/.sh/.py. It declares no literal
-  # path, so the census in
-  # test_ci_filter_covers_every_guard_subject.py cannot see it either.
-  # No new pattern is added for it: every tree that has ever carried
-  # the claim is already matched above (`deploy/helm/**`, `docs/**`,
-  # `*.md`, `llm-service/**`). Recorded rather than left implicit,
-  # because that coverage is a fact about today's tree, not a
-  # property of the guard -- the same claim written into, say,
-  # `api-gateway/internal/handlers/` would land on a PR this filter
-  # does not match. The unfiltered `push: [main]` after the PR is
-  # what still sweeps it.
+  # NO `docs/**` and NO `*.md` here, on purpose. They were here so that guards
+  # whose subject is markdown (test_doc_links_into_the_moat_are_delinked.py,
+  # test_no_doc_promises_a_silent_gateway_db_failure.py, and three enrolled in
+  # test_ci_filter_covers_every_guard_subject.py) ran on a docs-only PR. But every
+  # PR writes a docs/capabilities.d/ drop-in, so those two globs matched EVERY PR
+  # and ran this ~11,400-test job (316 s on frontend-only #1255) and the OSS image
+  # build on changes neither can see. Those guards now run in doc-links.yml's
+  # Doc guards job, which is unfiltered: it runs on every PR, and so covers a
+  # markdown subject -- or, for the silent-gateway guard, a claim written into
+  # any tree at all -- better than a glob here ever did. The census accepts that
+  # job as coverage, and test_a_docs_only_pr_runs_no_filtered_job fails if a
+  # markdown glob comes back.
+  # One exception, by exact path: test_shipped_images_are_publishable.py reads
+  # README.md but cannot join that job. It asks what a RELEASE TAG built and
+  # fails when no v*.*.* tag is visible, and the public-cut gate
+  # (assert-public-suite.sh) runs the Doc guards list in a fresh one-commit tree
+  # with no tags -- 5 failures there on #1254. So it stays here, where the
+  # checkout fetches tags, and README.md is listed by name: a drop-in never
+  # matches it, and a README-only PR is exactly the change that guard checks.
+  - 'README.md'
   # `install.sh` is the whole Docker-install acceptance path and is read by four
   # guards (test_install_reachability, test_byo_overlays_are_complete,
   # test_repo_slug_is_publishable, test_shipped_images_are_publishable -- 18
@@ -522,10 +526,32 @@ kafkasec:
   - 'llm-service/Dockerfile'
   - 'shared/mcp-connectors/internal/debezium/**'
   - 'shared/internal/infra/kafka-connect/**'
-  - 'docker-compose.yml'
-  - 'docker-compose.quickstart.yml'
   - 'deploy/helm/rsync-ai/test/kind/kafka-matrix/**'
   - 'deploy/helm/rsync-ai/test/kind/oidc/**'
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+  - '.github/workflows/ci.yml'
+# The two compose files the Kafka security matrix RENDERS -- it reads nothing
+# from them but the kafka-connect and debezium-mcp environment, per connect row.
+# Most edits here touch another service, so when only these fired the job's gate
+# asks `run.py --renders-match` whether that environment renders differently from
+# the base branch's, and runs the matrix only if it does.
+kafkasec_compose:
+  - 'docker-compose.yml'
+  - 'docker-compose.quickstart.yml'
+  # Self-protection: see the header.
+  - '.github/paths-filters.yml'
+  - '.github/workflows/ci.yml'
+# Everything the oss-leak-proof job's script can see. It builds
+# Dockerfile.community and Dockerfile.oss with llm-service/ as the build
+# context, and reads only oss-strip-list.txt and the moat sources, which are
+# all inside it. So no other path can change what it proves. It was gated on
+# `llm`, whose guard subjects span docs, compose, Go and the chart: over PRs
+# #1214-#1253 it rebuilt both images on 34, and 11 of those changed nothing
+# the script can see.
+oss:
+  - 'llm-service/**'
+  - 'scripts/oss-leak-proof-test.sh'
   # Self-protection: see the header.
   - '.github/paths-filters.yml'
   - '.github/workflows/ci.yml'

@@ -853,7 +853,9 @@ func IsLocalDBHost(host string) bool {
 	if ip := net.ParseIP(h); ip != nil {
 		return isPrivateOrLoopbackIP(ip)
 	}
-	return !strings.Contains(h, ".")
+	// A Kubernetes in-cluster name (*.svc, *.cluster.local) is local too: neither
+	// suffix resolves on public DNS (shared/local_db_host_golden.json).
+	return !strings.Contains(h, ".") || strings.HasSuffix(h, ".svc") || strings.HasSuffix(h, ".cluster.local")
 }
 
 // isPrivateOrLoopbackIP reports whether ip is loopback, RFC1918/ULA private,

@@ -69,6 +69,13 @@ const (
 	// error forever without leaving RUNNING, so /status stays green while the pipeline
 	// moves nothing (cdc_source_freshness.go).
 	IssueTypeSourceStreamStalled IssueType = "source_stream_stalled"
+	// IssueTypeCaptureStopped — the CDC capture side (the Debezium connector, its tasks, or
+	// the Kafka Connect worker running them) has been unhealthy for CaptureDownFloor
+	// consecutive dependency probes while the pipeline is still 'running'. Distinct from
+	// IssueTypeConnectorDown, the terminal verdict after the restart budget is spent: this
+	// one is raised on the way there, and also when Connect cannot be reached at all, where
+	// no restart is possible (cdc_capture_down.go).
+	IssueTypeCaptureStopped IssueType = "capture_stopped"
 )
 
 // IssueSeverity represents the severity of an issue

@@ -12,12 +12,35 @@ import (
 	"go.temporal.io/sdk/activity"
 )
 
+// runOutcome is the status a run was finally recorded with — after the postflight
+// silent-drop guard had its say, which can turn "completed" into "failed".
+type runOutcome struct {
+	Status       string `json:"status"`
+	ErrorMessage string `json:"error_message,omitempty"`
+}
+
 // UpdatePipelineStatusActivity updates the pipelines table (status/completed_at/error_message)
 // and keeps the executions table in sync when executionID is provided.
 //
 // This is intentionally best-effort: it should not fail workflow correctness if the DB is unavailable,
 // but it keeps the "pipelines" table aligned with the authoritative workflow state held by Temporal.
 func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, executionID string, status string, errorMessage string) error {
+	_, err := writePipelineStatus(ctx, pipelineID, executionID, status, errorMessage)
+	return err
+}
+
+// FinalizeCompletedRunActivity records a run the workflow believes completed and
+// returns the status it was actually recorded with. It is UpdatePipelineStatusActivity
+// with status "completed", plus the verdict: the postflight silent-drop guard inside
+// can still fail the run, and the workflow must know that BEFORE it announces
+// PIPELINE_COMPLETED (KI-SILENTDROP-COMPLETED-EVENT) — the event also fires the
+// projector's run-after-pipeline hook, which rebuilds downstream models.
+func FinalizeCompletedRunActivity(ctx context.Context, pipelineID string, executionID string) (runOutcome, error) {
+	return writePipelineStatus(ctx, pipelineID, executionID, "completed", "")
+}
+
+// writePipelineStatus is the single terminal-write site behind both activities above.
+func writePipelineStatus(ctx context.Context, pipelineID string, executionID string, status string, errorMessage string) (runOutcome, error) {
 	logger := activity.GetLogger(ctx)
 	logger.Info("Updating pipeline row status",
 		"pipeline_id", pipelineID,
@@ -27,14 +50,14 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 	)
 
 	if activityCtx == nil || activityCtx.DB == nil {
-		log.Warn("⚠️  UpdatePipelineStatusActivity: DB not available, skipping pipeline row update")
-		return nil
+		log.Warn("⚠️  writePipelineStatus: DB not available, skipping pipeline row update")
+		return runOutcome{Status: status, ErrorMessage: errorMessage}, nil
 	}
 
 	db, ok := activityCtx.DB.(*sql.DB)
 	if !ok || db == nil {
-		log.Warn("⚠️  UpdatePipelineStatusActivity: DB has unexpected type, skipping pipeline row update")
-		return nil
+		log.Warn("⚠️  writePipelineStatus: DB has unexpected type, skipping pipeline row update")
+		return runOutcome{Status: status, ErrorMessage: errorMessage}, nil
 	}
 
 	// Streaming handoff: close the execution row without touching the pipeline row.
@@ -88,7 +111,7 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 					"pipeline_id", pipelineID, "execution_id", executionID)
 			}
 		}
-		return nil
+		return runOutcome{Status: status, ErrorMessage: errorMessage}, nil
 	}
 
 	// Phase 1 postflight: when the workflow thinks it's completed, verify
@@ -152,7 +175,7 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 		// transaction commits both writes atomically.
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
-			return fmt.Errorf("failed to begin tx for terminal status update: %w", err)
+			return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to begin tx for terminal status update: %w", err)
 		}
 		// On any error path below, roll back. Successful path Commits and
 		// nils out tx so the deferred Rollback becomes a no-op.
@@ -171,7 +194,7 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 			WHERE id = $1
 		`, pipelineID, status, errParam)
 		if err != nil {
-			return fmt.Errorf("failed to update pipeline terminal status: %w", err)
+			return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to update pipeline terminal status: %w", err)
 		}
 		pipelineRows, pipelineRowsErr := res.RowsAffected()
 
@@ -197,7 +220,7 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 					"status", execStatus,
 					"error", err.Error(),
 				)
-				return fmt.Errorf("failed to update executions terminal status: %w", err)
+				return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to update executions terminal status: %w", err)
 			}
 
 			// Reconcile the progress surface on terminal FAILURE. The executor
@@ -227,13 +250,13 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 						"execution_id", executionID,
 						"error", err.Error(),
 					)
-					return fmt.Errorf("failed to reconcile pipeline_progress terminal status: %w", err)
+					return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to reconcile pipeline_progress terminal status: %w", err)
 				}
 			}
 		}
 
 		if err := tx.Commit(); err != nil {
-			return fmt.Errorf("failed to commit terminal status tx: %w", err)
+			return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to commit terminal status tx: %w", err)
 		}
 		tx = nil // disarm the deferred rollback
 
@@ -251,7 +274,7 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 			logger.Info("Pipeline row updated", "pipeline_id", pipelineID, "status", status, "rows_affected", pipelineRows)
 		}
 
-		return nil
+		return runOutcome{Status: status, ErrorMessage: errorMessage}, nil
 	}
 
 	// Non-terminal update (rare): do not touch completed_at.
@@ -263,7 +286,7 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 		WHERE id = $1
 	`, pipelineID, status, errParam)
 	if err != nil {
-		return fmt.Errorf("failed to update pipeline status: %w", err)
+		return runOutcome{Status: status, ErrorMessage: errorMessage}, fmt.Errorf("failed to update pipeline status: %w", err)
 	}
 	if rows, rerr := res.RowsAffected(); rerr == nil && rows == 0 {
 		logger.Warn("No pipeline row updated (pipeline not found?)", "pipeline_id", pipelineID, "status", status)
@@ -285,7 +308,7 @@ func UpdatePipelineStatusActivity(ctx context.Context, pipelineID string, execut
 	// Tiny guard to ensure deterministic behavior isn't impacted by time usage here (activity-only).
 	_ = time.Now()
 
-	return nil
+	return runOutcome{Status: status, ErrorMessage: errorMessage}, nil
 }
 
 // statsSettleGrace bounds how long the postflight waits for this execution's table

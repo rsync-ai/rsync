@@ -43,6 +43,12 @@ type fakeCatalog struct {
 	active map[string]bool
 	// broken makes every catalog lookup fail, as a DB outage would.
 	broken bool
+	// connections, when set, answers the workspace connection listing the chat
+	// reads to recognise a saved connection's NAME (namedConnectionsQueryRe).
+	connections []fakeConnectionRow
+	// otherErrs makes any other SQL fail quietly instead of being reported, for
+	// end-to-end tests whose later steps (checkConnections) query the DB too.
+	otherErrs bool
 
 	mu         sync.Mutex
 	asked      map[string]bool
@@ -101,6 +107,13 @@ func (c fakeCatalogConn) QueryContext(_ context.Context, query string, args []dr
 	fc := c.fc
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
+	if fc.connections != nil && namedConnectionsQueryRe.MatchString(query) {
+		fc.asked["<connections>"] = true
+		return &fakeConnectionRows{rows: fc.connections}, nil
+	}
+	if fc.otherErrs && !catalogCountQueryRe.MatchString(query) {
+		return nil, errors.New("fake catalog: not modelled")
+	}
 	name, _ := func() (string, bool) {
 		if len(args) != 1 {
 			return "", false
@@ -121,6 +134,30 @@ func (c fakeCatalogConn) QueryContext(_ context.Context, query string, args []dr
 		count = 1
 	}
 	return &fakeCountRows{count: count}, nil
+}
+
+var namedConnectionsQueryRe = regexp.MustCompile(`FROM connections\s+WHERE workspace_id = \$1 AND status = 'active'`)
+
+// fakeConnectionRow is one saved connection: name, alias, connector_type, type.
+type fakeConnectionRow struct{ name, alias, connectorType, direction string }
+
+type fakeConnectionRows struct {
+	rows []fakeConnectionRow
+	i    int
+}
+
+func (*fakeConnectionRows) Columns() []string {
+	return []string{"name", "alias", "connector_type", "type"}
+}
+func (*fakeConnectionRows) Close() error { return nil }
+func (r *fakeConnectionRows) Next(dest []driver.Value) error {
+	if r.i >= len(r.rows) {
+		return io.EOF
+	}
+	row := r.rows[r.i]
+	r.i++
+	dest[0], dest[1], dest[2], dest[3] = row.name, row.alias, row.connectorType, row.direction
+	return nil
 }
 
 type fakeCountRows struct {

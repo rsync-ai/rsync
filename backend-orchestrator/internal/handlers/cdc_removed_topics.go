@@ -131,7 +131,7 @@ func (r *RemovedTopicReaper) Readd(connCfg map[string]interface{}, tables []stri
 		return
 	}
 	prefix := connCfgString(connCfg, "topic.prefix")
-	for _, t := range cdcsnapshot.ReloadTopics(prefix, tables) {
+	for _, t := range cdcDataTopics(connCfg, prefix, tables) {
 		r.stats.IncludeTopic(t)
 	}
 }
@@ -152,7 +152,12 @@ func (r *RemovedTopicReaper) Schedule(pipelineID, connectorName string, connCfg 
 		if !plainCollection.MatchString(table) {
 			continue
 		}
-		topic := prefix + "." + table
+		// The name Debezium actually writes (SQL Server adds a database segment);
+		// an entry it cannot name for certain is skipped, never guessed.
+		topic, ok := cdcDataTopic(connCfg, prefix, table)
+		if !ok {
+			continue
+		}
 		key := pipelineID + "|" + topic
 		r.mu.Lock()
 		if r.jobs[key] {

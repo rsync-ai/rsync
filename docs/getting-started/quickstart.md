@@ -31,7 +31,7 @@ The host floor drops back to 6 GB, and the installer writes the resolved set int
 
 Running the same command again on a machine that already has rsync.ai upgrades it in place. It keeps your existing `.env` and, before it pulls or starts anything, checks two things:
 
-- **Settings.** Every variable the new compose file requires must have a value in `.env`. A missing internal secret that the installer generates on a fresh install (`INTERNAL_SERVICE_SECRET`, `JWT_SECRET`, `REDIS_PASSWORD`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`) is generated and added, and the installer says so. `POSTGRES_PASSWORD` and `ENCRYPTION_KEY` are never generated, because a new value would lock you out of the existing database or make saved connection credentials unreadable: if either is missing the installer stops and asks you to add the original value. Values already in `.env` are never changed. A line with nothing after the `=` counts as missing, and a line written as `export NAME=value` counts as set, the same way compose reads it.
+- **Settings.** Every variable the new compose file requires must have a value in `.env`. A missing internal secret that the installer generates on a fresh install (`INTERNAL_SERVICE_SECRET`, `JWT_SECRET`, `REDIS_PASSWORD`, `MINIO_ACCESS_KEY`, `MINIO_SECRET_KEY`, `BLOB_STAGING_ACCESS_KEY`, `BLOB_STAGING_SECRET_KEY`) is generated and added, and the installer says so. `POSTGRES_PASSWORD` and `ENCRYPTION_KEY` are never generated, because a new value would lock you out of the existing database or make saved connection credentials unreadable: if either is missing the installer stops and asks you to add the original value. Values already in `.env` are never changed. A line with nothing after the `=` counts as missing, and a line written as `export NAME=value` counts as set, the same way compose reads it.
 - **Ports.** Each host port the compose file publishes (5001 and 3000 by default) must be free or already held by this install's own containers. If another program or container holds one, the installer stops, names the port and what holds it, and explains how to free it or move rsync.ai to another port. Containers from the existing install are recreated only where their image or settings changed, and the data volumes are kept. If you are sure a reported port is free, put `RSYNC_SKIP_PORT_CHECK=1` on the `bash` side of the pipe to skip that check.
 
 For detailed self-hosting instructions (TLS, secrets management, backup, upgrades) see [deployment/self-hosting.md](../deployment/self-hosting.md).
@@ -180,5 +180,20 @@ docker compose -p rsync-ai down -v && docker compose -p rsync-ai up -d
 ```bash
 docker compose -p rsync-ai restart kafka
 ```
+
+**A connection to your own database fails with `could not translate host name` or `connection refused`:**
+
+rsync.ai reaches your database from inside containers, not from your machine's shell. Connectors run on the `rsync-ai-mcp` Docker network and the CDC engine (`kafka-connect`) runs on the stack's default network. The host name you enter must resolve and connect from both.
+
+- **`localhost` / `127.0.0.1`** point at the container itself, never at your machine. Use your machine's LAN IP address instead, and make sure the database listens on that address (for PostgreSQL, `listen_addresses` and `pg_hba.conf`).
+- **`host.docker.internal`** works on Docker Desktop (macOS, Windows). On Linux, connector containers do not get that name, so use the LAN IP.
+- **A database in another Docker Compose project** is not reachable by its service name. Either publish its port and use your machine's LAN IP, or attach its container to both networks under the name you enter:
+
+  ```bash
+  docker network connect --alias my-db rsync-ai-mcp <db-container>
+  docker network connect --alias my-db rsync-ai_default <db-container>
+  ```
+
+  Then enter `my-db` as the host.
 
 For more detail see [architecture/overview.md](../architecture/overview.md) and the per-service docs in [services/](../services/).

@@ -155,6 +155,13 @@ spec:
             - name: USE_MOCK_LLM
               value: "false"
             {{- include "rsync-ai.kafkaEnv" $root | nindent 12 }}
+            # LLM cost logging (src/utils/llm_cost.py) writes llm_usage_events
+            # into the gateway's database; without it every call goes unmetered.
+            # DB_* must come first: Kubernetes expands $(VAR) only from entries
+            # defined earlier in this list.
+            {{- include "rsync-ai.postgresEnv" $root | nindent 12 }}
+            - name: DATABASE_URL
+              value: "postgres://$(DB_USER):$(DB_PASSWORD)@$(DB_HOST):$(DB_PORT)/$(DB_NAME)?sslmode={{ include "rsync-ai.postgres.sslmode" $root }}"
             {{- end }}
             {{- if eq $svc.name "tool-generator" }}
             - name: RSYNC_EDITION
@@ -163,6 +170,12 @@ spec:
               value: /app/shared/mcp-connectors
             - name: RSYNC_MANAGED_CONNECTORS
               value: {{ $root.Values.generation.toolGenerator.managedConnectors | quote }}
+            # This pod's catalog is its own emptyDir copy (catalogInitContainer),
+            # so a connector generated here reaches no other service and is gone
+            # at the next restart. Generation refuses to save instead of
+            # reporting success (llm-service deployment/service.py).
+            - name: RSYNC_CONNECTOR_CATALOG_SHARED
+              value: "false"
             # DEPLOYER_URL is deliberately NOT set. The connector-deployer is
             # absent from this chart (it needs /var/run/docker.sock — see the
             # connectorDeployer note in values.yaml), so pointing this at a

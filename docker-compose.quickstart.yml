@@ -7,6 +7,11 @@
 # All images are pre-built and pulled from GHCR — no source code required.
 # Requires: Docker 24+, docker compose v2, and an .env file (see install.sh).
 #
+# Every first-party image is `${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/<name>:
+# ${RSYNC_VERSION:-latest}`: both halves are one variable each, so a mirror, an
+# air-gapped registry or a pre-release build moves every image together. The
+# same variable name is the Kubernetes installer's (install-k8s.sh).
+#
 # ── Sizing ───────────────────────────────────────────────────────────────────
 # Targets a 4 vCPU / 16 GiB host. Every service carries an explicit `mem_limit`,
 # which is doing two jobs: it stops one runaway container from taking the host
@@ -28,12 +33,14 @@
 # ── Optional profiles ────────────────────────────────────────────────────────
 # The default `up` starts the batch data plane only. Two opt-in profiles:
 #
-#   --profile cdc       change-data-capture: kafka-connect + debezium-mcp +
-#                       kafka-mcp-sink. ~2 GiB, and REQUIRED for any CDC
-#                       pipeline — the orchestrator's preflight hard-requires
-#                       all three (internal/workers/infra_preflight.go
+#   --profile cdc       change-data-capture: kafka-connect + debezium-mcp.
+#                       ~2 GiB, and REQUIRED for any CDC pipeline — the
+#                       orchestrator's preflight hard-requires both plus
+#                       kafka-mcp-sink (internal/workers/infra_preflight.go
 #                       requiredServices), so without this profile a CDC
 #                       pipeline fails preflight rather than degrading.
+#                       kafka-mcp-sink is NOT in the profile: batch runs
+#                       write through it too, so it always starts.
 #   --profile generate  context7-mcp, API-doc research used only while GENERATING
 #                       a new connector. Existing connectors run without it.
 #   --profile connectors  sample-data-mcp pre-started. Off by default: the first
@@ -210,6 +217,14 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    # The demo seed hands this host to the JIT-deployed postgresql connector, which
+    # joins ONLY rsync-ai-mcp (SEC-M-06), so on `default` alone the connector cannot
+    # resolve "demo-warehouse" and the seed 502s. Bridging it is safe where bridging
+    # postgres would not be: it has its own role and holds only the sample rows.
+    # Guarded by test_a_host_handed_to_a_connector_is_on_the_connector_network.
+    networks:
+      - default
+      - rsync-ai-mcp
 
   redis:
     image: redis:7-alpine
@@ -657,6 +672,73 @@ services:
         echo "minio-init: pipeline-data bucket ready"
     restart: "no"
 
+  # The blob lane's staging store: a second MinIO, on the connector network ONLY.
+  # Blob passthrough (copy raw files between object stores) has the SOURCE
+  # connector stage each object here and the DESTINATION connector fetch it, and
+  # connectors join only rsync-ai-mcp (SEC-M-06). `minio` above is on `default`
+  # only, so a connector could not resolve it; bridging it would hand every
+  # connector the store that holds every pipeline's staged claim-check rows. This
+  # one holds only staged blobs, under its own login, and nothing on `default`
+  # can reach it (the orchestrator only passes its URL along). Same image and
+  # digest as `minio`. The name must keep ":9000": the connectors' staging client
+  # uses path-style addressing only for an endpoint with "minio", "localhost" or
+  # ":9000" in it (base_connector.py _get_staging_client).
+  blob-staging:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    container_name: rsync-blob-staging
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    restart: unless-stopped
+    mem_limit: 512m
+    environment:
+      MINIO_ROOT_USER: ${BLOB_STAGING_ACCESS_KEY:?BLOB_STAGING_ACCESS_KEY is required}
+      MINIO_ROOT_PASSWORD: ${BLOB_STAGING_SECRET_KEY:?BLOB_STAGING_SECRET_KEY is required}
+    command: server /data
+    volumes:
+      - blob_staging_data:/data
+    networks:
+      - rsync-ai-mcp
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Bucket + expiry for blob-staging. Nothing deletes a staged blob per message:
+  # blobs are content-addressed and shared between messages, so this rule is the
+  # only cleanup. 7 days, like minio-init's, and for the same reason.
+  blob-staging-init:
+    image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
+    container_name: rsync-blob-staging-init
+    logging:
+      driver: json-file
+      options:
+        max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
+        max-file: "${RSYNC_LOG_MAX_FILE:-3}"
+    depends_on:
+      blob-staging:
+        condition: service_healthy
+    environment:
+      BLOB_STAGING_ACCESS_KEY: ${BLOB_STAGING_ACCESS_KEY:?BLOB_STAGING_ACCESS_KEY is required}
+      BLOB_STAGING_SECRET_KEY: ${BLOB_STAGING_SECRET_KEY:?BLOB_STAGING_SECRET_KEY is required}
+    networks:
+      - rsync-ai-mcp
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until mc alias set local http://blob-staging:9000 "$$BLOB_STAGING_ACCESS_KEY" "$$BLOB_STAGING_SECRET_KEY"; do
+          echo "waiting for blob-staging..."; sleep 2;
+        done
+        mc mb --ignore-existing local/pipeline-data
+        mc ilm rule add local/pipeline-data --expire-days 7 --prefix staging/ \
+          || echo "WARN: could not set the blob staging expiry rule"
+        echo "blob-staging-init: pipeline-data bucket ready"
+    restart: "no"
+
   # ─── TEMPORAL ────────────────────────────────────────────────────────────────
 
   temporal:
@@ -737,7 +819,7 @@ services:
   # pipeline-creation path in the product — plus the Data Explorer, suggestions and
   # the PII scanner. See .github/workflows/docker-publish.yml.
   llm-service:
-    image: ghcr.io/rsync-ai/llm-service-oss:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/llm-service-oss:${RSYNC_VERSION:-latest}
     container_name: rsync-llm-service
     logging:
       driver: json-file
@@ -770,6 +852,9 @@ services:
       # top of this file; every key defaults to empty and empty means unset.
       <<: *kafka-security
       PORT: 5000
+      # LLM cost logging (src/utils/llm_cost.py) writes llm_usage_events into the
+      # database api-gateway migrates. Unset, every LLM call goes unmetered.
+      DATABASE_URL: postgres://${POSTGRES_USER:-rsync}:${POSTGRES_PASSWORD}@${POSTGRES_HOST:-postgres}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-pipeline_db}?sslmode=${POSTGRES_SSLMODE:-disable}
       # Sent as X-Internal-Secret on service-to-service calls to the orchestrator
       # topology API (requirePrincipal). Empty = topology calls 401 in production.
       INTERNAL_SERVICE_SECRET: ${INTERNAL_SERVICE_SECRET:-}
@@ -872,11 +957,14 @@ services:
   # One-shot init: seed the mcp_connectors volume so a COLD self-host boots WITH
   # connectors. Without it the volume is created empty and every pipeline run
   # resolves zero connectors — a stack that comes up green and cannot move a row.
-  # Idempotent: skips when the volume already has content, so it never clobbers
-  # user-generated connectors on a restart. Same definition as
-  # docker-compose.oss.yml so layering the two merges cleanly.
+  # Runs the image's seed-connectors.sh on every boot: a no-op on the same
+  # release, a refresh of the shipped connectors after an upgrade (generated
+  # connectors kept), and the tree handed to tool-generator's uid. No `command:`
+  # here -- an inline copy of the logic is how an upgrade once kept the old
+  # connector code. Same definition as docker-compose.oss.yml so layering the
+  # two merges cleanly.
   connector-seed:
-    image: ghcr.io/rsync-ai/connector-seed:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/connector-seed:${RSYNC_VERSION:-latest}
     container_name: rsync-connector-seed
     restart: "no"
     logging:
@@ -886,15 +974,6 @@ services:
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
     volumes:
       - mcp_connectors:/target
-    command:
-      - sh
-      - -c
-      - >-
-        if [ -z "$$(ls -A /target 2>/dev/null)" ]; then
-          cp -a /seed/. /target/ && echo 'connectors seeded into mcp_connectors volume';
-        else
-          echo 'mcp_connectors already populated - skipping seed';
-        fi
 
   # Connector Deployer (SEC-H-02): THE trusted socket-holder. tool-generator now
   # drops root + the docker socket and delegates all JIT connector build/run to
@@ -911,7 +990,7 @@ services:
     # not exist on the customer's box -- `docker compose up` aborts the whole
     # stack with `unable to prepare context: path "./connector-deployer" not
     # found`. Published by docker-publish.yml alongside the other core services.
-    image: ghcr.io/rsync-ai/connector-deployer:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/connector-deployer:${RSYNC_VERSION:-latest}
     container_name: rsync-connector-deployer
     logging:
       driver: json-file
@@ -955,7 +1034,7 @@ services:
   # self-heal and pinned-version JIT builds, so the service name stays
   # `tool-generator` — every peer resolves it by that hostname.
   tool-generator:
-    image: ghcr.io/rsync-ai/connector-lifecycle:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/connector-lifecycle:${RSYNC_VERSION:-latest}
     container_name: rsync-tool-generator
     logging:
       driver: json-file
@@ -1000,7 +1079,7 @@ services:
       - mcp_connectors:/app/shared/mcp-connectors
 
   planner:
-    image: ghcr.io/rsync-ai/llm-service-oss:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/llm-service-oss:${RSYNC_VERSION:-latest}
     container_name: rsync-planner
     logging:
       driver: json-file
@@ -1076,7 +1155,7 @@ services:
       - mcp_connectors:/app/shared/mcp-connectors:ro
 
   orchestrator:
-    image: ghcr.io/rsync-ai/orchestrator:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/orchestrator:${RSYNC_VERSION:-latest}
     container_name: rsync-orchestrator
     logging:
       driver: json-file
@@ -1168,15 +1247,16 @@ services:
       SENTINEL_PROBE_TEMPORAL_ADAPTER_URL: http://temporal-adapter:8082
       SENTINEL_PROBE_CONNECTOR_DEPLOYER_URL: http://connector-deployer:5011
       SENTINEL_PROBE_LLM_SERVICE_URL: http://llm-service:5000
-      # Object-storage-to-object-storage runs stage bytes in MinIO using these
-      # (executor/blob_lane.go buildStagingConfig). Unset, the endpoint defaults
-      # to rsync-ai-minio, a container that does not exist in this file (it is
-      # rsync-minio here), with minioadmin credentials this MinIO was never
-      # given. Same values minio-mcp gets below.
-      MINIO_ENDPOINT_URL: http://minio:9000
-      MINIO_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY:?MINIO_ACCESS_KEY is required}
-      MINIO_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY:?MINIO_SECRET_KEY is required}
-      MINIO_BUCKET: pipeline-data
+      # Object-storage-to-object-storage runs (blob passthrough) stage bytes in
+      # blob-staging, and the orchestrator only hands these to the two connectors
+      # (executor/blob_lane.go buildStagingConfig). NOT `minio`: connectors join
+      # only rsync-ai-mcp and cannot resolve it. Unset, the lane falls back to
+      # MINIO_ENDPOINT_URL and then to rsync-ai-minio, neither of which a
+      # connector can reach here. The orchestrator reads no other MINIO_* value,
+      # so it carries no claim-check credentials at all.
+      BLOB_STAGING_ENDPOINT_URL: http://blob-staging:9000
+      BLOB_STAGING_ACCESS_KEY_ID: ${BLOB_STAGING_ACCESS_KEY:?BLOB_STAGING_ACCESS_KEY is required}
+      BLOB_STAGING_SECRET_ACCESS_KEY: ${BLOB_STAGING_SECRET_KEY:?BLOB_STAGING_SECRET_KEY is required}
       CORRELATION_CLAIM_TTL: 1h
       ENABLE_SCHEDULER: "false"
       ENABLE_CDC_TABLE_STATS: "true"
@@ -1204,7 +1284,7 @@ services:
       - mcp_connectors:/app/shared/mcp-connectors
 
   temporal-adapter:
-    image: ghcr.io/rsync-ai/temporal-adapter:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/temporal-adapter:${RSYNC_VERSION:-latest}
     container_name: rsync-temporal-adapter
     logging:
       driver: json-file
@@ -1286,7 +1366,7 @@ services:
       - mcp_connectors:/app/shared/mcp-connectors:ro
 
   api-gateway:
-    image: ghcr.io/rsync-ai/api-gateway:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/api-gateway:${RSYNC_VERSION:-latest}
     container_name: rsync-api-gateway
     logging:
       driver: json-file
@@ -1452,7 +1532,7 @@ services:
       - mcp_connectors:/app/shared/mcp-connectors:ro
 
   frontend:
-    image: ghcr.io/rsync-ai/frontend:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/frontend:${RSYNC_VERSION:-latest}
     container_name: rsync-frontend
     logging:
       driver: json-file
@@ -1512,7 +1592,7 @@ services:
   # block below is the only place those credentials reach this connector.
 
   minio-mcp:
-    image: ghcr.io/rsync-ai/mcp-minio:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-minio:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-minio-v1-0-0-mcp
     logging:
       driver: json-file
@@ -1561,7 +1641,7 @@ services:
   # (api-gateway demo.go demoDeployRetryWindow). minio-mcp above and the cdc
   # pair stay pre-started for reasons given at each.
   sample-data-mcp:
-    image: ghcr.io/rsync-ai/mcp-sample-data:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-sample-data:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-sample-data-v1-0-0-mcp
     profiles: ["connectors"]
     logging:
@@ -1580,8 +1660,9 @@ services:
       ENVIRONMENT: production
 
   # ── CDC data plane (profile: cdc) ───────────────────────────────────────────
-  # These three are a set. The orchestrator's preflight requires kafka-connect
-  # AND debezium-mcp AND kafka-mcp-sink for any CDC pipeline, so shipping a
+  # kafka-connect and debezium-mcp are a set. The orchestrator's preflight
+  # requires both (plus kafka-mcp-sink, which is unprofiled because batch needs
+  # it too) for any CDC pipeline, so shipping a
   # subset is strictly worse than shipping none: the two MCPs used to start
   # unconditionally here while kafka-connect — the engine debezium-mcp is a bridge
   # to — had no service at all, so a CDC pipeline failed preflight on a box that
@@ -1592,7 +1673,7 @@ services:
   # security env (x-kafka-client-env), and only after polling 24 x 5s first. So
   # the profile, not the first CDC pipeline, is what starts them.
   kafka-connect:
-    image: ghcr.io/rsync-ai/kafka-connect:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/kafka-connect:${RSYNC_VERSION:-latest}
     container_name: kafka-connect
     logging:
       driver: json-file
@@ -1738,7 +1819,7 @@ services:
       start_period: 60s
 
   debezium-mcp:
-    image: ghcr.io/rsync-ai/mcp-debezium:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-debezium:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-debezium-v1-0-0-mcp
     logging:
       driver: json-file
@@ -1778,14 +1859,19 @@ services:
       - connect_secrets:/connect-secrets
 
   kafka-mcp-sink-mcp:
-    image: ghcr.io/rsync-ai/mcp-kafka-sink:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-kafka-sink:${RSYNC_VERSION:-latest}
     container_name: rsync-ai-kafka-mcp-sink-v1-0-0-mcp
     logging:
       driver: json-file
       options:
         max-size: ${RSYNC_LOG_MAX_SIZE:-10m}
         max-file: "${RSYNC_LOG_MAX_FILE:-3}"
-    profiles: ["cdc"]
+    # Deliberately NOT behind the cdc profile. The sink is the Kafka →
+    # destination writer for BATCH runs too (the executor starts a sink worker
+    # for pipeline.<id>.data before producing), and the orchestrator's preflight
+    # requires it for every pipeline with a destination
+    # (internal/workers/infra_preflight.go requiredServices). Profiled out, a
+    # batch-only install fails every batch run at preflight.
     restart: unless-stopped
     mem_limit: 768m
     environment:
@@ -1851,7 +1937,7 @@ services:
   # is wrapped in try/except with a 3s timeout, so its absence is tolerated by
   # design — a stack that only RUNS existing connectors never needs it.
   context7-mcp:
-    image: ghcr.io/rsync-ai/mcp-context7:${RSYNC_VERSION:-latest}
+    image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-context7:${RSYNC_VERSION:-latest}
     container_name: rsync-context7-mcp
     logging:
       driver: json-file
@@ -1873,6 +1959,7 @@ volumes:
   redis_data:
   kafka_data:
   minio_data:
+  blob_staging_data:
   # Shared between debezium-mcp (writes) and kafka-connect (reads, ro) so source
   # DB credentials never transit the Kafka config topic.
   connect_secrets:

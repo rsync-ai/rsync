@@ -175,6 +175,7 @@ func AuthRequiredMiddleware() gin.HandlerFunc {
 			`, crypto.HashSessionToken(token)).Scan(&userID, &email, &role)
 			if err == nil {
 				c.Set("user_id", userID)
+				bindCallerToRequest(c, userID)
 				c.Set("user_email", email)
 				c.Set("user_role", role)
 				c.Next()
@@ -208,6 +209,7 @@ func AuthRequiredMiddleware() gin.HandlerFunc {
 			}
 		}
 		c.Set("user_id", userID)
+		bindCallerToRequest(c, userID)
 		// role/email are unknown in this mode; handlers should treat role as "user"
 		c.Next()
 	}

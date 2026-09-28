@@ -42,6 +42,17 @@ RUNNER_PLATFORM = {
 }
 
 
+# The quickstart names its registry as `${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}`
+# so an install can pull from a mirror. Resolved to the default compose uses when
+# nothing is set: a literal `ghcr.io/rsync-ai/` match reads that form as a
+# third-party image, and every first-party check here would lose the quickstart.
+_REGISTRY_KNOB = re.compile(r"\$\{RSYNC_IMAGE_REGISTRY:-([^}]*)\}")
+
+
+def _default_registry(image):
+    return _REGISTRY_KNOB.sub(r"\1", image)
+
+
 def _published_platforms():
     """The platform set `docker-publish.yml` actually produces, per build step."""
     doc = yaml.safe_load(open(WORKFLOW, encoding="utf-8"))
@@ -169,7 +180,7 @@ def test_quickstart_pins_the_platform_it_publishes_on_every_ghcr_service():
     ghcr_services = {
         name: svc
         for name, svc in doc["services"].items()
-        if str(svc.get("image", "")).startswith("ghcr.io/rsync-ai/")
+        if _default_registry(str(svc.get("image", ""))).startswith("ghcr.io/rsync-ai/")
     }
     # Anti-vacuity: a moved or renamed image reference would otherwise let this
     # guard pass over an empty set.
