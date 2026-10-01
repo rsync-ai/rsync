@@ -16,7 +16,7 @@ toolchain go1.26.8
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2
-	github.com/IBM/sarama v1.61.0
+	github.com/IBM/sarama v1.61.1
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-playground/validator/v10 v10.30.5
 	github.com/go-sql-driver/mysql v1.10.1
@@ -113,7 +113,7 @@ require (
 	github.com/jcmturner/gokrb5/v8 v8.4.4 // indirect
 	github.com/jcmturner/rpc/v2 v2.0.3 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
-	github.com/klauspost/compress v1.20.0 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/leodido/go-urn v1.5.0 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
@@ -123,7 +123,7 @@ require (
 	github.com/nexus-rpc/nexus-proto-annotations v0.1.0 // indirect
 	github.com/nexus-rpc/sdk-go v0.7.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
-	github.com/pierrec/lz4/v4 v4.1.30 // indirect
+	github.com/pierrec/lz4/v4 v4.1.31 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
 	github.com/prometheus/procfs v0.21.1 // indirect
