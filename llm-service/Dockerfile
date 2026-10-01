@@ -2,7 +2,7 @@
 # amd64 and arm64 both resolve through it). The tag alone floats, and every
 # layer below here -- apt, pip, spacy -- is invalidated the moment upstream
 # republishes it. Bump deliberately, not by accident.
-FROM python:3.11-slim@sha256:da047cb8f9d1d98e5c070f5300ba9f7274e33b8fc0e5be5ed88740aed1b95ba9
+FROM python:3.11-slim@sha256:e41613d42d4891e4930f79523f93f81bbc7632584ec65e36ab055f41a800b41e
 
 # Install Docker CLI + buildx plugin via apt (avoids curl|sh supply chain risk).
 # buildx is required for BuildKit named contexts (--build-context shared=...), which
