@@ -702,7 +702,7 @@ jobs:
         # --severity HIGH,CRITICAL: only the strong-copyleft classes gate;
         #   permissive/notice licenses (MIT/Apache/BSD) are LOW and ignored.
         # --exit-code 1: FAIL on any HIGH/CRITICAL license finding.
-        # Reviewed weak-copyleft that ELv2 permits (MPL-2.0, LGPL-3.0 — see
+        # Reviewed weak-copyleft that the rsync.ai license permits (MPL-2.0, LGPL-3.0 — see
         #   THIRD_PARTY_NOTICES.md) is allowlisted in /.trivyignore, which Trivy
         #   reads automatically from the scan root.
         # --skip-files "**/*.j2": mirror the vuln scan — Jinja templates aren't

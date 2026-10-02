@@ -1,9 +1,9 @@
 name: Licenses
 
-# Lightweight strong-copyleft guard for the source-available (Elastic License 2.0)
+# Lightweight strong-copyleft guard for the source-available (rsync.ai Source-Available License)
 # release: fail the build if a NEW GPL / AGPL / SSPL / BUSL dependency is introduced
 # in any dependency manifest. These licenses conflict with redistributing the combined
-# work under ELv2. LGPL / MPL are weak-copyleft (dynamically linked, kept as separate
+# work under our license. LGPL / MPL are weak-copyleft (dynamically linked, kept as separate
 # components) and are allowed.
 #
 # Implemented as a pure `grep` scan — no go-licenses / pip-licenses / npm install — so it
@@ -67,7 +67,7 @@ jobs:
             echo "::error::New strong-copyleft (GPL/AGPL/SSPL/BUSL) dependency detected in a manifest:"
             echo "$hits"
             echo ""
-            echo "GPL/AGPL/SSPL/BUSL conflict with redistribution under ELv2. Use a permissive"
+            echo "GPL/AGPL/SSPL/BUSL conflict with redistribution under the rsync.ai license. Use a permissive"
             echo "or weak-copyleft (LGPL/MPL) alternative, or add a reviewed exception to ALLOW."
             exit 1
           fi

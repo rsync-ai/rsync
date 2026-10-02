@@ -892,7 +892,10 @@ class ConnectorSpec(BaseModel):
     # Metadata
     spec_version: str = Field(default="1.1", description="Spec schema version")
     author: Optional[str] = Field(default=None)
-    license: str = Field(default="MIT")
+    # The licence of the connector code rsync generates, which is first-party code under
+    # the repo licence. This used to default to "MIT", so every generated connector
+    # described itself as MIT and a fork could cite it (test_license_is_one_story.py).
+    license: str = Field(default="LicenseRef-rsync-SAL-1.0")
     repository: Optional[str] = Field(default=None)
     documentation_url: Optional[str] = Field(default=None)
     # Free-form architect/builder metadata (e.g. lazy_ops flag, custom_scalars list).

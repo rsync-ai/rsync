@@ -1,7 +1,7 @@
 # rsync.ai — Self-hosted AI Data Pipelines, CDC, Scheduled Models, and Lineage
 
 [![Release](https://img.shields.io/github/v/release/rsync-ai/rsync?label=release&color=16a34a)](https://github.com/rsync-ai/rsync/releases/latest)
-[![License: ELv2](https://img.shields.io/badge/license-ELv2-3b82f6)](LICENSE)
+[![License: source-available](https://img.shields.io/badge/license-source--available-3b82f6)](LICENSE)
 [![Deploy: Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)](#docker--one-command)
 [![Deploy: Helm](https://img.shields.io/badge/deploy-Helm%20chart-0F1689?logo=helm&logoColor=white)](#kubernetes)
 [![Connectors](https://img.shields.io/badge/connectors-21-16a34a)](docs/connectors/reference.md)
@@ -24,9 +24,9 @@ and change-data-capture are both first-class. Twenty-one connectors ship in the 
 It is unrelated to [`rsync(1)`](https://rsync.samba.org/), the file-synchronisation
 tool — this moves rows between systems, not files between hosts.
 
-It is **source-available** under the [Elastic License 2.0](LICENSE): run it, modify it,
-and use it internally for free — you just cannot resell it as a hosted service. The
-[full summary is below](#license).
+It is **source-available** under the [rsync.ai Source-Available License](LICENSE): run it,
+modify it, and use it for your own business for free — you cannot sell it, host it for
+others, or build a competing product from it. The [full summary is below](#license).
 
 ## What it does
 
@@ -404,22 +404,38 @@ and read [CHANGELOG.md](CHANGELOG.md) before upgrading. Bugs and gaps are tracke
 
 ## License
 
-rsync.ai is **source-available** under the [Elastic License 2.0](LICENSE) (ELv2) — not an
-OSI "open source" license.
+rsync.ai is **source-available** under the
+[rsync.ai Source-Available License v1.0](LICENSE) — not an OSI "open source" license.
 
 The `LICENSE` file is the binding text; the following is a plain-English summary (not
 legal advice):
 
 **You can:**
-- Download, install, run, and modify rsync.ai on your own infrastructure
-- Use it for your own internal business data pipelines
-- Distribute it and your modifications under these same terms
+- Download, install, run, and modify rsync.ai on infrastructure you control
+- Use it for your own company's data pipelines, free of charge
+- Use it for personal and other non-commercial projects
+- Charge for your own time installing, configuring, supporting, or teaching others to use
+  it — but not for the software itself, and without running it for them as a service
 - Contribute back to the project (see [CONTRIBUTING.md](CONTRIBUTING.md))
 
-**You cannot:**
-- Offer rsync.ai (or a modified version) to third parties as a hosted or managed service
+**You cannot, without a commercial license from us:**
+- Sell, resell, sublicense, rent, or charge a fee for rsync.ai or a modified version
+- Host or run it for other people as a hosted, managed, or cloud service, paid or free
+- Embed it in, or build from it, a product or service you offer to others for money,
+  including one that competes with rsync.ai
+- Share copies with anyone outside your company, except free of charge, for
+  non-commercial purposes, with the license attached
 - Move, change, disable, or circumvent any license-key functionality
 - Remove or obscure the licensing, copyright, or other notices
+
+**Earlier versions.** Releases up to and including v0.1.7 were published under the
+Elastic License 2.0 and stay under it; its text is kept in
+[`LICENSES/`](LICENSES/LicenseRef-rsync-ELv2-legacy.txt). This license applies from the
+first release that includes it.
+
+Need something these terms do not allow, such as reselling it, embedding it in your
+product, or hosting it for others? Ask for a commercial license at
+[rsync.ai](https://rsync.ai).
 
 The rsync.ai name and logo are trademarks — see [TRADEMARK.md](TRADEMARK.md). Licenses of
 bundled third-party dependencies are listed in

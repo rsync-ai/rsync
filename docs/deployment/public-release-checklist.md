@@ -100,7 +100,7 @@ because a box is a claim and the API is the evidence. State confirmed 2026-09-22
   curl -sL https://github.com/rsync-ai/rsync | grep -o 'og:image" content="[^"]*"'
   ```
 - [x] **Licence display.** Confirmed: the repository API still reports the licence as
-  `NOASSERTION`, because GitHub does not detect the Elastic License 2.0 from the `LICENSE`
+  `NOASSERTION`, because GitHub does not detect the rsync.ai Source-Available License from the `LICENSE`
   file. That is expected, not a misconfiguration; the README's licence section is the
   plain-English statement. Call it "source-available", never "open source".
 - [x] **Discussions.** Enabled, with both categories this checklist requires present — *Q&A*

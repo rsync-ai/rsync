@@ -3,7 +3,7 @@
 # gen-third-party-notices.sh — regenerate THIRD_PARTY_NOTICES.md for the whole
 # repo (Go modules + Python images/connectors + frontend npm).
 #
-# Source-available (Elastic License 2.0) redistribution obligation: we ship
+# Source-available (rsync.ai Source-Available License) redistribution obligation: we ship
 # third-party OSS inside our Docker images, so we must reproduce their license
 # texts and copyright notices. This script produces a single aggregated
 # THIRD_PARTY_NOTICES.md at the repo root.
@@ -79,7 +79,7 @@ while IFS= read -r r; do PY_MANIFESTS+=("$r"); done < <(
 {
   echo "# Third-Party Notices"
   echo
-  echo "rsync.ai (Elastic License 2.0) redistributes the third-party open-source"
+  echo "rsync.ai (rsync.ai Source-Available License) redistributes the third-party open-source"
   echo "components listed below inside its container images. Their licenses and"
   echo "copyright notices are reproduced here to satisfy their redistribution terms."
   echo

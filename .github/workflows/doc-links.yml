@@ -216,6 +216,11 @@ jobs:
           # NOT test_shipped_images_are_publishable.py: it fails without release tags,
           # and this list also runs against the published tree, which has none. It
           # stays in llm-service-unit, which fetches tags, with README.md in the filter.
+          # test_license_is_one_story.py is half markdown and half code, like the
+          # self-host boundary guard: LICENSE, CLA.md and the README on one side,
+          # 34 connector metadata files and the generator's licence default on the
+          # other. A connector labelled MIT beside a LICENSE that bars selling it is a
+          # hole a fork can cite, and either side can reopen it alone. Stdlib only.
           pytest -q \
             tests/test_doc_merge_claims_are_true.py \
             tests/test_doc_links_resolve.py \
@@ -244,5 +249,6 @@ jobs:
             tests/test_chart_ships_no_developer_scaffolding.py \
             tests/test_published_image_platforms_match_the_docs.py \
             tests/test_fix_pr_must_change_a_test.py \
-            tests/test_shipped_images_are_anonymously_pullable.py
+            tests/test_shipped_images_are_anonymously_pullable.py \
+            tests/test_license_is_one_story.py
 

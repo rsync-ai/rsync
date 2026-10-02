@@ -6,7 +6,7 @@ Thank you for your interest in contributing. This guide covers how to set up a l
 
 - Check [existing issues](https://github.com/rsync-ai/rsync/issues) before opening a new one
 - For large changes, open an issue first to discuss the approach
-- All contributions are subject to the [Elastic License 2.0](LICENSE) and require a DCO sign-off (see [below](#developer-certificate-of-origin-dco))
+- All contributions require signing the [CLA](CLA.md) once, and a DCO sign-off on every commit (see [below](#contributor-license-agreement-cla)). They come in under the [rsync.ai Source-Available License](LICENSE)
 
 ## Local development setup
 
@@ -66,11 +66,22 @@ Use `requirements-oss.txt` instead of `requirements.txt` if you're working on th
 - Reference any related issues with `Fixes #123`
 - All CI checks must pass before merge
 
+## Contributor License Agreement (CLA)
+
+Before a first pull request can be merged you sign the [CLA](CLA.md), once. You keep the
+copyright in your contribution. The CLA lets the project distribute it, and change its own
+license later, without asking every contributor again. When you open your first pull request,
+the CLA bot comments on it with a link. Open it, sign in with your GitHub account and agree.
+The bot records the signature and does not ask again unless the CLA changes. A pull request from an
+account that has not signed will not be merged.
+
+The CLA is in addition to the DCO sign-off below, not a replacement for it.
+
 ## Developer Certificate of Origin (DCO)
 
-All contributions require a **sign-off** certifying you have the right to submit them under the
-[Elastic License 2.0](LICENSE). We use the [Developer Certificate of Origin](DCO) — a lightweight
-alternative to a CLA, with no copyright assignment.
+Every commit also requires a **sign-off** certifying you have the right to submit it under the
+[license](LICENSE) and the [CLA](CLA.md). We use the [Developer Certificate of Origin](DCO) — a
+lightweight per-commit statement, with no copyright assignment.
 
 Add a sign-off to each commit with the `-s` flag:
 

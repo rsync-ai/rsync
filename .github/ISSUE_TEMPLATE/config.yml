@@ -24,7 +24,7 @@ contact_links:
 
   - name: Contributing and development setup
     url: https://github.com/rsync-ai/rsync/blob/main/CONTRIBUTING.md
-    about: Local dev environment, running the test suites, the DCO sign-off, and the pull request process.
+    about: Local dev environment, running the test suites, the CLA and DCO sign-off, and the pull request process.
 
   - name: Questions and ideas
     url: https://github.com/rsync-ai/rsync/discussions
