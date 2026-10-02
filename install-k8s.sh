@@ -33,7 +33,7 @@ set -euo pipefail
 #   -h, --help
 #
 # Copyright (c) 2025 Infini Data Solution (Rahul Kumar Vishnoi)
-# Licensed under the Elastic License 2.0 — https://rsync.ai/license
+# Licensed under the rsync.ai Source-Available License — https://rsync.ai/license
 # ─────────────────────────────────────────────────────────────────────────────
 
 # The chart. Pinned to the release this script ships with, for the same reason

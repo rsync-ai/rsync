@@ -102,6 +102,6 @@
     {"name": "merge", "type": "destination", "method": "merge", "description": "CDC-style MERGE upsert/delete (present but dormant in v1.0.0)."}
   ],
   "resources": [],
-  "license": "ELv2",
+  "license": "LicenseRef-rsync-SAL-1.0",
   "source": "hand-curated"
 }

@@ -1,6 +1,6 @@
 # Third-Party Notices
 
-rsync.ai (Elastic License 2.0) redistributes the third-party open-source components listed
+rsync.ai (rsync.ai Source-Available License) redistributes the third-party open-source components listed
 below inside its container images and source distribution. Their licenses and copyright
 notices are reproduced here to satisfy their redistribution terms. Nothing here is legal advice.
 
@@ -31,22 +31,22 @@ production dependencies._
 
 A scan of the **language-level** dependencies (Go modules, Python packages, npm production deps)
 found **no strong-copyleft (GPL / AGPL / SSPL / BUSL)** among them; the only copyleft language
-deps are **weak-copyleft** (MPL-2.0 / LGPL-3.0 / EPL-2.0), which ELv2 redistribution permits because each is
+deps are **weak-copyleft** (MPL-2.0 / LGPL-3.0 / EPL-2.0), which redistribution alongside rsync.ai permits because each is
 consumed as a separable, dynamically-linked pre-compiled component (no static linking of
 rsync-ai's own code into the copyleft work). **Separately, OS/system packages baked into the
 connector container images (see § "Container image / OS packages") add two attention items —
 notably the SQL Server connector's `msodbcsql18` (Microsoft-proprietary, redistributed under the
-Microsoft EULA, not ELv2) and `unixODBC`.** Each copyleft/attention component is listed below and
+Microsoft EULA, not the rsync.ai license) and `unixODBC`.** Each copyleft/attention component is listed below and
 must remain separable and replaceable.
 
 | Dependency | Component | License | Notes |
 |---|---|---|---|
-| [`github.com/go-sql-driver/mysql`](https://github.com/go-sql-driver/mysql) | Go services (MySQL driver) | **MPL-2.0** | File-level weak copyleft; dynamically linked, unmodified. Redistributable under ELv2. |
+| [`github.com/go-sql-driver/mysql`](https://github.com/go-sql-driver/mysql) | Go services (MySQL driver) | **MPL-2.0** | File-level weak copyleft; dynamically linked, unmodified. Redistributable alongside rsync.ai. |
 | [`github.com/hashicorp/go-uuid`](https://github.com/hashicorp/go-uuid) | Go services (indirect) | **MPL-2.0** | File-level weak copyleft; indirect, unmodified. |
 | [`psycopg2-binary`](https://github.com/psycopg/psycopg2) | `postgresql` + `redshift` connectors | **LGPL-3.0-or-later** (w/ OpenSSL exception) | Weak copyleft; shipped as a pre-compiled binary wheel, dynamically imported as a separable component. The only copyleft dependency on the shipped Python **language** surface. Its LGPL text is distributed with the wheel. |
 | [`certifi`](https://github.com/certifi/python-certifi) | transitive (requests/httpx/boto3), Python connector images | **MPL-2.0** | CA-bundle data; weak copyleft, unmodified, redistributed as-is. Transitive — enumerated fully at release-time regen. |
-| [`sharp`](https://github.com/lovell/sharp) (`@img/sharp-*`, libvips) | frontend image optimization (Next.js) | **LGPL-3.0-or-later** (libvips; npm reports `Apache-2.0 AND LGPL-3.0-or-later [AND MIT]`) | Weak copyleft; the libvips native lib is a dynamically-linked, separable pre-built binary — ELv2-redistributable. Surfaced by the Trivy license scan (the direct-dep frontend scan missed the transitive libvips). Its licenses are covered by `licenses.yml`'s package.json grep + the release-time `license-checker`; the frontend npm lockfile is scoped out of the blocking Trivy license gate (a Trivy 3-component-compound bug — see `.github/workflows/security.yml`). |
-| [`msodbcsql18`](https://learn.microsoft.com/sql/connect/odbc/) | `sqlserver` connector image (apt) | **Proprietary — Microsoft ODBC Driver EULA** | Installed with `ACCEPT_EULA=Y`. Redistribution inside a published image is governed by the Microsoft EULA, **not** ELv2 — **flag for legal review before public distribution.** No other connector bundles it. |
+| [`sharp`](https://github.com/lovell/sharp) (`@img/sharp-*`, libvips) | frontend image optimization (Next.js) | **LGPL-3.0-or-later** (libvips; npm reports `Apache-2.0 AND LGPL-3.0-or-later [AND MIT]`) | Weak copyleft; the libvips native lib is a dynamically-linked, separable pre-built binary — redistributable alongside rsync.ai. Surfaced by the Trivy license scan (the direct-dep frontend scan missed the transitive libvips). Its licenses are covered by `licenses.yml`'s package.json grep + the release-time `license-checker`; the frontend npm lockfile is scoped out of the blocking Trivy license gate (a Trivy 3-component-compound bug — see `.github/workflows/security.yml`). |
+| [`msodbcsql18`](https://learn.microsoft.com/sql/connect/odbc/) | `sqlserver` connector image (apt) | **Proprietary — Microsoft ODBC Driver EULA** | Installed with `ACCEPT_EULA=Y`. Redistribution inside a published image is governed by the Microsoft EULA, **not** the rsync.ai license — **flag for legal review before public distribution.** No other connector bundles it. |
 | [`elkjs`](https://github.com/kieler/elkjs) | frontend graph layout (Explorer lineage + model graphs) | **EPL-2.0 OR GPL-3.0-or-later** — rsync-ai **elects EPL-2.0** | File-level weak copyleft. Shipped unmodified, as its own JS chunks (a Web Worker script, plus a main-thread fallback loaded only when a worker cannot start), never merged into rsync-ai source. The minifier strips source comments (elkjs's own licence header included), so the notice ships as a served file, `/third-party/elkjs-LICENSE.txt` (`frontend/public/`): the upstream copyright, a link to the release's source (<https://github.com/kieler/elkjs/tree/0.12.0>) and the full EPL-2.0 text; `elk-license.test.ts` fails when it stops matching the installed elkjs. The GPL-3.0 alternative is not elected. A change to elkjs itself would be EPL-2.0 and its source would have to be offered. |
 | [`unixODBC`](https://www.unixodbc.org/) (`unixodbc`/`unixodbc-dev`) | `sqlserver` connector image (apt) | **LGPL-2.1** (libs); **GPL-2.0** (some CLI tools, e.g. `isql`) | pyodbc's driver manager. The linked libraries are LGPL; the GPL-2.0 CLI tools ship in the image but are not invoked by the connector. |
 | `mysql-connector-python` | -- (removed) | GPL-2.0 | **No longer shipped.** Swapped to MIT `PyMySQL` in #499; remains only in dev/test manifests (`e2e/`, `tests/`) which are not part of any distributed image. |

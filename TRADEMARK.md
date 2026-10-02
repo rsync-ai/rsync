@@ -6,7 +6,7 @@ use the Marks.
 
 ## Code license vs. trademark
 
-The [Elastic License 2.0](LICENSE) grants you rights to the rsync.ai **source code**. It does
+The [rsync.ai Source-Available License](LICENSE) grants you rights to the rsync.ai **source code**. It does
 **not** grant any rights to the Marks. Trademark rights are separate from copyright, and this
 policy — not the code license — governs use of the name and logo.
 
@@ -15,7 +15,7 @@ policy — not the code license — governs use of the name and logo.
 - **Refer to the project truthfully** ("nominative fair use"): e.g. "built with rsync.ai",
   "compatible with rsync.ai", "a connector for rsync.ai", or writing tutorials, reviews, and
   articles about rsync.ai.
-- **Run and modify** your own copy of the software under the Elastic License 2.0.
+- **Run and modify** your own copy of the software under the [license](LICENSE).
 - **Link to** the official project at https://github.com/rsync-ai/rsync and https://rsync.ai.
 - Use the Marks in **unmodified** copies of the software as distributed by the project.
 
@@ -35,8 +35,8 @@ policy — not the code license — governs use of the name and logo.
 ## Why forks must rebrand
 
 Source-available software is only trustworthy if the name means one thing. Requiring forks to
-rebrand keeps "rsync.ai" pointing at the official, maintained project, while leaving you fully
-free to use, modify, and redistribute the **code** under the Elastic License 2.0.
+rebrand keeps "rsync.ai" pointing at the official, maintained project, while leaving you free
+to use and modify the **code** within the terms of the [license](LICENSE).
 
 ## A note on the name
 

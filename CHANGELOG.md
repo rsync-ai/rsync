@@ -191,6 +191,20 @@ Everything since v0.1.3.
   collector you configure; the seeded `sentinel_config` keys are now backend-neutral
   (migration `100`).
 
+### ⚖️ License
+
+#### Changed
+- **New license from the first release that includes it: the rsync.ai Source-Available
+  License v1.0** (`LICENSE`), replacing the Elastic License 2.0. Running rsync.ai for your
+  own business, and for personal or non-commercial projects, stays free. Without a separate
+  agreement you may no longer sell it, host it for others, embed it in a product you sell,
+  build a competing product from it, or share copies except free of charge for
+  non-commercial purposes. Releases up to and including v0.1.7 stay under the Elastic
+  License 2.0; its text is kept in `LICENSES/`.
+- **Contributions now need a signed [CLA](CLA.md)**, once, in addition to the DCO sign-off.
+- **Every connector's `license` field now carries the new license's identifier**, not
+  `MIT` or `ELv2`. The field had defaulted to `MIT` for connectors rsync.ai wrote itself.
+
 ## Earlier changes
 
 Entries from before the release tags; they are not tied to a version.

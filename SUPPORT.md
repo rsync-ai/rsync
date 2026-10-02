@@ -42,6 +42,6 @@ report on the same issue is more useful than a second issue.
 
 ## What is not supported
 
-rsync.ai is source-available under the [Elastic License 2.0](LICENSE). There is no
+rsync.ai is source-available under the [rsync.ai Source-Available License](LICENSE). There is no
 commercial support contract attached to this repository, and no service-level commitment
 on issue response. Maintainers read everything; they cannot promise a timeline.

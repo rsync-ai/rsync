@@ -12,7 +12,7 @@ set -euo pipefail
 # script runs with the default -- no error, just a setting silently ignored.
 #
 # Copyright (c) 2025 Infini Data Solution (Rahul Kumar Vishnoi)
-# Licensed under the Elastic License 2.0 — https://rsync.ai/license
+# Licensed under the rsync.ai Source-Available License — https://rsync.ai/license
 # ─────────────────────────────────────────────────────────────────────────────
 
 # The repository the installer pulls its compose files from. Overridable so a
@@ -1776,7 +1776,7 @@ print_success() {
   echo "    Update:   ${COMPOSE_CMD}pull && ${COMPOSE_CMD}up -d"
   echo ""
   echo -e "  ${BOLD}Documentation:${NC}  https://rsync.ai/docs"
-  echo -e "  ${BOLD}License:${NC}        Elastic License 2.0 — free to self-host"
+  echo -e "  ${BOLD}License:${NC}        rsync.ai Source-Available License — free for your own use"
   echo ""
 }
 

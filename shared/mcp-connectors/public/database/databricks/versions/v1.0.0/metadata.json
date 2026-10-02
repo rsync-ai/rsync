@@ -112,6 +112,6 @@
       {"name": "primary_keys", "type": "array", "required": true}
     ]}
   ],
-  "license": "MIT",
+  "license": "LicenseRef-rsync-SAL-1.0",
   "source": "built_in"
 }

@@ -161,7 +161,7 @@
       "method": "kafka-mcp-sink_health"
     }
   ],
-  "license": "MIT",
+  "license": "LicenseRef-rsync-SAL-1.0",
   "id": "kafka-mcp-sink",
   "display_name": "Kafka MCP Sink",
   "aliases": [

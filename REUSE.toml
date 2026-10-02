@@ -1,0 +1,28 @@
+version = 1
+SPDX-PackageName = "rsync.ai"
+SPDX-PackageSupplier = "Infini Data Solution (Rahul Kumar Vishnoi)"
+SPDX-PackageDownloadLocation = "https://github.com/rsync-ai/rsync"
+
+# One declaration for the first-party source, instead of an SPDX header in every
+# file. A header shifts every `file.ext:line` citation in the docs by one line, and
+# there are thousands of them; this file tells a licence scanner the same thing
+# without touching a source file. LICENSE is the binding text and
+# LICENSES/LicenseRef-rsync-SAL-1.0.txt is a byte-identical copy of it
+# (llm-service/tests/test_license_is_one_story.py enforces that).
+#
+# Only source code is declared. Logos, vendor icons and anything under a
+# third-party directory are deliberately NOT listed: a connector's logo is another
+# company's trademark, and a scanner should not be told we license it.
+[[annotations]]
+path = [
+  "**/*.go",
+  "**/*.py",
+  "**/*.ts",
+  "**/*.tsx",
+  "**/*.sh",
+  "**/*.sql",
+  "**/Dockerfile*",
+]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2025-2026 Infini Data Solution (Rahul Kumar Vishnoi)"
+SPDX-License-Identifier = "LicenseRef-rsync-SAL-1.0"

@@ -5,7 +5,7 @@
 # Trivy's plain .trivyignore matches license findings by their LICENSE ID (the SPDX-ish
 # name Trivy prints), one id per line — the same way it matches CVE ids for vulns and
 # AVD ids for misconfig. Each entry below silences one reviewed weak-copyleft license
-# that Elastic License 2.0 redistribution permits AND that THIRD_PARTY_NOTICES.md
+# that redistribution alongside rsync.ai permits AND that THIRD_PARTY_NOTICES.md
 # documents as a separable, dynamically-linked component.
 #
 # Every entry here must be a reviewed weak-copyleft license already in
@@ -17,7 +17,7 @@
 # pass silently; to pin an allow to a specific path instead, migrate to .trivyignore.yaml
 # (`licenses: [{ id: ..., paths: [...] }]`). Today the only shippers are the three below.
 
-# MPL-2.0 — file-level weak copyleft; dynamically linked, unmodified; ELv2-redistributable.
+# MPL-2.0 — file-level weak copyleft; dynamically linked, unmodified; redistributable alongside rsync.ai.
 #   Shippers: github.com/go-sql-driver/mysql (Go MySQL driver) and
 #   github.com/hashicorp/go-uuid (indirect). Both documented in THIRD_PARTY_NOTICES.md.
 #   (Trivy classes MPL-2.0 as RECIPROCAL/MEDIUM, below the HIGH,CRITICAL gate, so this is
@@ -25,7 +25,7 @@
 MPL-2.0
 
 # LGPL-3.0 — weak copyleft; shipped as a pre-compiled binary wheel, dynamically imported
-#   as a separable component; ELv2-redistributable. Its LGPL text ships with the wheel.
+#   as a separable component; redistributable alongside rsync.ai. Its LGPL text ships with the wheel.
 #   Shipper: psycopg2-binary (postgresql + redshift connectors) — the only copyleft dep
 #   on the shipped Python language surface. Documented in THIRD_PARTY_NOTICES.md.
 #   Two forms are listed because Trivy may normalize psycopg2's "LGPLv3+" classifier to
