@@ -1,10 +1,10 @@
 #!/bin/bash
-# Rsync AI - Complete Setup Script
+# rsync.ai - Complete Setup Script
 # Combines: init_project.sh, setup_environment.sh
 
 set -e
 
-echo "🚀 Rsync AI - Complete Setup"
+echo "🚀 rsync.ai - Complete Setup"
 echo "=============================="
 
 # Check prerequisites

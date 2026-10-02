@@ -173,6 +173,6 @@ func TestAuthorizeModelRun_UnknownModeIsGatedAsTable(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if refusal == "" {
-		t.Fatal("a model whose mode rsync does not recognize must not run a write")
+		t.Fatal("a model whose mode rsync.ai does not recognize must not run a write")
 	}
 }

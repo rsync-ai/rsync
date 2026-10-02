@@ -8,8 +8,8 @@ on:
   # at release time, not per commit: cut a v*.*.* tag or run the workflow
   # manually to publish.
   #
-  # That budget got tighter, not looser: a release now builds 34 images (the 13
-  # hand-listed below plus the 21 discovered connectors), so restoring a push
+  # That budget got tighter, not looser: a release now builds 33 images (the 13
+  # hand-listed below plus the 20 discovered connectors), so restoring a push
   # trigger would exhaust the month faster than the incident this comment
   # records. Both numbers are transcribed, so they are pinned to what they
   # describe by llm-service/tests/test_shipped_images_are_publishable.py
@@ -201,7 +201,7 @@ jobs:
             dockerfile: shared/mcp-connectors/internal/context7/Dockerfile
             cache_scope: mcp-context7
 
-          # The 21 public mcp-<connector> images are NOT listed here. They are
+          # The 20 public mcp-<connector> images are NOT listed here. They are
           # discovered from the connector tree by the two jobs below, because a
           # hand-written list would pin `versions/<v>` and silently publish a
           # stale version the moment a connector's current_version moved — the
@@ -528,4 +528,4 @@ jobs:
           helm push "dist/rsync-ai-${VERSION}.tgz" "oci://${REGISTRY}/${ORG}/charts"
 
           echo "Installable with:"
-          echo "  helm install rsync oci://${REGISTRY}/${ORG}/charts/rsync-ai --version ${VERSION}"
+          echo "  helm install rsync-ai oci://${REGISTRY}/${ORG}/charts/rsync-ai --version ${VERSION}"

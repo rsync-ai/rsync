@@ -33,11 +33,11 @@ import (
 
 // The built-in sentence, used when the generator names no LLM message.
 const llmGateSentence = "Set up an LLM first: add OPENAI_API_KEY (or another provider's key) to .env, " +
-	"or set LLM_PROVIDER=ollama for a local model, then restart rsync."
+	"or set LLM_PROVIDER=ollama for a local model, then restart rsync.ai."
 
 // Wording the generator may send instead; it differs from the built-in sentence,
 // so a test can tell a relayed message from the fallback.
-const llmGateCustomSentence = "Set up an LLM first: set LLM_PROVIDER=ollama and start Ollama, then restart rsync."
+const llmGateCustomSentence = "Set up an LLM first: set LLM_PROVIDER=ollama and start Ollama, then restart rsync.ai."
 
 // The spec-required gate's refusal (llm-service agents/integration.py).
 const specGateRefusal = "Cannot reliably generate a connector for 'gcs' without a machine-readable contract. " +

@@ -1,6 +1,6 @@
 # MCP Connectors
 
-Every data source and destination rsync supports is an **MCP connector**: a small
+Every data source and destination rsync.ai supports is an **MCP connector**: a small
 Python service that speaks JSON-RPC over stdin/stdout (locally) or HTTP (in Docker),
 and answers the same handful of methods no matter what it is talking to.
 
@@ -162,11 +162,16 @@ followed by `POST /v1/deploy`. The
 including what to implement by hand afterwards and how to get the connector into the
 compose file.
 
-If you are patching an existing connector, patch the current version **in place**.
-Do not spin a new version for a bug fix, and do not create root copies. New versions
-(`vX.Y.Z+1`) are for deliberate behavioural changes you want to be separately pinnable,
-and they have to move in lockstep: `versions/<v>/`, `latest.json`, and
-`docker-compose.mcp.yml`.
+Every connector is `v1.0.0`. If you are patching an existing connector, patch that
+version **in place**, so anyone who already pulled it gets the fix at the version they
+run. Do not spin a new version for a bug fix, and do not create root copies. A new
+version by hand is only for a change the maintainers decide is major, and it has to
+move in lockstep: `versions/<v>/`, `latest.json`, and `docker-compose.mcp.yml`.
+
+Regenerating a REST or GraphQL connector with the tool generator is different: it
+always writes a **new** version (`v1.0.0` the first time, then `v1.0.1`, `v1.0.2`, ...)
+and points `latest.json` at it, so a regeneration never overwrites a version that
+carries hand fixes.
 
 Four connectors are hand-curated (`postgresql`, `mysql`, `shopify-admin-graphql`,
 `google-sheets`). **A fix to one of those must also be applied to its Jinja template**

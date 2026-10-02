@@ -1,6 +1,6 @@
 # Kafka ACLs for a customer-managed (BYO) cluster
 
-If you point rsync at a Kafka cluster you already run, and that cluster is
+If you point rsync.ai at a Kafka cluster you already run, and that cluster is
 authorized (`authorizer.class.name` set), rsync's principal needs the ACLs below.
 This page lists **every** operation the platform performs and the exact resource
 names it performs them on, so you can grant a least-privilege set rather than
@@ -159,7 +159,7 @@ not a per-service rollout. The old groups linger on the broker until
 | `Describe` | `Group` | consumer-lag reporting (`OffsetFetch`) | [manager.go:1324](../../backend-orchestrator/internal/kafka/manager.go) |
 | `Delete` | `Group` | pipeline teardown deletes the pipeline's own `sink-*` groups | [topology.go:551](../../backend-orchestrator/internal/kafka/topology.go), called from [cdc_kafka_teardown.go:499](../../backend-orchestrator/internal/handlers/cdc_kafka_teardown.go) |
 
-rsync does **not** call `DescribeConfigs` or `AlterConfigs` — you do not need to
+rsync.ai does **not** call `DescribeConfigs` or `AlterConfigs` — you do not need to
 grant them. Topic configs (`min.insync.replicas`, `cleanup.policy`, retention)
 are set at creation time in the `CreateTopics` request, never altered afterwards.
 
@@ -238,7 +238,7 @@ exact parsing rules are in [env-vars.md](env-vars.md#kafka).
 The Connect worker's three internal topics take the same variable —
 `CONNECT_{CONFIG,OFFSET,STATUS}_STORAGE_REPLICATION_FACTOR`
 ([docker-compose.yml:359-361](../../docker-compose.yml)) — but they are created by
-the Connect worker, not by rsync, so they are **not** subject to the clamp above.
+the Connect worker, not by rsync.ai, so they are **not** subject to the clamp above.
 On a single-broker cluster leave `KAFKA_REPLICATION_FACTOR` unset or at `1`.
 
 ---
@@ -287,7 +287,7 @@ and is what §6 grants. Cluster-wide `Create` is only needed if you leave the
 prefix empty.
 
 **Verified against a real auto-create-off cluster.** Earlier revisions of this
-page said rsync had not been run against one; it has since been run against four
+page said rsync.ai had not been run against one; it has since been run against four
 (`PLAINTEXT`, `SASL_PLAINTEXT`+SCRAM, `SASL_SSL`+SCRAM, `SASL_SSL`+OAUTHBEARER)
 on a broker with `auto.create.topics.enable=false` confirmed live from the
 broker's own `describe-configs`. All 29 topics present afterwards were therefore

@@ -40,7 +40,7 @@ public, and any customer data out of logs and configs before pasting them.
 <!-- Logs from the service that failed, not the whole stack:
        docker compose -p rsync-ai logs --tail=200 <service>
      On Kubernetes:
-       kubectl -n rsync logs deploy/<service> --tail=200
+       kubectl -n rsync-ai logs deploy/<service> --tail=200
      Redact credentials before pasting. -->
 
 ```

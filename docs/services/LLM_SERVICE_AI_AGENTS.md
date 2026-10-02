@@ -658,11 +658,11 @@ curl http://localhost:5012/health
 export LOG_LEVEL=DEBUG
 
 # Check the model is actually on the server (bundled overlay)
-docker exec rsync-ollama ollama list
+docker exec rsync-ai-ollama ollama list
 ```
 
 If the list is empty the one-shot `ollama-pull` job failed; read its log with
-`docker logs rsync-ollama-pull`. Pointing at your own Ollama instead? Run `ollama list` against
+`docker logs rsync-ai-ollama-pull`. Pointing at your own Ollama instead? Run `ollama list` against
 that host and pull the three models the offline defaults above name.
 
 ---

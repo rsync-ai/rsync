@@ -857,10 +857,10 @@ func main() {
 	// joining before signing in. Rate-limited to blunt token enumeration.
 	r.GET("/api/v1/workspace-invites/:token", handlers.AuthRateLimitMiddleware(), handlers.GetWorkspaceInvite)
 
-	// Slack drift-approval interactivity callback. PUBLIC — Slack carries no rsync
+	// Slack drift-approval interactivity callback. PUBLIC — Slack carries no rsync.ai
 	// session, so this route is intentionally OUTSIDE the authed api group:
 	// authenticity is the Slack request signature (verified inside the handler),
-	// identity is mapped Slack→verified-email→rsync user, and authorization is the
+	// identity is mapped Slack→verified-email→rsync.ai user, and authorization is the
 	// user's role in the pipeline's workspace. Disabled + inert unless
 	// SLACK_SIGNING_SECRET is set. Rate-limited to blunt signature-spam.
 	slackInteractions := handlers.NewSlackInteractionsHandler(

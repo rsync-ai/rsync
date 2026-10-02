@@ -522,49 +522,6 @@ services:
       rsync-network:
         aliases:
           - rsync-ai-oracle-mcp
-  petstore-v1-0-3-mcp:
-    build:
-      context: ./shared/mcp-connectors/public/petstore/versions/v1.0.3
-      dockerfile: Dockerfile
-      additional_contexts:
-        shared: ./shared/mcp-connectors/public
-    image: mcp-petstore:v1.0.3
-    container_name: rsync-ai-petstore-v1-0-3-mcp
-    labels:
-      - rsync-ai.mcp=true
-      - rsync-ai.connector=petstore
-      - rsync-ai.connector_version=v1.0.3
-    environment:
-      - PORT=8000
-      - MCP_PORT=8000
-      - MCP_HTTP_MODE=true
-      - DOCKER_CONTAINER=true
-      - LOG_FORMAT=json
-      - LOG_LEVEL=info
-      - ENVIRONMENT=docker
-      - KAFKA_TOPIC_PREFIX=${KAFKA_TOPIC_PREFIX-rsync.}
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 30s
-      timeout: 10s
-      start_period: 10s
-      retries: 3
-    restart: unless-stopped
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
-    mem_limit: ${MCP_MEMORY_LIMIT:-512m}
-    pids_limit: ${MCP_PIDS_LIMIT:-512}
-    logging:
-      driver: json-file
-      options:
-        max-size: ${MCP_LOG_MAX_SIZE:-10m}
-        max-file: "${MCP_LOG_MAX_FILE:-3}"
-    networks:
-      rsync-network:
-        aliases:
-          - rsync-ai-petstore-mcp
   postgresql-v1-0-0-mcp:
     build:
       context: ./shared/mcp-connectors/public/postgresql/versions/v1.0.0

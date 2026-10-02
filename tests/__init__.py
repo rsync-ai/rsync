@@ -1,3 +1,3 @@
 """
-Test suite for RSYNC AI components
+Test suite for rsync.ai components
 """

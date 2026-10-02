@@ -8,7 +8,7 @@
 //
 // Pattern stolen from Airbyte's AirbyteErrorTraceMessage:
 //   - failure_type is a small 3-value enum so users can filter "is this on me
-//     or on rsync?" at a glance.
+//     or on rsync.ai?" at a glance.
 //   - user_message contains the fix, not just the symptom (Fivetran pattern).
 //   - internal_message preserves the raw exception for support tickets.
 //   - remediation carries copy-pasteable commands + a doc URL for the fix.
@@ -31,7 +31,7 @@ const (
 	// expired API key, missing OAuth scope.
 	FailureTypeConfigError FailureType = "config_error"
 
-	// FailureTypeSystemError — rsync itself has a bug. Examples: connector
+	// FailureTypeSystemError — rsync.ai itself has a bug. Examples: connector
 	// silent drop, ownership row missing, healer poison-pill loop. Routes
 	// to developer audience, surfaces to user as "we're working on it".
 	FailureTypeSystemError FailureType = "system_error"
@@ -49,7 +49,7 @@ type Audience string
 const (
 	AudienceUser      Audience = "user"      // end user / DBA
 	AudienceOperator  Audience = "operator"  // ops on-call
-	AudienceDeveloper Audience = "developer" // rsync engineer (paged via internal channel)
+	AudienceDeveloper Audience = "developer" // rsync.ai engineer (paged via internal channel)
 )
 
 // Severity for UI rendering + alert routing thresholds.
@@ -100,7 +100,7 @@ type Remediation struct {
 // being compiled into runtime error payloads (Remediation.DocURL is a JSON
 // field returned to users, not just a doc link). A path inside the repo that
 // serves the docs cannot rot independently of the docs.
-const DocsBaseURL = "https://github.com/rsync-ai/rsync/blob/main/docs"
+const DocsBaseURL = "https://github.com/rsync-ai/rsync.ai/blob/main/docs"
 
 // DocsBaseURLEnv overrides DocsBaseURL at runtime so an operator running a
 // self-hosted mirror can point remediation at their own copy. A trailing
@@ -141,7 +141,7 @@ type StructuredError struct {
 	FailureType FailureType `json:"failure_type"`
 
 	// Code — stable identifier, SCREAMING_SNAKE_CASE. Stable across
-	// rsync versions. Examples:
+	// rsync.ai versions. Examples:
 	//   "MYSQL_BINLOG_FORMAT_NOT_ROW"
 	//   "POSTGRES_PUBLICATION_DOES_NOT_EXIST"
 	//   "POSTGRES_REPLICATION_SLOT_CONFLICT"
@@ -278,7 +278,7 @@ func FromDiagnosis(d Diagnosis, s Signal) *StructuredError {
 		se.Code = "RATE_LIMIT_EXCEEDED"
 		se.Audience = AudienceUser
 		se.Severity = SeverityWarning
-		se.UserMessage = "The source API is rate-limiting this pipeline. rsync is automatically backing off and will retry."
+		se.UserMessage = "The source API is rate-limiting this pipeline. rsync.ai is automatically backing off and will retry."
 		// No remediation needed — auto-handled. Surface only if retries exhaust.
 
 	case CategorySchemaDrift:
@@ -301,17 +301,17 @@ func FromDiagnosis(d Diagnosis, s Signal) *StructuredError {
 		se.Code = "NETWORK_TRANSIENT_FAILURE"
 		se.Audience = AudienceUser
 		se.Severity = SeverityWarning
-		se.UserMessage = "Transient network error talking to the source or destination. rsync will retry automatically."
+		se.UserMessage = "Transient network error talking to the source or destination. rsync.ai will retry automatically."
 
 	case CategoryConnectorBug:
 		se.FailureType = FailureTypeSystemError
 		se.Code = "RSYNC_BUG_SILENT_DROP"
 		se.Audience = AudienceDeveloper
-		se.UserMessage = "rsync detected a connector behaved incorrectly (read rows from source but wrote none to destination). Our team has been alerted."
+		se.UserMessage = "rsync.ai detected a connector behaved incorrectly (read rows from source but wrote none to destination). Our team has been alerted."
 		se.Remediation = &Remediation{
 			Steps: []string{
 				"No action required from you",
-				"rsync engineering will investigate the connector logs",
+				"rsync.ai engineering will investigate the connector logs",
 				"You will be notified when a fix is deployed",
 			},
 			DocURL: ErrorDocURL("rsync-bug-silent-drop"),
@@ -375,10 +375,10 @@ func applyCDCProvisioningRefinement(se *StructuredError, s Signal) {
 	switch {
 	case strings.Contains(low, "publication does not exist"):
 		se.Code = "POSTGRES_PUBLICATION_DOES_NOT_EXIST"
-		se.UserMessage = "The PostgreSQL publication for this pipeline doesn't exist. rsync provisions it automatically; this usually means it was dropped manually."
+		se.UserMessage = "The PostgreSQL publication for this pipeline doesn't exist. rsync.ai provisions it automatically; this usually means it was dropped manually."
 		se.Remediation = &Remediation{
 			Steps: []string{
-				"Re-run the pipeline — rsync will recreate the publication",
+				"Re-run the pipeline — rsync.ai will recreate the publication",
 				"If it fails again, ensure the database user has CREATE on the database",
 			},
 			DocURL:           ErrorDocURL("postgres-publication-missing"),
@@ -450,7 +450,7 @@ func applyCDCProvisioningRefinement(se *StructuredError, s Signal) {
 
 	case strings.Contains(low, "sp_cdc_enable_db") || strings.Contains(low, "cannot enable cdc") || strings.Contains(low, "is_cdc_enabled") || strings.Contains(low, "needs sysadmin/db_owner"):
 		se.Code = "SQLSERVER_CDC_NOT_ENABLED"
-		se.UserMessage = "SQL Server change data capture is not enabled on this database. rsync enables it automatically, but that requires a sysadmin or db_owner login."
+		se.UserMessage = "SQL Server change data capture is not enabled on this database. rsync.ai enables it automatically, but that requires a sysadmin or db_owner login."
 		se.Remediation = &Remediation{
 			Steps: []string{
 				"As a sysadmin/db_owner, run the SQL below against the source database",
@@ -494,7 +494,7 @@ func applyCDCProvisioningRefinement(se *StructuredError, s Signal) {
 
 	case strings.Contains(low, "not a replica set") || strings.Contains(low, "notprimarynosecondaryok") || strings.Contains(low, "is not a member of a replica set"):
 		se.Code = "MONGODB_NOT_REPLICA_SET"
-		se.UserMessage = "MongoDB change data capture requires a replica set (or sharded cluster) — Debezium reads the change stream, which a standalone mongod does not expose. Initialize a single-node replica set, or point rsync at your existing one."
+		se.UserMessage = "MongoDB change data capture requires a replica set (or sharded cluster) — Debezium reads the change stream, which a standalone mongod does not expose. Initialize a single-node replica set, or point rsync.ai at your existing one."
 		se.Remediation = &Remediation{
 			Steps: []string{
 				"Start mongod with --replSet rs0 (or set replication.replSetName in mongod.conf)",
@@ -512,11 +512,11 @@ func applyCDCProvisioningRefinement(se *StructuredError, s Signal) {
 
 	case strings.Contains(low, "resume token") || strings.Contains(low, "resume of change stream") || strings.Contains(low, "changestreamhistorylost") || strings.Contains(low, "change stream history lost") || strings.Contains(low, "resume point may no longer be in the oplog"):
 		se.Code = "MONGODB_RESUME_TOKEN_INVALID"
-		se.UserMessage = "The MongoDB change-stream resume token is no longer in the oplog, so streaming can't continue from where it left off. rsync re-snapshots the affected collections from a fresh position; no data is lost, but the snapshot re-reads them."
+		se.UserMessage = "The MongoDB change-stream resume token is no longer in the oplog, so streaming can't continue from where it left off. rsync.ai re-snapshots the affected collections from a fresh position; no data is lost, but the snapshot re-reads them."
 		se.Severity = SeverityWarning
 		se.Remediation = &Remediation{
 			Steps: []string{
-				"No manual SQL is needed — rsync re-snapshots from a fresh change-stream position",
+				"No manual SQL is needed — rsync.ai re-snapshots from a fresh change-stream position",
 				"To prevent recurrence, size the oplog so tokens survive longer downtime (commands below)",
 				"Re-run or resume this pipeline",
 			},
@@ -549,12 +549,12 @@ func applyCDCProvisioningRefinement(se *StructuredError, s Signal) {
 
 	case strings.Contains(low, "slot already exists") || strings.Contains(low, "replication slot"):
 		se.Code = "POSTGRES_REPLICATION_SLOT_CONFLICT"
-		se.UserMessage = "A PostgreSQL replication slot for this pipeline already exists from a previous run. rsync's healer will attempt to reuse or recreate it."
+		se.UserMessage = "A PostgreSQL replication slot for this pipeline already exists from a previous run. rsync.ai's healer will attempt to reuse or recreate it."
 		se.Audience = AudienceOperator // auto-healable, only escalate if heal fails
 		se.Severity = SeverityWarning
 		se.Remediation = &Remediation{
 			Steps: []string{
-				"No action required — rsync's healer is attempting auto-recovery",
+				"No action required — rsync.ai's healer is attempting auto-recovery",
 				"If this error persists after 5 minutes, contact support",
 			},
 			DocURL: ErrorDocURL("postgres-slot-conflict"),

@@ -1,6 +1,6 @@
 # Error reference
 
-Every failure rsync surfaces carries a stable `code` and a `remediation` block. When a
+Every failure rsync.ai surfaces carries a stable `code` and a `remediation` block. When a
 remediation has a `doc_url`, it points at a section of **this page** — the anchor is the
 error code in lower-kebab form, so `POSTGRES_WAL_LEVEL_NOT_LOGICAL` links to
 [`#postgres-wal-level`](#postgres-wal-level).
@@ -153,7 +153,7 @@ missing config nor an auth rejection — usually the endpoint, port, or network 
 **Fix**
 
 1. Verify the host/endpoint, port and credentials in the source connection.
-2. Confirm the source is reachable from rsync (network / firewall / IP allow-list).
+2. Confirm the source is reachable from rsync.ai (network / firewall / IP allow-list).
 3. Re-test the connection after correcting it.
 
 ## postgres-connection-failed
@@ -168,7 +168,7 @@ checks could run. Reported as a check finding rather than a crash, so the UI can
 
 1. Verify host, port, user, password in connection config.
 2. Verify the database user has `CONNECT` privilege.
-3. Check network reachability from rsync to PostgreSQL.
+3. Check network reachability from rsync.ai to PostgreSQL.
 
 ## mysql-connection-failed
 
@@ -199,7 +199,7 @@ holding depends on the sync type and where the data is going:
   stays; DELETEs are not applied (they go to the dead-letter queue). So the destination
   drifts from the source. A nominated key column does not change this: nominations apply to
   batch loads only.
-- **Batch loads, and CDC into object storage.** rsync loads keyless tables using a
+- **Batch loads, and CDC into object storage.** rsync.ai loads keyless tables using a
   content-hash surrogate key (`_rsync_row_hash`). Because the hash covers all columns, a
   later change to any column is written as a **new row** and the prior version is retained,
   so updates accumulate duplicates rather than applying in place.
@@ -245,7 +245,7 @@ reports a `PRIMARY` index, so a naive "does a PRIMARY index exist?" check passes
 invisible columns are excluded from `SELECT *` and are not propagated to the destination.
 The replicated table therefore arrives with no key.
 
-rsync handles this: the table loads via the content-hash surrogate key (`_rsync_row_hash`)
+rsync.ai handles this: the table loads via the content-hash surrogate key (`_rsync_row_hash`)
 and the run succeeds. The caveat is the same as [cdc-missing-pk](#cdc-missing-pk) — because
 the hash covers all columns, a later change to any column is written as a new row, so
 updates can accumulate duplicates.
@@ -324,12 +324,12 @@ rather than `ALTER SYSTEM`.
 
 **Code:** `POSTGRES_PUBLICATION_DOES_NOT_EXIST` · config error · ~2 minutes.
 
-The PostgreSQL publication for this pipeline does not exist. rsync provisions it
+The PostgreSQL publication for this pipeline does not exist. rsync.ai provisions it
 automatically, so this usually means it was dropped manually.
 
 **Fix**
 
-1. Re-run the pipeline — rsync will recreate the publication.
+1. Re-run the pipeline — rsync.ai will recreate the publication.
 2. If it fails again, ensure the database user has `CREATE` on the database.
 
 ## postgres-slot-conflict
@@ -337,12 +337,12 @@ automatically, so this usually means it was dropped manually.
 **Code:** `POSTGRES_REPLICATION_SLOT_CONFLICT` · warning · routed to the operator.
 
 A PostgreSQL replication slot for this pipeline already exists from a previous run. This is
-auto-healable: rsync's healer attempts to reuse or recreate the slot, and only escalates if
+auto-healable: rsync.ai's healer attempts to reuse or recreate the slot, and only escalates if
 healing fails.
 
 **Fix**
 
-1. No action required — rsync's healer is attempting auto-recovery.
+1. No action required — rsync.ai's healer is attempting auto-recovery.
 2. If this error persists after 5 minutes, contact support.
 
 ## postgres-user-replication
@@ -465,7 +465,7 @@ SELECT pg_reload_conf();
 
 **Code:** `POSTGRES_PUBLICATION_PRIVILEGE` · advisory · ~5 minutes.
 
-rsync creates each pipeline's publication with `CREATE PUBLICATION … FOR ALL TABLES`, which
+rsync.ai creates each pipeline's publication with `CREATE PUBLICATION … FOR ALL TABLES`, which
 PostgreSQL allows only to a superuser — or, on a managed service, to a member of its admin
 role. The connection's user is neither. This is advisory: some platforms grant the right in
 ways the catalog does not show, so the pipeline may still start.
@@ -493,8 +493,8 @@ application's UPDATE and DELETE on that table fail, even though the pipeline doe
 ERROR: cannot update table "<table>" because it does not have a replica identity and publishes updates
 ```
 
-Tables the pipeline copies are not affected: rsync sets `REPLICA IDENTITY FULL` on them.
-rsync does not change your other tables; the assessment lists them, and the scheduled recheck
+Tables the pipeline copies are not affected: rsync.ai sets `REPLICA IDENTITY FULL` on them.
+rsync.ai does not change your other tables; the assessment lists them, and the scheduled recheck
 of a running pipeline reports new ones.
 
 **Fix**
@@ -565,7 +565,7 @@ SET GLOBAL binlog_row_image = 'FULL';
 
 **Code:** `MYSQL_BINLOG_EXPIRE_TOO_SHORT` · warning · ~2 minutes.
 
-Binary logs are being purged sooner than one day. If rsync is offline longer than the
+Binary logs are being purged sooner than one day. If rsync.ai is offline longer than the
 retention window, the binlog position it stopped at is gone and the affected tables must be
 re-snapshotted. At least 1 day is recommended so Debezium can resume after brief outages.
 
@@ -620,7 +620,7 @@ smallest vCore sizes are rejected.
 
 **Code:** `SQLSERVER_CDC_NOT_ENABLED` · config error · ~5 minutes.
 
-Change data capture is not enabled on this database. rsync enables it automatically, but
+Change data capture is not enabled on this database. rsync.ai enables it automatically, but
 that requires a `sysadmin` or `db_owner` login — the runtime login usually is not one.
 
 **Fix**
@@ -702,12 +702,12 @@ A single-node replica set is enough — you do not need extra members.
 **Code:** `MONGODB_RESUME_TOKEN_INVALID` · warning · ~10 minutes.
 
 The change-stream resume token is no longer in the oplog, so streaming cannot continue from
-where it left off. rsync re-snapshots the affected collections from a fresh position — no
+where it left off. rsync.ai re-snapshots the affected collections from a fresh position — no
 data is lost, but the snapshot re-reads them.
 
 **Fix**
 
-1. No manual command is needed; rsync re-snapshots from a fresh change-stream position.
+1. No manual command is needed; rsync.ai re-snapshots from a fresh change-stream position.
 2. To prevent recurrence, size the oplog so tokens survive longer downtime:
 
    ```javascript
@@ -799,16 +799,16 @@ The destination is out of disk, memory, or quota.
 
 ## rsync-bug-silent-drop
 
-**Code:** `RSYNC_BUG_SILENT_DROP` · **system error** — this one is on rsync, not you.
+**Code:** `RSYNC_BUG_SILENT_DROP` · **system error** — this one is on rsync.ai, not you.
 
-rsync detected that a connector behaved incorrectly: it read rows from the source but wrote
+rsync.ai detected that a connector behaved incorrectly: it read rows from the source but wrote
 none to the destination. This is a bug in the connector, which is why it is classified as a
 system error and routed to the developer audience rather than shown as something to fix.
 
 **What happens**
 
 1. No action is required from you.
-2. rsync engineering investigates the connector logs.
+2. rsync.ai engineering investigates the connector logs.
 3. You are notified when a fix is deployed.
 
 If you are self-hosting, this is the point to open an issue with the pipeline id and the

@@ -83,7 +83,7 @@ def test_the_scan_found_the_known_overrides():
     """
     names = {p for p, _ in _OVERRIDES}
     assert names, "no connector overrides configure_from_connection — layout drifted?"
-    for expected in ("stripe", "github-rest", "petstore"):
+    for expected in ("stripe", "github-rest"):
         assert any(n.startswith(expected + os.sep) for n in names), expected
 
 

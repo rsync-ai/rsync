@@ -191,7 +191,7 @@ export function UpgradeModal({ payload, open, onClose }: UpgradeModalProps) {
             ) : (
               <>
                 <Mail className="h-4 w-4" />
-                Contact the rsync team
+                Contact the rsync.ai team
               </>
             )}
           </Button>

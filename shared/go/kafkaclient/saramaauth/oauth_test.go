@@ -153,7 +153,7 @@ func TestApplyOAuthBearerUsesTheOIDCEndpoint(t *testing.T) {
 }
 
 // client.id is what a managed cluster attributes throttling and quotas to.
-// Unset, every rsync connection was the library's anonymous default.
+// Unset, every rsync.ai connection was the library's anonymous default.
 func TestApplySetsClientID(t *testing.T) {
 	cfg := sarama.NewConfig()
 	c := kafkaclient.Config{

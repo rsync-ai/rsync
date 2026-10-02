@@ -23,7 +23,7 @@ import pytest
 REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 INSTALL_SH = os.path.join(REPO_ROOT, "install.sh")
 QUICKSTART = "docker-compose.quickstart.yml"
-URL = f"https://raw.githubusercontent.com/rsync-ai/rsync/v0.1.5/{QUICKSTART}"
+URL = f"https://raw.githubusercontent.com/rsync-ai/rsync.ai/v0.1.5/{QUICKSTART}"
 
 pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
 
@@ -60,7 +60,7 @@ def _run(tmp_path, body, compose_dir="", version_requested="", cwd=None):
     script.write_text(
         "set -euo pipefail\n"
         f'PATH="{bin_dir}:$PATH"\n'
-        'RSYNC_REF="v0.1.5"\nRSYNC_REPO="rsync-ai/rsync"\n'
+        'RSYNC_REF="v0.1.5"\nRSYNC_REPO="rsync-ai/rsync.ai"\n'
         f'COMPOSE_FILE="{QUICKSTART}"\n'
         f'RSYNC_COMPOSE_DIR="{compose_dir}"\n'
         f'RSYNC_VERSION_REQUESTED="{version_requested}"\n'

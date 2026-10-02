@@ -84,7 +84,7 @@ export function SpecUploadFlow() {
   }
 
   // The browser fetches the document, not the server: the generator refuses
-  // server-side URL fetches, and this request carries no rsync credentials.
+  // server-side URL fetches, and this request carries no rsync.ai credentials.
   const onFetchUrl = async () => {
     const url = specUrl.trim()
     if (!/^https?:\/\//i.test(url)) {

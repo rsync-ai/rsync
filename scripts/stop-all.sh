@@ -1,5 +1,5 @@
 #!/bin/bash
-# Stop All Services Script for RSYNC AI
+# Stop All Services Script for rsync.ai
 # Stops all Docker containers and application processes
 
 set -e
@@ -11,7 +11,7 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-echo -e "${BLUE}🛑 RSYNC AI - Stop All Services${NC}"
+echo -e "${BLUE}🛑 rsync.ai - Stop All Services${NC}"
 echo "================================"
 echo ""
 

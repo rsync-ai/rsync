@@ -1,6 +1,6 @@
 """Python runtime of the Kafka security matrix.
 
-Security kwargs come ONLY from rsync's brokers_from_env()/kafka_security_kwargs()
+Security kwargs come ONLY from rsync.ai's brokers_from_env()/kafka_security_kwargs()
 (llm-service/src/utils/kafka_security.py, mounted read-only from the checkout at
 /rsync/kafka_security.py). Nothing security-related is set here. It writes
 PROBE_ID to PROBE_TOPIC (default "kmatrix") and reads it back.

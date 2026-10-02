@@ -84,11 +84,11 @@ const fleet: ComponentHealth[] = [
 ]
 
 function services(): HTMLElement {
-  return screen.getByRole("region", { name: "rsync services" })
+  return screen.getByRole("region", { name: "rsync.ai services" })
 }
 
 function findServices(): Promise<HTMLElement> {
-  return screen.findByRole("region", { name: "rsync services" })
+  return screen.findByRole("region", { name: "rsync.ai services" })
 }
 
 function connectors(): HTMLElement {
@@ -305,7 +305,7 @@ describe("ComponentHealthTable", () => {
       }),
     )
     render(<ComponentHealthTable refreshToken={0} />)
-    expect(await within(await findServices()).findByText("No rsync service has reported yet.")).toBeInTheDocument()
+    expect(await within(await findServices()).findByText("No rsync.ai service has reported yet.")).toBeInTheDocument()
     expect(screen.getByLabelText("Connector status summary")).toHaveTextContent("1 healthy")
   })
 

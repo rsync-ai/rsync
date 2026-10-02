@@ -137,7 +137,7 @@ services:
 
   postgres:
     image: postgres:16-alpine
-    container_name: rsync-postgres
+    container_name: rsync-ai-postgres
     logging:
       driver: json-file
       options:
@@ -198,7 +198,7 @@ services:
   # demo writes into it. Override RSYNC_DEMO_WAREHOUSE_PASSWORD if you disagree.
   demo-warehouse:
     image: postgres:16-alpine
-    container_name: rsync-demo-warehouse
+    container_name: rsync-ai-demo-warehouse
     logging:
       driver: json-file
       options:
@@ -228,7 +228,7 @@ services:
 
   redis:
     image: redis:7-alpine
-    container_name: rsync-redis
+    container_name: rsync-ai-redis
     logging:
       driver: json-file
       options:
@@ -261,7 +261,7 @@ services:
   kafka:
     image: apache/kafka:3.7.0
     hostname: kafka
-    container_name: rsync-kafka
+    container_name: rsync-ai-kafka
     logging:
       driver: json-file
       options:
@@ -335,7 +335,7 @@ services:
 
   kafka-init:
     image: apache/kafka:3.7.0
-    container_name: rsync-kafka-init
+    container_name: rsync-ai-kafka-init
     logging:
       driver: json-file
       options:
@@ -616,7 +616,7 @@ services:
     # "Unable to write to the backend". Nothing here waits on MinIO's health, so
     # without this the upgrade would report success with a dead object store.
     user: "0:0"
-    container_name: rsync-minio
+    container_name: rsync-ai-minio
     logging:
       driver: json-file
       options:
@@ -647,7 +647,7 @@ services:
   # the reason spelled out on minio-lifecycle-init in docker-compose.yml.
   minio-init:
     image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
-    container_name: rsync-minio-init
+    container_name: rsync-ai-minio-init
     logging:
       driver: json-file
       options:
@@ -685,7 +685,7 @@ services:
   # ":9000" in it (base_connector.py _get_staging_client).
   blob-staging:
     image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
-    container_name: rsync-blob-staging
+    container_name: rsync-ai-blob-staging
     logging:
       driver: json-file
       options:
@@ -712,7 +712,7 @@ services:
   # only cleanup. 7 days, like minio-init's, and for the same reason.
   blob-staging-init:
     image: cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1
-    container_name: rsync-blob-staging-init
+    container_name: rsync-ai-blob-staging-init
     logging:
       driver: json-file
       options:
@@ -743,7 +743,7 @@ services:
 
   temporal:
     image: temporalio/auto-setup:1.22.7
-    container_name: rsync-temporal
+    container_name: rsync-ai-temporal
     logging:
       driver: json-file
       options:
@@ -820,7 +820,7 @@ services:
   # the PII scanner. See .github/workflows/docker-publish.yml.
   llm-service:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/llm-service-oss:${RSYNC_VERSION:-latest}
-    container_name: rsync-llm-service
+    container_name: rsync-ai-llm-service
     logging:
       driver: json-file
       options:
@@ -965,7 +965,7 @@ services:
   # two merges cleanly.
   connector-seed:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/connector-seed:${RSYNC_VERSION:-latest}
-    container_name: rsync-connector-seed
+    container_name: rsync-ai-connector-seed
     restart: "no"
     logging:
       driver: json-file
@@ -991,7 +991,7 @@ services:
     # stack with `unable to prepare context: path "./connector-deployer" not
     # found`. Published by docker-publish.yml alongside the other core services.
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/connector-deployer:${RSYNC_VERSION:-latest}
-    container_name: rsync-connector-deployer
+    container_name: rsync-ai-connector-deployer
     logging:
       driver: json-file
       options:
@@ -1035,7 +1035,7 @@ services:
   # `tool-generator` — every peer resolves it by that hostname.
   tool-generator:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/connector-lifecycle:${RSYNC_VERSION:-latest}
-    container_name: rsync-tool-generator
+    container_name: rsync-ai-tool-generator
     logging:
       driver: json-file
       options:
@@ -1080,7 +1080,7 @@ services:
 
   planner:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/llm-service-oss:${RSYNC_VERSION:-latest}
-    container_name: rsync-planner
+    container_name: rsync-ai-planner
     logging:
       driver: json-file
       options:
@@ -1156,7 +1156,7 @@ services:
 
   orchestrator:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/orchestrator:${RSYNC_VERSION:-latest}
-    container_name: rsync-orchestrator
+    container_name: rsync-ai-orchestrator
     logging:
       driver: json-file
       options:
@@ -1216,7 +1216,7 @@ services:
       #
       # It is a birth setting, not a live one. Kafka cannot reduce a partition count at
       # all, and RAISING one on a topic that is already streaming rehashes every key
-      # onto a different partition and breaks per-key ordering, so rsync never resizes
+      # onto a different partition and breaks per-key ordering, so rsync.ai never resizes
       # an existing topic -- a change here reaches only topics created after it.
       KAFKA_CDC_TOPIC_PARTITIONS: ${KAFKA_CDC_TOPIC_PARTITIONS:-}
       # Namespace for every Kafka topic this product creates, so an operator can
@@ -1285,7 +1285,7 @@ services:
 
   temporal-adapter:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/temporal-adapter:${RSYNC_VERSION:-latest}
-    container_name: rsync-temporal-adapter
+    container_name: rsync-ai-temporal-adapter
     logging:
       driver: json-file
       options:
@@ -1367,7 +1367,7 @@ services:
 
   api-gateway:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/api-gateway:${RSYNC_VERSION:-latest}
-    container_name: rsync-api-gateway
+    container_name: rsync-ai-api-gateway
     logging:
       driver: json-file
       options:
@@ -1533,7 +1533,7 @@ services:
 
   frontend:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/frontend:${RSYNC_VERSION:-latest}
-    container_name: rsync-frontend
+    container_name: rsync-ai-frontend
     logging:
       driver: json-file
       options:
@@ -1938,7 +1938,9 @@ services:
   # design — a stack that only RUNS existing connectors never needs it.
   context7-mcp:
     image: ${RSYNC_IMAGE_REGISTRY:-ghcr.io/rsync-ai}/mcp-context7:${RSYNC_VERSION:-latest}
-    container_name: rsync-context7-mcp
+    # Not `rsync-ai-<x>-mcp`: api-gateway reads that shape as a connector (tools.go
+    # getMCPDockerContainers), and this is the doc-lookup helper generation uses.
+    container_name: rsync-ai-context7
     logging:
       driver: json-file
       options:

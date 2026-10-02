@@ -140,7 +140,7 @@ spec:
           inline prelude here, which compose never had.
 
           connectors.cdc.kafkaConnect.entrypoint is deprecated: set it only when
-          `image` is a Connect distribution that is not rsync's, and that image
+          `image` is a Connect distribution that is not rsync.ai's, and that image
           must then configure Kafka security itself. Its old default
           "/docker-entrypoint.sh start" is treated as unset -- rendering it would
           skip the script and ship a worker with no JAAS line.

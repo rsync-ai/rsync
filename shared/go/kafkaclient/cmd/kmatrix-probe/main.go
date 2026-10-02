@@ -2,10 +2,10 @@
 // (deploy/helm/rsync-ai/test/kind/kafka-matrix). It is a test tool: nothing
 // ships it and no service imports it.
 //
-// Config comes ONLY from kafkaclient.FromEnvForService -- the call every rsync
+// Config comes ONLY from kafkaclient.FromEnvForService -- the call every rsync.ai
 // Go service makes -- and the clients are built only through saramaauth and
 // kgoauth. Nothing security-related is set by hand here, so a pass or a failure
-// is a statement about rsync's code, not about this probe.
+// is a statement about rsync.ai's code, not about this probe.
 //
 //	kmatrix-probe sarama   -> saramaauth.NewClient, SyncProducer, partition consumer
 //	kmatrix-probe kafkago  -> kgoauth.Dialer (DialLeader + Reader) and kgoauth.Transport (Writer)

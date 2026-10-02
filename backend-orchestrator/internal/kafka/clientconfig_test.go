@@ -8,7 +8,7 @@ import (
 
 // client.id was set nowhere in this platform. On a managed cluster (MSK, Confluent
 // Cloud) broker-side quotas and throttle metrics key off it, so every connection from
-// every rsync service was indistinguishable both from each other and from any other
+// every rsync.ai service was indistinguishable both from each other and from any other
 // tenant's default client: when the cluster throttled us, neither side could tell which
 // service caused it, and the customer could not scope a quota to this product.
 //

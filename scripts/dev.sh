@@ -1,5 +1,5 @@
 #!/bin/bash
-# Rsync AI - Development Start Script
+# rsync.ai - Development Start Script
 # Combines: run_services.sh, start_all_services_go.sh, restart_services.sh
 
 set -e
@@ -8,7 +8,7 @@ ACTION="${1:-start}"
 
 case $ACTION in
   start)
-    echo "🚀 Starting all Rsync AI services..."
+    echo "🚀 Starting all rsync.ai services..."
     docker-compose up -d
     echo ""
     echo "⏳ Waiting for services to be ready..."

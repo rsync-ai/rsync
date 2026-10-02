@@ -67,7 +67,7 @@ PLAIN_MODULE = "org.apache.kafka.common.security.plain.PlainLoginModule"
 SCRAM_MODULE = "org.apache.kafka.common.security.scram.ScramLoginModule"
 OAUTH_MODULE = "org.apache.kafka.common.security.oauthbearer.OAuthBearerLoginModule"
 
-#: The mapping every site must encode. Kafka's own contract, not a rsync choice.
+#: The mapping every site must encode. Kafka's own contract, not a rsync.ai choice.
 CANONICAL = {
     "PLAIN": PLAIN_MODULE,
     "SCRAM-SHA-256": SCRAM_MODULE,

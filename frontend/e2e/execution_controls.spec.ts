@@ -74,7 +74,7 @@ async function getApiAuthHeaders(page: Page): Promise<Record<string, string>> {
   return headers
 }
 
-test.describe('RSYNC AI - Execution Controls', () => {
+test.describe('rsync.ai - Execution Controls', () => {
   test.beforeEach(async ({ page }) => {
     await ensureLoggedIn(page)
   })

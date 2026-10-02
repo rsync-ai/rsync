@@ -1,6 +1,6 @@
 # UI Testing Guide
 
-This guide covers testing strategies and best practices for the Rsync-AI frontend application.
+This guide covers testing strategies and best practices for the rsync.ai frontend application.
 
 ## Table of Contents
 

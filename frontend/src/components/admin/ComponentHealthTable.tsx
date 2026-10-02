@@ -297,12 +297,12 @@ function ServiceSection({ components, fetchedAt }: { components: ComponentHealth
 
   return (
     <section aria-labelledby={headingId} className="space-y-3">
-      <SectionHeading id={headingId} title="rsync services">
+      <SectionHeading id={headingId} title="rsync.ai services">
         An unhealthy or dead row here sends every admin an alert.
       </SectionHeading>
 
       {components.length === 0 ? (
-        <p className="text-sm text-zinc-500 dark:text-zinc-400">No rsync service has reported yet.</p>
+        <p className="text-sm text-zinc-500 dark:text-zinc-400">No rsync.ai service has reported yet.</p>
       ) : (
         <>
           <StatusSummary label="Status summary" components={components} fetchedAt={fetchedAt} />

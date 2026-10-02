@@ -34,7 +34,7 @@ export async function runModelNow(
     target_table?: string
   }
   if (!res.ok) {
-    // 400 = rsync refused (wrong class for the mode, no target, unsupported connector);
+    // 400 = rsync.ai refused (wrong class for the mode, no target, unsupported connector);
     // 422 = the engine rejected the statement. Both carry a usable message, and neither
     // is a server fault worth a generic "something went wrong".
     return { ok: false, message: data?.error || "The run did not complete" }

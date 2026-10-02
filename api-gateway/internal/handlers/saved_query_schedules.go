@@ -325,7 +325,7 @@ func SetSavedQueryMaterialization(c *gin.Context) {
 	m.TargetTable = target
 	if _, refusal, err := authorizeModelRun(c.Request.Context(), database, m, c.GetString("user_id")); err != nil {
 		// Undecided, not denied — a 400 here would tell the user their query is invalid
-		// when the truth is that rsync could not check.
+		// when the truth is that rsync.ai could not check.
 		log.WithError(err).Error("failed to authorize materialization target")
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "could not verify this query can be materialized; try again"})
 		return
@@ -440,7 +440,7 @@ func RunSavedQueryModel(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, res)
 	default:
 		// The statement reached the engine and the engine rejected it. 422 rather than
-		// 500: rsync did its job, the SQL did not.
+		// 500: rsync.ai did its job, the SQL did not.
 		c.JSON(http.StatusUnprocessableEntity, res)
 	}
 }

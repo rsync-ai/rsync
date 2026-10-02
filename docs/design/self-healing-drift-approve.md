@@ -8,7 +8,7 @@
 
 ## 1. Summary & non-goals
 
-rsync detects schema drift between a pipeline's source and its destination, renders a human-readable **diff**, and routes it through an **approve / reject** decision before any DDL touches the destination. We ship **propose → approve**.
+rsync.ai detects schema drift between a pipeline's source and its destination, renders a human-readable **diff**, and routes it through an **approve / reject** decision before any DDL touches the destination. We ship **propose → approve**.
 
 **`[RT-fix #4]` For the shipped phases (P0–P3), *all* drift classes — including additive `add_column` / `create_table` — surface as records/proposals; nothing auto-mutates the destination as a result of detection.** Additive auto-apply is a *separate, later, product-signed-off* phase, not on this critical path. (The sink already applies `add_column` silently today via `ensure_table` (`kafka-sink-worker/main.go:6476-6568`); detection makes that *auditable*, but the detection→auto-DDL path stays gated and off by default.) Every destructive class — `drop_column`, `drop_table`, `modify_column` (retype), `rename`, connector-regen, CDC re-provision — is **approval-only**, with the existing `applyMigration` DROP/TRUNCATE substring guard (`healer.go:869-874`) kept as a non-negotiable backstop even on the post-approval apply path.
 

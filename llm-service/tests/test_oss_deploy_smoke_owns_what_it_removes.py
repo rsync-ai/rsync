@@ -19,6 +19,7 @@ files and fails `docker build`, which ends each run just after preflight.
 import json
 import os
 import pathlib
+import re
 import subprocess
 
 import pytest
@@ -28,11 +29,14 @@ SCRIPT = REPO / "scripts" / "oss-deploy-smoke.sh"
 
 NET = "rsync-oss-smoke-net"
 LIFECYCLE = "rsync-oss-smoke-lifecycle"
-_CV = json.loads((REPO / "shared/mcp-connectors/public/petstore/latest.json").read_text())[
+# The seed connector is read from the script, so swapping it cannot leave this test
+# naming a connector the smoke no longer deploys (or one the tree no longer has).
+CONNECTOR = re.search(r'^CONNECTOR="([^"]+)"$', SCRIPT.read_text(), re.M).group(1)
+_CV = json.loads((REPO / f"shared/mcp-connectors/public/{CONNECTOR}/latest.json").read_text())[
     "current_version"
 ]
-JIT = "rsync-ai-petstore-v{}-mcp".format(_CV.lstrip("v").replace(".", "-"))
-IMAGE = f"mcp-petstore:{_CV}"
+JIT = "rsync-ai-{}-v{}-mcp".format(CONNECTOR, _CV.lstrip("v").replace(".", "-"))
+IMAGE = f"mcp-{CONNECTOR}:{_CV}"
 
 # containers: "<name> <net>[,<net>...]" per line; networks / images: one name per line.
 STUB = r"""#!/usr/bin/env bash

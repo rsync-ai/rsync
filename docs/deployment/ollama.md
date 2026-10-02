@@ -79,7 +79,7 @@ The lesson generalises past that one flag: **a config flag is only real if you h
 prompts actually went.** llm-service now says so at startup:
 
 ```bash
-docker logs rsync-llm-service 2>&1 | grep "explorer llm:"
+docker logs rsync-ai-llm-service 2>&1 | grep "explorer llm:"
 ```
 
 ```
@@ -94,7 +94,7 @@ is anything else, the next line is an `ERROR` naming the provider that will rece
 metadata. Grep for both:
 
 ```bash
-docker logs rsync-llm-service 2>&1 | grep -E "explorer (llm|router llm):|rank-tables llm:|WILL leave this deployment"
+docker logs rsync-ai-llm-service 2>&1 | grep -E "explorer (llm|router llm):|rank-tables llm:|WILL leave this deployment"
 ```
 
 Three lines are expected, one per entry point:
@@ -114,7 +114,7 @@ lines both said `ollama`. Two-out-of-three is not offline. Check all three.
 The container's own view of the variable is the other half of the check:
 
 ```bash
-docker exec rsync-llm-service printenv EXPLORER_OFFLINE_ONLY
+docker exec rsync-ai-llm-service printenv EXPLORER_OFFLINE_ONLY
 ```
 
 ---
@@ -192,14 +192,14 @@ if you want the full fallback chain — the first two fallbacks cover most failu
 Run the installer and choose provider **2) Ollama**. That is the whole procedure:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | bash
 ```
 
 With no terminal to answer the prompt, name it on the `bash` side of the pipe. The installer no
 longer bundles Ollama when nothing is set — it installs without an LLM instead:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=ollama bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | LLM_PROVIDER=ollama bash
 ```
 
 There is no model to pull by hand and no API key to find. The installer layers
@@ -210,7 +210,7 @@ model is on disk. First run spends several GB and several minutes on the downloa
 so as it goes. The weights live in an `ollama_models` volume, so a restart re-uses them and the job
 finishes immediately.
 
-Earlier revisions of this page told you to run three `docker exec rsync-ollama ollama pull` commands
+Earlier revisions of this page told you to run three `docker exec rsync-ai-ollama ollama pull` commands
 after `up -d`. Those are gone, and their absence is guarded: the pull job downloads the model, and
 [test_the_internal_llm_needs_no_manual_step.py](../../llm-service/tests/test_the_internal_llm_needs_no_manual_step.py)
 fails the build if the model it downloads stops being the model the code asks for.
@@ -291,7 +291,7 @@ there for the same reason: a server with no model in it starts healthy and answe
 prompt with `model not found`.
 
 ```bash
-helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
+helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai \
   --set ollama.enabled=true \
   --set generation.llm.provider=ollama \
   --wait --timeout 30m
@@ -358,7 +358,7 @@ Explorer, or accept visible timeouts.
 Reference GPU: NVIDIA T4 (AWS `g4dn.xlarge`) or better. Confirm Ollama picked it up:
 
 ```bash
-docker exec rsync-ollama ollama run llama3 "hi" 2>&1 | head -5
+docker exec rsync-ai-ollama ollama run llama3 "hi" 2>&1 | head -5
 ```
 
 Look for `using CUDA` (or `using Metal` on Apple silicon).

@@ -405,7 +405,7 @@ describe("SavedQueryModelDialog", () => {
   it("reports what the engine said when a rebuild is rejected", async () => {
     mockFetch.mockImplementation(async (url: string) => {
       if (String(url).endsWith("/run")) {
-        // 422: rsync did its job, the SQL did not.
+        // 422: rsync.ai did its job, the SQL did not.
         return res(422, { status: "failed", error: `relation "orders" does not exist` })
       }
       return res(404, { error: "no schedule for this saved query" })

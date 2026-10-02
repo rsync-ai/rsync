@@ -391,7 +391,7 @@ func (h *ServiceFieldHook) Fire(entry *log.Entry) error {
 
 func main() {
 	log.Info("================================================================================")
-	log.Info("🚀 RSYNC AI Go Orchestrator Starting")
+	log.Info("🚀 rsync.ai Go Orchestrator Starting")
 	log.Info("================================================================================")
 	log.Infof("Version: %s", Version)
 	log.Infof("Port: %s", cfg.Server.Port)
@@ -2190,7 +2190,7 @@ func setupRouter(kafkaManager *kafka.Manager, topologyManager *kafka.TopologyMan
 		// Mounted on a gated view of the SAME base path (no path change) because
 		// the assessment routes take an arbitrary pipeline id and an optional
 		// caller-supplied source_connection_id, then decrypt that connection and
-		// dial it from inside rsync's network. Anonymous, that was a credential
+		// dial it from inside rsync.ai's network. Anonymous, that was a credential
 		// oracle against any tenant. The per-resource workspace check lives in the
 		// handler (RunAssessment); this only authenticates.
 		assessmentAPI := api.Group("", requirePrincipal(db))

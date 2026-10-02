@@ -9,7 +9,7 @@ import (
 
 // A6. Both healer Kafka clients connected with the client library's anonymous
 // default. On a customer-managed cluster that is the identity in the broker's
-// request logs, its quota buckets and its authorization denials, so an rsync
+// request logs, its quota buckets and its authorization denials, so an rsync.ai
 // connection was indistinguishable from any other tenant's.
 
 func TestHealerKafkaSecurityCarriesTheServiceClientID(t *testing.T) {

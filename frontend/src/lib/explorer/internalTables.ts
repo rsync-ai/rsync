@@ -1,4 +1,4 @@
-// Shared predicate for rsync's internal bookkeeping (`_rsync_*`, `rsync_*`) and
+// Shared predicate for rsync.ai's internal bookkeeping (`_rsync_*`, `rsync_*`) and
 // pipeline-staging (`flat_mysql_<ts>`, `flat_pg_*`, `flat_postgres_*`) tables.
 // These land in user destinations to track CDC offsets / pipeline state or hold
 // denormalized staging copies, but they are noise in the Data Explorer — they

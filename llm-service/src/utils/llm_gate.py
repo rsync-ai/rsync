@@ -44,7 +44,7 @@ __all__ = [
 LLM_NOT_CONFIGURED = "llm_not_configured"
 LLM_NOT_CONFIGURED_MESSAGE = (
     "Set up an LLM first: add OPENAI_API_KEY (or another provider's key) to .env, "
-    "or set LLM_PROVIDER=ollama for a local model, then restart rsync."
+    "or set LLM_PROVIDER=ollama for a local model, then restart rsync.ai."
 )
 
 

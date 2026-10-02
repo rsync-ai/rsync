@@ -32,7 +32,7 @@ type HitlTablesPayload = {
   selected_tables?: string[]
 } & Record<string, unknown>
 
-test.describe('RSYNC AI - HITL Table Selection', () => {
+test.describe('rsync.ai - HITL Table Selection', () => {
   test.beforeEach(async ({ page }) => {
     await ensureLoggedIn(page)
   })

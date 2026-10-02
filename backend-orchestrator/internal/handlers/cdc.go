@@ -720,7 +720,7 @@ func diffTableLists(previous, written []string) (added, removed []string) {
 	return added, removed
 }
 
-// unescapeIncludeEntry turns an include-list entry rsync wrote ("public\.users")
+// unescapeIncludeEntry turns an include-list entry rsync.ai wrote ("public\.users")
 // back into the table name it stands for.
 func unescapeIncludeEntry(e string) string {
 	return strings.TrimSpace(strings.ReplaceAll(e, `\`, ""))
@@ -1086,7 +1086,7 @@ const backfillNotSupportedMessage = "This pipeline's CDC connector has no signal
 // MongoDB over the Kafka channel is blocking only. Debezium's incremental
 // snapshot for MongoDB has no read-only mode: it writes low/high watermark
 // documents into a signal collection in the source (signal.data.collection),
-// which rsync never configures. Without one the signal fails inside the
+// which rsync.ai never configures. Without one the signal fails inside the
 // connector (Debezium 3.1.3: a NullPointerException in emitWindowOpen) while the
 // task stays RUNNING, so a request accepted here would silently load nothing;
 // configuring one would mean writing to the customer's database. A blocking snapshot

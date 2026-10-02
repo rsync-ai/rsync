@@ -11,7 +11,7 @@ import (
 // It becomes the Kafka client.id (kafkaclient.DefaultClientID -> "rsync-orchestrator")
 // for every connection this package opens. client.id was set nowhere in this platform,
 // which on a managed cluster has a specific cost: broker-side quotas and throttle
-// metrics key off it, so every connection from every rsync service was
+// metrics key off it, so every connection from every rsync.ai service was
 // indistinguishable both from each other and from any other tenant's default client.
 // When the cluster throttled us, neither side could tell which service caused it.
 const ServiceName = "orchestrator"

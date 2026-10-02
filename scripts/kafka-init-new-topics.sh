@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==============================================================================
-# Kafka Topic Initialization Script - rsync platform topics
+# Kafka Topic Initialization Script - rsync.ai platform topics
 # ==============================================================================
 # Run by the kafka-init service in docker-compose.yml. Creates the platform
 # topics a default install needs before any pipeline exists:
@@ -339,7 +339,7 @@ if [ -n "$_kafka_sec_any" ]; then
     KAFKA_CC="--command-config $KAFKA_CLIENT_CONFIG"
 fi
 
-echo "🚀 Creating rsync platform Kafka topics..."
+echo "🚀 Creating rsync.ai platform Kafka topics..."
 echo "Broker: $KAFKA_BROKER"
 echo "Security: ${KAFKA_SECURITY_PROTOCOL:-PLAINTEXT}${KAFKA_SASL_MECHANISM:+ / $KAFKA_SASL_MECHANISM}"
 echo "Partitions: $PARTITIONS"

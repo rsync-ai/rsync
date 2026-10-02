@@ -5,7 +5,7 @@ come up green and answer every prompt with an error. Two independent reasons,
 both silent:
 
 1. **Nothing pulled a model.** ``docker-compose.ollama.yml`` started an empty
-   Ollama and left ``docker exec rsync-ollama ollama pull ...`` to the operator,
+   Ollama and left ``docker exec rsync-ai-ollama ollama pull ...`` to the operator,
    in a comment. Ollama answers a request for a model it does not have with
    ``model "..." not found, try pulling it first``, so every container stays
    ``running`` and ``/ready`` keeps returning 200 while nothing works.
@@ -196,12 +196,12 @@ def _install_sh():
 def test_the_overlay_pins_no_image_the_release_ref_controls():
     """install.sh takes this file off `main` while every other compose file comes
     from the pinned tag. That is only safe while the file has no half that can
-    drift against the images RSYNC_VERSION pulls -- which means no rsync image
+    drift against the images RSYNC_VERSION pulls -- which means no rsync.ai image
     and no version interpolation anywhere in it.
     """
     text = open(OVERLAY).read()
     assert "ghcr.io/rsync-ai" not in text, (
-        "the overlay names an rsync image. install.sh fetches this file from an "
+        "the overlay names an rsync.ai image. install.sh fetches this file from an "
         "unpinned ref, so that image would float free of the pinned release."
     )
     assert "RSYNC_VERSION" not in text, (
@@ -257,7 +257,7 @@ def test_the_installer_takes_only_this_one_file_off_the_unpinned_ref():
     stray = [f for f in unpinned if f[1] != "OLLAMA_FILE"]
     assert not stray, (
         f"these files are fetched off the UNPINNED ref: {stray}. Only the Ollama "
-        "overlay is exempt, and only because it pins no rsync image."
+        "overlay is exempt, and only because it pins no rsync.ai image."
     )
     assert not [f for f in fetches if f[0] == "RAW_BASE" and f[1] == "OLLAMA_FILE"], (
         "the overlay is also fetched from the pinned base; the two copies would "

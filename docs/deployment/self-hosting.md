@@ -66,8 +66,8 @@ Get rsync-ai running locally in under 5 minutes for evaluation. This uses dev de
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/rsync-ai/rsync.git
-cd rsync
+git clone https://github.com/rsync-ai/rsync.ai.git
+cd rsync.ai
 
 # 2. Set up an LLM provider (optional — see "LLM Provider Configuration")
 cp llm-service/.env.example llm-service/.env
@@ -424,9 +424,9 @@ LLM_MODEL=google/gemini-2.5-flash
 and prints the settings it needs, instead of installing a different provider or none:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=groq GROQ_API_KEY=gsk_... bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=azure AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com AZURE_OPENAI_API_KEY=... AZURE_OPENAI_DEPLOYMENT=<deployment> bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | OPENAI_API_KEY_SOURCE=gcp-metadata OPENAI_BASE_URL=https://<LOCATION>-aiplatform.googleapis.com/v1/projects/<PROJECT>/locations/<LOCATION>/endpoints/openapi LLM_MODEL=google/gemini-2.5-flash bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | LLM_PROVIDER=groq GROQ_API_KEY=gsk_... bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | LLM_PROVIDER=azure AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com AZURE_OPENAI_API_KEY=... AZURE_OPENAI_DEPLOYMENT=<deployment> bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | OPENAI_API_KEY_SOURCE=gcp-metadata OPENAI_BASE_URL=https://<LOCATION>-aiplatform.googleapis.com/v1/projects/<PROJECT>/locations/<LOCATION>/endpoints/openapi LLM_MODEL=google/gemini-2.5-flash bash
 ```
 
 ### Option B: Ollama, bundled with the stack (no API key, no manual pull)
@@ -490,9 +490,9 @@ bundle Ollama in that case.) To choose unattended, put the setting on the `bash`
 the pipe:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | OPENAI_API_KEY=sk-... bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=ollama bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=none bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | OPENAI_API_KEY=sk-... bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | LLM_PROVIDER=ollama bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | LLM_PROVIDER=none bash
 ```
 
 What works without an LLM, and what answers `Set up an LLM first`, is listed under
@@ -1053,19 +1053,19 @@ docker compose -f docker-compose.mcp.yml build <connector>-v<x-y-z>-mcp
 docker compose -f docker-compose.mcp.yml up -d --no-deps <connector>-v<x-y-z>-mcp
 ```
 
-Example — the Shopify connector (active version v1.0.1):
+Example — the Shopify connector (active version v1.0.0):
 
 ```bash
-docker compose -f docker-compose.mcp.yml build shopify-admin-graphql-v1-0-1-mcp
-docker compose -f docker-compose.mcp.yml up -d --no-deps shopify-admin-graphql-v1-0-1-mcp
+docker compose -f docker-compose.mcp.yml build shopify-admin-graphql-v1-0-0-mcp
+docker compose -f docker-compose.mcp.yml up -d --no-deps shopify-admin-graphql-v1-0-0-mcp
 # verify the new code is in the image:
-docker exec rsync-ai-shopify-admin-graphql-v1-0-1-mcp grep -n config_keys /app/connector.py
+docker exec rsync-ai-shopify-admin-graphql-v1-0-0-mcp grep -n config_keys /app/connector.py
 ```
 
 Notes:
 - A connector code change is **not** picked up until you `build` — Docker reuses the cached image otherwise. Always `build` then `up -d`.
-- **In-place fix (no version bump):** the service name is unchanged; just rebuild the existing `vX-Y-Z` image (the active version per `latest.json`).
-- **New version bump:** step 2 regenerates the compose with the new service name (from the bumped `latest.json.current_version`); build + `up -d` that new service. See the [connector developer guide](../connectors/developer-guide.md) for when to bump vs patch in place.
+- **In-place fix (no version bump):** the service name is unchanged; just rebuild the existing `v1-0-0` image (the active version per `latest.json`). Every bug fix ships this way.
+- **New version (a major change by hand, or a tool-generator regeneration, which always writes one):** step 2 regenerates the compose with the new service name (from the bumped `latest.json.current_version`); build + `up -d` that new service. See the [connector developer guide](../connectors/developer-guide.md) for when to bump vs patch in place.
 
 ---
 
@@ -1090,7 +1090,7 @@ defaults to `false` and the stack ships no collector, so nothing is exported.
 
 ### Outage alerts, and the two outages that need an outside check
 
-rsync alerts every admin when a service it depends on stops answering. A service counts as down
+rsync.ai alerts every admin when a service it depends on stops answering. A service counts as down
 after three failed checks in a row, 30 seconds apart. The alert names the service and what stops
 while it is down. It never quotes the probe's error, because that error can carry an address or
 a credential.
@@ -1125,7 +1125,7 @@ address is set (`KAFKA_CONNECT_URL`, `KAFKA_SINK_URL`) or a CDC pipeline exists.
   gateway is up and nothing more.
 - **PostgreSQL down.** Every alert is stored in PostgreSQL, and its recipients are looked up
   there, before it is sent. The bundled PostgreSQL container has a `pg_isready` healthcheck, so a
-  host monitor can read `docker inspect --format '{{.State.Health.Status}}' rsync-postgres`
+  host monitor can read `docker inspect --format '{{.State.Health.Status}}' rsync-ai-postgres`
   (the quickstart's container name). With a managed database, use the provider's own monitoring.
 
 ---
@@ -1254,10 +1254,11 @@ docker compose -f docker-compose.mcp.yml --env-file .env.prod up -d
 > half-starts dependency containers as a side effect. Migrations run automatically in
 > step 4's `up -d` — confirm via the log check below.
 
-> **Connector versions are usually patched in place (no `latest.json` bump).** Bug
-> fixes patch `versions/<current_version>/` and keep the same version, so step 3's
-> `mcp_generate_compose.py` regenerates the same service names and a plain rebuild
-> picks up the new code. A deliberate `vX.Y.(Z+1)` bump changes the service name —
+> **Connector versions are patched in place (no `latest.json` bump).** Every connector
+> is `v1.0.0`, and a bug fix patches `versions/<current_version>/` and keeps that version,
+> so step 3's `mcp_generate_compose.py` regenerates the same service names and a plain
+> rebuild picks up the new code. A new version (a major change, or a tool-generator
+> regeneration) changes the service name —
 > step 3 still handles it (it reads `latest.json`), but the old-version container
 > keeps running until you `down` it.
 
@@ -1359,8 +1360,8 @@ Otherwise the Explorer uses `LLM_PROVIDER` from `llm-service/.env`. Check:
 2. **Ollama (air-gapped)**: If `EXPLORER_OFFLINE_ONLY=true`, verify the server is up and the
    model is actually on it. With the bundled overlay:
    ```bash
-   docker exec rsync-ollama ollama list
-   docker logs rsync-ollama-pull        # empty list ⇒ the one-shot pull job failed
+   docker exec rsync-ai-ollama ollama list
+   docker logs rsync-ai-ollama-pull        # empty list ⇒ the one-shot pull job failed
    ```
    Pointing at your own Ollama instead:
    ```bash

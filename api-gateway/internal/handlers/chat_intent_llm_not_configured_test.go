@@ -21,7 +21,7 @@ import (
 // works without an LLM. These tests also prove that phrasing really is read
 // without a model, so the hint cannot go stale.
 
-const chatGatedSentence = "Set up an LLM first: add a provider key to .env, then restart rsync."
+const chatGatedSentence = "Set up an LLM first: add a provider key to .env, then restart rsync.ai."
 
 // A message that misses every regex fast path under the no-catalog fallback
 // (TestNonCanonicalPhrasingsMissEveryRegexFastPath pins the same phrasing).

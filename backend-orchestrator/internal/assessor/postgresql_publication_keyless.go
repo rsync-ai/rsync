@@ -1,6 +1,6 @@
 // Keyless tables outside the pipeline (PostgreSQL CDC).
 //
-// rsync creates each pipeline's publication FOR ALL TABLES (cdc/postgresql.go
+// rsync.ai creates each pipeline's publication FOR ALL TABLES (cdc/postgresql.go
 // ProvisionResources), and a table in a publication that publishes UPDATE and
 // DELETE must have a replica identity. So once the pipeline starts, every
 // table in the database without a primary key — including tables the pipeline
@@ -8,7 +8,7 @@
 // table … because it does not have a replica identity and publishes updates".
 // Selected tables are safe: provisioning sets REPLICA IDENTITY FULL on them.
 //
-// rsync does not work around this (user decision 2026-09-18): the assessment
+// rsync.ai does not work around this (user decision 2026-09-18): the assessment
 // lists those tables with the ALTER TABLE to run, as a warning, and the user
 // adds the keys. The scheduled recheck of running CDC pipelines reports a new
 // keyless table the same way.
@@ -109,7 +109,7 @@ func checkPostgresKeylessTablesOutsidePipeline(ctx context.Context, db *sql.DB, 
 		name := t.schema + "." + t.name
 		out = append(out, withObject(Check{
 			Code: codePostgresUnselectedTableMissingPK, Severity: SeverityWarning, Passed: false,
-			Message: fmt.Sprintf("%s is not in this pipeline and has no primary key. rsync's publication covers every table in the database, so once this pipeline starts, UPDATE and DELETE on %s fail in your application until it has a primary key.", name, name),
+			Message: fmt.Sprintf("%s is not in this pipeline and has no primary key. rsync.ai's publication covers every table in the database, so once this pipeline starts, UPDATE and DELETE on %s fail in your application until it has a primary key.", name, name),
 			Remediation: &diagnose.Remediation{
 				Steps: []string{
 					"Add a primary key to this table (replace id with the column(s) that identify a row)",

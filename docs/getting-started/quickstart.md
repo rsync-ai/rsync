@@ -5,7 +5,7 @@
 The fastest way to run rsync.ai is the one-command installer — no source code needed.
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | bash
 ```
 
 The installer asks which LLM you want and your domain or IP. Everything else it does itself — generates every secret, pulls the images, starts the full stack. For the LLM you can bring an OpenAI key, pick the bundled Ollama, which needs no key and no manual `ollama pull` (the stack runs its own Ollama container and downloads the model before any service that would ask for one starts), or pick none and set one up later. Without an LLM, pipelines, raw SQL in the Data Explorer and the shipped connectors work; chat beyond pipeline commands, natural-language SQL, pipeline diagnosis and connector generation say `Set up an LLM first`. An OpenAI key is used when you give one, and Ollama only when you choose it — see [which LLM is used](../deployment/self-hosting.md#which-llm-is-used). Open `http://localhost:3000` when it finishes and sign up straight away: the first account created on a new install becomes its admin, and later accounts are regular users until an admin changes their role in the admin panel. The installer does not ask for an admin email, because nothing reads one.
@@ -13,7 +13,7 @@ The installer asks which LLM you want and your domain or IP. Everything else it 
 Run without a terminal (for example from a provisioning script), the installer takes the LLM from the environment on the `bash` side of the pipe — `OPENAI_API_KEY=sk-...`, `LLM_PROVIDER=ollama` or `LLM_PROVIDER=none` — and with none of them set it installs without an LLM:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | LLM_PROVIDER=ollama bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | LLM_PROVIDER=ollama bash
 ```
 
 The full stack includes the change-data-capture services, so streaming pipelines work
@@ -23,7 +23,7 @@ that will only ever run batch syncs, put an empty `RSYNC_PROFILES` on the `bash`
 of the pipe — before `curl` it would set the variable for `curl`, which never reads it:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | RSYNC_PROFILES= bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | RSYNC_PROFILES= bash
 ```
 
 The host floor drops back to 6 GB, and the installer writes the resolved set into the
@@ -44,8 +44,8 @@ For detailed self-hosting instructions (TLS, secrets management, backup, upgrade
 
 ```bash
 # 1. Clone and configure
-git clone https://github.com/rsync-ai/rsync.git
-cd rsync
+git clone https://github.com/rsync-ai/rsync.ai.git
+cd rsync.ai
 cp .env.example .env          # secrets; OPENAI_API_KEY only if you have one
 cp llm-service/.env.example llm-service/.env
 # The LLM is optional. In llm-service/.env either set a real OPENAI_API_KEY, or

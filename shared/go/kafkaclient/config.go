@@ -140,7 +140,7 @@ type Config struct {
 	// ClientID is the client.id every connection announces itself with. It is
 	// not cosmetic on a managed cluster: broker throttling, quota assignment
 	// and the request logs all key off it, so an empty one means neither side
-	// can tell which rsync service is responsible for load, and a per-client
+	// can tell which rsync.ai service is responsible for load, and a per-client
 	// quota cannot be scoped to this product at all.
 	ClientID string
 
@@ -207,7 +207,7 @@ func FromEnv(defaultBrokers string) (Config, error) {
 //
 // service names the process ("orchestrator", "api-gateway", "kafka-sink") and
 // becomes the default client.id, so the customer's broker logs and quota
-// metrics can attribute load to a specific rsync service rather than to an
+// metrics can attribute load to a specific rsync.ai service rather than to an
 // anonymous default client. KAFKA_CLIENT_ID still overrides it, for a
 // deployment that wants one identity for the whole platform.
 func FromEnvForService(service, defaultBrokers string) (Config, error) {

@@ -128,7 +128,7 @@ def test_the_produced_tree_passes_the_ci_split_gate(tmp_path):
     """The script performs edits; assert-ci-split.py is what judges the result."""
     wf = _copy_of_the_real_workflows(tmp_path)
     assert _run(SPLIT, "--workflows", str(wf)).returncode == 0
-    judged = _run(GATE, "--workflows", str(wf), "--repo", "rsync-ai/rsync")
+    judged = _run(GATE, "--workflows", str(wf), "--repo", "rsync-ai/rsync.ai")
     assert judged.returncode == 0, judged.stdout + judged.stderr
 
 

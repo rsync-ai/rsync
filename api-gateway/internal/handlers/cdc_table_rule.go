@@ -33,7 +33,7 @@ const tableSelectionRuleKey = "table_selection_rule"
 // autoPickupSkippedKey records tables the watcher found but could NOT add,
 // with the reason. Today the only reason is a missing PRIMARY KEY on a pipeline
 // whose destination needs one for upsert/delete: the user must add the key (the
-// product decision is that rsync never invents one), so the fact has to survive
+// product decision is that rsync.ai never invents one), so the fact has to survive
 // the sweep that discovered it instead of living in a log line.
 const autoPickupSkippedKey = "auto_pickup_skipped_tables"
 

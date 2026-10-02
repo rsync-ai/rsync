@@ -3,7 +3,7 @@
 The defect: `values-gke.yaml`, `values-eks.yaml` and `values-aks.yaml` each open
 by telling the reader to run
 
-    helm install rsync ./rsync-ai -f rsync-ai/values-gke.yaml -f my-values.yaml
+    helm install rsync-ai ./rsync-ai -f rsync-ai/values-gke.yaml -f my-values.yaml
 
 and then said nothing at all about what goes in that second file. Six keys live
 there and in no file the chart ships, and they fail in two different ways:

@@ -1,5 +1,5 @@
 """
-rsync connector-lifecycle service — OSS / community edition entrypoint.
+rsync.ai connector-lifecycle service — OSS / community edition entrypoint.
 
 This is the moat-free counterpart to the private `tool-generator` service. It serves
 the connector-lifecycle surface the self-hosted data plane needs, plus deterministic
@@ -52,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("connector-lifecycle")
 
-app = FastAPI(title="rsync connector-lifecycle", description="Community-edition connector lifecycle service")
+app = FastAPI(title="rsync.ai connector-lifecycle", description="Community-edition connector lifecycle service")
 
 # POST /v1/deploy — what the data plane calls for self-heal / JIT builds.
 app.include_router(lifecycle_router, prefix="/v1", tags=["Connector Lifecycle"])

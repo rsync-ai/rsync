@@ -52,6 +52,7 @@ def _internal_minio_hosts() -> set:
     hosts = {
         "minio",
         "rsync-ai-minio",
+        "rsync-minio",  # the quickstart's container name before v0.1.8
         "blob-staging",
         "rsync-blob-staging",
         "rsync-ai-blob-staging",

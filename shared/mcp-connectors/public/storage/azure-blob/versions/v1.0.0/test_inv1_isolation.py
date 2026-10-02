@@ -64,6 +64,7 @@ def test_internal_minio_endpoint_is_denied():
         "minio:9000",
         "https://minio",
         "rsync-ai-minio",
+        "rsync-minio",
         # The blob lane's staging store (#1250 KI): a connector-network MinIO.
         "http://blob-staging:9000",
         "rsync-blob-staging",

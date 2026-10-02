@@ -1,7 +1,7 @@
 import { defineConfig, devices } from '@playwright/test'
 
 /**
- * Playwright E2E Test Configuration for RSYNC-AI Frontend
+ * Playwright E2E Test Configuration for rsync.ai Frontend
  * 
  * Prerequisites:
  *   - Start backend services: docker-compose up -d

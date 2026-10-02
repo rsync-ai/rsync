@@ -46,7 +46,7 @@ describe("PlanBanner — Upgrade to Pro", () => {
     fireEvent.click(screen.getByRole("button", { name: /upgrade to pro/i }))
 
     // Clicking surfaces the in-app dialog with a clear contact-the-team path.
-    expect(await screen.findByText(/contact the rsync team/i)).toBeInTheDocument()
+    expect(await screen.findByText(/contact the rsync.ai team/i)).toBeInTheDocument()
     expect(screen.getByText("sales@rsync.ai")).toBeInTheDocument()
   })
 

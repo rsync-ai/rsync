@@ -11,21 +11,21 @@ blank_issues_enabled: false
 
 contact_links:
   - name: Documentation
-    url: https://github.com/rsync-ai/rsync/blob/main/docs/README.md
+    url: https://github.com/rsync-ai/rsync.ai/blob/main/docs/README.md
     about: Install, configuration, deployment, the connector reference and the API reference. Most questions are answered here.
 
   - name: Getting help
-    url: https://github.com/rsync-ai/rsync/blob/main/SUPPORT.md
+    url: https://github.com/rsync-ai/rsync.ai/blob/main/SUPPORT.md
     about: Where to take each kind of question, and what makes a bug report actionable.
 
   - name: Report a security vulnerability
-    url: https://github.com/rsync-ai/rsync/blob/main/SECURITY.md
+    url: https://github.com/rsync-ai/rsync.ai/blob/main/SECURITY.md
     about: Do NOT open a public issue. Report privately so a fix can ship before the details are public.
 
   - name: Contributing and development setup
-    url: https://github.com/rsync-ai/rsync/blob/main/CONTRIBUTING.md
+    url: https://github.com/rsync-ai/rsync.ai/blob/main/CONTRIBUTING.md
     about: Local dev environment, running the test suites, the CLA and DCO sign-off, and the pull request process.
 
   - name: Questions and ideas
-    url: https://github.com/rsync-ai/rsync/discussions
+    url: https://github.com/rsync-ai/rsync.ai/discussions
     about: Ask a question or float an idea before it becomes an issue.

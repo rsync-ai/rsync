@@ -195,7 +195,7 @@ def test_the_detectors_fire_on_a_known_bad_document():
             'CREATE EXTENSION IF NOT EXISTS "uuid-ossp";',
             "```",
             "```bash",
-            "docker exec rsync-ollama ollama pull qwen2.5:7b",
+            "docker exec rsync-ai-ollama ollama pull qwen2.5:7b",
             "```",
         ]
     )

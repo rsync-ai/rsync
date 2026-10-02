@@ -24,7 +24,7 @@ import (
 // ============================================================================
 // A MODEL is a saved query plus a destination table (migration 085). Running one
 // materializes the query into that table on its own connection — the in-warehouse
-// "T" of ELT. The rows never transit rsync; the engine does the work server-side.
+// "T" of ELT. The rows never transit rsync.ai; the engine does the work server-side.
 //
 // This file is deliberately gin-free. Both callers reach the same function:
 //
@@ -79,9 +79,9 @@ const (
 // them:
 //
 //   - matTable wraps a SELECT in CREATE TABLE … AS and swaps the result into
-//     target_table. The query says what to compute; rsync says where it lands.
+//     target_table. The query says what to compute; rsync.ai says where it lands.
 //   - matStatement runs the SQL exactly as written. A MERGE / UPDATE / INSERT … SELECT
-//     already names its own destination, so there is nothing for rsync to decide and no
+//     already names its own destination, so there is nothing for rsync.ai to decide and no
 //     target_table to ask for — which is what made the old modal unanswerable for the
 //     statement people schedule most.
 const (
@@ -266,7 +266,7 @@ func modelSwapSQL(dialect, schemaName, tableName string, retireExisting bool) []
 // The shape is build-then-swap, and the reason is the whole point of the feature. The
 // obvious implementation — DROP the target, then CREATE it from the query — destroys
 // the existing table before it knows whether the new one can be built. That is exactly
-// backwards for rsync: the failure this product exists to catch is an upstream schema
+// backwards for rsync.ai: the failure this product exists to catch is an upstream schema
 // change breaking a model's SQL, and under drop-then-create that failure would convert
 // a broken query into permanent data loss. Here the long, failure-prone CREATE happens
 // under a scratch name while the live table is untouched; if it fails, the run reports
@@ -275,16 +275,16 @@ func modelSwapSQL(dialect, schemaName, tableName string, retireExisting bool) []
 // The swap also carries the collision guarantee. A rename onto the target name is NOT
 // an "if exists" operation on any of these engines — it fails outright when the name is
 // taken. So on a model's first run, when nothing has proven ownership yet, the engine
-// itself refuses to let rsync take over a table it did not create; rsync never has to
+// itself refuses to let rsync.ai take over a table it did not create; rsync.ai never has to
 // ask a catalog who owns what. Only once a run has completed this swap does
 // target_owned flip true, and only then may the plan include the step that retires the
 // previous table.
 //
 // retireExisting is that step's switch, and it is deliberately narrower than
-// target_owned. Ownership says rsync is ALLOWED to replace what stands at the target
+// target_owned. Ownership says rsync.ai is ALLOWED to replace what stands at the target
 // name; this says there is in fact something standing there to move aside. They agree
 // on every ordinary run and come apart in one case: the table gets dropped outside
-// rsync. Keying the step off ownership alone wedged those models permanently — every
+// rsync.ai. Keying the step off ownership alone wedged those models permanently — every
 // subsequent run tried to rename a table that was no longer there and failed
 // identically, with no way out but a manual UPDATE to the flag. Asking the catalog
 // instead (see modelTargetExists) degrades that case to the first-run plan, which
@@ -324,7 +324,7 @@ func buildMaterializationPlan(dialect, schemaName, tableName, innerSQL string, r
 // has a connection open on the warehouse.
 //
 // Two separate questions decide whether a run moves the table at the target name aside,
-// and both have to be yes: may we, which is rsync's own record of ownership and is
+// and both have to be yes: may we, which is rsync.ai's own record of ownership and is
 // already settled by the time we get here, and is there anything there, which only the
 // warehouse can answer. The second is the one that can have changed behind our back.
 func modelPlanBuilder(dialect, schemaName, tableName, innerSQL string, owned bool) func(context.Context, modelQueryer) ([]string, error) {
@@ -412,7 +412,7 @@ func resolveWorkspaceRoleForUser(ctx context.Context, database *sql.DB, workspac
 // DROP TABLE, and ClassDDL maps to WSAdmin in validators.classToMinRole — this is the
 // existing policy table applied to what the run actually executes.
 //
-// Statement mode issues no DDL of rsync's own, so its statement's class minimum would
+// Statement mode issues no DDL of rsync.ai's own, so its statement's class minimum would
 // be defensible on its own. The floor stays anyway, because the thing being authorized
 // is not really the statement — it is an unattended, repeating execution of it against
 // production with no human at the keyboard, and that is an administrative act whatever
@@ -531,14 +531,14 @@ type modelQueryer interface {
 // This is NOT an ownership check — saved_queries.target_owned is the record of whether
 // this model may replace what it finds, and that question is settled before we get
 // here. This answers the narrower one the plan actually needs: is there something to
-// retire? The two come apart when a table is dropped outside rsync, which is the case
+// retire? The two come apart when a table is dropped outside rsync.ai, which is the case
 // that used to wedge a model permanently (see buildMaterializationPlan).
 //
 // Deliberately limited to BASE TABLE. A view standing at the target name is not
-// something a previous run of this model left behind — rsync only ever creates tables —
+// something a previous run of this model left behind — rsync.ai only ever creates tables —
 // and Postgres would happily let ALTER TABLE ... RENAME move a user's view aside.
 // Reporting "nothing to retire" sends that case into the rename that collides and
-// refuses, which is the right answer for an object rsync did not create.
+// refuses, which is the right answer for an object rsync.ai did not create.
 func modelTargetExists(ctx context.Context, q modelQueryer, dialect, schemaName, tableName string) (bool, error) {
 	// An empty schema means "wherever this connection resolves unqualified names",
 	// which is exactly where the plan's own unqualified DDL will land — so the check has
@@ -698,8 +698,8 @@ const modelRunLockNamespace = 0x72534D44 // "rSMD" — rsync saved-query model
 // owned path both also target `<t>__rsync_old`, which is where the live data sits for
 // the instant between the renames.
 //
-// The lock is taken on the rsync application database, not the customer's warehouse:
-// it guards rsync's own plan, it must work on engines with no advisory-lock primitive,
+// The lock is taken on the rsync.ai application database, not the customer's warehouse:
+// it guards rsync.ai's own plan, it must work on engines with no advisory-lock primitive,
 // and it must not need any extra privilege on the target.
 //
 // A held lock is refused rather than queued. The caller wanted a rebuild of this model
@@ -900,9 +900,9 @@ func runSavedQueryModel(ctx context.Context, database *sql.DB, modelID, actorUse
 		}, nil
 	}
 
-	// A statement model has no target of rsync's own, so there is nothing here to
+	// A statement model has no target of rsync.ai's own, so there is nothing here to
 	// validate — the destination is inside the SQL, where it is the engine's business
-	// and not an identifier rsync interpolates. Skipping the check is not a relaxation:
+	// and not an identifier rsync.ai interpolates. Skipping the check is not a relaxation:
 	// validateModelTarget guards the one injection surface a rebuild has (a table name
 	// cannot be bound as a parameter), and a statement model never builds that string.
 	var schemaName, tableName string

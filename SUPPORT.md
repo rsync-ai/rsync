@@ -17,7 +17,7 @@ complete than a thread.
 
 ## Reporting a bug
 
-[Open an issue](https://github.com/rsync-ai/rsync/issues) using the bug template. What
+[Open an issue](https://github.com/rsync-ai/rsync.ai/issues) using the bug template. What
 makes a report actionable, roughly in order of usefulness:
 
 - **How you installed it** — the `install.sh` one-liner, `docker compose`, or Helm — and

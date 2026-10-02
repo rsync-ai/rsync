@@ -1,7 +1,7 @@
 """_get_staging_client must support workload identity and honor the endpoint.
 
 Two defects lived in the same 39 lines, and both broke the same story: install
-rsync on a managed Kubernetes cluster against managed object storage.
+rsync.ai on a managed Kubernetes cluster against managed object storage.
 
 1. Absent credentials were treated as a misconfiguration. On EKS/GKE/AKS the
    chart emits no MINIO_ACCESS_KEY_ID / MINIO_SECRET_ACCESS_KEY at all --

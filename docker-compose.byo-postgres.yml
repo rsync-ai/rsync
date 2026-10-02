@@ -120,7 +120,7 @@ services:
   # there is no shared script on the host to call.
   db-init:
     image: postgres:16-alpine
-    container_name: rsync-db-init
+    container_name: rsync-ai-db-init
     logging:
       driver: json-file
       options:

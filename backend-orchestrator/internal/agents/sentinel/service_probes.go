@@ -26,7 +26,7 @@ const serviceFailureThreshold = 3
 // goroutine, so a hung dependency must not delay the others past the next tick.
 const serviceProbeTimeout = 5 * time.Second
 
-// serviceProbe checks one core rsync service this process depends on but does not
+// serviceProbe checks one core rsync.ai service this process depends on but does not
 // own: the services whose outage stops pipelines without any pipeline-scoped sentinel
 // noticing, because every pipeline just goes quiet at once.
 //

@@ -11,7 +11,7 @@ successor (MongoDB SQL Interface) requires Atlas or Enterprise Advanced, is JDBC
 and needs a separately maintained SQL schema. Neither can ship in the OSS images or serve
 Community-edition users. Document browse mode needs only `pymongo`, which the connector
 already uses, and works on every MongoDB edition. SQL analytics over Mongo data remain
-available the rsync way: sync the collection into a warehouse and query it there.
+available the rsync.ai way: sync the collection into a warehouse and query it there.
 
 ## 2. Goal and non-goals
 

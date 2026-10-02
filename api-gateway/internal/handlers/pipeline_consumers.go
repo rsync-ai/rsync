@@ -73,7 +73,7 @@ type PipelineConsumer struct {
 // SCOPE
 //
 // The rows are the pipeline's kafka-mcp-sink groups — the consumers that actually
-// move rows to the destination. rsync's internal bookkeeping consumers
+// move rows to the destination. rsync.ai's internal bookkeeping consumers
 // (cdc-table-stats-*, cdc-schema-changes-*) are not written by the census: their
 // lag is real but a user cannot act on it. The `role` column exists so they can be
 // added later behind a toggle without a migration or an API change.

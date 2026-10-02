@@ -164,7 +164,7 @@ func (c *Client) SendVerification(ctx context.Context, toEmail, userName, verify
       <table width="520" cellpadding="0" cellspacing="0"
              style="background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
         <tr><td style="background:#0f172a;padding:28px 40px">
-          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">-ai</span></span>
+          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">.ai</span></span>
         </td></tr>
         <tr><td style="padding:40px">
           <h1 style="margin:0 0 16px;font-size:22px;color:#0f172a">Verify your email address</h1>
@@ -222,7 +222,7 @@ func (c *Client) SendWelcome(ctx context.Context, toEmail, userName, appURL stri
       <table width="520" cellpadding="0" cellspacing="0"
              style="background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
         <tr><td style="background:#0f172a;padding:28px 40px">
-          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">-ai</span></span>
+          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">.ai</span></span>
         </td></tr>
         <tr><td style="padding:40px">
           <h1 style="margin:0 0 16px;font-size:22px;color:#0f172a">Welcome to rsync-ai 🎉</h1>
@@ -282,7 +282,7 @@ func (c *Client) SendNewSignupAdminAlert(ctx context.Context, adminEmails []stri
       <table width="520" cellpadding="0" cellspacing="0"
              style="background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
         <tr><td style="background:#0f172a;padding:28px 40px">
-          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">-ai</span></span>
+          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">.ai</span></span>
         </td></tr>
         <tr><td style="padding:40px">
           <h1 style="margin:0 0 16px;font-size:20px;color:#0f172a">New user signup</h1>
@@ -344,7 +344,7 @@ func (c *Client) SendWorkspaceInvite(ctx context.Context, toEmail, workspaceName
       <table width="520" cellpadding="0" cellspacing="0"
              style="background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
         <tr><td style="background:#0f172a;padding:28px 40px">
-          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">-ai</span></span>
+          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">.ai</span></span>
         </td></tr>
         <tr><td style="padding:40px">
           <h1 style="margin:0 0 16px;font-size:22px;color:#0f172a">You've been invited to join %s</h1>
@@ -409,7 +409,7 @@ func (c *Client) SendUpgradeRequest(ctx context.Context, salesEmail, userEmail, 
       <table width="520" cellpadding="0" cellspacing="0"
              style="background:#ffffff;border-radius:8px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.08)">
         <tr><td style="background:#0f172a;padding:28px 40px">
-          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">-ai</span></span>
+          <span style="color:#ffffff;font-size:22px;font-weight:700;letter-spacing:-0.5px">rsync<span style="color:#6366f1">.ai</span></span>
         </td></tr>
         <tr><td style="padding:40px">
           <h1 style="margin:0 0 16px;font-size:20px;color:#0f172a">Pro upgrade request</h1>

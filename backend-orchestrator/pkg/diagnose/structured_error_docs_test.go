@@ -20,7 +20,7 @@ import (
 // in pipeline_run_events.payload and the pipeline status API.
 //
 // So the failure this guards is a user hitting a real error, clicking the link
-// rsync handed them, and reading whatever section happens to be at the top --
+// rsync.ai handed them, and reading whatever section happens to be at the top --
 // most likely believing it describes their problem.
 //
 // Both directions are asserted, because they fail differently:

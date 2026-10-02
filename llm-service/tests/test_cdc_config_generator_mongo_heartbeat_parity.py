@@ -10,7 +10,7 @@ There are two places that name a MongoDB heartbeat interval, and there has to be
 Because the generator is advisory, a divergence is wrong advice rather than an
 outage -- which is exactly why nothing else would catch it. An operator who
 copies the advised config and gets a different heartbeat cadence than the
-platform actually uses has been handed a number that no longer describes rsync.
+platform actually uses has been handed a number that no longer describes rsync.ai.
 
 Heartbeats are not cosmetic here. Debezium only commits a FRESH resume token when
 it emits an event from a captured collection, so an idle MongoDB source keeps

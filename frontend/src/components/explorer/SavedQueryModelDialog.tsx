@@ -40,7 +40,7 @@ const MANAGE_ROLE_HINT =
 
 // A model is a saved query plus a decision about what running it DOES, plus
 // (optionally) a schedule — the in-warehouse "T" of ELT. The rows never leave the
-// warehouse; rsync only sends the statement, so this dialog is about what the result
+// warehouse; rsync.ai only sends the statement, so this dialog is about what the result
 // does and how often, never about moving data.
 //
 // Two ordering rules are enforced by the backend and mirrored here so the UI never
@@ -947,7 +947,7 @@ export function SavedQueryModelDialog({
           )}
 
           {/* Said once at the top for the same reason the role notice is: the alternative
-              is a user reading three greyed-out radio buttons and concluding rsync is
+              is a user reading three greyed-out radio buttons and concluding rsync.ai is
               broken. Shown regardless of role — a viewer looking at a BigQuery query
               should not be told the only obstacle is their role. */}
           {engineBlocked && (

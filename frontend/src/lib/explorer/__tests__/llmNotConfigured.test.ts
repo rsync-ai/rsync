@@ -10,7 +10,7 @@ import { LLM_NOT_CONFIGURED, llmNotConfiguredError } from "@/lib/explorer/llmNot
 // Explorer used to show that as "AI service unavailable" with the code itself as
 // the message and a hint to check an Ollama nobody was meant to run.
 
-const MESSAGE = "Set up an LLM first: add OPENAI_API_KEY to .env, then restart rsync."
+const MESSAGE = "Set up an LLM first: add OPENAI_API_KEY to .env, then restart rsync.ai."
 
 describe("llmNotConfiguredError", () => {
   it("reads the gateway's flat body", () => {

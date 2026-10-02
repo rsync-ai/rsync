@@ -321,9 +321,9 @@ deterministic from the first offset, and the connector still keeps only objects 
 - [ ] `get_cdc_offsets` returns `{ "success": true, "offsets": [] }` (never an error) on
       first run.
 - [ ] If this is a connector-version-bumpable change, follow the MCP versioning rule in the
-      [connector developer guide](developer-guide.md): patch the active version in place —
-      there are no root copies — and cut a new `vX.Y.(Z+1)` only for a deliberate
-      behavior change you want separately pinnable.
+      [connector developer guide](developer-guide.md): patch the active `v1.0.0` in place —
+      there are no root copies — and cut a new version by hand only for a change the
+      maintainers decide is major.
 
 ---
 

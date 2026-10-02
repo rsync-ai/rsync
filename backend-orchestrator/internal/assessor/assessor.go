@@ -136,7 +136,7 @@ type Input struct {
 	// specific pipeline. Used for log lines / metadata, and to recognise the
 	// pipeline's own replication slot / publication on the source (their
 	// names start with cdc.PipelineResourcePrefix). Assessors must not read
-	// pipeline state from rsync's own database.
+	// pipeline state from rsync.ai's own database.
 	PipelineID string
 
 	// SyncMode — the pipeline's intended replication mode: "cdc", "batch",

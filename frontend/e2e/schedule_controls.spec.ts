@@ -11,7 +11,7 @@ const API_HEADERS = { 'X-User-ID': DEV_USER_ID }
 
 async function ensureLoggedIn(page: Page) {
   await page.goto('/dashboard')
-  const onLogin = await page.locator('text=Welcome to Rsync').isVisible().catch(() => false)
+  const onLogin = await page.locator('text=Welcome to rsync.ai').isVisible().catch(() => false)
   if (onLogin) {
     const useBtn = page.locator('button:has-text("Use")')
     if (await useBtn.isVisible().catch(() => false)) await useBtn.click()
@@ -63,7 +63,7 @@ async function waitForSchedule(page: Page, pipelineId: string, timeoutMs = 30000
   }
 }
 
-test.describe('RSYNC AI - Scheduler UI', () => {
+test.describe('rsync.ai - Scheduler UI', () => {
   test.beforeEach(async ({ page }) => {
     await ensureLoggedIn(page)
   })

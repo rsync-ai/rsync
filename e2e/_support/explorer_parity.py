@@ -152,7 +152,7 @@ def assert_explorer_matches_db(
         api_gateway_url: base URL of api-gateway, e.g. ``http://localhost:5001``
         auth_token: value of the ``auth_token`` cookie for an authenticated
             session.
-        connection_id: the rsync ``connections.id`` for the destination.
+        connection_id: the rsync.ai ``connections.id`` for the destination.
         db: docker-exec coordinates for the same destination.
         table: unqualified table name.
         schema: schema name (Postgres) or unused (MySQL — implied by db).

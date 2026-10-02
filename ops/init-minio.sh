@@ -1,5 +1,5 @@
 #!/bin/bash
-# Initialize MinIO buckets for RSYNC AI data pipeline
+# Initialize MinIO buckets for rsync.ai data pipeline
 # This script runs on startup to ensure all required buckets exist
 
 set -e

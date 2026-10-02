@@ -756,7 +756,7 @@ type MCPConnector struct {
 	SupportsSource      bool                `json:"supports_source"`
 	SupportsDestination bool                `json:"supports_destination"`
 	SupportsCDC         bool                `json:"supports_cdc"`
-	// SupportedVersions advertises which DB engine versions rsync supports,
+	// SupportedVersions advertises which DB engine versions rsync.ai supports,
 	// keyed by sync mode (e.g. {"batch": "...", "cdc": "..."}). Sourced from
 	// metadata.json `supported_versions`; surfaced read-only in the config modal.
 	SupportedVersions map[string]interface{} `json:"supported_versions,omitempty"`

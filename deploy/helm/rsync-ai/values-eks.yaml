@@ -1,6 +1,6 @@
 # EKS overlay — layer on top of values.yaml, do not use alone:
 #
-#   helm install rsync ./rsync-ai -f rsync-ai/values-eks.yaml -f my-values.yaml
+#   helm install rsync-ai ./rsync-ai -f rsync-ai/values-eks.yaml -f my-values.yaml
 #
 # This file sets only what is genuinely AWS-shaped: storage class, ingress
 # class + annotations, IRSA, and the BYO toggles you should flip on a real

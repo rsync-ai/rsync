@@ -17,7 +17,7 @@ const TABLES: SchemaTableLike[] = [
 // Athena-style layout: a Database *dropdown* selects one namespace at a time,
 // its tables are listed directly under a "Tables (N)" header, and a table
 // expands to reveal its columns. Selection checkboxes + click-to-insert are
-// preserved (rsync uses them for pipeline / NL→SQL table picking).
+// preserved (rsync.ai uses them for pipeline / NL→SQL table picking).
 describe("SchemaBrowser (Athena layout)", () => {
   it("renders a Database selector listing every database (alphabetised)", () => {
     render(<SchemaBrowser tables={TABLES} />)

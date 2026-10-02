@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Create all required Kafka topics for RSYNC AI
+# Create all required Kafka topics for rsync.ai
 #
 # Usage: ./scripts/create_kafka_topics.sh
 #
@@ -13,7 +13,7 @@ set -e
 FAILED_TOPICS=0
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║         Creating Kafka Topics for RSYNC AI                   ║"
+echo "║         Creating Kafka Topics for rsync.ai                   ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 

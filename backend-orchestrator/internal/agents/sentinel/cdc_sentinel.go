@@ -762,7 +762,7 @@ const maxIssueErrorText = 1000
 //
 // The Healer's issue sweep (heal/issue_sweep.go) builds its diagnose.Signal from the
 // issue's DESCRIPTION column and never reads metadata, so an error that lives only in
-// metadata is an error the diagnoser cannot see. rsync already knows how to classify a
+// metadata is an error the diagnoser cannot see. rsync.ai already knows how to classify a
 // MongoDB resume-token loss (diagnose.go → ActionReSnapshot) and how to explain it
 // (structured_error.go → MONGODB_RESUME_TOKEN_INVALID); it never got the chance,
 // because the description said only that a connector had failed.

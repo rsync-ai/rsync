@@ -54,8 +54,8 @@ describe("UpgradeModal", () => {
     // Address shown as selectable text.
     expect(screen.getByText("sales@rsync.ai")).toBeInTheDocument()
     // Primary CTA is an in-app button, not a mailto link (no external-app redirect).
-    expect(screen.getByRole("button", { name: /contact the rsync team/i })).toBeInTheDocument()
-    expect(screen.queryByRole("link", { name: /contact the rsync team/i })).toBeNull()
+    expect(screen.getByRole("button", { name: /contact the rsync.ai team/i })).toBeInTheDocument()
+    expect(screen.queryByRole("link", { name: /contact the rsync.ai team/i })).toBeNull()
     // Proactive dismiss label.
     expect(screen.getByRole("button", { name: /maybe later/i })).toBeInTheDocument()
   })
@@ -66,7 +66,7 @@ describe("UpgradeModal", () => {
       json: async () => ({ status: "sent" }),
     } as Response)
     render(<UpgradeModal open onClose={() => {}} />)
-    fireEvent.click(screen.getByRole("button", { name: /contact the rsync team/i }))
+    fireEvent.click(screen.getByRole("button", { name: /contact the rsync.ai team/i }))
     expect(mockAuthFetch).toHaveBeenCalledWith("/api/v1/plan/upgrade-request", { method: "POST" })
     // Button flips to the sent confirmation; no clipboard / mailto involved.
     expect(await screen.findByRole("button", { name: /request sent/i })).toBeInTheDocument()
@@ -80,7 +80,7 @@ describe("UpgradeModal", () => {
     const writeText = vi.fn().mockResolvedValue(undefined)
     Object.assign(navigator, { clipboard: { writeText } })
     render(<UpgradeModal open onClose={() => {}} />)
-    fireEvent.click(screen.getByRole("button", { name: /contact the rsync team/i }))
+    fireEvent.click(screen.getByRole("button", { name: /contact the rsync.ai team/i }))
     expect(
       await screen.findByRole("button", { name: /copied sales@rsync\.ai/i }),
     ).toBeInTheDocument()
@@ -98,7 +98,7 @@ describe("UpgradeModal", () => {
     const writeText = vi.fn().mockResolvedValue(undefined)
     Object.assign(navigator, { clipboard: { writeText } })
     render(<UpgradeModal open onClose={() => {}} />)
-    fireEvent.click(screen.getByRole("button", { name: /contact the rsync team/i }))
+    fireEvent.click(screen.getByRole("button", { name: /contact the rsync.ai team/i }))
 
     expect(
       await screen.findByRole("button", { name: /copied billing@acme\.example/i }),

@@ -2,7 +2,7 @@ import { describe, it, expect } from "vitest"
 import { isInternalExplorerTable } from "../internalTables"
 
 describe("isInternalExplorerTable", () => {
-  it("flags rsync internal bookkeeping tables (bare names)", () => {
+  it("flags rsync.ai internal bookkeeping tables (bare names)", () => {
     expect(isInternalExplorerTable("_rsync_cdc_offsets")).toBe(true)
     expect(isInternalExplorerTable("_rsync_pipelines")).toBe(true)
     expect(isInternalExplorerTable("_RSYNC_meta")).toBe(true) // case-insensitive

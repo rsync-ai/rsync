@@ -260,12 +260,12 @@ func checkPostgresPublicationPrivilege(ctx context.Context, db *sql.DB, pipeline
 	if super || platformAdmin {
 		return Check{
 			Code: code, Severity: SeverityInfo, Passed: true,
-			Message: fmt.Sprintf("User %q can create the publication rsync needs", user),
+			Message: fmt.Sprintf("User %q can create the publication rsync.ai needs", user),
 		}, true
 	}
 	return Check{
 		Code: code, Severity: SeverityInfo, Passed: false,
-		Message: fmt.Sprintf("User %q is not a superuser or a platform admin role member. rsync creates this pipeline's publication with CREATE PUBLICATION … FOR ALL TABLES, which may be refused. If the pipeline fails to start, grant the role below.", user),
+		Message: fmt.Sprintf("User %q is not a superuser or a platform admin role member. rsync.ai creates this pipeline's publication with CREATE PUBLICATION … FOR ALL TABLES, which may be refused. If the pipeline fails to start, grant the role below.", user),
 		Remediation: &diagnose.Remediation{
 			Steps: []string{
 				"Grant the connection user your platform's admin role (Cloud SQL: cloudsqlsuperuser, RDS: rds_superuser, Azure: azure_pg_admin), or make it a superuser on self-managed PostgreSQL",

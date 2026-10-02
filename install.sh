@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── rsync.ai — One-command installer ────────────────────────────────────────
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | bash
 #
 # Every RSYNC_* setting below goes on the `bash` side of the pipe:
 #   curl -sSL .../install.sh | RSYNC_PROFILES= bash
@@ -18,7 +18,7 @@ set -euo pipefail
 # The repository the installer pulls its compose files from. Overridable so a
 # fork, a mirror or a pre-release branch can be installed without editing this
 # script -- and so the slug lives in exactly one place when it changes.
-RSYNC_REPO="${RSYNC_REPO:-rsync-ai/rsync}"
+RSYNC_REPO="${RSYNC_REPO:-rsync-ai/rsync.ai}"
 # Defaults to the newest release tag, not `main`. `main` is a moving target on the
 # compose half and a "last publish" pointer on the image half, so the two halves
 # advance at different rates and a curl-pipe install is not reproducible. A tag
@@ -78,7 +78,7 @@ BYO_KAFKA_FILE="docker-compose.byo-kafka.yml"
 OLLAMA_FILE="docker-compose.ollama.yml"
 # The one file this script does not take from RSYNC_REF, and the reason is
 # specific rather than convenient. At v0.1.2 this overlay is a stub that starts
-# an empty Ollama and leaves `docker exec rsync-ollama ollama pull` to the
+# an empty Ollama and leaves `docker exec rsync-ai-ollama ollama pull` to the
 # operator -- the manual step the bundle exists to remove -- so taking it from
 # the pinned ref would ship the very defect the pin is meant to protect against.
 # The other way to fix that is to make v0.1.2 mean two different things.
@@ -423,7 +423,7 @@ prompt_llm_menu() {
     echo "    in ${INSTALL_DIR}/${ENV_FILE} set LLM_PROVIDER=openai and OPENAI_API_KEY=sk-..."
     echo "    (or LLM_PROVIDER=ollama for a local model), then re-run this installer."
     if (( ! TTY_OK )) && [[ "${LLM_PROVIDER_EXPLICIT:-0}" != "1" ]]; then
-      warn "No terminal and no OPENAI_API_KEY, so rsync was installed without an LLM."
+      warn "No terminal and no OPENAI_API_KEY, so rsync.ai was installed without an LLM."
       echo "  To install with one: OPENAI_API_KEY=sk-... bash, or LLM_PROVIDER=ollama bash"
     fi
   elif [[ "${_llm_choice:-1}" == "2" ]]; then
@@ -1601,7 +1601,7 @@ start_stack() {
   # reads healthy. Say that before the terminal goes quiet for several minutes.
   if (( OLLAMA_BUNDLED )); then
     warn "First start downloads the LLM into a docker volume — several GB, once."
-    echo "  This blocks until it finishes. Watch it: docker logs -f rsync-ollama-pull"
+    echo "  This blocks until it finishes. Watch it: docker logs -f rsync-ai-ollama-pull"
   fi
   docker compose \
     "${COMPOSE_ARGS[@]}" \

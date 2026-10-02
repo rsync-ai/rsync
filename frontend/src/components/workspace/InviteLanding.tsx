@@ -176,7 +176,7 @@ export default function InviteLanding({ token }: { token: string }) {
       <CardHeader className="space-y-2 text-center">
         <CardTitle className="text-2xl font-bold">You&apos;re invited</CardTitle>
         <CardDescription>
-          Join <span className="font-semibold text-foreground">{preview.workspace_name}</span> on Rsync
+          Join <span className="font-semibold text-foreground">{preview.workspace_name}</span> on rsync.ai
         </CardDescription>
         <div className="flex justify-center pt-1">
           <Badge variant="secondary" className="text-sm">

@@ -1,12 +1,12 @@
 #!/bin/bash
-# Rsync AI - Test Runner Script
+# rsync.ai - Test Runner Script
 # Combines: test_system_integration.sh, run_ui_tests.sh
 
 set -e
 
 TEST_TYPE="${1:-all}"
 
-echo "🧪 Rsync AI Test Runner"
+echo "🧪 rsync.ai Test Runner"
 echo "========================"
 
 # Check if services are running

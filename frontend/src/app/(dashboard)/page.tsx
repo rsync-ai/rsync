@@ -442,7 +442,7 @@ export default async function HomePage() {
       {/* Welcome Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-white">Welcome to Rsync</h1>
+          <h1 className="text-3xl font-bold tracking-tight text-zinc-900 dark:text-white">Welcome to rsync.ai</h1>
           <p className="text-zinc-500 dark:text-zinc-400 mt-1">
             Build and manage your data pipelines with AI assistance
           </p>

@@ -20,7 +20,7 @@ import (
 
 const validateTestName = "acme-orders-api"
 
-const validateGatedSentence = "Set up an LLM first: add a provider key to .env, then restart rsync."
+const validateGatedSentence = "Set up an LLM first: add a provider key to .env, then restart rsync.ai."
 
 // validateUpstream starts a fake tool-generator that counts its calls.
 func validateUpstream(t *testing.T, handler http.HandlerFunc) (*int64, string) {

@@ -418,7 +418,7 @@ func canGenerateConnector(connectorType string) bool {
 const llmNotConfiguredErrType = "llm_not_configured"
 
 const llmNotConfiguredFallbackMessage = "Set up an LLM first: add OPENAI_API_KEY (or another provider's key) to .env, " +
-	"or set LLM_PROVIDER=ollama for a local model, then restart rsync."
+	"or set LLM_PROVIDER=ollama for a local model, then restart rsync.ai."
 
 // llmNotConfiguredMessage returns the sentence to show the user when a generator
 // response says no LLM is set up. The generator answers

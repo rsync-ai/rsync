@@ -1,5 +1,5 @@
 #!/bin/bash
-# rsync-ai Kafka Connect entrypoint: turns rsync's KAFKA_* security contract --
+# rsync-ai Kafka Connect entrypoint: turns rsync.ai's KAFKA_* security contract --
 # the variables the Go and Python services read -- into the CONNECT_* worker
 # properties, then hands over to the base image's /docker-entrypoint.sh.
 #
@@ -280,7 +280,7 @@ esac
 
 echo "rsync connect-entrypoint: security.protocol=$PROTO keystore=[$KEYSTORE_FROM] jaas=[$JAAS_FROM]" >&2
 
-# rsync's log4j logger levels (log4j-loggers.properties) are applied here, at every
+# rsync.ai's log4j logger levels (log4j-loggers.properties) are applied here, at every
 # start, because a /kafka/config volume kept from an older image never receives a
 # newer image's file. The sync never fails the start; see its header.
 /opt/rsync/sync-log4j-loggers.sh || echo "rsync connect-entrypoint: log4j logger sync failed; starting with the existing levels" >&2

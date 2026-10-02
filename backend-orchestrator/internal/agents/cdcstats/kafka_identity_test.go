@@ -12,7 +12,7 @@ import (
 )
 
 // A6. Both consumer groups this agent opens connected with the client library's
-// anonymous default client.id, so on a customer-managed cluster an rsync
+// anonymous default client.id, so on a customer-managed cluster an rsync.ai
 // connection was indistinguishable from any other tenant's in the broker's
 // request logs, quota buckets and authorization denials.
 

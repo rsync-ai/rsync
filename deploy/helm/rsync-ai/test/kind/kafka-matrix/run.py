@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Kafka security matrix: every rsync Kafka client path against a real broker.
+"""Kafka security matrix: every rsync.ai Kafka client path against a real broker.
 
     python3 deploy/helm/rsync-ai/test/kind/kafka-matrix/run.py [--rows REGEX] [--keep]
 
@@ -558,7 +558,7 @@ QUICKSTART_DUMMIES = quickstart_dummies()
 # of every jar under the image's 12 connectors: on CI (run 36325162072) the
 # reflective one took 39-67 s per worker, and a lone worker needed 147 s of
 # WORKER_TIMEOUT's 180 to start. service_load keeps only the first scan. What it
-# drops -- plugins without a ServiceLoader manifest (the rsync SMT, the Mongo
+# drops -- plugins without a ServiceLoader manifest (the rsync.ai SMT, the Mongo
 # sink, vitess transforms) -- is never loaded by a row: no row creates a connector.
 HARNESS_WORKER_ENV = {"CONNECT_PLUGIN_DISCOVERY": "service_load"}
 

@@ -44,7 +44,7 @@
 #                      -> rsync-ai/connector-seed:local        (shared/mcp-connectors/Dockerfile.seed)
 #     connector-deployer  ghcr.io/rsync-ai/connector-deployer:latest  (tag kept)
 #                      +  build: ./connector-deployer
-#     tool-generator container_name  rsync-tool-generator -> rsync-connector-lifecycle
+#     tool-generator container_name  rsync-ai-tool-generator -> rsync-ai-connector-lifecycle
 #
 # Nothing else differs. `depends_on`, networks, volumes and every env var are
 # identical to the quickstart's — so use this file when you want to run YOUR
@@ -99,7 +99,7 @@ services:
       context: ./shared/mcp-connectors
       dockerfile: Dockerfile.seed
     image: rsync-ai/connector-seed:local
-    container_name: rsync-connector-seed
+    container_name: rsync-ai-connector-seed
     restart: "no"
     volumes:
       - mcp_connectors:/target
@@ -115,7 +115,7 @@ services:
   connector-deployer:
     build:
       context: ./connector-deployer
-    container_name: rsync-connector-deployer
+    container_name: rsync-ai-connector-deployer
     restart: unless-stopped
     environment:
       # ENVIRONMENT production => app-level S2S fail-closed (503 if secret unset),
@@ -146,7 +146,7 @@ services:
       context: ./llm-service
       dockerfile: Dockerfile.oss
     image: rsync-ai/connector-lifecycle:local
-    container_name: rsync-connector-lifecycle
+    container_name: rsync-ai-connector-lifecycle
     restart: unless-stopped
     # Replace the base's llm-service dependency entirely: the OSS stack has no llm-service,
     # and the lifecycle service waits for the connector volume to be seeded so /v1/deploy can

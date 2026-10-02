@@ -247,7 +247,7 @@ Not user-selectable sources — these are platform plumbing.
 
 ### Test fixtures (not products)
 
-`public/petstore/`, `public/sample-data/`, `public/widgets-graphql/` exist for tests and demos of
+`public/sample-data/` and `public/widgets-graphql/` exist for tests and demos of
 the generation flow. Do not present these as customer-facing connectors.
 
 ### Generation targets with OAuth preconfigured
@@ -498,7 +498,7 @@ shared/mcp-connectors/
 │   ├── github-rest/
 │   ├── google-sheets/
 │   ├── shopify-admin-graphql/
-│   └── petstore/ sample-data/ widgets-graphql/   # test fixtures, not products
+│   └── sample-data/ widgets-graphql/   # test fixtures, not products
 │
 ├── internal/                  # Infrastructure connectors
 │   ├── debezium/

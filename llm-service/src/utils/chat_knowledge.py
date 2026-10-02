@@ -8,7 +8,7 @@ from typing import Optional
 
 class ChatKnowledge:
     """
-    Knowledge base for handling common questions about RSYNC AI.
+    Knowledge base for handling common questions about rsync.ai.
     """
     
     def __init__(self):
@@ -19,7 +19,7 @@ class ChatKnowledge:
                     r"\bhow are you\b",
                 ],
                 "response": (
-                    "Hello! I'm your RSYNC AI assistant. I'm here to help you with:\n\n"
+                    "Hello! I'm your rsync.ai assistant. I'm here to help you with:\n\n"
                     "• Understanding pipeline status and execution\n"
                     "• Debugging pipeline failures\n"
                     "• Analyzing connection configurations\n"
@@ -30,12 +30,12 @@ class ChatKnowledge:
             },
             "what_is_rsync": {
                 "patterns": [
-                    r"\bwhat is rsync\b",
-                    r"\bwhat.* rsync ai\b",
-                    r"\btell me about rsync\b",
+                    r"\bwhat is rsync(?:\.ai)?\b",
+                    r"\bwhat.* rsync(?:\.ai| ai)\b",
+                    r"\btell me about rsync(?:\.ai)?\b",
                 ],
                 "response": (
-                    "RSYNC AI is an agentic data pipeline platform that provides:\n\n"
+                    "rsync.ai is an agentic data pipeline platform that provides:\n\n"
                     "• Automated data synchronization between sources and destinations\n"
                     "• Real-time Change Data Capture (CDC) for streaming data\n"
                     "• AI-powered pipeline planning and optimization\n"
@@ -70,7 +70,7 @@ class ChatKnowledge:
                     r"\blist.*connectors\b",
                 ],
                 "response": (
-                    "RSYNC AI supports these connectors:\n\n"
+                    "rsync.ai supports these connectors:\n\n"
                     "**Sources**:\n"
                     "• MySQL - Relational database\n"
                     "• PostgreSQL - Relational database\n"
@@ -103,7 +103,7 @@ class ChatKnowledge:
                     "• No impact on source database performance\n"
                     "• Complete change history\n"
                     "• Event-driven architecture support\n\n"
-                    "**In RSYNC AI**:\n"
+                    "**In rsync.ai**:\n"
                     "We use Debezium connectors for CDC, with automatic schema evolution "
                     "and built-in error handling.\n\n"
                     "Would you like to set up a CDC pipeline?"

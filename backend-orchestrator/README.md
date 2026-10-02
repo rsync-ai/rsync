@@ -1,4 +1,4 @@
-# Backend Orchestrator - RSYNC AI
+# Backend Orchestrator - rsync.ai
 
 **Control Plane Orchestrator + Stateless Workers for Agentic Data Pipelines**
 
@@ -6,7 +6,7 @@
 
 ## 🎯 Overview
 
-The Backend Orchestrator is the **heart of RSYNC AI**, implementing a **Control Plane + Stateless Workers** architecture for managing data pipeline lifecycles through natural language.
+The Backend Orchestrator is the **heart of rsync.ai**, implementing a **Control Plane + Stateless Workers** architecture for managing data pipeline lifecycles through natural language.
 
 ### Key Components
 

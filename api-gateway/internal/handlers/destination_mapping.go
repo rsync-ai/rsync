@@ -157,9 +157,9 @@ func destinationNamespaceFindings(namespace, kind string, createIfNotExists, exi
 			// Honest label (P3-b): the chosen namespace already exists, so state both
 			// what happens to tables already in it (they are written to in place) and
 			// the one condition that still moves the pipeline elsewhere — another
-			// rsync pipeline already writing one of the SAME tables there. Otherwise
+			// rsync.ai pipeline already writing one of the SAME tables there. Otherwise
 			// the user looks for their data in a schema it was never written to.
-			Message: fmt.Sprintf("Destination %s %q already exists — tables are created there, and a selected table already present is written to in place. Only if another rsync pipeline already writes one of the selected tables into %q is this pipeline moved to a collision-safe %s instead (%q, or %q if that is taken too); you are notified when that happens.",
+			Message: fmt.Sprintf("Destination %s %q already exists — tables are created there, and a selected table already present is written to in place. Only if another rsync.ai pipeline already writes one of the selected tables into %q is this pipeline moved to a collision-safe %s instead (%q, or %q if that is taken too); you are notified when that happens.",
 				kind, namespace, namespace, kind, "rsync_"+namespace, "rsync_"+namespace+"_<id>"),
 			Details: mergeDetails(base, map[string]interface{}{"exists": true, "collision_safe_prefix": "rsync_" + namespace}),
 		}}

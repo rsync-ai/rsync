@@ -48,7 +48,7 @@ func init() { sql.Register("postgres", pgxDriver{}) }
 // bug into a confidentiality regression. Verified against a TLS-less server:
 // lib/pq answers "SSL is not enabled on the server", pgx connects.
 //
-// Every DSN rsync builds today already pins sslmode explicitly, so this changes
+// Every DSN rsync.ai builds today already pins sslmode explicitly, so this changes
 // nothing that currently runs. It is here so that the next DSN to be written —
 // or an operator's hand-set DATABASE_URL — cannot silently opt out of TLS by
 // omission.

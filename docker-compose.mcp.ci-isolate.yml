@@ -23,8 +23,6 @@ services:
     container_name: ${STACK_PREFIX:-rsync-ai}-mysql-v1-0-0-mcp
   oracle-v1-0-0-mcp:
     container_name: ${STACK_PREFIX:-rsync-ai}-oracle-v1-0-0-mcp
-  petstore-v1-0-3-mcp:
-    container_name: ${STACK_PREFIX:-rsync-ai}-petstore-v1-0-3-mcp
   postgresql-v1-0-0-mcp:
     container_name: ${STACK_PREFIX:-rsync-ai}-postgresql-v1-0-0-mcp
   redshift-v1-0-0-mcp:

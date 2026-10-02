@@ -169,7 +169,7 @@ RUN set -eu; \
       echo "$left"; \
       exit 1; }
 
-# rsync's log4j logger levels (log4j-loggers.properties -- today, quieting the
+# rsync.ai's log4j logger levels (log4j-loggers.properties -- today, quieting the
 # pgoutput decoder's WARNs for tables outside every pipeline). They are applied at
 # container start by sync-log4j-loggers.sh, not baked into /kafka/config here:
 # /kafka/config is a volume, a kept volume never receives a later image's file, and

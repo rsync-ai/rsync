@@ -438,7 +438,7 @@ func TestAuthorizeModelRun_DemotionIsStillARefusal(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// The plan's shape: a table dropped outside rsync must not wedge the model
+// The plan's shape: a table dropped outside rsync.ai must not wedge the model
 // ---------------------------------------------------------------------------
 
 // planFor drives the builder against a catalog that answers with the given count, and
@@ -477,7 +477,7 @@ func planRetires(plan []string) bool {
 }
 
 // The defect: target_owned is a permanent record, but the table it refers to is not.
-// Drop the live table outside rsync — a cleanup script, a hand-run migration, a restore
+// Drop the live table outside rsync.ai — a cleanup script, a hand-run migration, a restore
 // from backup — and every subsequent run tried to rename a table that was no longer
 // there. It failed identically forever, and no amount of retrying or rescheduling
 // helped, because nothing about the run changed the state it was tripping over. The
@@ -542,7 +542,7 @@ func TestModelPlan_ACatalogFailureIsNotAnAbsentTable(t *testing.T) {
 
 // The check has to resolve an unqualified target the same way the plan's own DDL will —
 // through the connection's current schema, not a guess like "public" — and must count
-// only base tables. A view standing at the target name is not something rsync left
+// only base tables. A view standing at the target name is not something rsync.ai left
 // behind, and ALTER TABLE … RENAME would happily move a user's view aside.
 func TestModelTargetExists_IsSchemaAwareAndTableOnly(t *testing.T) {
 	for _, dialect := range modelDialects {

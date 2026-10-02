@@ -11,7 +11,7 @@ import (
 // The bug this file guards (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL): a MongoDB source
 // connector whose resume token had aged out of the oplog retried the same permanent
 // error roughly ten times a minute for three days, never left RUNNING, and so reported a
-// fully green /status the entire time. Nothing in rsync noticed, because everything that
+// fully green /status the entire time. Nothing in rsync.ai noticed, because everything that
 // looks for trouble was looking at the connector's STATE.
 //
 // The freshness alarm looks at the connector's committed source POSITION instead, which
@@ -359,7 +359,7 @@ func TestSourceStalledIssueIDIsItsOwnClass(t *testing.T) {
 
 // diagnosableErrorText is the §3A half of the fix: the Healer builds its diagnose.Signal
 // from the issue DESCRIPTION and never reads metadata (heal/issue_sweep.go), so an error
-// that lives only in metadata is an error rsync cannot classify. These tests pin the two
+// that lives only in metadata is an error rsync.ai cannot classify. These tests pin the two
 // things that makes it useful — the cause survives, and nothing secret does.
 func TestDiagnosableErrorText(t *testing.T) {
 	t.Run("keeps the first line and every cause, drops the frames", func(t *testing.T) {

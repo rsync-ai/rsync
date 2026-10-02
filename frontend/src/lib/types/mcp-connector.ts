@@ -233,7 +233,7 @@ export interface MCPConnector {
   supports_source: boolean
   supports_destination: boolean
   supports_cdc: boolean
-  // Which DB engine versions rsync supports, keyed by sync mode.
+  // Which DB engine versions rsync.ai supports, keyed by sync mode.
   // Sourced from metadata.json `supported_versions`; shown read-only in the config modal.
   supported_versions?: { batch?: string; cdc?: string } & Record<string, string>
   // Confidence (server-derived; preferred)

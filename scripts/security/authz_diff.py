@@ -3,7 +3,7 @@
 
 Replays tenant A's object requests with tenant B's credentials and flags any
 response that is NOT 401/403/404 — i.e. B could read or act on A's resource.
-This is rsync's #1 real-world finding class (cross-tenant IDOR), which no
+This is rsync.ai's #1 real-world finding class (cross-tenant IDOR), which no
 off-the-shelf scanner catches because it is a *relationship* ("B must not see
 A"), not a single-request property.
 

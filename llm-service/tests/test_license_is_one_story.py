@@ -46,8 +46,8 @@ import pytest
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
 LICENSE_NAME = "rsync.ai Source-Available License"
-LICENSE_ID = "LicenseRef-rsync-SAL-1.0"
-LEGACY_ID = "LicenseRef-rsync-ELv2-legacy"
+LICENSE_ID = "LicenseRef-rsync.ai-SAL-1.0"
+LEGACY_ID = "LicenseRef-rsync.ai-ELv2-legacy"
 
 # Prose that tells a newcomer which licence applies. Not the internal design docs:
 # those record decisions and legitimately discuss ELv2 as history.

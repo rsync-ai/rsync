@@ -68,7 +68,7 @@ export const NO_SIGNAL_CHANNEL_DETAIL =
  * Why a pipeline is offered the blocking mode only, and what that costs. Only
  * MongoDB is blocking-only today (cdc.go backfillModes): Debezium's incremental
  * snapshot on MongoDB writes watermark documents into a collection in the
- * source, and rsync never writes to a source. Fallback for
+ * source, and rsync.ai never writes to a source. Fallback for
  * cdc.go backfillModeNotSupportedMessage too.
  */
 export const BLOCKING_ONLY_DETAIL =

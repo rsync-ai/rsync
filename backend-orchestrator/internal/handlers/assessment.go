@@ -11,7 +11,7 @@
 // (cmd/orchestrator/main.go), which only AUTHENTICATES. Authentication alone is
 // not enough here: the pipeline id is a path parameter and source_connection_id
 // is caller-supplied, and the handler decrypts that connection and dials it from
-// inside rsync's network. So every entry point below ALSO applies the workspace
+// inside rsync.ai's network. So every entry point below ALSO applies the workspace
 // gate in cdc_authz.go before touching a resource. This comment used to read
 // "authentication is handled by upstream middleware" while no middleware was
 // mounted at all and no per-resource check existed — the routes were reachable

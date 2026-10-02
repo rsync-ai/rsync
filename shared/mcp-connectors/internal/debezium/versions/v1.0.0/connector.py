@@ -1123,7 +1123,7 @@ class DebeziumConnector:
             # Debezium's default for errors.max.retries is -1: retry a retriable error
             # forever. A permanently-broken source then keeps a task in RUNNING while it
             # fails on a loop, Connect's /status stays fully green (it reports task state,
-            # and a retrying task is not FAILED), and nothing in rsync ever sees the
+            # and a retrying task is not FAILED), and nothing in rsync.ai ever sees the
             # error: the Sentinel harvests a task trace, the diagnoser classifies it, and
             # the notifier raises it — but all three hang off a task reaching FAILED.
             # A MongoDB pipeline whose resume token aged out of the oplog therefore
@@ -1131,7 +1131,7 @@ class DebeziumConnector:
             # (KI-CDC-MONGO-RESUME-TOKEN-SILENT-STALL).
             #
             # A bound turns that into a FAILED task, which is what makes the diagnosis
-            # rsync already knows how to produce (diagnose.go -> ActionReSnapshot ->
+            # rsync.ai already knows how to produce (diagnose.go -> ActionReSnapshot ->
             # MONGODB_RESUME_TOKEN_INVALID) reachable at all.
             #
             # The default pair is deliberately generous. retriable.restart.connector.wait.ms
@@ -1292,7 +1292,7 @@ class DebeziumConnector:
             # It does NOT make the position a liveness beacon: on a database with no
             # writes at all there is no new LSN, and the heartbeat repeats the old one.
             # Only heartbeat.action.query would move it, and that writes to the source,
-            # which rsync never does. The Sentinel's freshness watchdog therefore still
+            # which rsync.ai never does. The Sentinel's freshness watchdog therefore still
             # skips PostgreSQL (cdc_source_freshness.go heartbeatAdvancesAnIdlePosition).
             #
             # The same commit clears a finished incremental snapshot from the stored

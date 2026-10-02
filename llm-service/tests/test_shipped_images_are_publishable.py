@@ -764,7 +764,7 @@ def _tagless_checkout_hint():
 #
 # Every tag check below was written on the assumption that the tree it runs in is
 # the tree that cuts the releases. That is true here and stops being true in any
-# mirror of this file: `v0.1.2` was cut on rsync-ai/rsync, the tree install.sh
+# mirror of this file: `v0.1.2` was cut on rsync-ai/rsync.ai, the tree install.sh
 # downloads from and the tree that packaged the published chart, and a checkout
 # without that tag cannot read the build matrix the release was built from. The
 # images exist either way; the local ref does not.
@@ -774,7 +774,7 @@ def _tagless_checkout_hint():
 # tag would rebuild all 34 images and republish them over the artifacts the real
 # release already produced -- and read that workflow's header before dismissing
 # the cost: a push trigger there once spent the org's whole month of CI minutes.
-RELEASE_REPO = "rsync-ai/rsync"
+RELEASE_REPO = "rsync-ai/rsync.ai"
 
 _OUTSIDE_RELEASE_SKIP = (
     "%s was cut on " + RELEASE_REPO + ", not in this checkout -- this is a mirror "

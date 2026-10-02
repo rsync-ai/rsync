@@ -814,13 +814,13 @@ jobs:
     # setting "Require approval for all external contributors", because a pull_request run
     # executes the workflow from the PR head.
     #
-    # The list, rather than one slug: the public repo is `rsync-ai/rsync` and the
+    # The list, rather than one slug: the public repo is `rsync-ai/rsync.ai` and the
     # private one keeps its own name and stays alive after the flip, so CI has to
     # run on BOTH. Naming only one silently disables this job on the other -- a
     # skipped job is indistinguishable from a passing one, which is the whole
     # reason test_repo_slug_is_publishable.py asserts the guard admits the repo
     # this checkout actually points at.
-    if: ${{ (contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync"]'), github.repository) && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ (contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync.ai"]'), github.repository) && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     # Serialize: the smoke uses fixed isolated resource names (rsync-oss-smoke-*) and a fixed
     # host port, so two concurrent runs would clobber each other. Queue (don't cancel) so an
@@ -875,7 +875,7 @@ jobs:
     # Both slugs, for the reason spelled out on oss-deploy-smoke above: this job
     # must keep running on the private repo before the flip and on the public one
     # after it.
-    if: ${{ contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync"]'), github.repository) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+    if: ${{ contains(fromJSON('["rsync-ai/rsync-ai", "rsync-ai/rsync.ai"]'), github.repository) && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
     runs-on: ubuntu-latest
     # NO job-level `concurrency` here, deliberately. There used to be one -- a
     # repository-wide group `oss-leak-proof` with `cancel-in-progress: false` --
