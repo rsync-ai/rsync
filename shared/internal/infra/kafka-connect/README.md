@@ -1,4 +1,4 @@
-# RSync Kafka Connect SMT
+# rsync.ai Kafka Connect SMT
 
 Custom Single Message Transforms (SMT) for Debezium CDC routing.
 

@@ -6,7 +6,7 @@ The `kafka-connect` service provides **CDC ingestion** using Debezium connectors
 In this repo, `kafka-connect` is used for:
 - MySQL/Postgres/MongoDB/SQL Server/Oracle CDC connectors (Debezium),
 - optional schema registry integration,
-- topic routing and partition-key header injection via RSync SMTs.
+- topic routing and partition-key header injection via rsync.ai SMTs.
 
 ### Runtime Interface
 - **Container**: `kafka-connect`

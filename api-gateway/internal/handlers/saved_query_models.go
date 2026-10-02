@@ -987,7 +987,7 @@ func runSavedQueryModel(ctx context.Context, database *sql.DB, modelID, actorUse
 	// The swap succeeded, so this model provably owns the table and later runs may
 	// retire it. A statement model owns nothing — it never created the tables its SQL
 	// writes to, and claiming otherwise would hand a later table-mode run of the same
-	// saved query a licence to DROP a table rsync did not create.
+	// saved query a licence to DROP a table rsync.ai did not create.
 	if !m.TargetOwned && !isStatementModel(m.Materialization) {
 		recordTargetOwnership(database, modelID)
 	}

@@ -302,7 +302,7 @@ services:
       # exceed it. docker-compose.yml has carried this since the bug was first hit; the
       # quickstart shipped the producer half alone.
       KAFKA_MESSAGE_MAX_BYTES: 15728640
-      # Retention for topics rsync does not create itself — Debezium auto-creates
+      # Retention for topics rsync.ai does not create itself — Debezium auto-creates
       # rsync.cdc-* and those inherit the BROKER default, not kafka/topology.go.
       # 168h/delete matches Apache's own defaults, so nothing changes today; it
       # pins the 7-day policy so a future image default cannot silently restore

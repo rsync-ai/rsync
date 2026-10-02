@@ -228,7 +228,7 @@ services:
       # (kafka-connect, producer side) and the kafka-sink-worker ReaderConfig.MaxBytes
       # (consumer side, which must exceed this). Topics inherit this broker default.
       KAFKA_MESSAGE_MAX_BYTES: 15728640
-      # Retention policy for topics rsync does NOT create itself.
+      # Retention policy for topics rsync.ai does NOT create itself.
       #
       # This is not redundant with kafka/topology.go: Debezium auto-creates the
       # rsync.cdc-* topics before the orchestrator's topology manager would, so

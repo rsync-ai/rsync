@@ -925,7 +925,7 @@ export function SavedQueryModelDialog({
           <DialogDescription>
             Decide what running this query does — build a table from its results, or run the
             SQL as written — and how often. Everything happens inside the same database:
-            rsync only sends the statement, so no rows leave the warehouse.
+            rsync.ai only sends the statement, so no rows leave the warehouse.
           </DialogDescription>
         </DialogHeader>
 
@@ -954,7 +954,7 @@ export function SavedQueryModelDialog({
             <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
               <p className="text-xs text-amber-700 dark:text-amber-300">
-                {ENGINE_HINT}. Running a query against {engineName} works, but rsync has no
+                {ENGINE_HINT}. Running a query against {engineName} works, but rsync.ai has no
                 way to execute the CREATE TABLE the rebuild needs, so this query can be saved
                 and run by hand but not turned into a table or put on a schedule.
               </p>

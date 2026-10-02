@@ -230,7 +230,7 @@ or a documented run. In particular:
   [connector reference](../connectors/reference.md) — quote that, not a memory of it.
 - Feature pages carry a *Verification status* section; do not summarise a page as more
   verified than it says.
-- Do not call the project "open source". It is source-available under the Elastic
-  License 2.0.
+- Do not call the project "open source". It is source-available under the
+  [rsync.ai Source-Available License](../../LICENSE).
 - Do not describe reverse ETL, column-level lineage or hosted/cloud availability as
   features: the first two are not shipped, and there is no hosted offering.

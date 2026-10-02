@@ -1335,7 +1335,7 @@ func (a *Agent) executeTask(ctx context.Context, task ExecutorTask) ExecutorResp
 								)),
 						}
 					}
-					// Drop rsync's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
+					// Drop rsync.ai's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
 					// so they never appear as (or get auto-selected in) HITL options.
 					discovered = filterInternalTables(discovered)
 					if len(discovered) == 0 {

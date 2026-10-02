@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Rsync AI are documented in this file.
+All notable changes to rsync.ai are documented in this file.
 
 <!-- Every `## [x.y.z]` heading below must name a tag that actually exists.
      Guarded by llm-service/tests/test_changelog_versions_name_real_tags.py --

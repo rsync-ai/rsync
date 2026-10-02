@@ -180,7 +180,7 @@ class MCPSchemaGenerator:
         # Generate fields
         avro_fields = [
             # Always include metadata fields
-            {"name": "_rsync_trace_id", "type": ["null", "string"], "default": None, "doc": "RSync trace ID"},
+            {"name": "_rsync_trace_id", "type": ["null", "string"], "default": None, "doc": "rsync.ai trace ID"},
             {"name": "_rsync_timestamp", "type": "long", "logicalType": "timestamp-millis", "doc": "Processing timestamp"},
             {"name": "_rsync_operation", "type": ["null", "string"], "default": None, "doc": "Operation type (INSERT/UPDATE/DELETE)"},
         ]

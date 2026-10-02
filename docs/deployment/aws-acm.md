@@ -1,6 +1,6 @@
-# ACM/ELv2 TLS Certificate
+# ACM TLS Certificate for the ALB
 
-"ELv2 certificate" refers to a TLS certificate issued by AWS Certificate Manager (ACM) and attached
+This is a TLS certificate issued by AWS Certificate Manager (ACM) and attached
 to an Application Load Balancer (ALBv2). It is free for public certificates and auto-renews.
 
 ---

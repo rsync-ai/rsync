@@ -1,4 +1,4 @@
-# Kafka Connect with RSync SMT
+# Kafka Connect with rsync.ai SMT
 #
 # This extends the main docker-compose.yml with Kafka Connect
 # configured with our custom SMTs for CDC routing.

@@ -9,8 +9,8 @@
     <version>1.0.0</version>
     <packaging>jar</packaging>
 
-    <name>RSync Kafka Connect SMT</name>
-    <description>Single Message Transforms for RSync AI CDC pipeline</description>
+    <name>rsync.ai Kafka Connect SMT</name>
+    <description>Single Message Transforms for rsync.ai CDC pipeline</description>
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>

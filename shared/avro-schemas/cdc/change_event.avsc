@@ -111,7 +111,7 @@
       "name": "processed_ts",
       "type": "long",
       "logicalType": "timestamp-millis",
-      "doc": "Timestamp when processed by RSync"
+      "doc": "Timestamp when processed by rsync.ai"
     },
     {
       "name": "sequence",
