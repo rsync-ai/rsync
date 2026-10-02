@@ -1,5 +1,5 @@
 """
-Rsync protocol primitives shared by connectors.
+rsync.ai protocol primitives shared by connectors.
 
 Goal: centralize correctness-critical logic (ordering, idempotency manifests, checkpoints)
 so generated connectors don't need to "guess" behavior.

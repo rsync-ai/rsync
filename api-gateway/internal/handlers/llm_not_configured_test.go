@@ -20,7 +20,7 @@ import (
 // routes with 503 {"error":"llm_not_configured","message":"Set up an LLM first: ..."};
 // the gateway must hand that to the UI instead of "SQL generation failed".
 
-const gatedMessage = "Set up an LLM first: add OPENAI_API_KEY to .env, then restart rsync."
+const gatedMessage = "Set up an LLM first: add OPENAI_API_KEY to .env, then restart rsync.ai."
 
 var (
 	flatGated   = `{"error":"llm_not_configured","message":"` + gatedMessage + `"}`

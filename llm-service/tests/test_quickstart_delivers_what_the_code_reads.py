@@ -668,7 +668,7 @@ def test_every_in_network_url_names_a_quickstart_host():
 
 def test_a_code_default_host_this_bundle_lacks_is_overridden():
     """The orchestrator's blob lane defaulted to ``rsync-ai-minio``, the dev compose's
-    container; the quickstart's MinIO is ``minio``/``rsync-minio``, so every
+    container; the quickstart's MinIO is ``minio``/``rsync-ai-minio``, so every
     object-storage load died at DNS until MINIO_ENDPOINT_URL was passed."""
     hosts = _quickstart_hosts()
     quickstart = _services(QUICKSTART)

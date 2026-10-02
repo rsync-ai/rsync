@@ -89,7 +89,7 @@ Wait ~5 min for DNS propagation.
 ## Step 7 — Install rsync.ai
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | bash
 ```
 
 The installer will:
@@ -200,7 +200,7 @@ name: rsync-ai
 services:
   traefik:
     image: traefik:v3.0
-    container_name: rsync-traefik
+    container_name: rsync-ai-traefik
     restart: unless-stopped
     ports:
       - "80:80"
@@ -293,7 +293,7 @@ sudo systemctl start rsync-ai
 cd ~/rsync-ai && docker compose -f docker-compose.quickstart.yml logs -f
 
 # View Traefik logs
-docker logs rsync-traefik -f
+docker logs rsync-ai-traefik -f
 
 # Stop
 cd ~/rsync-ai && docker compose -f docker-compose.quickstart.yml -f docker-compose.traefik.yml down

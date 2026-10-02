@@ -29,7 +29,7 @@ import (
 
 // ServiceName is what this process calls itself on a broker. It becomes the
 // client.id of every Kafka client here, so a customer reading a request log,
-// a throttle metric or a quota rule on a shared cluster sees which rsync
+// a throttle metric or a quota rule on a shared cluster sees which rsync.ai
 // service the load came from instead of the client library's anonymous default
 // — which is indistinguishable both between our services and from any other
 // tenant's default client.

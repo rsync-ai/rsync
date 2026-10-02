@@ -1,7 +1,7 @@
 {
   "info": {
-    "name": "Rsync AI (Local Docker)",
-    "description": "Postman collection for Rsync AI running locally via docker-compose.\n\nBase URLs are driven by the environment variables in `rsync-ai.local.postman_environment.json`.\n\nNotes:\n- Most endpoints accept `X-User-ID` (dev-friendly) and will fall back to the seeded dev user.\n- Many workflow endpoints are asynchronous; use `GET /pipelines/:id/state` and events to observe progress.\n",
+    "name": "rsync.ai (Local Docker)",
+    "description": "Postman collection for rsync.ai running locally via docker-compose.\n\nBase URLs are driven by the environment variables in `rsync-ai.local.postman_environment.json`.\n\nNotes:\n- Most endpoints accept `X-User-ID` (dev-friendly) and will fall back to the seeded dev user.\n- Many workflow endpoints are asynchronous; use `GET /pipelines/:id/state` and events to observe progress.\n",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "item": [

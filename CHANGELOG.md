@@ -1,11 +1,54 @@
 # Changelog
 
-All notable changes to Rsync AI are documented in this file.
+All notable changes to rsync.ai are documented in this file.
 
 <!-- Every `## [x.y.z]` heading below must name a tag that actually exists.
      Guarded by llm-service/tests/test_changelog_versions_name_real_tags.py --
      this file used to open with `## [1.0.0] - December 2025`, a version no tag
      has ever pointed at, and nothing in the repo could disagree with it. -->
+
+## [Unreleased]
+
+### ⚖️ License
+
+#### Changed
+- **New license from the first release that includes it: the rsync.ai Source-Available
+  License v1.0** (`LICENSE`), replacing the Elastic License 2.0. Running rsync.ai for your
+  own business, and for personal or non-commercial projects, stays free. Without a separate
+  agreement you may no longer sell it, host it for others, embed it in a product you sell,
+  build a competing product from it, or share copies except free of charge for
+  non-commercial purposes. Releases up to and including v0.1.7 stay under the Elastic
+  License 2.0; its text is kept in `LICENSES/`.
+- **Contributions now need a signed [CLA](CLA.md)**, once, in addition to the DCO sign-off.
+- **Every connector's `license` field now carries the new license's identifier**, not
+  `MIT` or `ELv2`. The field had defaulted to `MIT` for connectors rsync.ai wrote itself.
+  The identifier is `LicenseRef-rsync.ai-SAL-1.0`.
+
+### 🏷️ Named rsync.ai, not rsync
+
+rsync is also the name of a file-copy tool that has existed for decades. The product is
+rsync.ai, and the names below now say so.
+
+#### Changed
+- **The repository is `github.com/rsync-ai/rsync.ai`.** The install command is
+  `curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | bash`,
+  and a clone lands in `rsync.ai/`. GitHub redirects the old web and git addresses.
+- **Kubernetes: the default release and namespace are `rsync-ai`**, so resources are named
+  `rsync-ai-frontend`, `rsync-ai-secrets` and so on. `install-k8s.sh` finds an install
+  under the old default (`rsync` in `rsync`) and upgrades it in place. If you run `helm`
+  yourself, keep upgrading under the name you installed with.
+- **Docker: the self-host containers are named `rsync-ai-*`** (`rsync-ai-postgres`,
+  `rsync-ai-orchestrator`, ...). Your data is in volumes, which keep their names; the next
+  `up` replaces each container under its new name. Scripts that call `docker exec` or
+  `docker logs` with an old name need the new one.
+- **AI clients: the setup snippets name the MCP server `rsync-ai`**, and the server reports
+  `rsync.ai` as its title. A client you already set up keeps working under the name you
+  gave it.
+- **Load test: `RSYNC_AI_EMAIL` and `RSYNC_AI_PASSWORD`** replace `RSYNC_EMAIL` and
+  `RSYNC_PASSWORD` in `scripts/loadtest`. The rsync tool reads `RSYNC_PASSWORD` too.
+
+### Removed
+- **The `petstore` example connector**, a demo of a generated REST connector.
 
 ## [0.1.7] - 2026-09-28
 
@@ -190,20 +233,6 @@ Everything since v0.1.3.
 - The bundled observability-backend stack. Telemetry still exports over OTLP to whichever
   collector you configure; the seeded `sentinel_config` keys are now backend-neutral
   (migration `100`).
-
-### ⚖️ License
-
-#### Changed
-- **New license from the first release that includes it: the rsync.ai Source-Available
-  License v1.0** (`LICENSE`), replacing the Elastic License 2.0. Running rsync.ai for your
-  own business, and for personal or non-commercial projects, stays free. Without a separate
-  agreement you may no longer sell it, host it for others, embed it in a product you sell,
-  build a competing product from it, or share copies except free of charge for
-  non-commercial purposes. Releases up to and including v0.1.7 stay under the Elastic
-  License 2.0; its text is kept in `LICENSES/`.
-- **Contributions now need a signed [CLA](CLA.md)**, once, in addition to the DCO sign-off.
-- **Every connector's `license` field now carries the new license's identifier**, not
-  `MIT` or `ELv2`. The field had defaulted to `MIT` for connectors rsync.ai wrote itself.
 
 ## Earlier changes
 
@@ -452,7 +481,7 @@ Entries from before the release tags; they are not tied to a version.
 ## Known Issues
 
 Open issues are tracked at
-[github.com/rsync-ai/rsync/issues](https://github.com/rsync-ai/rsync/issues) — that
+[github.com/rsync-ai/rsync.ai/issues](https://github.com/rsync-ai/rsync.ai/issues) — that
 list is the register, and it cannot go stale the way a hand-maintained count here
 does. This heading used to read "None at this time", which was untrue when it was
 written and had no way of noticing.
@@ -474,5 +503,5 @@ written and had no way of noticing.
 For issues or questions:
 - Review: `docs/services/INDEX.md`
 - Check: `docker compose logs <service>`
-- GitHub: [rsync-ai/rsync issues](https://github.com/rsync-ai/rsync/issues)
+- GitHub: [rsync-ai/rsync.ai issues](https://github.com/rsync-ai/rsync.ai/issues)
 - Email: support@rsync.ai

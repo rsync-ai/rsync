@@ -12,7 +12,7 @@ package executor
 // Unlike the structured batch lane it does NOT discover schema, infer column
 // types, or run the transform engine — a blob is opaque bytes, not rows. The
 // source connector stages each object byte-identical into the claim-check store
-// (rsync's internal MinIO, the S3-compatible lingua franca every dest connector
+// (rsync.ai's internal MinIO, the S3-compatible lingua franca every dest connector
 // can read) and returns a pointer envelope; this lane forwards one Kafka message
 // per envelope to the kafka-mcp-sink, which has the destination connector fetch
 // the bytes and write them raw. The bytes never transit the executor.

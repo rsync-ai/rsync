@@ -16,7 +16,7 @@ policy — not the code license — governs use of the name and logo.
   "compatible with rsync.ai", "a connector for rsync.ai", or writing tutorials, reviews, and
   articles about rsync.ai.
 - **Run and modify** your own copy of the software under the [license](LICENSE).
-- **Link to** the official project at https://github.com/rsync-ai/rsync and https://rsync.ai.
+- **Link to** the official project at https://github.com/rsync-ai/rsync.ai and https://rsync.ai.
 - Use the Marks in **unmodified** copies of the software as distributed by the project.
 
 ## What you may not do (without written permission)

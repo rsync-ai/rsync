@@ -4,7 +4,7 @@ Thank you for your interest in contributing. This guide covers how to set up a l
 
 ## Before you start
 
-- Check [existing issues](https://github.com/rsync-ai/rsync/issues) before opening a new one
+- Check [existing issues](https://github.com/rsync-ai/rsync.ai/issues) before opening a new one
 - For large changes, open an issue first to discuss the approach
 - All contributions require signing the [CLA](CLA.md) once, and a DCO sign-off on every commit (see [below](#contributor-license-agreement-cla)). They come in under the [rsync.ai Source-Available License](LICENSE)
 
@@ -13,8 +13,8 @@ Thank you for your interest in contributing. This guide covers how to set up a l
 **Prerequisites:** Docker 24+, Go 1.22+, Node.js 20+, Python 3.11+
 
 ```bash
-git clone https://github.com/rsync-ai/rsync.git
-cd rsync
+git clone https://github.com/rsync-ai/rsync.ai.git
+cd rsync.ai
 cp .env.example .env
 # Optional: add your OPENAI_API_KEY to .env, or set LLM_PROVIDER=none to run
 # without an LLM (see docs/deployment/self-hosting.md, "Which LLM is used")

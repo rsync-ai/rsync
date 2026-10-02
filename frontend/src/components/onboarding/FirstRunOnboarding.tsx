@@ -213,7 +213,7 @@ export function FirstRunOnboarding({ initial }: { initial: OnboardingCounts }) {
   const currentIndex = steps.findIndex((s) => !s.done)
 
   return (
-    <section aria-label="Get started with rsync" className="space-y-4">
+    <section aria-label="Get started with rsync.ai" className="space-y-4">
       {/* Zero-credential try-it path. Rendered only when this deployment ships a
           demo destination and the user is still missing a half. On cloud
           /demo/status answers available:false, so none of this ever appears —

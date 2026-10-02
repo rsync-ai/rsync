@@ -3,7 +3,7 @@
 # rsync.ai services and the connector plane, and wires them at services you
 # already operate.
 #
-#   helm install rsync ./rsync-ai \
+#   helm install rsync-ai ./rsync-ai \
 #     -f rsync-ai/values-byo-everything.yaml \
 #     -f my-values.yaml
 #

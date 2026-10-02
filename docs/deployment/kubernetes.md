@@ -49,7 +49,7 @@ managed Postgres, Redis, Kafka and object storage.
 Point `kubectl` at any cluster and run:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install-k8s.sh | bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install-k8s.sh | bash
 ```
 
 That is the whole install. With no input at all it:
@@ -70,6 +70,12 @@ file is lost, they are read back from the `<release>-secrets` Secret the previou
 install left in the cluster — so `ENCRYPTION_KEY` and the database password are never
 regenerated. **Back the `.env` up:** `ENCRYPTION_KEY` encrypts every saved connection
 credential and there is no recovery without it.
+
+**Installed before v0.1.8?** The default was then release `rsync` in namespace `rsync`;
+it is now `rsync-ai` for both. The installer finds an install under the old name and
+upgrades it in place. If you run `helm` yourself, keep the old name
+(`helm upgrade rsync … --namespace rsync`): a new release name is a second install
+with fresh secrets and empty volumes.
 
 | Setting in `.env` | Default | Effect |
 |---|---|---|
@@ -148,9 +154,9 @@ the chart version **and** the default image tag from the same git tag, so a
 chart and the images it points at can never skew:
 
 ```bash
-helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
+helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai \
   --version 0.1.7 \
-  --namespace rsync --create-namespace \
+  --namespace rsync-ai --create-namespace \
   -f my-values.yaml
 ```
 
@@ -184,10 +190,10 @@ is no local file to name, and the two halves of the documentation do not compose
 `-f` does accept a URL, so pin the overlay to the same tag as the chart:
 
 ```bash
-helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
+helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai \
   --version 0.1.7 \
-  --namespace rsync --create-namespace \
-  -f https://raw.githubusercontent.com/rsync-ai/rsync/v0.1.7/deploy/helm/rsync-ai/values-gke.yaml \
+  --namespace rsync-ai --create-namespace \
+  -f https://raw.githubusercontent.com/rsync-ai/rsync.ai/v0.1.7/deploy/helm/rsync-ai/values-gke.yaml \
   -f my-values.yaml
 ```
 
@@ -199,8 +205,8 @@ from the chart at all:
 
 ```bash
 helm pull oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.7 --untar
-helm install rsync ./rsync-ai \
-  --namespace rsync --create-namespace \
+helm install rsync-ai ./rsync-ai \
+  --namespace rsync-ai --create-namespace \
   -f ./rsync-ai/values-gke.yaml \
   -f my-values.yaml
 ```
@@ -210,9 +216,9 @@ helm install rsync ./rsync-ai \
 The right path when you are modifying the chart:
 
 ```bash
-git clone https://github.com/rsync-ai/rsync.git
-helm install rsync ./deploy/helm/rsync-ai \
-  --namespace rsync --create-namespace \
+git clone https://github.com/rsync-ai/rsync.ai.git
+helm install rsync-ai ./deploy/helm/rsync-ai \
+  --namespace rsync-ai --create-namespace \
   -f my-values.yaml
 ```
 
@@ -360,8 +366,8 @@ objectStorage:
 ```
 
 ```bash
-helm install rsync ./deploy/helm/rsync-ai \
-  --namespace rsync --create-namespace \
+helm install rsync-ai ./deploy/helm/rsync-ai \
+  --namespace rsync-ai --create-namespace \
   -f deploy/helm/rsync-ai/values-eks.yaml \
   -f my-values.yaml
 ```
@@ -429,8 +435,8 @@ objectStorage:
 ```
 
 ```bash
-helm install rsync ./deploy/helm/rsync-ai \
-  --namespace rsync --create-namespace \
+helm install rsync-ai ./deploy/helm/rsync-ai \
+  --namespace rsync-ai --create-namespace \
   -f deploy/helm/rsync-ai/values-gke.yaml \
   -f my-values.yaml
 ```
@@ -592,8 +598,8 @@ The compose stack has the same capability — see
 ## Verify
 
 ```bash
-kubectl -n rsync get pods
-helm -n rsync test rsync
+kubectl -n rsync-ai get pods
+helm -n rsync-ai test rsync-ai
 ```
 
 `helm test` runs one throwaway pod
@@ -618,7 +624,7 @@ tag resolves.
 ## Uninstall
 
 ```bash
-helm -n rsync uninstall rsync
+helm -n rsync-ai uninstall rsync-ai
 ```
 
 PersistentVolumeClaims are **not** removed with the release. Delete them

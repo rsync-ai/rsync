@@ -136,10 +136,10 @@ const (
 		`{"intent":"general_knowledge","requires_execution":false,"parameters":{}}` +
 		"\n```"
 	fencedHelp = "```json\n" +
-		`{"message":"Point rsync at a source and a destination and it moves the data.",` +
+		`{"message":"Point rsync.ai at a source and a destination and it moves the data.",` +
 		`"suggestions":["mysql to bigquery"]}` +
 		"\n```"
-	realHelpAnswer = "Point rsync at a source and a destination and it moves the data."
+	realHelpAnswer = "Point rsync.ai at a source and a destination and it moves the data."
 )
 
 // Vacuity floor. If a future widening of the regex fast paths swallows the

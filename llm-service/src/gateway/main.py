@@ -2074,7 +2074,7 @@ async def completion(request: PromptRequest):
             elif request.prompt_name == "chat/assistant":
                 # Mock chat assistant response
                 user_msg = request.variables.get("user_message", "")
-                result = f"Hello! I'm your RSYNC AI assistant. I can help you with:\n\n" \
+                result = f"Hello! I'm your rsync.ai assistant. I can help you with:\n\n" \
                         f"• Understanding pipeline status and execution\n" \
                         f"• Debugging pipeline failures\n" \
                         f"• Analyzing connections and data flows\n" \

@@ -248,7 +248,7 @@ func unavailableCheck(connType, detail string) Check {
 		Remediation: &diagnose.Remediation{
 			Steps: []string{
 				"Retry the readiness check in a moment",
-				"If it persists, the source may be unreachable from rsync — verify network/firewall access",
+				"If it persists, the source may be unreachable from rsync.ai — verify network/firewall access",
 			},
 			EstimatedMinutes: 3,
 		},
@@ -310,7 +310,7 @@ func classifyConnectorFailure(connType, msg string) Check {
 			Remediation: &diagnose.Remediation{
 				Steps: []string{
 					"Verify the host/endpoint, port and credentials in the source connection",
-					"Confirm the source is reachable from rsync (network/firewall/IP allow-list)",
+					"Confirm the source is reachable from rsync.ai (network/firewall/IP allow-list)",
 					"Re-test the connection after correcting it",
 				},
 				DocURL:           diagnose.ErrorDocURL("connector-connection-failed"),

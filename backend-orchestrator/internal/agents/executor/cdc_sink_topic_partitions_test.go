@@ -190,7 +190,7 @@ func mongoSinkInputs(tables ...string) sinkTopicInputs {
 }
 
 // TestCDCSinkTopicsArePreCreatedWithTheResolvedPartitionCount: every CDC data topic
-// rsync pre-creates asks for the count the caller resolved, on both the per-table path
+// rsync.ai pre-creates asks for the count the caller resolved, on both the per-table path
 // and the single-topic path — and for 1 when nothing resolved one.
 func TestCDCSinkTopicsArePreCreatedWithTheResolvedPartitionCount(t *testing.T) {
 	withTopicPrefix(t, nil)

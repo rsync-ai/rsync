@@ -333,8 +333,8 @@ if [ "$CDC_COUNT" != "0" ] && [ "$CDC_SOURCE_DROPPED" != "yes" ]; then
     say "   database first (slots pin WAL indefinitely), then re-run with the flag."
     fatal=1
 elif [ "$CDC_COUNT" = "0" ]; then
-    say "✅ cdc_resources is empty — rsync tracks no CDC objects."
-    say "   NOTE: this proves rsync tracks none, not that none exist. If any source"
+    say "✅ cdc_resources is empty — rsync.ai tracks no CDC objects."
+    say "   NOTE: this proves rsync.ai tracks none, not that none exist. If any source"
     say "   database was ever CDC-provisioned outside this table, check it by hand:"
     say "     SELECT * FROM pg_replication_slots; SELECT * FROM pg_publication;"
 else

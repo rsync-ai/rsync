@@ -223,7 +223,7 @@ def verify_pipeline_creation():
 # --- Main Execution ---
 
 def run_truth_tests():
-    print(f"{Colors.BOLD}{Colors.CYAN}🕵️  RSYNC AI - TRUTH VERIFICATION SUITE{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}🕵️  rsync.ai - TRUTH VERIFICATION SUITE{Colors.RESET}")
     print("Verifying that Chatbot responses match System Reality...\n")
     
     results = []

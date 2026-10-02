@@ -380,7 +380,7 @@ func ParseIncludeList(cfg map[string]interface{}) []string {
 
 // includeListCaptures matches a data-collection against include-list entries
 // the way Debezium does: each entry is a regular expression over the whole
-// identifier, case-insensitive. rsync writes plain names with escaped dots
+// identifier, case-insensitive. rsync.ai writes plain names with escaped dots
 // ("public\.users"), which the fast path compares directly.
 func includeListCaptures(entries []string, table string) bool {
 	for _, e := range entries {

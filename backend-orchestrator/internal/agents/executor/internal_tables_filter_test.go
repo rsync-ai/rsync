@@ -8,9 +8,9 @@ func TestIsInternalDiscoveredTable(t *testing.T) {
 		in   string
 		want bool
 	}{
-		{"rsync cdc offsets", "_rsync_cdc_offsets", true},
-		{"rsync pipelines", "_rsync_pipelines", true},
-		{"rsync row hash", "_rsync_row_hash", true},
+		{"rsync.ai cdc offsets", "_rsync_cdc_offsets", true},
+		{"rsync.ai pipelines", "_rsync_pipelines", true},
+		{"rsync.ai row hash", "_rsync_row_hash", true},
 		{"rsync_ prefix", "rsync_state", true},
 		{"flat mysql staging", "flat_mysql_1720000000", true},
 		{"flat pg staging", "flat_pg_42", true},

@@ -18,7 +18,7 @@ import (
 // status, and answer 200. An error body has no "suggestions", so a failure
 // looked like "nothing to suggest". These tests pin the status handling.
 
-const nextStepsGatedSentence = "Set up an LLM first: add a provider key to .env, then restart rsync."
+const nextStepsGatedSentence = "Set up an LLM first: add a provider key to .env, then restart rsync.ai."
 
 // The shape llm-service's rules fallback (_mock_next_steps) returns with 200
 // when no LLM is set up and row_count > 10.

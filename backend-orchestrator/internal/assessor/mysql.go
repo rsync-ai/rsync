@@ -542,7 +542,7 @@ func oneMySQLTablePKCheck(ctx context.Context, db *sql.DB, dbName, table string,
 		// A PRIMARY index exists but every key column is invisible → MySQL's
 		// generated invisible primary key (GIPK). It won't replicate (excluded
 		// from SELECT *), so the table is effectively keyless. We do NOT block:
-		// rsync routes keyless tables through the sink's content-hash surrogate
+		// rsync.ai routes keyless tables through the sink's content-hash surrogate
 		// key (_rsync_row_hash), matching the Fivetran/Airbyte market standard.
 		// This is a WARNING, never a hard block — the run proceeds.
 		invName := strings.TrimSpace(invisiblePKNames.String)
@@ -551,7 +551,7 @@ func oneMySQLTablePKCheck(ctx context.Context, db *sql.DB, dbName, table string,
 		}
 		return Check{
 			Code: "MYSQL_TABLE_PRIMARY_KEY_INVISIBLE", Severity: SeverityWarning, Passed: true,
-			Message: fmt.Sprintf("Table %s.%s has only MySQL's auto-generated INVISIBLE primary key (%q), which is excluded from SELECT * and won't replicate. rsync will load it using a content-hash surrogate key (_rsync_row_hash), so the run succeeds. Because the hash covers all columns, a later change to any column is written as a new row (the prior version is retained), so updates can accumulate duplicates. For in-place updates, nominate identifying column(s) as the key (recommended) or add an explicit PRIMARY KEY on the source.", dbName, table, invName),
+			Message: fmt.Sprintf("Table %s.%s has only MySQL's auto-generated INVISIBLE primary key (%q), which is excluded from SELECT * and won't replicate. rsync.ai will load it using a content-hash surrogate key (_rsync_row_hash), so the run succeeds. Because the hash covers all columns, a later change to any column is written as a new row (the prior version is retained), so updates can accumulate duplicates. For in-place updates, nominate identifying column(s) as the key (recommended) or add an explicit PRIMARY KEY on the source.", dbName, table, invName),
 			Remediation: &diagnose.Remediation{
 				Steps: []string{
 					"No action needed to run — keyless tables replicate via a content-hash surrogate key.",
@@ -569,7 +569,7 @@ func oneMySQLTablePKCheck(ctx context.Context, db *sql.DB, dbName, table string,
 	}
 	return Check{
 		Code: code, Severity: SeverityWarning, Passed: true,
-		Message: fmt.Sprintf("Table %s.%s has no primary key. rsync will load it using a content-hash surrogate key (_rsync_row_hash), so the run succeeds. Because the hash covers all columns, a later change to any column is written as a new row (the prior version is retained), so updates can accumulate duplicates. For in-place updates, nominate identifying column(s) as the key (recommended) or add a PRIMARY KEY on the source.", dbName, table),
+		Message: fmt.Sprintf("Table %s.%s has no primary key. rsync.ai will load it using a content-hash surrogate key (_rsync_row_hash), so the run succeeds. Because the hash covers all columns, a later change to any column is written as a new row (the prior version is retained), so updates can accumulate duplicates. For in-place updates, nominate identifying column(s) as the key (recommended) or add a PRIMARY KEY on the source.", dbName, table),
 		Remediation: &diagnose.Remediation{
 			Steps: []string{
 				"No action needed to run — keyless tables replicate via a content-hash surrogate key.",

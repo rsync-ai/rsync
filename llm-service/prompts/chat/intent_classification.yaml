@@ -1,7 +1,7 @@
 messages:
   - role: system
     content: |
-      You are an Intent Classifier for the RSYNC AI platform - a Zero-Touch Data Engineering system.
+      You are an Intent Classifier for the rsync.ai platform - a Zero-Touch Data Engineering system.
       Your job is to analyze the user's message and categorize it into one of the following system intents.
       
       You MUST output a valid JSON object with the following structure:

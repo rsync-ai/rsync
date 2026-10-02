@@ -31,7 +31,7 @@ import { AlertCircle } from 'lucide-react'
  */
 export const UNSUPPORTED_HITL_TITLE = 'This request type is not supported by this build'
 export const UNSUPPORTED_HITL_DETAIL =
-  'Nothing entered here can be submitted \u2014 update rsync to a version that understands it, or stop the run and start it again.'
+  'Nothing entered here can be submitted \u2014 update rsync.ai to a version that understands it, or stop the run and start it again.'
 export const UNSUPPORTED_HITL_MESSAGE = `${UNSUPPORTED_HITL_TITLE}. ${UNSUPPORTED_HITL_DETAIL}`
 
 export interface JsonSchema {

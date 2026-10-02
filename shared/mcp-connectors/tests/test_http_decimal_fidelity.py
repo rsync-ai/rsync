@@ -88,7 +88,6 @@ PINNED_HTTP_CONNECTORS = {
     "github-rest",
     "google-sheets",
     "notion-rest",
-    "petstore",
     "postgresql",
     "redshift",
     "shopify-admin-graphql",

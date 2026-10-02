@@ -240,7 +240,7 @@ connector containers — and its transitive deps (`requests`, `urllib3`, `websoc
 | [python-dateutil](https://github.com/dateutil/dateutil) | base_connector.py lazy import (date parsing); ships transitively via boto3/botocore | Apache-2.0 OR BSD-3-Clause |
 | [python-snappy](https://github.com/andrix/python-snappy) | >=0.6.0 (aws-s3 connector; base_connector.py snappy) | BSD-3-Clause |
 | [pytz](https://github.com/stub42/pytz) | base_connector.py OPTIONAL lazy import (try/except tz path); not declared in any manifest — present only if pulled transitively | MIT |
-| [requests](https://github.com/psf/requests) | >=2.28.0 (github-rest, petstore, shopify-admin-graphql, stripe, widgets-graphql; also base_connector.py lazy import) | Apache-2.0 |
+| [requests](https://github.com/psf/requests) | >=2.28.0 (github-rest, shopify-admin-graphql, stripe, widgets-graphql; also base_connector.py lazy import) | Apache-2.0 |
 | [snowflake-connector-python](https://github.com/snowflakedb/snowflake-connector-python) | >=3.0.0 (snowflake connector) | Apache-2.0 |
 | [starlette](https://github.com/encode/starlette) | ==1.3.1 (OSS image; also fastapi transitive) | BSD-3-Clause |
 | [uvicorn](https://github.com/encode/uvicorn) | >=0.27.0 [standard] (OSS); >=0.22.0 (connectors) | BSD-3-Clause |

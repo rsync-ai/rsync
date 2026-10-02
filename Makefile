@@ -5,7 +5,7 @@
         staging-up staging-check staging-guard connector-reference
 
 # ============================================================================
-# RSYNC AI - Makefile
+# rsync.ai - Makefile
 # ============================================================================
 # Single entry point for all development operations
 # ============================================================================
@@ -31,7 +31,7 @@ NC := \033[0m # No Color
 help:
 	@echo ""
 	@echo "$(CYAN)╔══════════════════════════════════════════════════════════════════╗$(NC)"
-	@echo "$(CYAN)║           RSYNC AI - Development Commands                        ║$(NC)"
+	@echo "$(CYAN)║           rsync.ai - Development Commands                        ║$(NC)"
 	@echo "$(CYAN)╚══════════════════════════════════════════════════════════════════╝$(NC)"
 	@echo ""
 	@echo "$(GREEN)🚀 QUICK START$(NC)"
@@ -117,7 +117,7 @@ env-check:
 	@echo "$(CYAN)🔍 Checking environment files...$(NC)"
 	@if [ ! -f .env ]; then \
 		echo "$(YELLOW)Creating .env...$(NC)"; \
-		echo "# RSYNC AI Root Environment Variables" > .env; \
+		echo "# rsync.ai Root Environment Variables" > .env; \
 		echo "GITHUB_CLIENT_ID=" >> .env; \
 		echo "GITHUB_CLIENT_SECRET=" >> .env; \
 		echo "GOOGLE_CLIENT_ID=" >> .env; \
@@ -142,7 +142,7 @@ env-check:
 		echo "$(YELLOW)Creating frontend/.env...$(NC)"; \
 		echo "# Frontend Environment Variables" > frontend/.env; \
 		echo "NEXT_PUBLIC_API_URL=http://localhost:5001" >> frontend/.env; \
-		echo "NEXT_PUBLIC_APP_NAME=Rsync AI" >> frontend/.env; \
+		echo "NEXT_PUBLIC_APP_NAME=rsync.ai" >> frontend/.env; \
 		echo "NEXT_PUBLIC_ENVIRONMENT=development" >> frontend/.env; \
 	fi
 	@echo "$(GREEN)✓$(NC) All environment files present"
@@ -153,7 +153,7 @@ env-check:
 
 # Full development environment - starts everything
 dev: env-check
-	@echo "$(CYAN)🚀 Starting RSYNC AI Development Environment$(NC)"
+	@echo "$(CYAN)🚀 Starting rsync.ai Development Environment$(NC)"
 	@echo "$(CYAN)==============================================$(NC)"
 	@echo ""
 	@echo "$(YELLOW)Step 1/4:$(NC) Starting infrastructure..."
@@ -185,7 +185,7 @@ dev: env-check
 
 # Start all services (simple docker compose up)
 up:
-	@echo "$(CYAN)🚀 Starting all RSYNC AI services...$(NC)"
+	@echo "$(CYAN)🚀 Starting all rsync.ai services...$(NC)"
 	@docker compose up -d
 	@echo "$(GREEN)✅ All services started$(NC)"
 	@$(MAKE) --no-print-directory urls

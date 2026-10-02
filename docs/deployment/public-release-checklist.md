@@ -6,7 +6,7 @@ and does not mean. Nothing in this file is automated except where it says so, an
 these steps is performed by a code change: GitHub settings, releases and the website are
 changed by a maintainer.
 
-The public repository is [`rsync-ai/rsync`](https://github.com/rsync-ai/rsync).
+The public repository is [`rsync-ai/rsync.ai`](https://github.com/rsync-ai/rsync.ai).
 
 ## 1. What each number measures
 
@@ -15,8 +15,8 @@ last two are evidence that someone used the product.
 
 | Signal | Where to read it | What it actually counts | What it does not tell you |
 |---|---|---|---|
-| **Git clone traffic** | Repository → Insights → Traffic, or `gh api repos/rsync-ai/rsync/traffic/clones` | `git clone`/fetch operations against the repository, over a **rolling 14-day window** only. Includes bots, mirrors, CI runs and repeat clones. | People. It is not a user count, not an install count and not a download count. **Do not market clone counts as user downloads.** |
-| **Release asset downloads** | `gh api repos/rsync-ai/rsync/releases --jq '.[] \| {tag: .tag_name, assets: [.assets[] \| {name, download_count}]}'` | Exact per-file downloads of files **attached to a GitHub Release**, since the release was published. Only covers files you attach. | Whether the file was run, or succeeded. Downloads by CI, scanners and scripted re-downloads are included. |
+| **Git clone traffic** | Repository → Insights → Traffic, or `gh api repos/rsync-ai/rsync.ai/traffic/clones` | `git clone`/fetch operations against the repository, over a **rolling 14-day window** only. Includes bots, mirrors, CI runs and repeat clones. | People. It is not a user count, not an install count and not a download count. **Do not market clone counts as user downloads.** |
+| **Release asset downloads** | `gh api repos/rsync-ai/rsync.ai/releases --jq '.[] \| {tag: .tag_name, assets: [.assets[] \| {name, download_count}]}'` | Exact per-file downloads of files **attached to a GitHub Release**, since the release was published. Only covers files you attach. | Whether the file was run, or succeeded. Downloads by CI, scanners and scripted re-downloads are included. |
 | **Completed installs** | Nowhere today. | — | An install that reached a running stack leaves no trace on GitHub. `raw.githubusercontent.com` (where `install.sh` and the compose file are fetched from) keeps no counter, and image pulls from GHCR are visible only as per-package numbers, at roughly ten pulls per install. |
 | **First successful pipeline runs** | Nowhere today. | — | This is the number that would show real use, and it is invisible without a usage report from the installation itself. rsync.ai sends none, and none may be added without an explicit decision. |
 
@@ -34,9 +34,9 @@ GitHub keeps clone and view traffic for only 14 days. Capture it on a schedule, 
 gone; this needs push access to the repository.
 
 ```bash
-gh api repos/rsync-ai/rsync/traffic/clones   > "clones-$(date +%F).json"
-gh api repos/rsync-ai/rsync/traffic/views    > "views-$(date +%F).json"
-gh api repos/rsync-ai/rsync/traffic/popular/referrers > "referrers-$(date +%F).json"
+gh api repos/rsync-ai/rsync.ai/traffic/clones   > "clones-$(date +%F).json"
+gh api repos/rsync-ai/rsync.ai/traffic/views    > "views-$(date +%F).json"
+gh api repos/rsync-ai/rsync.ai/traffic/popular/referrers > "referrers-$(date +%F).json"
 ```
 
 Store the files somewhere that is not the repository itself.
@@ -70,14 +70,14 @@ because a box is a claim and the API is the evidence. State confirmed 2026-09-22
   what a search result for the repository says. It used to be worded differently on the
   grounds that it describes the running app rather than the repository; that distinction was
   dropped deliberately, so do not re-introduce it. Read the description back with
-  `gh api repos/rsync-ai/rsync --jq .description`.
+  `gh api repos/rsync-ai/rsync.ai --jq .description`.
 - [x] **Website.** `https://rsync.ai`, confirmed live
-  (`gh api repos/rsync-ai/rsync --jq .homepage`).
+  (`gh api repos/rsync-ai/rsync.ai --jq .homepage`).
 - [x] **Topics.** GitHub allows 20 and the repository sits at exactly 20, so every addition
   costs a removal. Swapped: **added** `data-lineage` and `source-available`, **dropped** `ai`
   (redundant beside `ai-data-pipelines`) and `data-integration` (the vaguest of the set — it
   overlaps `data-pipeline`, `elt` and `etl`). Read the current set back with
-  `gh api repos/rsync-ai/rsync --jq '.topics | length, .'`.
+  `gh api repos/rsync-ai/rsync.ai --jq '.topics | length, .'`.
 
   Two candidates this checklist used to suggest were deliberately **not** taken, and should
   not be re-proposed without new evidence:
@@ -97,7 +97,7 @@ because a box is a claim and the API is the evidence. State confirmed 2026-09-22
   generated default from `opengraph.githubassets.com`.
 
   ```bash
-  curl -sL https://github.com/rsync-ai/rsync | grep -o 'og:image" content="[^"]*"'
+  curl -sL https://github.com/rsync-ai/rsync.ai | grep -o 'og:image" content="[^"]*"'
   ```
 - [x] **Licence display.** Confirmed: the repository API still reports the licence as
   `NOASSERTION`, because GitHub does not detect the rsync.ai Source-Available License from the `LICENSE`
@@ -114,7 +114,7 @@ because a box is a claim and the API is the evidence. State confirmed 2026-09-22
   with `enforce_admins` on and force pushes off, so the rule binds the maintainer too and
   history cannot be rewritten. 16 required status checks, covering DCO, the doc guards, Go,
   frontend lint/test/build, a11y, the unit suites, the moat check and the six security
-  scanners. Read it back with `gh api repos/rsync-ai/rsync/branches/main/protection`.
+  scanners. Read it back with `gh api repos/rsync-ai/rsync.ai/branches/main/protection`.
 - [ ] **Issue templates.** `bug_report.md`, `feature_request.md` and the chooser
   configuration already exist under `.github/ISSUE_TEMPLATE/`; confirm they render at
   *Issues → New issue* after any change to them.
@@ -172,7 +172,7 @@ release automatically.
 After publishing, verify (the workflow needs a minute or two):
 
 ```bash
-gh release view <tag> --repo rsync-ai/rsync --json assets --jq '.assets[].name'
+gh release view <tag> --repo rsync-ai/rsync.ai --json assets --jq '.assets[].name'
 # Expect: install.sh, docker-compose.quickstart.yml, SHA256SUMS
 ```
 
@@ -183,7 +183,7 @@ workflow does not backfill them.
 ### After the first release with assets
 
 - [ ] Optionally point the README's one-line install at the latest release's asset —
-  `curl -sSL https://github.com/rsync-ai/rsync/releases/latest/download/install.sh | bash` —
+  `curl -sSL https://github.com/rsync-ai/rsync.ai/releases/latest/download/install.sh | bash` —
   so installs are counted. **Only do this once the latest release actually carries
   `install.sh`.** Until then the URL 404s and the documented install breaks. Some tests pin
   the documented install command, so change the README, the docs and those tests together.
@@ -230,7 +230,7 @@ or a documented run. In particular:
   [connector reference](../connectors/reference.md) — quote that, not a memory of it.
 - Feature pages carry a *Verification status* section; do not summarise a page as more
   verified than it says.
-- Do not call the project "open source". It is source-available under the Elastic
-  License 2.0.
+- Do not call the project "open source". It is source-available under the
+  [rsync.ai Source-Available License](../../LICENSE).
 - Do not describe reverse ETL, column-level lineage or hosted/cloud availability as
   features: the first two are not shipped, and there is no hosted offering.

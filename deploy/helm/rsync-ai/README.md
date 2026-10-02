@@ -4,8 +4,8 @@ Runs the rsync.ai data-movement platform on any Kubernetes ≥1.25 cluster. Same
 images as the compose stack — EKS, GKE and AKS differ only by a values file.
 
 ```bash
-helm install rsync ./deploy/helm/rsync-ai \
-  --namespace rsync --create-namespace \
+helm install rsync-ai ./deploy/helm/rsync-ai \
+  --namespace rsync-ai --create-namespace \
   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
   --set secrets.internalServiceSecret="$(openssl rand -hex 24)" \
@@ -15,6 +15,9 @@ helm install rsync ./deploy/helm/rsync-ai \
   --set frontend.publicUrl=https://app.example.com \
   --set frontend.apiUrl=https://api.example.com
 ```
+
+Installed before v0.1.8 under the old default name, release `rsync` in namespace `rsync`?
+Keep upgrading it under that name; a new release name is a second install with empty volumes.
 
 <!--
 The two minio lines are not optional garnish. `objectStorage.mode` defaults to
@@ -264,7 +267,7 @@ model in it starts healthy and answers every prompt with `model "…" not found,
 try pulling it first`, so the stack comes up green and nothing works.
 
 ```bash
-helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai \
+helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai \
   --set ollama.enabled=true \
   --set generation.llm.provider=ollama \
   --wait --timeout 30m
@@ -306,7 +309,7 @@ a node that can hold the model resident.
 Layer on top of `values.yaml`; none of them is usable alone.
 
 ```bash
-helm install rsync ./deploy/helm/rsync-ai \
+helm install rsync-ai ./deploy/helm/rsync-ai \
   -f deploy/helm/rsync-ai/values-eks.yaml \
   -f my-values.yaml
 ```
@@ -393,7 +396,7 @@ connection in a surviving external database.
 connector Services exist under the names the platform builds:
 
 ```bash
-kubectl -n rsync get svc | grep -- '-mcp$'
+kubectl -n rsync-ai get svc | grep -- '-mcp$'
 ```
 
 Anything a pipeline references that is not listed there costs 120 s of pre-flight
@@ -419,12 +422,12 @@ cluster does not have. `kubectl get sc`, then set `global.storageClass`.
 ## Uninstall
 
 ```bash
-helm uninstall rsync -n rsync
+helm uninstall rsync-ai -n rsync-ai
 ```
 
 PVCs and the release Secret survive by design. Delete them explicitly:
 
 ```bash
-kubectl -n rsync delete pvc -l app.kubernetes.io/instance=rsync
-kubectl -n rsync delete secret rsync-secrets
+kubectl -n rsync-ai delete pvc -l app.kubernetes.io/instance=rsync-ai
+kubectl -n rsync-ai delete secret rsync-ai-secrets
 ```

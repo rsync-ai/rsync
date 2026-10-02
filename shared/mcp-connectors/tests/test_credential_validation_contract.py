@@ -51,7 +51,7 @@ AUTH_HEADERS = ("authorization", "x-api-key", "api-key",
 # Floors. Every count below is asserted to be positive before any verdict is
 # read from it: a discovery regression returns an empty set, and an empty set
 # passes every `for` loop silently.
-MIN_CORROBORATING_CONNECTORS = 4
+MIN_CORROBORATING_CONNECTORS = 3  # github-rest, notion-rest, stripe (petstore deleted)
 MIN_VENDORED_BASES = 15
 
 

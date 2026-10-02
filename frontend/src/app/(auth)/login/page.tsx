@@ -71,7 +71,7 @@ function LoginForm() {
     <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-zinc-50 to-zinc-100 dark:from-zinc-900 dark:to-zinc-800 p-4">
       <Card className="w-full max-w-md">
         <CardHeader className="space-y-1">
-          <CardTitle className="text-2xl font-bold text-center">Welcome to Rsync</CardTitle>
+          <CardTitle className="text-2xl font-bold text-center">Welcome to rsync.ai</CardTitle>
           <CardDescription className="text-center">
             Enter your credentials to access your account
           </CardDescription>

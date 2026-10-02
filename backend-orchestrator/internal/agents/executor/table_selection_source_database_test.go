@@ -256,7 +256,7 @@ func TestTableSelectionPause_DiscoveredTablesNameTheDatabase(t *testing.T) {
 		{"cdc lists the tables", "cdc", pgTables, 2},
 		{"batch lists the tables", "batch", pgTables, 2},
 		{"cdc found no tables", "cdc", []TableMetadata{}, 0},
-		{"batch found only rsync's own tables", "batch", onlyInternal, 0},
+		{"batch found only rsync.ai's own tables", "batch", onlyInternal, 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

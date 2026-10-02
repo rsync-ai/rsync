@@ -1,5 +1,5 @@
 #!/bin/bash
-# RSYNC AI - Master Control Script
+# rsync.ai - Master Control Script
 # Fully automated pipeline orchestration with auto-recovery
 # Usage: ./scripts/rsync <command> [options]
 
@@ -16,7 +16,7 @@ NC='\033[0m'
 
 # Help text
 show_help() {
-    echo "RSYNC AI - Agentic Data Pipeline Platform"
+    echo "rsync.ai - Agentic Data Pipeline Platform"
     echo "=========================================="
     echo ""
     echo "Usage: ./scripts/rsync <command> [options]"

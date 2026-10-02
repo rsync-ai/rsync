@@ -840,7 +840,7 @@ func buildTableMetadataFromAvailable(raw interface{}) []TableMetadata {
 		if name == "" {
 			continue
 		}
-		// Never feed rsync's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
+		// Never feed rsync.ai's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
 		// to the LLM ranker: they are not user data and must not be suggested.
 		// Covers pipelines that parked before the executor-side filter shipped,
 		// whose persisted available_tables still contains them.

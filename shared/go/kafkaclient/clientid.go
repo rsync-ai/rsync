@@ -15,7 +15,7 @@ const ClientIDNamespace = "rsync"
 // client.id was set nowhere in this platform, in any language, which on a
 // managed cluster (MSK, Confluent Cloud) has a specific cost: broker-side quotas
 // and throttle metrics key off client.id, so with the default value every
-// connection from every rsync service was indistinguishable both from each other
+// connection from every rsync.ai service was indistinguishable both from each other
 // and from any other tenant's default client. When the cluster throttled us
 // neither side could tell which service caused it, and the customer could not
 // scope a quota to this product even if they wanted to.

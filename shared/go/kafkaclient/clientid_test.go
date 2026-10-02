@@ -6,7 +6,7 @@ import (
 )
 
 // On a managed cluster (MSK, Confluent Cloud) throttle metrics and quotas key
-// off client.id. With it unset, every connection from every rsync service was
+// off client.id. With it unset, every connection from every rsync.ai service was
 // the library default, so a throttled customer could not tell which service --
 // or even which tenant -- caused it.
 func TestDefaultClientIDNamesTheProductAndTheService(t *testing.T) {

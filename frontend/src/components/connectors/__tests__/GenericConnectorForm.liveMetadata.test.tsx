@@ -44,15 +44,14 @@ type Expectation = { kind: string; oauthConnect: boolean }
 // The contract every deployed connector's served metadata must satisfy.
 // Post-A2 every credentialed connector declares supported_auth_methods → the
 // picker is authoritative (kind "picker"); only the auth_type:none public API
-// (countries-gql) renders no auth UI. The two connectors whose FIRST method is
-// oauth2 with a resolvable provider also surface the standalone Connect block.
+// (countries-gql) renders no auth UI. The one connector whose FIRST method is
+// oauth2 with a resolvable provider also surfaces the standalone Connect block.
 const EXPECT: Record<string, Expectation> = {
   "aws-s3": { kind: "picker", oauthConnect: false }, // api_key, schema creds (the #290 net)
   "countries-gql": { kind: "none", oauthConnect: false }, // public API, no auth
   "github-rest": { kind: "picker", oauthConnect: false }, // bearer
   "google-sheets": { kind: "picker", oauthConnect: true }, // oauth2 + provider google
   "mysql": { kind: "picker", oauthConnect: false }, // basic
-  "petstore": { kind: "picker", oauthConnect: true }, // oauth2 + provider petstore
   "postgresql": { kind: "picker", oauthConnect: false }, // basic
   "shopify-admin-graphql": { kind: "picker", oauthConnect: false }, // first method custom_header (oauth2 secondary)
 }

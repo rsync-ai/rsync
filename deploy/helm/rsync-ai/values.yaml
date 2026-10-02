@@ -883,11 +883,11 @@ connectors:
     kafkaConnect:
       image: { repository: kafka-connect, tag: "" }
       groupId: rsync-connect-cluster
-      # DEPRECATED -- leave empty. The rsync kafka-connect image's own entrypoint
+      # DEPRECATED -- leave empty. The rsync.ai kafka-connect image's own entrypoint
       # builds sasl.jaas.config (and OAuth, and the mTLS keystore) from the
       # KAFKA_* settings; see shared/internal/infra/kafka-connect/connect-entrypoint.sh.
       # A value here replaces that entrypoint entirely, so set it only when
-      # `image` is a Connect distribution that is not rsync's -- that image must
+      # `image` is a Connect distribution that is not rsync.ai's -- that image must
       # then configure Kafka security itself. The old default
       # "/docker-entrypoint.sh start" is treated as empty.
       entrypoint: ""
@@ -933,8 +933,8 @@ connectors:
   # OOM-killed itself — the kernel kills the largest process on the node, which
   # is Kafka or Postgres.
   # Empty by default, and that is a resource decision rather than a missing
-  # prerequisite: all 21 connector images publish to ghcr.io/rsync-ai, but
-  # running all 21 would cost ~1 GB of the target 16 GB node before a single row
+  # prerequisite: all 20 connector images publish to ghcr.io/rsync-ai, but
+  # running all 20 would cost ~1 GB of the target 16 GB node before a single row
   # moves. Declare only the connectors your pipelines actually name.
   fleet: []
   #  - id: postgresql

@@ -1,6 +1,6 @@
-# Avro Schemas for RSync Data Pipeline
+# Avro Schemas for rsync.ai Data Pipeline
 
-This directory contains all Avro schemas used across the RSync platform for Kafka message serialization.
+This directory contains all Avro schemas used across the rsync.ai platform for Kafka message serialization.
 
 ## Overview
 

@@ -1,4 +1,4 @@
-# Rsync AI API (Local Docker) — Reference
+# rsync.ai API (Local Docker) — Reference
 
 This repo runs as a **multi-service stack**. The two HTTP APIs you'll call most are:
 

@@ -1,6 +1,6 @@
 # AKS overlay — layer on top of values.yaml, do not use alone:
 #
-#   helm install rsync ./rsync-ai -f rsync-ai/values-aks.yaml -f my-values.yaml
+#   helm install rsync-ai ./rsync-ai -f rsync-ai/values-aks.yaml -f my-values.yaml
 #
 # ─────────────────────────────────────────────────────────────────────────────
 # What goes in that second file

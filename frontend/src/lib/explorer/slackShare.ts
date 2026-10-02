@@ -131,7 +131,7 @@ export function buildSlackMessage(args: SlackMessageArgs): SlackMessage {
   const by = args.sharedBy?.trim()
   blocks.push({
     type: "context",
-    elements: [{ type: "mrkdwn", text: by ? `Shared from rsync Data Explorer by ${by}` : "Shared from rsync Data Explorer" }],
+    elements: [{ type: "mrkdwn", text: by ? `Shared from rsync.ai Data Explorer by ${by}` : "Shared from rsync.ai Data Explorer" }],
   })
 
   return { text: headline, blocks }

@@ -1,4 +1,4 @@
-# Rsync AI Scripts
+# rsync.ai Scripts
 
 Utility scripts for development, testing, and deployment.
 

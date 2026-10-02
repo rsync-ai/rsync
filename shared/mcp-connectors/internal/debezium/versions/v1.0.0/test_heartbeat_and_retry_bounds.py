@@ -14,7 +14,7 @@ pipeline that reported "healthy" for three days while moving zero rows:
 
 2. Debezium's default `errors.max.retries` is -1 — retry a retriable error forever.
    The task never leaves RUNNING, Connect's /status stays green, and every piece of
-   machinery rsync already has for this failure (diagnose.go -> ActionReSnapshot ->
+   machinery rsync.ai already has for this failure (diagnose.go -> ActionReSnapshot ->
    MONGODB_RESUME_TOKEN_INVALID) hangs off a task reaching FAILED, so none of it
    ever ran. Measured on the live connector: 0 FAILED transitions in 24h while the
    error fired roughly ten times a minute.
@@ -122,11 +122,11 @@ def test_the_key_debezium_names_the_topic_from_is_set():
     #1098 set only the first. Heartbeats fired on schedule and landed on
     `__debezium-heartbeat.<topic.prefix>`, while the pre-created, ACL-granted
     `rsync.heartbeat.<topic.prefix>` stayed at offset 0 forever (observed live
-    2026-09-20). On a BYO-Kafka cluster that grants rsync only `rsync.*`, the
+    2026-09-20). On a BYO-Kafka cluster that grants rsync.ai only `rsync.*`, the
     unqualified topic falls outside the grant and — with errors.tolerance=none —
     fails the task outright.
 
-    Every other assertion in this file checks the key rsync WRITES. This one checks
+    Every other assertion in this file checks the key rsync.ai WRITES. This one checks
     the key Debezium READS, which is the only reason the wrong fix could not stay
     green.
     """
@@ -183,7 +183,7 @@ def test_postgresql_source_heartbeats_by_default(db_type):
 
 def test_postgresql_heartbeat_never_writes_to_the_source():
     # heartbeat.action.query would advance an idle slot, but it runs a write on the
-    # customer's database. rsync reads the source and nothing else.
+    # customer's database. rsync.ai reads the source and nothing else.
     cfg = _relational_cfg("postgresql")
     assert "heartbeat.action.query" not in cfg
 
@@ -203,7 +203,7 @@ def test_postgresql_takes_the_orchestrator_supplied_prefix(monkeypatch):
 
 
 def test_heartbeat_prefix_is_namespaced_under_a_custom_kafka_topic_prefix(monkeypatch):
-    # A BYO-Kafka cluster grants rsync only `<prefix>*`. An unqualified
+    # A BYO-Kafka cluster grants rsync.ai only `<prefix>*`. An unqualified
     # `__debezium-heartbeat.*` topic is refused by the ACL, which is precisely
     # KI-KAFKA-DATAPLANE-AUTOCREATE-ONLY.
     monkeypatch.setenv("KAFKA_TOPIC_PREFIX", "acme.")

@@ -25,7 +25,7 @@ func clearKafkaEnv(t *testing.T) {
 }
 
 // The client.id is what a customer's broker attributes load, throttling and
-// quotas to. Unset, every connection from every rsync service is
+// quotas to. Unset, every connection from every rsync.ai service is
 // indistinguishable from every other tenant's default client.
 func TestSecurityStampsServiceClientID(t *testing.T) {
 	clearKafkaEnv(t)

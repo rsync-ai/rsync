@@ -1,5 +1,5 @@
 #!/bin/bash
-# Rsync AI - Database Migration Script
+# rsync.ai - Database Migration Script
 # Runs all SQL migrations in order
 
 set -e

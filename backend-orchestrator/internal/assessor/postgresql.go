@@ -58,7 +58,7 @@ func (a *PostgresAssessor) Assess(ctx context.Context, in Input) (*Result, error
 				Steps: []string{
 					"Verify host, port, user, password in connection config",
 					"Verify the database user has CONNECT privilege",
-					"Check network reachability from rsync to PostgreSQL",
+					"Check network reachability from rsync.ai to PostgreSQL",
 				},
 				DocURL:           diagnose.ErrorDocURL("postgres-connection-failed"),
 				EstimatedMinutes: 5,
@@ -456,12 +456,12 @@ func oneTablePKCheck(ctx context.Context, db *sql.DB, schema, table string, cdcD
 			Message: fmt.Sprintf("Table %s.%s has no declared primary key; using user-nominated key column(s): %s. Updates apply in place on this key.", schema, table, strings.Join(nominatedCols, ", ")),
 		}
 	}
-	// No primary key → do NOT block. rsync routes keyless tables through the
+	// No primary key → do NOT block. rsync.ai routes keyless tables through the
 	// sink's content-hash surrogate key (_rsync_row_hash), matching the
 	// Fivetran/Airbyte market standard. WARNING, never a hard block.
 	return Check{
 		Code: code, Severity: SeverityWarning, Passed: true,
-		Message: fmt.Sprintf("Table %s.%s has no primary key. rsync will load it using a content-hash surrogate key (_rsync_row_hash), so the run succeeds. Because the hash covers all columns, a later change to any column is written as a new row (the prior version is retained), so updates can accumulate duplicates. For in-place updates, nominate identifying column(s) as the key (recommended) or add a PRIMARY KEY on the source.", schema, table),
+		Message: fmt.Sprintf("Table %s.%s has no primary key. rsync.ai will load it using a content-hash surrogate key (_rsync_row_hash), so the run succeeds. Because the hash covers all columns, a later change to any column is written as a new row (the prior version is retained), so updates can accumulate duplicates. For in-place updates, nominate identifying column(s) as the key (recommended) or add a PRIMARY KEY on the source.", schema, table),
 		Remediation: &diagnose.Remediation{
 			Steps: []string{
 				"No action needed to run — keyless tables replicate via a content-hash surrogate key.",

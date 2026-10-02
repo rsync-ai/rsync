@@ -1,6 +1,6 @@
 """Every command a reader can copy must name the repository they can actually clone.
 
-The public repo is `rsync-ai/rsync`; the private one repeats the owner. Neither
+The public repo is `rsync-ai/rsync.ai`; the private one repeats the owner. Neither
 this paragraph nor the rest of this file writes that private slug out, because
 the gate below correctly refuses it in prose too -- see the note above EXEMPT. A
 stale slug in a `git clone` line is a first-run failure with a confusing message
@@ -45,7 +45,9 @@ import subprocess
 # search and so the gate cannot be defeated by editing the pattern to miss.
 OWNER = "rsync-ai"
 PRIVATE_SLUG = f"{OWNER}/{OWNER}"
-PUBLIC_SLUG = f"{OWNER}/rsync"
+PUBLIC_SLUG = f"{OWNER}/rsync.ai"
+# The public repo's name until it was renamed to match the product, rsync.ai.
+FORMER_PUBLIC_SLUG = f"{OWNER}/rsync"
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 
@@ -324,7 +326,7 @@ def test_no_history_permalink_was_repointed_at_the_public_repo():
     replacement is narrower, so read this before widening it. It was first
     written when the public repo had no history to cite -- a fresh orphan commit,
     no PRs -- which made every such URL a sweep artefact by construction. That is
-    no longer true: `rsync` now has its own merged PRs, and a private document
+    no longer true: `rsync.ai` now has its own merged PRs, and a private document
     about the two-repo split has legitimate reason to name one. What has NOT
     changed is that the two numbering schemes are indistinguishable inside a URL,
     so admitting the deliberate case would also admit every swept one.
@@ -374,3 +376,61 @@ def test_that_inverse_gate_is_not_vacuous():
     assert not pattern.search(f"https://github.com/{PUBLIC_SLUG}/issues"), (
         "the inverse gate flags the live issue tracker, which is a correct link"
     )
+
+
+# Files that record what happened under the former name, and stay as written.
+FORMER_SLUG_HISTORY = {
+    "CAPABILITIES-ARCHIVE.md": "append-only evidence, each row true on the day it was written",
+    "LICENSES/LicenseRef-rsync.ai-ELv2-legacy.txt": "the licence before v0.1.8, kept byte for byte",
+    "docs/internal/public-flip-runbook.md": "the record of the flip, which ran under the former name",
+}
+
+# The former slug, but not the private slug or the current one, which both start with it.
+_FORMER = re.compile(re.escape(FORMER_PUBLIC_SLUG) + r"(?![-\w]|\.ai)")
+
+
+def test_no_tracked_file_uses_the_former_public_name():
+    """The public repo was renamed; a reference to its old name can break without notice.
+
+    GitHub redirects git and web URLs of a renamed repository only until someone
+    creates a repository at the old name, and its documentation promises nothing
+    for raw.githubusercontent.com, which is what the one-line install fetches.
+    The image-publish guards in docker-publish.yml are worse: they compare
+    `github.repository` to a string, so the old name there is false forever and
+    the release publishes nothing. A copied install line or guard brings it back.
+    """
+    offenders = []
+    for rel in _tracked_files():
+        if rel in FORMER_SLUG_HISTORY:
+            continue
+        try:
+            text = (REPO / rel).read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError, FileNotFoundError):
+            continue
+        if FORMER_PUBLIC_SLUG not in text:
+            continue
+        for number, line in enumerate(text.splitlines(), start=1):
+            if _FORMER.search(line):
+                offenders.append((rel, number, line.strip()[:160]))
+    assert not offenders, (
+        f"These lines name the public repo by its former name, {FORMER_PUBLIC_SLUG}. "
+        f"Use {PUBLIC_SLUG}:\n"
+        + "\n".join(f"    {rel}:{n}: {line}" for rel, n, line in offenders)
+    )
+
+
+def test_the_former_name_matcher_is_not_vacuous():
+    """It must flag the old name in each shape a sweep misses, and pass the two live slugs."""
+    for stale in (
+        f"curl -sSL https://raw.githubusercontent.com/{FORMER_PUBLIC_SLUG}/main/install.sh",
+        f"git clone https://github.com/{FORMER_PUBLIC_SLUG}.git",
+        f"if: github.repository == '{FORMER_PUBLIC_SLUG}'",
+        f"see {FORMER_PUBLIC_SLUG}#22",
+    ):
+        assert _FORMER.search(stale), f"the former name is not flagged in: {stale}"
+    for live in (PUBLIC_SLUG, PRIVATE_SLUG, f"https://github.com/{PUBLIC_SLUG}.git"):
+        assert not _FORMER.search(live), f"a live slug is flagged as the former name: {live}"
+    for rel in FORMER_SLUG_HISTORY:
+        assert (REPO / rel).exists() or not (REPO / "docs" / "internal").exists(), (
+            f"{rel} is listed as history but is gone; drop it from FORMER_SLUG_HISTORY"
+        )

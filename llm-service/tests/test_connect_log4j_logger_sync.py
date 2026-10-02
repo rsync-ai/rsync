@@ -164,7 +164,7 @@ def test_the_image_ships_both_files_and_runs_the_sync_before_the_base_entrypoint
 
 def test_no_logger_level_is_baked_into_the_config_volume():
     """A level written into /kafka/config at build time reaches only a fresh volume --
-    the defect this file exists for. rsync's levels live in log4j-loggers.properties."""
+    the defect this file exists for. rsync.ai's levels live in log4j-loggers.properties."""
     dockerfile = (CONNECT / "Dockerfile").read_text()
     assert not re.search(r"log4j\.logger\.\S+=\S+", dockerfile), (
         "a logger level is set in the Dockerfile; put it in log4j-loggers.properties"

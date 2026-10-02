@@ -9,7 +9,7 @@ external service: every operation answers from in-memory Python data, so a
 sync flows straight through the existing batch pipeline to the user's chosen
 destination, and the freshly-synced tables are then queryable in Data Explorer.
 
-The `email` column on `customers` is intentional — it exercises rsync's
+The `email` column on `customers` is intentional — it exercises rsync.ai's
 PII-detection/masking gate during the demo, so the trust story is visible too.
 
 Implements the minimal SOURCE contract the orchestrator batch executor calls

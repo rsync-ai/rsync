@@ -137,7 +137,7 @@ def test_the_parser_handles_parenthesised_paths():
         ("api-gateway/cmd/server/main.go:114–119", "api-gateway/cmd/server/main.go"),  # en dash
         ("frontend/src/app/(dashboard)/page.tsx:120", "frontend/src/app/(dashboard)/page.tsx"),
         # not repo paths
-        ("https://github.com/rsync-ai/rsync", None),
+        ("https://github.com/rsync-ai/rsync.ai", None),
         ("#a-heading-in-this-file", None),
         ("", None),
     ],

@@ -1,8 +1,8 @@
 {{/*
 `helm test` for this release.
 
-WHY THIS EXISTS. docs/deployment/kubernetes.md has offered `helm -n rsync test
-rsync` as its verification step since the chart was written, and until this file
+WHY THIS EXISTS. docs/deployment/kubernetes.md has offered `helm -n rsync-ai test
+rsync-ai` as its verification step since the chart was written, and until this file
 existed the chart defined ZERO test hooks -- its only two are
 `post-install,post-upgrade` (infra/minio.yaml, jobs/kafka-init.yaml). So the
 command printed `TEST SUITE: None` and exited 0. A reader ran the documented

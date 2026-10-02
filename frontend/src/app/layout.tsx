@@ -23,8 +23,8 @@ export const dynamic = "force-dynamic"
 
 export const metadata: Metadata = {
   title: {
-    default: "Rsync",
-    template: "%s | Rsync",
+    default: "rsync.ai",
+    template: "%s | rsync.ai",
   },
   description:
     "Self-hosted, source-available AI data platform for batch pipelines, CDC, scheduled models, and lineage. Describe a pipeline in plain English, approve the plan, and see exactly what ran, failed, or became stale.",

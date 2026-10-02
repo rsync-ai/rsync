@@ -1,1 +1,0 @@
-"""Petstore MCP Connector"""

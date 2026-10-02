@@ -4,7 +4,7 @@
 
 set -e
 
-echo "🔍 RSYNC-AI Frontend Quick Test"
+echo "🔍 rsync.ai Frontend Quick Test"
 echo "================================"
 
 # Colors

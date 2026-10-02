@@ -74,6 +74,15 @@ Generation writes, into `versions/<version>/`:
 and a `latest.json` at the connector root pointing at that version. Everything after
 this point is editing `versions/<current_version>/connector.py`.
 
+Every connector here is `v1.0.0`, and a bug fix by hand patches that version **in
+place**, so a user who already pulled the connector gets the fix at the version they
+run. A new version by hand is only for a change the maintainers decide is major: bump
+`versions/<v>/`, `latest.json` and `docker-compose.mcp.yml` together.
+
+Regeneration is the exception. The tool generator (REST and GraphQL only) always
+writes a **new** version (`v1.0.0` the first time, then `v1.0.1`, `v1.0.2`, ...) and
+moves `latest.json` to it, so regenerating never overwrites a version you fixed by hand.
+
 ### 2. Implement Core Methods
 
 Edit `connector.py` and implement:
@@ -341,7 +350,7 @@ work from.
 
 #### Optional: `supported_versions` (database connectors)
 
-Database connectors should advertise which engine versions rsync supports,
+Database connectors should advertise which engine versions rsync.ai supports,
 keyed by sync mode. This block is surfaced read-only in the connection-config
 modal (`UnifiedConnectorModal`) so users know up front whether their server
 version is compatible — especially for CDC, which has stricter minimums.
@@ -365,7 +374,7 @@ Docker build context points at.
 
 ##### Supported engine versions
 
-This table is the canonical source for what rsync claims to support. Its strings are mirrored verbatim into each connector's `metadata.json` `supported_versions` and rendered read-only in the config modal. Keep this table and the metadata in lockstep.
+This table is the canonical source for what rsync.ai claims to support. Its strings are mirrored verbatim into each connector's `metadata.json` `supported_versions` and rendered read-only in the config modal. Keep this table and the metadata in lockstep.
 
 | Engine | Batch (snapshot / incremental) | CDC (streaming) |
 |---|---|---|

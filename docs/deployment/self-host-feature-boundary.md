@@ -1,6 +1,6 @@
 # What you get when you self-host
 
-This page answers one question: **if I run rsync on my own server or cluster, what
+This page answers one question: **if I run rsync.ai on my own server or cluster, what
 works, what needs me to bring something, and what is not there?**
 
 Every claim below is cited to the file that decides it. There is **no edition gate** in

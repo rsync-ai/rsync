@@ -1,7 +1,7 @@
 # Strategy: Chat Response Accuracy & "Truth" Verification
 
 ## 🎯 Objective
-To guarantee that the RSYNC AI Chat Assistant provides **factually correct** information by validating every bot response against the actual system state (Database/API). We move beyond simple "keyword matching" to "truth verification".
+To guarantee that the rsync.ai Chat Assistant provides **factually correct** information by validating every bot response against the actual system state (Database/API). We move beyond simple "keyword matching" to "truth verification".
 
 ## 🧠 Core Concept: "State-Aware Testing"
 Standard tests verify if the bot *responds*.

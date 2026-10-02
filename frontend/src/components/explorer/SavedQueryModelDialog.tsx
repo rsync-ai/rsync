@@ -40,7 +40,7 @@ const MANAGE_ROLE_HINT =
 
 // A model is a saved query plus a decision about what running it DOES, plus
 // (optionally) a schedule — the in-warehouse "T" of ELT. The rows never leave the
-// warehouse; rsync only sends the statement, so this dialog is about what the result
+// warehouse; rsync.ai only sends the statement, so this dialog is about what the result
 // does and how often, never about moving data.
 //
 // Two ordering rules are enforced by the backend and mirrored here so the UI never
@@ -925,7 +925,7 @@ export function SavedQueryModelDialog({
           <DialogDescription>
             Decide what running this query does — build a table from its results, or run the
             SQL as written — and how often. Everything happens inside the same database:
-            rsync only sends the statement, so no rows leave the warehouse.
+            rsync.ai only sends the statement, so no rows leave the warehouse.
           </DialogDescription>
         </DialogHeader>
 
@@ -947,14 +947,14 @@ export function SavedQueryModelDialog({
           )}
 
           {/* Said once at the top for the same reason the role notice is: the alternative
-              is a user reading three greyed-out radio buttons and concluding rsync is
+              is a user reading three greyed-out radio buttons and concluding rsync.ai is
               broken. Shown regardless of role — a viewer looking at a BigQuery query
               should not be told the only obstacle is their role. */}
           {engineBlocked && (
             <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-2">
               <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-400" />
               <p className="text-xs text-amber-700 dark:text-amber-300">
-                {ENGINE_HINT}. Running a query against {engineName} works, but rsync has no
+                {ENGINE_HINT}. Running a query against {engineName} works, but rsync.ai has no
                 way to execute the CREATE TABLE the rebuild needs, so this query can be saved
                 and run by hand but not turned into a table or put on a schedule.
               </p>

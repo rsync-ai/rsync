@@ -681,7 +681,7 @@ export function PipelineTableSelector(props: {
 
   const sortedTables = useMemo(() => {
     const merged = availableTables.length > 0 ? availableTables : discoveredTables
-    // Hide rsync's own bookkeeping/staging tables (`_rsync_*`, `flat_*`) — they
+    // Hide rsync.ai's own bookkeeping/staging tables (`_rsync_*`, `flat_*`) — they
     // are not user data and must never be shown, ranked, or pre-selected. Mirrors
     // the Data Explorer, which already filters them via the same predicate; this
     // also covers pipelines that parked before the executor-side filter shipped.
@@ -1294,7 +1294,7 @@ export function PipelineTableSelector(props: {
                       </>
                     ) : (
                       <>
-                        <span className="font-medium">Leave blank</span> and rsync creates a matching {destMeta.noun.toLowerCase()} for
+                        <span className="font-medium">Leave blank</span> and rsync.ai creates a matching {destMeta.noun.toLowerCase()} for
                         each one on the destination{exampleSchemas ? <> (e.g. <span className="font-mono">{exampleSchemas}</span>)</> : null},
                         so same-named tables never overwrite each other. <span className="font-medium">Type a name</span> to merge every
                         {" "}source {namespaceNoun} into that single {destMeta.noun.toLowerCase()} instead.
@@ -1307,7 +1307,7 @@ export function PipelineTableSelector(props: {
                   </p>
                 ) : (
                   <p className="text-xs text-zinc-500 dark:text-zinc-400">
-                    rsync <span className="font-medium">creates this {destMeta.noun.toLowerCase()}</span>{" "}
+                    rsync.ai <span className="font-medium">creates this {destMeta.noun.toLowerCase()}</span>{" "}
                     on the destination (if it doesn&apos;t already exist) and lands your tables in it.
                   </p>
                 )}

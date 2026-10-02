@@ -499,7 +499,7 @@ class ObjectStorageSourceMixin:
     def _stage_blob(self, content: bytes, *, staging_config: Dict,
                     content_type: str, object_key: str, sha256: str) -> str:
         """Copy one object's raw bytes byte-identical into the claim-check store
-        (rsync's internal MinIO) and return its s3://bucket/key data_ref.
+        (rsync.ai's internal MinIO) and return its s3://bucket/key data_ref.
 
         Reuses the connector's staging S3 client (self._get_staging_client, supplied
         by BaseMCPConnector). The staged key is content-addressed by the FULL sha256

@@ -149,7 +149,7 @@ func readConnectStatus(ctx context.Context, statusURL string) (connectStatusDoc,
 
 // restartFailedConnectorTasks asks Connect to restart only the FAILED instances.
 // Used once, when start_sync was a no-op on an identical config: a user who fixed
-// the cause outside rsync (credentials, privileges) and pressed Run again would
+// the cause outside rsync.ai (credentials, privileges) and pressed Run again would
 // otherwise meet the same FAILED task, because an unchanged config never restarts it.
 func restartFailedConnectorTasks(ctx context.Context, statusURL string) error {
 	restartURL := strings.TrimSuffix(statusURL, "/status") + "/restart?includeTasks=true&onlyFailed=true"

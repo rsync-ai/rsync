@@ -4,7 +4,7 @@ set -euo pipefail
 # ─── rsync.ai — One-command Kubernetes installer ─────────────────────────────
 #
 # Usage (any cluster your current kubectl context points at):
-#   curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install-k8s.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install-k8s.sh | bash
 #
 # It needs nothing else from you. Every secret and setting you do not supply is
 # generated or defaulted, and the result is a working install:
@@ -101,7 +101,7 @@ SETTLE_TIMEOUT_S="${RSYNC_SETTLE_TIMEOUT_S:-90}"
 # (connectors.sampleData). A guard (test_install_k8s_defaults_work.py) compares
 # this list with the tree, so a new connector cannot ship without being
 # installable here.
-KNOWN_CONNECTORS="aws-s3:v1.0.0 azure-blob:v1.0.0 bigquery:v1.0.0 clickhouse:v1.0.0 databricks:v1.0.0 gcs:v1.0.0 github-rest:v1.0.0 google-sheets:v1.0.0 mongodb:v1.0.0 mysql:v1.0.0 notion-rest:v1.0.0 oracle:v1.0.0 petstore:v1.0.3 postgresql:v1.0.0 redshift:v1.0.0 shopify-admin-graphql:v1.0.0 snowflake:v1.0.0 sqlserver:v1.0.0 stripe:v1.0.0 widgets-graphql:v1.0.0"
+KNOWN_CONNECTORS="aws-s3:v1.0.0 azure-blob:v1.0.0 bigquery:v1.0.0 clickhouse:v1.0.0 databricks:v1.0.0 gcs:v1.0.0 github-rest:v1.0.0 google-sheets:v1.0.0 mongodb:v1.0.0 mysql:v1.0.0 notion-rest:v1.0.0 oracle:v1.0.0 postgresql:v1.0.0 redshift:v1.0.0 shopify-admin-graphql:v1.0.0 snowflake:v1.0.0 sqlserver:v1.0.0 stripe:v1.0.0 widgets-graphql:v1.0.0"
 # Enough for the two documented paths (PG -> Mongo CDC, and object storage) plus
 # MySQL, which is the third most asked-for source. ~0.5 GiB of requests.
 DEFAULT_CONNECTORS="postgresql,mysql,mongodb,aws-s3,gcs"
@@ -307,8 +307,10 @@ build_fleet() {
 }
 
 load_settings() {
-  NAMESPACE="$(cfg RSYNC_NAMESPACE rsync)"
-  RELEASE="$(cfg RSYNC_RELEASE rsync)"
+  NAMESPACE_SET="$(cfg RSYNC_NAMESPACE)"
+  RELEASE_SET="$(cfg RSYNC_RELEASE)"
+  NAMESPACE="${NAMESPACE_SET:-rsync-ai}"
+  RELEASE="${RELEASE_SET:-rsync-ai}"
   STORAGE_CLASS="$(cfg RSYNC_STORAGE_CLASS)"
   IMAGE_REGISTRY="$(cfg RSYNC_IMAGE_REGISTRY)"
   IMAGE_TAG="$(cfg RSYNC_IMAGE_TAG)"
@@ -418,7 +420,7 @@ write_env_skeleton() {
 #RSYNC_APP_HOST=app.example.com
 #RSYNC_API_HOST=api.example.com
 #RSYNC_INGRESS_CLASS=nginx
-#RSYNC_TLS_SECRET=rsync-tls      # an existing kubernetes.io/tls Secret; makes the URLs https
+#RSYNC_TLS_SECRET=rsync-ai-tls   # an existing kubernetes.io/tls Secret; makes the URLs https
 
 # ── LLM (chat is how you create pipelines in the UI) ────────────────────────
 #OPENAI_API_KEY=sk-...
@@ -427,16 +429,16 @@ write_env_skeleton() {
 #RSYNC_LLM_PROVIDER=ollama
 
 # ── Cluster ──────────────────────────────────────────────────────────────────
-#RSYNC_NAMESPACE=rsync
-#RSYNC_RELEASE=rsync
+#RSYNC_NAMESPACE=rsync-ai
+#RSYNC_RELEASE=rsync-ai
 #RSYNC_KUBE_CONTEXT=              # default: your current kubectl context
 #RSYNC_STORAGE_CLASS=             # default: the cluster's default StorageClass
 
 # ── What to install ──────────────────────────────────────────────────────────
 # Source/destination connectors to run as pods (Kubernetes cannot deploy them
 # on demand). Pick from: aws-s3 azure-blob bigquery clickhouse databricks gcs
-# github-rest google-sheets mongodb mysql notion-rest oracle petstore postgresql
-# redshift shopify-admin-graphql snowflake sqlserver stripe widgets-graphql
+# github-rest google-sheets mongodb mysql notion-rest oracle postgresql redshift
+# shopify-admin-graphql snowflake sqlserver stripe widgets-graphql
 #RSYNC_CONNECTORS=postgresql,mysql,mongodb,aws-s3,gcs
 #RSYNC_DEMO=true                  # the sample-data try-it path
 
@@ -657,6 +659,27 @@ fit_to_cluster() {
 
 # ─── Cluster preflight ───────────────────────────────────────────────────────
 
+# Until v0.1.8 the default was release `rsync` in namespace `rsync`. Re-running
+# with the new default would install a second copy beside that one, with fresh
+# secrets and empty volumes, and leave the first running. So a name the user did
+# not choose falls back to the old default when an install is already there --
+# unless one exists under the new name too, which then wins.
+installed_as() {  # <namespace> <release>
+  "$HELM" status "$2" -n "$1" ${HELM_CTX[@]+"${HELM_CTX[@]}"} >/dev/null 2>&1 \
+    || kc -n "$1" get secret "${2}-secrets" >/dev/null 2>&1
+}
+
+keep_earlier_default_name() {
+  [[ -z "$NAMESPACE_SET" || -z "$RELEASE_SET" ]] || return 0
+  local ns="${NAMESPACE_SET:-rsync}" rel="${RELEASE_SET:-rsync}"
+  installed_as "$NAMESPACE" "$RELEASE" && return 0
+  installed_as "$ns" "$rel" || return 0
+  NAMESPACE="$ns"
+  RELEASE="$rel"
+  info "Found an earlier install as release '${RELEASE}' in namespace '${NAMESPACE}'; upgrading it in place"
+  echo "  (set RSYNC_RELEASE and RSYNC_NAMESPACE in ${INSTALL_DIR}/${ENV_FILE} to choose the name yourself)"
+}
+
 preflight_cluster() {
   section "Checking the cluster"
   local ctx
@@ -664,6 +687,7 @@ preflight_cluster() {
   [[ -n "$ctx" ]] || die "kubectl has no current context. Point it at your cluster (e.g. 'gcloud container clusters get-credentials …', 'aws eks update-kubeconfig …', 'az aks get-credentials …') and re-run."
   kc get --raw /readyz >/dev/null 2>&1 || kc version >/dev/null 2>&1 || die "Cannot reach the cluster behind context '${ctx}'. Check 'kubectl get nodes'."
   info "Cluster reachable (context: ${ctx})"
+  keep_earlier_default_name
 
   # An unbound PVC is the most common way a "successful" install hangs: nothing
   # errors, the database pod just sits Pending until --wait gives up.

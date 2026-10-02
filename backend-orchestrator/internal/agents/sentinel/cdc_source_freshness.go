@@ -219,7 +219,7 @@ func sourceHeartbeatEnabled(config map[string]interface{}) bool {
 // last LSN the connector received, so it acknowledges WAL that was decoded and filtered
 // out, but a database with no writes sends no new LSN and the heartbeat repeats the
 // same one. Only heartbeat.action.query would move it, and that writes to the source,
-// which rsync does not do. Treating a PostgreSQL heartbeat as a liveness beacon would
+// which rsync.ai does not do. Treating a PostgreSQL heartbeat as a liveness beacon would
 // therefore raise the stall alarm on every quiet PostgreSQL pipeline.
 //
 // connector.class is not a secret; like the heartbeat key it is read and never logged.

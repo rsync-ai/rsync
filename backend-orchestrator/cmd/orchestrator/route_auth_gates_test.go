@@ -66,7 +66,7 @@ func TestUngatedGroupsRequireAPrincipal(t *testing.T) {
 		body   string
 	}{
 		// Pre-flight assessment. The POST is the severe one: an anonymous caller
-		// supplying another tenant's source_connection_id had rsync decrypt those
+		// supplying another tenant's source_connection_id had rsync.ai decrypt those
 		// credentials and dial the victim's database from inside its own network.
 		{"run assessment", http.MethodPost, "/api/v1/pipelines/" + pipelineID + "/assess",
 			`{"source_connection_id":"00000000-0000-0000-0000-000000000001"}`},

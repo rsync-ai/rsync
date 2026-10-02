@@ -27,7 +27,7 @@ async function thrown(): Promise<DiscoveryError> {
   throw new Error("generateFromSession did not throw")
 }
 
-const SENTENCE = "Set up an LLM first: add OPENAI_API_KEY to .env, then restart rsync."
+const SENTENCE = "Set up an LLM first: add OPENAI_API_KEY to .env, then restart rsync.ai."
 
 describe("generateFromSession errors", () => {
   it("shows the sentence, not the code, when no LLM is set up", async () => {

@@ -142,7 +142,7 @@ func TestCheck_RemediationCarriesCopyableSQL(t *testing.T) {
 	// failure that killed docs.rsync-ai.dev. Comparing against
 	// diagnose.ErrorDocURL(...) here would be a tautology that passes no matter
 	// what the builder emits, so the expected value is written out by hand.
-	const wantURL = "https://github.com/rsync-ai/rsync/blob/main/docs/errors/README.md#mysql-binlog-format"
+	const wantURL = "https://github.com/rsync-ai/rsync.ai/blob/main/docs/errors/README.md#mysql-binlog-format"
 	if c.Remediation.DocURL != wantURL {
 		t.Errorf("DocURL = %q, want %q", c.Remediation.DocURL, wantURL)
 	}
@@ -154,7 +154,7 @@ func TestCheck_RemediationCarriesCopyableSQL(t *testing.T) {
 // docs mirror can repoint it with RSYNC_DOCS_BASE_URL.
 func TestErrorDocURL_ShapeAndOverride(t *testing.T) {
 	if got, want := diagnose.ErrorDocURL("postgres-wal-level"),
-		"https://github.com/rsync-ai/rsync/blob/main/docs/errors/README.md#postgres-wal-level"; got != want {
+		"https://github.com/rsync-ai/rsync.ai/blob/main/docs/errors/README.md#postgres-wal-level"; got != want {
 		t.Errorf("default ErrorDocURL = %q, want %q", got, want)
 	}
 	// Trailing slash on the override must not produce a doubled separator.

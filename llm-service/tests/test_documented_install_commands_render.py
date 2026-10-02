@@ -45,7 +45,7 @@ on any machine that has helm.
 
 _install_blocks() was also narrower than the docs it claimed to cover: its
 filter matched only `deploy/helm/rsync-ai`, so README.md's published-chart
-block (`helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai ...`) was
+block (`helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai ...`) was
 never collected, and every assertion in this file passed while that block --
 the one a reader can actually run without cloning the repo -- went unchecked.
 The OCI form also needed its own required-key source: apps/frontend.yaml
@@ -53,7 +53,7 @@ enforces `frontend.apiUrl`/`frontend.publicUrl` through a `required` function,
 not a validate.yaml `fail`, so reading validate.yaml alone under-reported the
 required set by two keys precisely on the block that needs them. Both gaps are
 closed now (`_required_value_paths()` reads validate.yaml + frontend.yaml;
-`_install_blocks()` admits a `helm install rsync oci://.../charts/rsync-ai`
+`_install_blocks()` admits a `helm install rsync-ai oci://.../charts/rsync-ai`
 line that also pins `--version`) and floored by
 test_the_published_chart_install_command_is_in_the_work_list, so neither can
 regress back into a silent zero.
@@ -84,7 +84,7 @@ _REQUIRED = re.compile(r"([a-zA-Z][a-zA-Z0-9]*\.[a-zA-Z][a-zA-Z0-9]*) is require
 _SET_FLAG = re.compile(r"--set\s+([a-zA-Z][a-zA-Z0-9.]*)=")
 # The runnable form, as opposed to the words "helm install" in prose or a
 # table cell. Used to prove the fences capture every invocation in a file.
-_INVOCATION = "helm install rsync ./deploy/helm/rsync-ai"
+_INVOCATION = "helm install rsync-ai ./deploy/helm/rsync-ai"
 
 
 def _required_value_paths():
@@ -154,12 +154,12 @@ def _install_blocks():
     are not install commands: deploy/helm/rsync-ai/README.md's Ollama example
     (`--set` flags meant to layer onto an existing install, no `--version`, no
     secrets -- so it isn't renderable as a standalone command) and
-    kubernetes.md's `helm pull oci://... && helm install rsync ./rsync-ai`
+    kubernetes.md's `helm pull oci://... && helm install rsync-ai ./rsync-ai`
     two-liner, where the oci:// reference belongs to `helm pull`, not to the
     `helm install` line the render layer executes. Both were false positives
     that broke test_every_documented_install_block_renders when this was
     widened the first time; measured against those two before landing. The fix
-    anchors on the literal "helm install rsync oci://.../charts/rsync-ai"
+    anchors on the literal "helm install rsync-ai oci://.../charts/rsync-ai"
     shape (chart ref immediately follows the release name, which is how every
     real full-install block writes it) and additionally requires `--version`,
     which only a complete install command pins.
@@ -174,7 +174,7 @@ def _install_blocks():
                 continue
             is_local = "deploy/helm/rsync-ai" in block
             is_oci_install = (
-                "helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai" in block
+                "helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai" in block
                 and "--version" in block
             )
             if is_local or is_oci_install:
@@ -389,7 +389,7 @@ objectStorage:
             slug, ref, path = m.group(1), m.group(2), m.group(3)
             # Deliberately NOT `git tag --list`. The URL is served by the PUBLIC
             # repo, whose tags this checkout does not have -- v0.1.2 is a tag on
-            # `<owner>/rsync` and not on the private mirror, so a local tag lookup
+            # `<owner>/rsync.ai` and not on the private mirror, so a local tag lookup
             # rejects the one URL that actually works.
             #
             # The version the ref must track is knowable offline, though: the
@@ -398,9 +398,9 @@ objectStorage:
             # -- a chart bump leaves this URL pointing at the previous release,
             # which still returns 200 and quietly hands the reader stale values.
             owner = "rsync" + "-ai"
-            assert slug == f"{owner}/rsync", (
+            assert slug == f"{owner}/rsync.ai", (
                 f"{doc}: the overlay URL points at {slug!r}. Readers can only fetch it from "
-                f"{owner}/rsync; any other slug is a 404 for everyone outside the org."
+                f"{owner}/rsync.ai; any other slug is a 404 for everyone outside the org."
             )
             chart_version = yaml.safe_load(
                 open(os.path.join(REPO_ROOT, "deploy", "helm", "rsync-ai", "Chart.yaml"), encoding="utf-8")
@@ -443,7 +443,7 @@ objectStorage:
 # A documented `helm test` must be backed by a real test hook.
 # ---------------------------------------------------------------------------
 #
-# docs/deployment/kubernetes.md has offered `helm -n rsync test rsync` as its
+# docs/deployment/kubernetes.md has offered `helm -n rsync-ai test rsync-ai` as its
 # verification step since the chart was written. For most of that time the chart
 # defined ZERO `helm.sh/hook: test` templates, so the command printed
 # `TEST SUITE: None` and exited 0 -- a reader ran the documented verify step, got
@@ -558,7 +558,7 @@ def _documented_install_pipes():
             text = fh.read()
         for m in _INSTALL_PIPE.finditer(text):
             whole = m.group(0)
-            if "rsync-ai/rsync" not in whole and not _RSYNC_ASSIGNMENT.search(whole):
+            if "rsync-ai/rsync.ai" not in whole and not _RSYNC_ASSIGNMENT.search(whole):
                 continue
             line = text[: m.start()].count("\n") + 1
             out.append((rel, line, m.group(1), m.group(2), whole))

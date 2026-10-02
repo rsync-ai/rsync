@@ -174,7 +174,7 @@ func TestBuildMaterializationPlan_NeverTouchesTargetBeforeTheRebuild(t *testing.
 			t.Fatalf("[%s] plan has no statement that builds the staging table: %v", dialect, plan)
 		}
 
-		// Everything before the build may only name rsync's own scratch tables.
+		// Everything before the build may only name rsync.ai's own scratch tables.
 		for i := 0; i < buildIdx; i++ {
 			if namesLiveTarget(plan[i], "orders") {
 				t.Fatalf("[%s] statement %d touches the live target before the rebuild: %q",
@@ -240,7 +240,7 @@ func TestBuildMaterializationPlan_FirstRunCannotDisplaceAnExistingTable(t *testi
 }
 
 // namesLiveTarget reports whether a statement refers to the target table itself
-// rather than one of rsync's suffixed scratch tables.
+// rather than one of rsync.ai's suffixed scratch tables.
 func namesLiveTarget(stmt, table string) bool {
 	stripped := strings.ReplaceAll(stmt, table+modelStagingSuffix, "")
 	stripped = strings.ReplaceAll(stripped, table+modelRetiredSuffix, "")

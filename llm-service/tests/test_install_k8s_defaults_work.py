@@ -112,7 +112,7 @@ def _values(tmp_path) -> dict:
 
 def _render(tmp_path, *extra_values):
     """Render the chart the way the installer does: its generated file, then any extra."""
-    cmd = [REAL_HELM, "template", "rsync", str(CHART), "-f", str(tmp_path / "inst" / "values.generated.yaml")]
+    cmd = [REAL_HELM, "template", "rsync-ai", str(CHART), "-f", str(tmp_path / "inst" / "values.generated.yaml")]
     for f in extra_values:
         cmd += ["-f", str(f)]
     cp = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
@@ -211,8 +211,8 @@ def test_zero_input_produces_a_chart_that_renders(tmp_path):
     docs = _render(tmp_path)
     names = {(d["kind"], d["metadata"]["name"]) for d in docs}
     for cid in fleet:
-        assert ("Deployment", f"rsync-mcp-{cid}-v1-0-0") in names or any(
-            k == "Deployment" and n.startswith("rsync-") and cid in n for k, n in names
+        assert ("Deployment", f"rsync-ai-mcp-{cid}-v1-0-0") in names or any(
+            k == "Deployment" and n.startswith("rsync-ai-") and cid in n for k, n in names
         ), f"no Deployment renders for connector {cid}; the fleet is not reaching the chart"
 
 
@@ -221,7 +221,7 @@ def test_the_generated_secret_reaches_the_chart_secret(tmp_path):
     assert _run(tmp_path, "--render-only").returncode == 0
     env = _dotenv(tmp_path)
     secret = next(
-        d for d in _render(tmp_path) if d["kind"] == "Secret" and d["metadata"]["name"] == "rsync-secrets"
+        d for d in _render(tmp_path) if d["kind"] == "Secret" and d["metadata"]["name"] == "rsync-ai-secrets"
     )
     data = secret.get("stringData") or {}
     assert data.get("ENCRYPTION_KEY") == env["ENCRYPTION_KEY"]
@@ -361,7 +361,7 @@ def test_an_extra_values_file_is_layered_on_top(tmp_path):
     assert cp.returncode == 0, cp.stdout + cp.stderr
     gw = next(
         d for d in _render(tmp_path, extra)
-        if d["kind"] == "Deployment" and d["metadata"]["name"] == "rsync-api-gateway"
+        if d["kind"] == "Deployment" and d["metadata"]["name"] == "rsync-ai-api-gateway"
     )
     assert gw["spec"]["replicas"] == 3
 
@@ -426,12 +426,13 @@ case "$*" in
   *"get deployments -n kube-system"*) printf '%b' "${FAKE_DEPLOYMENTS:-}" ;;
   *"get nodes"*) [[ -z "${FAKE_NODES_FAIL:-}" ]] || exit 1
     if [[ -n "${FAKE_NODES:-}" ]]; then printf '%b\n' "$FAKE_NODES"; else printf '32Gi 8\n32Gi 8\n'; fi ;;
-  *"get secret rsync-secrets -o"*)
+  *"get secret ${FAKE_SECRET_RELEASE:-rsync-ai}-secrets -o"*)
     [[ -n "${FAKE_EXISTING_SECRET:-}" ]] || exit 1
     key="$(printf '%s' "$*" | sed -n 's/.*index \.data "\([A-Z_]*\)".*/\1/p')"
     var="FAKE_SECRET_${key}"
     printf '%s' "${!var:-}" | base64 ;;
-  *"get secret rsync-secrets"*) [[ -n "${FAKE_EXISTING_SECRET:-}" ]] || exit 1 ;;
+  *"get secret ${FAKE_SECRET_RELEASE:-rsync-ai}-secrets"*) [[ -n "${FAKE_EXISTING_SECRET:-}" ]] || exit 1 ;;
+  *"get secret "*"-secrets"*) exit 1 ;;  # any other release: not installed
   *"get events"*) printf '%s\n' "${FAKE_EVENTS:-}" ;;
   *"version --client"*) echo '{"clientVersion":{"gitVersion":"v1.30.0"}}' ;;
   *) exit 0 ;;
@@ -487,14 +488,39 @@ def test_a_full_run_installs_with_the_documented_helm_command(tmp_path):
     cp = _run(tmp_path, "--no-port-forward", **env)
     assert cp.returncode == 0, cp.stdout + cp.stderr
     upgrade = next(l for l in log.read_text().splitlines() if l.startswith("helm upgrade"))
-    assert "--install rsync" in upgrade
+    assert "--install rsync-ai " in upgrade
     assert str(CHART) in upgrade
-    assert "--namespace rsync" in upgrade and "--create-namespace" in upgrade
+    assert "--namespace rsync-ai " in upgrade and "--create-namespace" in upgrade
     assert "--wait" in upgrade and "--timeout 15m" in upgrade
     assert f"-f {tmp_path}/inst/values.generated.yaml" in upgrade
     assert "--version" not in upgrade, "a local chart directory takes no --version"
-    assert "kubectl -n rsync port-forward" in cp.stdout, "the summary does not say how to open the UI"
+    assert "kubectl -n rsync-ai port-forward" in cp.stdout, "the summary does not say how to open the UI"
     assert "OPENAI_API_KEY" in cp.stdout, "no note that chat needs an LLM key"
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_an_install_under_the_earlier_default_name_is_upgraded_in_place(tmp_path):
+    """Until v0.1.8 the default was release `rsync` in namespace `rsync`. A re-run on the
+    new default must upgrade that install, not start a second one with empty volumes."""
+    env, log = _fake_cluster(tmp_path, FAKE_EXISTING_SECRET="1", FAKE_SECRET_RELEASE="rsync")
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    upgrade = next(l for l in log.read_text().splitlines() if l.startswith("helm upgrade"))
+    assert "--install rsync " in upgrade and "--namespace rsync " in upgrade, upgrade
+    assert "earlier install as release 'rsync' in namespace 'rsync'" in cp.stdout, cp.stdout
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
+def test_a_chosen_name_is_kept_even_beside_an_earlier_default_install(tmp_path):
+    env, log = _fake_cluster(
+        tmp_path, FAKE_EXISTING_SECRET="1", FAKE_SECRET_RELEASE="rsync",
+        RSYNC_NAMESPACE="data", RSYNC_RELEASE="pipes",
+    )
+    cp = _run(tmp_path, "--no-port-forward", **env)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    upgrade = next(l for l in log.read_text().splitlines() if l.startswith("helm upgrade"))
+    assert "--install pipes " in upgrade and "--namespace data " in upgrade, upgrade
+    assert "earlier install" not in cp.stdout
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
@@ -603,7 +629,7 @@ def test_an_unfinished_first_install_is_cleared_and_retried(tmp_path, status):
     cp = _run(tmp_path, "--no-port-forward", **env)
     assert cp.returncode == 0, cp.stdout + cp.stderr
     calls = log.read_text().splitlines()
-    uninstall = next(i for i, l in enumerate(calls) if l.startswith("helm uninstall rsync"))
+    uninstall = next(i for i, l in enumerate(calls) if l.startswith("helm uninstall rsync-ai"))
     upgrade = next(i for i, l in enumerate(calls) if l.startswith("helm upgrade"))
     assert uninstall < upgrade, "the stale release must be cleared BEFORE the retry"
 
@@ -658,7 +684,7 @@ def test_an_unrelated_failure_does_not_blame_the_architecture(tmp_path):
 
 
 def _frontend_env(docs) -> dict:
-    fe = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "rsync-frontend")
+    fe = next(d for d in docs if d["kind"] == "Deployment" and d["metadata"]["name"] == "rsync-ai-frontend")
     return {e["name"]: e.get("value") for e in fe["spec"]["template"]["spec"]["containers"][0]["env"] if "value" in e}
 
 
@@ -697,7 +723,7 @@ def test_the_runtime_urls_follow_the_ingress_hostname(tmp_path):
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
 def test_an_upgrade_from_a_release_that_predates_the_secret_generates_one(tmp_path):
-    """A cluster installed by an earlier installer has a rsync-secrets with no
+    """A cluster installed by an earlier installer has a rsync-ai-secrets with no
     INTERNAL_SERVICE_SECRET. Re-running must fill that key in and keep every other one."""
     env, _ = _fake_cluster(
         tmp_path,
@@ -837,9 +863,9 @@ def test_the_tight_profile_constants_are_what_the_chart_saves(tmp_path):
 
     # The saving must come from the three things it claims, and from nothing else.
     docs = {(d["kind"], d["metadata"]["name"]): d for d in _render(tmp_path, _tight_overrides(tmp_path))}
-    assert docs[("Deployment", "rsync-api-gateway")]["spec"]["replicas"] == 1
-    assert docs[("Deployment", "rsync-frontend")]["spec"]["replicas"] == 1
-    orch = docs[("Deployment", "rsync-orchestrator")]["spec"]["template"]["spec"]["containers"][0]
+    assert docs[("Deployment", "rsync-ai-api-gateway")]["spec"]["replicas"] == 1
+    assert docs[("Deployment", "rsync-ai-frontend")]["spec"]["replicas"] == 1
+    orch = docs[("Deployment", "rsync-ai-orchestrator")]["spec"]["template"]["spec"]["containers"][0]
     assert orch["resources"]["requests"]["cpu"] == _script_var("TIGHT_ORCHESTRATOR_CPU")
     # Deep-merged, not replaced: concurrent table loads are sized against the memory LIMIT
     # (tableConcurrency reads it back out of the cgroup), so the rung must not touch it.
@@ -1015,7 +1041,7 @@ def test_this_releases_own_pods_and_finished_pods_do_not_count_against_it(tmp_pa
         tmp_path,
         FAKE_NODES=_nodes(mem + 100, cpu + 100),
         FAKE_PODS=(
-            "Running\\trsync\\trsync\\tn1\\t8000Mi,3000m;\\n"  # this release: replaced by the upgrade
+            "Running\\trsync-ai\\trsync-ai\\tn1\\t8000Mi,3000m;\\n"  # this release: replaced by the upgrade
             "Succeeded\\tother\\tjob\\tn1\\t4000Mi,2000m;\\n"  # finished
             "Failed\\tother\\tjob2\\tn1\\t4000Mi,2000m;\\n"  # finished
         ),
@@ -1107,12 +1133,12 @@ def test_unreadable_nodes_skip_the_check_instead_of_failing_the_install(tmp_path
 # ---------------------------------------------------------------------------
 
 PODS_LISTING = (
-    "rsync-api-gateway-6d9-abc        1/1   Running     0   9m\\n"
-    "rsync-postgres-0                 1/1   Running     0   9m\\n"
-    "rsync-kafka-0                    1/1   Running     0   9m\\n"
-    "rsync-orchestrator-77f-xyz       0/1   Pending     0   9m\\n"
-    "rsync-kafka-init-q9x2p           0/1   Completed   0   3m\\n"
-    "rsync-mcp-mongodb-v1-0-0-zzz     0/1   CrashLoopBackOff   4   9m\\n"
+    "rsync-ai-api-gateway-6d9-abc     1/1   Running     0   9m\\n"
+    "rsync-ai-postgres-0              1/1   Running     0   9m\\n"
+    "rsync-ai-kafka-0                 1/1   Running     0   9m\\n"
+    "rsync-ai-orchestrator-77f-xyz    0/1   Pending     0   9m\\n"
+    "rsync-ai-kafka-init-q9x2p        0/1   Completed   0   3m\\n"
+    "rsync-ai-mcp-mongodb-v1-0-0-zzz  0/1   CrashLoopBackOff   4   9m\\n"
 )
 
 
@@ -1130,8 +1156,8 @@ def test_a_failed_install_lists_only_the_pods_that_are_not_ready(tmp_path):
     cp = _run(tmp_path, "--no-port-forward", **env)
     assert cp.returncode != 0
     listed = cp.stderr.split("Pods that are not ready:")[1].split("Look closer")[0]
-    assert "rsync-orchestrator-77f-xyz" in listed and "rsync-mcp-mongodb-v1-0-0-zzz" in listed
-    for healthy in ("rsync-api-gateway", "rsync-postgres-0", "rsync-kafka-0"):
+    assert "rsync-ai-orchestrator-77f-xyz" in listed and "rsync-ai-mcp-mongodb-v1-0-0-zzz" in listed
+    for healthy in ("rsync-ai-api-gateway", "rsync-ai-postgres-0", "rsync-ai-kafka-0"):
         assert healthy not in listed, f"{healthy} is Running 1/1 and was listed as not ready:\n{listed}"
     assert "kafka-init" not in listed, "a Completed hook Job is not a failure"
 
@@ -1143,7 +1169,7 @@ def test_a_failed_install_names_an_out_of_room_cluster_as_the_cause(tmp_path):
         FAKE_HELM_UPGRADE_FAILS="1",
         FAKE_POD_LIST=PODS_LISTING,
         FAKE_EVENTS=(
-            "9m  Warning  FailedScheduling  pod/rsync-orchestrator-77f-xyz  "
+            "9m  Warning  FailedScheduling  pod/rsync-ai-orchestrator-77f-xyz  "
             "0/1 nodes are available: 1 Insufficient memory. no new claims to deallocate"
         ),
     )
@@ -1152,7 +1178,7 @@ def test_a_failed_install_names_an_out_of_room_cluster_as_the_cause(tmp_path):
     assert cp.returncode != 0
     err = cp.stderr
     assert "out of room" in err and "Insufficient" in err
-    assert "rsync-orchestrator-77f-xyz" in err.split("out of room")[1], "the starved pod is not named"
+    assert "rsync-ai-orchestrator-77f-xyz" in err.split("out of room")[1], "the starved pod is not named"
     assert f"RSYNC_CONNECTORS={_script_var('LEAN_CONNECTORS')}" in err and "RSYNC_DEMO=false" in err
 
 
@@ -1280,8 +1306,8 @@ def test_without_a_terminal_no_forward_starts_and_the_two_commands_are_printed(t
     cp = _run(tmp_path, **env)
     assert cp.returncode == 0, cp.stdout + cp.stderr
     assert _forwards(log) == [], f"a port-forward started without a terminal:\n{log.read_text()}"
-    assert re.search(r"kubectl -n rsync port-forward svc/rsync-frontend 3000:\d+", cp.stdout)
-    assert re.search(r"kubectl -n rsync port-forward svc/rsync-api-gateway 8080:\d+", cp.stdout)
+    assert re.search(r"kubectl -n rsync-ai port-forward svc/rsync-ai-frontend 3000:\d+", cp.stdout)
+    assert re.search(r"kubectl -n rsync-ai port-forward svc/rsync-ai-api-gateway 8080:\d+", cp.stdout)
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm not installed")
@@ -1291,7 +1317,7 @@ def test_the_port_forward_flag_starts_both_forwards_without_a_terminal(tmp_path)
     assert cp.returncode == 0, cp.stdout + cp.stderr
     fw = _forwards(log)
     assert len(fw) == 2, fw
-    assert any("svc/rsync-frontend 3000:" in l for l in fw) and any("svc/rsync-api-gateway 8080:" in l for l in fw)
+    assert any("svc/rsync-ai-frontend 3000:" in l for l in fw) and any("svc/rsync-ai-api-gateway 8080:" in l for l in fw)
     assert "unbound variable" not in cp.stderr, cp.stderr
 
 

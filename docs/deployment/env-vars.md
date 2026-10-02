@@ -20,7 +20,7 @@ Store all three in AWS Secrets Manager or equivalent. Rotation of `ENCRYPTION_KE
 api-gateway, orchestrator, temporal-adapter and frontend each check a few settings once at startup. For each missing setting they write one ERROR line that starts with `Startup check:`, names the setting, says what will not work and says what to set. The line never includes a value. **None of these checks stops the service from starting**, because at least one supported way of starting it (the dev compose, the Helm chart, the CI end-to-end overlays) does not provide every setting yet, and the rest of the product works without it. After a start or an upgrade, look for these lines:
 
 ```bash
-docker logs rsync-api-gateway 2>&1 | grep "Startup check:"   # likewise orchestrator, temporal-adapter, frontend
+docker logs rsync-ai-api-gateway 2>&1 | grep "Startup check:"   # likewise orchestrator, temporal-adapter, frontend
 ```
 
 | Service | Setting | Logged when | What does not work |
@@ -98,7 +98,7 @@ The settings that already stop a service from starting are unchanged. Examples a
 |---|---|---|
 | `KAFKA_REPLICATION_FACTOR` | unset ⇒ `1` on a single-broker cluster, else `min(3, brokers)` | Replication factor requested for topics this platform creates (`backend-orchestrator/internal/kafka/replication.go:31`, derivation at `:131-139`). A **request, not a guarantee**: it is clamped down to the live broker count, so a typo degrades instead of failing every creation. A non-positive or non-numeric value is ignored with a warning and the built-in default applies (`:93-105`). Also feeds the Kafka Connect worker's three internal topics (`docker-compose.yml:359-361`), which the clamp does **not** cover |
 | `KAFKA_MIN_INSYNC_REPLICAS` | unset ⇒ `min(2, RF)` | Durability floor written explicitly onto every topic this platform creates (`replication.go:40`, `:157-175`). It is pinned even when you set nothing, because unset means the *broker's* default applies — 2 on MSK and most managed clusters — and an RF=1 topic inheriting `misr=2` is born permanently unwritable. Whatever you set is clamped to the topic's final RF, in that order (`:198-204`) |
-| `KAFKA_CDC_TOPIC_PARTITIONS` | unset ⇒ `1` on a single-broker cluster, else `min(3, brokers)` | Partition count requested for every CDC **data** topic (`backend-orchestrator/internal/kafka/partitions.go:20`, derivation at `:70-78`). One partition is one leader, so a CDC topic left at 1 puts all of its produce and fetch traffic on a single broker however many the cluster has. The number is handed to Kafka Connect as `topic.creation.default.partitions` so Connect creates the topic through the AdminClient **before** it produces — broker auto-create never gets a turn — and rsync's own pre-create asks for the same number as a backstop. Two things override it downward: a pipeline where any selected table has **no primary key** is pinned to 1, because null-keyed records round-robin and a partition offset stops being a total order for that table; and a broker count that cannot be read leaves topic creation exactly as it was. A non-positive or non-numeric value is ignored with a warning (`replication.go:93-105`). **Applies at creation only** — Kafka cannot reduce a partition count, and raising one on a live topic rehashes every key onto a different partition, so rsync never resizes an existing topic |
+| `KAFKA_CDC_TOPIC_PARTITIONS` | unset ⇒ `1` on a single-broker cluster, else `min(3, brokers)` | Partition count requested for every CDC **data** topic (`backend-orchestrator/internal/kafka/partitions.go:20`, derivation at `:70-78`). One partition is one leader, so a CDC topic left at 1 puts all of its produce and fetch traffic on a single broker however many the cluster has. The number is handed to Kafka Connect as `topic.creation.default.partitions` so Connect creates the topic through the AdminClient **before** it produces — broker auto-create never gets a turn — and rsync.ai's own pre-create asks for the same number as a backstop. Two things override it downward: a pipeline where any selected table has **no primary key** is pinned to 1, because null-keyed records round-robin and a partition offset stops being a total order for that table; and a broker count that cannot be read leaves topic creation exactly as it was. A non-positive or non-numeric value is ignored with a warning (`replication.go:93-105`). **Applies at creation only** — Kafka cannot reduce a partition count, and raising one on a live topic rehashes every key onto a different partition, so rsync.ai never resizes an existing topic |
 | `RSYNC_SINK_FLUSH_LANES` | unset ⇒ `4` | How many destination flushes the CDC sink worker runs at once (`shared/mcp-connectors/internal/kafka-mcp-sink/worker-src/cmd/kafka-sink-worker/flush_lanes.go:29`, lane pool at `:108`). Partitioning a topic only helps if something drains the partitions concurrently: the worker already *consumes* every assigned partition (kafka-go interleaves them into one `FetchMessage` stream), but before this it decoded, batched and then **blocked** on the destination write inline, so one slow table stalled every other partition — and Debezium gives a 20-table pipeline ~60 assigned partitions. A batch is now handed to a lane chosen by hashing the topic-and-partition prefix of its batcher key, so every batch from one partition lands on one serial lane. That is deliberate: both durability layers (kafka-go's `offsetStash` and the worker's own high-water mark) keep max(offset) per partition with **no gap tracking**, so completing offset 105 before 101 would make a restart silently classify 101-104 as already-written. Serial-per-partition keeps completion ascending inside the space that records it, which is why no offset encoder is needed. Ordering is preserved end to end because Debezium keys each event on the source PK and keyless tables are already pinned to 1 partition. Memory is bounded at `2 x lanes` resident batches. **`0` or `1` is the kill switch** — flushes go back to running inline on the consume goroutine, exactly as before. Clamped to 32; a malformed value warns and falls back to 4. Applies to the **database** sink path only: the object-storage batcher still flushes inline, deliberately — its one-time destination-folder clean is tracked per table rather than per partition, so sharding lanes on the partition cannot make it safe |
 
 ### Authentication and TLS
@@ -226,7 +226,7 @@ Authorization is separate and is not covered by any of the above: see
 | `KAFKA_ALLOW_LEGACY_UNPREFIXED_TOPICS` | `false` | Re-admits the pre-namespace bare topic names (`agent.`, `pipeline.`, `cdc.`, `cdc-`, `schemahistory.`, `pii.`, `task.`) to the topology API's allowlist (`handlers/topology.go:95`). Accepts `1`/`true`/`yes`/`on` and logs once on first use. Off by default because those names are generic enough to collide with a customer's own topics — and the API can delete what it matches. Only turn it on during a migration window |
 | `CDC_STREAMING_SINK_GROUP_PER_EXECUTION` | `false` | Rollback lever restoring the pre-fix, per-execution sink group id (`rsync.sink-<pid8>-<eid8>`) for `streaming_only`/`never` pipelines (`backend-orchestrator/internal/agents/executor/sink_consumer_group.go:17`, `:71`). A changing group name means no committed offsets, so leave it off unless you deliberately want that reset |
 
-> **Running rsync against your own Kafka cluster?** If it is authorized, see
+> **Running rsync.ai against your own Kafka cluster?** If it is authorized, see
 > [kafka-acls.md](kafka-acls.md) for the full list of ACLs the platform needs, and
 > [kafka-topics.md](../architecture/kafka-topics.md) for the topic inventory.
 
@@ -293,7 +293,7 @@ called that, the last step is a 404.
 > (`KI-EXPLORER-OFFLINE-FLAG-NOT-DELIVERED`).
 > **Confirm rather than assume** — llm-service logs the resolved provider and every model at startup,
 > once per entry point:
-> `docker logs rsync-llm-service 2>&1 | grep -E "explorer (llm|router llm):|rank-tables llm:"`.
+> `docker logs rsync-ai-llm-service 2>&1 | grep -E "explorer (llm|router llm):|rank-tables llm:"`.
 > **Three** lines, and all three must agree; `rank-tables` was added on 2026-08-03 after it was found
 > resolving to OpenAI on deployments where the other two said `ollama`. Details in
 > [ollama.md](ollama.md#verify-it--dont-assume-it).
@@ -422,7 +422,7 @@ OPENAI_API_KEY=sk-...
 # LLM_PROVIDER=ollama
 # OLLAMA_BASE_URL=http://host-gateway:11434
 # EXPLORER_OFFLINE_ONLY=true
-#   verify: docker logs rsync-llm-service 2>&1 \
+#   verify: docker logs rsync-ai-llm-service 2>&1 \
 #             | grep -E "explorer (llm|router llm):|rank-tables llm:"
 #           → three lines, all provider=ollama
 #

@@ -2,7 +2,7 @@
 // with that image's own kafka-clients jar (java -cp '/kafka/libs/*' RoundTrip.java),
 // so a PASS is about the client Connect and Debezium actually ship.
 //
-//   RoundTrip -                  client properties on stdin (what rsync's
+//   RoundTrip -                  client properties on stdin (what rsync.ai's
 //                                Debezium schema-history builder emitted, prefix
 //                                stripped). Used for producer and consumer alike.
 //   RoundTrip --connect <file>   a live worker's connect-distributed.properties:

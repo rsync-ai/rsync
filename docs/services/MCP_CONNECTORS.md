@@ -247,16 +247,16 @@ Not user-selectable sources — these are platform plumbing.
 
 ### Test fixtures (not products)
 
-`public/petstore/`, `public/sample-data/`, `public/widgets-graphql/` exist for tests and demos of
+`public/sample-data/` and `public/widgets-graphql/` exist for tests and demos of
 the generation flow. Do not present these as customer-facing connectors.
 
 ### Generation targets with OAuth preconfigured
 
-`shared/mcp-connectors/oauth/providers.json` ships OAuth app config for **18 providers**, so a
+`shared/mcp-connectors/oauth/providers.json` ships OAuth app config for **17 providers**, so a
 generated connector for any of them skips the auth plumbing:
 
 `dropbox`, `freshdesk`, `github`, `google`, `hubspot`, `intercom`, `jira`, `linear`, `mailchimp`,
-`notion`, `petstore`, `pipedrive`, `salesforce`, `shopify`, `slack`, `stripe`, `zendesk`, `zoho-crm`
+`notion`, `pipedrive`, `salesforce`, `shopify`, `slack`, `stripe`, `zendesk`, `zoho-crm`
 
 **These are not pre-built connectors.** They are sources the generator can target with auth already
 wired. Saying "we support Salesforce" is only true after the generator has produced and deployed
@@ -498,7 +498,7 @@ shared/mcp-connectors/
 │   ├── github-rest/
 │   ├── google-sheets/
 │   ├── shopify-admin-graphql/
-│   └── petstore/ sample-data/ widgets-graphql/   # test fixtures, not products
+│   └── sample-data/ widgets-graphql/   # test fixtures, not products
 │
 ├── internal/                  # Infrastructure connectors
 │   ├── debezium/

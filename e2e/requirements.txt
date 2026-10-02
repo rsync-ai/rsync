@@ -1,4 +1,4 @@
-# E2E Test Dependencies for RSYNC AI
+# E2E Test Dependencies for rsync.ai
 
 # Core testing
 pytest>=8.0.0

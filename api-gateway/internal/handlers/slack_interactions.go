@@ -21,13 +21,13 @@ import (
 // SlackInteractionsHandler serves Slack Block Kit interactivity callbacks — the
 // inbound side of the drift-approval Slack buttons.
 //
-// This endpoint is UNAUTHENTICATED at the gin layer (Slack carries no rsync
+// This endpoint is UNAUTHENTICATED at the gin layer (Slack carries no rsync.ai
 // session), so it defends itself in depth and FAILS CLOSED at every step:
 //  1. Authenticity — the Slack request signature (HMAC over the raw body) is
 //     verified before any field is trusted; a bad/absent/stale signature is
 //     rejected outright.
 //  2. Identity — the acting Slack user id is mapped to a verified email via
-//     Slack users.info, then to an rsync user by email. No mapping ⇒ no action.
+//     Slack users.info, then to an rsync.ai user by email. No mapping ⇒ no action.
 //  3. Authorization — the mapped user must hold ≥ member in THAT pipeline's
 //     workspace (not a session's active workspace, which doesn't exist here).
 //  4. Action — the approval runs through the SAME core the UI uses
@@ -112,7 +112,7 @@ func (h *SlackInteractionsHandler) HandleInteractions(c *gin.Context) {
 		return
 	}
 
-	// (4) Identity: Slack user id → verified email → rsync user.
+	// (4) Identity: Slack user id → verified email → rsync.ai user.
 	if h.resolveEmail == nil {
 		c.JSON(http.StatusOK, slackEphemeral("Approving from Slack isn't available — this server has no Slack bot token to verify who you are. Open the change in rsync-ai to approve."))
 		return
@@ -250,7 +250,7 @@ func parseSlackApprovalAction(body []byte) (slackApprovalAction, bool) {
 	}, true
 }
 
-// userByEmail resolves an rsync user id + canonical email from an email address
+// userByEmail resolves an rsync.ai user id + canonical email from an email address
 // (case-insensitive). found=false means no such user — the caller must not act.
 func userByEmail(ctx context.Context, database *sql.DB, email string) (userID, canonicalEmail string, found bool, err error) {
 	err = database.QueryRowContext(ctx, `

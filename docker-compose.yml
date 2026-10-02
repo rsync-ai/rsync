@@ -228,7 +228,7 @@ services:
       # (kafka-connect, producer side) and the kafka-sink-worker ReaderConfig.MaxBytes
       # (consumer side, which must exceed this). Topics inherit this broker default.
       KAFKA_MESSAGE_MAX_BYTES: 15728640
-      # Retention policy for topics rsync does NOT create itself.
+      # Retention policy for topics rsync.ai does NOT create itself.
       #
       # This is not redundant with kafka/topology.go: Debezium auto-creates the
       # rsync.cdc-* topics before the orchestrator's topology manager would, so
@@ -241,7 +241,7 @@ services:
       # 168h/delete matches Apache's own defaults, so this changes no behaviour
       # today. It pins it: an image whose defaults differ can no longer silently
       # re-open the unbounded-growth hole that fills the disk and stops BOTH data
-      # planes. Topics rsync creates explicitly still carry their own config, and
+      # planes. Topics rsync.ai creates explicitly still carry their own config, and
       # the one deliberate never-expire exception (the Debezium schema-history
       # topic) sets retention.ms=-1 per topic and overrides this.
       KAFKA_LOG_RETENTION_HOURS: 168
@@ -1239,7 +1239,7 @@ services:
       #
       # It is a birth setting, not a live one. Kafka cannot reduce a partition count at
       # all, and RAISING one on a topic that is already streaming rehashes every key
-      # onto a different partition and breaks per-key ordering, so rsync never resizes
+      # onto a different partition and breaks per-key ordering, so rsync.ai never resizes
       # an existing topic -- a change here reaches only topics created after it.
       KAFKA_CDC_TOPIC_PARTITIONS: "${KAFKA_CDC_TOPIC_PARTITIONS:-}"
       # Namespace for every Kafka topic this product creates, so an operator can
@@ -1520,7 +1520,7 @@ services:
       NOTIFIER_SLACK_WEBHOOK_URL: "${NOTIFIER_SLACK_WEBHOOK_URL:-}"
       # Slack one-click drift approvals (inbound interactivity). SIGNING_SECRET
       # verifies Slack request signatures; BOT_TOKEN (users:read.email) maps the
-      # clicking Slack user to their rsync account by email. Both unset ⇒ the
+      # clicking Slack user to their rsync.ai account by email. Both unset ⇒ the
       # inbound receiver is inert and drift alerts keep the plain link button.
       SLACK_SIGNING_SECRET: "${SLACK_SIGNING_SECRET:-}"
       SLACK_BOT_TOKEN: "${SLACK_BOT_TOKEN:-}"

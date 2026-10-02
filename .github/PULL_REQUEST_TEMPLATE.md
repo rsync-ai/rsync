@@ -25,12 +25,12 @@
 
 ## Checklist
 
-- [ ] I have signed the [CLA](https://github.com/rsync-ai/rsync/blob/main/CLA.md) (the bot
+- [ ] I have signed the [CLA](https://github.com/rsync-ai/rsync.ai/blob/main/CLA.md) (the bot
       comments on your first PR; you sign once)
 - [ ] Every commit is signed off (`git commit -s`) — required by the
-      [DCO](https://github.com/rsync-ai/rsync/blob/main/DCO); the DCO check on this PR
+      [DCO](https://github.com/rsync-ai/rsync.ai/blob/main/DCO); the DCO check on this PR
       goes red without it. Setup:
-      [CONTRIBUTING.md](https://github.com/rsync-ai/rsync/blob/main/CONTRIBUTING.md#developer-certificate-of-origin-dco)
+      [CONTRIBUTING.md](https://github.com/rsync-ai/rsync.ai/blob/main/CONTRIBUTING.md#developer-certificate-of-origin-dco)
 - [ ] No secrets or credentials in the diff
 - [ ] No new `.env` files committed
 - [ ] Database migration (if any) uses the next sequential prefix in `api-gateway/migrations/`

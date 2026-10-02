@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""MongoDB change streams must be scoped to the database rsync captures from (#19).
+"""MongoDB change streams must be scoped to the database rsync.ai captures from (#19).
 
 Debezium 3.x defaults to capture.scope=deployment, a cluster-wide change stream
 that needs changeStream+find on EVERY database. A user granted read on only the

@@ -2,7 +2,7 @@
 # Custom Kafka Connect image with:
 # - Base: debezium/connect (Apache 2.0) — replaces confluentinc/cp-kafka-connect (CCL)
 # - Debezium 3.1 connectors pre-installed in base image
-# - RSync SMTs built from source (multi-stage) so builds are self-contained
+# - rsync.ai SMTs built from source (multi-stage) so builds are self-contained
 #
 
 # The SMT jar is JVM bytecode -- identical for every target -- so it is built once,
@@ -72,7 +72,7 @@ RUN set -eu; \
 FROM quay.io/debezium/connect:3.1.3.Final
 
 LABEL maintainer="rsync-ai"
-LABEL description="Kafka Connect with RSync SMT for CDC routing"
+LABEL description="Kafka Connect with rsync.ai SMT for CDC routing"
 
 USER root
 
@@ -169,7 +169,7 @@ RUN set -eu; \
       echo "$left"; \
       exit 1; }
 
-# rsync's log4j logger levels (log4j-loggers.properties -- today, quieting the
+# rsync.ai's log4j logger levels (log4j-loggers.properties -- today, quieting the
 # pgoutput decoder's WARNs for tables outside every pipeline). They are applied at
 # container start by sync-log4j-loggers.sh, not baked into /kafka/config here:
 # /kafka/config is a volume, a kept volume never receives a later image's file, and

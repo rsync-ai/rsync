@@ -1,10 +1,10 @@
 # rsync.ai — Self-hosted AI Data Pipelines, CDC, Scheduled Models, and Lineage
 
-[![Release](https://img.shields.io/github/v/release/rsync-ai/rsync?label=release&color=16a34a)](https://github.com/rsync-ai/rsync/releases/latest)
+[![Release](https://img.shields.io/github/v/release/rsync-ai/rsync.ai?label=release&color=16a34a)](https://github.com/rsync-ai/rsync.ai/releases/latest)
 [![License: source-available](https://img.shields.io/badge/license-source--available-3b82f6)](LICENSE)
 [![Deploy: Docker Compose](https://img.shields.io/badge/deploy-Docker%20Compose-2496ED?logo=docker&logoColor=white)](#docker--one-command)
 [![Deploy: Helm](https://img.shields.io/badge/deploy-Helm%20chart-0F1689?logo=helm&logoColor=white)](#kubernetes)
-[![Connectors](https://img.shields.io/badge/connectors-21-16a34a)](docs/connectors/reference.md)
+[![Connectors](https://img.shields.io/badge/connectors-20-16a34a)](docs/connectors/reference.md)
 [![Docs](https://img.shields.io/badge/docs-read%20the%20guides-64748b)](docs/README.md)
 
 > **Self-hosted, source-available AI data platform for batch pipelines, CDC, scheduled
@@ -47,7 +47,7 @@ others, or build a competing product from it. The [full summary is below](#licen
   lineage view is recent — its page states how far it has been verified.
   → [Data Explorer](docs/explorer/README.md) ·
   [Lineage and observability](docs/solutions/data-lineage-and-pipeline-observability.md)
-- **Versioned MCP connectors.** Each of the 21 connectors runs as its own versioned
+- **Versioned MCP connectors.** Each of the 20 connectors runs as its own versioned
   container, so you can upgrade or pin one without touching the rest.
   → [Connector reference](docs/connectors/reference.md)
 
@@ -88,13 +88,19 @@ the middle: get the data moving *and* keep it modelled, on hardware you control.
 | **Airflow / n8n** | General orchestration and automation, enormously flexible | A pipeline is a first-class object with row counts, lineage and CDC built in, rather than something you assemble from operators or nodes. |
 
 **Where it is honestly weaker.** There is no managed option — every install is yours to run.
-The catalogue is 21 connectors, not hundreds. Data-quality assertions are not built yet. And
+The catalogue is 20 connectors, not hundreds. Data-quality assertions are not built yet. And
 the Kubernetes path is younger than the Docker one (see [Project status](#project-status)). If
 you want someone else carrying the pager, use a managed tool.
 
 ## Quick start
 
-1. **Install** with one command — [Install](#install) below. Docker is the only requirement.
+1. **Install** with one command. Docker is the only requirement:
+
+   ```bash
+   curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | bash
+   ```
+
+   [Install](#install) below covers the options, Kubernetes, and what the script sets up.
 2. Open `http://localhost:3000` and click **Start with sample data**. The stack bundles a
    `sample-data` source and a throwaway `demo-warehouse` PostgreSQL, so this needs no
    credential of your own.
@@ -115,6 +121,10 @@ flowchart LR
     ORCH --> TMP["Temporal<br/>durable workflows"]
     TMP --> CON["MCP connectors<br/>versioned containers"]
     CON --> DATA[("Your sources and<br/>destinations")]
+    DATA -->|"CDC change stream"| DBZ["Debezium<br/>on Kafka Connect"]
+    DBZ --> KAFKA[("Kafka")]
+    KAFKA --> SINK["Sink worker"]
+    SINK --> CON
 ```
 
 For CDC, Debezium on Kafka Connect and a sink worker carry the change stream; they start
@@ -147,7 +157,7 @@ component and data-flow diagrams.
 ### Docker — one command
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install.sh | bash
 ```
 
 Requires Docker and nothing else. The installer asks which LLM you want — your own
@@ -161,7 +171,7 @@ shipped connectors still work; the LLM features say `Set up an LLM first` until 
 the stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
-> **Which code you get.** `v0.1.7`, the current release. Both halves of the install come
+> **Which code you get.** `v0.1.8`, the current release. Both halves of the install come
 > from that one tag: the compose file is fetched from `RSYNC_REF` and the images are
 > pulled at a tag derived from it, so the file and the containers it starts are the same
 > commit. Every image the default compose starts is published at that tag and pullable
@@ -198,7 +208,7 @@ success banner over a dead stack.
 Point `kubectl` at any cluster and run:
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync/main/install-k8s.sh | bash
+curl -sSL https://raw.githubusercontent.com/rsync-ai/rsync.ai/main/install-k8s.sh | bash
 ```
 
 That is the whole install. It generates every secret, installs the platform, the demo
@@ -219,9 +229,9 @@ connector pod starts and no pipeline can reach a source
 ([why](docs/deployment/kubernetes.md#connectors-are-pods-you-choose)):
 
 ```bash
-git clone https://github.com/rsync-ai/rsync.git && cd rsync
-helm install rsync ./deploy/helm/rsync-ai \
-  --namespace rsync --create-namespace \
+git clone https://github.com/rsync-ai/rsync.ai.git && cd rsync.ai
+helm install rsync-ai ./deploy/helm/rsync-ai \
+  --namespace rsync-ai --create-namespace \
   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
   --set secrets.internalServiceSecret="$(openssl rand -hex 24)" \
@@ -242,7 +252,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > [!IMPORTANT]
 > **Save `secrets.encryptionKey`.** It encrypts every stored connection credential. Read
 > it back with
-> `kubectl -n rsync get secret rsync-secrets -o jsonpath='{.data.ENCRYPTION_KEY}' | base64 -d`
+> `kubectl -n rsync-ai get secret rsync-ai-secrets -o jsonpath='{.data.ENCRYPTION_KEY}' | base64 -d`
 > and keep it somewhere you will still have it after the cluster is gone — reinstalling
 > with a different key makes every saved connection permanently undecryptable.
 
@@ -250,8 +260,8 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > The chart is also published to the registry, so you can install without cloning:
 >
 > ```bash
-> helm install rsync oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.7 \
->   --namespace rsync --create-namespace \
+> helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.7 \
+>   --namespace rsync-ai --create-namespace \
 >   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
 >   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
 >   --set secrets.internalServiceSecret="$(openssl rand -hex 24)" \
@@ -270,7 +280,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > Chainguard's build instead, so neither path needs a MinIO override. Chart **0.1.5**
 > and older still name the withdrawn images; to install one of those, add
 > `--set objectStorage.minio.image=cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1`
-> and the same value for `objectStorage.minio.mcImage`. Both paths pull rsync's own
+> and the same value for `objectStorage.minio.mcImage`. Both paths pull rsync.ai's own
 > images at `.Chart.AppVersion` (**0.1.7**), and every `ghcr.io/rsync-ai` image the
 > chart names is published at that tag for both `amd64` and `arm64` (0.1.2 and older
 > are `amd64` only, so they will not start on Apple Silicon, Graviton, Axion or Ampere
@@ -292,7 +302,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 
 ## Connectors
 
-**21 connectors ship in the box** — every one is a source, 17 are also destinations, and
+**20 connectors ship in the box** — every one is a source, 16 are also destinations, and
 five support change data capture. Each runs as its own versioned container, so you can
 upgrade or pin one without touching the rest.
 
@@ -303,7 +313,7 @@ upgrade or pin one without touching the rest.
 | **Document** | MongoDB | MongoDB |
 | **Object storage** | AWS S3, Google Cloud Storage, Azure Blob Storage | — |
 | **APIs** | Stripe, Shopify, GitHub, Notion, Google Sheets | — |
-| **Demo and reference** | Sample Data (credential-free demo source), Petstore (OpenAPI example), Widgets-GraphQL (GraphQL example) | — |
+| **Demo and reference** | Sample Data (credential-free demo source), Widgets-GraphQL (GraphQL example) | — |
 
 The [connector reference](docs/connectors/reference.md) is generated from the connector
 tree itself and lists exact ids, versions and per-connector source/destination support —
@@ -313,7 +323,7 @@ add your own, start with the
 
 ## The Data Explorer
 
-Once data has landed somewhere, you can query it without leaving rsync. Ask a question in
+Once data has landed somewhere, you can query it without leaving rsync.ai. Ask a question in
 English and get SQL back, or write the SQL yourself; browse the schema; then keep the
 useful ones — as a saved query with versions and diffs, or as a **model**: a table that
 rebuilds itself on a cron, an interval, or after a given pipeline finishes. Results export
@@ -368,8 +378,8 @@ dive on [saved queries, models and schedules](docs/explorer/saved-queries-and-mo
 ## Development
 
 ```bash
-git clone https://github.com/rsync-ai/rsync.git
-cd rsync
+git clone https://github.com/rsync-ai/rsync.ai.git
+cd rsync.ai
 cp .env.example .env           # add your OPENAI_API_KEY, if you have one
 cp llm-service/.env.example llm-service/.env   # or set LLM_PROVIDER=none here
 docker compose -p rsync-ai up -d
@@ -392,12 +402,12 @@ hosted offering: every install is yours.
 What that means in practice: pin a tag rather than tracking `main` if you want
 reproducibility, keep `ENCRYPTION_KEY` somewhere durable before you store a credential,
 and read [CHANGELOG.md](CHANGELOG.md) before upgrading. Bugs and gaps are tracked as
-[GitHub issues](https://github.com/rsync-ai/rsync/issues) — that list is the register.
+[GitHub issues](https://github.com/rsync-ai/rsync.ai/issues) — that list is the register.
 
 ## Community and support
 
 - **Questions and help** — [SUPPORT.md](SUPPORT.md) points at the right place for each kind of question
-- **Bugs and feature requests** — [open an issue](https://github.com/rsync-ai/rsync/issues)
+- **Bugs and feature requests** — [open an issue](https://github.com/rsync-ai/rsync.ai/issues)
 - **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md) and the [Code of Conduct](CODE_OF_CONDUCT.md)
 - **Security** — report privately, never in a public issue: [SECURITY.md](SECURITY.md)
 - **Changes between versions** — [CHANGELOG.md](CHANGELOG.md)
@@ -430,7 +440,7 @@ legal advice):
 
 **Earlier versions.** Releases up to and including v0.1.7 were published under the
 Elastic License 2.0 and stay under it; its text is kept in
-[`LICENSES/`](LICENSES/LicenseRef-rsync-ELv2-legacy.txt). This license applies from the
+[`LICENSES/`](LICENSES/LicenseRef-rsync.ai-ELv2-legacy.txt). This license applies from the
 first release that includes it.
 
 Need something these terms do not allow, such as reselling it, embedding it in your

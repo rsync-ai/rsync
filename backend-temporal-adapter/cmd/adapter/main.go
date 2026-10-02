@@ -38,7 +38,7 @@ const adapterTaskQueue = "pipeline-workflows"
 // kafkaServiceName is the identity this process presents to the broker.
 //
 // It becomes the default client.id, which is what a customer-managed cluster keys its
-// logs, throttling and quota metrics off. Without it every rsync process shares one
+// logs, throttling and quota metrics off. Without it every rsync.ai process shares one
 // anonymous default, so a throttled cluster can tell neither our services apart nor ours
 // from another tenant's. KAFKA_CLIENT_ID still overrides it.
 const kafkaServiceName = "temporal-adapter"

@@ -1,6 +1,6 @@
 """Every Kafka bootstrapper creates the same platform topics, with the same config.
 
-Four shell creators pre-create rsync's platform topics, and the orchestrator's
+Four shell creators pre-create rsync.ai's platform topics, and the orchestrator's
 topology provisioner (backend-orchestrator/internal/kafka/topology.go) creates
 the same names at runtime:
 

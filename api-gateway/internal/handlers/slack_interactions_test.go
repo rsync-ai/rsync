@@ -161,7 +161,7 @@ func TestSlackInteractions_UnmappedIdentity_NoApprove(t *testing.T) {
 		resolveEmail: stubEmail("stranger@nowhere.test"), now: func() time.Time { return slackTestNow },
 	}
 
-	// email resolves, but no rsync user matches → empty result → no further SQL.
+	// email resolves, but no rsync.ai user matches → empty result → no further SQL.
 	mock.ExpectQuery(regexp.QuoteMeta("FROM users WHERE lower(email)")).
 		WithArgs("stranger@nowhere.test").
 		WillReturnRows(sqlmock.NewRows([]string{"id", "email"})) // zero rows

@@ -89,15 +89,15 @@ func TestParseIntentAcceptsFencedJSON(t *testing.T) {
 }
 
 func TestCallHelpResponseLLMAcceptsFencedJSON(t *testing.T) {
-	bare := `{"message":"rsync moves data between systems.","suggestions":["Sync MySQL to BigQuery"]}`
+	bare := `{"message":"rsync.ai moves data between systems.","suggestions":["Sync MySQL to BigQuery"]}`
 	llmStub(t, "```json\n"+bare+"\n```")
 	h := &ChatHandler{}
 
-	msg, sugs, err := h.callHelpResponseLLM(context.Background(), "what does rsync do?")
+	msg, sugs, err := h.callHelpResponseLLM(context.Background(), "what does rsync.ai do?")
 	if err != nil {
 		t.Fatalf("callHelpResponseLLM returned error: %v", err)
 	}
-	if msg != "rsync moves data between systems." {
+	if msg != "rsync.ai moves data between systems." {
 		t.Errorf("message = %q", msg)
 	}
 	if len(sugs) != 1 || sugs[0] != "Sync MySQL to BigQuery" {

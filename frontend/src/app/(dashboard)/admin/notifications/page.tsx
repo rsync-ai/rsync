@@ -417,7 +417,7 @@ export default function AdminNotificationsPage() {
                 <Label htmlFor="smtp-from">From address</Label>
                 <Input
                   id="smtp-from"
-                  placeholder="rsync alerts <alerts@example.com>"
+                  placeholder="rsync.ai alerts <alerts@example.com>"
                   value={form.from}
                   onChange={(e) => patch({ from: e.target.value })}
                 />

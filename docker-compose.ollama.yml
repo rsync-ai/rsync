@@ -20,7 +20,7 @@
 # long as that download takes — several minutes on a home connection, and about
 # 4.7 GB on disk for the default qwen2.5:7b. Watch it with:
 #
-#     docker logs -f rsync-ollama-pull
+#     docker logs -f rsync-ai-ollama-pull
 #
 # Later `up`s are a no-op: the volume survives `down`, and the pull step exits
 # immediately when the model is already there. `docker compose down -v` deletes
@@ -48,7 +48,7 @@ services:
     # Pinned: `latest` is what the README's no-OpenAI-key path pulls, and a model runtime
     # that changes under a re-pull changes inference behaviour, not just the binary.
     image: ollama/ollama:0.33.2
-    container_name: rsync-ollama
+    container_name: rsync-ai-ollama
     restart: unless-stopped
     logging:
       driver: json-file
@@ -86,7 +86,7 @@ services:
   # with no models in it, and the only thing telling you to fix that was a line
   # in this file's header:
   #
-  #     docker exec rsync-ollama ollama pull qwen2.5:7b
+  #     docker exec rsync-ai-ollama ollama pull qwen2.5:7b
   #
   # Skipping it does not fail loudly. Ollama answers the request and returns
   # `model "qwen2.5:7b" not found, try pulling it first`; the Python tier
@@ -102,7 +102,7 @@ services:
   # with no repo checkout, so there is no shared script on the host to call.
   ollama-pull:
     image: ollama/ollama:0.33.2
-    container_name: rsync-ollama-pull
+    container_name: rsync-ai-ollama-pull
     restart: "no"
     logging:
       driver: json-file

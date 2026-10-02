@@ -97,7 +97,7 @@ This license starts with the first release of the software that includes this
 file. Copies of the software that you obtained earlier, including every release
 up to and including v0.1.7 and any commit published before this file replaced
 the Elastic License 2.0, stay licensed to you under the terms they came with,
-which are preserved in LICENSES/LicenseRef-rsync-ELv2-legacy.txt. The license of
+which are preserved in LICENSES/LicenseRef-rsync.ai-ELv2-legacy.txt. The license of
 a copy is the one in force in the release or commit it came from.
 
 ## No Other Rights
@@ -128,7 +128,7 @@ The **licensor** is Infini Data Solution (Rahul Kumar Vishnoi), the entity
 offering these terms.
 
 The **software** is rsync.ai, the agentic data pipeline platform made
-available under these terms at https://github.com/rsync-ai/rsync, including any
+available under these terms at https://github.com/rsync-ai/rsync.ai, including any
 portion of it.
 
 **you** refers to the individual or entity agreeing to these terms.

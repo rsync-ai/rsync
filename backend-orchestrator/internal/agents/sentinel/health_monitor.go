@@ -86,7 +86,7 @@ type HealthMonitor struct {
 	// the UI reads. nil is valid — a monitor with no Agent attached.
 	onComponentsEvicted func(componentIDs []string)
 
-	// serviceProbes are the core rsync services checked alongside PostgreSQL, Kafka and
+	// serviceProbes are the core rsync.ai services checked alongside PostgreSQL, Kafka and
 	// Kafka Connect on the infrastructure tick (service_probes.go). Set by NewAgent from
 	// the environment; empty for a monitor built directly, as the tests do.
 	serviceProbes []*serviceProbe
@@ -647,7 +647,7 @@ func (h *HealthMonitor) checkConnectorReachability(ctx context.Context, name str
 }
 
 // monitorInfrastructure monitors infrastructure components: PostgreSQL, Kafka, Kafka
-// Connect, and the core rsync services in service_probes.go.
+// Connect, and the core rsync.ai services in service_probes.go.
 func (h *HealthMonitor) monitorInfrastructure() {
 	defer h.wg.Done()
 
@@ -678,7 +678,7 @@ func (h *HealthMonitor) checkInfrastructureHealth() {
 	// Check Kafka Connect (Debezium) for CDC pipelines
 	h.checkKafkaConnectHealth(ctx)
 
-	// Redis, Temporal and the rsync services pipelines depend on
+	// Redis, Temporal and the rsync.ai services pipelines depend on
 	h.checkServiceProbes(ctx)
 }
 

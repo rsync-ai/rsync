@@ -432,66 +432,6 @@
       "logo_url": "/api/v1/connectors/mysql/logo"
     },
     {
-      "name": "petstore",
-      "display_name": "Petstore",
-      "version": "1.0.3",
-      "description": "Swagger Petstore OpenAPI 3.0 sample API",
-      "category": "api_saas",
-      "icon": "",
-      "color": "",
-      "source": "built_in",
-      "lifecycle": "draft",
-      "status": "active",
-      "quality_tier": "silver",
-      "confidence_level": "unknown",
-      "capabilities": {
-        "auto_create_destination_tables": false,
-        "max_batch_size": 10000,
-        "supported_formats": [
-          "json"
-        ],
-        "supports_cdc": false,
-        "supports_ddl": false,
-        "supports_incremental_batch": true
-      },
-      "configuration_schema": {
-        "properties": {
-          "access_token": {
-            "description": "Access token / bearer credential used to authenticate requests.",
-            "secret": true,
-            "type": "string"
-          }
-        },
-        "required": [
-          "access_token"
-        ],
-        "type": "object"
-      },
-      "supports_source": true,
-      "supports_destination": true,
-      "supports_cdc": false,
-      "auth_type": "oauth2",
-      "oauth_provider": "petstore",
-      "supported_auth_methods": [
-        {
-          "config_keys": [
-            "access_token",
-            "oauth_token_id",
-            "token"
-          ],
-          "description": "OAuth 2.0 via the 'petstore' provider; the access token is sent as a Bearer token in the Authorization header.",
-          "header_name": "Authorization",
-          "header_prefix": "Bearer",
-          "method": "oauth2",
-          "oauth_provider": "petstore"
-        }
-      ],
-      "docker_deployed": false,
-      "docker_status": "auto_deploys_on_use",
-      "has_dockerfile": true,
-      "logo_url": "/api/v1/connectors/petstore/logo"
-    },
-    {
       "name": "postgresql",
       "display_name": "PostgreSQL",
       "version": "1.0.0",

@@ -55,7 +55,7 @@ type Notification struct {
 	CreatedAt time.Time  `json:"created_at"`
 }
 
-// audienceFilter hides notifications addressed to rsync engineers rather than
+// audienceFilter hides notifications addressed to rsync.ai engineers rather than
 // to the customer. StructuredError carries audience={user|operator|developer};
 // a developer-audience event ("RSYNC_BUG_*" internals) is our problem to fix,
 // not something a customer can action, so it never reaches their bell. Rows

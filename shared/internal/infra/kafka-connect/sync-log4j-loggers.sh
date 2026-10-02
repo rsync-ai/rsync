@@ -1,5 +1,5 @@
 #!/bin/bash
-# Applies rsync's logger levels (log4j-loggers.properties, next to this script) to
+# Applies rsync.ai's logger levels (log4j-loggers.properties, next to this script) to
 # the Kafka Connect worker's /kafka/config/log4j.properties at every start.
 #
 # Why at start and not at build: /kafka/config is a VOLUME in the debezium/connect
@@ -16,7 +16,7 @@
 # Each logger in log4j-loggers.properties that the live file does not set is
 # appended. A logger the live file already sets is left alone: an operator's level
 # wins, and a CONNECT_LOG4J_* variable still applies afterwards, because the base
-# entrypoint rewrites the line this appends. To override one of rsync's levels, set
+# entrypoint rewrites the line this appends. To override one of rsync.ai's levels, set
 # the logger to another level -- deleting its line brings it back at the next start.
 # Idempotent.
 #

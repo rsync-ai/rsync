@@ -94,7 +94,7 @@ def _rendered(ports, project="rsync-ai") -> str:
     for svc, hip, published, target in ports:
         out += [
             f"  {svc}:",
-            f"    container_name: rsync-{svc}",
+            f"    container_name: rsync-ai-{svc}",
             "    environment:",
             '      PORT: "8080"',
             "      NOT_A_PORT: published",
@@ -111,7 +111,7 @@ def _rendered(ports, project="rsync-ai") -> str:
         ]
     out += [
         "  postgres:",
-        "    container_name: rsync-postgres",
+        "    container_name: rsync-ai-postgres",
         "    expose:",
         '      - "5432"',
         "networks:",
@@ -315,7 +315,7 @@ def test_a_port_held_by_this_installs_own_container_is_fine(tmp_path):
     with _listener() as port:
         install_dir = tmp_path / "rsync-ai"
         install_dir.mkdir()
-        ps = f"rsync-api-gateway\trsync-ai\t{install_dir}\t127.0.0.1:{port}->8080/tcp, [::1]:{port}->8080/tcp\n"
+        ps = f"rsync-ai-api-gateway\trsync-ai\t{install_dir}\t127.0.0.1:{port}->8080/tcp, [::1]:{port}->8080/tcp\n"
         rc, out, _ = _run_fn(
             tmp_path,
             "check_ports_and_running_install",
@@ -332,7 +332,7 @@ def test_a_port_held_by_this_installs_own_container_is_fine(tmp_path):
 
 def test_our_project_started_from_another_directory_is_named_but_not_fatal(tmp_path):
     with _listener() as port:
-        ps = f"rsync-api-gateway\trsync-ai\t/some/source/checkout\t127.0.0.1:{port}->8080/tcp\n"
+        ps = f"rsync-ai-api-gateway\trsync-ai\t/some/source/checkout\t127.0.0.1:{port}->8080/tcp\n"
         rc, out, _ = _run_fn(
             tmp_path,
             "check_ports_and_running_install",
@@ -355,7 +355,7 @@ def test_an_install_dir_reached_through_a_symlink_is_not_another_directory(tmp_p
     assert physical != str(link)
     working_dir = str(link) if recorded == "logical" else physical
     with _listener() as port:
-        ps = f"rsync-api-gateway\trsync-ai\t{working_dir}\t127.0.0.1:{port}->8080/tcp\n"
+        ps = f"rsync-ai-api-gateway\trsync-ai\t{working_dir}\t127.0.0.1:{port}->8080/tcp\n"
         rc, out, _ = _run_fn(
             tmp_path,
             "check_ports_and_running_install",
@@ -1101,9 +1101,9 @@ def test_a_rerun_over_a_running_install_upgrades_it_in_place(tmp_path):
     assert len(first_env) > 10
 
     inst.ps.write_text(
-        f"rsync-api-gateway\trsync-ai\t{inst.install_dir}\t127.0.0.1:{inst.api_port}->8080/tcp\n"
-        f"rsync-frontend\trsync-ai\t{inst.install_dir}\t127.0.0.1:{inst.ui_port}->3000/tcp\n"
-        "rsync-postgres\trsync-ai\t" f"{inst.install_dir}\t5432/tcp\n"
+        f"rsync-ai-api-gateway\trsync-ai\t{inst.install_dir}\t127.0.0.1:{inst.api_port}->8080/tcp\n"
+        f"rsync-ai-frontend\trsync-ai\t{inst.install_dir}\t127.0.0.1:{inst.ui_port}->3000/tcp\n"
+        "rsync-ai-postgres\trsync-ai\t" f"{inst.install_dir}\t5432/tcp\n"
     )
     # What Docker's port proxy looks like from the host while those containers run.
     with _listener(port=inst.api_port), _listener(port=inst.ui_port):

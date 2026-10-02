@@ -41,10 +41,10 @@ keywords:
   - debezium
 home: https://rsync.ai
 sources:
-  - https://github.com/rsync-ai/rsync
+  - https://github.com/rsync-ai/rsync.ai
 maintainers:
   - name: rsync.ai
-    url: https://github.com/rsync-ai/rsync
+    url: https://github.com/rsync-ai/rsync.ai
 
 annotations:
   # There are no chart dependencies on purpose. Bitnami's postgresql/kafka/redis

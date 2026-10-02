@@ -1,10 +1,10 @@
 # Google Managed Service for Apache Kafka
 
-How to point rsync at a Google-managed Kafka cluster instead of the one in the
+How to point rsync.ai at a Google-managed Kafka cluster instead of the one in the
 chart. Everything here was run against a live cluster; the commands are the ones
 that worked, not a reconstruction from Google's docs.
 
-Nothing in rsync is GCP-specific — this is the generic BYO-Kafka path
+Nothing in rsync.ai is GCP-specific — this is the generic BYO-Kafka path
 ([`values.yaml`](../../deploy/helm/rsync-ai/values.yaml) `kafka.external`) filled
 in with the settings Google's brokers want. For the ACL model itself, read
 [Kafka ACLs for a customer-managed cluster](kafka-acls.md); this page covers only
@@ -24,7 +24,7 @@ cannot carry a long-running pipeline.
 | Use it for | **production, and anything that runs more than an hour** | a demo, a smoke test |
 
 **Use mutual TLS.** The SASL password Google accepts is an OAuth access token
-from `gcloud auth print-access-token`, and it is valid for about an hour. rsync
+from `gcloud auth print-access-token`, and it is valid for about an hour. rsync.ai
 passes `kafka.external.saslPassword` through as a static value — there is no
 refresh hook — while Google wants a valid token on *every new broker
 connection*. So a SASL-configured pipeline works, keeps working for an hour, and
@@ -32,7 +32,7 @@ then starts failing in a way that reads like an intermittent auth problem rather
 than an expiry. It is fine for proving connectivity and wrong for anything else.
 
 > Google's own recommendation for the SASL listener is OAUTHBEARER with
-> Application Default Credentials, which refreshes itself. rsync cannot use it
+> Application Default Credentials, which refreshes itself. rsync.ai cannot use it
 > yet: its `OAUTHBEARER` support is the OIDC client-credentials grant, so it
 > requires a token endpoint plus a client id and secret, which ADC does not have.
 > Mutual TLS is the supported answer today.
@@ -189,7 +189,7 @@ a Secret. Expect it to stop working within the hour.
 
 ## Verifying
 
-Any Kafka client that can reach the VPC will do. rsync's own clients — the Go
+Any Kafka client that can reach the VPC will do. rsync.ai's own clients — the Go
 orchestrator, the Go sink worker, the Python service, and the JVM client inside
 Kafka Connect — all read the same settings the chart writes above, so a
 successful install exercising a pipeline end to end is the real check. A failure

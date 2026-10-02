@@ -73,11 +73,11 @@ HOST_PORT="15010"                             # private host port -> lifecycle :
 # loopback-bound port, and it never leaves this script.
 S2S_SECRET="oss-deploy-smoke-internal-secret-not-a-real-credential"
 
-# Lightweight seed connector (no DB driver, no OAuth). petstore is a flat public connector
-# whose versioned dir is a self-contained build context (Dockerfile + connector.py +
+# Lightweight seed connector (no DB driver, no OAuth). widgets-graphql is a flat public
+# connector whose versioned dir is a self-contained build context (Dockerfile + connector.py +
 # requirements.txt + base_connector.py) and whose Dockerfile pulls shared libs via the
 # `shared` named context (public/rsync_protocol + public/warehouse_adapters.py).
-CONNECTOR="petstore"
+CONNECTOR="widgets-graphql"
 
 FAIL=0
 say() { printf '\n=== %s ===\n' "$1"; }
@@ -102,8 +102,8 @@ CV="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["current_ve
         "$SEED_SRC/public/$CONNECTOR/latest.json" 2>/dev/null)"
 if [ -z "${CV:-}" ]; then echo "cannot resolve $CONNECTOR current_version"; exit 1; fi
 VERSION_PART="$(printf '%s' "$CV" | sed 's/^v//; s/\./-/g')"
-CONTAINER="rsync-ai-${CONNECTOR}-v${VERSION_PART}-mcp"     # e.g. rsync-ai-petstore-v1-0-3-mcp
-IMAGE_REF="mcp-${CONNECTOR}:${CV}"                         # e.g. mcp-petstore:v1.0.3
+CONTAINER="rsync-ai-${CONNECTOR}-v${VERSION_PART}-mcp"     # e.g. rsync-ai-widgets-graphql-v1-0-0-mcp
+IMAGE_REF="mcp-${CONNECTOR}:${CV}"                         # e.g. mcp-widgets-graphql:v1.0.0
 
 # $CONTAINER and $IMAGE_REF are names the SHARED stack uses too, so they are this run's to
 # remove only once preflight has seen them absent. The trap is armed before preflight, and it

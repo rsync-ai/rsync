@@ -35,7 +35,7 @@ describe("getExamplePrompts", () => {
 })
 
 describe("getExamplePrompts — internal-table filtering + polish", () => {
-  it("excludes rsync internal tables and tailors to a real business table (BUG-B)", () => {
+  it("excludes rsync.ai internal tables and tailors to a real business table (BUG-B)", () => {
     const ex = getExamplePrompts([
       { name: "_rsync_cdc_offsets" },
       { name: "_rsync_pipelines" },

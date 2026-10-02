@@ -1181,7 +1181,7 @@ func (a *Agent) executeTask(ctx context.Context, task ExecutorTask) ExecutorResp
 									fmt.Sprintf("Schema discovery failed (%v). Enter a table/resource name manually (e.g. `users` or `mydb.users`).", err)),
 							}
 						}
-						// Drop rsync's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
+						// Drop rsync.ai's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
 						// so they never appear as (or get auto-selected in) HITL options.
 						discovered = filterInternalTables(discovered)
 						if len(discovered) == 0 {
@@ -1335,7 +1335,7 @@ func (a *Agent) executeTask(ctx context.Context, task ExecutorTask) ExecutorResp
 								)),
 						}
 					}
-					// Drop rsync's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
+					// Drop rsync.ai's own bookkeeping/staging tables (`_rsync_*`, `flat_*`)
 					// so they never appear as (or get auto-selected in) HITL options.
 					discovered = filterInternalTables(discovered)
 					if len(discovered) == 0 {
@@ -1790,7 +1790,7 @@ func (a *Agent) executePlan(ctx context.Context, task ExecutorTask, planData map
 					cfg[k] = v
 				}
 				tables, totals, derr := a.discoverSchemaWithTotals(ctx, step.Tool, cfg)
-				// Drop rsync's own bookkeeping/staging tables so single-table
+				// Drop rsync.ai's own bookkeeping/staging tables so single-table
 				// auto-selection and the multi-table HITL pause below both act on
 				// real user tables only (never `_rsync_*`/`flat_*`).
 				if derr == nil {
@@ -3287,14 +3287,14 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 	// This is what closes the creation race, and it closes it by removing the race
 	// rather than by surviving it. Nothing created these topics deliberately before:
 	// Debezium produced its first change event, the broker auto-created the topic at
-	// its own num.partitions (1 on the bundled broker), and rsync's own pre-create —
+	// its own num.partitions (1 on the bundled broker), and rsync.ai's own pre-create —
 	// which runs after start_sync — then found it already there and left it alone. The
 	// count was whatever the broker happened to default to, on every cluster, however
 	// many brokers it had.
 	//
 	// With topic.creation.* set, Kafka Connect creates the topic itself through the
 	// AdminClient BEFORE it produces to it, so auto-create never gets a turn and the
-	// count is the one rsync chose. The pre-create below is now a backstop for the case
+	// count is the one rsync.ai chose. The pre-create below is now a backstop for the case
 	// it was written for (snapshot.mode=no_data, where the first event can be hours
 	// away) rather than a second opinion about partitioning.
 	//
@@ -3314,7 +3314,7 @@ func (a *Agent) executeStreamingDataTransfer(ctx context.Context, task ExecutorT
 			"partitions":         shape.Partitions,
 			"replication_factor": shape.ReplicationFactor,
 			"min_insync":         shape.MinInsyncReplicas,
-		}).Info("🧱 CDC data topics will be created with this shape (Kafka Connect creates them; rsync's pre-create is the backstop)")
+		}).Info("🧱 CDC data topics will be created with this shape (Kafka Connect creates them; rsync.ai's pre-create is the backstop)")
 	}
 
 	cdcReq := mcp.ExecuteRequest{
@@ -6276,10 +6276,10 @@ func buildCDCSinkTopics(prefix, dbQualifier, sourceType string, tablesList []str
 	return topics
 }
 
-// cdcDataTopicPartitions is the partition count rsync falls back to for a CDC data
+// cdcDataTopicPartitions is the partition count rsync.ai falls back to for a CDC data
 // topic ("{ns}{prefix}.{db}.{table}") when it cannot derive a better one.
 //
-// This used to be the only answer, and the reason was that rsync is not the only
+// This used to be the only answer, and the reason was that rsync.ai is not the only
 // thing that creates these topics: the pre-create runs AFTER start_sync, so Debezium
 // could produce the first change event first and the broker would auto-create the
 // topic at its own num.partitions. Whichever side won kept its count, because the
@@ -6507,7 +6507,7 @@ func preCreateCDCSinkTopics(km sinkTopicPreCreator, topicsParam interface{}, pip
 				"pipeline_id": pipelineID,
 				"topic":       name,
 				"partitions":  md.NumPartitions,
-			}).Warnf("⚠️  CDC topic %q already exists with %d partitions; rsync creates CDC topics with %d. "+
+			}).Warnf("⚠️  CDC topic %q already exists with %d partitions; rsync.ai creates CDC topics with %d. "+
 				"It was left as it is, because Kafka cannot reduce a topic's partitions. "+
 				"Changes to one row still arrive in order when the table has a primary key (MongoDB always has _id). "+
 				"Do not add partitions to this topic while the pipeline runs: that moves rows between partitions "+
@@ -8572,7 +8572,7 @@ func extractExportRowsColumns(result map[string]interface{}, limit int) ([]map[s
 	return rows, columns
 }
 
-// isInternalDiscoveredTable reports whether a discovered table is one of rsync's
+// isInternalDiscoveredTable reports whether a discovered table is one of rsync.ai's
 // own bookkeeping (`_rsync_*`, `rsync_*`) or pipeline-staging (`flat_mysql_*`,
 // `flat_pg_*`, `flat_postgres_*`) tables. These land in user source/destination
 // databases to track CDC offsets and pipeline state but are never user data, so
@@ -8598,10 +8598,10 @@ func isInternalDiscoveredTable(name string) bool {
 
 // filterInternalTables drops rsync-internal bookkeeping/staging tables from a
 // discovered table list, preserving order. Applied at HITL table-selection sites
-// so users never see (or accidentally sync) rsync's own `_rsync_*` tables. Note
+// so users never see (or accidentally sync) rsync.ai's own `_rsync_*` tables. Note
 // this is intentionally NOT applied inside DiscoverSchema itself — callers like
 // connection validation must still see internal tables to judge a connection's
-// reachability (an rsync destination may legitimately hold only `_rsync_*` rows).
+// reachability (an rsync.ai destination may legitimately hold only `_rsync_*` rows).
 func filterInternalTables(tables []TableMetadata) []TableMetadata {
 	out := make([]TableMetadata, 0, len(tables))
 	for _, t := range tables {

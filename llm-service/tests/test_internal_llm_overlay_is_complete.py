@@ -5,7 +5,7 @@ key, no Ollama on the operator's host. Starting a server is the easy half. The
 half that used to be missing is getting a model INTO it -- and the only thing
 that ever asked for that was a comment in the file's own header:
 
-    docker exec rsync-ollama ollama pull qwen2.5:7b
+    docker exec rsync-ai-ollama ollama pull qwen2.5:7b
 
 Skipping it does not fail. Ollama answers every request with `model "<name>" not
 found, try pulling it first`, the Python tier surfaces that as a failed

@@ -82,7 +82,7 @@ func partitionsFor(requested int32, brokerCount int) int32 {
 // The three fields travel together because they are only meaningful together: a
 // replication factor without its min.insync.replicas floor produces a topic that is
 // created, listed, subscribable, and rejects every acks=all produce (see
-// pinMinInsyncReplicas). rsync is not the only creator of these topics — Kafka
+// pinMinInsyncReplicas). rsync.ai is not the only creator of these topics — Kafka
 // Connect creates them too, from topic.creation.* on the Debezium connector — so the
 // numbers have to be stated somewhere both creators can read, rather than each
 // deriving its own.

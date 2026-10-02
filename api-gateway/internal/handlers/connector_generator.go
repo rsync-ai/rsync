@@ -648,7 +648,7 @@ func ValidateConnector(c *gin.Context) {
 		log.Errorf("Failed to build tool-generator validate request: %v", err)
 		respondValidationUnavailable(c, req.ConnectorName, normalized,
 			"Could not check this connector name: the connector generator address (TOOL_GENERATOR_URL) is not a valid URL. "+
-				"Fix it in .env, then restart rsync.")
+				"Fix it in .env, then restart rsync.ai.")
 		return
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
