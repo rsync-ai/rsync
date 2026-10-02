@@ -171,7 +171,7 @@ shipped connectors still work; the LLM features say `Set up an LLM first` until 
 the stack does not come up, the installer says so and exits non-zero — it does not print a
 success banner over a dead stack.
 
-> **Which code you get.** `v0.1.7`, the current release. Both halves of the install come
+> **Which code you get.** `v0.1.8`, the current release. Both halves of the install come
 > from that one tag: the compose file is fetched from `RSYNC_REF` and the images are
 > pulled at a tag derived from it, so the file and the containers it starts are the same
 > commit. Every image the default compose starts is published at that tag and pullable
