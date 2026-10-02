@@ -260,7 +260,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > The chart is also published to the registry, so you can install without cloning:
 >
 > ```bash
-> helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.7 \
+> helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.8 \
 >   --namespace rsync-ai --create-namespace \
 >   --set secrets.jwtSecret="$(openssl rand -base64 32)" \
 >   --set secrets.encryptionKey="$(openssl rand -base64 32)" \
@@ -281,7 +281,7 @@ per-provider value files ship for EKS, GKE and AKS. See the
 > and older still name the withdrawn images; to install one of those, add
 > `--set objectStorage.minio.image=cgr.dev/chainguard/minio@sha256:bd014394a80898e68c149f2311fdf8d5a2c2f3bb2c33b9327ae6d02b4b065ae1`
 > and the same value for `objectStorage.minio.mcImage`. Both paths pull rsync.ai's own
-> images at `.Chart.AppVersion` (**0.1.7**), and every `ghcr.io/rsync-ai` image the
+> images at `.Chart.AppVersion` (**0.1.8**), and every `ghcr.io/rsync-ai` image the
 > chart names is published at that tag for both `amd64` and `arm64` (0.1.2 and older
 > are `amd64` only, so they will not start on Apple Silicon, Graviton, Axion or Ampere
 > nodes).

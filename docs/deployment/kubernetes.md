@@ -155,7 +155,7 @@ chart and the images it points at can never skew:
 
 ```bash
 helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai \
-  --version 0.1.7 \
+  --version 0.1.8 \
   --namespace rsync-ai --create-namespace \
   -f my-values.yaml
 ```
@@ -191,20 +191,20 @@ is no local file to name, and the two halves of the documentation do not compose
 
 ```bash
 helm install rsync-ai oci://ghcr.io/rsync-ai/charts/rsync-ai \
-  --version 0.1.7 \
+  --version 0.1.8 \
   --namespace rsync-ai --create-namespace \
-  -f https://raw.githubusercontent.com/rsync-ai/rsync.ai/v0.1.7/deploy/helm/rsync-ai/values-gke.yaml \
+  -f https://raw.githubusercontent.com/rsync-ai/rsync.ai/v0.1.8/deploy/helm/rsync-ai/values-gke.yaml \
   -f my-values.yaml
 ```
 
-Keep the two versions equal. The URL carries the tag `v0.1.7` and `--version`
-carries `0.1.7` — the same release, spelled the two different ways the tag and
+Keep the two versions equal. The URL carries the tag `v0.1.8` and `--version`
+carries `0.1.8` — the same release, spelled the two different ways the tag and
 the chart version use. If you would rather not fetch over the network at install
 time, unpack the chart and use the copy that shipped with it, which cannot skew
 from the chart at all:
 
 ```bash
-helm pull oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.7 --untar
+helm pull oci://ghcr.io/rsync-ai/charts/rsync-ai --version 0.1.8 --untar
 helm install rsync-ai ./rsync-ai \
   --namespace rsync-ai --create-namespace \
   -f ./rsync-ai/values-gke.yaml \
@@ -223,9 +223,9 @@ helm install rsync-ai ./deploy/helm/rsync-ai \
 ```
 
 The chart resolves its image tag to `.Chart.AppVersion`, so this pulls the
-**0.1.7** images. Every `ghcr.io/rsync-ai` image the chart names is published at that tag: all
-34 packages — 13 service images and 21 connectors — answer an anonymous pull at
-`0.1.7`, each returning an index that lists both `amd64` and `arm64` (checked 2026-09-28 by
+**0.1.8** images. Every `ghcr.io/rsync-ai` image the chart names is published at that tag: all
+33 packages — 13 service images and 20 connectors — answer an anonymous pull at
+`0.1.8`, each returning an index that lists both `amd64` and `arm64` (checked 2026-10-02 by
 manifest fetch); `0.1.2` and older are `amd64` only and fail on Apple Silicon, Graviton, Axion or Ampere
 nodes with `no match for platform in manifest`.
 
