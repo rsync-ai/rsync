@@ -7,7 +7,9 @@ All notable changes to rsync.ai are documented in this file.
      this file used to open with `## [1.0.0] - December 2025`, a version no tag
      has ever pointed at, and nothing in the repo could disagree with it. -->
 
-## [Unreleased]
+## [0.1.8] - 2026-10-02
+
+Everything since v0.1.7.
 
 ### ⚖️ License
 
